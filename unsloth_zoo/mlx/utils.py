@@ -7859,12 +7859,64 @@ def _convert_vlm_processor_output(value, return_tensors):
     return value
 
 
+_VLM_COMPONENT_KWARGS = contextvars.ContextVar("vlm_component_kwargs", default={})
+
+
+def _scope_vlm_component_call(component):
+    cls = type(component)
+    original = cls.__call__
+    if getattr(original, "_unsloth_vlm_component_kwargs", False):
+        return
+
+    @wraps(original)
+    def scoped(self, *args, **kwargs):
+        options = _VLM_COMPONENT_KWARGS.get().get(id(self))
+        if options is not None:
+            excluded, defaults = options
+            kwargs = {**defaults, **kwargs}
+            kwargs = {k: v for k, v in kwargs.items() if k not in excluded}
+        return original(self, *args, **kwargs)
+
+    scoped._unsloth_vlm_component_kwargs = True
+    try:
+        cls.__call__ = scoped
+    except (TypeError, AttributeError):
+        # Native callables cannot be patched and keep their own dispatch.
+        pass
+
+
+def _invoke_vlm_processor(processor_call, args, kwargs):
+    processor = args[0] if args and hasattr(args[0], "image_processor") else processor_call
+    tokenizer = getattr(processor, "tokenizer", None)
+    image_processor = getattr(processor, "image_processor", None)
+    if not callable(tokenizer) or not callable(image_processor):
+        return processor_call(*args, **kwargs)
+    from transformers.processing_utils import ImagesKwargs, TextKwargs
+
+    text_keys = set(TextKwargs.__annotations__)
+    image_keys = set(ImagesKwargs.__annotations__)
+    _scope_vlm_component_call(tokenizer)
+    _scope_vlm_component_call(image_processor)
+    # Keep component identity/state, and isolate options from other calls/threads.
+    options = dict(_VLM_COMPONENT_KWARGS.get())
+    options[id(image_processor)] = (text_keys - image_keys, {})
+    options[id(tokenizer)] = (
+        image_keys - text_keys,
+        {"padding": kwargs["padding"]} if "padding" in kwargs else {},
+    )
+    token = _VLM_COMPONENT_KWARGS.set(options)
+    try:
+        return processor_call(*args, **kwargs)
+    finally:
+        _VLM_COMPONENT_KWARGS.reset(token)
+
+
 def _call_vlm_processor(processor_call, args, kwargs):
-    """Retry only the Transformers fast-processor PyTorch output contract."""
+    """Scope modality options and negotiate PyTorch-only processor output."""
 
     return_tensors = kwargs.get("return_tensors")
     try:
-        return processor_call(*args, **kwargs)
+        return _invoke_vlm_processor(processor_call, args, kwargs)
     except ValueError as error:
         if (
             return_tensors not in {"mlx", "np"}
@@ -7874,7 +7926,7 @@ def _call_vlm_processor(processor_call, args, kwargs):
 
     retry_kwargs = dict(kwargs)
     retry_kwargs["return_tensors"] = "pt"
-    output = processor_call(*args, **retry_kwargs)
+    output = _invoke_vlm_processor(processor_call, args, retry_kwargs)
     return _convert_vlm_processor_output(output, return_tensors)
 
 

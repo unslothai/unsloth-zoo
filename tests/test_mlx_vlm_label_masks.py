@@ -5529,3 +5529,26 @@ def test_qwen3_omni_leaves_assistant_turns_alone_without_counts():
 
     assert [part.get("type") for part in template[0]["content"]] == ["text", "audio"]
     assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]
+
+
+@pytest.mark.parametrize("drops_padding", [False, True])
+def test_vlm_component_kwargs_preserve_expansion_and_modality_options(drops_padding):
+    from unsloth_zoo.mlx.utils import _call_vlm_processor
+    class Tokenizer:
+        def __call__(self, text, padding):
+            return {"input_ids": [[len(t)] for t in text], "padding": padding}
+
+    class Images:
+        def __call__(self, images, size):
+            return {"pixel_values": [i * size for i in images]}
+
+    class Processor:
+        tokenizer, image_processor = Tokenizer(), Images()
+        def __call__(self, text, images, **kwargs):
+            if drops_padding:
+                kwargs.pop("padding")
+            return {**self.image_processor(images, **kwargs),
+                    **self.tokenizer([t.replace("#", "##") for t in text], **kwargs)}
+
+    output = _call_vlm_processor(Processor(), (), dict(text=["a#", "bb#"], images=[2, 3], size=4, padding=True))
+    assert output == {"input_ids": [[3], [4]], "pixel_values": [8, 12], "padding": True}
