@@ -1199,8 +1199,8 @@ def _bytecode_would_be_used(function_location, bytecode_location):
     """Whether CPython would accept this pyc for this source (PEP 552).
 
     Header is magic, flags, then either (mtime, size) or a 64-bit source hash.
-    Bit 0 of flags selects hash-based; bit 1 is check_source, and an unchecked
-    hash pyc is loaded without ever looking at the source.
+    Flags bit 0 selects hash-based, bit 1 is check_source, and an unchecked
+    hash pyc loads without ever consulting the source.
     """
     try:
         with open(bytecode_location, "rb") as file:
@@ -1225,13 +1225,10 @@ def _remove_compiled_cache_bytecode(function_location):
     """Remove this rank's pyc before importing source we just rewrote.
 
     Only called when the bytes changed, the only time the pyc can be stale.
-
-    An unlink failure is fatal only when the bytecode would really be used. On
-    Windows `os.remove` raises PermissionError (WinError 32) whenever a scanner,
-    sync client or other interpreter holds the file, which this lock cannot
-    exclude; raising on that forced the group into tempfile recovery. A pyc
-    CPython would still accept, a same-size rewrite inside one timestamp tick or
-    an unchecked hash pyc, is the case this exists for and still fails over.
+    An unlink failure is fatal only when the pyc would really be used: on
+    Windows os.remove raises PermissionError whenever a scanner or other
+    interpreter holds the file, and raising on that forced the whole group into
+    tempfile recovery. A pyc CPython would still accept still fails over.
     """
     try:
         bytecode_location = importlib.util.cache_from_source(function_location)
@@ -1693,11 +1690,9 @@ def create_new_function(
         """Write this rank's own copy, then agree the outcome.
 
         Returns (agreed error or None, whether any rank changed its bytes).
-
-        The temp cache is `tempfile.gettempdir()`, which is per node, so routing
-        it through distributed_function() would write it on rank 0 alone and
-        leave every other node without the file. write_file() locks and compares
-        before writing, so ranks sharing a node stay idempotent.
+        The temp cache is per node, so routing it through distributed_function()
+        would write it on rank 0 alone and leave other nodes without the file.
+        write_file() locks and compares first, so co-located ranks stay idempotent.
         """
         ok, write_error, changed = write_file_outcome(
             function_location, write_new_source,
