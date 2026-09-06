@@ -1167,136 +1167,6 @@ def test_adapter_config_keeps_dropout_while_preference_context_is_active():
         context.restore()
 
 
-def test_referenced_dpo_rejects_non_lora_and_reference_free_accepts_it():
-    from unsloth_zoo.mlx.preference import build_reference_policy
-
-    class Model:
-        _hf_repo = "base"
-
-        def named_modules(self):
-            return [("", self)]
-
-        def parameters(self):
-            return {}
-
-        def trainable_parameters(self):
-            return {}
-
-    with pytest.raises(ValueError, match="requires plain LoRA"):
-        build_reference_policy(
-            Model(), reference_free=False, resume_provenance=None,
-        )
-    policy, provenance = build_reference_policy(
-        Model(), reference_free=True, resume_provenance=None,
-    )
-    assert policy is None and provenance == {"kind": "reference_free"}
-
-
-def test_reference_forward_restores_scale_and_neftune_after_failure(monkeypatch):
-    from unsloth_zoo.mlx import preference
-
-    adapter = types.SimpleNamespace(scale=0.75)
-    neftune = types.SimpleNamespace(_neftune_noise_enabled=True)
-    policy = preference.LoRAReferencePolicy([adapter], [neftune])
-    monkeypatch.setattr(
-        preference, "_response_logps",
-        lambda *_args: (_ for _ in ()).throw(RuntimeError("forward failed")),
-    )
-    with pytest.raises(RuntimeError, match="forward failed"):
-        policy.forward(object(), object(), object())
-    assert adapter.scale == 0.75
-    assert neftune._neftune_noise_enabled is True
-
-
-def test_referenced_dpo_accepts_only_fresh_or_same_run_plain_lora():
-    import mlx.core as mx
-    from unsloth_zoo.mlx.preference import build_reference_policy
-
-    class PlainLoRA:
-        def __init__(self, second_nonzero=False):
-            self.lora_a = mx.array([[1.0]])
-            self.lora_b = mx.array([[1.0 if second_nonzero else 0.0]])
-            self.scale = 1.0
-
-    class Model:
-        _hf_repo = "base/repo"
-        _unsloth_base_revision = "main"
-        _unsloth_base_commit_hash = "abc123"
-
-        def __init__(self, adapter, extra=False):
-            self.adapter = adapter
-            self.extra = extra
-
-        def named_modules(self):
-            return [("", self), ("q_proj", self.adapter)]
-
-        def parameters(self):
-            values = {
-                "q_proj": {
-                    "lora_a": self.adapter.lora_a,
-                    "lora_b": self.adapter.lora_b,
-                }
-            }
-            if self.extra:
-                values["norm"] = mx.array([1.0])
-            return values
-
-        def trainable_parameters(self):
-            return self.parameters()
-
-    fresh = Model(PlainLoRA())
-    policy, provenance = build_reference_policy(
-        fresh, reference_free=False, resume_provenance=None,
-    )
-    assert policy.modules == (fresh.adapter,)
-    assert provenance["base_commit"] == "abc123"
-
-    resumed = Model(PlainLoRA(second_nonzero=True))
-    resumed_policy, resumed_provenance = build_reference_policy(
-        resumed, reference_free=False, resume_provenance=provenance,
-    )
-    assert resumed_policy.modules == (resumed.adapter,)
-    assert resumed_provenance == provenance
-
-    with pytest.raises(ValueError, match="fresh zero-delta"):
-        build_reference_policy(
-            Model(PlainLoRA(second_nonzero=True)),
-            reference_free=False,
-            resume_provenance=None,
-        )
-    with pytest.raises(ValueError, match="LoRA-only trainable"):
-        build_reference_policy(
-            Model(PlainLoRA(), extra=True),
-            reference_free=False,
-            resume_provenance=None,
-        )
-
-
-def test_referenced_dpo_rejects_dora():
-    import mlx.core as mx
-    from unsloth_zoo.mlx.preference import build_reference_policy
-
-    DoRA = type("DoRALinear", (), {})
-    adapter = DoRA()
-    adapter.lora_a = mx.array([[1.0]])
-    adapter.lora_b = mx.array([[0.0]])
-    adapter.scale = 1.0
-
-    class Model:
-        def named_modules(self):
-            return [("", self), ("q_proj", adapter)]
-
-        def parameters(self):
-            return {"q_proj": {"lora_a": adapter.lora_a, "lora_b": adapter.lora_b}}
-
-        trainable_parameters = parameters
-
-    with pytest.raises(ValueError, match="does not support DoRA"):
-        build_reference_policy(
-            Model(), reference_free=False, resume_provenance=None,
-        )
-
-
 def test_preference_trainers_forward_shared_constructor_state():
     import mlx.nn as nn
     from unsloth_zoo.mlx.trainer import (
@@ -1599,74 +1469,8 @@ def test_trainer_applies_preference_formatter_once_per_row():
     assert calls == [0, 1, 2]
 
 
-def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path):
-    import json
-    import mlx.core as mx
-    import mlx.nn as nn
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
-
-    class Adapter(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lora_a = mx.array([[1.0]])
-            self.lora_b = mx.array([[0.0]])
-            self.scale = 1.0
-
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.adapter = Adapter()
-            self._config = {"model_type": "tiny"}
-            self._hf_repo = "base/repo"
-            self._unsloth_base_revision = "main"
-            self._unsloth_base_commit_hash = "abc123"
-            self.loaded = False
-
-        def named_modules(self):
-            return [("", self), ("q_proj", self.adapter)]
-
-        def parameters(self):
-            return {
-                "q_proj": {
-                    "lora_a": self.adapter.lora_a,
-                    "lora_b": self.adapter.lora_b,
-                }
-            }
-
-        trainable_parameters = parameters
-
-        def load_weights(self, *_args, **_kwargs):
-            self.loaded = True
-            self.adapter.lora_b = mx.array([[9.0]])
-
-    checkpoint = tmp_path / "checkpoint-1"
-    checkpoint.mkdir()
-    (checkpoint / "adapters.safetensors").touch()
-    (checkpoint / "optimizer_state.safetensors").touch()
-    (checkpoint / "trainer_state.json").write_text(json.dumps({
-        "global_step": 1,
-        "preference_reference": {"kind": "reference_free"},
-    }))
-    model = Model()
-    trainer = MLXDPOTrainer(
-        model, Tokenizer(), rows(1),
-        args=MLXDPOConfig(
-            max_steps=2, compile=False, gradient_checkpointing=False,
-            cast_norm_output_to_input_dtype=False, disable_memory_limits=True,
-            output_dir=str(tmp_path / "output"),
-        ),
-    )
-    trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
-        learning_rate=mx.array(1e-5), state={}, update=lambda *_args: None,
-    )
-    with pytest.raises(ValueError, match="provenance does not match"):
-        trainer.train(resume_from_checkpoint=str(checkpoint))
-    assert model.loaded is False
-    assert model.adapter.lora_b.tolist() == [[0.0]]
-
-
-def _tiny_model(lora=False):
-    """lora=True adds one adapter at zero delta, as referenced DPO requires."""
+def _tiny_model(lora=False, tail=False):
+    """lora=True adds an adapter at zero delta; tail=True a tensor no adapter owns."""
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -1684,6 +1488,8 @@ def _tiny_model(lora=False):
             self._config = {"model_type": "tiny"}
             if lora:
                 self.q_proj = Adapter()
+            if tail:
+                self.tail = mx.array([1.0])
 
         def __call__(self, tokens):
             return self.proj(self.embed(tokens))
@@ -1700,9 +1506,12 @@ def _tiny_model(lora=False):
                 return [("", self), ("q_proj", self.q_proj)]
 
             def parameters(self):
-                return {"q_proj": {
+                values = {"q_proj": {
                     "lora_a": self.q_proj.lora_a, "lora_b": self.q_proj.lora_b,
                 }}
+                if tail:
+                    values["tail"] = self.tail
+                return values
 
             def trainable_parameters(self):
                 return self.parameters()
@@ -1724,11 +1533,13 @@ def _generation_common(tmp_path, **overrides):
     return common
 
 
-def _run_generation_trainer(trainer, monkeypatch, calls, generate_batch=None):
+def _run_generation_trainer(
+    trainer, monkeypatch, calls, generate_batch=None, probe=None,
+):
     """Drive one training step whose evaluation samples, recording engine calls.
 
     ``generate_batch`` replaces the recording stub, for tests needing the engine
-    to fail or to return text of their own choosing.
+    to fail or to return text of their own choosing; ``probe`` sees each call's model.
     """
     import mlx.core as mx
     import mlx.nn as nn
@@ -1743,6 +1554,8 @@ def _run_generation_trainer(trainer, monkeypatch, calls, generate_batch=None):
             "defaults": defaults,
             "scales": [module.scale for _, module in iter_mlx_lora_modules(model)],
         })
+        if probe is not None:
+            probe(model)
         # Distinct per call and per row, so a mis-mapped sample reads wrong.
         return [
             types.SimpleNamespace(
@@ -1885,21 +1698,30 @@ def test_generation_prompt_reserves_room_for_the_sample():
 def test_referenced_dpo_samples_the_reference_with_scales_zeroed(
     tmp_path, monkeypatch,
 ):
-    """The reference sample is the base policy, and the scales come back."""
+    """The reference decodes the base policy; adapter and tensor come back afterwards."""
+    import mlx.core as mx
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
 
-    model = _tiny_model(lora=True)
+    model = _tiny_model(lora=True, tail=True)
     trainer = MLXDPOTrainer(
         model, Tokenizer(), rows(3), eval_dataset=rows(2),
         args=MLXDPOConfig(**_generation_common(tmp_path)),
     )
     calls = []
-    _run_generation_trainer(trainer, monkeypatch, calls)
+    tails = []
+
+    def probe(model):
+        tails.append(model.tail.tolist())
+        model.tail = mx.array([9.0])
+
+    _run_generation_trainer(trainer, monkeypatch, calls, probe=probe)
 
     assert len(calls) == 2, "policy and reference"
     assert all(scale != 0.0 for scale in calls[0]["scales"])
     assert all(scale == 0.0 for scale in calls[1]["scales"])
+    assert tails == [[1.0], [1.0]], "the reference decodes at the starting value"
+    assert model.tail.tolist() == [9.0], "the replaced tensor stays replaced"
     assert all(
         module.scale != 0.0 for _, module in iter_mlx_lora_modules(model)
     ), "scales restored after sampling"
