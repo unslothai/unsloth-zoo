@@ -1391,6 +1391,25 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
         if "attention_mask_4d" in kwargs and "mask" not in kwargs:
             kwargs["mask"] = kwargs.pop("attention_mask_4d")
         backbone_kwargs = _filter_backbone_kwargs(backbone, kwargs)
+        rope_args = getattr(tm, "args", getattr(backbone, "config", None))
+        rope_config = (
+            _config_get(rope_args, "rope_parameters")
+            or _config_get(rope_args, "rope_scaling")
+        )
+        if (
+            inputs_embeds is None
+            and backbone_kwargs.get("position_ids") is None
+            and backbone_kwargs.get("cache") is None
+            and hasattr(tm, "_position_ids")
+            and _config_get(rope_config, "mrope_section") is not None
+        ):
+            # Text prefill uses identical sequential positions on all mRoPE axes.
+            position_ids = mx.broadcast_to(
+                mx.arange(inputs.shape[1]), (3, inputs.shape[0], inputs.shape[1]),
+            )
+            backbone_kwargs.update(_filter_backbone_kwargs(
+                backbone, {"position_ids": position_ids},
+            ))
         if inputs_embeds is not None:
             backbone_kwargs[embed_kwarg] = inputs_embeds
         return backbone(inputs, **backbone_kwargs)
