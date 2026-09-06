@@ -1343,6 +1343,8 @@ class MLXTrainingConfig:
             "loss_type",
             "loss_weights",
             "discopop_tau",
+            "model_adapter_name",
+            "ref_adapter_name",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1435,6 +1437,9 @@ class MLXDPOConfig(MLXTrainingConfig):
     loss_type: str | list[str] = field(default="sigmoid", kw_only=True)
     loss_weights: list[float] | None = field(default=None, kw_only=True)
     discopop_tau: float = field(default=0.05, kw_only=True)
+    # ref_adapter_name is a saved adapter directory: an MLX model has one unnamed adapter set.
+    model_adapter_name: str | None = field(default=None, kw_only=True)
+    ref_adapter_name: str | None = field(default=None, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -2065,6 +2070,20 @@ class MLXTrainer:
             )
             self._resolved_preference_length_policy = policy
         return policy
+
+    def _build_dpo_reference(self, model, *, resume_provenance):
+        args = self.args
+        return build_reference_policy(
+            model,
+            reference_free=bool(args.reference_free),
+            resume_provenance=resume_provenance,
+            neftune=(
+                [self._neftune_emb]
+                if getattr(self, "_neftune_emb", None) is not None else []
+            ),
+            ref_adapter_name=getattr(args, "ref_adapter_name", None),
+            model_adapter_name=getattr(args, "model_adapter_name", None),
+        )
 
     def __init__(
         self,
@@ -4409,7 +4428,7 @@ class MLXTrainer:
                 return out
 
         # Report the base class's name so the save-window DoRA detection
-        # (`type(module).__name__.startswith("DoRA")` in mlx/utils.py) sees
+        # (`is_mlx_dora_module` in mlx/utils.py) sees
         # through this transparent stand-in. An embedding-only DoRA adapter
         # (use_dora=True targets embed_tokens) is what NEFTune subclasses here,
         # so a bare "_NEFTuneEmbed" name would fail that check and silently
@@ -5293,6 +5312,7 @@ class MLXTrainer:
         self._reset_run_state()
 
         _resume_step = 0
+        _dpo_reference = None
         ts = {}
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
@@ -5329,10 +5349,9 @@ class MLXTrainer:
                         "Unsloth MLX DPO: checkpoint reference mode does not match."
                     )
                 if preference_kind == "dpo" and not bool(args.reference_free):
-                    build_reference_policy(
-                        model,
-                        reference_free=False,
-                        resume_provenance=resume_provenance,
+                    # Built before the checkpoint hydrates the model.
+                    _dpo_reference = self._build_dpo_reference(
+                        model, resume_provenance=resume_provenance,
                     )
 
                 # 1. Load trained adapter weights into the model. The model
@@ -5459,18 +5478,12 @@ class MLXTrainer:
                     discopop_tau=args.discopop_tau,
                     reference_free=bool(args.reference_free),
                 )
-                reference_policy, provenance = build_reference_policy(
-                    model,
-                    reference_free=bool(args.reference_free),
-                    resume_provenance=ts.get("preference_reference"),
-                    neftune=(
-                        [self._neftune_emb]
-                        if getattr(self, "_neftune_emb", None) is not None else []
-                    ),
-                )
+                if _dpo_reference is None:
+                    _dpo_reference = self._build_dpo_reference(
+                        model, resume_provenance=ts.get("preference_reference"),
+                    )
+                reference_policy, provenance = _dpo_reference
                 self._preference_reference_provenance = provenance
-                # Sampling borrows this policy's adapter modules so it zeroes
-                # the same ones the loss does. NEFTune is already off in eval.
                 _sampling_reference = reference_policy
                 loss_fn = make_dpo_loss_fn(
                     objective, reference_policy=reference_policy,
@@ -5486,6 +5499,9 @@ class MLXTrainer:
             preference_eval_fn = make_preference_eval_fn(
                 objective, reference_policy=_sampling_reference,
             )
+        _reference_compile_state = (
+            [] if _sampling_reference is None else [_sampling_reference.state]
+        )
 
         self.callback_handler.optimizer = optimizer
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
@@ -5612,7 +5628,10 @@ class MLXTrainer:
         # that would add a report/no-report compile trace signature.
         _report_grad_norm = bool(getattr(args, "report_grad_norm", False))
         _compute_report_norm = _report_grad_norm and max_grad_norm <= 0
-        state = [model.state, optimizer.state, mx.random.state]
+        state = [
+            model.state, optimizer.state, mx.random.state,
+            *_reference_compile_state,
+        ]
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
@@ -5903,7 +5922,9 @@ class MLXTrainer:
         if _use_compile:
             _uncompiled_step_fn = step_fn
             if _ddp_compile_local_grad:
-                _compile_state = [model.state, mx.random.state]
+                _compile_state = [
+                    model.state, mx.random.state, *_reference_compile_state,
+                ]
                 _main_print(
                     "Unsloth: mx.compile enabled for MLX DDP local "
                     "loss/gradient accumulation; distributed collectives "
@@ -6612,16 +6633,12 @@ class MLXTrainer:
                     return
 
                 reference = None
-                modules = tuple(getattr(_sampling_reference, "modules", ()) or ())
-                if modules and not self._distributed_should_stop():
-                    scales = [module.scale for module in modules]
-                    try:
-                        for module in modules:
-                            module.scale = 0.0
+                if (
+                    _sampling_reference is not None
+                    and not self._distributed_should_stop()
+                ):
+                    with _sampling_reference.activate(model):
                         reference = _decode("reference")
-                    finally:
-                        for module, scale in zip(modules, scales):
-                            module.scale = scale
                     if reference is None:
                         # The policy half alone is indistinguishable from what an
                         # unreferenced objective publishes, hiding the failure.
@@ -7114,7 +7131,10 @@ class MLXTrainer:
                 _ddp_compile_local_grad = False
                 if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
-                state = [model.state, optimizer.state, mx.random.state]
+                state = [
+                    model.state, optimizer.state, mx.random.state,
+                    *_reference_compile_state,
+                ]
                 local_error = None
                 try:
                     result = step_fn(batch_data, prev_state, do_update)
@@ -7422,7 +7442,10 @@ class MLXTrainer:
                         if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
-                        state = [model.state, optimizer.state, mx.random.state]
+                        state = [
+                            model.state, optimizer.state, mx.random.state,
+                            *_reference_compile_state,
+                        ]
                         lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
                         )
