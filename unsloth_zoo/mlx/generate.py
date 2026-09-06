@@ -1223,14 +1223,16 @@ class BatchRowRefused(ValueError):
 
 
 def _text_events(index: int, state: "_PendingResult") -> Iterator[GenerationEvent]:
-    delta = state.release()
-    if delta:
-        yield GenerationEvent(
-            index=index,
-            delta=delta,
-            prompt_tokens=state.prompt_token_count,
-            generated_tokens=len(state.token_ids),
-        )
+    # Emitted even when the token decoded to no text. A tokenizer buffering an
+    # incomplete byte sequence is ordinary, not an edge case, and the counts ride on
+    # every event so a caller that cancels or withdraws right then still reports what
+    # the row actually consumed.
+    yield GenerationEvent(
+        index=index,
+        delta=state.release(),
+        prompt_tokens=state.prompt_token_count,
+        generated_tokens=len(state.token_ids),
+    )
 
 
 def _finished_events(
@@ -2711,7 +2713,15 @@ class _VLMBatchSession:
                 "This mlx-vlm's batch cannot carry a row's own logits processors."
             )
         input_ids, prompt_kwargs = self._prepare(request)
-        row_processors = adapter._row_logits_processors([request])
+        try:
+            row_processors = adapter._row_logits_processors([request])
+        except RuntimeError as refusal:
+            # Reachable when the penalties come from the defaults rather than the
+            # request, so the check above passes. add() refuses a row without
+            # disturbing the batch, and nothing here has been inserted yet, so this
+            # is a row refusal rather than the API-shape error raised when a whole
+            # batch is being built.
+            raise BatchRowRefused(str(refusal)) from refusal
         token_ids = input_ids.tolist()
         insert_kwargs = {
             "prompt_kwargs": adapter._split_prompt_kwargs(prompt_kwargs, 1),
@@ -3102,6 +3112,49 @@ class BatchStream:
         )
 
 
+class _OwnedStream:
+    """A ``_stream_batch`` iterator pinned to the thread and task that opened it.
+
+    The generator holds ``generation_mode``'s process-wide lock across its yields, and
+    that lock refuses a release from anyone else. Resuming or closing the iterator
+    elsewhere therefore runs the cleanup on the wrong owner: the release raises before
+    it can decrement the depth, the underlying RLock is never dropped, and every later
+    generation in the process blocks forever. ``BatchStream`` pins itself the same way.
+    """
+
+    def __init__(self, events: Iterator[GenerationEvent]):
+        self._events = events
+        self._owner = (threading.get_ident(), _current_async_task())
+
+    def _require_owner(self, action: str) -> None:
+        if (threading.get_ident(), _current_async_task()) == self._owner:
+            return
+        raise RuntimeError(
+            f"This stream_batch iterator belongs to the thread and task that "
+            f"opened it: the generation lock it holds can only be released there, "
+            f"so it cannot be {action} from another one."
+        )
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> GenerationEvent:
+        self._require_owner("advanced")
+        return next(self._events)
+
+    def send(self, value):
+        self._require_owner("advanced")
+        return self._events.send(value)
+
+    def throw(self, *args):
+        self._require_owner("advanced")
+        return self._events.throw(*args)
+
+    def close(self):
+        self._require_owner("closed")
+        self._events.close()
+
+
 def stream_batch(
     model,
     tokenizer_or_processor,
@@ -3118,9 +3171,12 @@ def stream_batch(
             "boundaries, which would retract text already streamed. Scan the "
             "deltas for them instead, or use generate_batch."
         )
-    return _stream_batch(
+    return _OwnedStream(_stream_batch(
         model, tokenizer_or_processor, requests, defaults=defaults,
-    )
+        # _OwnedStream.__next__ sits between the caller and the generator body, so
+        # the audio warning needs one more frame to reach the caller.
+        audio_warn_stacklevel=3,
+    ))
 
 
 def _stream_batch(
