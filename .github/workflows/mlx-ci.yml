@@ -213,6 +213,17 @@ jobs:
       # The three VLM/shape/batching suites, also run on Linux CPU MLX by
       # consolidated-tests-ci.yml. Here they meet real Metal and the mlx-vlm
       # version an Apple Silicon user resolves, which the audio gate is keyed on.
+      - name: tests/test_mlx_lora_group_selection.py
+        # Which linears each group flag adapts. Reads module trees rather than
+        # running kernels, so the Linux CPU lane gates it too; here it meets the
+        # mlx-lm and mlx-vlm versions an Apple Silicon user actually resolves.
+        run: python -m pytest tests/test_mlx_lora_group_selection.py -v -rs
+
+      - name: tests/test_mlx_resume_adapter_mismatch.py
+        # Resume binds with strict=False, so a checkpoint that predates a wider
+        # selection must be reported rather than silently half-loaded.
+        run: python -m pytest tests/test_mlx_resume_adapter_mismatch.py -v -rs
+
       - name: tests/test_mlx_shape_guard.py
         run: python -m pytest tests/test_mlx_shape_guard.py -v -rs
 

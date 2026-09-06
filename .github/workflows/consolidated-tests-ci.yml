@@ -581,6 +581,14 @@ jobs:
 
       # One pytest process per file: tests/mlx_simulation/ replaces
       # sys.modules["mlx.core"] process-wide, disarming whatever runs after it.
+      - name: tests/test_mlx_lora_group_selection.py
+        # Group-flag selection is structural, so real Metal adds nothing to it
+        # and the CPU backend is a full gate.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_lora_group_selection.py -v -rs
+
+      - name: tests/test_mlx_resume_adapter_mismatch.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_resume_adapter_mismatch.py -v -rs
+
       - name: tests/test_mlx_shape_guard.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_shape_guard.py -v -rs
 

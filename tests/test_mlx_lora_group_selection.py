@@ -24,11 +24,13 @@ pytest.importorskip("mlx.core")
 
 
 @pytest.fixture(autouse=True)
-def _require_real_metal():
+def _require_real_mlx():
+    # Selection reads module trees, never a kernel, so the CPU backend answers
+    # it as well as Metal does. The torch shim cannot: its module classes are
+    # not the ones the selection isinstance-checks against.
     import mlx.core as _mx   # re-import: the shim may have swapped it
-    if not (getattr(_mx, "metal", None) and _mx.metal.is_available()
-            and _mx.default_device() == _mx.gpu):
-        pytest.skip("real Metal required; shim active or no GPU")
+    if "mlx_simulation" in str(getattr(_mx, "__file__", "")):
+        pytest.skip("requires the real MLX runtime; shim active")
 
 
 HIDDEN, VOCAB, VISION = 64, 128, 32
