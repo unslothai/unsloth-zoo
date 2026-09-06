@@ -3154,6 +3154,37 @@ class _OwnedStream:
         self._require_owner("closed")
         self._events.close()
 
+    def __del__(self):
+        # Dropping the last reference finalizes the generator in whatever thread ran
+        # the collection, which does not come through close(). Off-owner that runs
+        # generation_mode's cleanup as a non-owner: the release raises before dropping
+        # the RLock, leaving the depth inconsistent on top of a lock only the owner
+        # could ever have released. Refcounting usually collects on the thread that
+        # dropped the reference, so closing here repairs the ordinary abandonment.
+        events = self.__dict__.pop("_events", None)
+        if events is None:
+            return
+        if (threading.get_ident(), _current_async_task()) == self._owner:
+            events.close()
+            return
+        # Off-owner there is nothing that can release the lock: an RLock is only
+        # releasable by the thread holding it. Let the generator finalize, swallow the
+        # non-owner release so it does not surface as an unraisable exception from
+        # whatever code happened to trigger the collection, and say plainly what
+        # leaked, since the alternative is a process that blocks with no explanation.
+        try:
+            events.close()
+        except RuntimeError:
+            pass
+        warnings.warn(
+            "A stream_batch iterator was dropped by a thread or task other than "
+            "the one that opened it, so the generation lock it holds cannot be "
+            "released and later generation will block. Close it on the thread that "
+            "opened it.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
 
 def stream_batch(
     model,
