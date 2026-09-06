@@ -236,12 +236,30 @@ def _mlx_lora_type_specs():
     return tuple(specs)
 
 
+def _mlx_bitlinear_types():
+    return tuple(
+        cls for name in ("mlx_lm.models.bitlinear_layers",
+                         "mlx_vlm.models.bitnet.bitlinear")
+        if isinstance(cls := getattr(sys.modules.get(name), "BitLinear", None), type)
+    )
+
+
+def _check_mlx_lora_base(module):
+    if isinstance(module, _mlx_bitlinear_types()):
+        raise ValueError(
+            "Unsloth: BitLinear cannot be adapted with MLX LoRA: its packed-weight "
+            "CustomKernel has no input gradient (VJP). A residual adapter would "
+            "still block backpropagation through the base product. Use "
+            "differentiable linear layers, or target only a downstream lm_head."
+        )
+
+
 def _mlx_lora_base_types():
     return tuple(
         base_type
         for spec in _mlx_lora_type_specs()
         for base_type in spec.base_types
-    )
+    ) + _mlx_bitlinear_types()
 
 
 def _mlx_quantized_switch_module_types():
@@ -356,7 +374,7 @@ def _mlx_language_layers(model):
     return model.model.layers
 
 
-def linear_to_lora_layers(model, num_layers, config):
+def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
     """Attach namespace-compatible LoRA wrappers to selected language layers."""
     from mlx.utils import tree_unflatten
 
@@ -388,13 +406,22 @@ def linear_to_lora_layers(model, num_layers, config):
         for name, module in model.named_modules():
             if name in shared:
                 _mlx_dora_wrapper_type(module, name)
-    attached = 0
+    selected = []
     for index, layer in enumerate(layers[offset:], start=offset):
         wanted = _layer_wanted(index)
+        selected.append((layer, [(name, module) for name, module in layer.named_modules()
+                                 if name in wanted]))
+    root_modules = [(name, module) for name, module in model.named_modules()
+                    if name in shared]
+    for _, modules in [*selected, (model, root_modules)]:
+        for _, module in modules:
+            _check_mlx_lora_base(module)
+    if dry_run:
+        return sum(len(modules) for _, modules in selected) + len(root_modules)
+    attached = 0
+    for layer, modules in selected:
         replacements = []
-        for name, module in layer.named_modules():
-            if name not in wanted:
-                continue
+        for name, module in modules:
             replacements.append((
                 name,
                 _mlx_lora_from_base(
@@ -413,8 +440,7 @@ def linear_to_lora_layers(model, num_layers, config):
     # `shared`, not `keys`: a layer-local `ff_proj` can name a root module too.
     root_replacements = [
         (name, _mlx_lora_from_base(module, config, specs=type_specs, path=name))
-        for name, module in model.named_modules()
-        if name in shared
+        for name, module in root_modules
     ]
     if root_replacements:
         model.update_modules(tree_unflatten(root_replacements))
@@ -7348,6 +7374,7 @@ def _lora_walk_module(
                 continue
         elif not match_all_linear and not _lora_name_matches_target(name, target_modules):
             continue
+        _check_mlx_lora_base(child)
         spec = _mlx_lora_spec_for_module(child, specs)
         if spec is None:
             continue
@@ -9088,16 +9115,6 @@ class FastMLXModel:
                 finetune_mlp_modules=finetune_mlp_modules, dry_run=True,
             )
 
-            # Scopes embedding_learning_rate to exactly these tensors.
-            model._unsloth_cpt_full_module_weight_keys = (
-                _full_module_weight_keys(model, _cpt_full_specs)
-                if _cpt_full_specs else set()
-            )
-
-            _fix_missing_no_grad(model)
-            _fix_gemma4_kv_sharing(model)
-            model.freeze()
-
             # Keys are rooted at `model`; the LoRA call below targets
             # `model.language_model`, so drop that prefix.
             _vlm_lm_head_keys = {
@@ -9105,6 +9122,7 @@ class FastMLXModel:
                 for p in _cpt_lm_head_keys
             }
             language_lora_count = 0
+            language_lora_keys = set()
             if (finetune_language_layers and (
                 target_modules is None or (isinstance(target_modules, list) and len(target_modules) > 0)
             )) or _vlm_lm_head_keys:
@@ -9124,21 +9142,37 @@ class FastMLXModel:
                     if targets_defaulted and finetune_language_layers else None
                 )
                 language_lora_keys = set(language_lora_keys or set()) | _vlm_lm_head_keys
-                if len(language_lora_keys) > 0:
-                    # Compat patch (older mlx-lm rejects scale=/dropout= on
-                    # from_base); before the seed since monkey-patching doesn't
-                    # advance mx.random.
-                    _patch_mlx_lora_from_base_compat()
-                    # Seed mx.random immediately before LoRA init (like
-                    # mlx_lm/tuner/lora.py train); otherwise lazy state
-                    # advances leak into lora_a sampling.
-                    _seed_mlx_random_state(random_state)
-                    language_lora_count = linear_to_lora_layers(
-                        lm,
-                        num_layers=num_layers,
-                        config={**lora_config, "keys": language_lora_keys,
-                                "layer_keys": language_layer_keys},
-                    )
+                linear_to_lora_layers(
+                    lm, num_layers,
+                    {**lora_config, "keys": language_lora_keys,
+                     "layer_keys": language_layer_keys}, dry_run=True,
+                )
+
+            # Scopes embedding_learning_rate to exactly these tensors.
+            model._unsloth_cpt_full_module_weight_keys = (
+                _full_module_weight_keys(model, _cpt_full_specs)
+                if _cpt_full_specs else set()
+            )
+
+            _fix_missing_no_grad(model)
+            _fix_gemma4_kv_sharing(model)
+            model.freeze()
+
+            if len(language_lora_keys) > 0:
+                # Compat patch (older mlx-lm rejects scale=/dropout= on
+                # from_base); before the seed since monkey-patching doesn't
+                # advance mx.random.
+                _patch_mlx_lora_from_base_compat()
+                # Seed mx.random immediately before LoRA init (like
+                # mlx_lm/tuner/lora.py train); otherwise lazy state
+                # advances leak into lora_a sampling.
+                _seed_mlx_random_state(random_state)
+                language_lora_count = linear_to_lora_layers(
+                    lm,
+                    num_layers=num_layers,
+                    config={**lora_config, "keys": language_lora_keys,
+                            "layer_keys": language_layer_keys},
+                )
 
             # LoRA beats unfreezing raw weights since many projectors are
             # QuantizedLinear and MLX can't backprop into quantized weights.

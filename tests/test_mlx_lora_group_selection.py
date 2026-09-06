@@ -349,6 +349,62 @@ def test_a_fused_expert_stack_reports_output_width_not_expert_count():
     assert _semantic_dims(nn.Linear(HIDDEN, 7)) == (7, HIDDEN)
 
 
+@pytest.mark.parametrize("module_name", ["mlx_lm.models.bitlinear_layers",
+                                         "mlx_vlm.models.bitnet.bitlinear"])
+@pytest.mark.parametrize("targets", [None, "q_proj", ["q_proj"], {"q_proj"},
+                                     frozenset({"q_proj"}), "all-linear", ["all-linear"]])
+def test_bitlinear_refuses_before_mutating_other_targets(module_name, targets):
+    import importlib
+    BitLinear = importlib.import_module(module_name).BitLinear
+    model = _text_model([_TEXT_BLOCK, {"self_attn": {
+        "q_proj": BitLinear(HIDDEN, HIDDEN, bias=False)}}])
+    with pytest.raises(ValueError, match="BitLinear.*CustomKernel.*VJP"):
+        _peft(model, target_modules=targets)
+    assert not _adapters(model)
+
+
+def test_vlm_bitlinear_refusal_preserves_trainability():
+    from mlx_lm.models.bitlinear_layers import BitLinear
+    from mlx.utils import tree_flatten
+    model = _vlm(decoder=[_TEXT_BLOCK, {"self_attn": {
+        "q_proj": BitLinear(HIDDEN, HIDDEN, bias=False)}}])
+    before = [name for name, _ in tree_flatten(model.trainable_parameters())]
+    with pytest.raises(ValueError, match="BitLinear.*CustomKernel.*VJP"):
+        _peft(model)
+    assert [name for name, _ in tree_flatten(model.trainable_parameters())] == before
+    assert not _adapters(model)
+
+
+@pytest.mark.parametrize("targets,attention", [(["lm_head"], True),
+                                               (["q_proj", "lm_head"], False)])
+def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.bitnet import Model, ModelArgs
+    model = Model(ModelArgs(
+        model_type="bitnet", hidden_size=HIDDEN, intermediate_size=HIDDEN * 2,
+        num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+        rms_norm_eps=1e-5, vocab_size=VOCAB, tie_word_embeddings=False,
+    ))
+    _peft(model, target_modules=targets, finetune_attention_modules=attention)
+    _, grads = nn.value_and_grad(model, lambda m: m(mx.array([[1, 2]])).sum())(model)
+    assert _adapters(model) == ["lm_head"]
+    assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
+
+
+def test_unselected_bitlinear_groups_are_left_alone():
+    from mlx_lm.models.bitlinear_layers import BitLinear
+    tower = _build({"q_proj": BitLinear(VISION, VISION, bias=False)})
+    vlm = _vlm(tower=tower)
+    _peft(vlm)
+    assert not _adapters(vlm, "vision_tower")
+    model = _text_model([{"self_attn": {"q_proj": BitLinear(HIDDEN, HIDDEN)}},
+                         _TEXT_BLOCK])
+    _peft(model, finetune_last_n_layers=1)
+    assert not _adapters(model, "model.layers.0")
+    assert _adapters(model, "model.layers.1")
+
+
 def test_a_tower_of_roleless_linears_says_so_rather_than_claiming_none_exist():
     model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, HIDDEN)}))
     with pytest.raises(ValueError) as excinfo:
