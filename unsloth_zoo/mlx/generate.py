@@ -3090,6 +3090,35 @@ class BatchStream:
         self._session = None
         self._stack.close()
 
+    def __del__(self):
+        # An open stream dropped without close() unwinds here instead. ExitStack has
+        # no finalizer, but the generation_mode generator it holds does, so the
+        # cleanup runs in whatever thread collected this. On the owner, which is where
+        # refcounting collects, closing repairs it; off-owner nothing can release an
+        # RLock the owner holds, so swallow the non-owner release rather than let it
+        # surface from unrelated code, and name the leak.
+        if self.__dict__.get("_closed", True):
+            return
+        self._closed = True
+        self._session = None
+        stack = self.__dict__.get("_stack")
+        if stack is None:
+            return
+        if (threading.get_ident(), _current_async_task()) == self._owner:
+            stack.close()
+            return
+        try:
+            stack.close()
+        except RuntimeError:
+            pass
+        warnings.warn(
+            "A BatchStream was dropped by a thread or task other than the one that "
+            "opened it, so the generation lock it holds cannot be released and later "
+            "generation will block. Close it on the thread that opened it.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     def _require_open(self):
         if self._session is None:
             raise RuntimeError("This BatchStream is closed.")
