@@ -53,7 +53,6 @@ def test_expected_media_tokens_are_covered():
 
 
 def test_lists_are_consistent():
-    # No duplicates, combined list is image + audio, MLX and CUDA share one source.
     assert VLM_PLACEHOLDER_TOKENS == IMAGE_TOKENS + AUDIO_TOKENS
     assert len(IMAGE_TOKENS) == len(set(IMAGE_TOKENS)), "duplicate image tokens"
     assert len(AUDIO_TOKENS) == len(set(AUDIO_TOKENS)), "duplicate audio tokens"
@@ -65,7 +64,6 @@ def test_mlx_mirror_matches():
     src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        "unsloth_zoo", "mlx", "utils.py")
     tree = ast.parse(open(src).read())
-    # _IMAGE_TOKEN_STRINGS must be derived from VLM_PLACEHOLDER_TOKENS, not a literal list
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "_IMAGE_TOKEN_STRINGS" for t in node.targets):
             assert not isinstance(node.value, (ast.Tuple, ast.List)), \

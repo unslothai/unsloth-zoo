@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Unsloth Zoo - Utilities for Unsloth
 # mlx_lm stub — load, utils, tuner.lora, tuner.utils, sample_utils, stream_generate
 """
 mlx_lm — sample/load/tuner facade.
@@ -35,9 +34,6 @@ import types
 import torch
 
 
-# ---------------------------------------------------------------------------
-# mlx_lm.load — top-level entry
-# ---------------------------------------------------------------------------
 def load(repo_path, *args, **kwargs):
     """Load a model + tokenizer pair.
 
@@ -47,17 +43,12 @@ def load(repo_path, *args, **kwargs):
     return real_load(repo_path, *args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# mlx_lm.stream_generate — generation streaming
-# ---------------------------------------------------------------------------
 def stream_generate(model, tokenizer, prompt, *args, **kwargs):
     from .mlx_helpers.stream_generate import stream_generate as real_sg
     yield from real_sg(model, tokenizer, prompt, *args, **kwargs)
 
 
-# ---------------------------------------------------------------------------
 # Submodules — populate after inject_into_sys_modules
-# ---------------------------------------------------------------------------
 def _pkg(name):
     m = types.ModuleType(name)
     m.__path__ = []
@@ -132,7 +123,6 @@ def _placeholder_lora_linear(*args, **kwargs):
     return LoRALinear(*args, **kwargs)
 
 
-# Expose the LoRALinear class itself for `isinstance` checks.
 class LoRALinear:
     """Placeholder until mlx_helpers.lora_linear is wired in Phase 5.
 
@@ -232,7 +222,6 @@ def _iterate_batches(dataset, batch_size, max_seq_length, train=True, *args, **k
 tuner_trainer_module.iterate_batches = _iterate_batches
 
 
-# --- mlx_lm.sample_utils -----------------------------------------------
 sample_utils_module = _pkg("mlx_lm.sample_utils")
 
 
@@ -252,7 +241,6 @@ def _make_sampler(temp=1.0, top_p=1.0, top_k=0, min_p=0.0, min_tokens_to_keep=1,
             sorted_probs = torch.softmax(sorted_logits, dim=-1)
             cum = torch.cumsum(sorted_probs, dim=-1)
             remove = cum > top_p
-            # always keep top min_tokens_to_keep
             remove[..., :min_tokens_to_keep] = False
             sorted_logits[remove] = float("-inf")
             scaled = torch.gather(sorted_logits, -1, torch.argsort(sorted_idx, dim=-1))
@@ -270,7 +258,6 @@ sample_utils_module.make_sampler = _make_sampler
 sample_utils_module.make_logits_processors = _make_logits_processors
 
 
-# --- mlx_lm.models.gated_delta -----------------------------------------
 models_module = _pkg("mlx_lm.models")
 gated_delta_module = _pkg("mlx_lm.models.gated_delta")
 
@@ -286,7 +273,6 @@ gated_delta_module.gated_delta_update = _gated_delta_placeholder
 models_module.gated_delta = gated_delta_module
 
 
-# ---------------------------------------------------------------------------
 __path__ = []
 
 

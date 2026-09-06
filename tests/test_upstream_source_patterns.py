@@ -52,10 +52,6 @@ def _skip_if_transformers_5x(reason: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Helpers.
-# ---------------------------------------------------------------------------
-
 def _drift(zoo_site: str, pattern: str, upstream_path: str,
            extra: str = "") -> None:
     msg = (
@@ -109,10 +105,6 @@ def _get_source_of(dotted: str):
             )
     return inspect.getsource(obj)
 
-
-# ===========================================================================
-# unsloth_zoo/compiler.py rewriters
-# ===========================================================================
 
 def test_compiler_gqa_enable_gqa_dropout_pinned_string_self_dropout():
     """``unsloth_zoo/compiler.py:304-307`` pins
@@ -1165,10 +1157,6 @@ def test_compiler_trainer_inner_training_loop_rename_pinned_string():
     )
 
 
-# ===========================================================================
-# unsloth_zoo/temporary_patches/misc.py rewriters
-# ===========================================================================
-
 def test_misc_merge_quantization_configs_class_name_compare():
     """``unsloth_zoo/temporary_patches/misc.py:133-136`` pins the single-line
     ``if quantization_config.__class__.__name__ !=
@@ -1233,10 +1221,6 @@ def test_misc_mllama_vision_encoder_gradient_checkpointing_probe():
     )
 
 
-# ===========================================================================
-# unsloth_zoo/temporary_patches/gpt_oss.py
-# ===========================================================================
-
 def test_gpt_oss_config_class_source_equality_probe():
     """``unsloth_zoo/temporary_patches/gpt_oss.py:2808-2810`` runs a
     source-equality probe between ``GptOssConfig`` and the bundled
@@ -1265,10 +1249,6 @@ def test_gpt_oss_config_class_source_equality_probe():
             "introduced to fix is ACTIVE on this install.",
         )
 
-
-# ===========================================================================
-# unsloth/import_fixes.py (mirrored for zoo benefit)
-# ===========================================================================
 
 def test_unsloth_import_fixes_enable_input_require_grads_modules_loop():
     """``unsloth/import_fixes.py:609-670``'s
@@ -1337,10 +1317,6 @@ def test_unsloth_import_fixes_make_inputs_require_grads_inner_fn():
                 "may install an API-incompatible hook.",
             )
 
-
-# ===========================================================================
-# Additional source-rewriter pins.
-# ===========================================================================
 
 def test_compiler_no_update_causal_mask_attribute_probe():
     """``unsloth_zoo/compiler.py:3524, 3762`` ``hasattr(source,

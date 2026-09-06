@@ -89,7 +89,6 @@ def test_runtime_cce_int64_wrap_to_ignore_index_poisons_gradients():
     [2**32, -(2**32), 2**32 + 5, 2**32 - 100],
 )
 def test_runtime_cce_int64_invalid_labels_do_not_wrap_to_valid(bad_target):
-    # int64 labels outside int32 range must NaN, not wrap to valid ids.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 

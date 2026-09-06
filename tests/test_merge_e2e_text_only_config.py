@@ -189,8 +189,6 @@ def test_base_config_read_failure_falls_back_with_a_warning(tmp_path, monkeypatc
         "the fallback must not lose the export it is protecting"
 
 
-# vocab-size helpers, config-level only
-
 _MISSING = object()
 
 

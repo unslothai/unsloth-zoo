@@ -1932,14 +1932,14 @@ def _fix_gemma4_kv_sharing(model):
     first_shared = getattr(backbone, "first_kv_shared_layer_idx", None)
     num_layers = getattr(backbone, "num_hidden_layers", None)
     if first_shared is None or num_layers is None or first_shared >= num_layers:
-        return  # No shared layers
+        return
 
     if _gemma4_has_native_shared_kv(backbone):
         return  # Native mlx-vlm shared_kv support
 
     cls = backbone.__class__
     if getattr(cls, "_kv_sharing_patched", False):
-        return  # Already patched
+        return
 
     original_call = cls.__call__
 
@@ -1987,7 +1987,6 @@ def _fix_qwen35_attention_cache(model):
     original_attn_call = attn_cls.__call__
 
     def patched_attn_call(self, x, mask=None, cache=None, position_ids=None, **kwargs):
-        # Compute position_ids when training (cache=None, position_ids=None).
         if cache is None and position_ids is None:
             import mlx.core as mx
             L = x.shape[1]
@@ -3321,9 +3320,7 @@ def _patch_mixed_precision_set_dtype(model):
     model._unsloth_mixed_precision_set_dtype_patched = True
 
 
-# ---------------------------------------------------------------------------
 # VLM prompt/template compatibility patches
-# ---------------------------------------------------------------------------
 _vlm_prompt_utils_patched = False
 _original_vlm_apply_chat_template = None
 
@@ -6441,9 +6438,8 @@ def _lora_walk_module(
                     if name == "":
                         setattr(model, attr_name, lora_layer)
                         continue
-                    # Navigate to parent and replace. The final segment can
-                    # be a numeric string (list index) for some VLM trees
-                    # like Qwen2.5-VL's vision merger.
+                    # The final segment can be a numeric string (list index)
+                    # for some VLM trees like Qwen2.5-VL's vision merger.
                     parts = name.split(".")
                     parent = root
                     for p in parts[:-1]:
@@ -7560,7 +7556,6 @@ class FastMLXModel:
 
         model_type = config_data.get("model_type", "")
 
-        # Route based on text_only.
         is_vlm = False
         force_vlm_text_path = bool(
             text_only is True and _prefer_vlm_loader_for_text(config_data, model_type)
@@ -8099,7 +8094,6 @@ class FastMLXModel:
         is_vlm = getattr(model, "_is_vlm_model", False)
 
         if is_vlm:
-            # Freeze everything, then apply LoRA selectively.
             _fix_missing_no_grad(model)
             _fix_gemma4_kv_sharing(model)
             model.freeze()
@@ -8110,7 +8104,6 @@ class FastMLXModel:
                 p[len("language_model."):] if p.startswith("language_model.") else p
                 for p in _cpt_lm_head_keys
             }
-            # LoRA the language model (filtered by target_modules).
             language_lora_count = 0
             if (finetune_language_layers and (
                 target_modules is None or (isinstance(target_modules, list) and len(target_modules) > 0)
@@ -8139,7 +8132,6 @@ class FastMLXModel:
                         config={**lora_config, "keys": language_lora_keys},
                     )
 
-            # Optionally LoRA the vision tower.
             vision_lora_count = 0
             if train_vision:
                 vision_lora_count = _lora_walk_module(
@@ -8149,9 +8141,8 @@ class FastMLXModel:
                     attr_names=("vision_tower", "vision_model", "vision_encoder"),
                 )
 
-            # Optionally LoRA the projector/connector. LoRA beats unfreezing
-            # raw weights since many projectors are QuantizedLinear and MLX
-            # can't backprop into quantized weights.
+            # LoRA beats unfreezing raw weights since many projectors are
+            # QuantizedLinear and MLX can't backprop into quantized weights.
             projector_lora_count = 0
             if train_projector:
                 projector_lora_count = _lora_walk_module(
@@ -8191,9 +8182,7 @@ class FastMLXModel:
                     )
                 _raise_no_lora_targets(target_modules)
 
-            # Unfreeze all LoRA params across the tree.
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
-            # CPT full modules (embed_tokens / lm_head weight).
             _unfreeze_full_modules(_cpt_full_specs)
         else:
             # Text-only path. _fix_missing_no_grad handles modules using

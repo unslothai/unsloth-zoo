@@ -102,7 +102,6 @@ def test_neftune_saved_map_reloads_against_base():
     finally:
         emb.__class__ = original
 
-    # Reload validates the saved map against the now-unmodified base model.
     adapter_cfg = {"base_resolved_quantization_map": saved_map}
     _validate_mlx_adapter_base(model, adapter_cfg)  # must not raise
 
@@ -199,7 +198,6 @@ def test_lora_wrapped_embedding_map_key_and_reload():
                 f"{sorted(set(wrapped_map) ^ set(base_map))}"
             )
 
-        # Reload validates the saved-while-wrapped map against a fresh base.
         fresh, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
         _validate_mlx_adapter_base(
             fresh, {"base_resolved_quantization_map": wrapped_map}
@@ -456,7 +454,6 @@ def test_embed_scale_probe_reads_the_installed_transformers():
 
     # gemma3 has scaled inside the embedding in every transformers that has it.
     assert probe("gemma3_text") is True
-    # A plain-embedding architecture, and one transformers does not know at all.
     assert probe("qwen3") is False
     assert probe("not_a_real_architecture") is None
     # It must answer without importing: a modeling module needs torch, which is
@@ -477,7 +474,6 @@ def test_embed_scale_probe_reads_the_installed_transformers():
     with mock.patch.object(loader, "get_source", lambda self, name: None):
         assert probe("gemma3_text") is True, "source-less package must still answer"
     probe.cache_clear()
-    # Only when neither is available is the question genuinely unanswerable.
     def _raise(self, name):
         raise OSError("no code")
     with mock.patch.object(loader, "get_source", lambda self, name: None), \
@@ -639,7 +635,6 @@ def test_embed_scale_reads_both_spellings_of_a_family(
     from types import SimpleNamespace
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    # Force the fallback: this is the path that reads the family sets.
     monkeypatch.setattr(mlx_utils, "_transformers_scales_inside_embedding",
                         lambda _mt: None)
     found = []
@@ -670,8 +665,6 @@ def test_probe_survives_the_backends_own_random_state():
     # mx.compile captured, which stops a compiled step redrawing.
     assert isinstance(mx.random.state, list) is _RNG_STATE_WRITABLE
 
-    # The rewind must work on whatever this mlx exposes, not just the pre-0.32
-    # list form.
     import mlx.nn as nn
     from unsloth_zoo.mlx.utils import _mlx_rng_key, _restore_mlx_rng_key
 

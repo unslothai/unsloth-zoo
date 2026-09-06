@@ -53,9 +53,8 @@ def _load(name: str, filename: str):
     return module
 
 
-# Package placeholder so intra-package imports in hf_xet_fallback resolve to the
-# files loaded below. Restored afterwards: a leftover would shadow the real
-# unsloth_zoo; the loaded modules keep their own references and work regardless.
+# Package placeholder so intra-package imports in hf_xet_fallback resolve to the files
+# loaded below. Restored afterwards: a leftover would shadow the real unsloth_zoo.
 _saved_modules = {
     name: sys.modules.get(name)
     for name in ("unsloth_zoo", "unsloth_zoo.hf_cache_state", "unsloth_zoo.hf_xet_fallback")
@@ -168,8 +167,7 @@ def test_transient_unmeasurable_tick_is_progress(hf_cache, monkeypatch):
     seq = {"n": 0}
     frozen = (2048, True)  # constant size + active .incomplete
     # A real partial as well as the mocked repo-wide figure: the watchdog phases its clocks on bytes
-    # in ACTIVE partials, so a mocked total alone would leave it in the 90s connect phase and the
-    # 0.3s data deadline asserted below would never apply.
+    # in ACTIVE partials, so a mocked total alone would sit in the 90s connect phase, never the 0.3s one.
     (_blobs_dir(hf_cache) / "frozen.incomplete").write_bytes(b"\0" * 2048)
 
     def fake_state(*args, **kwargs):
@@ -224,7 +222,6 @@ def test_file_watchdog_scopes_to_child_partial(hf_cache):
     grower = threading.Thread(target = _grow, daemon = True)
     grower.start()
 
-    # This download's child writes its own constant (stalled) partial, not in baseline.
     (blobs / "child.incomplete").write_bytes(b"\0" * 2048)
 
     calls: list[str] = []
@@ -391,7 +388,6 @@ def test_file_watchdog_pid_scope_ignores_unowned_sibling(hf_cache):
 def test_file_watchdog_empty_open_set_ignores_sibling(hf_cache, monkeypatch):
     """An EMPTY child open-set means the child owns no partial yet (connect/metadata phase), so a stalled sibling must not fire."""
     blobs = _blobs_dir(hf_cache)
-    # Sibling partial created after baseline (not name-excluded), constant (stalled).
     (blobs / "sibling.incomplete").write_bytes(b"\0" * 4096)
     monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda pid: set())  # child owns none
 
@@ -463,12 +459,10 @@ def test_custom_cache_dir_is_watched_and_cleaned(tmp_path, monkeypatch):
     partial = blobs / "stalled.incomplete"
     partial.write_bytes(b"partial-bytes")
 
-    # Default cache sees nothing; the custom cache sees the active partial.
     assert xf.get_hf_download_state([REPO]) == (0, False)
     total, has_incomplete = xf.get_hf_download_state([REPO], cache_dir = str(custom_cache))
     assert has_incomplete is True and total > 0
 
-    # The watchdog fires for the custom cache, not the (empty) default one.
     calls: list[str] = []
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append, cache_dir = str(custom_cache),
@@ -681,9 +675,8 @@ def test_status_callback_failure_does_not_kill_watchdog(hf_cache):
         stop.set()
 
 
-# Transport policy: cached short-circuit, cancel, error propagation, the single
-# Xet->HTTP fallback, injected prepare seam, and UNSLOTH_DISABLE_XET. The download
-# seam (_run_download_attempt) is faked, so no real spawn.
+# Transport policy: cached short-circuit, cancel, error propagation, the single Xet->HTTP
+# fallback, injected prepare seam, UNSLOTH_DISABLE_XET. _run_download_attempt is faked, so no spawn.
 DL_REPO, FILE = "ztest/xet-dl", "model-Q4_K_XL.gguf"
 
 
@@ -698,7 +691,6 @@ def _no_real_cache_hit(monkeypatch):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", _snap_miss)
     # Neutralize the generic cache purge; tests that care record it.
     monkeypatch.setattr(xf, "_default_prepare_for_http", lambda *a, **k: None)
-    # No env knob unless a test sets it.
     monkeypatch.delenv("UNSLOTH_DISABLE_XET", raising = False)
     monkeypatch.delenv("UNSLOTH_STABLE_DOWNLOADS", raising = False)
     monkeypatch.delenv("HF_HUB_DISABLE_XET", raising = False)
@@ -806,8 +798,7 @@ def test_snapshot_cancel_honored_even_when_cached(monkeypatch, tmp_path):
 
 def test_nonstall_error_propagates_without_fallback(monkeypatch):
     fake = _install(monkeypatch, [("error", "RepositoryNotFoundError: 404 not found")])
-    # Deterministic Hub error re-raised with its original type across the spawn boundary,
-    # reconstructed from the child's "<Name>: ..." prefix.
+    # Deterministic Hub error re-raised with its original type, rebuilt from the child's "<Name>: " prefix.
     expected_cls = xf._resolve_exception_class("RepositoryNotFoundError")
     assert expected_cls is not None and expected_cls is not RuntimeError
     with pytest.raises(expected_cls, match = "RepositoryNotFoundError"):
@@ -872,7 +863,6 @@ def test_is_retryable_download_error_classification():
     def f(exc, on_xet = True):
         return xf._is_retryable_download_error(exc, on_xet = on_xet)
 
-    # Transient transport failures -> retryable.
     assert f(Exception("hf_xet download failed: data processing error")) is True
     assert f(TimeoutError("connection reset by peer")) is True
     assert f(Exception("CasClientError: deadline exceeded")) is True
@@ -942,7 +932,6 @@ def test_local_entry_not_found_transient_is_retryable():
     class LocalEntryNotFoundError(Exception):
         pass
 
-    # Transient connection wrapper -> retryable.
     transient = LocalEntryNotFoundError(
         "An error happened while trying to locate the file on the Hub and we cannot find the "
         "requested files in the local cache. Please check your connection and try again."
@@ -950,7 +939,6 @@ def test_local_entry_not_found_transient_is_retryable():
     assert f(transient) is True
     timed_out = LocalEntryNotFoundError("Read timed out while fetching metadata")
     assert f(timed_out) is True
-    # Genuine offline miss (no transient hint) -> deterministic, type-preserved.
     offline = LocalEntryNotFoundError(
         "Cannot find the requested files in the disk cache and outgoing traffic has been disabled."
     )
@@ -1324,13 +1312,11 @@ def test_http_retry_backoff_honours_zero(monkeypatch):
     assert xf._http_retry_backoff() == 0.0
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "1.5")
     assert xf._http_retry_backoff() == 1.5
-    # Negative and unparseable are junk and fall back; unset falls back too.
     for bad in ("abc", "-1", "  "):
         monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", bad)
         assert xf._http_retry_backoff() == xf.DEFAULT_HTTP_RETRY_BACKOFF, bad
     monkeypatch.delenv("UNSLOTH_HTTP_RETRY_BACKOFF")
     assert xf._http_retry_backoff() == xf.DEFAULT_HTTP_RETRY_BACKOFF
-    # A zero backoff really does return at once, with no cancel event in play.
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
     started = time.monotonic()
     xf._wait_before_http_retry(None)
@@ -1441,9 +1427,8 @@ def test_file_path_accepts_cache_dir(monkeypatch):
     assert fake.calls[0].cache_dir == "/custom/cache"
 
 
-# Spawn env-timing: the parent sets HF_HUB_DISABLE_XET before the child starts, so
-# the child inherits it before re-importing huggingface_hub (constants cache it at
-# import). Uses a fake spawn context -- no real subprocess.
+# Spawn env-timing: the parent sets HF_HUB_DISABLE_XET before the child starts, so the child
+# inherits it before re-importing huggingface_hub (constants cache it at import). Fake spawn context.
 class _FakeProc:
     def __init__(self, recorder):
         self._rec = recorder
@@ -1504,10 +1489,8 @@ def test_http_retry_sets_disable_xet_before_spawn(monkeypatch):
         stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
     )
     assert (kind_result, payload) == ("ok", "/cache/x")
-    # Child inherited HTTP transport env at spawn time.
     assert rec["disable_xet"] == "1"
     assert rec["hf_transfer"] == "0"
-    # Parent env restored afterwards (was unset).
     assert "HF_HUB_DISABLE_XET" not in os.environ
 
 
@@ -1713,7 +1696,6 @@ def test_scrub_redacts_presigned_url():
     assert "X-Amz-Signature" not in out
     assert "deadbeefcafe" not in out and "AKIAEXAMPLE123" not in out
     assert "cas-bridge.xethub.hf.co/xet-bridge-us/abc/def?***" in out
-    # A non-signed URL keeps its (harmless) query string.
     plain = xf._default_scrub_secrets("see https://huggingface.co/org/repo?download=true now")
     assert "download=true" in plain
 
@@ -1728,7 +1710,6 @@ def test_scrub_redaction_preserves_surrounding_delimiters():
     assert "deadbeef" not in out                       # signed query redacted
     assert "cas-bridge.xethub.hf.co/x/y?***" in out
     assert out.endswith('"}')                           # closing delimiters preserved
-    # A signed URL wrapped in single quotes / parens keeps those delimiters too.
     wrapped = "(https://s3.amazonaws.com/b/k?X-Amz-Signature=abc123) tail"
     out2 = xf._default_scrub_secrets(wrapped)
     assert "abc123" not in out2 and "?***)" in out2 and out2.endswith(") tail")
@@ -1854,8 +1835,7 @@ def test_unclearable_partial_forces_clean_redownload(hf_cache, monkeypatch):
     fake = _install(monkeypatch, [("stall", None), ("stall", None), ("ok", "/cache/x")])
     out = xf.snapshot_download_with_xet_fallback(DL_REPO, token = None)
     assert out == "/cache/x"
-    # Neither Xet attempt is forced: Xet rewrites from zero anyway, and forcing would discard the
-    # finalized blobs the retry is meant to keep.
+    # Neither Xet attempt is forced: Xet rewrites from zero, and forcing discards finalized blobs.
     assert [c.force_download for c in fake.calls] == [False, False, True]
 
 
@@ -1975,13 +1955,11 @@ def test_snapshot_dir_is_complete_checkpoint_index_does_not_gate_root(tmp_path):
     blob = tmp_path / "blob"
     blob.write_bytes(b"x")
     (snap / "model.safetensors").symlink_to(blob)                    # complete root weight
-    # Incomplete checkpoint shard index (shard 2 missing) under checkpoint-7/.
     (snap / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob)
     (snap / "checkpoint-7" / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
                                    "b": "model-00002-of-00002.safetensors"}})
     )
-    # Root warm is complete: the checkpoint index is skipped, the root weight suffices.
     assert hcs.snapshot_dir_is_complete(snap) is True
 
 
@@ -2121,16 +2099,12 @@ def test_request_can_include_weights_index_json_only():
 
 def test_request_can_include_weights_path_qualified():
     """Path-qualified allow_patterns resolve inside their directory, so a subfolder/checkpoint/shard weight request is not misread as weightless."""
-    # Concrete subfolder globs: weights live under the directory.
     assert hcs.request_can_include_weights(["checkpoint-10/*"], None) is True
     assert hcs.request_can_include_weights(["checkpoint-10/*.safetensors"], None) is True
     assert hcs.request_can_include_weights(["models/*.bin"], None) is True
-    # A specific (non-first) shard named verbatim.
     assert hcs.request_can_include_weights(["model-00002-of-00005.safetensors"], None) is True
     assert hcs.request_can_include_weights(["checkpoint-10/pytorch_model.bin"], None) is True
-    # Globbed parent dir, weight-targeting basename.
     assert hcs.request_can_include_weights(["checkpoint-*/*.safetensors"], None) is True
-    # Subfolder requests targeting only non-weight files stay weightless.
     assert hcs.request_can_include_weights(["checkpoint-10/config.json"], None) is False
     assert hcs.request_can_include_weights(["checkpoint-10/*.json"], None) is False
     assert hcs.request_can_include_weights(["checkpoint-*/tokenizer.json"], None) is False
@@ -2146,7 +2120,6 @@ def test_request_can_include_weights_path_qualified_custom_globs():
     assert hcs.request_can_include_weights(["checkpoint-*/lora_*.bin"], None) is True
     assert hcs.request_can_include_weights(["models/custom_*.pt"], None) is True
     assert hcs.request_can_include_weights(["checkpoint-10/model-[0-9].safetensors"], None) is True
-    # A non-weight basename under a subfolder stays weightless.
     assert hcs.request_can_include_weights(["checkpoint-10/tokenizer.json"], None) is False
 
 
@@ -2172,7 +2145,6 @@ def test_request_can_include_weights_string_form():
     assert hcs.request_can_include_weights("*.safetensors", None) is True
     assert hcs.request_can_include_weights("config.json", None) is False
     assert hcs.request_can_include_weights(None, "*.safetensors") is True   # ignore as str
-    # A string ignore that drops every weight format leaves the request weightless.
     assert hcs.request_can_include_weights(
         "config.json", ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf",
                         "*.h5", "*.msgpack", "*.ckpt", "*.onnx", "*.pdparams"]
@@ -2359,7 +2331,6 @@ def test_requested_named_files_present_exact_request(tmp_path):
     assert hcs.requested_named_files_present(snap, allow_patterns = ["tokenizer.json"]) is True
     # A glob list is best-effort: a missing optional file does not fail it.
     assert hcs.requested_named_files_present(snap, allow_patterns = ["tokenizer*", "vocab.txt"]) is True
-    # No allow_patterns -> trivially satisfied.
     assert hcs.requested_named_files_present(snap) is True
     # An ignore-filtered name is not requested, so its absence does not fail.
     assert hcs.requested_named_files_present(
@@ -2455,7 +2426,6 @@ def test_oserror_subclass_errno_preserved(monkeypatch):
 
 def test_raise_child_error_errno_only_for_builtin_oserror():
     """errno is preserved only for a BUILTIN OSError type; a non-builtin OSError subclass (e.g. HfHubHTTPError) with a bracketed [Errno N] gets no spurious errno."""
-    # Builtin OSError subclass -> errno preserved.
     with pytest.raises(FileNotFoundError) as excinfo:
         xf._raise_child_error("FileNotFoundError: [Errno 2] No such file or directory")
     assert excinfo.value.errno == 2
@@ -2555,10 +2525,9 @@ def test_disable_xet_read_under_spawn_lock(monkeypatch):
     assert seen.get("held") is True
 
 
-# Conservative fast-path gate + pre/post-download acceptance split. The gate fast-paths
-# ONLY the unambiguous canonical model cache, deferring everything else to the watched
-# child. Pre-download (skip the child?) and post-download (accept the result?) are
-# deliberately asymmetric: strict pre, lenient post.
+# Conservative fast-path gate + pre/post-download acceptance split. The gate fast-paths ONLY the
+# unambiguous canonical model cache, deferring everything else to the watched child. Pre-download
+# (skip the child?) and post-download (accept the result?) are asymmetric: strict pre, lenient post.
 def _mk_snapshot(tmp_path, name):
     blob = tmp_path / "_blob"
     if not blob.exists():
@@ -2613,9 +2582,7 @@ def test_gate_defers_incomplete_preferred_index_masked_by_complete_bin(tmp_path)
                                    "b": "model-00002-of-00002.safetensors"}}))
     (snap / "pytorch_model.bin").symlink_to(blob)  # complete bin co-resident
     assert hcs.snapshot_dir_is_complete(snap) is False  # load prefers the incomplete safetensors
-    # safetensors ignored -> the load reads the complete bin -> eligible.
     assert hcs.snapshot_dir_is_complete(snap, ignore_patterns = ["*.safetensors"]) is True
-    # A complete safetensors index alongside the bin is eligible.
     (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
     assert hcs.snapshot_dir_is_complete(snap) is True
 
@@ -2699,7 +2666,6 @@ def test_request_can_include_weights_partial_ignore_strip_is_weight_bearing():
     r = hcs.request_can_include_weights
     assert r(None, ["model.safetensors", "pytorch_model.bin"]) is True  # variant / other-format survives
     assert r(None, ["*.safetensors", "*.bin"]) is True                  # .pt / .gguf / .pth / ... survive
-    # Only stripping EVERY weight format is weightless.
     all_formats = ["*.safetensors", "*.bin", "*.pt", "*.pth", "*.gguf", "*.ckpt",
                    "*.onnx", "*.msgpack", "*.h5", "*.pdparams"]
     assert r(None, all_formats) is False
@@ -2735,7 +2701,6 @@ def test_pre_download_defers_bin_only_when_safetensors_preferred(tmp_path):
     assert xf._cache_can_skip_download(
         snap, repo_type = "model", allow_patterns = None,
         ignore_patterns = ["*.safetensors", "*.safetensors.index.json"]) is True
-    # PRE: safetensors present -> fast-path.
     (snap / "model.safetensors").symlink_to(blob)
     assert xf._cache_can_skip_download(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -2745,7 +2710,6 @@ def test_pre_download_defers_bin_only_when_safetensors_preferred(tmp_path):
     (snap2 / "pytorch_model.bin").symlink_to(blob2)
     assert xf._download_result_usable(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
-    # POST: a sharded bin-only repo is likewise accepted.
     snap3, blob3 = _mk_snapshot(tmp_path, "binonly_sharded_post")
     (snap3 / "pytorch_model-00001-of-00002.bin").symlink_to(blob3)
     (snap3 / "pytorch_model-00002-of-00002.bin").symlink_to(blob3)
@@ -2796,7 +2760,6 @@ def test_post_accepts_nonstandard_sharded_safetensors_names(tmp_path):
     assert xf._download_result_usable(
         snap2, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
 
-    # Sanity: the standard sharded layout still passes.
     snap3, blob3 = _mk_snapshot(tmp_path, "qwen35_standard")
     (snap3 / "config.json").write_text("{}")
     std = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
@@ -2832,7 +2795,6 @@ def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_
     assert xf._cache_can_skip_download(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
 
-    # Complete: the 2_Dense weight is now present -> fast-path.
     (snap / "2_Dense" / "model.safetensors").symlink_to(blob)
     assert xf._cache_can_skip_download(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -2873,7 +2835,6 @@ def test_post_download_rejects_sentence_transformers_missing_known_subfolder_wei
             *mods,
         ])
 
-    # Known Dense module missing its weight -> reject.
     snap, blob = _mk_snapshot(tmp_path, "st_post_dense_missing")
     (snap / "model.safetensors").symlink_to(blob)
     (snap / "modules.json").write_text(_modules(
@@ -2882,7 +2843,6 @@ def test_post_download_rejects_sentence_transformers_missing_known_subfolder_wei
     (snap / "2_Dense" / "config.json").write_text("{}")  # config only, weight missing
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # Dense weight present -> accept.
     (snap / "2_Dense" / "model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -2912,7 +2872,6 @@ def test_post_download_rejects_ignored_only_format(tmp_path):
     (snap / "pytorch_model.bin").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is False
-    # The requested safetensors present -> accepted.
     (snap / "model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is True
@@ -2929,7 +2888,6 @@ def test_post_download_rejects_canonical_only_for_variant(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
-    # A complete sharded variant set (shards + index) is accepted.
     snap2, blob2 = _mk_snapshot(tmp_path, "varshard")
     (snap2 / "model.fp16-00001-of-00002.safetensors").symlink_to(blob2)
     (snap2 / "model.fp16-00002-of-00002.safetensors").symlink_to(blob2)
@@ -2948,7 +2906,6 @@ def test_post_accepts_nonstandard_sharded_variant_names(tmp_path):
     completeness is still enforced via the index: a missing shard is rejected."""
     shards = ["model.fp16.safetensors-00001-of-00002.safetensors",
               "model.fp16.safetensors-00002-of-00002.safetensors"]
-    # Complete cache with the non-standard variant shard names -> accepted.
     snap, blob = _mk_snapshot(tmp_path, "varnonstd")
     (snap / "config.json").write_text("{}")
     for s in shards:
@@ -2990,12 +2947,10 @@ def test_post_download_rejects_patterned_canonical_only_for_variant(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
         variant = "fp16") is False
-    # The in-scope variant weight present -> accepted.
     (sub / "model.fp16.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["weights/*"], ignore_patterns = None,
         variant = "fp16") is True
-    # A complete sharded in-scope variant weight (dash infix + variant index) is accepted.
     snap2, blob2 = _mk_snapshot(tmp_path, "subvarshard")
     sub2 = snap2 / "weights"
     sub2.mkdir()
@@ -3037,14 +2992,11 @@ def test_post_download_rejects_variant_only_diffusers_for_plain_load(tmp_path):
     for comp in ("unet", "vae"):
         (snap / comp).mkdir()
         (snap / comp / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
-    # plain load: variant-only components do not satisfy it -> retry.
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None, variant = None) is False
-    # the same cache is a complete fp16 warm -> the variant load accepts it.
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
-    # a complete plain pipeline (non-variant component weights) is accepted.
     snap2, blob2 = _mk_snapshot(tmp_path, "plaincomplete")
     (snap2 / "model_index.json").write_text(
         _mi(unet = ["diffusers", "UNet2DConditionModel"], vae = ["diffusers", "AutoencoderKL"]))
@@ -3068,7 +3020,6 @@ def test_post_download_rejects_incomplete_sharded_glob(tmp_path):
                                    "b": "model-00002-of-00002.safetensors"}}))
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None) is False
-    # The missing shard present -> complete -> accepted.
     (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None) is True
@@ -3119,7 +3070,6 @@ def test_post_download_rejects_incomplete_ignored_format_shards(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None,
         ignore_patterns = ["*.safetensors"]) is False
-    # Ignoring the .bin instead (load reads the complete safetensors) -> accepted.
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is True
 
@@ -3140,12 +3090,10 @@ def test_post_download_rejects_incomplete_variant_shards(tmp_path):
     assert xf._download_result_usable(
         snap_noidx, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is False
-    # The missing variant shard present -> complete set -> accepted.
     (snap / "model.fp16-00002-of-00002.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
-    # A single-file variant (no index) is accepted.
     snap2, blob2 = _mk_snapshot(tmp_path, "variant_single")
     (snap2 / "model.fp16.safetensors").symlink_to(blob2)
     assert xf._download_result_usable(
@@ -3160,7 +3108,6 @@ def test_post_download_accepts_exact_named_shard_subset(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model",
         allow_patterns = ["model-00001-of-00002.safetensors"], ignore_patterns = None) is True
-    # The exact-named shard absent -> rejected.
     snap2, _ = _mk_snapshot(tmp_path, "exact_shard_absent")
     (snap2 / "config.json").write_text("{}")
     assert xf._download_result_usable(
@@ -3177,7 +3124,6 @@ def test_post_download_accepts_from_tf_flax_weights(tmp_path):
         (snap / "config.json").write_text("{}")
         assert xf._download_result_usable(
             snap, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is True
-    # Both PyTorch formats ignored but no h5/msgpack present -> still rejected.
     snap, _ = _mk_snapshot(tmp_path, "tf_none")
     (snap / "config.json").write_text("{}")
     assert xf._download_result_usable(
@@ -3195,20 +3141,17 @@ def test_post_download_checks_sharded_tf_flax_completeness(tmp_path):
     for base, ext in (("tf_model", "h5"), ("flax_model", "msgpack")):
         idx = json.dumps({"weight_map": {"a": f"{base}-00001-of-00002.{ext}",
                                          "b": f"{base}-00002-of-00002.{ext}"}})
-        # Complete sharded set -> accepted.
         snap, blob = _mk_snapshot(tmp_path, f"tfshard_ok_{base}")
         (snap / f"{base}-00001-of-00002.{ext}").symlink_to(blob)
         (snap / f"{base}-00002-of-00002.{ext}").symlink_to(blob)
         (snap / f"{base}.{ext}.index.json").write_text(idx)
         assert xf._download_result_usable(
             snap, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is True
-        # A shard listed by the index is missing -> rejected.
         snap2, blob2 = _mk_snapshot(tmp_path, f"tfshard_missing_{base}")
         (snap2 / f"{base}-00001-of-00002.{ext}").symlink_to(blob2)
         (snap2 / f"{base}.{ext}.index.json").write_text(idx)
         assert xf._download_result_usable(
             snap2, repo_type = "model", allow_patterns = None, ignore_patterns = ig) is False
-        # A lone shard with no index -> rejected.
         snap3, blob3 = _mk_snapshot(tmp_path, f"tfshard_lone_{base}")
         (snap3 / f"{base}-00001-of-00002.{ext}").symlink_to(blob3)
         assert xf._download_result_usable(
@@ -3223,7 +3166,6 @@ def test_post_download_checks_explicit_checkpoint_shard_completeness(tmp_path):
     (snap / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["checkpoint-7/*"], ignore_patterns = None) is False
-    # Complete checkpoint shard set (index + all shards) -> accepted.
     snap2, blob2 = _mk_snapshot(tmp_path, "ckpt_complete")
     (snap2 / "checkpoint-7").mkdir()
     (snap2 / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob2)
@@ -3241,8 +3183,8 @@ def test_post_download_checks_explicit_checkpoint_shard_completeness(tmp_path):
     (snap3 / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob3)  # lone, but not read
     assert xf._download_result_usable(
         snap3, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is True
-    # A nested checkpoint the request explicitly targets (allow=['foo/checkpoint-7/*']) still rejects its lone shard
-    # (the scope check matches a checkpoint dir at any leading segment).
+    # A nested checkpoint the request targets (allow=['foo/checkpoint-7/*']) still rejects its lone
+    # shard: the scope check matches a checkpoint dir at any leading segment.
     snap4, blob4 = _mk_snapshot(tmp_path, "ckpt_nested")
     (snap4 / "foo" / "checkpoint-7").mkdir(parents = True)
     (snap4 / "foo" / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob4)
@@ -3259,7 +3201,6 @@ def test_post_download_accepts_exact_named_variant_shard_subset(tmp_path):
         snap, repo_type = "model",
         allow_patterns = ["model.fp16-00001-of-00002.safetensors"], ignore_patterns = None,
         variant = "fp16") is True
-    # The exact-named variant shard absent -> still rejected.
     snap2, _ = _mk_snapshot(tmp_path, "exact_var_absent")
     (snap2 / "config.json").write_text("{}")
     assert xf._download_result_usable(
@@ -3275,7 +3216,6 @@ def test_post_download_rejects_patterned_incomplete_variant_shards(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["*.safetensors"], ignore_patterns = None,
         variant = "fp16") is False
-    # Complete variant shard set -> accepted.
     (snap / "model.fp16-00002-of-00002.safetensors").symlink_to(blob)
     (snap / "model.safetensors.index.fp16.json").write_text(json.dumps(
         {"weight_map": {"a": "model.fp16-00001-of-00002.safetensors",
@@ -3293,7 +3233,6 @@ def test_post_download_applies_ignore_to_diffusers_components(tmp_path):
     (snap / "unet" / "diffusion_pytorch_model.bin").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is False
-    # The safetensors component present -> usable.
     (snap / "unet" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"]) is True
@@ -3308,7 +3247,6 @@ def test_post_download_rejects_index_only_sharded_masked_by_bin(tmp_path):
     (snap / "pytorch_model.bin").symlink_to(blob)  # complete bin, no ST shards at all
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # safetensors explicitly ignored -> load reads the complete bin -> usable.
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.safetensors"]) is True
 
@@ -3349,7 +3287,6 @@ def test_post_download_root_variant_weight_honors_ignore(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"],
         variant = "fp16") is False
-    # The safetensors variant present -> usable.
     (snap / "model.fp16.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.bin"],
@@ -3380,7 +3317,6 @@ def test_post_download_rejects_variant_index_only_masked_by_bin(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is False
-    # The variant safetensors ignored -> load reads the complete variant bin -> usable.
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = ["*.safetensors"],
         variant = "fp16") is True
@@ -3397,7 +3333,6 @@ def test_post_download_rejects_incomplete_sharded_adapter(tmp_path):
     allow = ["adapter_config.json", "adapter_model*"]
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = allow, ignore_patterns = None) is False
-    # The missing adapter shard present -> complete set -> accepted.
     (snap / "adapter_model-00002-of-00002.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = allow, ignore_patterns = None) is True
@@ -3425,7 +3360,6 @@ def test_post_download_rejects_gguf_only_default_load(tmp_path):
     (snap / "config.json").write_text("{}")
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # The safetensors weight present -> the default warm accepts, even beside the gguf.
     (snap / "model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -3598,7 +3532,6 @@ def test_post_download_single_safetensors_beats_stale_index(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
     assert hcs.snapshot_dir_is_complete(snap) is True  # the PRE gate agrees
-    # No single weight, only the stale index -> incomplete.
     snap2, _ = _mk_snapshot(tmp_path, "stale_index_only")
     (snap2 / "config.json").write_text("{}")
     (snap2 / "model.safetensors.index.json").write_text(json.dumps(
@@ -3664,7 +3597,6 @@ def test_post_download_variant_presence_requires_canonical_name(tmp_path):
     assert xf._download_result_usable(
         snap_dot, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is False
-    # The canonical single variant weight -> accepted.
     (snap / "model.fp16.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
@@ -3673,7 +3605,6 @@ def test_post_download_variant_presence_requires_canonical_name(tmp_path):
 
 def test_post_download_rejects_selected_shard_without_index(tmp_path):
     """A selected non-root numbered shard with no index is an incomplete set the load cannot enumerate, so it is rejected; a complete indexed set is accepted."""
-    # A sharded adapter with a lone shard and no index.
     snap, blob = _mk_snapshot(tmp_path, "adapter_lone_shard")
     (snap / "config.json").write_text("{}")
     (snap / "adapter_config.json").write_text("{}")
@@ -3681,7 +3612,6 @@ def test_post_download_rejects_selected_shard_without_index(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
         ignore_patterns = None) is False
-    # Complete it with the second shard + index -> accepted.
     (snap / "adapter_model-00002-of-00002.safetensors").symlink_to(blob)
     (snap / "adapter_model.safetensors.index.json").write_text(json.dumps(
         {"weight_map": {"a": "adapter_model-00001-of-00002.safetensors",
@@ -3707,7 +3637,6 @@ def test_post_download_diffusers_presence_scoped_to_declared(tmp_path):
     (snap / "controlnet" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # The declared components present -> accepted.
     for comp in ("unet", "vae"):
         (snap / comp).mkdir()
         (snap / comp / "diffusion_pytorch_model.safetensors").symlink_to(blob)
@@ -3725,7 +3654,6 @@ def test_post_download_diffusers_variant_presence_scoped_to_declared(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is False
-    # The declared component variant weights present -> accepted.
     for comp in ("unet", "vae"):
         (snap / comp).mkdir()
         (snap / comp / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
@@ -3883,7 +3811,6 @@ def test_post_download_rejects_diffusers_component_with_only_sidecar_weight(tmp_
     (unet / "adapter_model.safetensors").symlink_to(blob)  # sidecar, not the base weight
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # The canonical base weight present -> accepted.
     (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -3903,7 +3830,6 @@ def test_post_download_diffusers_component_weight_must_be_at_component_root(tmp_
     (unet / "old" / "diffusion_pytorch_model.safetensors").symlink_to(blob)  # nested, not read
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # The top-level component weight present -> accepted.
     (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -3936,7 +3862,6 @@ def test_post_download_subfolder_single_weight_beats_stale_index(tmp_path):
     """In a selected subfolder, a single canonical weight is read before a same-format shard index
     (transformers precedence), so a stale co-resident index must not false-reject the warm; a shard index
     with no single is still required complete."""
-    # encoder/model.safetensors present beside a stale encoder/model.safetensors.index.json -> accepted.
     snap, blob = _mk_snapshot(tmp_path, "subdir_single_beats_index")
     enc = snap / "encoder"
     enc.mkdir()
@@ -3946,7 +3871,6 @@ def test_post_download_subfolder_single_weight_beats_stale_index(tmp_path):
                         "b": "model-00002-of-00002.safetensors"}}))  # shards absent (stale)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["encoder/*"], ignore_patterns = None) is True
-    # No single, index missing shards -> still incomplete.
     snap2, blob2 = _mk_snapshot(tmp_path, "subdir_index_only")
     enc2 = snap2 / "encoder"
     enc2.mkdir()
@@ -3969,7 +3893,6 @@ def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is True
-    # A single .bin variant beside a stale .bin variant index (no ST) -> usable.
     snapb, blobb = _mk_snapshot(tmp_path, "single_bin_variant_beats_index")
     (snapb / "config.json").write_text("{}")
     (snapb / "pytorch_model.fp16.bin").symlink_to(blobb)
@@ -4004,7 +3927,6 @@ def test_post_download_variant_component_sidecar_is_not_warm(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
         variant = "fp16") is False
-    # The canonical component variant weight present -> accepted.
     (unet / "diffusion_pytorch_model.fp16.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None,
@@ -4015,7 +3937,6 @@ def test_post_download_diffusers_component_single_beats_stale_index(tmp_path):
     """A diffusers pipeline component reads a single canonical weight before a same-format shard index in
     its own subfolder, so a stale co-resident index must not false-reject a complete component; a component
     holding only a stale index (no single) is still incomplete."""
-    # unet single diffusion_pytorch_model.safetensors beside a stale same-dir index -> accepted.
     snap, blob = _mk_snapshot(tmp_path, "diff_comp_single_beats_index")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -4028,7 +3949,6 @@ def test_post_download_diffusers_component_single_beats_stale_index(tmp_path):
                         "b": "diffusion_pytorch_model-00002-of-00002.safetensors"}}))  # shards absent
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
-    # No single, index lists a missing shard -> still incomplete.
     snap2, blob2 = _mk_snapshot(tmp_path, "diff_comp_index_only")
     (snap2 / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -4056,7 +3976,6 @@ def test_post_download_adapter_single_beats_stale_index(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
         ignore_patterns = None) is True
-    # Sharded adapter, one shard absent, no single -> incomplete.
     snap2, blob2 = _mk_snapshot(tmp_path, "adapter_sharded_incomplete")
     (snap2 / "adapter_config.json").write_text("{}")
     (snap2 / "adapter_model.safetensors.index.json").write_text(json.dumps(
@@ -4090,7 +4009,6 @@ def test_post_download_model_component_stray_sidecar_rejected(tmp_path):
     (unet / "tokenizer_config.json").write_text("{}")  # stray weightless-shaped sidecar, no weight/config
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # unet now holds its config + canonical weight -> accepted (scheduler still needs no weight).
     (unet / "config.json").write_text("{}")
     (unet / "diffusion_pytorch_model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
@@ -4193,7 +4111,6 @@ def test_post_download_out_of_scope_malformed_index_not_rejected(tmp_path):
 
 def test_selected_readable_weight_complete_entry_point(tmp_path):
     """The acceptance helper enforces (A) a readable weight present, (B) its shard set complete: exercise present+complete, absent, and incomplete-shard cases."""
-    # Present + complete single weight -> True.
     snap, blob = _mk_snapshot(tmp_path, "srwc_ok")
     (snap / "model.safetensors").symlink_to(blob)
     assert xf._selected_readable_weight_complete(
@@ -4260,7 +4177,6 @@ def test_gate_rejects_malformed_shard_index(tmp_path):
     (snap2 / "model-00001-of-00002.safetensors").symlink_to(blob2)
     (snap2 / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {}}))
     assert hcs.snapshot_dir_is_complete(snap2) is False
-    # weight_map not a dict.
     snap3, blob3 = _mk_snapshot(tmp_path, "listidx")
     (snap3 / "model.safetensors.index.json").write_text(json.dumps({"weight_map": ["a", "b"]}))
     assert hcs._weight_shard_index_complete(snap3 / "model.safetensors.index.json") is False
@@ -4283,7 +4199,6 @@ def test_shard_index_rejects_unsafe_path_refs(tmp_path):
     assert hcs._weight_shard_index_complete(snap / "model.safetensors.index.json") is False
     # The enumerator returns None (defer) rather than a path escaping the snapshot.
     assert hcs._index_shard_rel_paths(snap / "model.safetensors.index.json", "") is None
-    # A well-formed relative index still enumerates + validates.
     snap2, blob2 = _mk_snapshot(tmp_path, "safe_shard_idx")
     (snap2 / "model-00001-of-00002.safetensors").symlink_to(blob2)
     (snap2 / "model-00002-of-00002.safetensors").symlink_to(blob2)
@@ -4339,7 +4254,6 @@ def test_gate_ignored_canonical_weight_does_not_prove_complete(tmp_path):
         json.dumps({"weight_map": {"a": "pytorch_model-00001-of-00001.bin"}}))
     assert hcs.snapshot_dir_is_complete(snap2, ignore_patterns = ["*.bin"]) is False
     assert hcs.snapshot_dir_is_complete(snap2) is True
-    # A safetensors warm survives an *.bin ignore.
     snap3, blob3 = _mk_snapshot(tmp_path, "stignbin")
     (snap3 / "config.json").write_text("{}")
     (snap3 / "model.safetensors").symlink_to(blob3)
@@ -4368,7 +4282,6 @@ def test_gate_rejects_variant_only_shard_index(tmp_path):
     (snap / "model.safetensors.index.fp16.json").write_text(
         json.dumps({"weight_map": {"a": "model-00001-of-00001.fp16.safetensors"}}))
     assert hcs.snapshot_dir_is_complete(snap) is False
-    # The canonical index for the same model still fast-paths.
     (snap / "model-00001-of-00001.safetensors").symlink_to(blob)
     (snap / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"a": "model-00001-of-00001.safetensors"}}))
@@ -4445,7 +4358,6 @@ def test_post_download_rejects_incomplete_canonical_root_shards(tmp_path):
     (snap / "model-00001-of-00002.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # Complete the set with its index -> accepted.
     (snap / "model-00002-of-00002.safetensors").symlink_to(blob)
     (snap / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": {"a": "model-00001-of-00002.safetensors",
@@ -4555,7 +4467,6 @@ def test_post_download_rejects_adapter_only_for_default_load(tmp_path):
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["adapter_model*", "adapter_config.json"],
         ignore_patterns = None) is True
-    # The base weight present -> the default warm accepts, even beside the adapter.
     (snap / "model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -4595,7 +4506,6 @@ def test_post_download_rejects_variant_only_root_for_default_load(tmp_path):
     (snap_sh / "config.json").write_text("{}")
     assert xf._download_result_usable(
         snap_sh, repo_type = "model", allow_patterns = None, ignore_patterns = None) is False
-    # The canonical weight present -> accepted, even beside the variant.
     (snap / "model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = None, ignore_patterns = None) is True
@@ -4619,7 +4529,6 @@ def test_post_download_variant_either_format_exact_alternatives(tmp_path):
         snap, repo_type = "model",
         allow_patterns = ["model.fp16.safetensors", "pytorch_model.fp16.bin"],
         ignore_patterns = None, variant = "fp16") is True
-    # The canonical either-format pair keeps working.
     snap_c, blob_c = _mk_snapshot(tmp_path, "canon_either")
     (snap_c / "pytorch_model.bin").symlink_to(blob_c)
     assert xf._download_result_usable(
@@ -4642,7 +4551,6 @@ def test_post_download_validates_weightless_named_subset(tmp_path):
         snap, repo_type = "model", allow_patterns = ["tokenizer.json"], ignore_patterns = None) is False
     assert xf._download_result_usable(
         snap, repo_type = "dataset", allow_patterns = ["data.parquet"], ignore_patterns = None) is False
-    # Present named file -> accepted; a glob stays lenient.
     (snap / "tokenizer.json").write_text("{}")
     assert xf._download_result_usable(
         snap, repo_type = "model", allow_patterns = ["tokenizer.json"], ignore_patterns = None) is True
@@ -4663,7 +4571,6 @@ def test_post_download_rejects_missing_exact_weight_request(tmp_path):
     assert xf._download_result_usable(
         base, repo_type = "model",
         allow_patterns = ["model.safetensors", "pytorch_model.bin"], ignore_patterns = None) is True
-    # Both present -> accepted.
     (base / "adapter_model.safetensors").symlink_to(blob)
     assert xf._download_result_usable(
         base, repo_type = "model",
@@ -4800,8 +4707,7 @@ def test_post_download_init_is_not_a_stall(hf_cache):
     try:
         # Hold the partial long enough that the watchdog thread certainly measured it once: a 0.15s
         # hold passed on an idle box but not under a loaded suite, where the thread could first run
-        # AFTER the unlink, and a watchdog that never saw a partial cannot tell "finished" from
-        # "never started".
+        # AFTER the unlink, and a watchdog that never saw a partial cannot tell finished from never started.
         time.sleep(0.6)
         part.unlink()                      # download completed
         (blobs / "finishing").write_bytes(b"\0" * 1024)
@@ -5444,8 +5350,7 @@ def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch
     for var in ("HF_XET_HIGH_PERFORMANCE", "HF_XET_HP", "UNSLOTH_XET_FORCE_CAPS"):
         monkeypatch.delenv(var, raising = False)
 
-    # Exactly what import leaves behind: the roomy default cache's numbers, in the environment and
-    # recorded as ours.
+    # Exactly what import leaves behind: the roomy default cache's numbers, recorded as ours.
     key = "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT"
     monkeypatch.setenv("HF_HUB_CACHE", str(roomy / "hub"))
     monkeypatch.setenv(key, str(64 * GB))

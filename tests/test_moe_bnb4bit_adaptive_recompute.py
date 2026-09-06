@@ -75,8 +75,6 @@ def test_default_non_gc_uses_recompute_provider(monkeypatch):
 
 
 def test_gc_recompute_pass_recomputes_for_4bit(monkeypatch):
-    # A 4-bit base prefers recompute even inside a GC recompute pass, so the packed
-    # Params4bit is kept and dequant deferred rather than pinning the full bf16 stack.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     with _gradient_checkpoint_recompute_marker():
         assert _run_and_record(monkeypatch) == ["provider"]  # recompute, no bf16 pin
@@ -125,7 +123,6 @@ def test_4bit_prefers_recompute_but_dense_still_pins_under_gc(monkeypatch):
     with _gradient_checkpoint_recompute_marker():
         assert mu._moe_recompute_enabled(q) is True       # 4-bit -> recompute
         assert mu._moe_recompute_enabled(dense) is False  # dense -> pin (unchanged)
-    # UNSLOTH_MOE_RECOMPUTE=0 still forces the pin even for a 4-bit base.
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "0")
     assert mu._moe_recompute_enabled(q) is False
 

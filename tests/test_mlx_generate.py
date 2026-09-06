@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import inspect
 import pathlib
+import sys
 import types
 from dataclasses import make_dataclass
 import pytest
@@ -138,7 +139,6 @@ def test_text_api_probe_accepts_supported_shape_and_names_gap_on_mismatch():
 def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
     with pytest.raises(TypeError, match="defaults"):
         generate_batch(object(), None, [], defaults={})
-    # Refused per backend, not by the container, so each reason is true.
     from unsloth_zoo.mlx.generate import _validate_text_requests
     for name in ("kv_bits", "kv_group_size", "kv_quant_scheme", "quantized_kv_start"):
         value = "affine" if name == "kv_quant_scheme" else 4
@@ -158,6 +158,135 @@ def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
     with pytest.warns(RuntimeWarning, match="clear_cache"), pytest.raises(ValueError, match="body"):
         with _generation_cache_hygiene():
             raise ValueError("body")
+
+def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
+    events = []
+    monkeypatch.setattr(
+        "mlx.core.synchronize",
+        # `is None`: a falsey stream labelled "default" would hide an over-drain.
+        lambda stream=None: events.append(
+            f"synchronize:{'default' if stream is None else stream}"
+        ),
+    )
+    if has_clear_cache:
+        monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
+    else:
+        # None, not delattr: tests/mlx_simulation trampolines any missing name, so a
+        # deleted attribute stays callable and the guard never fires.
+        monkeypatch.setattr("mlx.core.clear_cache", None, raising=False)
+    return events
+
+def test_both_cache_clears_drain_gpu_work_first(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    with _generation_cache_hygiene():
+        events.append("body")
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_the_generation_stream_is_drained_not_just_the_default_one(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    for name in ("mlx_lm.generate", "mlx_vlm.generate.dispatch"):
+        monkeypatch.setitem(
+            sys.modules, name,
+            types.SimpleNamespace(generation_stream=f"stream<{name}>"),
+        )
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<mlx_lm.generate>") == 2
+    assert events.count("synchronize:stream<mlx_vlm.generate.dispatch>") == 2
+    assert events.index("synchronize:stream<mlx_lm.generate>") < events.index("clear_cache")
+
+def _fake_stream_module(monkeypatch, name, stream):
+    monkeypatch.setitem(sys.modules, name, types.SimpleNamespace(generation_stream=stream))
+
+def test_the_speculative_decoding_stream_is_drained_too(monkeypatch):
+    # Created on import and never routed through wired_limit: nothing else drains it.
+    events = _record_cache_calls(monkeypatch)
+    _fake_stream_module(monkeypatch, "mlx_vlm.speculative.common", "stream<speculative>")
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<speculative>") == 2
+
+def test_one_stream_shared_by_several_modules_is_drained_once(monkeypatch):
+    # 0.6.x re-exports one stream from every candidate name, so identity decides.
+    events = _record_cache_calls(monkeypatch)
+    shared = "stream<shared>"
+    for name in ("mlx_vlm.generate", "mlx_vlm.generate.dispatch", "mlx_vlm.generate.ar"):
+        _fake_stream_module(monkeypatch, name, shared)
+
+    with _generation_cache_hygiene():
+        pass
+
+    assert events.count("synchronize:stream<shared>") == 2
+
+def test_a_stream_that_cannot_be_drained_does_not_stop_the_clear(monkeypatch):
+    # A plain mx.new_stream (the mlx-vlm pin floor) raises off its creating thread.
+    events = _record_cache_calls(monkeypatch)
+    def synchronize(stream=None):
+        if stream == "stream<foreign>":
+            raise RuntimeError("There is no Stream(gpu, 0) in current thread")
+        events.append(f"synchronize:{'default' if stream is None else stream}")
+    monkeypatch.setattr("mlx.core.synchronize", synchronize)
+    _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<foreign>")
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_a_module_getattr_that_raises_does_not_stop_the_clear(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    module = types.ModuleType("mlx_vlm.generate")
+    def module_getattr(name):
+        raise RuntimeError(f"lazy attribute {name} exploded")
+    module.__getattr__ = module_getattr
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate", module)
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == [
+        "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
+    ]
+
+def test_a_runtime_without_synchronize_still_clears(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    monkeypatch.setattr("mlx.core.synchronize", None, raising=False)
+    _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<mlx_lm>")
+
+    with _generation_cache_hygiene():
+        events.append("body")
+
+    assert events == ["clear_cache", "body", "clear_cache"]
+
+def test_the_exit_clear_still_drains_when_the_body_raised(monkeypatch):
+    events = _record_cache_calls(monkeypatch)
+    with pytest.raises(ValueError, match="body"):
+        with _generation_cache_hygiene():
+            raise ValueError("body")
+    assert events == [
+        "synchronize:default", "clear_cache", "synchronize:default", "clear_cache",
+    ]
+
+@pytest.mark.parametrize("metal", [
+    types.SimpleNamespace(),
+    # Refused even when the pre-0.22 shape is present: this path never accepted it.
+    types.SimpleNamespace(clear_cache=lambda: None),
+])
+def test_missing_clear_cache_is_rejected_before_any_work(monkeypatch, metal):
+    events = _record_cache_calls(monkeypatch, has_clear_cache=False)
+    monkeypatch.setattr("mlx.core.metal", metal, raising=False)
+    with pytest.raises(RuntimeError, match="clear_cache missing"):
+        with _generation_cache_hygiene():
+            pytest.fail("body must not run when the runtime cannot clear its cache")
+    assert events == []
 
 def test_training_flag_restore_attempts_every_module():
     class Module:
@@ -446,7 +575,6 @@ def test_vlm_chunking_respects_release_capabilities():
 
 
 def test_vlm_run_chunk_builds_the_generator_after_embeddings():
-    # The policy needs real inputs, so the generator is built after embeddings.
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     order, seen = [], {}
     ids, embeds = (types.SimpleNamespace(tolist=lambda: [[1], [2]]),
@@ -460,7 +588,7 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
     adapter._add_special_tokens, adapter._drive = (lambda: True), (lambda *a: ["ok"] * 2)
     adapter._split_prompt_kwargs = lambda kw, n: (seen.update(kwargs=kw), [{}] * n)[1]
     # Recording on ENTRY proves embeddings run inside the wired-limit context.
-    adapter._wired_limit = lambda: _entry_ctx(order)  # records on ENTRY
+    adapter._wired_limit = lambda: _entry_ctx(order)
     adapter._chunked_prefill_kwargs = lambda **kw: (
         order.append("policy"), seen.update(policy=kw), {})[2]
     adapter.model = types.SimpleNamespace(
@@ -481,8 +609,6 @@ def test_vlm_run_chunk_builds_the_generator_after_embeddings():
 
 @pytest.mark.parametrize("nested", (True, False))
 def test_vlm_probe_accepts_both_event_class_locations(nested):
-    # Pre-0.5 nests Response with a logprob vector; 0.5+ moves it to
-    # GenerationBatch with a scalar token_logprob.
     from unsloth_zoo.mlx.generate import _probe_vlm_api
     response = type("Response", (), {"__dataclass_fields__": dict.fromkeys(
         ("uid", "token", "finish_reason", "logprobs" if nested else "token_logprob"))})
@@ -509,8 +635,6 @@ def test_vlm_prompt_kwargs_prefer_upstream_only_when_mrope_aware():
 
 
 def test_vlm_images_are_decoded_once_and_flow_to_preprocessing():
-    # One fetch per request; the decoded object reaches grouping and
-    # prepare_inputs; raw bytes are rejected.
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     loads, seen = [], {}
     decoded = types.SimpleNamespace(size=(8, 8))
@@ -527,9 +651,9 @@ def test_vlm_images_are_decoded_once_and_flow_to_preprocessing():
 
 
 def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
-    # Newer layout: the package re-exports BatchGenerator while helpers and the
-    # event class live on the defining module. Delegation via __getattr__ is
-    # omitted so this proves the defining-module binding alone.
+    # Newer layout: the package re-exports BatchGenerator while the helpers and the
+    # event class live on the defining module. __getattr__ delegation is left out so
+    # this proves the defining-module binding alone.
     import sys
     import mlx_vlm.utils  # noqa: F401  (cache the real module before shadowing)
     from unsloth_zoo.mlx import generate as engine
@@ -552,7 +676,7 @@ def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
     policy_calls = []
     ar._chunked_prefill_enabled = lambda model, **kwargs: policy_calls.append(model) or True
     bare = types.ModuleType("mlx_vlm.generate")
-    bare.BatchGenerator = Generator  # re-export only; no delegation here
+    bare.BatchGenerator = Generator
     monkeypatch.setitem(sys.modules, "mlx_vlm.generate", bare)
     monkeypatch.setitem(sys.modules, "mlx_vlm.generate.ar", ar)
     adapter = engine._VLMBatchAdapter(object(), _CharTokenizer(), GenerationDefaults())
@@ -560,7 +684,7 @@ def test_vlm_adapter_initializes_against_newer_module_layout(monkeypatch):
     assert adapter.batch_module is ar and adapter.per_row_prompt_kwargs
     assert adapter._split_prompt_kwargs({}, 3) == [{}, {}, {}]  # upstream splitter chosen
     assert adapter._chunked_prefill_kwargs(input_ids=None, prefill_kwargs={}) == {}
-    assert policy_calls  # the policy helper was consulted, not bypassed
+    assert policy_calls
     # The probed capability must reach the adapter, not merely exist on the module.
     assert adapter.cancel is not None
 
@@ -575,12 +699,10 @@ def test_module_resolution_separates_an_absent_release_from_a_broken_install(mon
     monkeypatch.setattr(importlib_module, "import_module", fake_import)
     with pytest.raises(ModuleNotFoundError, match="timm"):
         _resolve_module_attr(("mlx_vlm.generate",), "BatchGenerator")
-    # The candidate itself being absent still degrades to None.
     assert _resolve_module_attr(("mlx_vlm.generate.ar",), "BatchGenerator") is None
 
 
 def test_vlm_drive_raises_on_true_stall_and_survives_long_prefill():
-    # Impossible admission raises; a multi-poll prefill must still complete.
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
     adapter.defaults, adapter.per_row_prompt_kwargs = GenerationDefaults(), True
@@ -598,7 +720,6 @@ def test_vlm_drive_raises_on_true_stall_and_survives_long_prefill():
             if self._empty_polls:
                 self._empty_polls -= 1
                 if not self._empty_polls:
-                    # Prefill done: the sequence is promoted into decoding.
                     self._prompt_batch, self._generation_batch = None, [1]
                 return ([], [])
             return super().next(**kwargs)
@@ -629,8 +750,8 @@ def test_vlm_requests_group_by_sampling_params():
     adapter.generate([GenerationRequest(prompt="a"), GenerationRequest(prompt="b", sampling=hot),
                       GenerationRequest(prompt="c")])
     assert sorted(chunks) == [[0, 2], [1]]
-    # Preprocessing stacks a group without padding, so differing prompt lengths
-    # must not share a chunk; upstream raises when they do.
+    # Preprocessing stacks a group without padding, so differing prompt lengths must
+    # not share a chunk; upstream raises when they do.
     chunks.clear()
     adapter.generate([GenerationRequest(prompt="a"), GenerationRequest(prompt="bb"),
                       GenerationRequest(prompt="c")])
@@ -639,7 +760,6 @@ def test_vlm_requests_group_by_sampling_params():
 
 @pytest.mark.parametrize("plural", (True, False))
 def test_vlm_stop_strings_trim_and_cancel_in_the_release_form(plural):
-    # Both signature forms, collection and single uid, must drive correctly.
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter, _resolve_cancel
     cancelled = []
     class Generator(_vlm_stub(True, events=[[(0, 2, None)], [(0, 3, None)]])):
@@ -665,13 +785,13 @@ def test_vlm_stop_strings_drop_later_events_when_the_release_cannot_cancel():
     Generator = _vlm_stub(False, events=[
         [(0, 2, None), (1, 1, None)],
         [(0, 3, None), (1, 1, None)],       # uid 0 completes "<STOP>" here
-        [(0, 1, None), (1, 1, "length")]])  # uid 0's late token must be ignored
+        [(0, 1, None), (1, 1, "length")]])
     adapter = _VLMBatchAdapter.__new__(_VLMBatchAdapter)
     adapter.defaults = GenerationDefaults(stop_strings=("STOP",))
     adapter.per_row_prompt_kwargs = False
     adapter.processor = types.SimpleNamespace(tokenizer=_CharTokenizer())
     adapter.cancel = _resolve_cancel(Generator)
-    assert adapter.cancel is None  # no cancellation on this release
+    assert adapter.cancel is None
     stopped, sibling = adapter._drive(Generator(object(), object()), [0, 1], {})
     assert (stopped.token_ids, stopped.finish_reason, stopped.stop_match) == (
         [], "stop_string", "STOP")
@@ -696,9 +816,9 @@ def test_generation_mode_serializes_threads_and_rejects_overlapping_tasks():
         try:
             assert held.wait(5)
             acquired = _GENERATION_MODE_LOCK.acquire(True, 0.05)
-            if acquired:  # never leak global lock state on failure
+            if acquired:
                 _GENERATION_MODE_LOCK.release()
-            assert acquired is False  # serialized across threads
+            assert acquired is False
         finally:
             release.set()
             task.result()
@@ -726,7 +846,6 @@ def test_detokenizer_buffers_partial_characters_and_emits_once():
 
 
 def test_detokenizer_never_re_emits_after_a_shortening_decode():
-    # A shortening decode must not push the offset back and re-emit that tail.
     from unsloth_zoo.mlx.generate import _PendingResult, _StopStringScanner
     tokenizer = _TableTokenizer({(1,): "hello", (1, 2): "he", (1, 2, 3): "hello there"})
     state = _PendingResult(detokenizer=_new_detokenizer(tokenizer),
@@ -787,7 +906,6 @@ class _CriteriaTokenizer(_CharTokenizer):
     (((1, None), (3, None)), _CriteriaTokenizer(), ([1], "stop")),
     # ... and that same authority reports an ordinary token as a length cut-off.
     (((1, None), (2, None), (2, None)), _CriteriaTokenizer(), ([1, 2], "length")),
-    # A reported reason is believed, not re-inferred, in both directions.
     (((1, None), (2, "stop")), None, ([1], "stop")),
     (((1, None), (3, "length")), _CriteriaTokenizer(), ([1], "length")),
     # Nothing generated at all: newer releases emit one event with no token.
@@ -821,7 +939,6 @@ def test_audio_fallback_forwards_the_request_to_the_stream():
     assert args[2] == "p"  # the rendered prompt, after model and processor
     assert (kwargs["audio"], kwargs["max_tokens"]) == ("a.wav", 9)
     assert kwargs["sampler"] is adapter.sampler
-    # Per-request sampling, not the batch-wide default.
     assert (adapter.sampler_kwargs["temp"], adapter.sampler_kwargs["top_k"]) == (0.25, 7)
 
 
@@ -835,8 +952,8 @@ def test_audio_fallback_honours_stop_strings():
 
 
 def test_audio_requests_reach_the_fallback_through_the_public_entry_point(monkeypatch):
-    # The tests above drive the adapter directly and would stay green if the
-    # old blanket audio rejection came back.
+    # The tests above drive the adapter directly and would stay green if the old
+    # blanket audio rejection came back.
     from unsloth_zoo.mlx import generate as engine
     seen = []
     monkeypatch.setattr(engine._VLMBatchAdapter, "__init__",
@@ -857,7 +974,6 @@ def test_audio_requests_reach_the_fallback_through_the_public_entry_point(monkey
 
 
 def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches():
-    # Audio has no batched path, but must not drag the others out of theirs.
     from unsloth_zoo.mlx.generate import _VLMBatchAdapter
     adapter = _audio_adapter(_audio_events((1, None), (2, "length")))
     batched = []
@@ -870,7 +986,7 @@ def test_audio_requests_decode_alone_while_the_rest_of_the_batch_still_batches()
                 GenerationRequest(prompt="c")]
     with pytest.warns(RuntimeWarning, match="decode one at a time"):
         results = _VLMBatchAdapter.generate(adapter, requests)
-    assert batched == [[0, 2]]  # the audio row never reached the batched path
+    assert batched == [[0, 2]]
     assert [results[0], results[2]] == ["batched", "batched"]
     assert results[1].token_ids == [1]
 

@@ -23,9 +23,6 @@ from unsloth_zoo.gradient_checkpointing import (
 import unsloth_zoo.temporary_patches.moe_utils as mu
 
 
-# ---------------------------------------------------------------------------
-# The recompute marker
-# ---------------------------------------------------------------------------
 def test_marker_idempotent_nesting_and_exception_safe():
     assert in_gradient_checkpoint_recompute() is False
     with _gradient_checkpoint_recompute_marker():
@@ -64,9 +61,6 @@ def test_marker_true_only_during_gc_recompute():
     assert torch.allclose(x.grad, torch.full_like(x, 2.0))
 
 
-# ---------------------------------------------------------------------------
-# The adaptive decision
-# ---------------------------------------------------------------------------
 def test_recompute_policy_adaptive_and_overrides(monkeypatch):
     # Isolate the policy layer from the base-recomputable guards (which need CUDA +
     # torch._grouped_mm support).

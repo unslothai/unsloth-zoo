@@ -41,17 +41,13 @@ from torch.utils.checkpoint import checkpoint
 from unsloth_zoo.temporary_patches import utils as U
 
 
-# aot_eager, not inductor: this file tests the compile-mode switch and what
-# autograd saves, both of which AOTAutograd already covers. Inductor adds a C++
-# codegen step that fails for reasons of its own once an earlier test touched
-# the inductor config -- why these passed alone and failed in a full run.
+# aot_eager, not inductor: inductor's C++ codegen fails once an earlier test touched its config.
 _BACKEND = "aot_eager"
 
 
 def _norm(w, x, k):
-    # `k` is a plain int, so Dynamo specialises on its value and every block
-    # forces a fresh compilation. A real vision run exhausts the cache the same
-    # way, one guard per shape rather than per constant.
+    # `k` is a plain int, so Dynamo specialises on it and every block recompiles, the
+    # way a real vision run exhausts the cache one guard a shape.
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * w * (1.0 + 0.0 * k)
 
 
@@ -99,25 +95,18 @@ def dynamo_limits():
     saved = {n: getattr(dynamo.config, n) for n in names
              if hasattr(dynamo.config, n)}
     n_wrappers = len(U._EAGER_FALLBACK_WRAPPERS)
-    # These tests end with a bump deliberately outstanding, so the bookkeeping
-    # has to come back too: left behind, a later fallback restores this test's
-    # limit of 2 over the process default, or finds the allowance spent. Running
-    # out also takes EVERY live borrower eager, including the package's own
-    # patched kernels, which would stay latched for the rest of the worker.
+    # These tests end with a bump deliberately outstanding: left behind, a later
+    # fallback restores this test's limit of 2 over the process default, or finds the
+    # allowance spent and takes EVERY live borrower eager.
     saved_states = [(_w, dict(_w._unsloth_fallback_state))
                     for _w in (_r() for _r in U._EAGER_FALLBACK_WRAPPERS)
                     if _w is not None]
     saved_global = U._GLOBAL_BUMPS
     saved_orig = dict(U._ORIGINAL_RECOMPILE_LIMITS)
-    # Deep copy: the map is {bumped value: the value it came from} with lists
-    # appended to and popped in place, so copying it as a set broke the restore
-    # chain, and copying only the outer layers let a test that settles a debt
-    # mutate the snapshot teardown restores from.
+    # Deep copy: the lists are mutated in place, so a shallow copy let a settled debt mutate the snapshot.
     saved_bumped = {k: {kk: list(vv) for kk, vv in v.items()}
                     for k, v in U._BUMPED_RECOMPILE_LIMITS.items()}
-    # The give-up decision is kept by LABEL, so it outlives the wrapper. Every
-    # test here reuses "test_norm", so an earlier latch would start the next
-    # one already eager.
+    # The give-up decision is kept by LABEL, and every test here reuses "test_norm".
     U._LATCHED_EAGER_LABELS.discard("test_norm")
     U._PENDING_EAGER_LABELS.discard("test_norm")
     try:
@@ -125,9 +114,7 @@ def dynamo_limits():
     finally:
         for n, v in saved.items():
             setattr(dynamo.config, n, v)
-        # Drop only what died: the registry is process-wide, and a module
-        # imported during these tests appends its own kernels past the mark, so
-        # truncating deregistered gemma/gemma4/qwen3 for the rest of the worker.
+        # Process-wide registry: truncating past the mark deregistered gemma/gemma4/qwen3.
         _tail = [_r for _r in U._EAGER_FALLBACK_WRAPPERS[n_wrappers:]
                  if _r() is not None]
         del U._EAGER_FALLBACK_WRAPPERS[n_wrappers:]
@@ -154,8 +141,7 @@ def test_exhausted_recompile_cache_does_not_break_the_backward(dynamo_limits):
                              backend = _BACKEND)
     fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
 
-    # Before the fix this raises: the first blocks pack compiled activations,
-    # the fallback flips to eager mid-forward, and the recompute disagrees.
+    # Before the fix this raises: eager mid-forward disagrees with what was packed compiled.
     _run_checkpointed_step(fn)
 
     state = fn._unsloth_fallback_state
@@ -184,9 +170,7 @@ def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limi
                              backend = _BACKEND)
     fn = U._fall_back_to_eager_on_recompile_limit(compiled, _norm, "test_norm")
 
-    # Deny the loan at its source: pinning `_GLOBAL_BUMPS` stopped working once
-    # the allowance became a live measurement rather than a stored count, and
-    # the retry silently succeeded.
+    # Pinning `_GLOBAL_BUMPS` stopped working once the allowance became a live measurement.
     real_bump = U._bump_recompile_limits
     U._bump_recompile_limits = lambda *a, **k: False
     try:
@@ -199,9 +183,7 @@ def test_a_spent_budget_ends_the_step_instead_of_flipping_mid_region(dynamo_limi
     assert state["eager"], "the wrapper must latch so the retry is consistent"
     assert state["bumps"] == 0, "no budget was borrowed"
 
-    # The promise is that the caller can retry the step. torch holds
-    # `with _checkpoint_hook(...)` open across the generator's yield, so our
-    # raise abandons it with the hooks installed; the boundary settles that.
+    # torch holds `_checkpoint_hook` open across the yield, so the raise abandons it installed.
     U.apply_pending_eager_fallbacks()
     def plain(x): return torch.nn.functional.softmax(x * 2, dim = -1)
     checkpoint(plain, torch.randn(4, 4, requires_grad = True),
@@ -334,8 +316,6 @@ def test_pending_switch_is_applied_at_the_step_boundary(dynamo_limits):
     assert fn._unsloth_fallback_state["eager"]
     assert not fn._unsloth_fallback_state["pending_eager"]
 
-    # A second call is a no-op, and the next step is now consistently eager,
-    # so the backward keeps working.
     assert U.apply_pending_eager_fallbacks() == 0
     _run_checkpointed_step(fn)
 
@@ -363,8 +343,7 @@ def test_settlement_retries_until_the_generator_is_actually_collected():
             cycle = {"exc": exc}                # a cycle, as raising through
             cycle["self"] = cycle               # compiled frames leaves
             U._RAISED_INSIDE_CHECKPOINT = True
-            # The step boundary the caller reaches before retrying: the
-            # traceback is still live, so no collection can finalise anything.
+            # The traceback is still live, so no collection can finalise anything.
             U.apply_pending_eager_fallbacks()
             assert U._in_non_reentrant_checkpoint() is True, "hooks already gone"
 
@@ -443,3 +422,118 @@ def test_the_last_sequential_segment_is_outside_every_region():
     is packed while it executes and eager is safe there even when the earlier
     segments are non-reentrant."""
     assert _sequential_walk(2, False) == [True, True, False, False]
+
+
+# ---- the disabled-hook arm, which used to flip with no question asked -----
+
+def _disabled_hook_error():
+    """Dynamo's refusal to inline a `torch.compiler.disable`d callable."""
+    import torch._dynamo.exc as exc
+    cls = getattr(exc, "Unsupported", None)
+    if cls is None:
+        pytest.skip("this torch has no torch._dynamo.exc.Unsupported")
+    try:
+        return cls(
+            "Skip calling `torch.compiler.disable()`d function\n"
+            "  Explanation: Skip calling function `requires_grad_pre_hook` "
+            "since it was wrapped with `torch.compiler.disable`\n"
+            "  Hint: Remove the `torch.compiler.disable` call"
+        )
+    except Exception:
+        pytest.skip("Unsupported cannot be constructed on this torch")
+
+
+@pytest.fixture
+def hook_label():
+    label = "test_disabled_hook_under_checkpoint"
+    for s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+              U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        s.discard(label)
+    packed = U._PACKED_COMPILED_IN_CHECKPOINT
+    yield label
+    for s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+              U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        s.discard(label)
+    U._PACKED_COMPILED_IN_CHECKPOINT = packed
+    U._RAISED_INSIDE_CHECKPOINT = False
+    U._CHECKPOINT_SETTLE_ATTEMPTS = 0
+
+
+@pytest.mark.skipif(
+    U._in_non_reentrant_checkpoint() is None,
+    reason = "torch < 2.8 cannot report whether a checkpoint region is live",
+)
+def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label):
+    """The Gemma4 abort.
+
+    Dynamo only discovers a disabled hook while TRACING, so this arm fires on a
+    recompile, routinely the backward recompute of a region whose forward already
+    packed compiled. It used to set `state["eager"]` and run eager on the spot,
+    with none of the checkpoint question the other give-up arms ask, and torch
+    raised CheckpointError about recomputed tensors having different metadata,
+    with `_LATCHED_EAGER_LABELS` still empty because this arm recorded nothing.
+    """
+    calls = {"n": 0}
+
+    def compiled(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "compiled"
+        raise _disabled_hook_error()
+
+    fn = U._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda *a, **k: "eager", hook_label)
+
+    def region(x):
+        # First call packs compiled, so the region owes a compiled recompute.
+        assert fn(x) == "compiled"
+        # A later trace in the same region refuses. Eager here is the abort.
+        return fn(x) * x
+
+    with pytest.raises(Exception) as ei:
+        checkpoint(region, torch.randn(4, 4, requires_grad = True),
+                   use_reentrant = False)
+    message = str(ei.value)
+    assert "torch.compiler.disable" in message, message[:200]
+
+    assert hook_label in U._LATCHED_EAGER_LABELS, "the flip must be recorded"
+    assert hook_label in U._RECENT_EAGER_LABELS, "and as this step's evidence"
+    assert U._RAISED_INSIDE_CHECKPOINT, "the abandoned region must be settled"
+    assert fn._unsloth_fallback_state["eager"], "the retry has to be eager"
+
+    # `ei` roots the traceback, hence the abandoned generator and its still
+    # installed hooks -- the case `_settle_abandoned_checkpoint_generator` covers.
+    del ei
+    U.apply_pending_eager_fallbacks()
+    assert U._in_non_reentrant_checkpoint() is False, "the region never closed"
+
+
+@pytest.mark.skipif(
+    U._in_non_reentrant_checkpoint() is None,
+    reason = "torch < 2.8 cannot report whether a checkpoint region is live",
+)
+def test_a_disabled_hook_still_falls_back_when_nothing_packed_compiled(hook_label):
+    """The majority case must not regress: a refusal on the FIRST call means
+    nothing compiled was packed by this label, so eager pack and eager recompute
+    agree. Turning that into a dead step would cost users a working run."""
+    def compiled(*args, **kwargs):
+        raise _disabled_hook_error()
+
+    fn = U._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda *a, **k: "eager", hook_label)
+
+    out = checkpoint(lambda x: fn(x) and x * 2,
+                     torch.randn(4, 4, requires_grad = True),
+                     use_reentrant = False)
+    out.sum().backward()
+    assert fn._unsloth_fallback_state["eager"]
+    assert not U._RAISED_INSIDE_CHECKPOINT, "nothing was stranded"
+
+
+def test_a_disabled_hook_outside_any_region_is_unchanged(hook_label):
+    def compiled(*args, **kwargs):
+        raise _disabled_hook_error()
+    fn = U._fall_back_to_eager_on_recompile_limit(
+        compiled, lambda *a, **k: "eager", hook_label)
+    assert fn() == "eager"
+    assert not U._RAISED_INSIDE_CHECKPOINT

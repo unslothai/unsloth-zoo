@@ -619,6 +619,48 @@ def generation_mode(model):
                 pass
 
 
+# Speculative decoding's stream belongs here but not in _VLM_STREAM_MODULES, which may
+# only hold modules exporting wired_limit.
+def _drain_stream_modules():
+    # A function, not a constant: _VLM_STREAM_MODULES is defined further down.
+    return ("mlx_lm.generate",) + _VLM_STREAM_MODULES + ("mlx_vlm.speculative.common",)
+
+
+def _drain_generation_streams(mx):
+    """Drain the generation streams, best effort, before the caller clears the cache.
+
+    A no-argument mx.synchronize() waits on the default stream, not these. Best effort
+    because they can fail: at the mlx-vlm pin floor generation_stream is a plain
+    mx.new_stream, which raises when synchronized off its creating thread, and losing
+    the drain must never cost the caller its clear. Only effective on the generating
+    thread: elsewhere a thread-local stream drains nothing instead of raising.
+    """
+
+    synchronize = getattr(mx, "synchronize", None)
+    if not callable(synchronize):
+        return
+    drained = []
+    for name in _drain_stream_modules():
+        try:
+            # sys.modules only, so cleanup never imports mlx-vlm; a module __getattr__
+            # runs arbitrary code and getattr swallows only AttributeError.
+            stream = getattr(sys.modules.get(name), "generation_stream", None)
+        except Exception:
+            continue
+        # 0.6.x aliases one object across every mlx_vlm.generate name.
+        if stream is None or any(stream is seen for seen in drained):
+            continue
+        drained.append(stream)
+        try:
+            synchronize(stream)
+        except Exception:
+            continue
+    try:
+        synchronize()
+    except Exception:
+        pass
+
+
 @contextmanager
 def _generation_cache_hygiene():
     """Cache hygiene around one burst; limits stay owned by ``generation_mode``."""
@@ -630,6 +672,8 @@ def _generation_cache_hygiene():
         raise RuntimeError(
             "Unsupported MLX runtime API shape (mlx.core.clear_cache missing)."
         )
+    # MLX pins buffers a live command buffer reads, but not an output array dropped mid-flight.
+    _drain_generation_streams(mx)
     clear_cache()
     active_error = None
     try:
@@ -639,14 +683,15 @@ def _generation_cache_hygiene():
         raise
     finally:
         try:
+            _drain_generation_streams(mx)
             clear_cache()
-        except BaseException as clear_error:
+        except BaseException as cleanup_error:
             if active_error is None:
                 raise
             try:
                 warnings.warn(
-                    "mlx.core.clear_cache() failed while preserving an active "
-                    f"{type(active_error).__name__}: {clear_error}",
+                    "mlx.core.synchronize()/clear_cache() failed while preserving an "
+                    f"active {type(active_error).__name__}: {cleanup_error}",
                     RuntimeWarning,
                     stacklevel=2,
                 )

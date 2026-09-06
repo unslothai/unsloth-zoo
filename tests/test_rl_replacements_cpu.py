@@ -35,11 +35,6 @@ import torch
 from unsloth_zoo import rl_replacements as rr
 
 
-# ---------------------------------------------------------------------------
-# calculate_pad_tokens_in_prompt
-# ---------------------------------------------------------------------------
-
-
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
     # batch=2, seq_len=6, logits_to_keep=3 -> prompt_section is the
@@ -63,11 +58,6 @@ def test_calculate_pad_tokens_in_prompt_rejects_invalid_keep():
         rr.calculate_pad_tokens_in_prompt(input_ids, logits_to_keep = 5, pad_token_id = PAD)
 
 
-# ---------------------------------------------------------------------------
-# create_completion_attention_mask
-# ---------------------------------------------------------------------------
-
-
 def test_create_completion_attention_mask_zeros_left_prompt_and_right_pads():
     PAD = 0
     # batch=2, completion_len=6. left_pad_tokens_per_prompt says
@@ -88,15 +78,8 @@ def test_create_completion_attention_mask_zeros_left_prompt_and_right_pads():
         pad_token_id           = PAD,
     )
     assert mask.dtype == torch.bool
-    # row 0: zero the first 3 cols (max-0), keep non-pad. shape mask = [0,0,0,1,0,0]
     assert mask[0].tolist() == [False, False, False, True, False, False]
-    # row 1: zero the first 1 col (max-2), keep non-pad. shape mask = [0,1,1,0,0,0]
     assert mask[1].tolist() == [False, True, True, False, False, False]
-
-
-# ---------------------------------------------------------------------------
-# left_pack_padding
-# ---------------------------------------------------------------------------
 
 
 def test_left_pack_padding_moves_pads_to_right_stable():
@@ -108,7 +91,6 @@ def test_left_pack_padding_moves_pads_to_right_stable():
         ]
     )
     packed = rr.left_pack_padding(t, pad_id = PAD)
-    # Non-pad tokens preserve their relative order (stable sort).
     assert packed[0].tolist() == [1, 2, 3, PAD, PAD]
     assert packed[1].tolist() == [4, 5, 6, PAD, PAD]
 
@@ -118,11 +100,6 @@ def test_left_pack_padding_idempotent_on_already_packed():
     t = torch.tensor([[1, 2, 3, PAD, PAD]])
     out = rr.left_pack_padding(t, pad_id = PAD)
     assert out.tolist() == t.tolist()
-
-
-# ---------------------------------------------------------------------------
-# align_logprobs_with_mask
-# ---------------------------------------------------------------------------
 
 
 def test_align_logprobs_with_mask_inserts_per_row_left_padding():
@@ -148,18 +125,9 @@ def test_align_logprobs_with_mask_inserts_per_row_left_padding():
         attention_mask = attention_mask,
         pad_value      = 0.0,
     )
-    # Output shape matches attention_mask's seq_len = 4.
     assert aligned.shape == (2, 4)
-    # row 0: shift by 1 left pad -> logprobs land at cols 1,2; cols 0,3 stay pad.
-    # row 1: shift by 0 left pads -> logprobs land at cols 0,1; cols 2,3 stay pad.
-    # `pytest.approx` for float32 round-trip tolerance.
     assert aligned[0].tolist() == pytest.approx([0.0, 0.5, 0.7, 0.0])
     assert aligned[1].tolist() == pytest.approx([0.1, 0.2, 0.0, 0.0])
-
-
-# ---------------------------------------------------------------------------
-# sanitize_logprob
-# ---------------------------------------------------------------------------
 
 
 def test_sanitize_logprob_returns_value_for_finite():
@@ -170,11 +138,6 @@ def test_sanitize_logprob_returns_value_for_finite():
 def test_sanitize_logprob_returns_none_for_nan():
     p = SimpleNamespace(logprob = float("nan"))
     assert rr.sanitize_logprob(p) is None
-
-
-# ---------------------------------------------------------------------------
-# RL_REPLACEMENTS dict integrity
-# ---------------------------------------------------------------------------
 
 
 def test_RL_REPLACEMENTS_values_are_callables_or_source_strings():
@@ -213,9 +176,6 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
 
 
-# ---------------------------------------------------------------------------
-# Unsloth_Offloaded_Log_Softmax backward returns LOCAL input gradients
-# ---------------------------------------------------------------------------
 # backward + leaf .grad double-counts through the outer AccumulateGrad.
 
 
@@ -278,9 +238,6 @@ def test_offloaded_recompute_weight_grad_not_double_counted(shared, preexisting)
     assert not torch.allclose(_weight_grad(buggy.apply, shared, preexisting), ref, atol=1e-4)
 
 
-# ---------------------------------------------------------------------------
-# Unsloth_Offloaded_Log_Softmax offload paths (pinned CUDA / pageable CPU)
-# ---------------------------------------------------------------------------
 # backward's event wait is load-bearing: the pinned non_blocking copy races
 # without it.
 

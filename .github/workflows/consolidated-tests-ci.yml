@@ -137,6 +137,9 @@ jobs:
             venv=".lanes/venv-$version"
             log=".lanes/$version.log"
             (
+              # Per-lane generated-source dir: else 3.10 imports a cache 3.13 wrote.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$version"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 "$interpreter" -m venv "$venv" &&
@@ -296,6 +299,10 @@ jobs:
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
         #
+        # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
+        # eager fallback: still falls back on a first-call refusal, ends the step
+        # when a compiled pack is outstanding, latches only its own label. CPU-pure.
+        #
         # test_gemma4_mlp_not_compiled pins Gemma4TextMLP.forward eager, on the
         # `fullgraph = None` sentinel. It regresses from either side: the call site
         # flipping to a bool, or patch_function redefining None. No GPU, no gemma4.
@@ -360,6 +367,7 @@ jobs:
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
+            tests/test_disabled_hook_checkpoint_guard.py \
             tests/test_gemma4_mlp_not_compiled.py \
             -v
 
@@ -367,6 +375,22 @@ jobs:
         # Run in a fresh process so its module-scoped MLX simulation does not
         # inherit module state from another MLX test file.
         run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
+
+      - name: pytest MLX GGUF export gates (HARD GATE)
+        # One invocation each, for the reason above: tests/mlx_simulation/ replaces
+        # sys.modules["mlx.core"] process-wide, so a file collected after another
+        # inherits its shim.
+        #
+        # These are here because they were in NO job, which is the failure the
+        # comment above already lists four times. The MoE name-restoration work
+        # changed the arguments _prepare_mlx_gguf_export_directory is called with and
+        # took 13 tests in test_mlx_save_export_edge_cases.py down; every check on
+        # that pull request stayed green, because `pytest tests/ --collect-only`
+        # proves only that a file imports.
+        run: |
+          python -m pytest tests/test_mlx_save_export_regressions.py -v
+          python -m pytest tests/test_mlx_save_export_edge_cases.py -v
+          python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
@@ -692,6 +716,10 @@ jobs:
             id="$1"; shift
             venv=".lanes/venv-$id"; log=".lanes/$id.log"
             (
+              # Per-lane generated-source dir, absolute (compiler.py puts it on sys.path):
+              # concurrent lanes sharing one checkout rewrite the default cache under a reader.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$id"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 set -x &&
@@ -749,6 +777,7 @@ jobs:
                   tests/test_upstream_source_patterns.py \
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
+                  tests/test_compiler_getsource_tokenerror.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \

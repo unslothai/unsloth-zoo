@@ -16,6 +16,12 @@ import threading
 import types
 from pathlib import Path, PureWindowsPath
 
+# `os.geteuid` is POSIX-only and these decorators run at collection time, so a
+# bare call takes the whole module out on Windows (tests/test_llama_cpp_prebuilt.py:30
+# guards the same way).
+IS_POSIX = os.name == "posix"
+
+
 import pytest
 import torch
 
@@ -36,9 +42,6 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
 
     monkeypatch.setattr(mutils.mx, "transpose", _transpose)
     monkeypatch.setattr(mutils.mx, "all", _all)
-
-
-# --- Group 1: _mlx_arrays_match ---
 
 
 def test_arrays_match_rank3_checks_values(monkeypatch):
@@ -118,9 +121,6 @@ def test_arrays_match_nan_tensors_do_not_match(monkeypatch):
     # NaN != NaN elementwise, so a clone never value-matches; identity does.
     assert mutils._mlx_arrays_match(nan, nan.clone()) is False
     assert mutils._mlx_arrays_match(nan, nan) is True
-
-
-# --- Group 2: _rewrite_mlx_vlm_tensor_for_gguf branches ---
 
 
 def test_rewrite_handles_5d_layout_transform(monkeypatch):
@@ -250,9 +250,6 @@ def test_rewrite_model_prefixed_alias_families(monkeypatch):
     assert new_name == "model.visual.embed.bias"
 
 
-# --- Group 3: _MlxVlmSanitizeProxy (2-param sanitize path) ---
-
-
 def test_two_param_sanitize_receives_config_proxy():
     import unsloth_zoo.mlx.utils as mutils
 
@@ -296,9 +293,6 @@ def test_sanitize_missing_method_returns_weights_unchanged():
 
     weights = {"w": torch.zeros(1)}
     assert mutils._call_mlx_vlm_sanitize(NoSanitize, {}, weights) is weights
-
-
-# --- Group 4: _prepare_mlx_gguf_export_directory end-to-end (real shards) ---
 
 
 class _ConvAndRenameSanitizer:
@@ -604,9 +598,6 @@ def test_nextn_handles_language_and_thinker_nested_configs():
     assert "nextn_predict_layers" not in config["thinker_config"]["text_config"]
 
 
-# --- Group 5: _copy_source_sidecars filesystem edges ---
-
-
 def test_sidecars_src_equals_dst_copies_nothing(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -658,7 +649,8 @@ def test_sidecars_unicode_names_and_spaces_in_paths(tmp_path):
     assert (dst / "tokenizer_配置.json").exists()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks no-op as root")
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0,
+                    reason="permission checks no-op as root / non-POSIX")
 def test_sidecars_unreadable_source_propagates_loudly(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -681,9 +673,6 @@ def test_sidecars_windows_style_path_object_does_not_crash():
 
     # On POSIX a PureWindowsPath coerces to a missing relative path: return 0.
     assert mutils._copy_source_sidecars(PureWindowsPath("C:/no/such"), "out") == 0
-
-
-# --- Group 6: _read_json_file non-dict payloads + processor repair robustness ---
 
 
 @pytest.mark.parametrize("payload", ["[]", '"just a string"', "null", "3.14"])
@@ -723,7 +712,8 @@ def test_read_json_file_directory_path_returns_empty(tmp_path):
     assert loader._read_json_file(tmp_path) == {}
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks no-op as root")
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0,
+                    reason="permission checks no-op as root / non-POSIX")
 def test_read_json_file_permission_error_returns_empty(tmp_path):
     import unsloth_zoo.mlx.loader as loader
 
@@ -743,9 +733,6 @@ def test_read_json_file_accepts_str_and_path(tmp_path):
     sidecar.write_text('{"a": 1}', encoding="utf-8")
     assert loader._read_json_file(str(sidecar)) == {"a": 1}
     assert loader._read_json_file(sidecar) == {"a": 1}
-
-
-# --- Group 7: _get_model_config fallback ladder ---
 
 
 def test_get_model_config_to_dict_returning_non_dict_falls_through():
@@ -802,9 +789,6 @@ def test_get_model_config_non_dict_private_config_falls_through():
     assert mutils._get_model_config(model) == {"model_type": "qwen3"}
 
 
-# --- Group 8: _save_mlx_config routing and quantization key handling ---
-
-
 def _capture_save_config(monkeypatch, module_name):
     calls = {}
     fake = types.ModuleType(module_name)
@@ -855,9 +839,6 @@ def test_save_config_vlm_without_quantization_key_adds_nothing(monkeypatch, tmp_
     assert "quantization" not in calls["config"]
 
 
-# --- Group 9: _is_vlm_model real body ---
-
-
 def test_is_vlm_explicit_flag_overrides_structure():
     import unsloth_zoo.mlx.utils as mutils
 
@@ -895,9 +876,6 @@ def test_is_vlm_requires_language_model():
     assert mutils._is_vlm_model(types.SimpleNamespace(vision_tower=object())) is False
     assert mutils._is_vlm_model(types.SimpleNamespace(language_model=object())) is False
     assert mutils._is_vlm_model(object()) is False
-
-
-# --- Group 10: save_merged_model contracts ---
 
 
 def _install_fake_lm_save(monkeypatch):
@@ -1020,9 +998,6 @@ def test_merged_save_keeps_quantization_when_not_dequantizing(
     assert calls["saved_config"]["quantization"] == {"bits": 4}
 
 
-# --- Group 11: save_pretrained_gguf first_conversion derivation + quantize step ---
-
-
 def _gguf_export_scaffold(
     monkeypatch, tmp_path, shards=1, mmproj=False, mmproj_shards=1
 ):
@@ -1112,7 +1087,14 @@ def _gguf_export_scaffold(
     monkeypatch.setattr(
         mutils,
         "_prepare_mlx_gguf_export_directory",
-        lambda path, model=None, replay_sanitizers=True: 0,
+        lambda path, model=None, replay_sanitizers=True, norm_offsets=None,
+               relaid_out=None: 0,
+    )
+    # The MoE pass also runs on every export, and this scaffold has no shards for it.
+    monkeypatch.setattr(
+        mutils,
+        "_prepare_moe_gguf_export_directory",
+        lambda path, model=None, source_norm_offsets=None, source_layouts=(): 0,
     )
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unused"))
     monkeypatch.setattr(
@@ -1303,9 +1285,6 @@ def test_gguf_keeps_the_intermediates_when_quantization_fails(monkeypatch, tmp_p
     ]
 
 
-# --- Group 12: concurrency over the patcher env mutation ---
-
-
 def test_concurrent_gguf_exports_serialize_env_mutation(monkeypatch, tmp_path):
     import unsloth_zoo.llama_cpp as llama_cpp
 
@@ -1392,8 +1371,6 @@ def test_gguf_export_respects_preexisting_scripts_dir_override(
     assert seen["env"] == custom
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == custom
 
-
-# --- Group 13: converter placement contract (monolith vs package layout) ---
 
 _PACKAGE_ENTRYPOINT = b"""\
 #!/usr/bin/env python3
@@ -1569,9 +1546,6 @@ def test_monolith_layout_patched_script_stays_in_default_dir(
     assert (root / "convert_hf_to_gguf.py").read_bytes() == _MONOLITH
 
 
-# --- Group 14: path-shape portability ---
-
-
 def test_save_config_accepts_str_and_path_targets(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -1601,9 +1575,6 @@ def test_repair_with_backslash_path_string_returns_processor_unchanged():
         processor, "C:\\models\\fake", "fake_type"
     )
     assert repaired is processor
-
-
-# --- Group 15: review follow-ups ---
 
 
 def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):

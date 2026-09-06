@@ -178,6 +178,11 @@ jobs:
         # ordering and stop-string contracts.
         run: python -m pytest tests/test_mlx_generate_metal.py -v -rs
 
+      - name: tests/test_mlx_gguf_moe_export_metal.py
+        # GGUF staging on a real mlx-lm MoE model: stacked switch_mlp experts
+        # must come back out under the per-expert HF names llama.cpp maps.
+        run: python -m pytest tests/test_mlx_gguf_moe_export_metal.py -v -rs
+
       - name: tests/test_mlx_cpt_partition_metal.py
         # CPT partition, target normalization and full-module save routing.
         run: python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs

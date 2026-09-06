@@ -2031,7 +2031,6 @@ class MLXTrainer:
         self._mlx_train_dataset_for_batches = train_dataset
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
-        # Use args or defaults
         self.args = args or self.config_class()
         if self.preference_kind and not isinstance(self.args, self.config_class):
             raise TypeError(
@@ -2045,10 +2044,8 @@ class MLXTrainer:
             self.args = copy.copy(self.args)
         self.args.greater_is_better = _resolve_greater_is_better(self.args)
 
-        # Auto-detect VLM
         self._is_vlm = _is_vlm_model(model)
 
-        # Constructor params override args if provided
         if dataset_text_field is not None:
             self.args.dataset_text_field = dataset_text_field
         if max_seq_length is not None:
@@ -4706,7 +4703,6 @@ class MLXTrainer:
                         "compiled signature. Use a finite dataset, or train "
                         "with compile disabled or in best-effort mode."
                     )
-                # No plan to survey: peek one batch, chained back.
                 stream_carries_audio, batch_iter = (
                     self._peek_stream_carries_audio(batch_iter)
                 )
@@ -4847,7 +4843,6 @@ class MLXTrainer:
                     batches, batch_iter, total_steps, report, compile_allowed,
                 )
 
-            # (memory limits already applied above; just log what we configured)
             if self._memory_limits_applied:
                 parts = []
                 if "memory_limit_gb" in self._memory_limits_applied:
@@ -4867,7 +4862,6 @@ class MLXTrainer:
                     f"({', '.join(parts)})."
                 )
 
-            # Apply gradient checkpointing if requested
             if args.gradient_checkpointing:
                 apply_gradient_checkpointing(model)
                 _main_print("Unsloth: Using gradient checkpointing to reduce memory.")
@@ -4964,7 +4958,6 @@ class MLXTrainer:
                     _module.fused_apply = True
                 except Exception:
                     pass
-            # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile
                 _mlx_compile.set_qwen3_vision_norm_cast_output(
@@ -5234,7 +5227,6 @@ class MLXTrainer:
                     f"({', '.join(frozen_audio)})."
                 )
 
-        # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
 
         # Resume: adapters were already loaded into the model before train(), so
@@ -5447,7 +5439,6 @@ class MLXTrainer:
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-        # Per-group learning rates (LoRA+, embedding LR) via post-update rescale
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
         if use_lora_plus:
@@ -5455,7 +5446,6 @@ class MLXTrainer:
 
         embedding_lr = args.embedding_learning_rate
         main_lr = args.learning_rate
-        # Ratio < 1 slows embeddings down; 0 = disabled
         use_embedding_lr = embedding_lr > 0 and main_lr > 0
         embedding_lr_ratio = embedding_lr / main_lr if use_embedding_lr else 1.0
         if use_embedding_lr:
@@ -5527,10 +5517,6 @@ class MLXTrainer:
                 updates.append((name, pre + r * (post - pre)))
             model.update(tree_unflatten(updates))
 
-        # Build step functions following mlx-lm's pattern. `max_grad_value`
-        # remains an elementwise clamp. MLX's cheap default is now the clearer
-        # `max_grad_leaf_norm`, a proportional per-leaf norm cap that avoids
-        # global norm clipping's cross-tree memory overhead.
         (
             max_grad_norm,
             max_grad_value,
@@ -5938,7 +5924,6 @@ class MLXTrainer:
         if _ddp_update_outside_step and not _ddp_compile_local_grad:
             step_fn = _ddp_eager_local_step_fn
 
-        # Prepare eval batches
         eval_batches = None
         # (split_name, prompt_text, prompt_token_ids), filled by the plan
         # builder's own pass so the eval dataset is never read twice.
@@ -6030,7 +6015,6 @@ class MLXTrainer:
                 getattr(args, "per_device_eval_batch_size", None)
                 or args.per_device_train_batch_size
             )
-            # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
@@ -6256,7 +6240,6 @@ class MLXTrainer:
                     f"  - {rec.setting}={rec.recommended_value!r}: {rec.reason}"
                 )
 
-        # Training loop — mlx-lm pattern
         model.train()
         # HF's include_num_input_tokens_seen gate: "no"/False (its default, and the
         # one _ensure_callback_args_compat applies) skips input-token counting
@@ -7193,7 +7176,6 @@ class MLXTrainer:
 
             tic = time.perf_counter()
 
-            # Get next batch
             batch_error = None
             batch_data = None
             try:
@@ -7463,7 +7445,6 @@ class MLXTrainer:
                 train_time += pending_time
                 pending_time = 0
 
-            # Only log/eval on actual optimizer steps
             if not do_update:
                 accum_progress += 1
                 _fire("on_substep_end")
@@ -7591,9 +7572,6 @@ class MLXTrainer:
             if should_log:
                 _run_training_log(current_step, grad_norm)
 
-            # Eval (cadence or a synced callback request). _run_eval builds eval
-            # batches lazily on every rank, runs the collective eval, then fires
-            # on_evaluate on rank 0 and syncs any stop before best tracking.
             # The static cadence mirrors DefaultFlowCallback's step-strategy
             # rule (strategy is STEPS, on a multiple of eval_steps, past
             # eval_delay); an explicit callback request stays independent of
@@ -7714,8 +7692,6 @@ class MLXTrainer:
                 sum(self._train_loss_history) / len(self._train_loss_history)
                 if self._train_loss_history else 0.0
             )
-        # Total wall-clock training time, consumed by the summary line and the
-        # distributed diagnostics / train_runtime metrics below.
         total_time = time.perf_counter() - start_time
 
         # Report the step actually reached, which is < total_steps after an
@@ -8490,7 +8466,6 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             }
-            # Always emit num_layers for mlx-lm.load_adapters() attr-access.
             adapter_config["num_layers"] = _num_layers
             if _lora_rank is not None:
                 adapter_config["lora_parameters"] = {
@@ -8614,7 +8589,6 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
 
-    # 1. Gather all text strings (serial, fast)
     all_texts = []
     for item in dataset:
         if formatting_func is not None:
@@ -8761,7 +8735,6 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
 
-    # Limit if needed
     if num_batches is not None and len(schedule) > num_batches:
         schedule = schedule[:num_batches]
         widths = widths[:num_batches]
@@ -9024,7 +8997,6 @@ def train_on_responses_only(
         train_on_responses_only as _hf_train_on_responses_only,
     )
 
-    # Resolve tokenizer: kwarg > trainer.tokenizer
     _source = tokenizer
     if _source is None and trainer is not None:
         _source = trainer.tokenizer
@@ -9034,7 +9006,6 @@ def train_on_responses_only(
             "kwarg or via trainer.tokenizer."
         )
 
-    # Callable HF tokenizer for token matching and text batch encoding.
     _tokenizer = _resolve_response_mask_tokenizer(_source)
     _lazy_text_eval = False
     eval_dataset = getattr(trainer, "eval_dataset", None)
@@ -9076,7 +9047,6 @@ def train_on_responses_only(
     else:
         _detect_source = _tokenizer
 
-    # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
         None,
         instruction_part=instruction_part,
@@ -9098,7 +9068,6 @@ def train_on_responses_only(
         )
 
     if trainer._is_vlm:
-        # VLM path: store mask_fn for application during batch creation
         trainer._vlm_response_mask_fn = mask_fn
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
     else:
@@ -9135,7 +9104,6 @@ def train_on_responses_only(
             print("Unsloth: train_on_responses_only enabled (lazy text mode).")
             return trainer
 
-        # Eager/sized text path: tokenize, mask, and create batches now.
         total_batches_needed = (
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None

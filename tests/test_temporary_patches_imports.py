@@ -26,10 +26,8 @@ import importlib
 import pytest
 
 
-# ---------------------------------------------------------------------------
 # Per-submodule import smoke. Explicit (not a glob) so a silent drop or rename
 # surfaces as a missing test; new files must be added to this list.
-# ---------------------------------------------------------------------------
 
 
 TEMPORARY_PATCHES_SUBMODULES = [
