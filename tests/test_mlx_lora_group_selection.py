@@ -402,3 +402,20 @@ def test_a_root_module_sharing_a_layer_local_name_is_left_alone():
     assert _adapters(model) == [
         "model.layers.0.att_proj", "model.layers.0.attn_out",
         "model.layers.0.ff_out", "model.layers.0.ff_proj"]
+
+
+def test_every_container_discovery_yields_can_be_written_back_into():
+    # Selection is only useful if the pass that adapts can replace what it
+    # found, so discovery must not name a container the writer cannot mutate.
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import _named_child_modules, _navigate, _set_child
+    holder = _build({})
+    holder.as_list = [nn.Linear(4, 4)]
+    holder.as_dict = {"vision": nn.Linear(4, 4)}
+    found = [name for name, _ in _named_child_modules(holder)]
+    assert sorted(found) == ["as_dict.vision", "as_list.0"]
+    for path in found:
+        parent_path, _, leaf = path.rpartition(".")
+        parent = _navigate(holder, parent_path)
+        _set_child(parent, leaf, nn.Linear(4, 4))       # must not raise
+        assert _navigate(holder, path) is not None

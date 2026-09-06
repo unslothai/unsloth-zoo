@@ -6595,7 +6595,9 @@ def _named_child_modules(module):
     for name, child in children.items():
         if isinstance(child, nn.Module):
             found.append((name, child))
-        elif isinstance(child, (list, tuple)):
+        # Lists and mappings only: mlx does not register a tuple as a container,
+        # and a tuple could not be written back into if it did.
+        elif isinstance(child, list):
             found.extend(
                 (f"{name}.{index}", item)
                 for index, item in enumerate(child)
