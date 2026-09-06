@@ -2184,6 +2184,8 @@ def _explicit_position_embedding_adapter(original, replacement):
             return original(self, input_ids, pixel_values, **kwargs)
         return replacement(self, input_ids, pixel_values, **kwargs)
 
+    patched._unsloth_static_vlm_metadata = ("image_grid_thw", "video_grid_thw")
+    patched._unsloth_static_metadata_with_positions = True
     return patched
 
 
@@ -2869,6 +2871,10 @@ def _qwen3_batch_embedding_adapter(
                 )
         return features
 
+    patched._unsloth_static_vlm_metadata = (
+        ("image_grid_thw", "video_grid_thw") if replacement is not None else ()
+    )
+    patched._unsloth_static_metadata_with_positions = True
     patched._unsloth_qwen3_batch_visual_state = True
     patched._unsloth_qwen3_replaces_visual_inference = bool(
         replacement is not None
@@ -4175,6 +4181,9 @@ def _install_paddleocr_vl_compile_patches():
     _patch_method(vision_module.Attention, "__call__", patched_paddle_attention)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_paddle_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "__call__", patched_paddle_vision_call)
+    patched_paddle_get_input_embeddings._unsloth_static_vlm_metadata = (
+        "image_grid_thw", "video_grid_thw",
+    )
     _patch_method(module.Model, "get_input_embeddings", patched_paddle_get_input_embeddings)
     _PATCHED_ARCHES.add("paddleocr_vl")
 
@@ -5688,6 +5697,7 @@ def _install_phi4_multimodal_patches():
             )
             return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
+        patched_phi4_siglip_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
         _patch_method(
             phi4_siglip_module.Model,
             "get_input_embeddings",
@@ -5803,6 +5813,7 @@ def _install_phi4_multimodal_patches():
         return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
     _patch_method(phi4mm_vision_module.VisionTower, "__call__", patched_phi4mm_vision_tower_call)
+    patched_phi4mm_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
     _patch_method(phi4mm_module.Model, "get_input_embeddings", patched_phi4mm_get_input_embeddings)
     _PATCHED_ARCHES.add("phi4mm")
 

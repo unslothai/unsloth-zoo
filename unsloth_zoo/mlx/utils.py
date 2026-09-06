@@ -1234,7 +1234,7 @@ def _identify_vlm_embedding_module(model):
             embed_result = model.get_input_embeddings(ids, None)
         except TypeError:
             embed_result = model.get_input_embeddings(ids)
-        merged, _ = _unpack_embed_result(embed_result, model)
+        merged, _ = _unpack_embed_result(embed_result, model, input_ids=ids)
     except Exception:
         return None
     finally:
@@ -2727,6 +2727,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             and not k.startswith("_unsloth_")
             and v is not None
         }
+        _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
         # Always sent: 13 families declare `mask` without a default. None lets
         # them build the mask they would use for generation.
@@ -2751,7 +2752,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                 **{k: v for k, v in fwd_kwargs.items()
                    if k not in ("mask", "cache")},
             )
-            merged_embeds, embed_kwargs = _unpack_embed_result(embed_result, model)
+            merged_embeds, embed_kwargs = _unpack_embed_result(
+                embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+            )
             scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
             # per_layer_inputs and friends: the merge produced them, and
             # recomputing from ids inside the stack would redo the work.
@@ -2824,7 +2827,20 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
-def _unpack_embed_result(embed_result, model):
+def _apply_static_vlm_metadata(model, batch_dict, kwargs):
+    embedder = getattr(model, "get_input_embeddings", None)
+    keys = getattr(embedder, "_unsloth_static_vlm_metadata", ())
+    if getattr(embedder, "_unsloth_static_metadata_with_positions", False) and (
+        not getattr(model, "training", False) or kwargs.get("position_ids") is None
+    ):
+        return
+    static = batch_dict.get("_unsloth_static_vlm_metadata", {})
+    for key in keys:
+        if key in static:
+            kwargs[key] = static[key]
+
+
+def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=None):
     """Unpack get_input_embeddings result into embeds + backbone kwargs.
 
     Handles plain mx.array returns and the InputEmbeddingsFeatures dataclass
@@ -2862,33 +2878,15 @@ def _unpack_embed_result(embed_result, model):
     else:
         merged_embeds = embed_result
 
-    # Qwen-VL family: some get_input_embeddings paths stash position_ids on the
-    # language model wrapper; the inner backbone needs them explicitly.
-    # Do not override position_ids explicitly returned by InputEmbeddingsFeatures
-    # (for example when the collator passed CUDA-parity mRoPE IDs through the
-    # embedder).
-    # When no position_ids were stashed (e.g. text-only samples or simple
-    # images without grid_thw), generate sequential ones so the backbone
-    # doesn't crash accessing cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
     if lm is not None and "position_ids" not in backbone_kwargs:
-        _MISSING = object()
-        pos_ids = getattr(lm, "_position_ids", _MISSING)
-        if pos_ids is not _MISSING and pos_ids is not None:
+        pos_ids = getattr(lm, "_position_ids", None)
+        if pos_ids is not None:
             backbone_kwargs["position_ids"] = pos_ids
-        elif pos_ids is None:
-            # Fallback: sequential position_ids. Correct for text-only and
-            # single-image samples. For multi-image with spatial m-RoPE
-            # (Qwen VL), the per-axis positions should differ for image
-            # regions — but grid_thw metadata is unavailable here so we
-            # use sequential as an approximation.
-            seq_len = merged_embeds.shape[1]
-            pos_ids = mx.arange(seq_len).reshape(1, -1)
-            pos_ids = mx.broadcast_to(pos_ids, (merged_embeds.shape[0], seq_len))
-            # Qwen VL m-RoPE uses 3 axes: temporal, height, width
-            MROPE_AXES = 3
-            pos_ids = mx.expand_dims(pos_ids, axis=0)
-            pos_ids = mx.tile(pos_ids, (MROPE_AXES, 1, 1))
+        elif (hasattr(lm, "_position_ids") and input_ids is not None
+              and callable(getattr(lm, "get_rope_index", None))):
+            # The model owns the positional axes; a cached field alone says nothing about rank.
+            pos_ids, _ = lm.get_rope_index(input_ids, attention_mask=attention_mask)
             backbone_kwargs["position_ids"] = pos_ids
 
     return merged_embeds, backbone_kwargs
@@ -2943,6 +2941,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         and not k.startswith("_unsloth_")
         and v is not None
     }
+    _apply_static_vlm_metadata(model, batch_dict, extra_kwargs)
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
 
     embed_result = model.get_input_embeddings(
@@ -2951,7 +2950,9 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         mask=fwd_attn_mask,
         **extra_kwargs,
     )
-    merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
+    merged_embeds, backbone_kwargs = _unpack_embed_result(
+        embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+    )
     merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
@@ -3097,24 +3098,6 @@ def _mlx_vlm_canonical_model_type(model_type):
     except Exception:
         pass
     return name.replace("-", "_")
-
-
-# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
-# `.prod()`, `[:, 1:]`). Everything else keeps the tuple the Qwen/Paddle compile
-# patches trace: an array becomes a tracer under mx.compile and `.tolist()` raises.
-_VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
-    "glm4v",
-    "glm_ocr",
-    # Not compile-patched, and opens with `grid_thw.tolist()`.
-    "muse_glimmer",
-    "glm5_next",
-})
-
-
-def _grid_thw_to_mx_array(grid_thw):
-    if grid_thw is None:
-        return None
-    return mx.array(grid_thw, dtype=mx.int32)
 
 
 def _normalize_size_tuples(values):
@@ -3795,23 +3778,19 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    # Resolved, not raw: an aliased config is routed to the canonical family's tower,
-    # so the grid form has to follow it there.
-    grid_as_array = (
-        _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
-    )
-    if image_grid_thw is not None:
-        batch_dict["image_grid_thw"] = (
-            _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
-        )
-    if video_grid_thw is not None:
-        batch_dict["video_grid_thw"] = (
-            _grid_thw_to_mx_array(video_grid_thw) if grid_as_array else video_grid_thw
-        )
+    static_metadata = {}
+    for key, normalized in (
+        ("image_grid_thw", image_grid_thw),
+        ("video_grid_thw", video_grid_thw),
+        ("spatial_shapes", spatial_shapes),
+    ):
+        if normalized is not None:
+            value = batch_dict[key]
+            batch_dict[key] = value if isinstance(value, (mx.array, np.ndarray)) else normalized
+            static_metadata[key] = normalized
+    batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
     if image_sizes is not None:
         batch_dict["image_sizes"] = image_sizes
-    if spatial_shapes is not None:
-        batch_dict["spatial_shapes"] = spatial_shapes
     if images_spatial_crop is not None:
         batch_dict["images_spatial_crop"] = images_spatial_crop
     if audio_embed_sizes is not None:

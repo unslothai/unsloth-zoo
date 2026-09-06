@@ -3820,32 +3820,25 @@ def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
         [7, image_id, 8, audio_id, 9]
     ]
 
-def _prepared_grid(model_type):
+@pytest.mark.parametrize("array_factory", [mx.array, np.array, tuple])
+@pytest.mark.parametrize("key,rows", [
+    ("image_grid_thw", [[1, 16, 12], [2, 8, 4]]),
+    ("video_grid_thw", [[2, 12, 8], [3, 4, 2]]),
+    ("spatial_shapes", [[16, 12], [8, 4]]),
+])
+def test_processor_grid_structure_survives_compile_preparation(array_factory, key, rows):
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
 
-    # "content" is the phase that fixes the grid form; "positions" needs the
-    # per-family token ids a bare model_type config does not carry.
-    return _prepare_vlm_batch_for_compile({
-        "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
-        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
-        "image_grid_thw": mx.array([[1, 16, 16]], dtype=mx.int32),
-    }, {"model_type": model_type, "vision_config": {"hidden_size": 8}},
-        phase="content")
-
-
-def test_array_grid_families_keep_an_indexable_grid():
-    """These vision towers open with `grid_thw.tolist()`; tuples raise there."""
-    for model_type in ("glm4v", "glm_ocr", "muse_glimmer", "glm5_next"):
-        grid = _prepared_grid(model_type)["image_grid_thw"]
-        assert isinstance(grid, mx.array), model_type
-        assert grid.tolist() == [[1, 16, 16]], model_type
-
-
-def test_compile_patched_families_keep_the_traceable_tuple_grid():
-    """Qwen/Paddle patches trace the grid as static metadata, not an array."""
-    for model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "paddleocr_vl"):
-        grid = _prepared_grid(model_type)["image_grid_thw"]
-        assert grid == ((1, 16, 16),), model_type
+    value = array_factory(rows)
+    batch = _prepare_vlm_batch_for_compile({"input_ids": mx.array([[1, 2, 3], [4, 5, 6]]), key: value},
+                                           {"model_type": "new_architecture"}, phase="content")
+    expected = tuple(tuple(row) for row in rows)
+    assert batch["_unsloth_static_vlm_metadata"][key] == expected
+    if array_factory is tuple:
+        assert batch[key] == expected
+    else:
+        assert batch[key] is value
+        assert batch[key].tolist() == rows
 
 
 def _prepared_positions(model_type):
