@@ -253,3 +253,21 @@ def test_a_flag_that_will_not_train_warns_before_the_model_is_touched(
     assert len(_adapters(model, prefix)) == 8
     # Warning, not refusing: the tower really is wrapped, just never trained.
     assert bool(_adapters(model, adapted)) if adapted else True
+
+
+# A connector nested in the tower is skipped so the projector pass can adapt it
+# once. With that pass switched off there is no second pass, and skipping would
+# drop linears the tower walk used to reach.
+@pytest.mark.parametrize("train_projector,adapted_by", [
+    (False, "the tower pass"), (True, "its own pass")],
+    ids=["projector off", "projector on"])
+def test_a_nested_connector_is_adapted_whichever_pass_owns_it(
+        train_projector, adapted_by):
+    model = _vlm(tower=_tower(merger=_GLM_MERGER))
+    _peft(model, finetune_vision_layers=True, train_projector=train_projector)
+    merger = _adapters(model, "vision_tower.merger")
+    assert merger == ["down_proj", "gate_proj", "proj"], adapted_by
+    # Once, not twice: an adapter stacked on an adapter would show a wrapped base.
+    assert not [name for name, module in model.named_modules()
+                if hasattr(module, "lora_a")
+                and hasattr(getattr(module, "linear", None), "lora_a")]

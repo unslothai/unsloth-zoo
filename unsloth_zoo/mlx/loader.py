@@ -6943,10 +6943,9 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
     projector_path = None
     if train_vision and vision_module is None:
         _raise_vision_unresolved(vision_flag, model)
-    # Also resolved when nothing will adapt it, so the tower pass can skip it.
     projector_entries = (
         _resolve_projector_group(model, vision_owner, vision_module, vision_path)
-        if train_projector or (train_vision and targets_defaulted) else []
+        if train_projector else []
     )
     if train_projector:
         if not projector_entries:
@@ -6956,6 +6955,8 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
             projector_path = projector_path.rpartition(".")[0]
 
     # Adapting a nested connector here would stack on the projector pass's base.
+    # Only that pass earns the skip: with `train_projector` off there is no
+    # second pass, and skipping would drop a connector the tower pass reached.
     nested_projectors = [
         attr for owner, attr, _, _ in projector_entries
         if owner is vision_module
