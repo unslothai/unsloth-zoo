@@ -356,3 +356,49 @@ def test_a_tower_of_roleless_linears_says_so_rather_than_claiming_none_exist():
     said = str(excinfo.value)
     assert "holds no linear layer" not in said
     assert "read as attention or MLP" in said and "'patch_dense'" in said
+
+
+# An all-caps prefix runs into the next word, so a tower found only by its class
+# name needs the acronym boundary as well as the camelCase one.
+@pytest.mark.parametrize("name,expected", [
+    ("CLIPVisionModel", {"clip", "vision", "model"}),
+    ("SiglipVisionTransformer", {"siglip", "vision", "transformer"}),
+    ("vision_tower", {"vision", "tower"})])
+def test_a_class_name_splits_on_acronym_boundaries(name, expected):
+    from unsloth_zoo.mlx.loader import _role_tokens
+    assert expected <= _role_tokens(name)
+
+
+def test_a_tower_named_only_by_its_class_still_resolves():
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import _resolve_vision_group
+    # `encoder` says nothing, so only the class name marks this as a tower.
+    tower = _tower()
+    tower.__class__ = type("CLIPVisionModel", (nn.Module,), {})
+    assert _resolve_vision_group(_vlm(tower_attr="encoder", tower=tower))[1] == "encoder"
+
+
+def test_a_module_registered_in_a_mapping_is_reachable():
+    from unsloth_zoo.mlx.loader import _named_child_modules, _navigate
+    model = _vlm(tower_attr="placeholder", tower=_build({"x": (VISION, VISION)}))
+    model.encoders = {"vision": _tower()}
+    assert "encoders.vision" in [name for name, _ in _named_child_modules(model)]
+    assert _navigate(model, "encoders.vision") is not None
+
+
+def test_a_text_side_projection_is_not_the_vision_connector():
+    from unsloth_zoo.mlx.loader import _resolve_vision_group, _resolve_projector_group
+    model = _vlm()
+    model.text_projection = _build({"linear_1": (VISION, HIDDEN)})
+    owner, _, path, tower = _resolve_vision_group(model)
+    assert _resolve_projector_group(model, owner, tower, path) == []
+
+
+def test_a_root_module_sharing_a_layer_local_name_is_left_alone():
+    import mlx.nn as nn
+    model = _text_model([_MOLMO_BLOCK])
+    model.ff_proj = nn.Linear(HIDDEN, HIDDEN)   # an unrelated auxiliary head
+    _peft(model)
+    assert _adapters(model) == [
+        "model.layers.0.att_proj", "model.layers.0.attn_out",
+        "model.layers.0.ff_out", "model.layers.0.ff_proj"]

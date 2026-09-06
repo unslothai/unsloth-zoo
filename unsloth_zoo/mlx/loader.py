@@ -340,10 +340,12 @@ def linear_to_lora_layers(model, num_layers, config):
 
     # Root-module pass: a head named in `keys` sits beside the layers, so the
     # layer walk above never reaches it.
+    # `shared` rather than `keys`: a layer-local path like `ff_proj` can name an
+    # unrelated root module too, and only the caller's own keys belong here.
     root_replacements = [
         (name, _mlx_lora_from_base(module, config, specs=type_specs))
         for name, module in model.named_modules()
-        if name in keys
+        if name in shared
     ]
     if root_replacements:
         model.update_modules(tree_unflatten(root_replacements))
@@ -6556,7 +6558,8 @@ _OTHER_MODALITY_TOKENS = frozenset((
 ))
 _NON_VISION_ROLE_TOKENS = _OTHER_MODALITY_TOKENS | frozenset(("language", "text"))
 # Whole words, not substrings: "sam" occurs inside `itok_upsampler`.
-_ROLE_TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])")
+_ROLE_TOKEN_SPLIT = re.compile(
+    r"[^A-Za-z0-9]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def _role_tokens(name):
@@ -6592,10 +6595,16 @@ def _named_child_modules(module):
     for name, child in children.items():
         if isinstance(child, nn.Module):
             found.append((name, child))
-        elif isinstance(child, list):
+        elif isinstance(child, (list, tuple)):
             found.extend(
                 (f"{name}.{index}", item)
                 for index, item in enumerate(child)
+                if isinstance(item, nn.Module)
+            )
+        elif isinstance(child, dict):
+            found.extend(
+                (f"{name}.{key}", item)
+                for key, item in child.items()
                 if isinstance(item, nn.Module)
             )
     return found
@@ -6611,6 +6620,11 @@ def _navigate(owner, path):
     for segment in str(path).split("."):
         if node is None:
             return None
+        # A plain dict is keyed by the segment itself; a Module is a dict too,
+        # so ask for the attribute there rather than reading its own mapping.
+        if isinstance(node, dict) and not hasattr(node, "named_modules"):
+            node = node.get(segment)
+            continue
         try:
             node = node[int(segment)]
         except (ValueError, TypeError):
@@ -6621,7 +6635,14 @@ def _navigate(owner, path):
 
 
 def _set_child(parent, leaf, value):
+    if isinstance(parent, dict) and not hasattr(parent, "named_modules"):
+        parent[leaf] = value
+        return
     try:
+        # A Module is a dict, so `parent[0]` would insert an int key beside the
+        # attribute named "0" rather than replacing it.
+        if not isinstance(parent, (list, tuple)):
+            raise TypeError
         parent[int(leaf)] = value
     except (ValueError, TypeError):
         setattr(parent, leaf, value)
@@ -6738,7 +6759,9 @@ def _projector_candidates(owner, owner_path, skip, text_hidden_size):
             continue
         if not _reads_as(name, child, _PROJECTOR_ROLE_TOKENS):
             continue
-        if _reads_as(name, child, _OTHER_MODALITY_TOKENS):
+        # `text_projection` reads as a strong connector and feeds the decoder
+        # width, but it is the text side of the model, not the bridge to it.
+        if _reads_as(name, child, _NON_VISION_ROLE_TOKENS):
             continue
         # The decoder is what a connector feeds, not something it holds.
         if _holds_text_decoder(child):
