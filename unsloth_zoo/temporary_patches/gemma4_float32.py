@@ -332,7 +332,18 @@ def patch_Gemma4RMSNorm():
         _gemma4_rms_norm_unscaled     = _gemma4_rms_norm_unscaled,
     )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
+    # NOT named `forward`. The compiler (compiler.create_standalone_class) treats
+    # a replacement forward whose name is still `forward` as the original: it
+    # emits the patched body as a standalone `Gemma4RMSNorm_forward` and then
+    # tries to splice a call to it over the ORIGINAL method's source, which is
+    # no longer what the class attribute holds, so the splice matches nothing
+    # and the compiled class keeps the upstream forward. That forward returns
+    # the input dtype, so under UNSLOTH_FORCE_FLOAT32 the fp32 residual reached
+    # a bf16 q_proj unchanged and the first matmul died with "expected mat1 and
+    # mat2 to have the same dtype, but got: float != c10::BFloat16". A renamed
+    # replacement takes the compiler's other path, which locates the original
+    # `def forward` in the class text and replaces it with a call to this one.
+    def _gemma4_forced_rmsnorm_forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when
         # with_scale. `self` is read in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
@@ -347,7 +358,7 @@ def patch_Gemma4RMSNorm():
     # No `fullgraph`: the kernels are the compiled units; compiling this wrapper too
     # would put `self` back into the guards. Dynamo inlines it anyway when a caller is
     # compiled.
-    patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4RMSNorm, "forward", forward, match_level = "relaxed")
+    patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4RMSNorm, "forward", _gemma4_forced_rmsnorm_forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
 
