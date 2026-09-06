@@ -459,7 +459,14 @@ def _vlm_quantized_cache_gap(model, defaults: GenerationDefaults) -> str | None:
     try:
         from mlx_vlm.models.cache import should_quantize_kv_layer
     except ImportError:
-        should_quantize_kv_layer = lambda index, count: True  # noqa: E731
+        # mlx-vlm only exported this policy as a helper from 0.6.6. Before that the
+        # same rule is inline in generate/ar.py, which builds each layer's batch cache
+        # with `quantize=(i < n - 1 if n > 2 else True)`: a deep stack leaves its last
+        # layer unquantized. Reproducing it keeps the refusal in step with what the
+        # installed release actually does, where assuming every layer quantizes made
+        # this refuse a model mlx-vlm would have batched.
+        def should_quantize_kv_layer(index, count):
+            return True if count <= 2 else index < count - 1
     try:
         entries = list(make_cache())
     except Exception:

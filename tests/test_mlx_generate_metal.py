@@ -408,6 +408,7 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     assert left.lengths.tolist() == [4, 7, -2]
 
 
+@metal_only
 def test_a_penalised_row_answers_the_same_batched_and_alone():
     """A row shown its whole prompt is penalised against text it never sees alone, and the
     two prompts differ in length, so one offset cannot serve both rows."""

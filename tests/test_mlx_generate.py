@@ -1248,7 +1248,7 @@ class _OpenBatchGenerator:
 
 def _open_stream(monkeypatch, generator_type=_OpenBatchGenerator, **defaults):
     """A BatchStream over a fake generator, with the generation lock stubbed out."""
-    import unsloth_zoo.mlx.generate as module
+    from unsloth_zoo.mlx import generate as module
     from unsloth_zoo.mlx.generate import BatchStream
 
     def adapter(model, tok, defaults_):
