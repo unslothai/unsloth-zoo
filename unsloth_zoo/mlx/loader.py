@@ -309,13 +309,22 @@ def linear_to_lora_layers(model, num_layers, config):
     layers = _mlx_language_layers(model)
     type_specs = _mlx_lora_type_specs()
     keys = set(config.get("keys") or ())
+    # Roles are read per layer, so one generic name can be attention beside a
+    # qkv and MLP beside an fc1. Applying the union everywhere would wrap it in
+    # both. Keys the caller added on top of the selection are not layer-local.
+    layer_keys = config.get("layer_keys")
+    if layer_keys is not None and len(layer_keys) != len(layers):
+        layer_keys = None
+    shared = keys - {k for ks in layer_keys for k in ks} if layer_keys else keys
 
     limit = max(int(num_layers), 0)
     attached = 0
-    for layer in layers[max(len(layers) - limit, 0):]:
+    offset = max(len(layers) - limit, 0)
+    for index, layer in enumerate(layers[offset:], start=offset):
+        wanted = (set(layer_keys[index]) | shared) if layer_keys else keys
         replacements = []
         for name, module in layer.named_modules():
-            if name not in keys:
+            if name not in wanted:
                 continue
             replacements.append((
                 name,
@@ -6680,9 +6689,8 @@ def _feeds_text_width(name, module, text_hidden_size):
         return False
     text_hidden_size = int(text_hidden_size)
     reaches = changes = False
-    from .utils import _linear_semantic_dims
     for _, linear in _subtree_linears(module):
-        out_dim, in_dim = _linear_semantic_dims(linear)
+        out_dim, in_dim = _semantic_dims(linear)
         reaches = reaches or out_dim == text_hidden_size
         changes = changes or in_dim != text_hidden_size
     if not reaches:
@@ -6840,7 +6848,9 @@ def _linear_role(path):
         tokens = _role_tokens(segment)
         if tokens & _ATTENTION_PATH_TOKENS:
             return "attention"
-        if tokens & _MLP_PATH_TOKENS:
+        # `feed_forward` splits into two tokens, so the compound needs naming
+        # as well as the joined `feedforward` spelling.
+        if tokens & _MLP_PATH_TOKENS or {"feed", "forward"} <= tokens:
             return "mlp"
     for segment in reversed(segments):
         names = _role_tokens(segment)
@@ -6853,6 +6863,23 @@ def _linear_role(path):
 
 def _under_any(path, prefixes):
     return any(path == p or path.startswith(f"{p}.") for p in prefixes)
+
+
+def _semantic_dims(linear):
+    """Output and input width, reading the axes `_projects` reads.
+
+    `_linear_semantic_dims` takes the first two axes, which for a fused expert
+    stack are the expert count and the output width rather than output and
+    input.
+    """
+    from .utils import _linear_semantic_dims
+    if len(linear.weight.shape) <= 2:
+        return _linear_semantic_dims(linear)
+    out_dim, in_dim = int(linear.weight.shape[-2]), int(linear.weight.shape[-1])
+    bits = getattr(linear, "bits", None)
+    if isinstance(bits, int) and bits > 0 and hasattr(linear, "scales"):
+        in_dim = in_dim * 32 // bits
+    return out_dim, in_dim
 
 
 def _projects(linear):
@@ -6896,12 +6923,20 @@ def _raise_empty_target_modules():
 
 def _raise_group_empty(flag, role, module_path, module, target_modules=None):
     leaf_names = _subtree_linear_leaf_names(module)
-    if target_modules is None or not leaf_names:
+    if not leaf_names:
         raise ValueError(
             f"Unsloth: {flag}=True, but the {role} at {module_path!r} holds no "
             f"linear layer to adapt. Its modules are "
             f"{_child_names(module)!r}. Set "
             f"{flag}=False."
+        )
+    if target_modules is None:
+        raise ValueError(
+            f"Unsloth: {flag}=True, but none of the linear layers in the {role} "
+            f"at {module_path!r} read as attention or MLP, so the group flags "
+            f"select none of them. They are named {leaf_names!r}. Pass "
+            f"target_modules with names from that list to train the {role} "
+            f"anyway, or set {flag}=False."
         )
     raise ValueError(
         f"Unsloth: {flag}=True selected no LoRA target inside the {role} at "
@@ -7101,10 +7136,16 @@ def _language_lora_keys(model, target_modules, targets_defaulted,
     """
     if targets_defaulted:
         keys = set()
-        for root in _mlx_language_layers(model):
-            keys.update(_role_selected_paths(root, attention, mlp))
+        for selected in _language_layer_keys(model, attention, mlp):
+            keys.update(selected)
         return keys
     return _resolve_lora_keys(model, target_modules)
+
+
+def _language_layer_keys(model, attention, mlp):
+    """Each decoder layer's own role selection, in layer order."""
+    return [set(_role_selected_paths(root, attention, mlp))
+            for root in _mlx_language_layers(model)]
 
 
 def _raise_no_lora_targets(target_modules):
@@ -8768,6 +8809,11 @@ class FastMLXModel:
                         finetune_attention_modules, finetune_mlp_modules)
                     if finetune_language_layers else None
                 )
+                language_layer_keys = (
+                    _language_layer_keys(lm, finetune_attention_modules,
+                                         finetune_mlp_modules)
+                    if targets_defaulted and finetune_language_layers else None
+                )
                 language_lora_keys = set(language_lora_keys or set()) | _vlm_lm_head_keys
                 if len(language_lora_keys) > 0:
                     # Compat patch (older mlx-lm rejects scale=/dropout= on
@@ -8781,7 +8827,8 @@ class FastMLXModel:
                     language_lora_count = linear_to_lora_layers(
                         lm,
                         num_layers=num_layers,
-                        config={**lora_config, "keys": language_lora_keys},
+                        config={**lora_config, "keys": language_lora_keys,
+                                "layer_keys": language_layer_keys},
                     )
 
             # LoRA beats unfreezing raw weights since many projectors are
@@ -8849,6 +8896,11 @@ class FastMLXModel:
                     finetune_attention_modules, finetune_mlp_modules)
                 if finetune_language_layers else None
             )
+            language_layer_keys = (
+                _language_layer_keys(model, finetune_attention_modules,
+                                     finetune_mlp_modules)
+                if targets_defaulted and finetune_language_layers else None
+            )
             if _cpt_lm_head_keys or _cpt_full_specs:
                 # Empty layer targets are valid here (full modules / an lm_head
                 # adapter still train); never fall through to auto-discovery.
@@ -8874,7 +8926,8 @@ class FastMLXModel:
                 language_lora_count = linear_to_lora_layers(
                     model,
                     num_layers=num_layers,
-                    config={**lora_config, "keys": language_lora_keys},
+                    config={**lora_config, "keys": language_lora_keys,
+                            "layer_keys": language_layer_keys},
                 )
                 if language_lora_count == 0:
                     _raise_no_lora_targets(target_modules)

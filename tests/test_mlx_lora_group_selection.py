@@ -281,7 +281,8 @@ def test_a_refusal_on_the_defaulted_path_names_no_target_modules():
     model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, HIDDEN)}))
     with pytest.raises(ValueError) as excinfo:
         _peft(model, finetune_vision_layers=True)
-    assert "target_modules" not in str(excinfo.value)
+    # Suggesting one is fine; quoting back a list they never passed is not.
+    assert "target_modules=" not in str(excinfo.value)
     assert "'patch_dense'" in str(excinfo.value)
     # A vocabulary the caller did pass is still worth naming back to them.
     model = _vlm(tower=_tower(merger=_GLM_MERGER))
@@ -305,3 +306,53 @@ def test_a_tower_holding_routed_experts_adapts_them(mixed):
     adapted = _adapters(model, "vision_tower")
     assert "blocks.0.mlp.switch_mlp" in adapted
     assert ("blocks.0.attn.qkv" in adapted) is mixed
+
+
+# `feed_forward` splits into two tokens, so the joined spelling in the MLP table
+# did not reach it and the whole block lost its role.
+@pytest.mark.parametrize("block_name,role", [
+    ("feed_forward", "mlp"), ("feedforward", "mlp"), ("ffn", "mlp"),
+    ("mlp", "mlp"), ("self_attn", "attention")])
+def test_an_enclosing_block_names_its_role_however_it_is_spelled(block_name, role):
+    from unsloth_zoo.mlx.loader import _linear_role
+    assert _linear_role(f"{block_name}.dense_h_to_4h") == role
+
+
+def test_a_block_spelled_feed_forward_is_adapted_by_the_mlp_flag():
+    model = _text_model([{"self_attn": {"q_proj": (HIDDEN, HIDDEN)},
+                          "feed_forward": {"dense_h_to_4h": (HIDDEN, HIDDEN),
+                                           "dense_4h_to_h": (HIDDEN, HIDDEN)}}])
+    _peft(model)
+    assert _adapters(model, "model.layers.0") == [
+        "feed_forward.dense_4h_to_h", "feed_forward.dense_h_to_4h",
+        "self_attn.q_proj"]
+
+
+# A role is read per layer, so the same generic name can be attention beside a
+# qkv and MLP beside an fc1. Unioning the layers wrapped it in both.
+def test_a_role_read_in_one_layer_does_not_reach_another():
+    model = _text_model([{"mixer": {"qkv": (HIDDEN, HIDDEN * 3),
+                                    "proj": (HIDDEN, HIDDEN)}},
+                         {"mixer": {"fc1": (HIDDEN, HIDDEN),
+                                    "proj": (HIDDEN, HIDDEN)}}])
+    _peft(model, finetune_mlp_modules=False)
+    assert _adapters(model, "model.layers.0") == ["mixer.proj", "mixer.qkv"]
+    assert _adapters(model, "model.layers.1") == []
+
+
+def test_a_fused_expert_stack_reports_output_width_not_expert_count():
+    switch_layers = pytest.importorskip("mlx_lm.models.switch_layers")
+    from unsloth_zoo.mlx.loader import _semantic_dims
+    # (experts, out, in): the first axis counts experts, not outputs.
+    assert _semantic_dims(switch_layers.SwitchLinear(HIDDEN, 7, 4)) == (7, HIDDEN)
+    import mlx.nn as nn
+    assert _semantic_dims(nn.Linear(HIDDEN, 7)) == (7, HIDDEN)
+
+
+def test_a_tower_of_roleless_linears_says_so_rather_than_claiming_none_exist():
+    model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, HIDDEN)}))
+    with pytest.raises(ValueError) as excinfo:
+        _peft(model, finetune_vision_layers=True)
+    said = str(excinfo.value)
+    assert "holds no linear layer" not in said
+    assert "read as attention or MLP" in said and "'patch_dense'" in said
