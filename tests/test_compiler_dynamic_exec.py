@@ -145,21 +145,69 @@ def _restore_torch_nn_forwards():
     `Repo tests (CPU)`, so CI does not currently put them in one process. That
     is a scheduling accident and not a property worth relying on.
 
-    Restored by identity against a snapshot rather than by deleting the
-    attribute: several of these classes legitimately define their own forward,
-    and deleting would expose an inherited one instead.
+    Two directions, because the loop patches by assignment and assignment does
+    not care whether the class had a forward of its own.
+
+    A class that owned one gets it put back by identity rather than deleted:
+    several of these legitimately define their own, and deleting would expose
+    an inherited one instead.
+
+    A class that owned none has to have the attribute deleted, not restored,
+    and this is the half worth stating. ``BatchNorm1d``, ``BatchNorm2d`` and
+    ``BatchNorm3d`` inherit ``forward`` from ``_BatchNorm``, so they are absent
+    from the snapshot; the loop then gives each one a real attribute it never
+    had. Restoring only the recorded names leaves those three rewritten, which
+    is exactly what an audit of what survives teardown found still leaking
+    after the first version of this fixture.
     """
     before = _own_torch_nn_forwards()
     try:
         yield
     finally:
-        if not before:
+        if before is None:
             return
         import torch
-        for name, original in before.items():
-            cls = getattr(torch.nn, name, None)
-            if isinstance(cls, type) and vars(cls).get("forward") is not original:
-                cls.forward = original
+        for name, obj in vars(torch.nn).items():
+            if not isinstance(obj, type):
+                continue
+            current = vars(obj).get("forward")
+            if current is None:
+                continue
+            if name in before:
+                if current is not before[name]:
+                    obj.forward = before[name]
+            else:
+                delattr(obj, "forward")
+
+
+@pytest.fixture(autouse = True)
+def _restore_unsloth_env():
+    """Undo the ``UNSLOTH_*`` variables the compiler sets on its way through.
+
+    ``monkeypatch`` only knows about what the *test* set. The compiler writes
+    to ``os.environ`` itself, and an audit of what survives teardown found
+    three escaping every drive:
+
+        UNSLOTH_FULLGRAPH                 unset -> '1'
+        UNSLOTH_HIGH_PRECISION_LAYERNORM  unset -> '0'
+        UNSLOTH_RETURN_LOGITS             unset -> '0'
+
+    ``UNSLOTH_FULLGRAPH`` in particular changes how later tests compile, and
+    the module that set it is long gone by then. Restoring the whole
+    ``UNSLOTH_*`` namespace to its snapshot is idempotent with respect to
+    ``monkeypatch``, which puts the same original values back whichever of the
+    two finalizers runs first.
+    """
+    before = {k: v for k, v in os.environ.items() if k.startswith("UNSLOTH_")}
+    try:
+        yield
+    finally:
+        for key in [k for k in os.environ if k.startswith("UNSLOTH_")]:
+            if key not in before:
+                del os.environ[key]
+        for key, value in before.items():
+            if os.environ.get(key) != value:
+                os.environ[key] = value
 
 
 # Model types the zoo compiler drives end-to-end (from its call sites).
