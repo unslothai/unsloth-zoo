@@ -204,7 +204,7 @@ def test_a_bare_return_is_the_functions_contract():
 
 
 def _nn_patch_region() -> str:
-    i = SRC.index("source = inspect.getsource(function.forward).rstrip()")
+    i = SRC.index("source = inspect.getsource(original_forward).rstrip()")
     return SRC[max(0, i - 1600):i + 1400]
 
 
@@ -222,7 +222,7 @@ def test_the_nn_forward_patch_loop_is_guarded():
     forward is unreadable -- both measured, not assumed. This guards a state
     we have observed rather than encoding a theory about how it arises.
     """
-    guards = _getsource_guards("inspect.getsource(function.forward)")
+    guards = _getsource_guards("inspect.getsource(original_forward)")
     assert guards, "the forward getsource is no longer inside a try"
     for caught in guards:
         assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
@@ -242,7 +242,7 @@ def test_an_unreadable_forward_is_skipped_not_fatal():
     # Exactly the try whose body IS this assignment -- several other blocks
     # also call getsource on a forward, and their handlers legitimately do
     # something else.
-    target = "source = inspect.getsource(function.forward).rstrip()"
+    target = "source = inspect.getsource(original_forward).rstrip()"
     handlers = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try) or len(node.body) != 1:
@@ -272,7 +272,7 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    sites = {"inspect.getsource(modeling_file)", "inspect.getsource(function.forward)"}
+    sites = {"inspect.getsource(modeling_file)", "inspect.getsource(original_forward)"}
     for call in sites:
         guards = _getsource_guards(call)
         assert guards and all(
