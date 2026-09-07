@@ -374,6 +374,7 @@ jobs:
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
             tests/test_disabled_hook_checkpoint_guard.py \
+            tests/test_conftest_module_leak_gate.py \
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
             -v
