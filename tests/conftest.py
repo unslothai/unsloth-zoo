@@ -371,9 +371,17 @@ def pytest_runtest_teardown(item, nextitem):
             continue
         leaked.append(name)
     if leaked:
+        # Naming the file is the whole diagnosis for the bare names: whether the copy
+        # is a leak or the compile folder doing its job is a question about where it
+        # was read from, and without this the report is the same either way.
+        where = ", ".join(
+            f"{n} from {getattr(_sys.modules.get(n), '__file__', None)!r}"
+            for n in leaked
+        )
         raise AssertionError(
-            f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back, "
+            f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back "
+            f"({where}), "
             f"so every later test in this process imports the substitute. Use "
-            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown, or "
+            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown, or"
             f"save and restore the entry by hand where the import itself installs it."
         )
