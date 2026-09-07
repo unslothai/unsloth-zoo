@@ -30,6 +30,7 @@ import ast
 import importlib
 import inspect
 import os
+import sys
 import textwrap
 
 import pytest
@@ -54,6 +55,56 @@ def _compile_disabled(monkeypatch):
     instead. Scoped and undone here, the setting reaches only this module.
     """
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
+
+
+@pytest.fixture(autouse = True)
+def _unimport_the_compile_folder(monkeypatch):
+    """Take back out of ``sys.modules`` whatever the compile folder put in.
+
+    Driving ``unsloth_compile_transformers`` writes a generated module and then
+    imports it, and a generated MoE module imports its helpers by bare name --
+    ``moe_utils`` and friends resolve only because the compile folder is on
+    ``sys.path``. Nothing in the installed environment provides that name, so
+    the import IS the swap, and the module it leaves behind outlives the
+    directory it was read from. Every later test in the process that imports it
+    bare then gets a stale copy, and because the generated module swallows that
+    import it loads reporting success with its backend names undefined. That is
+    #1168's failure, arriving here by a second route: it fixed the leak in
+    test_moe_weight_preprocessor_registry_shared.py and added the gate that now
+    catches this one on `Core drift`, where a newer transformers takes the
+    qwen3_moe path that emits the import.
+
+    Keyed on where a module was loaded from rather than on a list of names, so a
+    generated module that starts importing some new helper is covered without
+    anyone remembering to add it here.
+
+    ``monkeypatch`` is requested for its teardown ordering, not for its API:
+    depending on it puts this finalizer ahead of the env being unpatched, so
+    ``get_compile_folder()`` below still resolves the folder the test used.
+    """
+    before = dict(sys.modules)
+    try:
+        yield
+    finally:
+        try:
+            folder, _ = compiler.get_compile_folder()
+            root = os.path.realpath(folder)
+        except Exception:
+            return
+        for name, module in list(sys.modules.items()):
+            path = getattr(module, "__file__", None)
+            if not path:
+                continue
+            try:
+                resolved = os.path.realpath(path)
+            except (OSError, ValueError):
+                continue
+            if resolved != root and not resolved.startswith(root + os.sep):
+                continue
+            if name in before:
+                sys.modules[name] = before[name]
+            else:
+                del sys.modules[name]
 
 
 # Model types the zoo compiler drives end-to-end (from its call sites).
