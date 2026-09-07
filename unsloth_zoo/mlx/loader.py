@@ -2643,7 +2643,7 @@ def _paligemma_replace_mask(features, token_type_ids, attention_mask):
     Without token types there is no prefix boundary to derive, so upstream's mask
     is left as it is rather than guessed at.
     """
-    if token_type_ids is None or features.attention_mask_4d is None:
+    if token_type_ids is None:
         return features
     features.attention_mask_4d = _paligemma_prefix_lm_mask(
         token_type_ids, attention_mask,

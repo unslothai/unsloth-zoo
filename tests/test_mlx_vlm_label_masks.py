@@ -2335,10 +2335,13 @@ def test_paligemma_mask_is_left_alone_without_token_types():
     untouched = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=outer_product), None, padding)
     assert untouched.attention_mask_4d is outer_product
-    # Nor when upstream built no mask at all, e.g. a text-only batch.
-    assert _paligemma_replace_mask(
+    text_mask = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=None),
-        mx_.zeros((1, 4), dtype=mx_.int32), padding).attention_mask_4d is None
+        mx_.array([[0, 0, 1, 1], [0, 0, 0, 1]]), mx_.ones((2, 4)),
+    ).attention_mask_4d
+    visible = np.asarray(text_mask).reshape(2, 4, 4)
+    assert visible[0, 0, 1] and visible[1, 0, 2]
+    assert not visible[0, 0, 2] and not visible[1, 2, 3]
     replaced = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=outer_product),
         mx_.array([[0, 0, 1, 1]], dtype=mx_.int32), padding)
@@ -2346,14 +2349,15 @@ def test_paligemma_mask_is_left_alone_without_token_types():
     assert not np.asarray(replaced.attention_mask_4d).reshape(4, 4)[2, 3]
 
 
-def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
+@pytest.mark.parametrize("has_native_mask", [False, True])
+def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped(has_native_mask):
     """The wrapper is what actually reaches a loaded model, so it has to hand the
     token types on rather than return upstream's mask untouched."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.loader import _paligemma_causal_mask_wrapper
 
     mx_ = _utils_mx()
-    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_) if has_native_mask else None
     seen = {}
 
     def original(_self, input_ids=None, pixel_values=None, mask=None, **kwargs):
@@ -2370,7 +2374,8 @@ def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
     assert not np.asarray(got.attention_mask_4d).reshape(4, 4)[2, 3]
 
 
-def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
+@pytest.mark.parametrize("has_native_mask", [False, True])
+def test_paligemma_plain_loss_path_also_gets_the_causal_suffix(has_native_mask):
     """Upstream's call embeds with a fixed three arguments, dropping the token
     types, so without threading them the `use_cce=False` path keeps leaking."""
     from types import SimpleNamespace
@@ -2380,7 +2385,7 @@ def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
     )
 
     mx_ = _utils_mx()
-    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_) if has_native_mask else None
     padding = mx_.ones((1, 4), dtype=mx_.int32)
     seen = {}
 
@@ -5545,3 +5550,21 @@ def test_vlm_component_kwargs_preserve_expansion_and_modality_options(drops_padd
 
     output = _call_vlm_processor(Processor(), (), dict(text=["a#", "bb#"], images=[2, 3], size=4, padding=True))
     assert output == {"input_ids": [[3], [4]], "pixel_values": [8, 12], "padding": True}
+
+@pytest.mark.parametrize("existing_pad", [None, "[UNK]"])
+def test_image_free_vlm_calls_use_the_padded_tokenizer(existing_pad):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "[EOS]": 1, "a": 2, "b": 3}))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="[EOS]",
+                                       unk_token="[UNK]", pad_token=existing_pad, model_input_names=["input_ids", "attention_mask"])
+    processor = mock.Mock(spec=["tokenizer", "image_processor"], tokenizer=tokenizer, image_processor=object())
+    processor.side_effect = AssertionError("image processor must not receive text-only calls")
+    inputs = _processor_vlm_inputs(processor, ["a b", "b"], [[], []], 8)
+    assert inputs["input_ids"].tolist() == [[2, 3], [3, 1 if existing_pad is None else 0]]
+    assert inputs["attention_mask"].tolist() == [[1, 1], [1, 0]]
+    processor.assert_not_called()
+    assert tokenizer.pad_token == (existing_pad or "[EOS]")
+

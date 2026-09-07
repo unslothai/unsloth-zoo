@@ -7986,6 +7986,8 @@ class MLXTrainer:
             model_type=model_type,
             strict=False,
         )
+        from .utils import _ensure_vlm_pad_token
+        _ensure_vlm_pad_token(processor)
         self.processor = processor
         return processor
 

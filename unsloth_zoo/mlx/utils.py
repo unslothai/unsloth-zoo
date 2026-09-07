@@ -2449,6 +2449,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         if attention_np.dtype == np.float64:
             attention_np = attention_np.astype(np.float32)
         mask = mask | (attention_np.astype(np.int32) == 0)
+    if inputs.get("_unsloth_suffix_only_loss", False):
+        mask = mask | (np.asarray(inputs["token_type_ids"]) == 0)
     return mask
 
 def _reject_mlx_valued_vlm(context):
@@ -2629,6 +2631,9 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     if attention_mask is not None:
         ignore = mx.array(ignore_index, dtype=labels.dtype)
         labels = mx.where(attention_mask == 0, ignore, labels)
+    if batch_dict.get("_unsloth_suffix_only_loss", False):
+        labels = mx.where(batch_dict["token_type_ids"] == 0,
+                          mx.array(ignore_index, dtype=labels.dtype), labels)
     return labels
 
 
@@ -8037,6 +8042,15 @@ def _drop_unsupported_processor_kwargs(processor, kwargs):
     return {k: v for k, v in kwargs.items() if k in params}
 
 
+def _ensure_vlm_pad_token(processor):
+    tokenizer = _get_processor_tokenizer(processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        eos = getattr(tokenizer, "eos_token", None)
+        if eos is not None:
+            tokenizer.pad_token = eos
+    return tokenizer
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -8047,6 +8061,12 @@ def _processor_vlm_inputs(
     padding_side=None,
     all_audio=None,
 ):
+    tokenizer = _ensure_vlm_pad_token(processor)
+    images = _format_vlm_images_for_processor(all_images, processor=processor)
+    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
+    text_only = images is None and audio is None and callable(tokenizer)
+    if text_only:
+        processor = tokenizer
     base_kwargs = dict(
         text=texts,
         padding=True,
@@ -8054,7 +8074,6 @@ def _processor_vlm_inputs(
         add_special_tokens=False,
     )
     base_kwargs = _drop_unsupported_processor_kwargs(processor, base_kwargs)
-    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
     audio_kwarg = None
     if audio is not None:
         audio_kwarg = _vlm_processor_audio_kwarg(processor)
@@ -8093,7 +8112,6 @@ def _processor_vlm_inputs(
             ))
     if padding_side is not None:
         base_kwargs["padding_side"] = padding_side
-    images = _format_vlm_images_for_processor(all_images, processor=processor)
     if images is not None:
         image_layouts = (
             ("nested", "flat")
@@ -8103,7 +8121,12 @@ def _processor_vlm_inputs(
     else:
         image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
-        base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
+        base_kwargs["text_pair" if text_only else "suffix"] = [
+            (suffix or "") + (getattr(tokenizer, "eos_token", None) or "")
+            if text_only else (suffix or "") for suffix in suffixes
+        ]
+        if text_only:
+            base_kwargs["return_token_type_ids"] = True
     if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
@@ -8176,7 +8199,14 @@ def _processor_vlm_inputs(
         raise first_error
 
     if audio_kwarg is None:
-        return _run_layouts()
+        inputs = _run_layouts()
+        if text_only and "text_pair" in base_kwargs:
+            inputs["labels"] = np.where(
+                np.asarray(inputs["token_type_ids"]) == 0, -100,
+                np.asarray(inputs["input_ids"]),
+            )
+            inputs["_unsloth_suffix_only_loss"] = True
+        return inputs
 
     def _run_audio_layouts():
         return _repair_audio_batch(
