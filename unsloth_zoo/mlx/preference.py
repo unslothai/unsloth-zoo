@@ -637,6 +637,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
         "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
+        "_reference",
     )
 
     def __init__(
@@ -654,6 +655,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self._visit_policy = "identity"
         self._visit_seed = None
         self._visit_epoch_cache = None
+        self._reference = None
         self._widths = tuple(self._raw_width(batch) for batch in self._schedule)
 
     @property
@@ -672,23 +674,33 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     def cycle_length(self):
         return self._cycle_length
 
+    @property
+    def reference_logps(self):
+        return self._reference
+
+    def set_reference_logps(self, table):
+        """Install ``(rows, 2)`` reference log probabilities, chosen then rejected."""
+        table = np.asarray(table, dtype=np.float32)
+        if table.shape != (len(self._rows), 2):
+            raise ValueError(
+                "Unsloth MLX DPO: the reference table must hold one (chosen, "
+                "rejected) pair per row."
+            )
+        self._reference = table
+
     def __len__(self):
         return len(self._schedule)
 
     def _raw_width(self, batch):
-        raw = max(
-            max(len(self._rows[index].chosen), len(self._rows[index].rejected))
-            for index in batch
-        )
-        return _finite_text_pad_width(
-            raw, pad_to_multiple=32, minimum_width=2,
-            max_seq_length=self.max_seq_length,
+        return _preference_width(
+            [self._rows[index] for index in batch], self.max_seq_length,
         )
 
     def batch_width(self, index):
         return self._widths[index]
 
     def batch_family(self, index):
+        # The precomputed reference element is shaped by the pair count the family keys on.
         pairs = len(self._schedule[index])
         return (
             "preference_tuple_3",
@@ -747,7 +759,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
                                 for step in range(start, end))
         indices = np.full(capacity, -1, dtype=np.int32)
         indices[:len(selected)] = selected
-        return (*batch, mx.array(indices))
+        return (*batch[:3], mx.array(indices), *batch[4:])
 
     def materialize(self, index, *, phase=None):
         indices = self._schedule[index]
@@ -756,21 +768,17 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         if self._shape_plan is not None and phase is not None:
             family = self.batch_family(index)
             width = self._shape_plan.endpoint_for(family, width)
-        batch = np.full((2 * len(rows), width), self.pad_id, dtype=np.int32)
-        lengths = np.zeros((2 * len(rows), 2), dtype=np.int32)
-        for offset, row in enumerate(rows):
-            for output_row, values, prompt_length in (
-                (offset, row.chosen, len(row.chosen_prompt_ids)),
-                (
-                    offset + len(rows), row.rejected,
-                    len(row.rejected_prompt_ids),
-                ),
-            ):
-                size = min(len(values), width)
-                batch[output_row, :size] = values[:size]
-                lengths[output_row] = (prompt_length, size)
-        return mx.array(batch), mx.array(lengths), mx.array(
-            self._normalizers[index], dtype=mx.int32,
+        batch, lengths = _pack_rows(rows, width, self.pad_id)
+        materialized = (
+            mx.array(batch), mx.array(lengths),
+            mx.array(self._normalizers[index], dtype=mx.int32),
+        )
+        if self._reference is None:
+            return materialized
+        held = self._reference[list(indices)]
+        # Position four is the compaction indices, filled by prepare_cce_batch.
+        return materialized + (
+            None, mx.array(np.concatenate([held[:, 0], held[:, 1]])),
         )
 
     def __getitem__(self, index):
@@ -778,6 +786,48 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
 
     def materialize_all(self):
         return [self[index] for index in range(len(self))]
+
+
+def _preference_width(rows, max_seq_length):
+    raw = max(max(len(row.chosen), len(row.rejected)) for row in rows)
+    return _finite_text_pad_width(
+        raw, pad_to_multiple=32, minimum_width=2, max_seq_length=max_seq_length,
+    )
+
+
+def _pack_rows(rows, width, pad_id):
+    batch = np.full((2 * len(rows), width), pad_id, dtype=np.int32)
+    lengths = np.zeros((2 * len(rows), 2), dtype=np.int32)
+    for offset, row in enumerate(rows):
+        for output_row, values, prompt_length in (
+            (offset, row.chosen, len(row.chosen_prompt_ids)),
+            (offset + len(rows), row.rejected, len(row.rejected_prompt_ids)),
+        ):
+            size = min(len(values), width)
+            batch[output_row, :size] = values[:size]
+            lengths[output_row] = (prompt_length, size)
+    return batch, lengths
+
+
+def precompute_reference_logps(plan, model, reference_policy, *, batch_size):
+    """Score every row of ``plan`` once, ``batch_size`` pairs at a time, and hand
+    the plan the table its batches carry. A row's value is the live forward's at
+    its chunk's shape; the kernels round differently at another."""
+    rows = plan.rows
+    batch_size = max(1, int(batch_size))
+    table = np.zeros((len(rows), 2), dtype=np.float32)
+    for start in range(0, len(rows), batch_size):
+        chunk = rows[start:start + batch_size]
+        batch, lengths = _pack_rows(
+            chunk, _preference_width(chunk, plan.max_seq_length), plan.pad_id,
+        )
+        logps = reference_policy.forward(model, mx.array(batch), mx.array(lengths))
+        mx.eval(logps)
+        values = logps.tolist()
+        table[start:start + len(chunk), 0] = values[:len(chunk)]
+        table[start:start + len(chunk), 1] = values[len(chunk):]
+    plan.set_reference_logps(table)
+    return table
 
 
 def _window_normalizers(rows, schedule, cycle_length, grad_accum):
@@ -1056,6 +1106,7 @@ class ReferencePolicy:
         self.paths = tuple(paths)
         self.mirrored = tuple(mirrored)
         self.neftune_modules = tuple(neftune_modules)
+        self.released = False
 
     @property
     def state(self):
@@ -1066,6 +1117,11 @@ class ReferencePolicy:
     def activate(self, model):
         """Yield the module to score with; overrides go on the owning module,
         where value_and_grad installs its tracers, so the swap holds in a trace."""
+        if self.released:
+            raise RuntimeError(
+                "Unsloth MLX DPO: the reference was released once its log "
+                "probabilities were precomputed."
+            )
         if self.model is not None:
             yield self.model
             return
@@ -1095,6 +1151,13 @@ class ReferencePolicy:
         scorer = _response_logps if response_scorer is None else response_scorer
         with self.activate(model) as reference:
             return mx.stop_gradient(scorer(reference, batch, lengths))
+
+    def release(self):
+        """Drop a snapshot's arrays; a reference model is the caller's and stays."""
+        if self.model is None:
+            self.values.clear()
+            self.targets = ()
+        self.released = True
 
     def _synced_tensor(self, index):
         if self.model is None:
@@ -1435,10 +1498,10 @@ def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
     _require_kind(objective, "dpo")
     _require_reference(objective, reference_policy)
 
-    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None, reference=None):
         terms, stats = _dpo_scores(
             model, batch, lengths, objective, reference_policy=reference_policy,
-            scorer=_scorer, cce_indices=cce_indices,
+            scorer=_scorer, cce_indices=cce_indices, reference=reference,
         )
         pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
@@ -1740,7 +1803,8 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
 
 
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
-                scorer=None, cce_indices=None):
+                scorer=None, cce_indices=None, reference=None):
+    """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
     pairs = batch.shape[0] // 2
     logits = logit_totals = None
     if scorer is None:
@@ -1750,7 +1814,9 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
         ce, sums = scorer(model, batch, mask > 0, cce_indices)
         logit_totals = _logit_totals(sums, mask, scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
-    if objective.reference_free:
+    if reference is not None:
+        reference = reference.astype(logps.dtype)
+    elif objective.reference_free:
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
     elif scorer is not None and reference_policy.model is None:
         def response_scorer(model, batch, _lengths):
@@ -1797,7 +1863,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     beta = objective.beta
     scorer = None if model is None else _make_preference_cce_scorer(model)
 
-    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None):
+    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
         pairs = batch.shape[0] // 2
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
@@ -1811,7 +1877,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
             terms, stats = _dpo_scores(
                 model, batch, lengths, objective,
                 reference_policy=reference_policy,
-                scorer=scorer, cce_indices=cce_indices,
+                scorer=scorer, cce_indices=cce_indices, reference=reference,
             )
             loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
