@@ -973,11 +973,12 @@ class PreferenceRunContext:
 
 
 class ReferencePolicy:
-    """The frozen policy a referenced DPO run scores against: the policy model
-    under overrides (a ``scale`` per adapter module, an array per parameter)
-    while active, for a loss forward, a compiled step, or a whole decode."""
+    """The frozen policy a referenced DPO run scores against: a model of its own,
+    or the policy model under overrides (a ``scale`` per adapter module, an
+    array per parameter) while active."""
 
-    def __init__(self, *, scales=(), overrides=(), neftune_modules=()):
+    def __init__(self, *, model=None, scales=(), overrides=(), neftune_modules=()):
+        self.model = model
         # Scales are floats, apart from ``values``, the list a compiled step captures.
         self.scales = tuple(scales)
         self.targets = tuple((module, name) for module, name, _ in overrides)
@@ -987,12 +988,15 @@ class ReferencePolicy:
     @property
     def state(self):
         """What a compiled step captures to read the reference afresh each call."""
-        return self.values
+        return self.values if self.model is None else self.model.state
 
     @contextmanager
     def activate(self, model):
-        """Yield ``model`` under the overrides, set on the owning module where
-        value_and_grad installs its tracers, so the swap holds inside a trace."""
+        """Yield the module to score with; overrides go on the owning module,
+        where value_and_grad installs its tracers, so the swap holds in a trace."""
+        if self.model is not None:
+            yield self.model
+            return
         saved_scales = [module.scale for module, _ in self.scales]
         saved_values = [getattr(module, name) for module, name in self.targets]
         noise = [
@@ -1595,7 +1599,9 @@ def _owner_of(by_name, parameter_path):
     if module is None:
         raise ValueError(
             f"Unsloth MLX DPO: the reference cannot stand in for "
-            f"{parameter_path!r}, which no module of the model owns."
+            f"{parameter_path!r}, which no module of the model owns: a "
+            "parameter held in a list or dict is not supported for a "
+            "referenced run. Use reference_free=True."
         )
     return module, attribute
 
@@ -1658,11 +1664,21 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
     return None if scale is None else float(scale), overrides, set(tensors)
 
 
+def _check_provenance(resume_provenance, provenance):
+    if resume_provenance is not None and resume_provenance != provenance:
+        raise ValueError(
+            "Unsloth MLX DPO: the checkpoint reference provenance does not match "
+            "this model, adapter layout, or reference."
+        )
+
+
 def build_reference_policy(
     model, *, reference_free, resume_provenance, neftune=(),
     ref_adapter_name=None, model_adapter_name=None,
+    ref_model=None, force_use_ref_model=False,
 ):
-    """Validate the run's reference and construct the policy that computes it."""
+    """Validate the run's reference and construct its policy, in TRL's order: a
+    ``ref_model``, else the adapters disabled, else the starting weights."""
     if reference_free:
         return None, {"kind": "reference_free"}
     if model_adapter_name not in (None, "default"):
@@ -1673,20 +1689,12 @@ def build_reference_policy(
             "the directory of the saved adapter to score against."
         )
     named_modules = list(iter_mlx_lora_modules(model))
-    if not named_modules:
-        raise ValueError(
-            "Unsloth MLX DPO: referenced training requires LoRA or DoRA "
-            "adapters. Use reference_free=True for full fine-tuning."
-        )
-    adapters = collect_mlx_lora_adapter_tensors(model)
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
-    if not any(name in adapters for name in trainable):
+    if not trainable:
         raise ValueError(
-            "Unsloth MLX DPO: referenced training requires at least one "
-            "trainable LoRA adapter tensor."
+            "Unsloth MLX DPO: this model has no trainable parameters to "
+            "reference."
         )
-    modules = [module for _, module in named_modules]
-    by_name = dict(model.named_modules())
     provenance = {
         # Also DoRA's base; checkpoints from when only LoRA was accepted still resume.
         "kind": "plain_lora_base",
@@ -1695,14 +1703,67 @@ def build_reference_policy(
         "base_commit": getattr(model, "_unsloth_base_commit_hash", None),
         "adapter_modules": [name for name, _ in named_modules],
     }
+    if ref_model is not None:
+        if not hasattr(ref_model, "parameters"):
+            raise ValueError(
+                "Unsloth MLX DPO: ref_model must be a loaded MLX model, not "
+                f"{type(ref_model).__name__}; MLX DPO does not load a "
+                "reference from a model id."
+            )
+        if ref_model is model:
+            raise ValueError(
+                "Unsloth MLX DPO: model and ref_model cannot be the same "
+                "object. Load the reference separately, or pass ref_model=None."
+            )
+        if ref_adapter_name is not None:
+            raise ValueError(
+                "Unsloth MLX DPO: ref_model and ref_adapter_name each name a "
+                "reference; pass one of them."
+            )
+        if named_modules and not force_use_ref_model:
+            warnings.warn(
+                "Unsloth MLX DPO: this model carries adapters, so its base is "
+                "already the reference and a ref_model doubles the memory. "
+                "Pass ref_model=None, or force_use_ref_model=True to score "
+                "against a different model without this warning.",
+                RuntimeWarning, stacklevel=2,
+            )
+        ref_model.eval()
+        provenance.update(
+            kind="reference_model",
+            reference_repo=getattr(ref_model, "_hf_repo", None),
+            reference_commit=getattr(ref_model, "_unsloth_base_commit_hash", None),
+        )
+        _check_provenance(resume_provenance, provenance)
+        return ReferencePolicy(model=ref_model), provenance
+    by_name = dict(model.named_modules())
+    if not named_modules:
+        if ref_adapter_name is not None:
+            raise ValueError(
+                "Unsloth MLX DPO: ref_adapter_name replaces this model's "
+                "adapter tensors, and a full fine-tune has none."
+            )
+        # Immutable arrays: the snapshot copies nothing until the optimizer replaces a tensor.
+        provenance["kind"] = "parameter_snapshot"
+        _check_provenance(resume_provenance, provenance)
+        return ReferencePolicy(
+            overrides=[
+                (*_owner_of(by_name, name), value)
+                for name, value in trainable.items()
+            ],
+            neftune_modules=neftune,
+        ), provenance
+    adapters = collect_mlx_lora_adapter_tensors(model)
+    if not any(name in adapters for name in trainable):
+        raise ValueError(
+            "Unsloth MLX DPO: referenced training requires at least one "
+            "trainable LoRA adapter tensor."
+        )
+    modules = [module for _, module in named_modules]
     if ref_adapter_name is not None:
         provenance["kind"] = "reference_adapter"
         provenance["reference_adapter"] = os.path.normpath(str(ref_adapter_name))
-    if resume_provenance is not None and resume_provenance != provenance:
-        raise ValueError(
-            "Unsloth MLX DPO: the checkpoint reference provenance does not match "
-            "this model, adapter layout, or reference adapter."
-        )
+    _check_provenance(resume_provenance, provenance)
     # A tensor no adapter owns is held at its starting value, as PEFT restores
     # modules_to_save: refused once trained, unless a resume hydrates it later.
     extra = [name for name in trainable if name not in adapters]
