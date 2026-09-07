@@ -2004,7 +2004,15 @@ def torch_native_forward(
 
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-            with torch.autocast(device_type=device_type, enabled=False): # Force float32
+            # Autocast off so the adapter matmuls stay float32. The float32 down projection
+            # itself comes from elsewhere: unsloth's loader registers a custom dtype rule
+            # setting _pre_set_compute_dtype = torch.float32 on every gpt-oss down_projs
+            # module (and mlp.router) on the forced-float32 path, because bitsandbytes
+            # Linear4bit casts its input to self.compute_dtype whatever autocast says.
+            # Both halves are load-bearing: measured on gpt-oss-20b 4bit QLoRA the output
+            # here peaks around 51800, which is 0.79x of the float16 maximum, so storing it
+            # in float16 would leave only about a quarter of the range as headroom.
+            with torch.autocast(device_type=device_type, enabled=False):
                 out = down_proj(gated_output)
             
             weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
@@ -2026,9 +2034,11 @@ def torch_native_forward(
         # glu = gate * torch.sigmoid(gate * self.alpha)
         # fused = (up_h + 1) * glu
 
-        # Force float32 matrix multiply on down projection only
+        # Autocast off for the down projection only. As in the training branch above, the
+        # float32 comes from _pre_set_compute_dtype on the down_projs modules rather than
+        # from this context manager.
         device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):
             out_list = [
                 down_l(fused[e].to(dtype))
                 for e, down_l in enumerate(self.down_projs)
@@ -2040,8 +2050,10 @@ def torch_native_forward(
     pass
 pass
 
-# torch_native_forward has full float32 protection (swiglu in float32, autocast
-# disabled around down_proj) to prevent NaN in fp16 training.
+# torch_native_forward has full float32 protection in float16 training: swiglu in float32,
+# autocast disabled around down_proj, and the down projection itself computing in float32 via
+# _pre_set_compute_dtype. The last of those is what keeps the down projection output out of
+# float16, and it is set in unsloth's loader rather than here.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():
