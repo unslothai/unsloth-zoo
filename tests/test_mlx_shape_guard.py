@@ -9,14 +9,21 @@ from unsloth_zoo.mlx.shape_guard import (
     AUTOMATIC_TEXT_COMPILE_CEILING,
     DDP_LOCAL_GRAD_SCOPE,
     FULL_STEP_SCOPE,
+    SMALL_EXACT_SIGNATURE_THRESHOLD,
+    STREAM_GRID_FLOOR_WIDTH,
+    StreamShapeGrid,
+    StreamShapeGuardReport,
     TextShapeEvent,
     build_text_shape_frontier,
+    describe_stream_shape_grid,
     materialize_text_shape_frontier,
     phase_for_microstep,
     plan_text_shape_buckets,
     plan_text_shape_padding_budget,
     resolve_compile_max_variants,
     select_text_shape_padding_budget,
+    stream_exact_ceiling,
+    stream_phase_count,
 )
 
 
@@ -202,7 +209,7 @@ def test_padding_budget_exact_threshold_boundary_and_domain():
 
     assert (exact.action, exact.planned_signatures, exact.raw_signatures) == ("exact", 128, 128)
     assert (bucketed.action, bucketed.raw_signatures) == ("bucket", 129)
-    # No bounded points exist below the default; the ceiling caps above.
+    # No bounded points below the default; the ceiling caps above.
     for invalid in (31, AUTOMATIC_TEXT_COMPILE_CEILING + 1):
         with pytest.raises(ValueError):
             select_text_shape_padding_budget(
@@ -436,6 +443,101 @@ def test_shared_cap_materialization_preserves_both_padding_budgets():
     assert shared.report.padding_work_fraction <= 0.05
     assert shared.report.max_width_stretch <= 1.5
     assert shared.report.budget_satisfied is True
+
+
+def test_stream_grid_endpoints_are_idempotent_and_bounded_by_the_budget():
+    grid = StreamShapeGrid()
+    endpoints = grid.endpoints_through(20_000)
+
+    # Endpoints map to themselves; ranks agree without exchanging any.
+    assert all(grid.endpoint_for(point) == point for point in endpoints)
+    assert all(b > a for a, b in zip(endpoints, endpoints[1:]))
+    assert endpoints[0] == STREAM_GRID_FLOOR_WIDTH
+    assert grid.endpoint_for(1) == grid.endpoint_for(2) == STREAM_GRID_FLOOR_WIDTH
+    assert StreamShapeGrid().endpoints_through(20_000) == endpoints
+    linear = [point for point in endpoints if 2 < point <= 641]
+    assert linear == list(range(33, 642, 32))
+    assert all(grid.endpoint_for(point - 1) == point for point in linear[1:])
+    # Inside the quadratic budget the ratio was solved against.
+    overheads = {
+        w: (grid.endpoint_for(w) ** 2 - w * w) / (w * w)
+        for w in range(641, 20_000)
+    }
+    assert max(overheads.values()) < 0.13
+    mass = sum(1 / w for w in overheads)
+    log_uniform_mean = sum(v / w for w, v in overheads.items()) / mass
+    assert log_uniform_mean < 0.06
+
+
+def test_stream_grid_anchor_and_report_contract():
+    anchored = StreamShapeGrid(anchor=100)
+
+    # The anchor is the final endpoint; nothing widens past it.
+    assert anchored.endpoints_through(500) == (2, 33, 65, 97, 100)
+    assert anchored.endpoint_count == 5
+    assert anchored.endpoint_for(98) == anchored.endpoint_for(4096) == 100
+    assert StreamShapeGrid(anchor=STREAM_GRID_FLOOR_WIDTH).endpoint_count == 1
+    with pytest.raises(ValueError):
+        StreamShapeGrid(anchor=STREAM_GRID_FLOOR_WIDTH - 1)
+
+    # VLM has no anchor: expansion can exceed max_seq_length.
+    unbounded = StreamShapeGrid()
+    assert unbounded.endpoint_count is None
+    assert unbounded.endpoint_for(1_000_000) >= 1_000_000
+
+    report = StreamShapeGuardReport(
+        action="stream_grid", reason="streaming", cap=128,
+        compile_scope=FULL_STEP_SCOPE, grid_ratio="21/20", grid_floor=2,
+        grid_anchor=4096, grid_endpoints=60, observed_signatures=7,
+        gate_released=True,
+    )
+
+    payload = report.to_dict()
+    assert set(payload) == {
+        "action", "reason", "cap", "compile_scope", "grid_ratio", "grid_floor",
+        "grid_anchor", "grid_endpoints", "observed_signatures", "tripped",
+        "trip_reason", "exact_width_only", "exact_ceiling", "gate_released",
+    }
+    assert (payload["action"], payload["gate_released"]) == ("stream_grid", True)
+    assert (payload["observed_signatures"], payload["tripped"]) == (7, False)
+    assert (payload["grid_endpoints"], payload["grid_anchor"]) == (60, 4096)
+    # Reports the grid it was handed, not the default ratio.
+    assert "1.05" in describe_stream_shape_grid(StreamShapeGrid(anchor=4096), 128)
+    assert "2.00" in describe_stream_shape_grid(StreamShapeGrid(ratio=2), 128)
+
+    # Tightest clamp wins, and the allowance vanishes once endpoints or the
+    # cap leave nothing to spend. 60 endpoints here, so cap 64 leaves only 4.
+    wide = StreamShapeGrid(anchor=4096)
+    assert [stream_exact_ceiling(g, c) for g, c in (
+        (wide, 128), (wide, 64), (StreamShapeGrid(), 64), (wide, 60),
+    )] == [SMALL_EXACT_SIGNATURE_THRESHOLD, 3, 16, None]
+    # The allowance must leave room for the grid it precedes. Two ways to get
+    # this wrong: ignoring that accumulation makes one endpoint cost a
+    # signature per phase, and forgetting that an allowance of N admits N + 1
+    # signatures because it holds while the count is at or below N.
+    # Pin the helper across the range, or one returning 2 for every
+    # accumulation above one would satisfy every other assertion here.
+    assert [stream_phase_count(FULL_STEP_SCOPE, n) for n in (1, 2, 3, 4, 8)] == [
+        1, 2, 3, 3, 3,
+    ]
+    for cap in (64, 128, 256):
+        for anchor in (2048, 4096, 16384):
+            grid = StreamShapeGrid(anchor=anchor)
+            for phases in (1, 2, 3):
+                for in_flight in (0, 2):
+                    ceiling = stream_exact_ceiling(grid, cap, phases, in_flight)
+                    if ceiling is None:
+                        continue
+                    admitted = ceiling + 1 + in_flight
+                    assert admitted + grid.endpoint_count * phases <= cap, (
+                        cap, anchor, phases, in_flight, ceiling,
+                    )
+    # Returning None everywhere would satisfy that invariant vacuously, so pin
+    # that the allowance survives where there is genuinely room for it.
+    assert stream_exact_ceiling(wide, 128, 2) > 0
+    assert stream_exact_ceiling(wide, 128, 1, 4) == SMALL_EXACT_SIGNATURE_THRESHOLD
+    assert "at most 32 signatures" in describe_stream_shape_grid(wide, 128, 32)
+    assert "stay exact" not in describe_stream_shape_grid(wide, 128, None)
 
 
 def test_audio_feature_batches_are_detected_for_eager_routing():
