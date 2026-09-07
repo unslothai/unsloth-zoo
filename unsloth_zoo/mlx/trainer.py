@@ -1346,6 +1346,9 @@ class MLXTrainingConfig:
             "model_adapter_name",
             "ref_adapter_name",
             "force_use_ref_model",
+            "sync_ref_model",
+            "ref_model_mixup_alpha",
+            "ref_model_sync_steps",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1443,6 +1446,9 @@ class MLXDPOConfig(MLXTrainingConfig):
     ref_adapter_name: str | None = field(default=None, kw_only=True)
     # force_use_ref_model only silences the doubled-memory warning.
     force_use_ref_model: bool = field(default=False, kw_only=True)
+    sync_ref_model: bool = field(default=False, kw_only=True)
+    ref_model_mixup_alpha: float = field(default=0.6, kw_only=True)
+    ref_model_sync_steps: int = field(default=512, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -2088,6 +2094,7 @@ class MLXTrainer:
             model_adapter_name=getattr(args, "model_adapter_name", None),
             ref_model=getattr(self, "ref_model", None),
             force_use_ref_model=bool(getattr(args, "force_use_ref_model", False)),
+            sync_ref_model=bool(getattr(args, "sync_ref_model", False)),
         )
 
     def __init__(
@@ -5329,6 +5336,12 @@ class MLXTrainer:
 
         _resume_step = 0
         _dpo_reference = None
+        _sync_reference = (
+            preference_kind == "dpo" and not bool(args.reference_free)
+            and bool(getattr(args, "sync_ref_model", False))
+        )
+        _sync_every = int(args.ref_model_sync_steps) if _sync_reference else 0
+        _sync_alpha = float(args.ref_model_mixup_alpha) if _sync_reference else 0.0
         ts = {}
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
@@ -5382,6 +5395,8 @@ class MLXTrainer:
                 )
                 # 2. Restore optimizer state (Adam moments m,v, step counter).
                 load_optimizer_state(optimizer, _resume_from)
+                if _sync_reference:
+                    _dpo_reference[0].load(_resume_from)
                 # 3. Restore trainer scalars (step counter, loss history, and
                 #    best-model / early-stopping tracking). .get defaults keep
                 #    pre-fix SFT checkpoints resumable.
@@ -6911,6 +6926,8 @@ class MLXTrainer:
                         # succeeded, so log failures but keep it.
                         try:
                             save_optimizer_state(optimizer, ckpt_dir)
+                            if _sync_reference:
+                                _sampling_reference.save(ckpt_dir)
                             save_trainer_state(
                                 {
                                     "global_step": current_step,
@@ -7658,6 +7675,8 @@ class MLXTrainer:
             self._global_step = current_step
             self.state.global_step = current_step
             accum_progress = 0
+            if _sync_reference and current_step % _sync_every == 0:
+                _sampling_reference.sync(model, _sync_alpha)
             # Advance the callback epoch only on an optimizer step, beside the
             # global_step it belongs to and just before on_step_end -- HF's
             # `state.global_step += 1; state.epoch = epoch + (step+1)/
@@ -8191,6 +8210,20 @@ class MLXTrainer:
                     raise ValueError(
                         "Unsloth MLX DPO: label_smoothing must be in [0, 0.5)."
                     )
+                if bool(getattr(args, "sync_ref_model", False)) and not bool(
+                    args.reference_free
+                ):
+                    alpha = float(args.ref_model_mixup_alpha)
+                    if not math.isfinite(alpha) or not 0 <= alpha <= 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: ref_model_mixup_alpha must be in "
+                            "[0, 1]."
+                        )
+                    if int(args.ref_model_sync_steps) < 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: ref_model_sync_steps must be at "
+                            "least 1."
+                        )
             try:
                 len(train_dataset)
                 train_dataset[0]

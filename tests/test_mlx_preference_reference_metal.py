@@ -69,25 +69,36 @@ def _build(model, **options):
     )[0]
 
 
-@pytest.mark.parametrize("mode", ["adapter", "full", "ref_model"])
+@pytest.mark.parametrize("mode", [
+    "adapter", "full", "ref_model", "synced_full", "synced_model",
+    "synced_adapter", "synced_dora", "synced_adapted_model",
+])
 def test_reference_overrides_hold_inside_a_compiled_step(mode):
-    """The reference stays at the initial weights while the policy trains; the
-    unadapted twin from the same seed is the oracle."""
+    """The compiled step scores against the initial weights, or the mix taken at
+    a sync; a twin from the same seed is the oracle."""
     import mlx.nn as nn
     import mlx.optimizers as optim
+    from mlx.utils import tree_map
     from unsloth_zoo.mlx.preference import _response_logps
 
-    model = _tiny() if mode == "full" else _adapted(train_embedding=True)
-    pristine = _tiny()
+    synced = mode.startswith("synced")
+    with_model = mode in ("ref_model", "synced_model", "synced_adapted_model")
+    adapted = mode in ("adapter", "ref_model", "synced_adapter", "synced_dora",
+                       "synced_adapted_model")
+    build = functools.partial(
+        _adapted, dora=mode == "synced_dora", train_embedding=True,
+    ) if adapted else _tiny
+    model = build()
+    pristine = build() if synced and adapted else _tiny()
     tokens, lengths = _batch()
-    options = {}
-    if mode == "ref_model":
-        reference = _tiny()
+    options = {"sync_ref_model": synced}
+    if with_model:
+        reference = build() if mode == "synced_adapted_model" else _tiny()
         # Inert only because the build puts the reference in eval mode.
         reference.drop = nn.Dropout(0.5)
-        options = {"ref_model": reference, "force_use_ref_model": True}
+        options.update(ref_model=reference, force_use_ref_model=True)
     policy = _build(model, **options)
-    if mode == "ref_model":
+    if with_model:
         assert policy.state is reference.state
     optimizer = optim.SGD(learning_rate=0.5)
 
@@ -104,19 +115,26 @@ def test_reference_overrides_hold_inside_a_compiled_step(mode):
         optimizer.update(model, grads)
         return loss, scored
 
-    initial = model.embed.weight
+    embedding = model.embed.embedding if mode == "synced_dora" else model.embed
+    initial = embedding.weight
     for index in range(3):
         loss, scored = step(tokens, lengths)
         mx.eval(loss, scored, model.parameters())
-        if mode == "ref_model" and index == 0:
+        if with_model and index == 0:
             scaled = pristine.embed.weight * 1.5
             reference.embed.weight = scaled
             pristine.embed.weight = scaled
+        if synced and index == 1:
+            policy.sync(model, 0.25)
+            pristine.update(tree_map(
+                lambda held, trained: 0.75 * held + 0.25 * trained,
+                pristine.trainable_parameters(), model.trainable_parameters(),
+            ))
 
-    assert not mx.allclose(model.embed.weight, initial).item(), "the policy moved"
+    assert not mx.allclose(embedding.weight, initial).item(), "the policy moved"
     if mode == "adapter":
         assert (model.proj.scale, model.head.scale) == (1.0, 1.0)
-    if mode == "ref_model":
+    if with_model:
         assert reference.training is False
     expected = _response_logps(pristine, tokens, lengths)
     assert mx.allclose(scored, expected, atol=1e-5).item()

@@ -1469,6 +1469,48 @@ def test_trainer_applies_preference_formatter_once_per_row():
     assert calls == [0, 1, 2]
 
 
+@pytest.mark.parametrize("sync", [True, False, "reference_free"])
+def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, sync):
+    """Every ref_model_sync_steps optimizer steps; never when off or reference-free."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2),
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, max_steps=4, eval_steps=4, sync_ref_model=bool(sync),
+            ref_model_sync_steps=2, ref_model_mixup_alpha=0.25,
+            reference_free=sync == "reference_free",
+        )),
+    )
+    synced = []
+    build = trainer._build_dpo_reference
+
+    def capture(*args, **kwargs):
+        policy, provenance = build(*args, **kwargs)
+        if policy is not None:
+            policy.sync = lambda model, alpha: synced.append(
+                (trainer._global_step, alpha, model is trainer.model))
+        return policy, provenance
+
+    trainer._build_dpo_reference = capture
+    _run_generation_trainer(trainer, monkeypatch, [])
+    assert synced == ([(2, 0.25, True), (4, 0.25, True)] if sync is True else [])
+    if sync == "reference_free":
+        assert trainer._preference_reference_provenance == {"kind": "reference_free"}
+        return
+    for bad, match in (
+        ({"ref_model_sync_steps": 0}, "ref_model_sync_steps must be at least 1"),
+        ({"ref_model_mixup_alpha": 1.5}, r"ref_model_mixup_alpha must be in \[0, 1\]"),
+    ):
+        trainer = MLXDPOTrainer(
+            _tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2),
+            args=MLXDPOConfig(**_generation_common(
+                tmp_path, sync_ref_model=True, **bad)),
+        )
+        with pytest.raises(ValueError, match=match):
+            _run_generation_trainer(trainer, monkeypatch, [])
+
+
 def _tiny_model(lora=False, tail=False):
     """lora=True adds an adapter at zero delta; tail=True a tensor no adapter owns."""
     import mlx.core as mx
