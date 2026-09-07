@@ -203,9 +203,8 @@ def test_a_bare_return_is_the_functions_contract():
     assert any(r.value is None for r in returns)
 
 
-# The dtype patcher reads `original_forward`, pinned from `function.forward`
-# before any rewrite (#967), so a second pass never reads its own generated
-# output back through getsource.
+# Pinned from `function.forward` before any rewrite (#967), so a second pass
+# never reads its own generated output back.
 NN_FORWARD_GETSOURCE = "source = inspect.getsource(original_forward).rstrip()"
 
 
@@ -486,9 +485,8 @@ def test_the_unreadable_forward_is_wrapped_rather_than_dropped():
 
 
 def test_the_forward_is_pinned_before_it_is_read():
-    """The pristine forward is captured before any rewrite and every branch
-    installs from it, or the second pass (loader.py prepends "siglip", so
-    vision loads patch torch.nn twice) reads its own output back."""
+    """Captured before any rewrite, or the second pass (vision loads patch
+    torch.nn twice) reads its own output back."""
     region = _nn_patch_region()
     pin = region.index("original_forward = function.forward")
     assert pin < region.index(NN_FORWARD_GETSOURCE)

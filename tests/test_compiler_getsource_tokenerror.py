@@ -136,11 +136,9 @@ def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
 
 
 def test_the_dtype_patcher_never_reads_its_own_generated_forward(tmp_path):
-    """After a warm-up, the torch.nn forwards are the patcher's own generated
-    ones. A second pass must not call getsource on them: it pins the pristine
-    forward before any rewrite and rebuilds from that (#967), which is what
-    removed the mid-rewrite TokenError this file was written for. A getsource
-    that does resolve into the compile folder is that path coming back."""
+    """A second pass pins the pristine forward and rebuilds from it (#967), so
+    it must never getsource its own generated forward; a hit is the
+    mid-rewrite TokenError path coming back."""
     proc = _run(
         """
         import torch
