@@ -5,6 +5,7 @@ import re
 
 import numpy as np
 import pytest
+from PIL import Image
 from pathlib import Path
 from unittest import mock
 
@@ -482,11 +483,11 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     processor = _ConversationalPromptCompletionProcessor()
     _finalized_collate(
         [{
-            "image": "top-level",
+            "image": Image.new("RGB", (8, 8), "red"),
             "prompt": [{
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": "embedded"},
+                    {"type": "image", "image": Image.new("RGB", (8, 8), "blue")},
                     {"type": "text", "text": "Q"},
                 ],
             }],
@@ -497,7 +498,7 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
         image_size=16,
     )
 
-    assert processor.images_seen[0] == ["embedded"]
+    assert processor.images_seen[0] == [Image.new("RGB", (8, 8), "blue")]
 
 
 def test_vlm_prompt_completion_uses_top_level_image_for_bare_placeholder():
@@ -505,8 +506,8 @@ def test_vlm_prompt_completion_uses_top_level_image_for_bare_placeholder():
 
     messages = [{"role": "user", "content": [{"type": "image"}]}]
     assert _extract_vlm_pc_images(
-        {"image": "top-level"}, messages, [], image_size=16,
-    ) == ["top-level"]
+        {"image": Image.new("RGB", (8, 8), "red")}, messages, [], image_size=16,
+    ) == [Image.new("RGB", (8, 8), "red")]
 
 
 def test_vlm_collate_passes_studio_top_level_image_to_processor():
@@ -522,24 +523,24 @@ def test_vlm_collate_passes_studio_top_level_image_to_processor():
                     {"type": "text", "text": "Q"},
                 ],
             }],
-            "image": "top-level",
+            "image": Image.new("RGB", (8, 8), "red"),
         }],
         processor,
         max_seq_length=8,
         image_size=16,
     )
 
-    assert processor.images_seen == [["top-level"]]
+    assert processor.images_seen == [[Image.new("RGB", (8, 8), "red")]]
 
 
 def test_vlm_top_level_images_key_still_wins_over_image_key():
     from unsloth_zoo.mlx.utils import _extract_vlm_images
 
     assert _extract_vlm_images(
-        {"images": ["plural"], "image": "singular"},
+        {"images": [Image.new("RGB", (8, 8), "red")], "image": Image.new("RGB", (8, 8), "blue")},
         [],
         image_size=16,
-    ) == ["plural"]
+    ) == [Image.new("RGB", (8, 8), "red")]
 
 
 def test_vlm_top_level_image_key_requires_bare_image_placeholder():
@@ -610,7 +611,7 @@ def test_vlm_prompt_completion_top_level_images_use_cuda_process_shape(monkeypat
     def fake_process_vision_info(conversations, **kwargs):
         seen["conversations"] = conversations
         seen["kwargs"] = kwargs
-        return ["processed"], None, {"fps": []}
+        return [Image.new("RGB", (8, 8), "blue")], None, {"fps": []}
 
     monkeypatch.setattr(
         vision_utils,
@@ -618,9 +619,9 @@ def test_vlm_prompt_completion_top_level_images_use_cuda_process_shape(monkeypat
         fake_process_vision_info,
     )
 
-    assert _extract_vlm_pc_images({"images": ["raw"]}, [], [], image_size=16) == ["processed"]
+    assert _extract_vlm_pc_images({"images": [Image.new("RGB", (8, 8), "red")]}, [], [], image_size=16) == [Image.new("RGB", (8, 8), "blue")]
     assert seen == {
-        "conversations": [{"image": "raw"}],
+        "conversations": [{"image": Image.new("RGB", (8, 8), "red")}],
         "kwargs": {"return_video_kwargs": True},
     }
 
@@ -655,7 +656,7 @@ def test_vlm_render_falls_back_to_content_part_templates():
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
             assert tokenize is False
             if messages and all(isinstance(part, dict) and "type" in part for part in messages):
-                return "parts:" + ",".join(part["type"] for part in messages)
+                return "parts:" + ",".join(part["type"] for part in messages) + ":" + "".join(part.get("text", "") for part in messages)
             raise ValueError("expected content parts")
 
     rendered = _render_vlm_messages(
@@ -663,7 +664,7 @@ def test_vlm_render_falls_back_to_content_part_templates():
         [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Q"}]}],
     )
 
-    assert rendered == "parts:image,text"
+    assert rendered == "parts:image,text:Q"
 
 
 def test_vlm_render_falls_back_to_text_templates():
@@ -912,7 +913,7 @@ def test_deepseek_rendering_repairs_missing_image_token():
         chat_template = "deepseek"
 
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-            return "question"
+            return "".join(part.get("text", "") for m in messages for part in m["content"])
 
     text = _render_vlm_messages(
         DeepseekProcessor(),
@@ -5552,7 +5553,6 @@ def test_vlm_component_kwargs_preserve_expansion_and_modality_options(drops_padd
 
     output = _call_vlm_processor(Processor(), (), dict(text=["a#", "bb#"], images=[2, 3], size=4, padding=True))
     assert output == {"input_ids": [[3], [4]], "pixel_values": [8, 12], "padding": True}
-
 @pytest.mark.parametrize("existing_pad", [None, "[UNK]"])
 def test_image_free_vlm_calls_use_the_padded_tokenizer(existing_pad):
     from tokenizers import Tokenizer, models, pre_tokenizers
@@ -5571,7 +5571,6 @@ def test_image_free_vlm_calls_use_the_padded_tokenizer(existing_pad):
     assert tokenizer.pad_token == (existing_pad or "[EOS]")
 
 
-
 @pytest.mark.parametrize("key", ["image_sizes", "images_spatial_crop"])
 def test_nested_size_metadata_preserves_image_and_slice_axes(key):
     from unsloth_zoo.mlx.utils import _normalize_size_tuples, _prepare_vlm_batch_for_compile
@@ -5580,3 +5579,20 @@ def test_nested_size_metadata_preserves_image_and_slice_axes(key):
     batch = _prepare_vlm_batch_for_compile({key: raw}, {}, phase="content")
     assert batch[key] is raw and batch[key].shape == (2, 2, 2)
     assert batch["_unsloth_static_vlm_metadata"][key] == (((2, 3), (4, 5)), ((6, 7), (8, 9)))
+
+
+@pytest.mark.parametrize("image_type", ["image", "image_url", "input_image"])
+@pytest.mark.parametrize("stringify", [False, True])
+def test_vlm_rendering_keeps_image_order_without_stringifying_parts(tmp_path, monkeypatch, image_type, stringify):
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(models.WordLevel({"x": 0})))
+    expression = "m['content']" if stringify else "'' + m['content']"
+    tokenizer.chat_template = "{% for m in messages %}{{ " + expression + " }}{% endfor %}"
+    processor = SimpleNamespace(tokenizer=tokenizer, image_token="<|picture|>")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "before"}, {"type": image_type},
+        {"type": "text", "text": "after"}]}]
+    assert _render_vlm_messages(processor, messages) == "before<|picture|>after"

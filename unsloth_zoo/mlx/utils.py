@@ -4308,8 +4308,18 @@ def normalize_mlx_chat_template(
         setattr(target, "_unsloth_model_type", model_type)
 
     tokenizer = _get_processor_tokenizer(target)
-    if is_vlm and not _has_chat_template(target) and _has_chat_template(tokenizer):
-        target.chat_template = tokenizer.chat_template
+    if is_vlm and not _has_chat_template(target):
+        if not _has_chat_template(tokenizer):
+            for source in (getattr(target, "_unsloth_model_name", None),
+                           getattr(tokenizer, "name_or_path", None)):
+                if not source or not Path(source).is_dir():
+                    continue
+                template_path = Path(source) / "chat_template.jinja"
+                if template_path.is_file():
+                    tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+                    break
+        if not _has_chat_template(target) and _has_chat_template(tokenizer):
+            target.chat_template = tokenizer.chat_template
 
     template_target = target if is_vlm else tokenizer
     if strict and not _has_chat_template(template_target):
@@ -4509,6 +4519,9 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         parts.append({"type": "text", "text": part})
                     elif isinstance(part, dict):
                         clean = _clean_vlm_none_keys(part)
+                        for key in ("input_image", "image_url"):
+                            if key in clean:
+                                clean.setdefault("image", clean.pop(key))
                         # Gemma 3n's template renders a placeholder for
                         # "audio" alone, so a part left under an alias carries
                         # a clip with nothing behind it, and an untyped one
@@ -4520,6 +4533,8 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                                 clean["type"] = "image"
                             elif any(alias in clean for alias in _AUDIO_PART_TYPES):
                                 clean["type"] = "audio"
+                        elif clean["type"] in ("image_url", "input_image"):
+                            clean["type"] = "image"
                         elif clean["type"] in _AUDIO_PART_TYPES:
                             clean["type"] = "audio"
                         parts.append(clean)
@@ -4559,7 +4574,7 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
-def _flatten_vlm_content_for_text_template(messages):
+def _flatten_vlm_content_for_text_template(messages, image_token=None):
     """Render list-style VLM content as text for text-only chat templates."""
     flattened = copy.deepcopy(messages)
     for message in flattened:
@@ -4570,6 +4585,8 @@ def _flatten_vlm_content_for_text_template(messages):
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
                 texts.append(str(part.get("text", "")))
+            elif isinstance(part, dict) and part.get("type") == "image" and image_token:
+                texts.append(image_token)
             elif isinstance(part, str):
                 texts.append(part)
         message["content"] = "".join(texts)
@@ -4608,24 +4625,35 @@ def _count_vlm_image_parts(messages):
     return count
 
 
-def _repair_deepseek_rendered_image_tokens(processor, text, messages):
+def _vlm_image_token(processor):
+    for owner in (processor, _get_processor_tokenizer(processor)):
+        for name in ("image_token", "boi_token"):
+            token = getattr(owner, name, None)
+            if isinstance(token, str) and token:
+                return token
+    module = sys.modules.get(type(processor).__module__)
+    for name in ("DEFAULT_IMAGE_TOKEN", "IMAGE_TOKEN", "IMAGE_PLACEHOLDER"):
+        token = getattr(module, name, None)
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
+def _vlm_render_preserves_content(text, messages):
     if not isinstance(text, str) or not text.strip():
-        return text
-    marker = (
-        f"{processor.__class__.__module__}.{processor.__class__.__name__}"
-    ).lower()
-    if "deepseek" not in marker:
-        return text
-    image_count = _count_vlm_image_parts(messages)
-    if image_count <= 0:
-        return text
-    image_token = getattr(processor, "image_token", None)
-    if not image_token:
-        return text
-    missing = image_count - text.count(image_token)
-    if missing <= 0:
-        return text
-    return (image_token * missing) + text
+        return False
+    normalized = " ".join(text.split())
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            if content and str(content) in text:
+                return False
+            parts = [p.get("text", "") if isinstance(p, dict) else p for p in content]
+        else:
+            parts = [content]
+        if any(" ".join(str(part).split()) not in normalized for part in parts):
+            return False
+    return True
 
 
 def _processor_accepts_assistant_list_content(processor):
@@ -4661,63 +4689,55 @@ def _render_vlm_messages(
     *,
     add_generation_prompt=False,
 ):
-    normalize_vlm_processor_chat_template(processor, strict=True)
     if isinstance(messages, str):
         return messages
+    messages = _normalize_vlm_messages(messages)
+    normalize_vlm_processor_chat_template(processor, strict=False)
+    tokenizer = _get_processor_tokenizer(processor)
+    renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
+    image_token = _vlm_image_token(processor)
+    flat_messages = _flatten_vlm_content_for_text_template(messages, image_token)
+    if not _has_chat_template(renderer):
+        return "\n".join(message.get("content", "") for message in flat_messages)
 
     render_messages = messages
-    if not _processor_accepts_assistant_list_content(processor):
+    if not _processor_accepts_assistant_list_content(renderer):
         render_messages = _collapse_vlm_assistant_content(render_messages)
-
-    first_error = None
-    second_error = None
-    third_error = None
-
-    try:
-        text = processor.apply_chat_template(
-            render_messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
+    marked_messages = copy.deepcopy(render_messages)
+    if image_token:
+        for message in marked_messages:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                message["content"] = [
+                    {"type": "text", "text": image_token}
+                    if isinstance(part, dict) and part.get("type") == "image" else part
+                    for part in content
+                ]
+    image_count = _count_vlm_image_parts(messages)
+    image_tokens = {token for token in (image_token, getattr(processor, "boi_token", None),
+                                        getattr(tokenizer, "boi_token", None)) if token}
+    error = None
+    for candidate in (render_messages, marked_messages, flat_messages,
+                      _flatten_vlm_messages_to_content_parts(marked_messages)):
+        try:
+            text = renderer.apply_chat_template(
+                candidate,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+            if not all(_vlm_render_preserves_content(text, source) for source in (messages, candidate)):
+                continue
+            if image_tokens and max(text.count(token) for token in image_tokens) < image_count:
+                continue
             return text
-    except Exception as exc:
-        first_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_messages_to_content_parts(messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        second_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_content_for_text_template(render_messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        third_error = exc
-
-    if first_error is not None:
-        raise RuntimeError(
-            "Unsloth MLX VLM: failed to render chat messages with this "
-            "processor chat_template. Check that the dataset roles/content "
-            "schema matches the model family, or pass a formatting_func that "
-            "returns pre-rendered text."
-        ) from (third_error or second_error or first_error)
-
-    return ""
+        except Exception as exc:
+            error = exc
+    raise RuntimeError(
+        "Unsloth MLX VLM: failed to render chat messages with this "
+        "processor chat_template. Check that the dataset roles/content "
+        "schema matches the model family, or pass a formatting_func that "
+        "returns pre-rendered text."
+    ) from error
 
 
 def _looks_like_mlx_chat_messages(value):
@@ -6166,6 +6186,22 @@ def _resize_vlm_images(images, image_size):
     target = (image_size, image_size) if isinstance(image_size, int) else image_size
     resized = []
     for image in images:
+        if isinstance(image, (bytes, dict, str, os.PathLike)):
+            from io import BytesIO
+            if isinstance(image, dict):
+                image = image.get("bytes") or image.get("path") or image.get("url")
+            if isinstance(image, str) and image.startswith(("http://", "https://")):
+                from unsloth_zoo.vision_utils import fetch_remote_media_bytes
+                image = fetch_remote_media_bytes(image)
+            elif isinstance(image, str) and image.startswith("data:image"):
+                from base64 import b64decode
+                image = b64decode(image.split("base64,", 1)[1])
+            elif isinstance(image, str) and image.startswith("file://"):
+                from unsloth_zoo.vision_utils import resolve_file_uri_to_path
+                image = resolve_file_uri_to_path(image)
+            if isinstance(image, bytes):
+                image = BytesIO(image)
+            image = Image.open(image)
         if isinstance(image, Image.Image):
             image = image.convert("RGB")
             if _is_vlm_no_resize_image_size(image_size):
@@ -6242,6 +6278,10 @@ def _extract_vlm_images(
                 if isinstance(part, dict) and part.get("type") == "image":
                     image = part.get("image")
                     if image is not None:
+                        if any(key in part for key in ("resized_height", "resized_width", "min_pixels", "max_pixels")):
+                            from unsloth_zoo.vision_utils import fetch_image
+                            image = _resize_vlm_images([image], None)[0]
+                            image = fetch_image({**part, "image": image})
                         images.append(image)
 
     if (
