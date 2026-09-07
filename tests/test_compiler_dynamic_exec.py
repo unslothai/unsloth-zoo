@@ -107,6 +107,61 @@ def _unimport_the_compile_folder(monkeypatch):
                 del sys.modules[name]
 
 
+def _own_torch_nn_forwards():
+    """The ``forward`` each ``torch.nn`` class defines in its own ``__dict__``.
+
+    Read off ``vars(cls)`` rather than ``getattr``, so an inherited forward is
+    not recorded as if the class owned one and then installed on it as a real
+    attribute by the restore below.
+    """
+    try:
+        import torch
+    except Exception:
+        return None
+    return {
+        name: vars(obj)["forward"]
+        for name, obj in vars(torch.nn).items()
+        if isinstance(obj, type) and "forward" in vars(obj)
+    }
+
+
+@pytest.fixture(autouse = True)
+def _restore_torch_nn_forwards():
+    """Put ``torch.nn``'s own forwards back after the dtype loop rewrites them.
+
+    ``unsloth_compile_transformers`` patches ``torch.nn.<Module>.forward`` in
+    place, on the real ``torch.nn``, and nothing here undoes it. The wrappers
+    then outlive the test and every later test in the process sees a torch.nn
+    that is already patched.
+
+    That is not theoretical: it fails
+    ``test_compiled_cache_collective.py::test_repeated_dtype_patching_does_not_stack_the_source_rewrite``,
+    which opens by capturing ``pristine = torch.nn.Conv2d.forward`` and then
+    asserts the installed marker carries torch's own forward. Run after this
+    module in one process, what it captures is already a
+    ``_dtype_safe_forward.<locals>.forward``, so the assertion compares a
+    wrapper against the genuine original and fails on a contract that holds.
+    The two files are in different jobs today, `Core drift` and
+    `Repo tests (CPU)`, so CI does not currently put them in one process. That
+    is a scheduling accident and not a property worth relying on.
+
+    Restored by identity against a snapshot rather than by deleting the
+    attribute: several of these classes legitimately define their own forward,
+    and deleting would expose an inherited one instead.
+    """
+    before = _own_torch_nn_forwards()
+    try:
+        yield
+    finally:
+        if not before:
+            return
+        import torch
+        for name, original in before.items():
+            cls = getattr(torch.nn, name, None)
+            if isinstance(cls, type) and vars(cls).get("forward") is not original:
+                cls.forward = original
+
+
 # Model types the zoo compiler drives end-to-end (from its call sites).
 KNOWN_MODEL_TYPES = [
     "llama",
