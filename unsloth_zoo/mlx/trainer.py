@@ -617,6 +617,7 @@ from .preference import (
     make_dpo_loss_fn,
     make_orpo_loss_fn,
     make_preference_eval_fn,
+    precompute_reference_logps,
     resolve_preference_objective,
     resolve_preference_length_policy,
 )
@@ -1349,6 +1350,8 @@ class MLXTrainingConfig:
             "sync_ref_model",
             "ref_model_mixup_alpha",
             "ref_model_sync_steps",
+            "precompute_ref_log_probs",
+            "precompute_ref_batch_size",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1449,6 +1452,9 @@ class MLXDPOConfig(MLXTrainingConfig):
     sync_ref_model: bool = field(default=False, kw_only=True)
     ref_model_mixup_alpha: float = field(default=0.6, kw_only=True)
     ref_model_sync_steps: int = field(default=512, kw_only=True)
+    # precompute_ref_batch_size defaults to the split's batch size.
+    precompute_ref_log_probs: bool = field(default=False, kw_only=True)
+    precompute_ref_batch_size: int | None = field(default=None, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -3973,8 +3979,7 @@ class MLXTrainer:
                     if is_vlm:
                         scored = loss_fn(self.model, batch_data)
                     else:
-                        batch, lengths, labels = batch_data
-                        scored = loss_fn(self.model, batch, lengths, labels)
+                        scored = loss_fn(self.model, *batch_data)
                     loss, ntoks = scored[0], scored[1]
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
@@ -5802,9 +5807,7 @@ class MLXTrainer:
         def _loss_and_grad(batch_data):
             if isinstance(batch_data, dict):
                 return loss_and_grad_fn(model, batch_data)
-            return loss_and_grad_fn(
-                model, batch_data[0], batch_data[1], batch_data[2]
-            )
+            return loss_and_grad_fn(model, *batch_data)
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
@@ -6123,6 +6126,31 @@ class MLXTrainer:
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
+        _precompute_reference = _sampling_reference is not None and bool(
+            getattr(args, "precompute_ref_log_probs", False)
+        )
+        _precompute_chunk = (
+            getattr(args, "precompute_ref_batch_size", None)
+            if _precompute_reference else None
+        )
+
+        def _precompute_eval_reference(plans, eval_batch_size):
+            plans = list(plans.values()) if isinstance(plans, dict) else [plans]
+            paused = pause_mlx_training_patches()
+            was_training = getattr(model, "training", True)
+            model.eval()
+            try:
+                for plan in plans:
+                    precompute_reference_logps(
+                        plan, model, _sampling_reference,
+                        batch_size=int(_precompute_chunk or eval_batch_size),
+                    )
+            finally:
+                model.train(was_training)
+                resume_mlx_training_patches(paused)
+            if not _samples_prompts:
+                _sampling_reference.release()
+
         def _prepare_eval_batches():
             """Materialize eval batches the first time evaluation is requested.
 
@@ -6219,6 +6247,8 @@ class MLXTrainer:
                         eval_batches = _create_every_eval_split()
                 else:
                     eval_batches = _create_every_eval_split()
+                if _precompute_reference:
+                    _precompute_eval_reference(eval_batches, eval_batch_size)
             self.callback_handler.eval_dataloader = eval_batches
             _eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
             if eval_batches and _eval_steps > 0:
@@ -6245,6 +6275,19 @@ class MLXTrainer:
                         f"({eval_batch_count} eval batches)."
                     )
             return eval_batches
+
+        if _precompute_reference:
+            _train_chunk = int(_precompute_chunk or args.per_device_train_batch_size)
+            precompute_reference_logps(
+                batches, model, _sampling_reference, batch_size=_train_chunk,
+            )
+            if self.eval_dataset is None and not _samples_prompts:
+                _sampling_reference.release()
+            _main_print(
+                "Unsloth: precomputed the reference log probabilities "
+                f"({len(batches.rows)} training rows, {_train_chunk} pairs "
+                "per chunk)."
+            )
 
         def _fire(event, **kwargs):
             """Dispatch an HF callback event on every rank, like HF Trainer.
@@ -8223,6 +8266,21 @@ class MLXTrainer:
                         raise ValueError(
                             "Unsloth MLX DPO: ref_model_sync_steps must be at "
                             "least 1."
+                        )
+                if bool(getattr(args, "precompute_ref_log_probs", False)) and not bool(
+                    args.reference_free
+                ):
+                    if bool(getattr(args, "sync_ref_model", False)):
+                        raise ValueError(
+                            "Unsloth MLX DPO: precompute_ref_log_probs scores "
+                            "the reference once, and sync_ref_model moves it "
+                            "during the run. Use one of the two."
+                        )
+                    chunk = getattr(args, "precompute_ref_batch_size", None)
+                    if chunk is not None and int(chunk) < 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: precompute_ref_batch_size must be "
+                            "at least 1."
                         )
             try:
                 len(train_dataset)

@@ -1167,6 +1167,52 @@ def test_adapter_config_keeps_dropout_while_preference_context_is_active():
         context.restore()
 
 
+def test_a_precomputed_reference_travels_in_the_batch():
+    """A batch carries its rows' precomputed values; the loss and the evaluation read them."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx.preference import (
+        make_dpo_loss_fn, make_preference_eval_fn, precompute_reference_logps,
+        resolve_preference_objective)
+
+    plan = build_plan(dataset=rows(5), num_batches=3)
+    assert plan.reference_logps is None and len(plan[1]) == 3
+    chunks = []
+
+    class Scorer:
+        def forward(self, model, batch, lengths):
+            pairs = batch.shape[0] // 2
+            chunks.append(pairs)
+            sizes = lengths[:, 1].astype(mx.float32)
+            return mx.concatenate([sizes[:pairs], -sizes[pairs:]])
+
+    table = precompute_reference_logps(plan, None, Scorer(), batch_size=2)
+    expected = [[len(row.chosen), -len(row.rejected)] for row in plan.rows]
+    assert chunks == [2, 2, 1] and table.tolist() == expected
+    with pytest.raises(ValueError, match="pair per row"):
+        plan.set_reference_logps(expected[1:])
+    *_, reference = plan[1]
+    held = plan.schedule[1]
+    assert reference.tolist() == (
+        [expected[i][0] for i in held] + [expected[i][1] for i in held])
+    class Refusing:
+        def forward(self, *_args):
+            raise AssertionError("the reference was scored")
+
+    objective = resolve_preference_objective("dpo", beta=0.1)
+    loss_fn = make_dpo_loss_fn(objective, reference_policy=Refusing())
+    eval_fn = make_preference_eval_fn(objective, reference_policy=Refusing())
+    model = TinyModel()
+    loss, evaluated = float(loss_fn(model, *plan[1])[0]), float(eval_fn(model, *plan[1])[0])
+    zeroed = build_plan(dataset=rows(5), num_batches=3)
+    zeroed.set_reference_logps([[0.0, 0.0]] * 5)
+    free = make_dpo_loss_fn(
+        resolve_preference_objective("dpo", beta=0.1, reference_free=True))
+    zero_loss = float(loss_fn(model, *zeroed[1])[0])
+    assert math.isclose(zero_loss, float(free(model, *zeroed[1][:3])[0]))
+    assert not math.isclose(loss, zero_loss), "the loss reads the values"
+    assert not math.isclose(evaluated, float(eval_fn(model, *zeroed[1])[0]))
+
+
 def test_preference_trainers_forward_shared_constructor_state():
     import mlx.nn as nn
     from unsloth_zoo.mlx.trainer import (
@@ -1511,6 +1557,75 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
             _run_generation_trainer(trainer, monkeypatch, [])
 
 
+@pytest.mark.parametrize("sampling", [False, True])
+def test_the_trainer_precomputes_the_reference_once_per_split(
+    tmp_path, monkeypatch, sampling,
+):
+    """The training rows before the first step, an eval split when first built and
+    as an evaluation scores; a snapshot then goes unless the sampler reads it."""
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    from unsloth_zoo.mlx.utils import mlx_training_patches_active
+
+    trainer = MLXDPOTrainer(
+        _tiny_model(tail=True), Tokenizer(), rows(5),
+        eval_dataset={"a": rows(2), "b": rows(3)},
+        args=MLXDPOConfig(**_generation_common(
+            tmp_path, max_steps=2, eval_steps=2, precompute_ref_log_probs=True,
+            precompute_ref_batch_size=2 if sampling else None,
+            generate_during_eval=sampling, per_device_eval_batch_size=3,
+        )),
+    )
+    forwards, tables, built = [], [], []
+    build = trainer._build_dpo_reference
+
+    def capture(*args, **kwargs):
+        policy, provenance = build(*args, **kwargs)
+        if policy is not None:
+            forward = policy.forward
+
+            def counting(model, batch, lengths):
+                forwards.append((trainer._global_step, batch.shape[0] // 2))
+                return forward(model, batch, lengths)
+
+            policy.forward = counting
+            built.append(policy)
+        return policy, provenance
+
+    precompute = trainer_module.precompute_reference_logps
+
+    def recording(plan, model, policy, *, batch_size):
+        tables.append((
+            len(plan.rows), batch_size, mlx_training_patches_active(), model.training,
+        ))
+        return precompute(plan, model, policy, batch_size=batch_size)
+
+    trainer._build_dpo_reference = capture
+    monkeypatch.setattr(trainer_module, "precompute_reference_logps", recording)
+    _run_generation_trainer(trainer, monkeypatch, [])
+    assert trainer._global_step == 2
+    chunk = 2 if sampling else 3
+    assert tables == [(5, 2, True, True), (2, chunk, False, False), (3, chunk, False, False)]
+    assert forwards == [(0, 2), (0, 2), (0, 1)] + [
+        (2, n) for n in [2] + ([2, 1] if sampling else [3])]
+    assert built[0].released is not sampling
+    if sampling:
+        assert trainer.last_generation_samples[0]["reference"]
+    else:
+        assert built[0].values == [] and built[0].targets == ()
+    for bad, match in (
+        ({"sync_ref_model": True}, "Use one of the two"),
+        ({"precompute_ref_batch_size": 0}, "precompute_ref_batch_size must be"),
+    ):
+        trainer = MLXDPOTrainer(
+            _tiny_model(tail=True), Tokenizer(), rows(3), eval_dataset=rows(2),
+            args=MLXDPOConfig(**_generation_common(
+                tmp_path, precompute_ref_log_probs=True, **bad)),
+        )
+        with pytest.raises(ValueError, match=match):
+            _run_generation_trainer(trainer, monkeypatch, [])
+
+
 def _tiny_model(lora=False, tail=False):
     """lora=True adds an adapter at zero delta; tail=True a tensor no adapter owns."""
     import mlx.core as mx
@@ -1536,8 +1651,14 @@ def _tiny_model(lora=False, tail=False):
         def __call__(self, tokens):
             return self.proj(self.embed(tokens))
 
+        training = True
+
         def train(self, mode=True):
+            self.training = mode
             return self
+
+        def eval(self):
+            self.training = False
 
         @property
         def state(self):
