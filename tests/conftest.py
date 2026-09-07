@@ -285,6 +285,17 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
 # the same and is already used elsewhere in these files: monkeypatch.setitem, which puts
 # the original back.
 _GUARDED_MODULES = ("bitsandbytes", "bitsandbytes.functional", "bitsandbytes.nn")
+
+# Names that nothing in the installed environment provides. A top-level `moe_utils`
+# only ever resolves because a test put a compile-cache directory on sys.path, so
+# for these the exemption below is wrong in both directions: the import IS the swap,
+# and the module it leaves behind outlives the directory it was read from. Leaving
+# one there makes the bare `from moe_utils import ...` in every generated MoE module
+# resolve to a stale copy, which is invisible because that import is deliberately
+# swallowed -- the module loads reporting success with its backend names undefined.
+# That is exactly how test_compiled_cache_collective.py's recovery test failed on
+# main while passing when run alone.
+_GUARDED_BARE_MODULES = ("moe_utils",)
 _MODULE_SNAPSHOT_KEY = "_unsloth_guarded_module_snapshot"
 
 
@@ -299,7 +310,10 @@ def _is_module_stub(mod):
 def pytest_runtest_setup(item):
     import sys as _sys
 
-    setattr(item, _MODULE_SNAPSHOT_KEY, {n: _sys.modules.get(n) for n in _GUARDED_MODULES})
+    setattr(item, _MODULE_SNAPSHOT_KEY, {
+        n: _sys.modules.get(n)
+        for n in _GUARDED_MODULES + _GUARDED_BARE_MODULES
+    })
 
 
 @_pytest.hookimpl(trylast = True)
@@ -322,6 +336,13 @@ def pytest_runtest_teardown(item, nextitem):
         now = _sys.modules.get(name)
         if now is was:
             continue
+        if was is None and now is not None and name in _GUARDED_BARE_MODULES:
+            # No exemption here: see _GUARDED_BARE_MODULES. Importing one of these
+            # at all requires a sys.path the rest of the session does not have, so
+            # "nothing was there and the test imported the real thing" is precisely
+            # the leak rather than the innocent case it is for a real package.
+            leaked.append(name)
+            continue
         if was is None and not _is_module_stub(now):
             # Nothing was there and the test imported the real thing. That is an
             # import, not a swap, and flagging it would fail every test that touches
@@ -332,5 +353,6 @@ def pytest_runtest_teardown(item, nextitem):
         raise AssertionError(
             f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back, "
             f"so every later test in this process imports the substitute. Use "
-            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown."
+            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown, or "
+            f"save and restore the entry by hand where the import itself installs it."
         )

@@ -1321,6 +1321,12 @@ def test_direct_recovery_can_still_import_cache_helpers(
         "forward_moe_backend = 'installed'\n", encoding="utf-8",
     )
 
+    # The generated module does a bare `from moe_utils import ...`, so an entry
+    # left in sys.modules by any earlier test wins over the file just written and
+    # this reports a search-path bug that is not there. Isolate it on the way in
+    # as well as on the way out; tests/conftest.py now fails the leaker directly.
+    previous_moe_utils = sys.modules.pop("moe_utils", None)
+
     name = "pr967_recovery_helper"
     real_import = compiler.importlib.import_module
     failed = False
@@ -1350,14 +1356,19 @@ def test_direct_recovery_can_still_import_cache_helpers(
         )
 
         assert getattr(module, f"{name}_fn")(21) == 42
+        resolved = getattr(sys.modules.get("moe_utils"), "__file__", None)
         assert getattr(module, "forward_moe_backend", None) == "installed", (
             "the recovered module could not import moe_utils from the compiled "
             "cache, so a generated MoE module would load with its backend names "
-            "undefined and fail at the first forward."
+            "undefined and fail at the first forward. moe_utils resolved to "
+            f"{resolved!r}; the helper written for this test is "
+            f"{str(primary / 'moe_utils.py')!r}."
         )
     finally:
         for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
             sys.modules.pop(alias, None)
+        if previous_moe_utils is not None:
+            sys.modules["moe_utils"] = previous_moe_utils
 
 
 def test_recovered_module_keeps_an_importable_module_identity(
