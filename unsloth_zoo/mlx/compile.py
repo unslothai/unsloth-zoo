@@ -5086,7 +5086,7 @@ def _install_deepseek_ocr_compile_patches():
             seq_features = []
             patch_idx = 0
 
-            for image_idx, crop_shape in enumerate(images_spatial_crop or ()):
+            for image_idx, crop_shape in enumerate(() if images_spatial_crop is None else images_spatial_crop):
                 width_crop_num, height_crop_num = (int(crop_shape[0]), int(crop_shape[1]))
                 has_crops = width_crop_num > 1 or height_crop_num > 1
                 num_patches = width_crop_num * height_crop_num if has_crops else 0

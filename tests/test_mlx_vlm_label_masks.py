@@ -5616,3 +5616,21 @@ def test_decoder_containers_support_lora(layout, count, use_dora):
     assert not _fix_gemma3n_altup_batch(NS(language_model=root))
     assert linear_to_lora_layers(root, count, dict(keys=["proj"], rank=2, scale=2, dropout=0, use_dora=use_dora)) == count
     assert [hasattr(layer.proj, "lora_a") for layer in stack.layers] == [count == 2, True]
+
+
+def test_crop_arrays_reach_the_image_tower_without_boolean_conversion(monkeypatch):
+    from collections import defaultdict
+    from types import SimpleNamespace as NS
+    from unsloth_zoo.mlx import compile as patches
+    modules = defaultdict(lambda: NS(**{name: type(name, (), {}) for name in (
+        "Model", "MlpProjector", "VisionEmbeddings", "VisionModel", "InputEmbeddingsFeatures")}))
+    monkeypatch.setattr(patches, "importlib", NS(import_module=lambda name: modules[name]))
+    monkeypatch.setattr(patches, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(patches, "_patch_method", setattr)
+    patches._install_deepseek_ocr_compile_patches()
+    model = NS(language_model=NS(model=NS(embed_tokens=lambda ids: mx.zeros((1, 2, 4)))),
+               sam_model=mock.Mock(side_effect=RuntimeError("image tower reached")))
+    with pytest.raises(RuntimeError, match="image tower reached"):
+        modules["mlx_vlm.models.deepseekocr.deepseekocr"].Model.get_input_embeddings(
+            model, mx.array([[1, 2]]), (mx.zeros((0, 3, 1, 1)), mx.zeros((2, 3, 1, 1))),
+            images_spatial_crop=mx.array([[1, 1], [2, 1]]))
