@@ -38,20 +38,43 @@ flex = pytest.importorskip("unsloth_zoo.temporary_patches.flex_attention_bwd")
 torch = pytest.importorskip("torch")
 
 
-def _staged(block, stages, head_dim, dtype_size):
-    """The formula this module shipped with, kept here as the floor it must not go under."""
-    return stages * block * head_dim * dtype_size * 2 + flex._SHMEM_OVERHEAD
+def _dtypes():
+    """Every dtype the backward is reached with, including any float8 this torch has."""
+    out = [torch.bfloat16, torch.float16, torch.float32]
+    for name in ("float8_e4m3fn", "float8_e5m2"):
+        dt = getattr(torch, name, None)
+        if dt is not None:
+            out.append(dt)
+    return out
+
+
+def _staged(block, stages, head_dim, dtype):
+    """The formula this module shipped with, dtype rule included.
+
+    Its rule answers 4 for anything that is not bf16 or fp16, which is four times a
+    float8's real width. Reproduced faithfully rather than corrected, because this is
+    the floor the estimate must not drop below, not a model of the hardware.
+    """
+    size = 2 if dtype in (torch.bfloat16, torch.float16) else 4
+    return stages * block * head_dim * size * 2 + flex._SHMEM_OVERHEAD
 
 
 class TestTheEstimateIsNeverLowerThanItWas:
-    """Whatever else changes, no GPU may stop being covered."""
+    """Whatever else changes, no GPU may stop being covered.
+
+    The float8 rows are the ones that caught a real slip: correcting the element width
+    to its true 1 byte dropped the estimate for an fp8 kernel to well under what the
+    shipped formula produced, which would have closed the gate on a case it opens today.
+    Each term now keeps its own dtype rule so the maximum is a floor for every dtype.
+    """
 
     @pytest.mark.parametrize("block", [16, 32, 64, 128])
     @pytest.mark.parametrize("stages", [1, 2, 3])
     @pytest.mark.parametrize("head_dim", [64, 128, 192, 256])
-    def test_it_never_drops_below_the_original_formula(self, block, stages, head_dim):
-        got = flex._estimate_shmem(block, stages, head_dim, torch.bfloat16)
-        assert got >= _staged(block, stages, head_dim, 2), (
+    @pytest.mark.parametrize("dtype", _dtypes(), ids = lambda d: str(d).replace("torch.", ""))
+    def test_it_never_drops_below_the_original_formula(self, block, stages, head_dim, dtype):
+        got = flex._estimate_shmem(block, stages, head_dim, dtype)
+        assert got >= _staged(block, stages, head_dim, dtype), (
             "an estimate below the original one would close the gate on a GPU where it "
             "fires today, which is a silent failure to compile"
         )
@@ -75,7 +98,7 @@ class TestTheMeasuredRequirementIsCovered:
         """The exact config GB10 was handed, against the limit Triton enforces."""
         assert flex._estimate_shmem(64, 1, 256, torch.bfloat16) > 101376
         # And the old formula, which is why it slipped: 1 * 64 * 256 * 2 * 2 + 10240.
-        assert _staged(64, 1, 256, 2) == 75776
+        assert _staged(64, 1, 256, torch.bfloat16) == 75776
 
     def test_a_head_dim_that_fits_still_fits(self):
         """head_dim 128 compiles on GB10 today, so the gate must stay shut for it."""

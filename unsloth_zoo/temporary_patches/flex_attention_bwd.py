@@ -63,9 +63,22 @@ _SHMEM_TILE_FACTOR = 3.5
 def _dtype_size(dtype):
     if dtype in (torch.bfloat16, torch.float16):
         return 2
+    # getattr, because the float8 dtypes do not exist on every supported torch.
     if dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e5m2", None)):
         return 1
     return 4
+
+
+def _staged_dtype_size(dtype):
+    """The dtype rule the staged formula was fitted with, kept exactly as it was.
+
+    It answers 4 for anything that is not bf16 or fp16, which includes the float8
+    dtypes -- four times their real width. That is wrong as physics and right as a
+    floor: correcting it here would drop the staged estimate for an fp8 kernel below
+    what this patch has been using, and the whole point of keeping this term is that
+    it can only ever raise the answer.
+    """
+    return 2 if dtype in (torch.bfloat16, torch.float16) else 4
 
 
 def _estimate_shmem(block_size, num_stages, head_dim, dtype):
@@ -76,10 +89,14 @@ def _estimate_shmem(block_size, num_stages, head_dim, dtype):
     on sm_121 it measurably does not. Neither formula is safe alone, so take whichever
     is larger -- an over-estimate costs a few discarded autotune candidates, while an
     under-estimate silently returns a config that cannot compile.
+
+    Each term keeps its own dtype rule so the maximum is a true floor over the
+    original: the staged one because it was fitted that way, the linear one because
+    it is the measured relationship and wants the real element width.
     """
-    tile = block_size * head_dim * _dtype_size(dtype)
-    staged = num_stages * tile * 2 + _SHMEM_OVERHEAD
-    linear = _SHMEM_TILE_FACTOR * tile
+    tile = block_size * head_dim
+    staged = num_stages * tile * _staged_dtype_size(dtype) * 2 + _SHMEM_OVERHEAD
+    linear = _SHMEM_TILE_FACTOR * tile * _dtype_size(dtype)
     return int(max(staged, linear))
 
 
