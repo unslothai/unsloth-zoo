@@ -100,9 +100,13 @@ def test_bare_moe_utils_copy_shares_the_registry(cache_copy, monkeypatch):
     # A third copy: compiler.py puts the compile location on sys.path, so the bare
     # `from moe_utils import ...` generated modules do is its own module too.
     monkeypatch.syspath_prepend(os.environ["UNSLOTH_COMPILE_LOCATION"])
-    monkeypatch.delitem(sys.modules, "moe_utils", raising=False)
+    # Record the slot BEFORE the import fills it. setitem after the import
+    # remembers the bare copy as the value to restore, so the scratch copy
+    # outlived this test in sys.modules and every later bare `from moe_utils
+    # import ...` in the process resolved to it instead of its own cache.
+    monkeypatch.setitem(sys.modules, "moe_utils", None)
+    del sys.modules["moe_utils"]
     import moe_utils as bare
-    monkeypatch.setitem(sys.modules, "moe_utils", bare)
     assert bare is not moe_utils and bare is not cache_copy
     key = "unit_test_registry_shared_arch_bare"
     fn = lambda weight, proj_type, hidden_dim: weight

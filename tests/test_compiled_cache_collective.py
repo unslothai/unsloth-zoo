@@ -1317,6 +1317,10 @@ def test_direct_recovery_can_still_import_cache_helpers(
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
+    # An earlier test that imported a bare moe_utils from its own scratch cache
+    # would satisfy the import below from sys.modules and never touch the
+    # search path this test exists to check. Start from an empty slot.
+    monkeypatch.delitem(sys.modules, "moe_utils", raising=False)
     (primary / "moe_utils.py").write_text(
         "forward_moe_backend = 'installed'\n", encoding="utf-8",
     )
