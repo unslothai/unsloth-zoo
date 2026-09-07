@@ -188,6 +188,74 @@ def test_the_dtype_patcher_never_reads_its_own_generated_forward(tmp_path):
     )
 
 
+def test_a_mode_change_rebuilds_from_the_pristine_forward(tmp_path):
+    """A same-mode second pass continues before touching the pin, so only a
+    mode change exercises it: the rebuild must come from torch's own forward,
+    read nothing out of the compile folder, and not stack a wrapper."""
+    proc = _run(
+        """
+        import torch
+
+        real_getsource = compiler.inspect.getsource
+        hits = []
+
+        def raise_on_generated(obj, *args, **kwargs):
+            code = getattr(obj, "__code__", None)
+            if code is not None and code.co_filename.startswith(CACHE):
+                hits.append(code.co_filename)
+                raise tokenize.TokenError("EOF in multi-line statement", (1, 0))
+            return real_getsource(obj, *args, **kwargs)
+
+        compiler.inspect.getsource = raise_on_generated
+        # The compiled global F.layer_norm is not what this exercises.
+        import unsloth_zoo.patch_torch_functions as ptf
+        ptf.patch_torch_functions = lambda: None
+
+        mod = fresh_llama()
+        compiler._patch_torch_dtype_modules(
+            "transformers.models.llama.modeling_llama",
+            dir(mod),
+            compiler.get_torch_compile_options(),
+            True,
+            False,
+            None,
+        )
+
+        rebuilt = []
+        stacked = []
+        from_cache = []
+        for name in compiler._patch_functions:
+            if not hasattr(torch.nn, name):
+                continue
+            fwd = getattr(torch.nn, name).forward
+            if not getattr(fwd, "__unsloth_dtype_wrapped__", False):
+                continue
+            original = fwd.__unsloth_dtype_original__
+            rebuilt.append([name, fwd.__unsloth_dtype_disable__])
+            if getattr(original, "__unsloth_dtype_wrapped__", False):
+                stacked.append(name)
+            code = getattr(original, "__code__", None)
+            if code is not None and code.co_filename.startswith(CACHE):
+                from_cache.append(name)
+
+        print("RESULT " + json.dumps({
+            "hits": hits,
+            "rebuilt": rebuilt,
+            "stacked": stacked,
+            "from_cache": from_cache,
+        }))
+        """,
+        tmp_path / "cache_mode_change",
+    )
+    out = _result(proc, "mode-change-rebuild")
+
+    assert out["rebuilt"], "no torch.nn forward was rebuilt, so the mode change never reached the loop"
+    assert all(disable is False for _, disable in out["rebuilt"]), out["rebuilt"]
+    assert out["hits"] == [], f"the rebuild read a generated forward through getsource: {out['hits']}"
+    assert out["stacked"] == [], f"a wrapper was rebuilt on top of a wrapper: {out['stacked']}"
+    assert out["from_cache"] == [], f"the pin points at a generated forward: {out['from_cache']}"
+
+
 def test_the_probe_sets_cpu_mode_itself_rather_than_inheriting_it():
     """The subprocess must not depend on conftest for its own importability.
 
