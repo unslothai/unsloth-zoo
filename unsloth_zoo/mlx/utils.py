@@ -16690,6 +16690,106 @@ _MODEL_WEIGHT_SUFFIXES = (
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
 
 
+def _save_vlm_processor_assets(processor, path, sources=()):
+    path = Path(path)
+    failures = []
+    saved = set()
+    asset_names = set()
+
+    def valid_asset(file):
+        try:
+            if not file.is_file():
+                return False
+            if file.suffix == ".json":
+                json.loads(file.read_text())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def copy_assets(source, overwrite=False, source_only=False, complete=True):
+        for file in Path(source).rglob("*"):
+            relative = file.relative_to(source)
+            if not file.is_file() or file.suffix in _MODEL_WEIGHT_SUFFIXES:
+                continue
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if file.resolve().is_relative_to(path.resolve()):
+                continue
+            if file.name in _CORE_SAVE_FILENAMES or file.name == "adapter_config.json":
+                continue
+            if file.name.startswith(("model-", "pytorch_model")):
+                continue
+            if source_only and file.suffix not in _MODEL_SIDECAR_SUFFIXES and file.name not in asset_names:
+                continue
+            if not complete and file.suffix != ".json":
+                continue
+            target = path / relative
+            if relative in saved or (
+                not overwrite and target.suffix == ".json" and valid_asset(target)
+            ):
+                continue
+            try:
+                if file.suffix == ".json":
+                    json.loads(file.read_text())
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file, target)
+                saved.add(relative)
+            except Exception as error:
+                failures.append(f"{relative}: {error}")
+
+    def save_component(component, overwrite=True):
+        vocab_files = getattr(component, "vocab_files_names", None)
+        if isinstance(vocab_files, dict):
+            asset_names.update(Path(name).name for name in vocab_files.values() if isinstance(name, str))
+        save = getattr(component, "save_pretrained", None)
+        if not callable(save):
+            return False
+        success = True
+        try:
+            with tempfile.TemporaryDirectory() as staging:
+                try:
+                    save(staging)
+                except Exception as error:
+                    failures.append(f"{type(component).__name__}: {error}")
+                    success = False
+                # Only JSON can be validated after an interrupted writer.
+                copy_assets(staging, overwrite=overwrite, complete=success)
+        except Exception as error:
+            failures.append(f"{type(component).__name__}: {error}")
+            success = False
+        return success
+
+    if not save_component(processor, overwrite=True):
+        if not failures:
+            failures.append(f"{type(processor).__name__} has no save_pretrained")
+    # Some processors' save methods omit components or are entirely no-ops.
+    names = ("tokenizer", "image_processor", "feature_extractor")
+    names += tuple(getattr(processor, "attributes", ()) or ())
+    seen = {id(processor)}
+    for name in names:
+        component = getattr(processor, name, None)
+        if component is not None and id(component) not in seen:
+            seen.add(id(component))
+            save_component(component)
+
+    for source in sources:
+        if source is None:
+            continue
+        try:
+            source = Path(source)
+            copy_assets(source, source_only=True)
+            config = source / "config.json"
+            target = path / "config.json"
+            if config.is_file() and not valid_asset(target):
+                json.loads(config.read_text())
+                shutil.copy2(config, target)
+        except Exception as error:
+            failures.append(f"processor source: {error}")
+    if failures:
+        print("Unsloth: Adapter saved; processor assets recovered where available: "
+              + "; ".join(dict.fromkeys(failures)))
+
+
 def _copy_source_sidecars(src_path, path):
     """Copy non-weight source sidecars that tokenizer/model saves may omit."""
     copied = 0

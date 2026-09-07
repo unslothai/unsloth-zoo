@@ -8610,33 +8610,25 @@ class MLXTrainer:
                 save_lora_adapters(
                     self.model, output_dir, adapter_config=adapter_config,
                 )
-            # VLM processors include the inner tokenizer; skip the separate
-            # tokenizer save when the processor will cover it.
             _processor = self.processor or getattr(self.model, "_processor", None)
-            _processor_saves_tokenizer = (
-                _processor is not None and hasattr(_processor, "save_pretrained")
+            sources = (
+                getattr(self.model, "_config_src_path", None),
+                getattr(self.model, "_src_path", None),
             )
-            if not _processor_saves_tokenizer:
+            if _processor is not None:
+                from .utils import _save_vlm_processor_assets
+                _save_vlm_processor_assets(_processor, output_dir, sources)
+            else:
                 self.tokenizer.save_pretrained(output_dir)
+                src_path = next((source for source in sources if source is not None), None)
+                if src_path is not None:
+                    import shutil
+                    from pathlib import Path
+                    src_config = Path(src_path) / "config.json"
+                    dst_config = Path(output_dir) / "config.json"
+                    if src_config.exists() and not dst_config.exists():
+                        shutil.copy(str(src_config), str(dst_config))
 
-            # Copy base config.json so the checkpoint is loadable. Prefer the
-            # mlx-vlm patched dir when materialized (e.g. DeepSeek OCR): _src_path
-            # holds the original snapshot, whose unpatched model_type/auto_map
-            # would break mlx-vlm routing on the saved adapter's reload.
-            src_path = (
-                getattr(self.model, "_config_src_path", None)
-                or getattr(self.model, "_src_path", None)
-            )
-            if src_path is not None:
-                import shutil
-                from pathlib import Path
-                src_config = Path(src_path) / "config.json"
-                dst_config = Path(output_dir) / "config.json"
-                if src_config.exists() and not dst_config.exists():
-                    shutil.copy(str(src_config), str(dst_config))
-
-            if _processor_saves_tokenizer:
-                _processor.save_pretrained(output_dir)
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:
             save_merged_model(self.model, self.tokenizer, output_dir)
