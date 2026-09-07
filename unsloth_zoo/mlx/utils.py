@@ -2406,6 +2406,7 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
     coercion parity holds by construction. Float comparisons mirror MLX's
     effective float32 narrowing so placement matches the finalized tensors.
     """
+    generated = labels is None
     if labels is None:
         labels = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
         if labels is None:
@@ -2427,6 +2428,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         # Same normalization finalize uses (wide unsigned ids -> int64 sentinels)
         values = _normalize_numpy_cce_labels(values)
     mask = values == -100
+    if generated and any(inputs.get(key) is not None for key in ("pixel_values", "images")):
+        mask = mask | (values < 0)
     if ignore_token_ids:
         compare = np.asarray(list(ignore_token_ids))
         if np.issubdtype(values.dtype, np.floating):
@@ -2615,9 +2618,13 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     # its own narrow, so wide/unsigned invalid ids (e.g. uint32(2**32-100))
     # must survive as out-of-vocab sentinels instead of wrapping to -100.
     # Prefer the pre-narrow raw carrier when deriving labels from input_ids.
+    generated = labels is None
     if labels is None:
         labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
     labels = _normalize_cce_label_dtype(labels)
+    if generated and batch_dict.get("pixel_values") is not None:
+        # Processor-generated negative image placeholders are not vocabulary targets.
+        labels = mx.where(labels < 0, mx.array(ignore_index, dtype=labels.dtype), labels)
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
     spans = _audio_span_positions_np(batch_dict, labels.shape)
     if spans is not None:
@@ -4679,6 +4686,45 @@ def _processor_accepts_assistant_list_content(processor):
             return True
 
 
+def _vlm_token_messages(processor, messages):
+    model_type = getattr(processor, "_unsloth_model_type", None)
+    if not model_type:
+        return messages
+    from mlx_vlm.prompt_utils import get_message_json
+
+    rendered = []
+    image_offset = 0
+    for message in messages:
+        count = _count_vlm_image_parts([message])
+        offset = image_offset
+        image_offset += count
+        parts = message.get("content")
+        if not isinstance(parts, list) or any(
+            not isinstance(part, dict) or part.get("type") not in ("text", "image")
+            for part in parts
+        ):
+            rendered.append(message)
+            continue
+        text = "".join(str(part.get("text", "")) for part in parts
+                       if part.get("type") == "text")
+        try:
+            native = get_message_json(
+                model_type, text, role=message.get("role", "user"), num_images=count,
+            )
+        except ValueError:
+            native = None
+        content = native.get("content") if isinstance(native, dict) else None
+        if isinstance(content, str) and (not count or content != text):
+            if count and offset and content.endswith(text):
+                prefix = content[:-len(text)] if text else content
+                prefix = re.sub(r"<\|image_(\d+)\|>",
+                                lambda match: f"<|image_{int(match[1]) + offset}|>", prefix)
+                content = prefix + text
+            message = {**message, "content": content}
+        rendered.append(message)
+    return rendered
+
+
 def _render_vlm_messages(
     processor,
     messages,
@@ -4689,7 +4735,7 @@ def _render_vlm_messages(
     if isinstance(messages, str):
         return messages
 
-    render_messages = messages
+    render_messages = _vlm_token_messages(processor, messages)
     if not _processor_accepts_assistant_list_content(processor):
         render_messages = _collapse_vlm_assistant_content(render_messages)
 
@@ -7758,6 +7804,9 @@ _VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
 
 
 def _to_mx_vlm_batch(inputs):
+    if inputs.get("pixel_values") is None and inputs.get("images") is not None:
+        inputs = dict(inputs)
+        inputs["pixel_values"] = inputs.pop("images")
     batch = {}
     for key, value in inputs.items():
         if key == "sound_clips" and isinstance(value, (list, tuple)):

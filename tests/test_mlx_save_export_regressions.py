@@ -1863,6 +1863,8 @@ def test_processor_loader_is_call_scoped_and_preserves_failure_policy(
         @classmethod
         def from_pretrained(cls, _path, **kwargs):
             calls.append(kwargs["trust_remote_code"])
+            if cls.error is None:
+                return tokenizer
             raise cls.error
 
     monkeypatch.setitem(globals(), "AutoProcessor", FakeAutoProcessor)
@@ -1877,6 +1879,14 @@ def test_processor_loader_is_call_scoped_and_preserves_failure_policy(
     assert scoped(tmp_path) is native and trusted(tmp_path) is native
     assert calls == [False, True] and load_processor is _test_bound_load_processor
     assert AutoProcessor is FakeAutoProcessor
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(WordLevel({"word": 0})))
+    FakeAutoProcessor.error = None
+    assert scoped(tmp_path) is native
+    tokenizer.image_processor = object()
+    assert scoped(tmp_path) is tokenizer
     FakeAutoProcessor.error = RuntimeError("unrelated")
     with pytest.raises(RuntimeError, match="unrelated"):
         scoped(tmp_path)

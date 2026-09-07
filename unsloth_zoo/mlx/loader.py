@@ -207,7 +207,7 @@ class _MLXLoRATypeSpec:
     wrapper_type: type
 
 
-def _mlx_lora_type_specs():
+def _mlx_lora_type_specs(*, include_convolutions=False):
     import mlx.nn as nn
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
     from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
@@ -233,6 +233,9 @@ def _mlx_lora_type_specs():
                 vlm_lora_module.LoRASwitchLinear,
             )
         )
+    if include_convolutions:
+        from .lora import LoRAPointwiseConv2d
+        specs.append(_MLXLoRATypeSpec((nn.Conv2d,), LoRAPointwiseConv2d))
     return tuple(specs)
 
 
@@ -289,7 +292,9 @@ def _mlx_quantized_module_types():
 def _mlx_lora_spec_for_module(module, specs):
     for spec in specs:
         if isinstance(module, spec.base_types):
-            return spec
+            supports = getattr(spec.wrapper_type, "supports", None)
+            if supports is None or supports(module):
+                return spec
     return None
 
 
@@ -1519,9 +1524,6 @@ def _read_json_file(path):
 
 def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
     """Resolve a custom mlx-vlm or Transformers processor class by name."""
-    if not processor_class_name:
-        return None
-
     module_model_type = (model_type or "").replace("-", "_")
     module_types = [module_model_type]
     # Aliased model types live under their MODEL_REMAPPING target package.
@@ -1546,13 +1548,19 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
             module = importlib.import_module(module_name)
         except Exception:
             continue
-        processor_class = getattr(module, processor_class_name, None)
+        if processor_class_name:
+            processor_class = getattr(module, processor_class_name, None)
+        else:
+            candidates = [getattr(module, name) for name in getattr(module, "__all__", ())
+                          if name.endswith("Processor") and "ImageProcessor" not in name
+                          and callable(getattr(getattr(module, name, None), "from_pretrained", None))]
+            processor_class = candidates[0] if len(candidates) == 1 else None
         if isinstance(processor_class, type):
             return processor_class
 
     try:
         import transformers
-        processor_class = getattr(transformers, processor_class_name, None)
+        processor_class = getattr(transformers, processor_class_name or "", None)
         return processor_class if isinstance(processor_class, type) else None
     except Exception:
         return None
@@ -1613,10 +1621,16 @@ def _load_declared_mlx_vlm_processor(model_path, model_type, **kwargs):
         )
     try:
         with _mlx_tokenizer_loading_scope(kwargs.get("trust_remote_code", False)):
-            return scoped_processor_class.from_pretrained(
-                processor_load_path,
-                **kwargs,
-            )
+            try:
+                return scoped_processor_class.from_pretrained(processor_load_path, **kwargs)
+            except AttributeError as error:
+                if ("backend_tokenizer" not in str(error)
+                        or "fix_mistral_regex" in kwargs):
+                    raise
+                # Transformers' regex repair expects a backend wrapper, not a raw Tokenizer.
+                return scoped_processor_class.from_pretrained(
+                    processor_load_path, **kwargs, fix_mistral_regex=False,
+                )
     finally:
         if str(processor_load_path) != str(model_path):
             shutil.rmtree(processor_load_path, ignore_errors=True)
@@ -1722,6 +1736,17 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
                             *args,
                             **call_kwargs,
                         )
+                        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+                        if (isinstance(processor, PreTrainedTokenizerBase)
+                                and getattr(processor, "image_processor", None) is None):
+                            config_data = _read_json_file(
+                                os.path.join(str(processor_load_path), "config.json")
+                            )
+                            native = _load_declared_mlx_vlm_processor(
+                                processor_load_path, config_data.get("model_type"), **call_kwargs,
+                            )
+                            if native is not None:
+                                processor = _inherit_mlx_vlm_processor_runtime(processor, native)
                     except Exception as error:
                         if not _is_mlx_vlm_processor_resolution_error(error):
                             raise
@@ -4216,7 +4241,7 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
     if not module_paths:
         return 0
 
-    type_specs = _mlx_lora_type_specs()
+    type_specs = _mlx_lora_type_specs(include_convolutions=True)
     try:
         from mlx_lm.tuner.lora import LoRAEmbedding
     except Exception:
@@ -7204,6 +7229,21 @@ def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
     return [path for path in paths if wanted.get(roles[path], False)]
 
 
+def _vision_projection_paths(module, attention, mlp, skip_subtrees=()):
+    paths = _role_selected_paths(module, attention, mlp, skip_subtrees)
+    if paths or not (attention and mlp):
+        return paths
+    from .lora import LoRAPointwiseConv2d
+    paths = [path for path, linear in _subtree_linears(module)
+             if _projects(linear) and _linear_role(path) is None
+             and not _under_any(path, skip_subtrees)]
+    paths.extend(path for path, child in module.named_modules()
+                 if LoRAPointwiseConv2d.supports(child) and child.weight.shape[0] > 1
+                 and _linear_role(path) != "gate"
+                 and not _under_any(path, skip_subtrees))
+    return paths
+
+
 def _raise_empty_target_modules():
     raise ValueError(
         "Unsloth: target_modules became empty after filtering by "
@@ -7293,7 +7333,7 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
         if targets_defaulted:
             # The canonical names are this code's own vocabulary, not the
             # caller's, and a tower rarely speaks it.
-            role_paths = _role_selected_paths(
+            role_paths = _vision_projection_paths(
                 vision_module, finetune_attention_modules,
                 finetune_mlp_modules, skip_subtrees=nested_projectors,
             )
@@ -7349,7 +7389,7 @@ def _lora_walk_module(
     mlx-lm's `linear_to_lora_layers` expects."""
     try:
         # The specs selection reads, so the walk adapts all it is handed.
-        specs = _mlx_lora_type_specs()
+        specs = _mlx_lora_type_specs(include_convolutions=match_paths is not None)
     except ImportError:
         return 0
 
