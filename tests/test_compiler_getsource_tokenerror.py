@@ -135,8 +135,12 @@ def test_compile_transformers_survives_tokenerror_from_getsource(tmp_path):
     )
 
 
-def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
-    """Raises only on the generated forward, so the pipeline reaches the dtype patcher."""
+def test_the_dtype_patcher_never_reads_its_own_generated_forward(tmp_path):
+    """After a warm-up, the torch.nn forwards are the patcher's own generated
+    ones. A second pass must not call getsource on them: it pins the pristine
+    forward before any rewrite and rebuilds from that (#967), which is what
+    removed the mid-rewrite TokenError this file was written for. A getsource
+    that does resolve into the compile folder is that path coming back."""
     proc = _run(
         """
         import torch
@@ -168,7 +172,7 @@ def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
 
         print("RESULT " + json.dumps({
             "generated": len(generated),
-            "hits": len(hits),
+            "hits": hits,
         }))
         """,
         tmp_path / "cache_generated",
@@ -177,12 +181,12 @@ def test_dtype_patcher_survives_tokenerror_on_its_generated_forward(tmp_path):
 
     assert out["generated"] > 0, (
         "no torch.nn forward was served out of the compile folder after a "
-        "warm-up compile, so this probe does not cover the concurrent-rewrite "
-        "case it exists for"
+        "warm-up compile, so this probe does not cover the second-pass case "
+        "it exists for"
     )
-    assert out["hits"] > 0, (
-        "no getsource call resolved into the compile folder, so the dtype "
-        "patcher's TokenError handler was never exercised"
+    assert out["hits"] == [], (
+        f"the dtype patcher read its own generated forward back through "
+        f"getsource: {out['hits']}"
     )
 
 

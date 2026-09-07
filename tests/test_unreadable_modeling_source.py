@@ -203,8 +203,14 @@ def test_a_bare_return_is_the_functions_contract():
     assert any(r.value is None for r in returns)
 
 
+# The dtype patcher reads `original_forward`, pinned from `function.forward`
+# before any rewrite (#967), so a second pass never reads its own generated
+# output back through getsource.
+NN_FORWARD_GETSOURCE = "source = inspect.getsource(original_forward).rstrip()"
+
+
 def _nn_patch_region() -> str:
-    i = SRC.index("source = inspect.getsource(function.forward).rstrip()")
+    i = SRC.index(NN_FORWARD_GETSOURCE)
     return SRC[max(0, i - 1600):i + 1400]
 
 
@@ -222,7 +228,7 @@ def test_the_nn_forward_patch_loop_is_guarded():
     forward is unreadable -- both measured, not assumed. This guards a state
     we have observed rather than encoding a theory about how it arises.
     """
-    guards = _getsource_guards("inspect.getsource(function.forward)")
+    guards = _getsource_guards("inspect.getsource(original_forward)")
     assert guards, "the forward getsource is no longer inside a try"
     for caught in guards:
         assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
@@ -242,7 +248,7 @@ def test_an_unreadable_forward_is_skipped_not_fatal():
     # Exactly the try whose body IS this assignment -- several other blocks
     # also call getsource on a forward, and their handlers legitimately do
     # something else.
-    target = "source = inspect.getsource(function.forward).rstrip()"
+    target = NN_FORWARD_GETSOURCE
     handlers = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try) or len(node.body) != 1:
@@ -272,7 +278,7 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    sites = {"inspect.getsource(modeling_file)", "inspect.getsource(function.forward)"}
+    sites = {"inspect.getsource(modeling_file)", "inspect.getsource(original_forward)"}
     for call in sites:
         guards = _getsource_guards(call)
         assert guards and all(
@@ -477,6 +483,15 @@ def test_the_wrapper_is_marked_so_it_is_not_wrapped_twice():
 def test_the_unreadable_forward_is_wrapped_rather_than_dropped():
     region = _nn_patch_region()
     assert "_dtype_safe_forward(" in region
+
+
+def test_the_forward_is_pinned_before_it_is_read():
+    """The pristine forward is captured before any rewrite and every branch
+    installs from it, or the second pass (loader.py prepends "siglip", so
+    vision loads patch torch.nn twice) reads its own output back."""
+    region = _nn_patch_region()
+    pin = region.index("original_forward = function.forward")
+    assert pin < region.index(NN_FORWARD_GETSOURCE)
 
 
 def test_the_tensor_may_arrive_by_keyword():
