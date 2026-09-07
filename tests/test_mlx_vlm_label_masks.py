@@ -3830,6 +3830,8 @@ def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     ("image_grid_thw", [[1, 16, 12], [2, 8, 4]]),
     ("video_grid_thw", [[2, 12, 8], [3, 4, 2]]),
     ("spatial_shapes", [[16, 12], [8, 4]]),
+    ("image_sizes", [[16, 12], [8, 4]]),
+    ("images_spatial_crop", [[2, 3], [4, 5]]),
 ])
 def test_processor_grid_structure_survives_compile_preparation(array_factory, key, rows):
     from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
@@ -5568,3 +5570,13 @@ def test_image_free_vlm_calls_use_the_padded_tokenizer(existing_pad):
     processor.assert_not_called()
     assert tokenizer.pad_token == (existing_pad or "[EOS]")
 
+
+
+@pytest.mark.parametrize("key", ["image_sizes", "images_spatial_crop"])
+def test_nested_size_metadata_preserves_image_and_slice_axes(key):
+    from unsloth_zoo.mlx.utils import _normalize_size_tuples, _prepare_vlm_batch_for_compile
+    assert _normalize_size_tuples([[[2, 3], [4, 5]], [[6, 7]]]) == (((2, 3), (4, 5)), ((6, 7),))
+    raw = mx.array([[[2, 3], [4, 5]], [[6, 7], [8, 9]]])
+    batch = _prepare_vlm_batch_for_compile({key: raw}, {}, phase="content")
+    assert batch[key] is raw and batch[key].shape == (2, 2, 2)
+    assert batch["_unsloth_static_vlm_metadata"][key] == (((2, 3), (4, 5)), ((6, 7), (8, 9)))

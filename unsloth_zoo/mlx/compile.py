@@ -5199,6 +5199,7 @@ def _install_deepseek_ocr_compile_patches():
 
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
+        patched_deepseekocr_get_input_embeddings._unsloth_static_vlm_metadata = ("images_spatial_crop",)
         _patch_method(
             deepseekocr_module.Model,
             "get_input_embeddings",
@@ -5308,6 +5309,7 @@ def _install_deepseek_ocr_compile_patches():
 
         return InputEmbeddingsFeatures2(inputs_embeds=input_embeds)
 
+    patched_deepseekocr2_get_input_embeddings._unsloth_static_vlm_metadata = ("images_spatial_crop",)
     _patch_method(
         deepseekocr2_module.Model,
         "get_input_embeddings",
@@ -5550,6 +5552,7 @@ def _install_negative_image_placeholder_patches():
 
         return txt_embeds
 
+    patched_phi3_get_input_embeddings._unsloth_static_vlm_metadata = ("image_sizes",)
     _patch_method(phi3_module.Model, "get_input_embeddings", patched_phi3_get_input_embeddings)
     _patch_method(phi3_vision_module.VisionModel, "__call__", patched_phi3_vision_call)
     _PATCHED_ARCHES.add("phi3_v")

@@ -3108,17 +3108,11 @@ def _mlx_vlm_canonical_model_type(model_type):
 def _normalize_size_tuples(values):
     if values is None:
         return None
-    if isinstance(values, mx.array):
+    if hasattr(values, "tolist"):
         values = values.tolist()
-    elif hasattr(values, "tolist"):
-        values = values.tolist()
-
-    normalized = []
-    for item in values:
-        if hasattr(item, "tolist"):
-            item = item.tolist()
-        normalized.append(tuple(int(x) for x in item))
-    return tuple(normalized)
+    if isinstance(values, (list, tuple)):
+        return tuple(_normalize_size_tuples(item) for item in values)
+    return int(values)
 
 
 def _normalize_int_tuple(values):
@@ -3788,16 +3782,14 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         ("image_grid_thw", image_grid_thw),
         ("video_grid_thw", video_grid_thw),
         ("spatial_shapes", spatial_shapes),
+        ("image_sizes", image_sizes),
+        ("images_spatial_crop", images_spatial_crop),
     ):
         if normalized is not None:
             value = batch_dict[key]
             batch_dict[key] = value if isinstance(value, (mx.array, np.ndarray)) else normalized
             static_metadata[key] = normalized
     batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
-    if image_sizes is not None:
-        batch_dict["image_sizes"] = image_sizes
-    if images_spatial_crop is not None:
-        batch_dict["images_spatial_crop"] = images_spatial_crop
     if audio_embed_sizes is not None:
         # The model calls .item() on each entry, so hand over an array; the
         # tuple above is only for this function's span arithmetic.
