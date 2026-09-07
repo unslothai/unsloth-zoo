@@ -8768,6 +8768,9 @@ class FastMLXModel:
             model._processor = processor
             for fixup in _VLM_MODEL_FIXUPS:
                 _run_with_vlm_config_view(fixup, model)
+            if not force_vlm_text_path and patch_mode == "patched":
+                from .legacy_vision import bind_legacy_image_processor
+                _run_with_vlm_config_view(bind_legacy_image_processor, model, processor)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
@@ -9199,13 +9202,8 @@ class FastMLXModel:
             model.freeze()
 
             if len(language_lora_keys) > 0:
-                # Compat patch (older mlx-lm rejects scale=/dropout= on
-                # from_base); before the seed since monkey-patching doesn't
-                # advance mx.random.
+                # Finish compatibility setup before seeding adapter initialization.
                 _patch_mlx_lora_from_base_compat()
-                # Seed mx.random immediately before LoRA init (like
-                # mlx_lm/tuner/lora.py train); otherwise lazy state
-                # advances leak into lora_a sampling.
                 _seed_mlx_random_state(random_state)
                 language_lora_count = linear_to_lora_layers(
                     lm,

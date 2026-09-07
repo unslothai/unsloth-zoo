@@ -4364,6 +4364,9 @@ def _install_llama_pixtral_mistral_compile_patches():
         llama4_module = None
 
     def patched_single_image_prepare_inputs(self, image_features, inputs_embeds, input_ids):
+        count = getattr(self, "_unsloth_legacy_image_token_count", None)
+        if count is not None and image_features.size // image_features.shape[-1] != count * input_ids.shape[0]:
+            raise ValueError("Unsloth MLX: legacy image feature count changed after token expansion.")
         return _merge_special_token_features_only(
             self.config.image_token_index,
             None,

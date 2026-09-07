@@ -462,29 +462,11 @@ def test_vision_lora_b_moves_through_the_processed_image_merge(pixel_key):
     from unsloth_zoo.mlx.compile import _merge_special_token_features_only
     from unsloth_zoo.mlx.utils import _to_mx_vlm_batch, make_vlm_baseline_loss_fn
 
-    class Backbone(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_tokens = nn.Embedding(VOCAB, HIDDEN)
-            self.layers = [_build({"q_proj": (HIDDEN, HIDDEN)})]
-
-        def __call__(self, ids, inputs_embeds):
-            return nn.tanh(self.layers[0].q_proj(mx.cumsum(inputs_embeds, axis=1)))
-
-    class Decoder(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = Backbone()
-            self.lm_head = nn.Linear(HIDDEN, VOCAB)
-
-        def __call__(self, ids, inputs_embeds):
-            return self.lm_head(self.model(ids, inputs_embeds))
-
     class Wrapper(nn.Module):
         def __init__(self):
             super().__init__()
             self.config = SimpleNamespace(hidden_size=HIDDEN, image_token_index=7)
-            self.language_model = Decoder()
+            self.language_model = _text_model([{"q_proj": (HIDDEN, HIDDEN)}])
             self.vision_tower = _build({"q_proj": (VISION, HIDDEN)})
             self._is_vlm_model = True
 
@@ -496,7 +478,9 @@ def test_vision_lora_b_moves_through_the_processed_image_merge(pixel_key):
             return SimpleNamespace(inputs_embeds=text)
 
         def __call__(self, ids, pixel_values=None, **kwargs):
-            return self.language_model(ids, self.get_input_embeddings(ids, pixel_values).inputs_embeds)
+            embeds = self.get_input_embeddings(ids, pixel_values).inputs_embeds
+            hidden = self.language_model.model.layers[0].q_proj(mx.cumsum(embeds, axis=1))
+            return self.language_model.lm_head(nn.tanh(hidden))
 
     model = _peft(Wrapper(), finetune_vision_layers=True)
     loss_fn = make_vlm_baseline_loss_fn(model)
@@ -607,3 +591,14 @@ def test_generated_image_labels_ignore_negative_placeholders_only(pixel_key):
     assert mx.array_equal(_apply_vlm_label_masks(batch, labels=mx.array(ids)), mx.array(ids))
     assert not _stage_vlm_label_mask_np({"input_ids": ids}).any()
     assert mx.array_equal(_apply_vlm_label_masks({"input_ids": mx.array(ids)}), mx.array(ids))
+
+
+@pytest.mark.parametrize("row", [0, 1])
+def test_legacy_image_validation_checks_each_row(row):
+    from unsloth_zoo.mlx.legacy_vision import validate_legacy_image_batch
+    batch = {"input_ids": [[1, -200, -200, 2], [-200, -200, 3, 4]],
+             "_unsloth_legacy_image_spec": (-200, 2)}
+    validate_legacy_image_batch(batch)
+    batch["input_ids"][row][1] = 5
+    with pytest.raises(ValueError, match="split or removed"):
+        validate_legacy_image_batch(batch)

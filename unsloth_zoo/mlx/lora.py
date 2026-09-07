@@ -27,9 +27,7 @@ class LoRAPointwiseConv2d(nn.Module):
         module.dropout = nn.Dropout(dropout)
         width = base.weight.shape[-1]
         bound = 1 / math.sqrt(width)
-        module.lora_a = mx.random.uniform(
-            low=-bound, high=bound, shape=(width, r),
-        )
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(width, r))
         module.lora_b = mx.zeros((r, base.weight.shape[0]))
         return module
 
@@ -43,7 +41,6 @@ class LoRAPointwiseConv2d(nn.Module):
         return y + (self.scale * delta).astype(y.dtype)
 
     def fuse(self):
-        """Return a convolution with the adapter folded into its weight."""
         conv = copy.deepcopy(self.conv)
         delta = (self.lora_a @ self.lora_b).T[:, None, None, :]
         conv.weight = conv.weight + (self.scale * delta).astype(conv.weight.dtype)

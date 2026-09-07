@@ -3790,6 +3790,8 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         return _vlm_positions_for_compile(batch_dict, config)
     if phase != "content":
         raise ValueError(f"unknown VLM prepare phase: {phase!r}")
+    from .legacy_vision import validate_legacy_image_batch
+    validate_legacy_image_batch(batch_dict)
     # The provenance marker is pipeline-private: processor output carrying it is a
     # forgery that would misclassify foreign position ids as regenerated.
     batch_dict.pop("_unsloth_collated_position_ids", None)
@@ -4707,6 +4709,10 @@ def _vlm_token_messages(processor, messages):
             continue
         text = "".join(str(part.get("text", "")) for part in parts
                        if part.get("type") == "text")
+        if hasattr(processor, "_unsloth_legacy_image_spec"):
+            rendered.append({**message, "content": "".join(
+                "<image>\n" if part["type"] == "image" else str(part.get("text", "")) for part in parts)})
+            continue
         try:
             native = get_message_json(
                 model_type, text, role=message.get("role", "user"), num_images=count,
@@ -8065,6 +8071,10 @@ def _processor_vlm_inputs(
     padding_side=None,
     all_audio=None,
 ):
+    from .legacy_vision import legacy_image_inputs
+    legacy = legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation)
+    if legacy is not None:
+        return legacy
     base_kwargs = dict(
         text=texts,
         padding=True,
