@@ -542,15 +542,61 @@ jobs:
           .lanes/venv-suites/bin/python -c "import mlx_vlm, mlx_lm; print('mlx-vlm', mlx_vlm.__version__)"
           # If the joint resolution missed the transformers cap, this job is
           # gating an environment the package forbids.
+          #
+          # Read the cap off our own installed metadata rather than repeating it
+          # as a literal. A literal here says "<=5.5.0" and means "whatever
+          # pyproject pins": the moment pyproject legitimately moves the cap the
+          # gate reports drift that does not exist, which is exactly how #1144
+          # went red. It also only ever checked the ceiling, so a resolution
+          # landing on one of the excluded releases (4.57.4, 5.0.0, ...) passed.
+          # The whole specifier set is the contract, so assert the whole thing.
           .lanes/venv-suites/bin/python - <<'PY'
-          from importlib.metadata import version
+          from importlib.metadata import requires, version
+          from packaging.requirements import Requirement
           from packaging.version import Version
-          transformers = Version(version("transformers"))
-          assert transformers <= Version("5.5.0"), (
-              f"transformers {transformers} exceeds the cap this package pins; "
-              "the MLX packages were resolved without it"
+
+          specifiers = {
+              str(req.specifier)
+              for raw in (requires("unsloth_zoo") or [])
+              for req in [Requirement(raw)]
+              if req.name.lower().replace("_", "-") == "transformers"
+          }
+          assert specifiers, (
+              "unsloth_zoo declares no transformers requirement, so this gate is "
+              "checking nothing. Did the dependency move out of pyproject.toml?"
           )
-          print("transformers", transformers, "within the pinned cap")
+          assert len(specifiers) == 1, (
+              f"unsloth_zoo pins transformers inconsistently across extras: "
+              f"{sorted(specifiers)}. Pick one before this gate can mean anything."
+          )
+          pinned = Requirement(f"transformers{specifiers.pop()}").specifier
+          transformers = Version(version("transformers"))
+          assert transformers in pinned, (
+              f"transformers {transformers} is outside the range this package "
+              f"pins ({pinned}); the MLX packages were resolved without it"
+          )
+          print("transformers", transformers, "within the pinned range", pinned)
+
+          # The ceiling is a deliberate policy choice, not an incidental number,
+          # so state it here as well and on purpose. mlx-vlm >= 0.6.9 requires
+          # transformers >= 5.14, and we are not taking that jump yet; the cap is
+          # what keeps the joint MLX resolution off it. Checking only "matches
+          # pyproject" above would let an automated dependency bump raise the cap
+          # and quietly opt the whole project in -- which is exactly what #1144
+          # did. Raising this is a decision: change CEILING in the same commit
+          # that changes pyproject.toml, deliberately.
+          CEILING = Version("5.5.0")
+          declared = [
+              Version(str(s.version)) for s in pinned if s.operator == "<="
+          ]
+          assert declared and max(declared) <= CEILING, (
+              f"pyproject.toml pins transformers <= {max(declared) if declared else None}, "
+              f"above the {CEILING} ceiling this project holds on purpose. "
+              "mlx-vlm >= 0.6.9 needs transformers >= 5.14 and we are not "
+              "following it yet. If raising it is intended, raise CEILING here "
+              "in the same commit and say why."
+          )
+          print("declared ceiling", max(declared), "at or below the policy ceiling", CEILING)
           PY
 
       - name: pytest tests/test_mlx_quantized_optimizer_state.py (HARD GATE)
