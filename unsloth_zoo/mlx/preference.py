@@ -973,16 +973,23 @@ class PreferenceRunContext:
 
 
 class ReferencePolicy:
-    """The frozen policy a referenced DPO run scores against: a model of its own,
-    or the policy model under overrides (a ``scale`` per adapter module, an
-    array per parameter) while active."""
+    """The policy a referenced DPO run scores against: a model of its own, or the
+    policy model under overrides (a ``scale`` per adapter module, an array per
+    parameter) while active. ``paths`` names the trainable tensors ``sync``
+    moves toward the policy and ``save`` / ``load`` carry across a checkpoint."""
 
-    def __init__(self, *, model=None, scales=(), overrides=(), neftune_modules=()):
+    def __init__(
+        self, *, model=None, scales=(), overrides=(), paths=(), mirrored=(),
+        neftune_modules=(),
+    ):
         self.model = model
         # Scales are floats, apart from ``values``, the list a compiled step captures.
         self.scales = tuple(scales)
         self.targets = tuple((module, name) for module, name, _ in overrides)
         self.values = [value for _, _, value in overrides]
+        # A snapshot syncs its first ``len(paths)`` values; a model syncs ``mirrored``.
+        self.paths = tuple(paths)
+        self.mirrored = tuple(mirrored)
         self.neftune_modules = tuple(neftune_modules)
 
     @property
@@ -1022,6 +1029,67 @@ class ReferencePolicy:
     def forward(self, model, batch, lengths):
         with self.activate(model) as reference:
             return mx.stop_gradient(_response_logps(reference, batch, lengths))
+
+    def _synced_tensor(self, index):
+        if self.model is None:
+            return self.values[index]
+        module, name = self.mirrored[index]
+        return getattr(module, name)
+
+    def _store_synced(self, index, value):
+        if self.model is None:
+            self.values[index] = value
+        else:
+            module, name = self.mirrored[index]
+            setattr(module, name, value)
+
+    def _require_synced(self):
+        if not self.paths:
+            raise RuntimeError("Unsloth MLX DPO: this reference does not sync.")
+
+    def sync(self, policy, alpha):
+        """``(1 - alpha) * reference + alpha * policy`` over the policy's trainable
+        tensors, mixed in float32, stored at the reference's dtype one tensor at a
+        time, in place inside the list a compiled step captured."""
+        self._require_synced()
+        trainable = dict(mlx.utils.tree_flatten(policy.trainable_parameters()))
+        for index, path in enumerate(self.paths):
+            reference = self._synced_tensor(index)
+            value = (1.0 - alpha) * reference.astype(mx.float32) \
+                + alpha * trainable[path].astype(mx.float32)
+            value = value.astype(reference.dtype)
+            mx.eval(value)
+            self._store_synced(index, value)
+
+    def save(self, directory):
+        self._require_synced()
+        os.makedirs(directory, exist_ok=True)
+        mx.save_safetensors(
+            os.path.join(directory, "reference.safetensors"),
+            {path: self._synced_tensor(index) for index, path in enumerate(self.paths)},
+        )
+
+    def load(self, directory):
+        file = os.path.join(directory, "reference.safetensors")
+        if not os.path.isfile(file):
+            raise FileNotFoundError(
+                f"Unsloth MLX DPO: {directory!r} has no reference.safetensors; "
+                "a sync_ref_model run resumes its synced reference from it."
+            )
+        self._require_synced()
+        loaded = mx.load(file)
+        if set(loaded) != set(self.paths) or any(
+            tuple(loaded[path].shape) != tuple(self._synced_tensor(index).shape)
+            for index, path in enumerate(self.paths)
+        ):
+            raise ValueError(
+                "Unsloth MLX DPO: reference.safetensors does not match this "
+                "run's reference tensors."
+            )
+        for index, path in enumerate(self.paths):
+            restored = loaded[path].astype(self._synced_tensor(index).dtype)
+            mx.eval(restored)  # read now: mx.load is lazy and file-backed
+            self._store_synced(index, restored)
 
 
 def _response_logps(model, batch, lengths):
@@ -1593,13 +1661,13 @@ def _adapter_carries_delta(modules, magnitudes):
     )
 
 
-def _owner_of(by_name, parameter_path):
+def _owner_of(by_name, parameter_path, *, of="the model"):
     module_path, _, attribute = parameter_path.rpartition(".")
     module = by_name.get(module_path)
     if module is None:
         raise ValueError(
             f"Unsloth MLX DPO: the reference cannot stand in for "
-            f"{parameter_path!r}, which no module of the model owns: a "
+            f"{parameter_path!r}, which no module of {of} owns: a "
             "parameter held in a list or dict is not supported for a "
             "referenced run. Use reference_free=True."
         )
@@ -1664,6 +1732,17 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
     return None if scale is None else float(scale), overrides, set(tensors)
 
 
+def _snapshot_policy(by_name, trainable, *, neftune, synced, fixed=()):
+    """Hold every trainable tensor at the value given; ``fixed`` overrides never sync."""
+    return ReferencePolicy(
+        overrides=[
+            (*_owner_of(by_name, name), value) for name, value in trainable.items()
+        ] + list(fixed),
+        paths=list(trainable) if synced else (),
+        neftune_modules=neftune,
+    )
+
+
 def _check_provenance(resume_provenance, provenance):
     if resume_provenance is not None and resume_provenance != provenance:
         raise ValueError(
@@ -1675,7 +1754,7 @@ def _check_provenance(resume_provenance, provenance):
 def build_reference_policy(
     model, *, reference_free, resume_provenance, neftune=(),
     ref_adapter_name=None, model_adapter_name=None,
-    ref_model=None, force_use_ref_model=False,
+    ref_model=None, force_use_ref_model=False, sync_ref_model=False,
 ):
     """Validate the run's reference and construct its policy, in TRL's order: a
     ``ref_model``, else the adapters disabled, else the starting weights."""
@@ -1703,6 +1782,19 @@ def build_reference_policy(
         "base_commit": getattr(model, "_unsloth_base_commit_hash", None),
         "adapter_modules": [name for name, _ in named_modules],
     }
+    if sync_ref_model:
+        # Absent from unsynced provenance, so earlier checkpoints still match.
+        provenance["synced"] = True
+        packed = [
+            name for name, value in trainable.items()
+            if not mx.issubdtype(value.dtype, mx.floating)
+        ]
+        if packed:
+            raise ValueError(
+                "Unsloth MLX DPO: sync_ref_model mixes each trainable tensor "
+                f"in float, and {packed[0]!r} is {trainable[packed[0]].dtype}: "
+                "a quantized weight cannot be mixed."
+            )
     if ref_model is not None:
         if not hasattr(ref_model, "parameters"):
             raise ValueError(
@@ -1720,7 +1812,7 @@ def build_reference_policy(
                 "Unsloth MLX DPO: ref_model and ref_adapter_name each name a "
                 "reference; pass one of them."
             )
-        if named_modules and not force_use_ref_model:
+        if named_modules and not (force_use_ref_model or sync_ref_model):
             warnings.warn(
                 "Unsloth MLX DPO: this model carries adapters, so its base is "
                 "already the reference and a ref_model doubles the memory. "
@@ -1729,13 +1821,34 @@ def build_reference_policy(
                 RuntimeWarning, stacklevel=2,
             )
         ref_model.eval()
+        mirrored = []
+        if sync_ref_model:
+            reference_tensors = dict(mlx.utils.tree_flatten(ref_model.parameters()))
+            ref_by_name = dict(ref_model.named_modules())
+            for name, value in trainable.items():
+                held = reference_tensors.get(name)
+                if (
+                    held is None or tuple(held.shape) != tuple(value.shape)
+                    or not mx.issubdtype(held.dtype, mx.floating)
+                ):
+                    raise ValueError(
+                        "Unsloth MLX DPO: sync_ref_model mixes each trainable "
+                        "tensor of the model into the same-named tensor of "
+                        f"ref_model, which has no floating {name!r} of shape "
+                        f"{tuple(value.shape)}. Load the reference the way the "
+                        "model is loaded, adapters included."
+                    )
+                mirrored.append(_owner_of(ref_by_name, name, of="ref_model"))
         provenance.update(
             kind="reference_model",
             reference_repo=getattr(ref_model, "_hf_repo", None),
             reference_commit=getattr(ref_model, "_unsloth_base_commit_hash", None),
         )
         _check_provenance(resume_provenance, provenance)
-        return ReferencePolicy(model=ref_model), provenance
+        return ReferencePolicy(
+            model=ref_model, mirrored=mirrored,
+            paths=list(trainable) if sync_ref_model else (),
+        ), provenance
     by_name = dict(model.named_modules())
     if not named_modules:
         if ref_adapter_name is not None:
@@ -1743,16 +1856,17 @@ def build_reference_policy(
                 "Unsloth MLX DPO: ref_adapter_name replaces this model's "
                 "adapter tensors, and a full fine-tune has none."
             )
-        # Immutable arrays: the snapshot copies nothing until the optimizer replaces a tensor.
         provenance["kind"] = "parameter_snapshot"
         _check_provenance(resume_provenance, provenance)
-        return ReferencePolicy(
-            overrides=[
-                (*_owner_of(by_name, name), value)
-                for name, value in trainable.items()
-            ],
-            neftune_modules=neftune,
+        return _snapshot_policy(
+            by_name, trainable, neftune=neftune, synced=sync_ref_model,
         ), provenance
+    if sync_ref_model and ref_adapter_name is not None:
+        raise ValueError(
+            "Unsloth MLX DPO: sync_ref_model moves the reference toward the "
+            "policy, and a saved reference adapter is fixed. Pass ref_model "
+            "instead, as TRL's DPOTrainer requires for TR-DPO."
+        )
     adapters = collect_mlx_lora_adapter_tensors(model)
     if not any(name in adapters for name in trainable):
         raise ValueError(
@@ -1782,6 +1896,40 @@ def build_reference_policy(
         [name for name in extra if name not in reloaded] if delta else []
     )
     if ref_adapter_name is None:
+        if sync_ref_model:
+            # A sync needs the reference's own copy of every trainable tensor: a snapshot.
+            if delta or trained:
+                carried = (
+                    f"the loader restored trained tensors beside the adapter "
+                    f"(starting with {reloaded[0]!r})" if reloaded
+                    else "this model's adapter already carries a delta"
+                )
+                raise ValueError(
+                    "Unsloth MLX DPO: sync_ref_model starts the reference at "
+                    f"the base model, and {carried}. Pass ref_model=<a second "
+                    "load of the model, adapters included> to start the "
+                    "reference where the policy starts, as TRL's DPOTrainer "
+                    "requires for TR-DPO."
+                )
+            # A frozen DoRA magnitude holds at the base norms without syncing.
+            magnitude_paths = {
+                id(module): f"{name}.m" if name else "m"
+                for name, module in named_modules
+            }
+            base_magnitudes = {
+                magnitude_paths[id(module)]: magnitude
+                for module, magnitude in magnitudes
+                if magnitude_paths[id(module)] in trainable
+            }
+            return _snapshot_policy(
+                by_name, {**trainable, **base_magnitudes},
+                neftune=neftune, synced=True,
+                fixed=[
+                    (module, "m", magnitude)
+                    for module, magnitude in magnitudes
+                    if magnitude_paths[id(module)] not in trainable
+                ],
+            ), provenance
         if trained:
             raise ValueError(
                 "Unsloth MLX DPO: the model carries trained tensors no adapter "
