@@ -203,13 +203,36 @@ def test_a_bare_return_is_the_functions_contract():
     assert any(r.value is None for r in returns)
 
 
-# Pinned from `function.forward` before any rewrite (#967), so a second pass
-# never reads its own generated output back.
-NN_FORWARD_GETSOURCE = "source = inspect.getsource(original_forward).rstrip()"
+def _nn_forward_getsource() -> tuple:
+    """``(assignment, call, variable)`` for the getsource read in the dtype patcher.
+
+    Found on the parse of ``_patch_torch_dtype_modules`` rather than by spelling: #967
+    renamed the variable from ``function.forward`` to the pinned ``original_forward`` and
+    every anchor here went red on a correct change.
+    """
+    tree = ast.parse(SRC)
+    fn = next(
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_patch_torch_dtype_modules"
+    )
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        call = node.value
+        # `inspect.getsource(x).rstrip()`: the getsource call is the receiver.
+        inner = call.func.value if isinstance(call.func, ast.Attribute) else None
+        if not isinstance(inner, ast.Call) or ast.unparse(inner.func) != "inspect.getsource":
+            continue
+        if len(inner.args) == 1 and isinstance(inner.args[0], ast.Name):
+            return ast.unparse(node), ast.unparse(inner), inner.args[0].id
+    raise AssertionError("no `source = inspect.getsource(<forward>).rstrip()` in _patch_torch_dtype_modules")
+
+
+NN_FORWARD_ASSIGN, NN_FORWARD_CALL, NN_FORWARD_VAR = _nn_forward_getsource()
 
 
 def _nn_patch_region() -> str:
-    i = SRC.index(NN_FORWARD_GETSOURCE)
+    i = SRC.index(NN_FORWARD_ASSIGN)
     return SRC[max(0, i - 1600):i + 1400]
 
 
@@ -227,7 +250,7 @@ def test_the_nn_forward_patch_loop_is_guarded():
     forward is unreadable -- both measured, not assumed. This guards a state
     we have observed rather than encoding a theory about how it arises.
     """
-    guards = _getsource_guards("inspect.getsource(original_forward)")
+    guards = _getsource_guards(NN_FORWARD_CALL)
     assert guards, "the forward getsource is no longer inside a try"
     for caught in guards:
         assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
@@ -247,7 +270,7 @@ def test_an_unreadable_forward_is_skipped_not_fatal():
     # Exactly the try whose body IS this assignment -- several other blocks
     # also call getsource on a forward, and their handlers legitimately do
     # something else.
-    target = NN_FORWARD_GETSOURCE
+    target = NN_FORWARD_ASSIGN
     handlers = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try) or len(node.body) != 1:
@@ -277,7 +300,7 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    sites = {"inspect.getsource(modeling_file)", "inspect.getsource(original_forward)"}
+    sites = {"inspect.getsource(modeling_file)", NN_FORWARD_CALL}
     for call in sites:
         guards = _getsource_guards(call)
         assert guards and all(
@@ -487,9 +510,10 @@ def test_the_unreadable_forward_is_wrapped_rather_than_dropped():
 def test_the_forward_is_pinned_before_it_is_read():
     """Captured before any rewrite, or the second pass (vision loads patch
     torch.nn twice) reads its own output back."""
+    assert NN_FORWARD_VAR != "function", "the read is not pinned: it goes through function.forward"
     region = _nn_patch_region()
-    pin = region.index("original_forward = function.forward")
-    assert pin < region.index(NN_FORWARD_GETSOURCE)
+    pin = region.index(f"{NN_FORWARD_VAR} = function.forward")
+    assert pin < region.index(NN_FORWARD_ASSIGN)
 
 
 def test_the_tensor_may_arrive_by_keyword():
