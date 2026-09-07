@@ -1505,10 +1505,11 @@ def _tiny_model(lora=False, tail=False):
             def named_modules(self):
                 return [("", self), ("q_proj", self.q_proj)]
 
+        if lora or tail:
             def parameters(self):
                 values = {"q_proj": {
                     "lora_a": self.q_proj.lora_a, "lora_b": self.q_proj.lora_b,
-                }}
+                }} if lora else nn.Module.parameters(self)
                 if tail:
                     values["tail"] = self.tail
                 return values
@@ -1552,6 +1553,7 @@ def _run_generation_trainer(
         calls.append({
             "requests": list(requests),
             "defaults": defaults,
+            "model": model,
             "scales": [module.scale for _, module in iter_mlx_lora_modules(model)],
         })
         if probe is not None:
