@@ -5596,3 +5596,23 @@ def test_vlm_rendering_keeps_image_order_without_stringifying_parts(tmp_path, mo
         {"type": "text", "text": "before"}, {"type": image_type},
         {"type": "text", "text": "after"}]}]
     assert _render_vlm_messages(processor, messages) == "before<|picture|>after"
+
+
+@pytest.mark.parametrize("layout", ["nested", "decoder", "view"])
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("use_dora", [False, True])
+def test_decoder_containers_support_lora(layout, count, use_dora):
+    from types import SimpleNamespace as NS
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers, _fix_gemma3n_altup_batch
+    from unsloth_zoo.mlx.utils import _get_transformer_layers
+    stack = nn.Module()
+    stack.layers = [nn.Module(), nn.Module()]
+    for layer in stack.layers:
+        layer.proj = nn.Linear(4, 4)
+    root = {"nested": NS(model=NS(layers=stack)), "decoder": NS(layers=range(2), model=NS(decoder=stack)),
+            "view": NS(model=stack)}[layout]
+    assert _get_transformer_layers(root) is stack.layers
+    assert not _fix_gemma3n_altup_batch(NS(language_model=root))
+    assert linear_to_lora_layers(root, count, dict(keys=["proj"], rank=2, scale=2, dropout=0, use_dora=use_dora)) == count
+    assert [hasattr(layer.proj, "lora_a") for layer in stack.layers] == [count == 2, True]

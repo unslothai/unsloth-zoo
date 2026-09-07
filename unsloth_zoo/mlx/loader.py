@@ -351,9 +351,9 @@ def _mlx_lora_from_base(module, config, *, specs, path=None):
 
 
 def _mlx_language_layers(model):
-    if hasattr(model, "layers"):
-        return model.layers
-    return model.model.layers
+    from .utils import _get_transformer_layers
+    layers = _get_transformer_layers(model)
+    return layers if layers is not None else ()
 
 
 def linear_to_lora_layers(model, num_layers, config):
@@ -361,6 +361,14 @@ def linear_to_lora_layers(model, num_layers, config):
     from mlx.utils import tree_unflatten
 
     layers = _mlx_language_layers(model)
+    root = model
+    seen = set()
+    while not all(callable(getattr(root, name, None)) for name in ("named_modules", "update_modules")):
+        if root is None or id(root) in seen:
+            root = None
+            break
+        seen.add(id(root))
+        root = getattr(root, "model", None)
     type_specs = _mlx_lora_type_specs()
     keys = set(config.get("keys") or ())
     # A generic name is attention beside a qkv and MLP beside an fc1, so the
@@ -385,7 +393,7 @@ def linear_to_lora_layers(model, num_layers, config):
             for name, module in layer.named_modules():
                 if name in wanted:
                     _mlx_dora_wrapper_type(module, name)
-        for name, module in model.named_modules():
+        for name, module in (root.named_modules() if root is not None else ()):
             if name in shared:
                 _mlx_dora_wrapper_type(module, name)
     attached = 0
@@ -413,11 +421,11 @@ def linear_to_lora_layers(model, num_layers, config):
     # `shared`, not `keys`: a layer-local `ff_proj` can name a root module too.
     root_replacements = [
         (name, _mlx_lora_from_base(module, config, specs=type_specs, path=name))
-        for name, module in model.named_modules()
+        for name, module in (root.named_modules() if root is not None else ())
         if name in shared
     ]
     if root_replacements:
-        model.update_modules(tree_unflatten(root_replacements))
+        root.update_modules(tree_unflatten(root_replacements))
         attached += len(root_replacements)
 
     return attached
@@ -2587,8 +2595,8 @@ def _fix_gemma3n_altup_batch(model=None):
     outright. Upstream repaired this in mlx-vlm 0.5.0, so this only ever runs
     against older releases, whose source no longer changes.
     """
-    layers = getattr(getattr(getattr(model, "language_model", None), "model", None),
-                     "layers", None)
+    from .utils import _get_transformer_layers
+    layers = _get_transformer_layers(model)
     altup = getattr(layers[0], "altup", None) if layers else None
     if altup is None:
         return False

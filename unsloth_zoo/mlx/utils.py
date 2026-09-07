@@ -767,13 +767,20 @@ def apply_gather_qmm_nax_guard() -> bool:
 
 
 def _get_transformer_layers(model):
-    """Find transformer layers, unwrapping VLM wrappers if needed.
-
-    VLMs: model.language_model.model.layers; text: model.(model.)layers.
-    """
-    m = getattr(model, 'language_model', model)
-    m = getattr(m, 'model', m)
-    return getattr(m, 'layers', None)
+    pending = collections.deque([getattr(model, "language_model", model)])
+    seen = set()
+    while pending:
+        module = pending.popleft()
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        for name in ("layers", "blocks"):
+            layers = getattr(module, name, None)
+            if isinstance(layers, (list, tuple)):
+                return layers
+        for name in ("decoder", "model", "transformer", "layers", "blocks"):
+            pending.append(getattr(module, name, None))
+    return None
 
 
 def _get_vision_encoder_layers(model):
@@ -2916,6 +2923,13 @@ def _filter_backbone_kwargs(backbone, kwargs):
         params = inspect.signature(backbone.__call__).parameters
     except (TypeError, ValueError):
         return kwargs
+    cache = params.get("cache")
+    if (
+        cache is not None and cache.default is inspect.Parameter.empty
+        and cache.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and "cache" not in kwargs
+    ):
+        kwargs = {**kwargs, "cache": None}
     if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
         return kwargs
     allowed = set(params)
