@@ -119,7 +119,6 @@ def _reference_forward(experts, X, top_k_index, top_k_weights, first, second, sc
 
 def _setup(monkeypatch):
     _install_fake_unsloth_kernels(monkeypatch)
-    # The LoRA delta path reads this module global at call time; no CUDA needed.
     monkeypatch.setattr(moe_utils, "native_moe_grouped_mm", moe_utils._manual_grouped_mm)
 
     num_experts, hidden, intermediate, rank = 4, 16, 12, 4
