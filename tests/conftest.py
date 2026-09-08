@@ -287,15 +287,36 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
 _GUARDED_MODULES = ("bitsandbytes", "bitsandbytes.functional", "bitsandbytes.nn")
 
 # Names that nothing in the installed environment provides. A top-level `moe_utils`
-# only ever resolves because a test put a compile-cache directory on sys.path, so
-# for these the exemption below is wrong in both directions: the import IS the swap,
-# and the module it leaves behind outlives the directory it was read from. Leaving
-# one there makes the bare `from moe_utils import ...` in every generated MoE module
-# resolve to a stale copy, which is invisible because that import is deliberately
+# only ever resolves because something put a compile-cache directory on sys.path.
+# Leaving one behind makes the bare `from moe_utils import ...` in every generated
+# MoE module resolve to it, which is invisible because that import is deliberately
 # swallowed -- the module loads reporting success with its backend names undefined.
-# That is exactly how test_compiled_cache_collective.py's recovery test failed on
-# main while passing when run alone.
+# That is how test_compiled_cache_collective.py's recovery test failed on main while
+# passing when run alone.
+#
+# Flagged only when the copy came out of a pytest temp directory, and that
+# qualification is load-bearing rather than caution. Compiling a MoE architecture
+# imports moe_utils out of the real unsloth_compiled_cache as ordinary production
+# behaviour, and that copy stays valid for the rest of the session; a rule without
+# the qualification fails test_compiler_dynamic_exec.py for doing its job. A copy
+# read from a tmp_path_factory directory is the opposite: it outlives the directory
+# and is a different module from the one the next test means to import.
 _GUARDED_BARE_MODULES = ("moe_utils",)
+
+
+def _is_from_pytest_tmp(mod):
+    import pathlib
+
+    path = getattr(mod, "__file__", None)
+    if not path:
+        return False
+    # Matched on the "pytest-of-<user>" element tmp_path_factory always creates,
+    # rather than on a basetemp looked up from the config: --basetemp overrides it,
+    # xdist gives each worker its own, and a stale entry can outlive the fixture
+    # that made it. The directory name is the stable part.
+    return any(
+        part.startswith("pytest-of-") for part in pathlib.Path(path).parts
+    )
 _MODULE_SNAPSHOT_KEY = "_unsloth_guarded_module_snapshot"
 
 
@@ -336,12 +357,12 @@ def pytest_runtest_teardown(item, nextitem):
         now = _sys.modules.get(name)
         if now is was:
             continue
-        if was is None and now is not None and name in _GUARDED_BARE_MODULES:
-            # No exemption here: see _GUARDED_BARE_MODULES. Importing one of these
-            # at all requires a sys.path the rest of the session does not have, so
-            # "nothing was there and the test imported the real thing" is precisely
-            # the leak rather than the innocent case it is for a real package.
-            leaked.append(name)
+        if name in _GUARDED_BARE_MODULES:
+            # See _GUARDED_BARE_MODULES: for these the import itself can be the
+            # swap, so the exemption below does not apply. Narrowed to the copies
+            # that go stale, which are the ones a later test can be misled by.
+            if _is_from_pytest_tmp(now):
+                leaked.append(name)
             continue
         if was is None and not _is_module_stub(now):
             # Nothing was there and the test imported the real thing. That is an
@@ -350,9 +371,17 @@ def pytest_runtest_teardown(item, nextitem):
             continue
         leaked.append(name)
     if leaked:
+        # Naming the file is the whole diagnosis for the bare names: whether the copy
+        # is a leak or the compile folder doing its job is a question about where it
+        # was read from, and without this the report is the same either way.
+        where = ", ".join(
+            f"{n} from {getattr(_sys.modules.get(n), '__file__', None)!r}"
+            for n in leaked
+        )
         raise AssertionError(
-            f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back, "
+            f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back "
+            f"({where}), "
             f"so every later test in this process imports the substitute. Use "
-            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown, or "
+            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown, or"
             f"save and restore the entry by hand where the import itself installs it."
         )

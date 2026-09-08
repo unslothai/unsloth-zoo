@@ -25,6 +25,31 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytest.importorskip("mlx_lm")
 
+# "Is mlx importable" is not "is this real mlx", and this file needs the second.
+# simulate_mlx_on_torch() installs process-wide and one sibling module calls it
+# while being IMPORTED (test_mlx_arrays_cache_advance.py, which sorts just before
+# this one), so collection alone is enough to make the importorskip above succeed
+# against the shim. These tests then run against a simulation that refuses the
+# operation they are built on:
+#
+#     NotImplementedError: mlx-shim: mx.quantize is not implemented in the
+#     simulation. Use real MLX on a Mac to produce quantized weights.
+#
+# 40 failures, every one of them on a box that simply has no MLX. That is the
+# trap test_mlx_real_detection_is_order_independent.py documents; it guards the
+# find_spec spellings of it, and importorskip is a third spelling that lies the
+# same way. Alone this file skips and passes, which is why it stayed hidden here
+# while failing unsloth's Core job, the one place that runs this suite as a
+# whole directory rather than a curated list.
+from mlx_simulation import mlx_is_simulated  # noqa: E402
+
+if mlx_is_simulated():
+    pytest.skip(
+        "needs real MLX: these compare a fused Metal kernel against the "
+        "runtime's own path, and the shim implements neither",
+        allow_module_level = True,
+    )
+
 from unsloth_zoo.mlx.attention import (
     _PATCH_FLAG,
     _PATCH_TARGETS,

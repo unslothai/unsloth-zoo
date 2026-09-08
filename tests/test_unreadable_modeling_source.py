@@ -57,13 +57,30 @@ COMPILER = ROOT / "unsloth_zoo" / "compiler.py"
 SRC = COMPILER.read_text(encoding="utf-8")
 
 
+def _require_index(anchor: str, what: str) -> int:
+    """`SRC.index`, but a miss says which contract broke.
+
+    A bare `.index` raises `ValueError: substring not found` and names neither
+    the anchor nor the test's subject, which is how #967's rename showed up:
+    six tests failed pointing at the test file's own line rather than at the
+    production edit that moved the text out from under them.
+    """
+    i = SRC.find(anchor)
+    assert i != -1, (
+        f"{what}: no `{anchor}` in compiler.py. Either the guard is gone, or "
+        f"it was renamed and this anchor needs to follow it.")
+    return i
+
+
 def _guard_region() -> str:
     """The modeling-file guard and its handler.
 
     Anchored on the call, not on "except (OSError, TypeError)": the torch
     forward guard uses the same clause and is defined earlier in the file.
     """
-    i = SRC.index("full_source = inspect.getsource(modeling_file)")
+    i = _require_index(
+        "full_source = inspect.getsource(modeling_file)",
+        "the modeling-file guard")
     return SRC[max(0, i - 400):i + 2200]
 
 
@@ -174,14 +191,18 @@ def test_the_warning_says_the_model_still_works():
 def test_lora_patching_happens_before_the_guard():
     """Returning early is only acceptable because the LoRA forwards have
     already been patched by this point."""
-    lora = SRC.index("patch_lora_forwards(torch_compile_options)")
-    guard = SRC.index("full_source = inspect.getsource(modeling_file)")
+    lora = _require_index(
+        "patch_lora_forwards(torch_compile_options)", "the LoRA forward patch")
+    guard = _require_index(
+        "full_source = inspect.getsource(modeling_file)", "the modeling-file guard")
     assert lora < guard
 
 
 def test_the_patched_marker_is_set_before_the_guard():
-    marker = SRC.index("modeling_file.__UNSLOTH_PATCHED__ = True")
-    guard = SRC.index("full_source = inspect.getsource(modeling_file)")
+    marker = _require_index(
+        "modeling_file.__UNSLOTH_PATCHED__ = True", "the patched marker")
+    guard = _require_index(
+        "full_source = inspect.getsource(modeling_file)", "the modeling-file guard")
     assert marker < guard, (
         "an early return must not leave the module looking unpatched, or a "
         "later pass would try again and fail again")
@@ -203,9 +224,80 @@ def test_a_bare_return_is_the_functions_contract():
     assert any(r.value is None for r in returns)
 
 
+def _nn_forward_read() -> tuple:
+    """The torch.nn forward read, discovered rather than spelled out.
+
+    Returns `(name, statement)` where `name` is whatever local the loop reads
+    the forward's source from and `statement` is the assignment as written.
+
+    Discovered because the spelling is not the contract. #967 renamed this
+    operand from `function.forward` to `original_forward` -- a strictly better
+    version of the same read, pinning the pristine forward so a second pass
+    cannot consume its own generated output -- and six tests here reported it
+    as the guard having been deleted. A test that fails on a correct rename is
+    reporting on the test, not on compiler.py.
+
+    Matched on shape: an assignment to `source` of `inspect.getsource(<Name>)
+    .rstrip()`. The name is then held to its real contract by
+    `test_the_forward_source_is_read_from_the_pinned_original` below, so this
+    stays a rename-tolerant search and not a weaker assertion.
+    """
+    found = []
+    for node in ast.walk(ast.parse(SRC)):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Name) and target.id == "source"):
+            continue
+        call = node.value
+        if not (isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "rstrip"):
+            continue
+        inner = call.func.value
+        if not (isinstance(inner, ast.Call)
+                and ast.unparse(inner.func) == "inspect.getsource"
+                and len(inner.args) == 1
+                and isinstance(inner.args[0], ast.Name)):
+            continue
+        found.append((inner.args[0].id, ast.unparse(node)))
+
+    assert found, (
+        "no `source = inspect.getsource(<name>).rstrip()` in compiler.py at "
+        "all. The torch.nn forward patch loop no longer reads the forward's "
+        "source the way every test below assumes.")
+    assert len({name for name, _ in found}) == 1, (
+        f"several forward-source reads with different operands: {sorted(found)}. "
+        "These tests assume one site and would guard an arbitrary one of them.")
+    return found[0]
+
+
+NN_FORWARD_NAME, NN_FORWARD_READ = _nn_forward_read()
+NN_FORWARD_GETSOURCE = f"inspect.getsource({NN_FORWARD_NAME})"
+
+
 def _nn_patch_region() -> str:
-    i = SRC.index("source = inspect.getsource(function.forward).rstrip()")
+    i = _require_index(NN_FORWARD_READ, "the torch.nn forward patch loop")
     return SRC[max(0, i - 1600):i + 1400]
+
+
+def test_the_forward_source_is_read_from_the_pinned_original():
+    """The operand is discovered, so pin what it must BE.
+
+    Either it is `function.forward` itself, or it is a local assigned from
+    `function.forward` in the same loop -- #967's pin, which is what makes the
+    read idempotent across the two passes a vision load performs. Without this,
+    `_nn_forward_read` would happily latch onto a rename to something that is
+    not the forward at all and every test below would still pass.
+    """
+    if NN_FORWARD_NAME == "function":
+        pytest.skip("read directly off `function.forward`, nothing to pin")
+    pin = f"{NN_FORWARD_NAME} = function.forward"
+    i = _require_index(pin, "the pristine-forward pin")
+    read = _require_index(NN_FORWARD_READ, "the forward source read")
+    assert i < read, (
+        f"`{pin}` must precede `{NN_FORWARD_READ}`, or the loop is not reading "
+        "the forward it pinned")
 
 
 def test_the_nn_forward_patch_loop_is_guarded():
@@ -222,8 +314,8 @@ def test_the_nn_forward_patch_loop_is_guarded():
     forward is unreadable -- both measured, not assumed. This guards a state
     we have observed rather than encoding a theory about how it arises.
     """
-    guards = _getsource_guards("inspect.getsource(function.forward)")
-    assert guards, "the forward getsource is no longer inside a try"
+    guards = _getsource_guards(NN_FORWARD_GETSOURCE)
+    assert guards, f"`{NN_FORWARD_GETSOURCE}` is no longer inside a try"
     for caught in guards:
         assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
             f"the forward guard stopped catching one of them: {sorted(caught)}")
@@ -242,7 +334,7 @@ def test_an_unreadable_forward_is_skipped_not_fatal():
     # Exactly the try whose body IS this assignment -- several other blocks
     # also call getsource on a forward, and their handlers legitimately do
     # something else.
-    target = "source = inspect.getsource(function.forward).rstrip()"
+    target = NN_FORWARD_READ
     handlers = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try) or len(node.body) != 1:
@@ -272,7 +364,7 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    sites = {"inspect.getsource(modeling_file)", "inspect.getsource(function.forward)"}
+    sites = {"inspect.getsource(modeling_file)", NN_FORWARD_GETSOURCE}
     for call in sites:
         guards = _getsource_guards(call)
         assert guards and all(
@@ -541,7 +633,8 @@ def test_a_rebuild_wraps_the_original_not_the_wrapper():
 
 def test_the_loop_rebuilds_on_a_mode_change():
     region = _nn_patch_region()
-    i = SRC.index('__unsloth_dtype_wrapped__", False)')
+    i = _require_index(
+        '__unsloth_dtype_wrapped__", False)', "the already-wrapped check")
     window = SRC[i:i + 800]
     assert "__unsloth_dtype_disable__" in window, (
         "a wrapper built for the other compile mode must not be reused")
