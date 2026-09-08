@@ -2969,20 +2969,33 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # Ship CLONES, never the live training tensors. vLLM's
         # LoRAModel.from_lora_tensors stores `tensor.to(device, dtype)`, which
         # is a NO-OP (same storage) when device+dtype already match, so the
-        # engine would hold ALIASES of the training weights:
-        # (1) LoRALayerWeights.optimize() then runs `lora_b *= scaling`
-        #     in-place -> with lora_alpha != lora_rank the TRAINING weights get
-        #     multiplied by s on every hot-load (s^8 per GRPO step observed;
-        #     rollouts rot to gibberish within ~5 steps);
-        # (2) the engine's adapter registry keeps live references into training
-        #     memory, so later readers (save_pretrained_merged with the engine
-        #     alive) race the engine's allocator churn.
-        # A LoRA-sized clone (a few MB) per hot-load is negligible.
+        # engine holds ALIASES of the training weights. LoRALayerWeights
+        # .optimize() then runs `lora_b *= scaling` in-place on them, once per
+        # hot-load, and LORA_REQUEST_ID increments every call so each generate
+        # builds a fresh LoRAModel and the multiply compounds (s^n over n
+        # generations; rollouts rot to gibberish within a few optimizer steps).
+        #
+        # Three conditions must coincide for the corruption, which is why it
+        # does not show on every config:
+        #   - lora_alpha != r, else optimize() short-circuits on scaling == 1;
+        #   - the adapter dtype equals lora_config.lora_dtype, else the .to()
+        #     copies and breaks the alias. PEFT keeps the adapter in fp32 over a
+        #     bf16 base by default, which masks this; a bf16 adapter does not.
+        #     Measured on Llama-3.2-1B, r=16, alpha=32, 4 generations: fp32
+        #     adapter 0/224 tensors drifted, bf16 adapter 112/224.
+        #   - the engine reaches optimize() under no_grad/inference_mode, which
+        #     the lazy v1 path does; with grad enabled it raises on the leaf
+        #     Parameter instead of silently scaling it.
+        # Cloning removes the aliasing itself rather than any one condition.
+        # Cost is one adapter payload per hot-load: 45 MB for Llama-3.2-1B r=16
+        # over 7 projections, ~168 MB for an 8B r=32 adapter in bf16.
+        #
         # inference_mode(False): load_lora runs under @torch.inference_mode, so
         # a plain clone would be an inference tensor and vLLM's later in-place
         # LoRALayerWeights.optimize() scaling (`lora_b *= scaling`) would raise
         # "Inplace update to inference tensor outside InferenceMode" on
-        # dispatch paths that do not wrap _load_adapter in inference mode.
+        # dispatch paths that do not wrap _load_adapter in inference mode
+        # (LLMEngine.add_lora is one; the v1 model runner is not).
         with torch.inference_mode(False):
             state_dict = {
                 k.replace(".default", ""): v.detach().clone()

@@ -212,8 +212,12 @@ def _absmax(t):
     # max|t| via a single fused reduction. torch.abs(t) would materialize a
     # second full-size float32 tensor (multi-GB for embed_tokens / lm_head /
     # fused expert weights) and could OOM a merge that otherwise fits.
+    # Reduce to the scalar on-device and read it back ONCE: two .item() calls
+    # would cost two device syncs per merged tensor, and _merge_lora calls this
+    # twice per key. NaN propagates through torch.maximum just as it did through
+    # the Python max(), so the isfinite gate keeps seeing it.
     amin, amax = torch.aminmax(t)
-    return max(abs(amin.item()), abs(amax.item()))
+    return torch.maximum(amin.abs(), amax.abs()).item()
 pass
 
 
@@ -274,17 +278,23 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         W = (magnitude / weight_norm).unsqueeze(1) * W
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
-    # Recycled-memory corruption (e.g. merging while a colocated vLLM engine is
-    # still alive) folds FINITE garbage (~1e12+) into the export, which the
-    # isfinite gate above cannot catch. A healthy LoRA delta cannot inflate the
-    # merged magnitude by orders of magnitude over the base weight.
+    # A merge that folds FINITE garbage (~1e12+) into the export slips straight
+    # past the isfinite gate above, so bound the merged magnitude too: a healthy
+    # LoRA delta cannot inflate a weight by orders of magnitude over its base.
+    # Both conditions must hold, so a legitimately tiny base weight cannot trip
+    # it on the ratio alone (240 uncorrupted r x alpha x scale x {LoRA, DoRA,
+    # rsLoRA} configurations pass; see tests/test_vllm_lora_hotload_aliasing.py).
+    # The message deliberately does not name a single cause: a magnitude
+    # excursion is an observation, and in-place mutation of the live adapter by
+    # a colocated engine is only the case we have reproduced.
     W_absmax = _absmax(W)
     if W_absmax > max(64.0 * W_base_absmax, 1e4):
         raise ValueError(
             f"Unsloth: Merge failed for {name}: merged |W|max = {W_absmax:.3e} vs "
             f"base |W|max = {W_base_absmax:.3e}. The LoRA weights read at merge "
-            "time look like recycled/corrupted GPU memory. Re-merge offline from "
-            "the last checkpoint (do not merge with a live vLLM engine)."
+            "time are far too large to be a healthy adapter delta. If a vLLM "
+            "engine is still alive in this process, shut it down and re-merge, "
+            "or merge offline from the last saved adapter checkpoint."
         )
     return W
 pass
