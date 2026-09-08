@@ -812,7 +812,7 @@ RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
     them is not silently dropped. Only top_entropy_quantile < 1.0 (entropy masking) is
-    unimplemented; its TRL default is 1.0 in 0.27.0 through 1.12.0, so only non-defaults
+    unimplemented; its TRL default is 1.0 in 0.22.2 through 1.12.0, so only non-defaults
     warn. use_bias_correction_kl is supported and must never be listed here.
     """
     if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):

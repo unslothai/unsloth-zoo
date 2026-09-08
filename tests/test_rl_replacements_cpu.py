@@ -482,7 +482,7 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
 def _trl_mirror_grpo_loss(
     ref, new, old, mask, beta, advantages,
     importance_sampling_level="token", use_bias_correction_kl=False,
-    epsilon_low=0.2, epsilon_high=0.2,
+    epsilon_low=0.2, epsilon_high=0.2, vllm_is_ratio=None,
 ):
     # Independent of unsloth_zoo; mean_kl follows unsloth's per-row masked mean.
     if advantages.dim() == 1:
@@ -499,10 +499,59 @@ def _trl_mirror_grpo_loss(
         per_token_kl = per_token_kl * coef_1
     coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
     per_token_loss = -torch.min(coef_1 * advantages, coef_2 * advantages)
+    if vllm_is_ratio is not None:
+        # TRL v1.12.0 grpo_trainer.py:3236 then :3239 - the vLLM ratio scales the policy
+        # term only, and the KL is added after it.
+        per_token_loss = per_token_loss * vllm_is_ratio
     per_token_loss = per_token_loss + beta * per_token_kl
     loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
     mean_kl = ((per_token_kl * mask).sum(-1) / mask.sum(-1)).mean()
     return loss, mean_kl
+
+
+@pytest.mark.parametrize("mode", ["sequence_mask", "token_truncate"])
+@pytest.mark.parametrize("use_bias_correction_kl", [False, True])
+def test_bias_correction_kl_is_not_scaled_by_the_vllm_ratio(mode, use_bias_correction_kl):
+    # fast_inference=True feeds sampling_per_token_logps, and the vLLM ratio must reach
+    # the policy term only. Multiplying the corrected KL by it too would apply the
+    # correction twice with the wrong ratio.
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    sampling = old - 0.3 * torch.randn(old.shape, generator=torch.Generator().manual_seed(5),
+                                       dtype=old.dtype)
+    kwargs.update(
+        use_vllm=True,
+        vllm_importance_sampling_mode=mode,
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+        use_bias_correction_kl=use_bias_correction_kl,
+    )
+
+    new_ours = new.clone().requires_grad_(True)
+    loss, _cl, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new_ours, old, sampling, input_ids, mask, beta, advantages, **kwargs
+    )
+    loss.backward()
+
+    is_ratio = (old - sampling) * mask
+    if mode == "sequence_mask":
+        is_ratio = is_ratio.sum(dim=-1, keepdim=True)
+    is_ratio = torch.exp(is_ratio)
+    if mode == "token_truncate":
+        is_ratio = torch.clamp(is_ratio, min=0.0, max=3.0)
+    else:
+        is_ratio = is_ratio.masked_fill((is_ratio < 0.0) | (is_ratio > 3.0), 0.0)
+
+    new_trl = new.clone().requires_grad_(True)
+    loss_trl, mean_kl_trl = _trl_mirror_grpo_loss(
+        ref, new_trl, old, mask, beta, advantages,
+        use_bias_correction_kl=use_bias_correction_kl, vllm_is_ratio=is_ratio,
+    )
+    loss_trl.backward()
+
+    assert torch.allclose(loss.detach(), loss_trl.detach(), atol=1e-10, rtol=1e-8)
+    assert torch.allclose(mean_kl.detach(), mean_kl_trl.detach(), atol=1e-10, rtol=1e-8)
+    assert torch.allclose(new_ours.grad, new_trl.grad, atol=1e-10, rtol=1e-8)
 
 
 @pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
