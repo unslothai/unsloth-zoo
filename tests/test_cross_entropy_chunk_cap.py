@@ -63,8 +63,47 @@ def test_cap_effective_in_4_to_8_gib_band(monkeypatch):
 def test_small_logits_stay_single_chunk(monkeypatch):
     # Configs whose full logits already fit the target keep a single chunk.
     ce = _load_module(monkeypatch, 180 * 1024 ** 3)
-    # 2.2 GiB footprint at 18 bytes/element (< 4 GiB cap).
+    # 2 GiB footprint at 16 bytes/element (< 4 GiB cap).
     assert ce.get_chunk_size(1, 2_048, 65_536) == 1
+
+
+def test_bytes_per_logit_covers_the_whole_chain(monkeypatch):
+    # The estimate counted 4 bytes, the float32 logits alone, and missed the
+    # bf16 logits, the log_softmax output on the tape and the backward gradient.
+    # Measured 14 bytes/element eager on a B200; the constant must stay at or
+    # above that or every chunk overruns target_gb (unslothai/unsloth-zoo#946).
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    assert ce._CE_BYTES_PER_LOGIT >= 14.0
+
+
+def test_unchunkable_memory_is_charged_to_the_target(monkeypatch):
+    # grad_lm_head and grad_inputs do not shrink with the chunk count, so they
+    # come out of the budget before the chunk transient is sized. A caller
+    # declaring fixed memory must get at least as many chunks as one that does
+    # not, and strictly more once the fixed part is a real share of the target.
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    none = ce.get_chunk_size(1, 16_384, 151_936, target_gb=4.0, fixed_gb=0.0)
+    some = ce.get_chunk_size(1, 16_384, 151_936, target_gb=4.0, fixed_gb=2.0)
+    assert some > none, (none, some)
+
+
+def test_fixed_larger_than_target_does_not_explode_chunks(monkeypatch):
+    # When the unchunkable part alone exceeds the target no chunk count can
+    # satisfy it. Sizing must fall back to the plain budget rather than driving
+    # the count toward one token per chunk.
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    plain = ce.get_chunk_size(1, 16_384, 151_936, target_gb=1.0, fixed_gb=0.0)
+    swamped = ce.get_chunk_size(1, 16_384, 151_936, target_gb=1.0, fixed_gb=8.0)
+    assert swamped == plain, (plain, swamped)
+    assert swamped <= 16_384
+
+
+def test_chunks_never_exceed_token_count(monkeypatch):
+    # torch.chunk caps at one element per chunk anyway; asking for more is a
+    # sizing bug that only costs launches.
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    n = ce.get_chunk_size(1, 64, 262_144, target_gb=0.001)
+    assert 1 <= n <= 64, n
 
 
 def test_cap_bounds_target_independent_of_free(monkeypatch):

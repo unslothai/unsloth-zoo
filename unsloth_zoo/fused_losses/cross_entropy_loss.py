@@ -136,11 +136,19 @@ def compute_fused_ce_loss(
 pass
 
 
+# Bytes of chunk-dependent transient per (token x vocab) element in the fused
+# path: bf16 logits (2) + the float32 upcast (4) + the log_softmax output the
+# tape saves (4) + the float32 gradient cross_entropy backward produces (4).
+# Measured on a B200 (torch 2.9.1, bf16): 14.0 flat across vocab 32k-262k,
+# hidden 16-8192 and chunk lengths 64-8192, rising to 16.0 with logit
+# softcapping. torch.compile fuses the upcast and lands near 2.0, but it can
+# fall back to eager at runtime, so the eager figure is the one that must hold.
+# The old value here was 4, which counted the float32 logits alone and missed
+# every other tensor in the chain.
+_CE_BYTES_PER_LOGIT = 16.0
+
 @functools.cache
-def _get_chunk_multiplier(
-    vocab_size, target_gb = None, device = None,
-    logit_scale_multiply = None, logit_scale_divide = None, logit_softcapping = None
-):
+def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
         # Find current VRAM left in the GPU, and use 50% or less of it
@@ -156,89 +164,35 @@ def _get_chunk_multiplier(
     if target_gb <= 1e-9: # Use a small epsilon for float comparison
         raise RuntimeError("Unsloth: No or negligible GPU memory available for fused cross entropy.")
 
-    # Self-calibrate true bytes per element at runtime
-    bytes_per_element = 18.0 # default fallback
-    try:
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif isinstance(device, str):
-            device = torch.device(device)
+    # Allocations chunking cannot shrink still come out of the same budget, so
+    # the chunk transient only gets what is left. If they already exceed the
+    # target, no chunk count can satisfy it; keep the old budget rather than
+    # driving the chunk count to the token count, since target_gb is a soft cap
+    # (min(50% free, 4GB)), not the real memory limit.
+    if 0.0 < fixed_gb < target_gb:
+        target_gb = target_gb - fixed_gb
+    pass
 
-        if device.type == "cuda":
-            rng_state = torch.cuda.get_rng_state(device)
-        else:
-            rng_state = torch.get_rng_state()
-
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(device)
-            mem_before = torch.cuda.max_memory_allocated(device)
-
-            dummy_qlen = 256
-            # Use small hidden dim (e.g. 16) to minimize overhead not related to vocab_size
-            hidden = torch.randn(1, dummy_qlen, 16, dtype=torch.bfloat16, device=device, requires_grad=True)
-            weight = torch.randn(vocab_size, 16, dtype=torch.bfloat16, device=device, requires_grad=True)
-            target = torch.randint(0, vocab_size, (dummy_qlen,), device=device)
-
-            with torch.enable_grad():
-                logits = torch.nn.functional.linear(hidden, weight)
-                logits_fp32 = logits.view(-1, vocab_size).float()
-
-                if logit_scale_multiply != 0 and logit_scale_multiply is not None:
-                    logits_fp32 = logits_fp32 * logit_scale_multiply
-                if logit_scale_divide != 0 and logit_scale_divide is not None:
-                    logits_fp32 = logits_fp32 / logit_scale_divide
-                if logit_softcapping != 0 and logit_softcapping is not None:
-                    logits_fp32 = logits_fp32 / logit_softcapping
-                    logits_fp32 = torch.tanh(logits_fp32)
-                    logits_fp32 = logits_fp32 * logit_softcapping
-
-                loss = torch.nn.functional.cross_entropy(logits_fp32, target)
-                loss.backward()
-
-            mem_after = torch.cuda.max_memory_allocated(device)
-            peak_used = mem_after - mem_before
-            measured_bytes = peak_used / (dummy_qlen * vocab_size)
-
-            print(f"[CALIBRATION] measured_bytes = {measured_bytes:.2f} bytes/element")
-            bytes_per_element = max(float(measured_bytes), 4.0)
-
-            del hidden, weight, target, logits, logits_fp32, loss
-    except Exception as e:
-        print(f"[CALIBRATION] failed, using fallback: {e}")
-    finally:
-        if 'rng_state' in locals():
-            try:
-                if device.type == "cuda":
-                    torch.cuda.set_rng_state(rng_state, device)
-                else:
-                    torch.set_rng_state(rng_state)
-            except Exception as e:
-                print(f"[CALIBRATION] Failed to restore RNG state: {e}")
-
-    multiplier = (vocab_size * bytes_per_element / 1024 / 1024 / 1024) / (target_gb)
+    multiplier = (vocab_size * _CE_BYTES_PER_LOGIT / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, device = None, **kwargs):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
     """Number of chunks that fits the target max memory usage."""
-    logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
-    logit_scale_divide = kwargs.get("logit_scale_divide", None)
-    logit_softcapping = kwargs.get("logit_softcapping", None)
-    multiplier = _get_chunk_multiplier(
-        vocab_size, target_gb, device,
-        logit_scale_multiply, logit_scale_divide, logit_softcapping
-    )
+    multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
     n_splits = (bsz*qlen) * multiplier
-    # n_splits * 4 == (full float32 logits GiB) / target: the exact number of
-    # chunks needed to keep every chunk within target. Round UP to the next
-    # multiple of 4 so the target stays a real ceiling. Nearest-rounding could
-    # round down (round(0.5) -> 0) and collapse a 4-8 GiB logits transient into
-    # a single uncapped chunk; a config that already fits one chunk stays at one.
+    # n_splits * 4 == (chunk transient GiB) / target: the exact number of chunks
+    # needed to keep every chunk within target. Round UP to the next multiple of
+    # 4 so the target stays a real ceiling. Nearest-rounding could round down
+    # (round(0.5) -> 0) and collapse a large logits transient into a single
+    # uncapped chunk; a config that already fits one chunk stays at one.
     exact = n_splits * 4
     if exact <= 1.0 + 1e-9:
         return 1
-    return math.ceil(exact / 4 - 1e-9) * 4
+    n_chunks = math.ceil(exact / 4 - 1e-9) * 4
+    # More chunks than tokens is meaningless - torch.chunk caps out there anyway.
+    return min(n_chunks, bsz*qlen)
 pass
 
 class UnslothFusedLoss(torch.autograd.Function):
@@ -318,7 +272,19 @@ class UnslothFusedLoss(torch.autograd.Function):
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
-            n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb, device = device, **extra_kwargs)
+            # Memory no chunk count can shrink, charged to the same target:
+            # grad_inputs, and for a trainable head both grad_lm_head and the
+            # same-sized gradient functorch returns for every chunk (measured
+            # as 2*grad_lm_head on a B200, and likewise for the bias).
+            fixed_bytes = grad_inputs.numel() * grad_inputs.element_size()
+            if grad_lm_head is not None:
+                fixed_bytes += 2 * grad_lm_head.numel() * grad_lm_head.element_size()
+            if grad_lm_head_bias is not None:
+                fixed_bytes += 2 * grad_lm_head_bias.numel() * grad_lm_head_bias.element_size()
+            n_chunks = get_chunk_size(
+                bsz, qlen, vocab_size, target_gb = target_gb,
+                fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
+            )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)
