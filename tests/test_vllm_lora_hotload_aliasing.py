@@ -14,20 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""LoRA weights must not be aliased by a colocated vLLM engine, and a merge must
-not export finite garbage.
+"""LoRA snapshot isolation in create_lora_statistics, and _merge_lora's magnitude
+tripwire for finite garbage the isfinite gate cannot see.
 
-Two independent guarantees, both regressions we have actually observed:
-
-1. `create_lora_statistics` snapshots the LoRA factors, so a merge reads the values
-   that were live when it was called. Storing the live `module.weight` meant anything
-   mutating the adapter afterwards (vLLM's in-place `lora_b *= scaling` on a hot-load)
-   silently changed what got exported.
-2. `_merge_lora`'s magnitude tripwire catches a merged weight that is far too large to
-   be a healthy adapter delta, which the pre-existing `isfinite` gate cannot see.
-
-CPU only, and does not import vLLM: the vLLM-side composition is asserted by
-`_absmax`/snapshot behaviour here, not by spinning an engine.
+CPU only, and does not import vLLM.
 """
 import pytest
 import torch
@@ -83,11 +73,7 @@ def _base_weight(model):
     raise AssertionError("base layer not found")
 
 
-# ----------------------------------------------------------------------------------
-# snapshot isolation
-# ----------------------------------------------------------------------------------
 def test_snapshot_isolates_merge_from_later_adapter_mutation():
-    """The exact failure mode: the engine scales lora_B in place after capture."""
     model = _tiny_peft()
     stats = _delta_stats(model)
     W = _base_weight(model).detach().clone().float()
@@ -118,8 +104,6 @@ def test_snapshot_is_a_detached_cpu_copy_with_exact_values(dtype):
 
 
 def test_snapshot_survives_being_taken_under_inference_mode():
-    """create_lora_statistics is @torch.inference_mode; the snapshot must still be a
-    normal tensor, or downstream code outside inference mode rejects it."""
     weight = nn.Parameter(torch.randn(4, 4))
 
     @torch.inference_mode
@@ -139,9 +123,6 @@ def test_dora_magnitude_is_snapshotted_too():
     assert not isinstance(stats.magnitude, nn.Parameter)
 
 
-# ----------------------------------------------------------------------------------
-# _absmax
-# ----------------------------------------------------------------------------------
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16, torch.float16])
 def test_absmax_matches_abs_max(dtype):
     t = (torch.randn(32, 48) * 7.0).to(dtype)
@@ -159,9 +140,6 @@ def test_absmax_propagates_nan_so_the_isfinite_gate_still_fires():
     assert torch.isnan(torch.tensor(_absmax(torch.tensor([1.0, float("nan")])))).item()
 
 
-# ----------------------------------------------------------------------------------
-# merge tripwire
-# ----------------------------------------------------------------------------------
 def test_tripwire_rejects_finite_garbage_the_isfinite_gate_misses():
     W = torch.randn(64, 64) * 0.02
     stats = LoraStats(
@@ -179,8 +157,6 @@ def test_tripwire_rejects_finite_garbage_the_isfinite_gate_misses():
 @pytest.mark.parametrize("base_scale", [1e-3, 1e-1, 1.0])
 @pytest.mark.parametrize("mode", ["lora", "dora", "rslora"])
 def test_tripwire_accepts_healthy_merges(rank, alpha_ratio, base_scale, mode):
-    """No uncorrupted configuration may trip the guard, however extreme its alpha or
-    however small its base weight."""
     torch.manual_seed(rank * 977 + alpha_ratio * 13 + int(base_scale * 1000))
     d_in, d_out = 256, 192
     W = torch.randn(d_out, d_in) * base_scale
@@ -196,8 +172,8 @@ def test_tripwire_accepts_healthy_merges(rank, alpha_ratio, base_scale, mode):
 
 
 def test_tripwire_does_not_fire_on_an_all_zero_base_weight():
-    """A zero base leaves only the absolute floor; the ratio arm must not divide it
-    into rejecting every adapter."""
+    """A zero base leaves only the absolute floor; the ratio arm must not reject
+    every adapter."""
     stats = LoraStats(
         module = None,
         lora_A = torch.randn(8, 64),

@@ -2966,36 +2966,11 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         peft_config = get_peft_config(save_directory)
         state_dict = model.state_dict()
         items = state_dict.items()
-        # Ship CLONES, never the live training tensors. vLLM's
-        # LoRAModel.from_lora_tensors stores `tensor.to(device, dtype)`, which
-        # is a NO-OP (same storage) when device+dtype already match, so the
-        # engine holds ALIASES of the training weights. LoRALayerWeights
-        # .optimize() then runs `lora_b *= scaling` in-place on them, once per
-        # hot-load, and LORA_REQUEST_ID increments every call so each generate
-        # builds a fresh LoRAModel and the multiply compounds (s^n over n
-        # generations; rollouts rot to gibberish within a few optimizer steps).
-        #
-        # Three conditions must coincide for the corruption, which is why it
-        # does not show on every config:
-        #   - lora_alpha != r, else optimize() short-circuits on scaling == 1;
-        #   - the adapter dtype equals lora_config.lora_dtype, else the .to()
-        #     copies and breaks the alias. PEFT keeps the adapter in fp32 over a
-        #     bf16 base by default, which masks this; a bf16 adapter does not.
-        #     Measured on Llama-3.2-1B, r=16, alpha=32, 4 generations: fp32
-        #     adapter 0/224 tensors drifted, bf16 adapter 112/224.
-        #   - the engine reaches optimize() under no_grad/inference_mode, which
-        #     the lazy v1 path does; with grad enabled it raises on the leaf
-        #     Parameter instead of silently scaling it.
-        # Cloning removes the aliasing itself rather than any one condition.
-        # Cost is one adapter payload per hot-load: 45 MB for Llama-3.2-1B r=16
-        # over 7 projections, ~168 MB for an 8B r=32 adapter in bf16.
-        #
-        # inference_mode(False): load_lora runs under @torch.inference_mode, so
-        # a plain clone would be an inference tensor and vLLM's later in-place
-        # LoRALayerWeights.optimize() scaling (`lora_b *= scaling`) would raise
-        # "Inplace update to inference tensor outside InferenceMode" on
-        # dispatch paths that do not wrap _load_adapter in inference mode
-        # (LLMEngine.add_lora is one; the v1 model runner is not).
+        # Ship CLONES, never the live training tensors: LoRAModel.from_lora_tensors stores
+        # `tensor.to(device, dtype)`, a no-op sharing storage when both already match, and
+        # LoRALayerWeights.optimize() then scales lora_b in place on the training weights.
+        # inference_mode(False): a plain clone would be an inference tensor, which the eager
+        # add_lora path (not wrapped in inference mode) cannot mutate in place.
         with torch.inference_mode(False):
             state_dict = {
                 k.replace(".default", ""): v.detach().clone()

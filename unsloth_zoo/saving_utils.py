@@ -209,13 +209,8 @@ pass
 
 
 def _absmax(t):
-    # max|t| via a single fused reduction. torch.abs(t) would materialize a
-    # second full-size float32 tensor (multi-GB for embed_tokens / lm_head /
-    # fused expert weights) and could OOM a merge that otherwise fits.
-    # Reduce to the scalar on-device and read it back ONCE: two .item() calls
-    # would cost two device syncs per merged tensor, and _merge_lora calls this
-    # twice per key. NaN propagates through torch.maximum just as it did through
-    # the Python max(), so the isfinite gate keeps seeing it.
+    # Not torch.abs(t).max(): abs() materializes a second full-size tensor and can OOM
+    # a merge that otherwise fits.
     amin, amax = torch.aminmax(t)
     return torch.maximum(amin.abs(), amax.abs()).item()
 pass
@@ -278,15 +273,9 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         W = (magnitude / weight_norm).unsqueeze(1) * W
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
-    # A merge that folds FINITE garbage (~1e12+) into the export slips straight
-    # past the isfinite gate above, so bound the merged magnitude too: a healthy
-    # LoRA delta cannot inflate a weight by orders of magnitude over its base.
-    # Both conditions must hold, so a legitimately tiny base weight cannot trip
-    # it on the ratio alone (240 uncorrupted r x alpha x scale x {LoRA, DoRA,
-    # rsLoRA} configurations pass; see tests/test_vllm_lora_hotload_aliasing.py).
-    # The message deliberately does not name a single cause: a magnitude
-    # excursion is an observation, and in-place mutation of the live adapter by
-    # a colocated engine is only the case we have reproduced.
+    # Finite garbage (~1e12+) slips past the isfinite gate above, so bound the merged
+    # magnitude too. Both arms must hold: a legitimately tiny base weight must not trip
+    # the ratio alone.
     W_absmax = _absmax(W)
     if W_absmax > max(64.0 * W_base_absmax, 1e4):
         raise ValueError(
@@ -471,17 +460,10 @@ pass
 
 
 def _snapshot_lora_weight(weight):
-    # Snapshot LoRA factors to CPU at capture time. create_lora_statistics used
-    # to store LIVE GPU references, and _merge_lora reads them only later while
-    # the merge allocates/frees GBs of VRAM (and, under fast_inference, while
-    # the vLLM engine still owns part of the pool). If a tensor's storage gets
-    # recycled in between, the merge folds finite garbage (~1e12+) into the
-    # export while the checkpoint on disk stays clean. A CPU copy of a LoRA
-    # factor is a few MB and pins the values read at entry.
-    # inference_mode(False): create_lora_statistics runs under
-    # @torch.inference_mode; without this the snapshot would be an inference
-    # tensor (the original code stored plain Parameters), and downstream code
-    # outside inference mode may reject inference tensors.
+    # Storing live references here let anything mutating the adapter between capture and
+    # _merge_lora (a colocated vLLM engine hot-load) change what gets exported.
+    # inference_mode(False): create_lora_statistics is @torch.inference_mode, and an
+    # inference tensor is rejected by downstream code outside inference mode.
     with torch.inference_mode(False):
         return weight.detach().to("cpu", copy = True)
 pass
