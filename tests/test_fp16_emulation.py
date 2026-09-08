@@ -32,6 +32,7 @@ from unsloth_zoo.fp16_emulation import (  # noqa: E402
     fp16_split_matmul,
     fp16_split_mm,
     pow2_scale,
+    pow2_scale_tensor,
     split_terms,
 )
 
@@ -44,6 +45,14 @@ def _rel_l2(actual, reference):
 
 def _reference(A, B):
     return torch.mm(A.double(), B.double())
+
+
+def _pair(m, k, n, mag = 0.02, device = "cuda"):
+    """Operand pair at a magnitude typical of LLM weights, which is below float16's
+    normal-range floor of 0.125 and therefore depends on the scaling to work at all."""
+    torch.manual_seed(3407)
+    return (torch.randn(m, k, device = device) * mag,
+            torch.randn(k, n, device = device) * mag)
 
 
 def _fp16_direct(A, B):
@@ -179,3 +188,54 @@ def test_bf16_control_reproduces_upstream_relationship():
         fp16_split_mm(A, B, dtype = torch.bfloat16, terms = 3, products = 9, scale = False), ref
     )
     assert bf16x3 < _rel_l2(torch.mm(A, B), ref) * 2.0
+
+
+# ---------------------------------------------------------------- torch.compile
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_compiles_fullgraph():
+    """fullgraph is the real bar: it proves no host sync survives in the hot path."""
+    A, B = _pair(512, 512, 512, mag = 0.02)
+    out = torch.compile(fp16_split_mm, fullgraph = True)(A, B)
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_compiled_keeps_float32_accuracy():
+    """The regression that matters, and the reason _round_to is a custom op.
+
+    Without the opaque-op barrier Inductor fuses the float16 round trip away, the residual
+    becomes exactly 0, and this lands at plain-float16 error (~2.9e-04) while running
+    faster. Compiled output must stay at float32 parity, not merely be finite.
+    """
+    A, B = _pair(2048, 2048, 2048, mag = 0.02)
+    ref = A.double() @ B.double()
+    rel = lambda t: ((t.double() - ref).norm() / ref.norm()).item()
+    fp32_err = rel(torch.mm(A, B))
+    compiled_err = rel(torch.compile(fp16_split_mm)(A, B))
+    fp16_err = rel(torch.mm(A.half(), B.half()).float())
+    assert compiled_err < 10 * fp32_err, f"compiled {compiled_err:.2e} vs fp32 {fp32_err:.2e}"
+    assert compiled_err < fp16_err / 50, f"compiled {compiled_err:.2e} near fp16 {fp16_err:.2e}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_round_to_actually_rounds_under_compile():
+    """Directly pin the mechanism: a non-zero residual is what the split IS."""
+    def split(x):
+        return split_terms(x, torch.float16, 2)[1]
+    x = torch.randn(1024, 1024, device = "cuda") * 0.02
+    head = split_terms(x, torch.float16, 2)[0]
+    residual = x - head.float()
+    assert residual.norm().item() > 0
+    assert torch.compile(lambda t: t - split_terms(t, torch.float16, 2)[0].float())(x) \
+        .norm().item() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_pow2_scale_tensor_matches_pow2_scale():
+    """The sync-free scale must be the same number, not merely a similar one."""
+    for mag in (1e-6, 1e-3, 0.1, 1.0, 1e3):
+        x = torch.randn(256, 256, device = "cuda") * mag
+        assert pow2_scale_tensor(x).item() == pow2_scale(x)
+    zero = torch.zeros(8, 8, device = "cuda")
+    assert pow2_scale_tensor(zero).item() == pow2_scale(zero) == 1.0

@@ -70,6 +70,17 @@ T4 itself measured 9.06e-7 against IEEE 2.61e-7, i.e. 3.5x IEEE rather than the 
 B200, still 324x better than plain float16. That B200/T4 gap is unexplained; plausibly
 different tensor-core accumulate behaviour, but that is a guess and is recorded as one.
 
+torch.compile. `fp16_split_mm` compiles fullgraph and compiling it is worth 1.5-2.2x (B200,
+torch 2.14), which turns square-4096 from 1.24x into 3.25x against float32. Two things had to
+change to get there, both load-bearing:
+
+  - the scale must not call `.item()`, which syncs and breaks fullgraph. `pow2_scale_tensor`
+    uses frexp instead and returns the identical number.
+  - the float16 rounding must go through an opaque custom op. Inductor otherwise fuses
+    `.to(float16).to(float32)` away, leaving a residual of exactly 0, so the split silently
+    stops existing and lands at plain-float16 error while running faster. Guarded by
+    test_compiled_keeps_float32_accuracy.
+
 So: numerically sound, not currently worth enabling. Kept for the case where a large
 float32 GEMM appears on hardware without bfloat16 tensor cores.
 """
@@ -84,6 +95,7 @@ import torch
 __all__ = [
     "fp16_emulation_enabled",
     "pow2_scale",
+    "pow2_scale_tensor",
     "split_terms",
     "fp16_split_mm",
     "fp16_split_matmul",
@@ -128,6 +140,9 @@ def pow2_scale(x: torch.Tensor, target_exp: int = 14) -> float:
     A power of two is exact in binary floating point, so the scaling contributes no error of
     its own. That matters when the entire purpose is to measure error. target_exp = 14 puts
     the maximum an octave below the float16 ceiling of 65504.
+
+    Returns a Python float, so it syncs. `pow2_scale_tensor` is the torch.compile-safe form;
+    this one is kept because it is the readable definition and is what the tests assert on.
     """
     m = x.abs().max().item()
     if m == 0 or not math.isfinite(m):
@@ -135,11 +150,45 @@ def pow2_scale(x: torch.Tensor, target_exp: int = 14) -> float:
     return 2.0 ** (target_exp - math.floor(math.log2(m)))
 
 
+def pow2_scale_tensor(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
+    """`pow2_scale` without the host sync, returning a 0-dim tensor.
+
+    `.item()` is a data-dependent host read: it forces a device sync, and under
+    torch.compile(fullgraph = True) it is a hard error ("could not guard on data-dependent
+    expression"). frexp gives the exponent on device instead. frexp returns
+    m = mantissa * 2**exp with mantissa in [0.5, 1), so floor(log2(m)) == exp - 1.
+    """
+    m = x.abs().max()
+    _, exp = torch.frexp(m)
+    scale = torch.exp2((target_exp - (exp - 1)).float())
+    return torch.where(torch.isfinite(m) & (m > 0), scale, torch.ones_like(scale))
+
+
+# Rounding to low precision has to survive Inductor, and by default it does not: it fuses
+# `x.to(float16).to(float32)` into a no-op, keeping the value in a float32 register and never
+# rounding. The residual is then exactly 0, the low term vanishes and the split silently
+# degrades to a plain float16 matmul, measured at 2.93e-04 against eager's 4.86e-06 while
+# looking 5.8x faster. An opaque custom op is the barrier that forces a real round trip.
+_HAS_CUSTOM_OP = hasattr(torch.library, "custom_op")
+
+if _HAS_CUSTOM_OP:
+    @torch.library.custom_op("unsloth_zoo::fp16_emulation_round", mutates_args = ())
+    def _round_to(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return x.to(dtype)
+
+    @_round_to.register_fake
+    def _(x, dtype):
+        return torch.empty_like(x, dtype = dtype)
+else:
+    def _round_to(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return x.to(dtype)
+
+
 def split_terms(x: torch.Tensor, dtype: torch.dtype, terms: int) -> list:
     """Split a float32 tensor into `terms` low-precision terms, residual by residual."""
     out, residual = [], x
     for _ in range(terms):
-        head = residual.to(dtype)
+        head = _round_to(residual, dtype)
         out.append(head)
         residual = residual - head.float()
     return out
@@ -168,8 +217,9 @@ def fp16_split_mm(
         raise ValueError(f"products={products} exceeds terms*terms={terms * terms}")
 
     A32, B32 = A.float(), B.float()
-    sA = pow2_scale(A32) if scale else 1.0
-    sB = pow2_scale(B32) if scale else 1.0
+    one = torch.ones((), device = A32.device, dtype = torch.float32)
+    sA = pow2_scale_tensor(A32) if scale else one
+    sB = pow2_scale_tensor(B32) if scale else one
     a_terms = split_terms(A32 * sA, dtype, terms)
     b_terms = split_terms(B32 * sB, dtype, terms)
 
