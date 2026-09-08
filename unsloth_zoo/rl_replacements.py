@@ -460,6 +460,9 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
+    # False is the pre-TRL-1.10 default, and the right fallback for TRL versions with no
+    # such field. TRL flipped its own default to True in 1.10.0, and grpo_accumulated_loss
+    # always forwards the trainer's actual value, so this only affects direct callers.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
 
@@ -813,9 +816,9 @@ def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options the optimized GRPO path
     ignores, so setting them is not silently dropped. UnslothGRPOConfig forwards every
     field via **kwargs, but the fast path does not implement top_entropy_quantile < 1.0
-    (entropy masking). The TRL default (grpo_config, TRL 1.7.1) is 1.0, so only
-    non-defaults warn. use_bias_correction_kl IS supported (grpo_compute_loss applies
-    kl_i * coef_1), so it must not be listed here.
+    (entropy masking). Its TRL default is 1.0 in every version checked (0.27.0 through
+    1.12.0), so only non-defaults warn. use_bias_correction_kl IS supported
+    (grpo_compute_loss applies kl_i * coef_1), so it must not be listed here.
     """
     if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
         return
@@ -837,7 +840,11 @@ def _warn_unsupported_grpo_options(trainer):
         except Exception:
             import warnings as _warnings
             _warnings.warn(message)
-    trainer._unsloth_grpo_unsupported_warned = True
+        # Only latch after warning, so a config changed mid-run still gets one warning.
+        try:
+            trainer._unsloth_grpo_unsupported_warned = True
+        except Exception:
+            pass
     return
 pass
 RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
@@ -848,8 +855,9 @@ _n_chunks_deprecation_warned = False
 def _warn_deprecated_n_chunks(n_chunks):
     """Warn once per process when unsloth_num_chunks is set to a non-default value.
     grpo_accumulated_loss still accepts n_chunks because unsloth's generated GRPO
-    trainer passes unsloth_num_chunks, but loss chunking was removed and the value
-    has no effect.
+    trainer passes unsloth_num_chunks, but the caller-side chunk selection was removed
+    and the value never reaches UnslothEfficientGRPO.apply, which is always called with
+    1, so setting it has no effect.
     """
     global _n_chunks_deprecation_warned
     if _n_chunks_deprecation_warned:
@@ -858,9 +866,9 @@ def _warn_deprecated_n_chunks(n_chunks):
         return
     _n_chunks_deprecation_warned = True
     message = (
-        "Unsloth: unsloth_num_chunks is deprecated and has no effect; loss chunking "
-        "was removed since memory is managed by unsloth_grpo_mini_batch and "
-        "unsloth_logit_chunk_multiplier."
+        "Unsloth: unsloth_num_chunks is deprecated and is ignored; the GRPO loss now "
+        "always runs as a single chunk, since memory is managed by "
+        "unsloth_grpo_mini_batch and unsloth_logit_chunk_multiplier."
     )
     try:
         logger.warning(message)
@@ -929,7 +937,9 @@ def grpo_accumulated_loss(
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
-    # KL bias correction (TRL 0.27.0+); older TRL lacks the field -> off, the default.
+    # KL bias correction: the field exists from TRL 0.27.0 and defaults to False through
+    # 1.9.x and True from 1.10.0, so this follows whatever TRL itself would do. Older TRL
+    # lacks the field entirely, and False is the correct behavior there.
     kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
     # n_chunks stays in the signature (generated trainers still pass unsloth_num_chunks)

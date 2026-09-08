@@ -34,9 +34,11 @@ Covers:
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import logging
 import math
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -200,7 +202,22 @@ def test_warn_unsupported_grpo_options_silent_on_defaults(caplog):
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
     assert caplog.records == []
-    assert trainer._unsloth_grpo_unsupported_warned is True
+    # Nothing was warned about, so nothing latches.
+    assert not hasattr(trainer, "_unsloth_grpo_unsupported_warned")
+
+
+def test_warn_unsupported_grpo_options_warns_after_a_mid_run_config_change(caplog):
+    # A silent first call must not suppress a warning for a later non-default value.
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+        assert caplog.records == []
+        trainer.args.top_entropy_quantile = 0.2
+        rr._warn_unsupported_grpo_options(trainer)
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "top_entropy_quantile=0.2" in msgs[0]
 
 
 def test_warn_unsupported_grpo_options_silent_when_attrs_missing(caplog):
@@ -299,6 +316,103 @@ def test_grpo_accumulated_loss_does_not_forward_n_chunks():
     assert "UnslothEfficientGRPO.apply" in src
     apply_args = src.split("UnslothEfficientGRPO.apply(", 1)[1].split(")", 1)[0]
     assert "n_chunks" not in apply_args
+
+
+# ---------------------------------------------------------------------------
+# Version skew. unsloth text-copies these function bodies into the generated
+# UnslothGRPOTrainer cache, so a cache written by a new unsloth can be executed
+# against an older installed unsloth_zoo that has neither helper. The helper calls
+# must degrade to a no-op rather than break the training step.
+# ---------------------------------------------------------------------------
+
+
+def _helper_call_snippets():
+    src = inspect.getsource(rr.grpo_accumulated_loss)
+    lines = src.splitlines()
+    snippets = []
+    for i, line in enumerate(lines):
+        if line.strip() != "try:":
+            continue
+        block = [line]
+        indent = len(line) - len(line.lstrip())
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and (len(nxt) - len(nxt.lstrip())) <= indent and \
+               not nxt.strip().startswith(("except", "else", "finally")):
+                break
+            block.append(nxt)
+        text = "\n".join(block)
+        if "_warn_unsupported_grpo_options" in text or "_warn_deprecated_n_chunks" in text:
+            snippets.append(textwrap.dedent(text))
+    return snippets
+
+
+def test_helper_calls_no_op_against_an_older_unsloth_zoo(monkeypatch):
+    # Both helpers missing from the installed module, as in an old unsloth_zoo.
+    monkeypatch.delattr(rr, "_warn_unsupported_grpo_options", raising=False)
+    monkeypatch.delattr(rr, "_warn_deprecated_n_chunks", raising=False)
+    snippets = _helper_call_snippets()
+    assert len(snippets) == 2, "expected both helper calls to be guarded try blocks"
+    for snippet in snippets:
+        exec(snippet, {"trainer": object(), "n_chunks": 4})
+
+
+def test_warn_unsupported_grpo_options_survives_an_unassignable_trainer():
+    # A trainer with __slots__ cannot take the latch attribute; warning must still fire.
+    class Slotted:
+        __slots__ = ("args",)
+
+    trainer = Slotted()
+    trainer.args = SimpleNamespace(top_entropy_quantile=0.2)
+    rr._warn_unsupported_grpo_options(trainer)
+    rr._warn_unsupported_grpo_options(trainer)
+
+
+def test_warn_helpers_fall_back_to_warnings_when_the_logger_raises(monkeypatch):
+    class _BrokenLogger:
+        def warning(self, *args, **kwargs):
+            raise RuntimeError("no logger")
+
+    monkeypatch.setattr(rr, "logger", _BrokenLogger())
+    monkeypatch.setattr(rr, "_n_chunks_deprecation_warned", False)
+    with pytest.warns(UserWarning):
+        rr._warn_unsupported_grpo_options(_make_grpo_trainer(top_entropy_quantile=0.2))
+    with pytest.warns(UserWarning):
+        rr._warn_deprecated_n_chunks(4)
+
+
+@pytest.mark.parametrize("quantile", [None, 1.0, 1.5])
+def test_warn_unsupported_grpo_options_silent_for_non_masking_quantiles(quantile, caplog):
+    # None means "unset" on some TRL versions; >= 1.0 keeps every token.
+    trainer = _make_grpo_trainer(top_entropy_quantile=quantile)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []
+
+
+def test_warn_unsupported_grpo_options_fires_for_the_zero_quantile(caplog):
+    # 0.0 is a legal TRL value (mask all but the highest-entropy token), not a default.
+    trainer = _make_grpo_trainer(top_entropy_quantile=0.0)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert len(caplog.records) == 1
+
+
+def test_bias_correction_follows_the_installed_trl_default():
+    # grpo_accumulated_loss reads trainer.args, so whatever TRL defaults to is what
+    # Unsloth does. TRL's own default is False through 1.9.x and True from 1.10.0.
+    trl_config = pytest.importorskip("trl.trainer.grpo_config")
+    fields = {f.name: f for f in dataclasses.fields(trl_config.GRPOConfig)}
+    if "use_bias_correction_kl" not in fields:
+        pytest.skip("installed TRL predates use_bias_correction_kl")
+    trl_default = fields["use_bias_correction_kl"].default
+    args = SimpleNamespace(use_bias_correction_kl=trl_default)
+    assert getattr(args, "use_bias_correction_kl", False) is trl_default
+
+
+def test_bias_correction_defaults_off_without_the_trl_field():
+    # Older TRL has no such attribute; the getattr fallback must keep the old behavior.
+    args = SimpleNamespace()
+    assert getattr(args, "use_bias_correction_kl", False) is False
 
 
 # ---------------------------------------------------------------------------
