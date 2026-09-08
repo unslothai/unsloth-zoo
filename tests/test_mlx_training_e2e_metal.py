@@ -1447,10 +1447,7 @@ def test_gather_qmm_guard_never_breaks_a_working_call(failing, monkeypatch,
 @metal_only
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
 def test_the_logit_sum_holds_the_widest_vocabulary_in_float16(dtype):
-    """float16 is the recommended dtype on M1 and M2 and stops at 65504, far
-    below the 1e9 a wide row of large logits sums to. The contraction has to
-    scale the accumulation into range rather than reporting an infinity the
-    response mask then turns into NaN."""
+    """float16 stops at 65504, far below the 1e9 a wide row of logits sums to."""
     from unsloth_zoo.mlx.preference import _row_logit_sum
 
     wide = mx.full((1, 2, 262144), 4000.0, dtype=getattr(mx, dtype))

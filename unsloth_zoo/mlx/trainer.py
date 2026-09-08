@@ -1996,11 +1996,7 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
 
 
 def _preference_metric_values(names, denominators, summed):
-    """Window means from summed numerators and the denominators they name.
-
-    ``summed`` holds every numerator followed by every denominator, so a window
-    or an eval set is averaged exactly however unlike its batches are.
-    """
+    """``summed`` is every numerator then every denominator; the mean is exact."""
     values = {}
     for index, name in enumerate(names):
         divisor = summed[denominators[index]]
@@ -5486,8 +5482,7 @@ class MLXTrainer:
             self._preference_run_context = PreferenceRunContext(
                 model, enabled=bool(getattr(args, "disable_dropout", True)),
             )
-            # Not the training loss: that one normalizes across an accumulation
-            # window, where this one normalizes over the split it is given.
+            # Not the training loss: that one normalizes across a window.
             preference_eval_fn = make_preference_eval_fn(
                 objective, reference_policy=_sampling_reference,
             )
@@ -5783,11 +5778,7 @@ class MLXTrainer:
             return grad, toks_f
 
         def _scored(batch_data):
-            """Loss, its weight, and the metric sums a preference loss reports.
-
-            ``stats`` is None for every objective that reports no metrics of its
-            own, which is every SFT and VLM loss.
-            """
+            """``stats`` is None for every SFT and VLM loss, which report none."""
             scored, grad = _loss_and_grad(batch_data)
             stats = scored[2] if len(scored) > 2 else None
             return scored[0], scored[1], stats, grad
@@ -6351,8 +6342,7 @@ class MLXTrainer:
         supervised_tokens = 0
         pending_supervised_tokens = 0
         pending_steps = 0
-        # The preference metric sums, split the same way; None until a loss
-        # that reports them runs, which an SFT or VLM objective never does.
+        # Preference metric sums, split like the loss counters; None for SFT/VLM.
         metric_stats = None
         pending_stats = None
         trained_tokens = 0
@@ -6525,7 +6515,6 @@ class MLXTrainer:
             if grad_norm_val is not None:
                 logs["grad_norm"] = grad_norm_val
             if metric_stats is not None:
-                # TRL's preference trainers log these beside the loss every step.
                 summed_stats = self._distributed_all_sum(
                     metric_stats, stream=mx.cpu,
                 )

@@ -1002,15 +1002,12 @@ def _response_logps(model, batch, lengths):
     return -(ce * _response_mask(targets, lengths)).sum(axis=1)
 
 
-# TRL's own warning list, narrower than the set that drops the value: discopop
-# drops it silently.
+# TRL's own warning list, narrower than the set that drops the value.
 _DPO_SMOOTHING_WARNINGS = frozenset({
     "hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down",
 })
 
-# These read the reference log probabilities themselves rather than the ratios,
-# so a reference-free run, which never computes them, leaves them nothing to
-# score. TRL computes the reference regardless and does not notice.
+# These rebuild from the raw reference logps, bypassing TRL's reference_free mask.
 _DPO_NEEDS_REFERENCE = frozenset({
     "sppo_hard", "nca_pair", "aot_pair", "aot", "discopop",
 })
@@ -1027,11 +1024,7 @@ _DPO_REFUSED = {
 
 @dataclass(frozen=True)
 class _DPOTerms:
-    """The four log probabilities a variant reads, and the ratios TRL derives.
-
-    ``delta`` groups its subtraction as TRL does rather than the equivalent
-    ``chosen_ratio - rejected_ratio``, which is not the same in float32.
-    """
+    """``delta`` uses TRL's subtraction grouping; regrouping shifts it in float32."""
 
     chosen: object
     rejected: object
@@ -1150,8 +1143,6 @@ _DPO_VARIANTS = {
 
 @dataclass(frozen=True)
 class PreferenceObjective:
-    """What a preference run optimizes, resolved once and scored everywhere."""
-
     kind: str
     beta: float
     label_smoothing: float = 0.0
@@ -1161,7 +1152,6 @@ class PreferenceObjective:
     reference_free: bool = False
 
     def __post_init__(self):
-        # Frozen stops rebinding, not editing what a list holds.
         object.__setattr__(self, "loss_types", tuple(self.loss_types))
         object.__setattr__(self, "weights", tuple(self.weights))
         if self.kind not in ("dpo", "orpo"):
@@ -1174,8 +1164,6 @@ class PreferenceObjective:
                 f"not {self.beta}."
             )
         if self.kind != "dpo":
-            # ORPO reads beta and nothing below, and each loss takes only its
-            # own kind, so nothing else here reaches a reader that would mind.
             return
         if len(self.weights) != len(self.loss_types):
             raise ValueError(
@@ -1188,7 +1176,6 @@ class PreferenceObjective:
                 "Unsloth MLX DPO: loss_type must name at least one loss."
             )
         if not all(math.isfinite(weight) for weight in self.weights):
-            # A NaN or infinite weight carries into every pair of the step.
             raise ValueError(
                 f"Unsloth MLX DPO: loss_weights must all be finite, not "
                 f"{list(self.weights)}."
@@ -1205,21 +1192,18 @@ class PreferenceObjective:
                     f"{', '.join(sorted(_DPO_VARIANTS))}."
                 )
         if not 0 <= self.label_smoothing < 0.5:
-            # The range the parameter is defined over, and the one bound to
-            # state: robust divides by 1 - 2 * it, exo_pair logs 1 - it.
+            # robust divides by 1 - 2 * it, so 0.5 is a division by zero.
             raise ValueError(
                 "Unsloth MLX DPO: label_smoothing must be in [0, 0.5), not "
                 f"{self.label_smoothing}."
             )
         if self.label_smoothing == 0 and "exo_pair" in self.loss_types:
-            # exo_pair takes log(label_smoothing), which has no answer at
-            # zero. TRL applies this floor from inside exo_pair's own branch,
-            # so anything listed ahead of it misses it on the first
-            # micro-batch only; the value is the same, the timing is not.
+            # exo_pair logs label_smoothing, undefined at zero. Floored here at
+            # config time; TRL mutates self.label_smoothing inside exo_pair's own
+            # branch, a state change that leaks into the other losses in the list.
             object.__setattr__(self, "label_smoothing", 1e-3)
         if "discopop" in self.loss_types and not 0 < self.discopop_tau < math.inf:
-            # discopop divides by it, and the delta is zero while the
-            # reference still matches the policy, so zero is NaN, not sharper.
+            # discopop divides by it, and delta is zero at init, so 0 is NaN.
             raise ValueError(
                 "Unsloth MLX DPO: discopop_tau must be finite and above zero, "
                 f"not {self.discopop_tau}."
@@ -1237,8 +1221,7 @@ class PreferenceObjective:
 
     @property
     def length_normalized(self):
-        """IPO scores per-token log probabilities. TRL divides before any
-        variant runs, so naming it anywhere moves the rest of the list."""
+        """TRL divides before any variant runs, so ipo normalizes the whole list."""
         return "ipo" in self.loss_types
 
 
@@ -1246,13 +1229,6 @@ def resolve_preference_objective(
     kind, *, beta, label_smoothing=0.0, loss_type="sigmoid",
     loss_weights=None, discopop_tau=0.05, reference_free=False,
 ):
-    """Normalize a preference configuration into the objective both paths score.
-
-    Only the configuration's own spellings are resolved here; every setting a
-    loss depends on is established by the objective, so a caller that builds one
-    directly gets the same. The reference policy is a model rather than a
-    setting, so the factories take it separately.
-    """
     beta = float(beta)
     if kind == "orpo":
         return PreferenceObjective(kind="orpo", beta=beta)
@@ -1292,7 +1268,6 @@ def _dpo_pair_loss(objective, terms):
 
 
 def make_dpo_loss_fn(objective, *, reference_policy=None):
-    """Create the DPO loss for a resolved objective."""
     _require_kind(objective, "dpo")
     _require_reference(objective, reference_policy)
 
@@ -1335,24 +1310,13 @@ PREFERENCE_EVAL_METRICS = {
 }
 
 
-# Contracted against instead of ones: a matmul returns the input dtype, and a
-# float16 vocabulary row sum runs past 65504 to infinity, which the mask then
-# turns into NaN. The smallest power of two still normal in float16, so undoing
-# it is exact; a 262144-entry vocabulary uses up its headroom near logits of 4096.
+# An unscaled float16 vocabulary row sum overflows to inf, which the mask then
+# turns into NaN. This is the smallest normal float16, so undoing it is exact.
 _LOGIT_SUM_SCALE = 2.0 ** -14
 
 
 def _row_logit_sum(logits):
-    """Logit sum at each position, accumulated wider than the logits are stored.
-
-    mx.sum accumulates in the input dtype, which can overflow float16 at a real
-    vocabulary and loses mantissa in bf16. Casting first fixes both but
-    materializes a float32 copy of the largest tensor in the step -- 1.6 GB at
-    batch 4, sequence 2048, vocabulary 49152, since MLX does not fuse the cast
-    into the reduction. Contracting accumulates in float32 inside the matmul
-    instead, for the cost of the per-position result alone, which is then rounded
-    once to the logits' own mantissa.
-    """
+    """Logit sum per position, accumulated in float32 by the matmul, not mx.sum."""
     weights = mx.full(
         (logits.shape[-1], 1), _LOGIT_SUM_SCALE, dtype = logits.dtype,
     )
@@ -1369,23 +1333,16 @@ def _masked_logit_sum(logits, mask):
 
 
 def _orpo_logit_sum(logits):
-    """Logit sum over every position, and the count it divides by."""
     return _row_logit_sum(logits).sum(), mx.array(float(math.prod(logits.shape)))
 
 
-# The denominators summed alongside the metrics, in the order appended.
 _PREFERENCE_DENOMINATOR_NAMES = {
     "dpo": ("chosen_logits", "rejected_logits", "pairs"),
     "orpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
 }
 
-# The metrics that are token means; the pair count recovers every other one.
-# These three are also the ones that can disagree with a CUDA log, which they do
-# once a window's batches carry unlike tokens per pair: TRL weights its
-# per-micro-batch means equally, so its number moves with
-# per_device_train_batch_size on identical data -- 13% across batch sizes 1 to 16
-# in one measured window. Summing numerators over the window and dividing by the
-# tokens they cover does not, and is what both paths report here.
+# Token means, unlike TRL, which weights per-micro-batch means equally and so
+# reports a number that moves with per_device_train_batch_size.
 _PREFERENCE_TOKEN_DENOMINATORS = {
     "dpo": {
         "logits/chosen": "chosen_logits",
@@ -1400,12 +1357,6 @@ _PREFERENCE_TOKEN_DENOMINATORS = {
 
 
 def _preference_denominators(kind):
-    """Metric index -> index of the stats entry it is divided by.
-
-    Derived rather than written out: the indices are positions in a vector whose
-    length changes with the objective, and a hand-maintained map would rot the
-    first time a metric moved.
-    """
     names = PREFERENCE_EVAL_METRICS[kind]
     offsets = {
         name: len(names) + offset
@@ -1433,11 +1384,7 @@ def _preference_stats(
     kind, logits, mask, *, chosen, rejected, chosen_rewards, rejected_rewards,
     extra=(), extra_denominators=(),
 ):
-    """One batch's metric numerators, then the denominators they divide by.
-
-    Every entry is a sum, so summing over a window and dividing each numerator
-    by the entry its index names averages that window exactly.
-    """
+    """Numerators then denominators, all sums, so a window average is exact."""
     pairs = chosen.shape[0]
     # TRL is inconsistent between its trainers: DPOTrainer averages its logit
     # metric over completion positions, ORPOTrainer over the whole sequence.
@@ -1464,7 +1411,6 @@ def _preference_stats(
         *extra_denominators,
         mx.array(float(pairs)),
     ]
-    # Reported, never trained on: the loss is the only path to the gradient.
     return mx.stop_gradient(
         mx.stack([value.astype(mx.float32) for value in values])
     )
@@ -1481,10 +1427,7 @@ def _preference_forward(model, batch, lengths):
 
 
 def _orpo_scores(model, batch, lengths, beta):
-    """Score one ORPO batch as ``(nll_sum, nll_tokens, ratio, stats)``.
-
-    Unreduced: training normalizes over its window, evaluation over the batch.
-    """
+    """Unreduced: training normalizes over its window, evaluation over the batch."""
     logits, ce, mask = _preference_forward(model, batch, lengths)
     pairs = batch.shape[0] // 2
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
@@ -1509,7 +1452,6 @@ def _orpo_scores(model, batch, lengths, beta):
 
 
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
-    """Score one DPO batch: the variants' terms, then the metrics for the log."""
     logits, ce, mask = _preference_forward(model, batch, lengths)
     pairs = batch.shape[0] // 2
     logps = -(ce * mask).sum(axis=1)
@@ -1524,9 +1466,8 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
     beta = objective.beta
     chosen, rejected = logps[:pairs], logps[pairs:]
     ref_chosen, ref_rejected = reference[:pairs], reference[pairs:]
-    # TRL adds the rewards up once per entry, so a two-entry list reports twice
-    # what a one-entry list does. In its order, not scaled by the summed
-    # weights, which is a different float32 number.
+    # TRL adds the rewards once per loss entry, so a two-entry list reports twice
+    # a one-entry list; summed in its order, not scaled by the summed weights.
     stats = _preference_stats(
         "dpo", logits, mask,
         chosen=chosen, rejected=rejected,

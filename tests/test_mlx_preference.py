@@ -830,10 +830,8 @@ def test_dpo_label_smoothing_matches_conservative_formula():
     assert int(weight) == 1
 
 
-# What TRL 0.23.1's own dpo_loss returns for these pairs at beta 0.3 and
-# discopop_tau 0.2, smoothing 0.15 wherever the variant reads it -- run from its
-# source, not transcribed. The fourth pair carries the difference past 1 / beta
-# where hinge clamps; the first three sort differently from their order.
+# Run from TRL 0.23.1's own dpo_loss, not transcribed. The fourth pair pushes
+# past 1 / beta where hinge clamps; the first three sort out of their order.
 _DPO_FIXTURE = dict(
     chosen=[-1.0, -2.5, -0.4, -0.2], rejected=[-1.8, -0.6, -2.2, -3.6],
     ref_chosen=[-1.3, -2.0, -0.9, -2.4], ref_rejected=[-1.1, -1.4, -2.6, -1.9],
@@ -860,7 +858,6 @@ def test_each_dpo_variant_matches_the_trl_formula(name):
     from unsloth_zoo.mlx import preference
 
     assert set(preference._DPO_VARIANTS) == set(_TRL_PAIR_LOSSES)
-    # TRL warns for a narrower set than the one that drops the value.
     assert "discopop" not in preference._DPO_SMOOTHING_WARNINGS
     objective = preference.resolve_preference_objective(
         "dpo", beta=0.3, loss_type=name, discopop_tau=0.2,
@@ -878,8 +875,6 @@ def test_each_dpo_variant_matches_the_trl_formula(name):
 
 
 def test_an_objective_is_valid_however_it_was_built():
-    """The invariants belong to the type, so a caller past the resolver still
-    cannot hold an objective its loss would score wrongly."""
     import dataclasses
     from unsloth_zoo.mlx.preference import (
         PreferenceObjective, make_dpo_loss_fn, make_orpo_loss_fn,
@@ -908,8 +903,7 @@ def test_an_objective_is_valid_however_it_was_built():
     with pytest.raises(ValueError, match="unknown objective kind"):
         resolve_preference_objective("cpo", beta=0.1)
 
-    # A bound binds only where a loss reads the value, and exo_pair's
-    # log(smoothing) has no zero wherever it is named.
+    # A bound binds only where a loss reads the value.
     kept = PreferenceObjective(
         kind="dpo", beta=0.1, loss_types=["sigmoid", "exo_pair"],
         weights=[0.0, -1.0], discopop_tau=0.0)
@@ -922,7 +916,6 @@ def test_an_objective_is_valid_however_it_was_built():
         "kind", "beta", "label_smoothing", "loss_types", "weights",
         "discopop_tau", "reference_free"}
 
-    # Each factory takes its own kind, so ORPO may carry DPO fields it ignores.
     dpo = resolve_preference_objective("dpo", beta=0.1)
     assert (dpo.loss_types, dpo.weights, dpo.label_smoothing) == (
         ("sigmoid",), (1.0,), 0.0)
@@ -944,8 +937,6 @@ def _ordered(rewards, weights):
 
 
 def _assert_reported_stats(kind, stats, expected, counts, over):
-    """Every reported slot against a value recomputed here, then the counts it
-    is divided by -- both their totals and which one each metric names."""
     from unsloth_zoo.mlx import preference
 
     names = preference.PREFERENCE_EVAL_METRICS[kind]
@@ -961,14 +952,10 @@ def _assert_reported_stats(kind, stats, expected, counts, over):
 
 
 def test_the_training_loss_and_its_reported_metrics_follow_the_objective():
-    """The closure scores the named variants at their weights on the ratios TRL
-    derives, accumulates rewards once per entry as TRL does, and named ipo
-    divides policy and reference alike before any variant runs."""
     import mlx.core as mx
     from unsloth_zoo.mlx import preference
 
-    # Rows of unlike length, so a count taken from the first row and scaled by
-    # the row count is not the count these rows carry.
+    # Rows of unlike length, so a count scaled from the first row is wrong.
     batch, lengths, normalizers = build_plan([
         {"prompt": f"question {index}: ", "chosen": "yes " * (index + 1),
          "rejected": "no " * (2 - index)} for index in range(2)],
@@ -976,9 +963,7 @@ def test_the_training_loss_and_its_reported_metrics_follow_the_objective():
     model = TinyModel()
     beta, weights = 0.3, [0.1, 0.2, -0.3]
     pairs = batch.shape[0] // 2
-    # A reference far enough above one pair's rejected row and the other's
-    # chosen row that the two pairs order oppositely whatever the model scores,
-    # which is what the accuracy count below is read against.
+    # Far enough out that the two pairs order oppositely whatever the model scores.
     held = mx.array([0.0, 60.0, 60.0, 0.0])
     policy = types.SimpleNamespace(forward=lambda *_a: held)
     resolve = preference.resolve_preference_objective
@@ -1005,8 +990,7 @@ def test_the_training_loss_and_its_reported_metrics_follow_the_objective():
     assert resolve("dpo", beta=beta,
                    loss_type=["hinge", "sigmoid"]).weights == (1.0, 1.0)
 
-    # These weights cancel, separating TRL's per-entry copies from one copy
-    # scaled by their sum.
+    # Weights summing to zero separate TRL's per-entry copies from one scaled copy.
     reward_chosen = _ordered(beta * (chosen - ref_chosen), weights)
     reward_rejected = _ordered(beta * (rejected - ref_rejected), weights)
     logits, _ce, mask = preference._preference_forward(model, batch, lengths)
@@ -1395,7 +1379,6 @@ def test_preference_trainer_runs_through_shared_training_loop(
 
 
 def _window_mean(model, plan, indices, metric="logps/chosen"):
-    """What a window covering these micro-batches reports for one metric."""
     from unsloth_zoo.mlx import preference
 
     loss_fn = preference.make_dpo_loss_fn(preference.resolve_preference_objective(
@@ -1407,8 +1390,7 @@ def _window_mean(model, plan, indices, metric="logps/chosen"):
 
 
 class _StopMidWindow:
-    """on_substep_end fires off the accumulation boundary, so its second call
-    lands mid-window and mid-epoch: the only partial window there is to abandon."""
+    """on_substep_end fires off the accumulation boundary, so call two is mid-window."""
 
     def __init__(self):
         self.substeps = 0
@@ -1428,9 +1410,7 @@ class _StopMidWindow:
 def test_a_logged_window_holds_its_own_metrics_and_nothing_earlier(
     logging_steps, steps, epochs, stop, windows, monkeypatch, tmp_path,
 ):
-    """Each log line covers the window that produced it: not its first
-    micro-batch, not one already reported, and not one whose gradient was
-    discarded, whose rows the optimizer never saw."""
+    """Each log line covers its own window, not one already reported or dropped."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     model = _tiny_model()
@@ -1444,8 +1424,7 @@ def test_a_logged_window_holds_its_own_metrics_and_nothing_earlier(
     plan, _ = trainer._prepare_data(False)
     _run_generation_trainer(trainer, monkeypatch, [])
 
-    # The stubbed optimizer never moves the weights, so the plan rescores the
-    # same numbers after the run.
+    # The stubbed optimizer never moves the weights, so the plan rescores equal.
     logged = [entry["logps/chosen"] for entry in trainer.state.log_history
               if "logps/chosen" in entry]
     assert len(logged) == len(windows)
@@ -1793,9 +1772,7 @@ def _run_generation_trainer(trainer, monkeypatch, calls, generate_batch=None):
 @pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig"])
 def test_a_preference_field_a_dump_predates_still_reads_as_a_wholesale_copy(
         config_cls_name):
-    """Every field these configs add arrived after some release whose dumps are
-    still accepted, so an unregistered one flips the copy detection and lets a
-    copied default warmup_steps override an explicit warmup_ratio."""
+    """An unregistered appended field flips the copy detection, losing warmup_ratio."""
     import dataclasses
     from unsloth_zoo.mlx import trainer as trainer_module
 
@@ -2148,8 +2125,7 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
         _preference_metric_values,
     )
 
-    # Each metric is a window sum over the denominator it names; TRL averages
-    # per-batch means instead.
+    # A window sum over the denominator it names; TRL averages per-batch means.
     batches = [[4.0, 9.0, 2.0, 3.0], [1.0, 1.0, 1.0, 1.0]]
     summed = [sum(column) for column in zip(*batches)]
     weighted = _preference_metric_values(("a", "b"), {0: 2, 1: 3}, summed)
@@ -2176,8 +2152,6 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
 
 def test_the_config_carries_every_objective_field_into_the_run(tmp_path,
                                                                monkeypatch):
-    """A run that dropped any of these would still train, on a different
-    objective, and evaluation would rank its checkpoints by another again."""
     from unsloth_zoo.mlx import trainer as trainer_module
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
@@ -2232,15 +2206,7 @@ def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
 
 
 def test_the_orpo_logit_sum_is_accumulated_in_float32():
-    """Both objectives reduce raw logits wider than the logits are stored.
-
-    mx.sum does not promote, and a batch holds millions of logits: in bf16 the
-    running sum stops registering addends long before the end, and a cast of the
-    result lands after the damage.
-
-    This shim runs in float32, so the assertion is on the dtype rather than on
-    the value; only a real-mlx run reproduces the drift itself.
-    """
+    """mx.sum does not promote; this shim is float32, so assert on the dtype."""
     import mlx.core as mx
     from unsloth_zoo.mlx import preference as pref
 
