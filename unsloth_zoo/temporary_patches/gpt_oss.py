@@ -1413,22 +1413,13 @@ else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 
-# coordinate_descent_tuning used to be driven by use_combo_kernels as well, so asking for
-# combo kernels also bought the tuning. They cost very differently and were measured apart:
+# coordinate_descent_tuning used to be driven by use_combo_kernels too, so asking for combo
+# kernels also bought the tuning. Measured apart on T4/L4/A100/B200: combo kernels are free
+# (decode compile 7.36s vs 7.48s off), the tuning costs +28% on A100 and +32% on L4 decode
+# compile for no measurable gain anywhere. Default it off, opt in to re-measure.
 #
-#   flag                        compile overhead (decode)      step time / decode tok/s
-#   combo_kernels               A100 7.36s vs 7.48s off        within noise on T4/L4/A100/B200
-#   coordinate_descent_tuning   A100 9.55s (+28%)              no measurable benefit anywhere
-#                               L4   9.21s (+32%)
-#
-# So the tuning is the expensive half and had no measured payoff, on either training or
-# decode, on any of T4 16GB, L4 22GB, A100 40GB or B200 180GB. Default it off and let it be
-# turned back on explicitly for anyone who wants to re-measure.
-#
-# Note also that the 40GB test is in GiB: an A100-SXM4-40GB reports 39.49, so it falls BELOW
-# this threshold and combo kernels are off there. Left as-is because combo kernels measured
-# as no-effect on both sides of the boundary, so moving it would change nothing; recorded so
-# the next reader does not assume a 40GB card takes the combo path.
+# The 40GB test above is in GiB, so an A100-SXM4-40GB reports 39.49 and falls BELOW it.
+# Left as-is: combo kernels measured as no-effect on both sides of the boundary.
 use_coordinate_descent = os.environ.get("UNSLOTH_COORDINATE_DESCENT_TUNING", "0") == "1"
 
 fused_torch_compile_options = get_torch_compile_options(
