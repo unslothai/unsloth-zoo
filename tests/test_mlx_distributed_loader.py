@@ -109,6 +109,22 @@ class _VLMOnlyClass:
     """Stands in for a class only mlx-vlm ships; routing never calls it."""
 
 
+def test_vlm_only_text_routing_checks_remapped_module_presence(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    monkeypatch.setattr(loader, "_mlx_lm_module_name", lambda _: "remapped")
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: _VLMOnlyClass)
+    seen = []
+    monkeypatch.setattr(loader.importlib.util, "find_spec", lambda name: seen.append(name))
+    assert loader._mlx_vlm_only_text_model({"model_type": "alias"}, "alias")
+    assert seen == ["mlx_lm.models.remapped"]
+    monkeypatch.setattr(loader.importlib.util, "find_spec", lambda _: object())
+    assert not loader._mlx_vlm_only_text_model({"model_type": "alias"}, "alias")
+    monkeypatch.setattr(loader.importlib.util, "find_spec", lambda _: None)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: None)
+    assert not loader._mlx_vlm_only_text_model({"model_type": "absent"}, "absent")
+
+
 def test_text_only_vlm_load_stays_on_vlm_path_when_mlx_lm_has_no_model(monkeypatch):
     import unsloth_zoo.mlx.loader as loader
 
@@ -354,6 +370,7 @@ def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatc
         "install_mlx_compile_patches", "_ensure_vlm_processor_inputs_patched",
         "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype",
         "_patch_mixed_precision_set_dtype", "_ensure_minicpmo_mlx_sanitize",
+        "_ensure_native_vlm_weight_names",
         "_ensure_minicpmo_vision_dtype", "_fix_gemma4_kv_sharing",
         "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa",
         "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32",

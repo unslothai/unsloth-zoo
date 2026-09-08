@@ -43,6 +43,138 @@ if _METAL:
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 
 
+@metal_only
+@pytest.mark.parametrize("family", ["qwen2_vl", "glm4v"])
+def test_cacheless_text_positions_match_language_wrapper(family):
+    import importlib
+    from types import SimpleNamespace
+
+    configs = importlib.import_module(f"mlx_vlm.models.{family}.config")
+    language = importlib.import_module(f"mlx_vlm.models.{family}.language")
+    args = configs.TextConfig.from_dict(dict(
+        model_type=family, hidden_size=512, num_hidden_layers=2,
+        intermediate_size=128, num_attention_heads=4, num_key_value_heads=2,
+        rms_norm_eps=1e-5, vocab_size=32, max_position_embeddings=128,
+        rope_scaling={"type": "default", "rope_type": "default",
+                      "mrope_section": [8, 12, 12] if family == "glm4v" else [16, 24, 24]},
+    ))
+    config = SimpleNamespace(vision_config=SimpleNamespace(spatial_merge_size=2),
+                             image_token_id=40, video_token_id=41, vision_start_token_id=42)
+    lm = language.LanguageModel(args, config)
+    for rows in ([[2, 3, 4], [5, 6, 7]], [[7, 6], [4, 3]], [[2, 3, 4], [5, 6, 8]]):
+        inputs = mx.array(rows)
+        positions, _ = lm.get_rope_index(inputs)
+        expected = mlx_utils._model_logits(lm(inputs, position_ids=positions))
+        lm._position_ids = mx.full((3, 1, 1), 97)
+        hidden = mlx_utils._forward_text_hidden_states(lm, inputs)
+        actual = lm.lm_head(hidden)
+        mx.eval(actual, expected)
+        assert mx.allclose(actual, expected, atol=1e-5).item()
+        assert lm._position_ids.shape == (3, 1, 1)
+        explicit = positions + mx.array([0, 1, 2])[:, None, None]
+        expected_hidden = lm.model(inputs, position_ids=explicit)
+        actual_hidden = mlx_utils._forward_text_hidden_states(lm, inputs, position_ids=explicit)
+        assert mx.array_equal(actual_hidden, expected_hidden).item()
+
+
+@metal_only
+def test_cached_position_attribute_does_not_imply_multiaxis_rope():
+    from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+    from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
+
+    args = TextConfig(hidden_size=64, intermediate_size=64, dense_intermediate_size=128,
+                      num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+                      head_dim=32, vocab_size=32, num_local_experts=2, num_experts_per_tok=1,
+                      shared_intermediate_size=64, moe_layer_freq=[0, 0])
+    lm = LanguageModel(args)
+    inputs = mx.array([[2, 3, 4], [5, 6, 7]])
+    expected = lm(inputs).logits
+    actual = lm.lm_head(mlx_utils._forward_text_hidden_states(lm, inputs))
+    assert mx.allclose(actual, expected, atol=1e-5).item()
+
+
+@metal_only
+@pytest.mark.parametrize("static", [False, True])
+def test_native_vlm_names_preserve_source_remaps_and_transforms(monkeypatch, static):
+    import inspect
+    from unsloth_zoo.mlx import loader
+
+    class RenamingModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.decoder = nn.Linear(3, 3)
+            self.other = nn.Linear(3, 3)
+
+    def sanitize(weights):
+        return {
+            ("decoder." + k if k.startswith("decoder.") else k.replace("source.", "other.")):
+            (v.T if k == "decoder.bias" else v)
+            for k, v in weights.items()
+        }
+
+    RenamingModel.sanitize = staticmethod(sanitize) if static else lambda self, weights: sanitize(weights)
+
+    original_class_call = RenamingModel.sanitize
+    original_signature = inspect.signature(RenamingModel().sanitize)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: RenamingModel)
+    loader._ensure_native_vlm_weight_names("arbitrary")
+    loader._ensure_native_vlm_weight_names("arbitrary")
+    model = RenamingModel()
+    assert RenamingModel.sanitize is original_class_call
+    assert inspect.signature(model.sanitize) == original_signature
+    weights = {"decoder.weight": mx.ones((3, 3)), "source.weight": mx.zeros((3, 3)),
+               "decoder.scales": mx.ones((3, 1)), "decoder.biases": mx.zeros((3, 1)),
+               "unknown.weight": mx.ones((2, 2)), "decoder.bias": mx.ones((3,))}
+    result = model.sanitize(weights)
+    assert result["decoder.weight"] is weights["decoder.weight"]
+    for key in ("decoder.scales", "decoder.biases"):
+        assert result[key] is weights[key]
+    assert result["other.weight"] is weights["source.weight"]
+    assert result["unknown.weight"] is weights["unknown.weight"]
+    assert "decoder.decoder.bias" in result
+    assert "decoder.bias" not in result
+    if static:
+        assert RenamingModel.sanitize(weights).keys() == sanitize(weights).keys()
+        assert mlx_utils._call_mlx_vlm_sanitize(RenamingModel, {}, weights).keys() == sanitize(weights).keys()
+
+
+@metal_only
+@pytest.mark.parametrize("per_layer", [False, True])
+def test_recurrent_language_layers_receive_one_adapter_each(per_layer):
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers
+    from mlx_lm.tuner.lora import LoRALinear
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4, bias=False)
+            self.v_proj = nn.Linear(4, 4, bias=False)
+
+    class RecurrentModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.low, self.high = Layer(), Layer()
+
+        @property
+        def layers(self):
+            return [self.low, self.low, self.high, self.low, self.high]
+
+    model = RecurrentModel()
+    config = dict(keys=["q_proj"], rank=2, scale=2, dropout=0)
+    if per_layer:
+        config.update(keys=["q_proj", "v_proj"],
+                      layer_keys=[["q_proj"], ["q_proj"], ["v_proj"], ["q_proj"], ["v_proj"]])
+    assert linear_to_lora_layers(model, 5, config) == 2
+    assert isinstance(model.low.q_proj, LoRALinear)
+    if per_layer:
+        assert isinstance(model.high.v_proj, LoRALinear)
+        assert not isinstance(model.high.q_proj, LoRALinear)
+        assert not isinstance(model.low.v_proj, LoRALinear)
+    else:
+        assert isinstance(model.high.q_proj, LoRALinear)
+        assert model.low.q_proj is not model.high.q_proj
+
+
 def _dataset(n=24):
     return [
         {"text": f"### Question: what is {i} plus {i}?\n### Answer: {2 * i}."}

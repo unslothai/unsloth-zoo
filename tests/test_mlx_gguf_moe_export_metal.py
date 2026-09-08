@@ -38,6 +38,52 @@ CONFIG = dict(
 )
 
 
+@metal_only
+def test_native_name_sanitizer_preserves_vlm_expert_export(monkeypatch, tmp_path):
+    import inspect
+    from types import SimpleNamespace
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+    from mlx_vlm.models.llava_onevision.llava_onevision import Model as StaticModel
+    from unsloth_zoo.mlx import loader, utils
+
+    model = Model.__new__(Model)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(text_config=SimpleNamespace(
+        tie_word_embeddings=False, num_hidden_layers=2, num_experts=2,
+    ))
+    source = {}
+    for layer in range(2):
+        prefix = f"model.language_model.layers.{layer}.mlp.experts"
+        source[f"{prefix}.gate_up_proj"] = mx.arange(48).reshape(2, 6, 4).astype(mx.float32) + layer * 100
+        source[f"{prefix}.down_proj"] = mx.arange(24).reshape(2, 4, 3).astype(mx.float32) + layer * 100
+    staged = model.sanitize(dict(source))
+    static_model = StaticModel.__new__(StaticModel)
+    owners = [model, static_model]
+    vocabulary = set(utils._mlx_sanitizer_vocabulary(owners))
+    def exported(directory):
+        directory.mkdir()
+        mx.save_safetensors(str(directory / "model.safetensors"), staged)
+        assert utils._prepare_moe_gguf_export_directory(directory, model=model) > 0
+        return mx.load(str(directory / "model.safetensors"))
+
+    expected = exported(tmp_path / "before")
+    assert any(name.endswith("experts.gate_up_proj") for name in expected)
+
+    monkeypatch.setattr(Model, "sanitize", Model.sanitize)
+    monkeypatch.setattr(StaticModel, "sanitize", inspect.getattr_static(StaticModel, "sanitize"))
+    loader._ensure_native_vlm_weight_names("qwen3_5_moe")
+    loader._ensure_native_vlm_weight_names("llava_onevision")
+    for order in (owners, owners[::-1]):
+        assert vocabulary == set(utils._mlx_sanitizer_vocabulary(order))
+    assert utils._mlx_sanitizer_writes_in_place(utils._mlx_moe_sanitizers(model)[0])
+    actual = exported(tmp_path / "after")
+    assert actual.keys() == expected.keys()
+    for name in actual:
+        assert mx.array_equal(actual[name], expected[name]).item()
+        assert mx.array_equal(actual[name], source[name]).item()
+
+
 def _stage_merged_moe_model(path, shards=1):
     from mlx_lm.models import qwen3_moe
 
