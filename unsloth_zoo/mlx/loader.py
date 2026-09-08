@@ -279,8 +279,7 @@ def _unfreeze_dora_magnitudes(model):
     from .utils import iter_mlx_lora_modules
 
     count = 0
-    # LoRA pair AND DoRA class, like the adapter collector: a base module
-    # that merely owns an `m` must stay frozen.
+    # LoRA pair AND DoRA class: a base that merely owns an `m` stays frozen.
     for _name, module in iter_mlx_lora_modules(model):
         if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
             module.unfreeze(keys=["m"], recurse=False)
@@ -299,15 +298,11 @@ def _mlx_dora_wrapper_type(module, path):
             "upgrade mlx-lm or train with use_dora=False."
         ) from exc
     # Exact types, not isinstance: a fused projection subclasses nn.Linear
-    # but returns a tuple its caller destructures, so a wrapper returning one
-    # array attaches cleanly and then breaks the next forward.
+    # but returns a tuple, so a wrapper attaches cleanly then breaks forward.
     if type(module) in (nn.Linear, nn.QuantizedLinear):
-        # DoRALinear.from_base recovers the unpacked width as
-        # `input_dims *= 32 // linear.bits`, which is exact only when bits
-        # divides 32. At 3, 5 or 6 it truncates, so lora_a is built against
-        # the wrong input dimension and the wrapper raises a bare matmul
-        # shape error on its first forward. Plain LoRA is unaffected, so
-        # refuse here rather than hand back a wrapper that cannot run.
+        # DoRALinear.from_base recovers the unpacked width as `32 // bits`,
+        # exact only when bits divides 32; otherwise lora_a is built against
+        # the wrong input dim. Plain LoRA is unaffected.
         bits = getattr(module, "bits", None)
         if bits is not None and 32 % int(bits):
             raise ValueError(
@@ -329,8 +324,8 @@ def _mlx_dora_wrapper_type(module, path):
 
 def _mlx_lora_from_base(module, config, *, specs, path=None):
     if config.get("use_dora"):
-        # to_lora() returns plain-LoRA wrappers for fused linears, which
-        # would silently downgrade the request; mlx-lm skips it for that too.
+        # to_lora() returns plain-LoRA wrappers for fused linears, silently
+        # downgrading the request; mlx-lm skips it for that too.
         return _mlx_dora_wrapper_type(module, path).from_base(
             module,
             r=config["rank"],
@@ -384,16 +379,10 @@ def linear_to_lora_layers(model, num_layers, config):
         return (set(layer_keys[index]) | shared) if layer_keys else keys
 
     if config.get("use_dora"):
-        # Wrappers are committed per layer below, so an unsupported base
-        # found late would leave earlier layers converted and the retry
-        # advice (use_dora=False) failing on them. Only the TYPE refusal is
-        # all-or-nothing; a later construction failure is not covered.
-        #
-        # Same predicates as the conversion, not the `keys` union: under
-        # role-based selection a local name can be a selected dense
-        # projection in one layer and an unselected fused or routed one in
-        # another, and validating the union would refuse the run over a
-        # module that is never wrapped.
+        # Preflight so a late refusal leaves no layer converted; only the
+        # TYPE refusal is all-or-nothing. Must use the same per-layer
+        # predicates as the conversion, not the `keys` union, which would
+        # refuse over a module that is never wrapped.
         for index, layer in enumerate(layers[offset:], start=offset):
             wanted = _layer_wanted(index)
             for name, module in layer.named_modules():
@@ -8726,8 +8715,7 @@ class FastMLXModel:
         finetune_mlp_modules=True,
         finetune_last_n_layers=None,
         modules_to_save=None,
-        # Appended, never inserted: pre-DoRA positional callers must keep
-        # binding the same arguments.
+        # Appended last, never inserted: positional callers keep binding.
         use_dora=False,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
@@ -8874,8 +8862,7 @@ class FastMLXModel:
 
         if use_dora:
             if lora_dropout:
-                # Reported rather than refused: an interchange caveat must
-                # not block a run that trains correctly here.
+                # Reported, not refused: peft interchange caveat only.
                 print(
                     "Unsloth: DoRA with lora_dropout > 0 trains normally in "
                     "MLX format, but peft applies DoRA dropout inside the "
@@ -8885,9 +8872,8 @@ class FastMLXModel:
                     "keep the two equivalent."
                 )
             if init_lora_weights is False:
-                # `m` is seeded from the base weight norm, which is the
-                # adapted norm only while lora_b is zero; re-deriving it for
-                # randomized factors is init math left to mlx-lm.
+                # `m` is seeded from the base weight norm, the adapted norm
+                # only while lora_b is zero.
                 raise ValueError(
                     "Unsloth MLX: DoRA does not support "
                     "init_lora_weights=False; the magnitude vector is "
@@ -8895,11 +8881,8 @@ class FastMLXModel:
                     "randomized adapter. Use init_lora_weights=True (or "
                     "'gaussian'), or train with use_dora=False."
                 )
-            # Same reason as the vision refusal below, but about the tree
-            # rather than the request: a base that already carries plain-LoRA
-            # wrappers outside this selection (a previously adapted vision
-            # tower, a resumed adapter) keeps them, and the saved artifact
-            # still records one adapter type for the whole tree.
+            # Pre-existing plain-LoRA wrappers survive the wrap, and a mixed
+            # tree saves under one fine_tune_type and reloads as all-DoRA.
             from .utils import iter_mlx_lora_modules
 
             existing = sorted({
@@ -8917,8 +8900,8 @@ class FastMLXModel:
                     "Reload the base model before requesting DoRA, or train "
                     "with use_dora=False."
                 )
-            # A mixed tree is not rejected by the savers -- it saves, is
-            # stamped "dora", and reloads as all-DoRA -- so refuse it here.
+            # Towers wrap as plain LoRA; the savers accept the mixed tree,
+            # stamp it "dora", and it reloads as all-DoRA.
             if is_vlm and (train_vision or train_projector):
                 raise ValueError(
                     "Unsloth MLX: DoRA is not supported for vision or "

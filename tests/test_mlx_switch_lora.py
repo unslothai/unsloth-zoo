@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX wrapper-selection coverage: routed SwitchLinear expert projections,
-and the DoRA wrappers that accept only exact dense linear bases."""
+"""MLX wrapper-selection coverage: routed SwitchLinear experts, and DoRA
+wrappers that accept only exact dense linear bases."""
 
 import json
 import importlib
@@ -563,10 +563,8 @@ def test_legacy_switch_rank_layout(tmp_path):
 
 
 def _require_real_mlx_wrappers():
-    """The file-level guard runs at import; a sibling test can install the
-    simulation later, stubbing both wrapper modules while leaving switch
-    layers real. Nothing that wraps a base survives that, so callers skip
-    whole rather than part-way."""
+    """A sibling test can install the simulation after import, stubbing both
+    wrapper modules; nothing that wraps a base survives that."""
     from mlx_lm.tuner.dora import DoRALinear
     from mlx_lm.tuner.lora import LoRALinear
     if not all(isinstance(cls, type) for cls in (DoRALinear, LoRALinear)):
@@ -591,21 +589,19 @@ def test_dora_wraps_exact_linears_and_trains_magnitudes():
     wrapped = model.model.layers[0].proj
     assert type(wrapped).__name__ == "DoRALinear"
     trainable = set(dict(tree_flatten(model.trainable_parameters())))
-    # Without the magnitude only the direction is learned; without the
-    # factors, unfreezing `m` would mask a wrapper the LoRA unfreeze missed.
     assert "model.layers.0.proj.m" in trainable
     assert "model.layers.0.proj.lora_a" in trainable
     assert "model.layers.0.proj.lora_b" in trainable
     assert "model.layers.0.proj.linear.weight" not in trainable
 
-    # Trainable listing is not enough: the magnitude must receive a gradient.
+    # Trainable listing is not enough: `m` must receive a gradient.
     grads = nn.value_and_grad(
         model, lambda m: mx.sum(m.model.layers[0].proj(mx.ones((1, 64)))),
     )(model)[1]
     assert float(mx.sum(mx.abs(
         dict(tree_flatten(grads))["model.layers.0.proj.m"]))) > 0
 
-    # Owning an adapter pair, not the class name, is what makes a wrapper.
+    # The gate needs BOTH the LoRA pair and the DoRA class name.
     class DoRAttention(nn.Module):
         def __init__(self):
             super().__init__()
@@ -634,7 +630,7 @@ def test_dora_refuses_fused_and_routed_bases_atomically():
         _mlx_dora_wrapper_type(FusedLinear(64, [8, 8]), "layers.0.qkv_proj")
     with pytest.raises(ValueError, match="SwitchLinear"):
         _mlx_dora_wrapper_type(SwitchLinear(64, 16, 2), "layers.0.experts")
-    # Construct, not just dispatch: the magnitude is seeded from the base.
+    # Construct, not just dispatch.
     quantized = nn.QuantizedLinear(64, 16, bias=False)
     wrapper = _mlx_dora_wrapper_type(quantized, "layers.0.proj").from_base(
         quantized, r=4, scale=2.0, dropout=0.0,
@@ -643,8 +639,8 @@ def test_dora_refuses_fused_and_routed_bases_atomically():
     assert type(wrapper.linear).__name__ == "QuantizedLinear"
     assert wrapper.m.shape == (16,)
 
-    # A late unsupported base must not leave earlier layers converted, or
-    # the error's own advice (use_dora=False) fails on a half-wrapped tree.
+    # A late refusal must not leave earlier layers converted, or the error's
+    # own advice (use_dora=False) fails on a half-wrapped tree.
     model = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
     config = {"rank": 4, "alpha": 8, "dropout": 0.0, "scale": 2.0,
               "use_dora": True, "keys": {"proj"}}
@@ -652,8 +648,7 @@ def test_dora_refuses_fused_and_routed_bases_atomically():
         linear_to_lora_layers(model, num_layers=2, config=config)
     assert type(model.model.layers[0].proj).__name__ == "Linear"
 
-    # A head sits beside the layers, so only validating the root pass too
-    # keeps them untouched when it fails.
+    # A head sits beside the layers, so the root pass must validate too.
     head = _TinyModel([nn.Linear(64, 16, bias=False)])
     head.lm_head = FusedLinear(64, [8, 8])
     with pytest.raises(ValueError, match="FusedLinear"):
@@ -674,10 +669,8 @@ def test_dora_validation_mirrors_the_per_layer_selection():
     config = {"rank": 4, "alpha": 8, "dropout": 0.0, "scale": 2.0,
               "use_dora": True, "keys": {"proj"}}
 
-    # Role-based selection makes `keys` a union that is not layer-wide: the
-    # same local name can be a selected dense projection in one layer and an
-    # unselected fused one in another. Validating the union would refuse the
-    # run over a module the conversion never touches.
+    # Preflight must use the conversion's per-layer predicates: the `keys`
+    # union would refuse a module the conversion never touches.
     model = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
     attached = linear_to_lora_layers(
         model, num_layers=2,
@@ -687,7 +680,7 @@ def test_dora_validation_mirrors_the_per_layer_selection():
     assert type(model.model.layers[0].proj).__name__ == "DoRALinear"
     assert type(model.model.layers[1].proj).__name__ == "FusedLinear"
 
-    # Selected, it is still refused, and still before anything is committed.
+    # Selected, it is still refused, before anything is committed.
     selected = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
     with pytest.raises(ValueError, match="FusedLinear"):
         linear_to_lora_layers(
@@ -696,8 +689,7 @@ def test_dora_validation_mirrors_the_per_layer_selection():
         )
     assert type(selected.model.layers[0].proj).__name__ == "Linear"
 
-    # The root pass walks `shared`, so a layer-local name that also names a
-    # root module is not validated there either.
+    # The root pass walks `shared`, not `keys`.
     root = _TinyModel([nn.Linear(64, 16, bias=False)])
     root.proj = FusedLinear(64, [8, 8])
     attached = linear_to_lora_layers(
@@ -715,11 +707,8 @@ def test_dora_refuses_quantized_widths_its_wrapper_cannot_unpack():
 
     _require_real_mlx_wrappers()
 
-    # DoRALinear.from_base recovers the unpacked width as `32 // bits`, which
-    # is exact only for widths dividing 32. At 3/5/6 it truncates and the
-    # wrapper raises a bare matmul shape error on its first forward, so the
-    # dispatch has to refuse rather than hand one back. Plain LoRA is fine at
-    # those widths, which is why this cannot be left to the base type alone.
+    # DoRALinear.from_base recovers the unpacked width as `32 // bits`, exact
+    # only when bits divides 32; plain LoRA is fine at 3/5/6.
     for bits in (2, 4, 8):
         base = nn.QuantizedLinear(64, 16, bias=False, bits=bits, group_size=64)
         wrapper = _mlx_dora_wrapper_type(base, "proj").from_base(
@@ -734,7 +723,7 @@ def test_dora_refuses_quantized_widths_its_wrapper_cannot_unpack():
         with pytest.raises(ValueError, match=f"{bits}-bit"):
             _mlx_dora_wrapper_type(base, "proj")
 
-    # A dense base carries no `bits`, so the width gate must not touch it.
+    # A dense base carries no `bits`.
     assert _mlx_dora_wrapper_type(
         nn.Linear(64, 16, bias=False), "proj",
     ).__name__ == "DoRALinear"
@@ -747,10 +736,7 @@ def test_dora_refuses_a_tree_that_already_carries_plain_lora():
 
     _require_real_mlx_wrappers()
 
-    # Adapter modules left outside the DoRA selection survive the wrap, and
-    # the artifact records one type for the whole tree, so the mixed result
-    # would be stamped "dora" and reload those layers as a wrapper they were
-    # never trained as.
+    # A mixed tree saves under one fine_tune_type and reloads as all-DoRA.
     model = _TinyModel([
         nn.Linear(64, 16, bias=False), nn.Linear(64, 16, bias=False),
     ])
@@ -765,7 +751,7 @@ def test_dora_refuses_a_tree_that_already_carries_plain_lora():
     assert type(model.model.layers[0].proj).__name__ == "Linear"
     assert type(model.model.layers[1].proj).__name__ == "LoRALinear"
 
-    # The gate is about MIXING, so a clean base is untouched by it.
+    # The gate is about MIXING; a clean base passes.
     clean = _TinyModel([nn.Linear(64, 16, bias=False)])
     FastMLXModel.get_peft_model(
         clean, r=4, target_modules=["proj"], use_dora=True,
@@ -783,7 +769,7 @@ def test_dora_request_refusals_and_positional_compatibility():
     def _model():
         return _TinyModel([nn.Linear(64, 16, bias=False)])
 
-    # A mixed tree would reload as all-DoRA: one artifact, one adapter type.
+    # A mixed tree saves under one fine_tune_type and reloads as all-DoRA.
     vlm = _model()
     vlm._is_vlm_model = True
     with pytest.raises(ValueError, match="vision"):
@@ -797,20 +783,20 @@ def test_dora_request_refusals_and_positional_compatibility():
             _model(), r=4, target_modules=["proj"], use_dora="false",
             use_gradient_checkpointing=False,
         )
-    # Randomized init leaves the magnitude describing the unadapted weight.
+    # Randomized init leaves `m` describing the unadapted weight.
     with pytest.raises(ValueError, match="init_lora_weights"):
         FastMLXModel.get_peft_model(
             _model(), r=4, target_modules=["proj"], use_dora=True,
             init_lora_weights=False, use_gradient_checkpointing=False,
         )
-    # Dropout is a caveat, not a refusal: it trains correctly here.
+    # Dropout is a caveat, not a refusal.
     drop = _model()
     FastMLXModel.get_peft_model(
         drop, r=4, target_modules=["proj"], use_dora=True, lora_dropout=0.1,
         use_gradient_checkpointing=False,
     )
     assert type(drop.model.layers[0].proj).__name__ == "DoRALinear"
-    # Appended last, so a pre-DoRA positional call binds as it always did.
+    # use_dora is appended last, so positional callers keep binding.
     positional = _model()
     FastMLXModel.get_peft_model(
         positional, 4, ["proj"], 8, 0.0, "none", False, True,
