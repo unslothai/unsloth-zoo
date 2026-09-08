@@ -43,10 +43,6 @@ def _install_shim():
     simulate_mlx_on_torch()
 
 
-# ---------------------------------------------------------------------------
-# Shared lightweight tokenizer / model stubs.
-# ---------------------------------------------------------------------------
-
 class _SpaceTokenizer:
     """Whitespace tokenizer that mimics the HF fast-tokenizer surface."""
 
@@ -74,10 +70,6 @@ def _identity_mask_fn(d):
     return {"labels": [list(ids)]}
 
 
-# ===========================================================================
-# Thread 4: SGD coupled weight decay.
-# ===========================================================================
-
 def test_thread4_build_optimizer_routes_sgd_to_coupled_decay():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
@@ -91,7 +83,6 @@ def test_thread4_build_optimizer_routes_sgd_to_coupled_decay():
 
     optimizer = trainer._build_optimizer(total_steps=4)
 
-    # SGD uses coupled decay, not decoupled manual shrink.
     assert trainer._coupled_weight_decay == pytest.approx(0.1)
     assert trainer._manual_weight_decay == pytest.approx(0.0)
     # MLX SGD's built-in decay stays off; our helper owns the decay term.
@@ -145,7 +136,6 @@ def test_thread4_coupled_decay_is_noop_when_disabled():
     trainer = MLXTrainer.__new__(MLXTrainer)
     trainer._coupled_weight_decay = 0.0
     grad = {"layer": {"weight": mx.array([1.0], dtype=mx.float32)}}
-    # Returns the same object untouched when wd <= 0.
     assert trainer._apply_coupled_weight_decay(TinyModel(), grad) is grad
 
 
@@ -166,7 +156,6 @@ def test_thread4_coupled_sgd_matches_torch_sgd_with_momentum():
         ref.grad = torch.tensor([1.0])
         ref_opt.step()
 
-    # Branch path: MLX SGD with weight_decay=0 + our coupled helper.
     class TinyModel:
         def __init__(self):
             self.p = mx.array([3.0], dtype=mx.float32)
@@ -234,10 +223,6 @@ def test_thread4_decoupled_shrink_would_diverge_from_torch_sgd():
     assert model.p.item() != pytest.approx(ref.item(), rel=1e-4, abs=1e-4)
 
 
-# ===========================================================================
-# Thread 2: seed=None labeled torch_randperm ordering.
-# ===========================================================================
-
 def test_thread2_labeled_batches_accept_none_seed_with_torch_randperm():
     from unsloth_zoo.mlx.trainer import _create_labeled_batches
 
@@ -281,10 +266,6 @@ def test_thread2_labeled_torch_randperm_reseeds_per_epoch():
     # Per-epoch reseed means the two orders differ.
     assert first != second
 
-
-# ===========================================================================
-# Threads 1 & 3: epoch flag preservation and gated materialization.
-# ===========================================================================
 
 class _StubModel:
     _hf_repo = None
@@ -349,7 +330,6 @@ def test_thread3_step_based_run_does_not_materialize_all_epochs(monkeypatch):
 
     # Truncated to max_steps * grad_accum = 2 batches, not 6 * 5 = 30.
     assert len(trainer._batches) == 2
-    # Step-based run: prebuilt batches are a single (truncated) block.
     assert trainer._prepared_batches_include_epochs is False
 
 
@@ -429,15 +409,10 @@ def test_thread1_regression_without_fix_would_triple_count():
         buggy = n_batches // grad_accum
     assert buggy == 54  # 3x over-trained
 
-    # Fixed path keeps the flag.
     include_epochs = True
     fixed = n_batches // grad_accum if include_epochs else buggy
     assert fixed == 18
 
-
-# ===========================================================================
-# Thread 5: _get_processor_tokenizer must not unwrap HF fast tokenizers.
-# ===========================================================================
 
 class _RustBackend:
     """Mimics tokenizers.Tokenizer: token_to_id, but no HF convenience API."""
@@ -468,7 +443,6 @@ class _MlxWrapper:
         self._tokenizer = _FastTokenizer()
 
     def __getattr__(self, name):
-        # Proxy everything that is not private to the inner HF tokenizer.
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self.__dict__["_tokenizer"], name)
@@ -499,7 +473,6 @@ def test_thread5_mlx_wrapper_keeps_hf_api_available():
 
     wrapper = _MlxWrapper()
     result = _get_processor_tokenizer(wrapper)
-    # Returned object exposes the HF API (directly or via proxy).
     assert hasattr(result, "convert_tokens_to_ids")
     assert result.convert_tokens_to_ids("x") == 123
     assert result.chat_template == "FAST_TEMPLATE"
@@ -554,12 +527,10 @@ def test_thread5_vlm_ignore_ids_resolve_with_fast_tokenizer():
     assert 201 in ids
 
 
-# ===========================================================================
 # Thread 5 follow-up: train_on_responses_only must hand the HF masking impl
 # a CALLABLE tokenizer. mlx-lm's TokenizerWrapper proxies attributes via
 # __getattr__ (so hasattr(convert_tokens_to_ids) is True) but defines no
 # __call__, and the HF impl invokes tokenizer(...) directly.
-# ===========================================================================
 
 def test_thread5_noncallable_proxy_wrapper_unwraps_for_masking(monkeypatch):
     import unsloth_zoo.dataset_utils as dataset_utils

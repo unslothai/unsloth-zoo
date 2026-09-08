@@ -7,9 +7,8 @@
 # (at your option) any later version.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# Coverage for visual_engine._canvas_maxtok: the per-turn DiffusionGemma canvas is
-# non-causal, so its compute buffer is ~quadratic in size; oversized values must defer
-# to the server's MAXTOK=0 auto-size path instead of reserving a buffer that OOMs.
+# The per-turn DiffusionGemma canvas is non-causal, so its compute buffer is
+# ~quadratic: oversized values must defer to the MAXTOK=0 auto-size path or OOM.
 
 from __future__ import annotations
 

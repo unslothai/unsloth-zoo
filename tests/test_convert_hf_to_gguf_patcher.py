@@ -32,10 +32,8 @@ def _load_llama_cpp_module():
     return module
 
 
-# --- Synthetic fixtures matching upstream layouts ---------------------------
 
-# A minimal but realistic stand-in for the new `convert_hf_to_gguf.py`
-# entrypoint. The structural anchor we detect on is `from conversion import`.
+# New-layout entrypoint. The structural anchor we detect on is `from conversion import`.
 _PACKAGE_ENTRYPOINT = b"""\
 #!/usr/bin/env python3
 import argparse
@@ -56,8 +54,7 @@ from conversion import (
 )
 """
 
-# A minimal stand-in for conversion/base.py containing the canonical
-# Metadata.load call site at 8-space indent (matches conversion/base.py:912).
+# conversion/base.py: canonical Metadata.load at 8-space indent (base.py:912).
 _PACKAGE_BASE_PY = b"""\
 import gguf
 from enum import IntEnum
@@ -80,8 +77,7 @@ class ModelBase:
             self.metadata.name = self.remote_hf_model_id
 """
 
-# A minimal stand-in for conversion/__init__.py with realistic TEXT_MODEL_MAP
-# and MMPROJ_MODEL_MAP dict literals (matches __init__.py:19-231,234-283).
+# conversion/__init__.py TEXT_MODEL_MAP + MMPROJ_MODEL_MAP (__init__.py:19-231,234-283).
 _PACKAGE_INIT_PY = b"""\
 from __future__ import annotations
 from .base import ModelBase, ModelType
@@ -111,8 +107,8 @@ def get_model_class(name, mmproj=False):
     return ModelBase
 """
 
-# Stand-in for the new conversion/qwen.py: contains both expert-key literals
-# in the same find_hparam call (upstream already handles the alias).
+# conversion/qwen.py: both expert-key literals in one find_hparam call (upstream
+# already handles the alias).
 _PACKAGE_QWEN_PY = b"""\
 from .base import ModelBase
 
@@ -123,9 +119,7 @@ class Qwen2MoeModel(ModelBase):
         return n_experts
 """
 
-# A minimal stand-in for the OLD monolithic convert_hf_to_gguf.py. Note: NO
-# `from conversion import` anywhere; that is the structural anchor for layout
-# detection. ModelBase and ModelType are defined inline.
+# The OLD monolith: NO `from conversion import`, the anchor for layout detection.
 _MONOLITH = b"""\
 import argparse
 import gguf
@@ -176,7 +170,6 @@ def monolith_layout(tmp_path):
     return root
 
 
-# --- Layout detection -------------------------------------------------------
 
 
 def test_detect_layout_returns_package_for_new_tree(package_layout):
@@ -198,7 +191,6 @@ def test_detect_layout_falls_back_to_monolith_when_conversion_dir_missing(tmp_pa
     assert llama_cpp._detect_converter_layout(_PACKAGE_ENTRYPOINT, str(tmp_path)) == "monolith"
 
 
-# --- Arch enumeration from conversion/__init__.py ---------------------------
 
 
 def test_extract_text_model_map_keys(package_layout):
@@ -231,14 +223,12 @@ def test_extract_returns_empty_for_unparseable_file(tmp_path):
     assert llama_cpp._extract_dict_keys_from_conversion_init(str(tmp_path / "nope.py"), "TEXT_MODEL_MAP") == set()
 
 
-# --- Branding patch on conversion/base.py -----------------------------------
 
 
 def test_branding_patch_applies_and_is_idempotent(package_layout):
     llama_cpp = _load_llama_cpp_module()
     base_py = package_layout / "conversion" / "base.py"
 
-    # First call: applies.
     assert llama_cpp._apply_branding_patch_to_base(str(base_py)) == "applied"
     content = base_py.read_bytes()
     assert b"# UNSLOTH_BRANDING_APPLIED" in content
@@ -246,9 +236,7 @@ def test_branding_patch_applies_and_is_idempotent(package_layout):
     assert b"self.metadata.repo_url = 'https://huggingface.co/unsloth'" in content
     assert b"self.metadata.tags = ['unsloth', 'llama.cpp']" in content
 
-    # Second call: no-op (idempotent).
     assert llama_cpp._apply_branding_patch_to_base(str(base_py)) == "already-applied"
-    # File contents should be unchanged after the second call.
     assert base_py.read_bytes() == content
 
 
@@ -267,17 +255,13 @@ def test_branding_patch_preserves_lines_around_target(package_layout):
     llama_cpp._apply_branding_patch_to_base(str(base_py))
     patched = base_py.read_bytes()
 
-    # The Metadata.load line itself is preserved verbatim.
     assert b"self.metadata = gguf.Metadata.load(" in patched
-    # Code that followed the target (the if self.remote_hf_model_id... block)
-    # is still present after the patch (we only inserted lines, not deleted).
+    # Code after the target survives: the patch only inserts lines.
     assert b"if self.remote_hf_model_id:" in patched
     assert b"self.metadata.name = self.remote_hf_model_id" in patched
-    # File grew (we added 4 branding lines + marker), not shrank.
     assert len(patched) > len(original)
 
 
-# --- Qwen expert-key alias detection ---------------------------------------
 
 
 def test_qwen_aliases_detected_when_both_keys_present(package_layout):
@@ -293,7 +277,6 @@ def test_qwen_aliases_not_detected_when_only_one_key_present(tmp_path):
     assert llama_cpp._qwen_already_handles_expert_aliases(str(qwen_py)) is False
 
 
-# --- Cache-key invalidation (sibling info) ---------------------------------
 
 
 def test_conversion_sibling_info_changes_when_base_py_changes(package_layout):
@@ -348,16 +331,12 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
     dir than the override) and raise ModuleNotFoundError, aborting the
     patcher before AST arch extraction + branding could run.
 
-    We assert the contract by replacing `_load_module_from_path` with a
-    sentinel that fails the test if called, then driving the patcher end-
+    We assert the contract by replacing the monolith-only arch extractor with
+    a sentinel that fails the test if called, then driving the patcher end-
     to-end with `UNSLOTH_LLAMA_CPP_SCRIPTS_DIR` set."""
     llama_cpp = _load_llama_cpp_module()
 
-    # Build a custom package-layout checkout in tmp_path. We extend the
-    # shared fixture with a parse_args() stub so the end-to-end pipeline can
-    # finish its flag-parsing step on the patched file (the real upstream
-    # entrypoint has these calls; the shared fixture omits them because no
-    # other test exercises the full pipeline).
+    # A parse_args() stub so the end-to-end pipeline can finish its flag parsing.
     entry_with_args = _PACKAGE_ENTRYPOINT + (
         b"\n"
         b"def parse_args():\n"
@@ -379,17 +358,15 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
 
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(root))
 
-    # Sentinel: any call here means the patcher fell through to the
-    # module-load path on package layout, which is the bug we're guarding.
+    # A call here means the patcher fell through to the monolith path on package
+    # layout, which is the bug being guarded.
     called = {"hit": False}
     def _trap(*a, **kw):
         called["hit"] = True
-        raise AssertionError("monolith-only _load_module_from_path called on package layout")
-    monkeypatch.setattr(llama_cpp, "_load_module_from_path", _trap)
+        raise AssertionError("monolith-only arch extraction ran on package layout")
+    monkeypatch.setattr(llama_cpp, "_extract_archs_from_monolith_source", _trap)
 
-    # Cache must be cleared between runs because @lru_cache(1) keys include
-    # the resolved local_script_info -- but a stale entry from a previous
-    # test would short-circuit the new call.
+    # @lru_cache(1) keys include local_script_info; a stale entry short-circuits.
     llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
 
     patched_path, text_archs, vision_archs = llama_cpp._download_convert_hf_to_gguf("regression_no_module_import")
@@ -398,7 +375,6 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
     assert patched_path.endswith(".py")
     assert "LlamaForCausalLM" in text_archs
     assert text_archs == frozenset(text_archs)
-    # base.py was patched in place under the override dir.
     assert b"# UNSLOTH_BRANDING_APPLIED" in (conv / "base.py").read_bytes()
     # Cleanup for follow-on tests.
     llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
@@ -506,7 +482,6 @@ def test_latest_upstream_arch_enumeration_non_empty(latest_llama_cpp):
         f"upstream TEXT_MODEL_MAP missing LlamaForCausalLM; "
         f"got {sorted(text_archs)[:10]}..."
     )
-    # The set should also contain at least some Qwen entries since this is the
-    # user's reported architecture family.
+    # Qwen* entries: the user's reported architecture family.
     qwen_keys = {k for k in text_archs if k.startswith("Qwen")}
     assert qwen_keys, f"upstream TEXT_MODEL_MAP has no Qwen* entries: {sorted(text_archs)[:20]}..."

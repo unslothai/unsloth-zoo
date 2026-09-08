@@ -16,7 +16,7 @@
 
 """Tier 0 LoRA merge correctness tests for unsloth_zoo/saving_utils.py.
 
-Run on Linux+CUDA without an MLX shim. Cover _active_merge_device(), _merge_lora
+Run on Linux+CUDA/XPU without an MLX shim. Cover _active_merge_device(), _merge_lora
 (base merge, vocab-resize, non-finite guard), and the 5 MoE expert-merge variants
 against a numpy reference.
 """
@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 import torch
 
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 from unsloth_zoo.saving_utils import (
     LoraStats,
     _active_merge_device,
@@ -38,6 +39,11 @@ from unsloth_zoo.saving_utils import (
     _merge_moe_up_expert,
 )
 
+# conftest sets UNSLOTH_ALLOW_CPU=1, so DEVICE_TYPE_TORCH says "cuda" even with no GPU: probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
+)
 
 SEED = 1234
 
@@ -46,14 +52,12 @@ def _ls(lora_A: torch.Tensor, lora_B: torch.Tensor, alpha: float) -> LoraStats:
     return LoraStats(module=None, lora_A=lora_A, lora_B=lora_B, alpha=alpha)
 
 
-# ---------------------------------------------------------------------------
 # 1. _active_merge_device — recent fix that replaced the W-based helper.
-# ---------------------------------------------------------------------------
 
-def test_active_merge_device_returns_string_on_cuda_host():
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
-    assert _active_merge_device() == "cuda"
+def test_active_merge_device_returns_string_on_gpu():
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
+    assert _active_merge_device() == DEVICE_TYPE_TORCH
 
 
 def test_active_merge_device_takes_no_args():
@@ -66,9 +70,7 @@ def test_active_merge_device_takes_no_args():
     )
 
 
-# ---------------------------------------------------------------------------
 # 2. _merge_lora — basic correctness against a numpy reference.
-# ---------------------------------------------------------------------------
 
 def _ref_merge_lora(W: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor,
                     alpha: float) -> torch.Tensor:
@@ -104,14 +106,16 @@ def test_merge_lora_moves_cpu_inputs_to_active_device():
     The W-based helper returned an indexless torch.device('cuda') for CPU W
     (unreliable on multi-GPU); the fix returns the string 'cuda' instead.
     """
-    if not torch.cuda.is_available():
-        pytest.skip("requires CUDA")
+    if not gpu_available:
+        pytest.skip("requires CUDA or XPU")
     torch.manual_seed(SEED)
     W = torch.randn(64, 32, dtype=torch.bfloat16)
     lora_A = torch.randn(8, 32, dtype=torch.bfloat16) * 0.05
     lora_B = torch.randn(64, 8, dtype=torch.bfloat16) * 0.05
     out = _merge_lora(W.clone(), _ls(lora_A, lora_B, alpha=16.0), name="cpu_input")
-    assert out.is_cuda, "expected merge result on CUDA after _active_merge_device()"
+    assert out.device.type == DEVICE_TYPE_TORCH, (
+        f"expected merge result on {DEVICE_TYPE_TORCH} after _active_merge_device(), got {out.device}"
+    )
 
 
 def test_merge_lora_vocab_resize():
@@ -127,10 +131,8 @@ def test_merge_lora_vocab_resize():
 
     assert out.shape == (new_vocab, dim)
     assert out.dtype == torch.float32
-    # The first old_vocab rows: original W + alpha * lora_B[:old_vocab] @ lora_A
     expected_old = (W.to(torch.float32) +
                     alpha * (lora_B[:old_vocab].to(torch.float32) @ lora_A.to(torch.float32)))
-    # New rows: zero base + alpha * lora_B[old_vocab:] @ lora_A
     expected_new = alpha * (lora_B[old_vocab:].to(torch.float32) @ lora_A.to(torch.float32))
     torch.testing.assert_close(out[:old_vocab].cpu(), expected_old, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out[old_vocab:].cpu(), expected_new, atol=5e-2, rtol=5e-2)
@@ -151,9 +153,7 @@ def test_merge_lora_returns_W_when_lora_missing():
     assert out is W
 
 
-# ---------------------------------------------------------------------------
 # 3. _merge_moe_gate_expert — first half of A is gate_proj.
-# ---------------------------------------------------------------------------
 
 def test_merge_moe_gate_expert():
     """gate_W shape (inter_dim, hidden_dim).  delta = (B @ gate_a).T."""
@@ -171,7 +171,6 @@ def test_merge_moe_gate_expert():
                                  expert_idx=expert_idx, num_experts=num_experts,
                                  output_dtype=torch.bfloat16)
 
-    # Reference: a_slice = lora_A[r:r*2], gate_a = a_slice[:, :inter_dim]
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
     b_slice = lora_B[:, s:e].to(torch.float32)
@@ -184,9 +183,7 @@ def test_merge_moe_gate_expert():
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 4. _merge_moe_up_expert — second half of A is up_proj.
-# ---------------------------------------------------------------------------
 
 def test_merge_moe_up_expert():
     torch.manual_seed(SEED)
@@ -206,16 +203,14 @@ def test_merge_moe_up_expert():
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
     b_slice = lora_B[:, s:e].to(torch.float32)
-    up_a = a_slice[:, inter_dim:]  # second half
+    up_a = a_slice[:, inter_dim:]
     up_delta = b_slice @ up_a
     expected = up_W.to(torch.float32) + alpha * up_delta.T
 
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 5. _merge_moe_down_proj_expert — full A slice (no halving).
-# ---------------------------------------------------------------------------
 
 def test_merge_moe_down_proj_expert():
     """down_W shape (H, I).  A: (total_rank, H).  B: (I, total_rank).  delta = (B @ A).T = (H, I)."""
@@ -242,9 +237,7 @@ def test_merge_moe_down_proj_expert():
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 6. _merge_moe_fused_gate_up_expert — 3D fused tensor across all experts.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("is_transposed", [True, False])
 def test_merge_moe_fused_gate_up_expert(is_transposed):
@@ -280,9 +273,7 @@ def test_merge_moe_fused_gate_up_expert(is_transposed):
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 7. _merge_moe_fused_down_proj_expert — 3D fused tensor.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("is_transposed", [True, False])
 def test_merge_moe_fused_down_proj_expert(is_transposed):

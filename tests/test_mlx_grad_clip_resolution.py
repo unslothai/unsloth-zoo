@@ -28,9 +28,6 @@ def _resolve(raw_mgv=None, raw_mgln=None, max_grad_norm=0.0):
     return _resolve_mlx_grad_clipping(cfg)
 
 
-# -- field defaults ---------------------------------------------------------
-
-
 def test_field_defaults_are_none_sentinels():
     """Defaults are sentinels meaning 'use MLX cheap default'."""
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
@@ -64,9 +61,6 @@ def test_fields_accept_explicit_positive():
     )
     assert cfg.max_grad_value == 2.5
     assert cfg.max_grad_leaf_norm == 1.5
-
-
-# -- resolution semantics ---------------------------------------------------
 
 
 def test_default_uses_cheap_leaf_norm():
@@ -140,9 +134,6 @@ def test_max_grad_value_wins_over_leaf_norm_when_both_positive():
     assert mgv == 2.0
     assert mgln == 0.0
     assert mode == "value"
-
-
-# -- trainer source assertions (defense-in-depth) ---------------------------
 
 
 def test_trainer_source_pins_resolution_rule():

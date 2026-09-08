@@ -45,7 +45,6 @@ def _build_lora_for(experts, rank, scaling):
     """
     E = experts.num_experts
     if experts.gate_up_proj.shape[1] == 2 * (experts.down_proj.shape[1] if experts.down_proj.shape[1] != experts.gate_up_proj.shape[2] else experts.down_proj.shape[2]):
-        # Heuristic that holds for both layouts in this test
         pass
     # Derive in/out from the actual base shape to stay layout-agnostic
     if experts.gate_up_proj.shape[1] > experts.gate_up_proj.shape[2]:
@@ -130,7 +129,6 @@ def test_forward_native_moe_loop_with_lora_matches_naive(transposed_storage):
     experts = _build_experts(num_experts, hidden, intermediate, transposed_storage)
     gate_up_lora, down_lora = _build_lora_for(experts, rank, scaling=2.0)
 
-    # Stash the LoRA tensors where forward_native_moe_loop expects them.
     experts._unsloth_lora_gate_up_proj = gate_up_lora
     experts._unsloth_lora_down_proj = down_lora
 
@@ -187,7 +185,6 @@ def test_forward_native_moe_loop_square_dim_uses_grouped_mm_flag():
 
     experts = nn.Module()
     experts.num_experts = num_experts
-    # Transposed (grouped_mm) storage:
     experts.gate_up_proj = nn.Parameter(
         torch.randn(num_experts, hidden, 2 * intermediate, dtype=torch.float32)
     )
@@ -236,7 +233,6 @@ def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):
 
     experts = _build_experts(num_experts, hidden, intermediate, False)
     gate_up_lora, down_lora = _build_lora_for(experts, rank, scaling=1.5)
-    # Cast everything (params + lora) to the target dtype.
     experts.gate_up_proj.data = experts.gate_up_proj.data.to(dtype)
     experts.down_proj.data = experts.down_proj.data.to(dtype)
     experts._unsloth_lora_gate_up_proj = (
@@ -255,7 +251,6 @@ def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):
                          experts._unsloth_lora_gate_up_proj,
                          experts._unsloth_lora_down_proj)
 
-    # Looser tolerance for low-precision dtypes
     atol = 1e-4 if dtype == torch.float32 else 1e-1
     rtol = 1e-4 if dtype == torch.float32 else 1e-1
     torch.testing.assert_close(out, ref, atol=atol, rtol=rtol)

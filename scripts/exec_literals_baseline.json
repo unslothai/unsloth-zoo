@@ -1,0 +1,464 @@
+{
+  "_comment": "Call sites that predate the gate. New ones fail; see scripts/lint_exec_literals.py.",
+  "targets": [
+    "unsloth_zoo",
+    "scripts"
+  ],
+  "entries": [
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "03e6d133b778a53e",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "174a84171de1b969",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "41335056252b5222",
+      "count": 10,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "582a2ff284d76dd9",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "5a45a5e68b27c8a8",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "ae0dc524263f37f6",
+      "count": 4,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "b38977cf659d599a",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "b4ffe1845a490edc",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "c88f4b2a2dfece41",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "d25aca7e28ccdfab",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "eval",
+      "digest": "e50edcd7f45039da",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "002343bd43161592",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "07325163fcae29ba",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "125ef0dee8697ab8",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "16b803be263a7d1b",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "2a08ef7bf87aa806",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "477178a6b990eb09",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "60ec2e1e4c46a9ed",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "65cae25d9d007c86",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "6db61d41d15041a9",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "9e394cdc35663c6e",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "aec8dc650544d15a",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "bf2e8c51f0f6c2ed",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "d6252fea6de677cd",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "d9650e96220991c3",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
+      "digest": "ffa18102ffbe15dd",
+      "count": 1,
+      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
+    },
+    {
+      "file": "unsloth_zoo/fused_losses/forward_install.py",
+      "sink": "compile",
+      "digest": "3fd201db6a1d7d8a",
+      "count": 1,
+      "reason": "Installs a rewritten `forward` built by this file from an AST it produced itself."
+    },
+    {
+      "file": "unsloth_zoo/fused_losses/forward_install.py",
+      "sink": "exec",
+      "digest": "f08538fbdca0f314",
+      "count": 1,
+      "reason": "Installs a rewritten `forward` built by this file from an AST it produced itself."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "sink": "eval",
+      "digest": "48fec3bfd1611cf8",
+      "count": 1,
+      "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "sink": "exec",
+      "digest": "3725bba562bb6fff",
+      "count": 1,
+      "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "sink": "exec",
+      "digest": "7330700d494b9249",
+      "count": 1,
+      "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "sink": "compile",
+      "digest": "748ca8caa706cbb1",
+      "count": 1,
+      "reason": "Re-imports a fixed set of torch._dynamo names, filtered against what the installed torch actually exposes, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "sink": "exec",
+      "digest": "12f4a6d20e7de470",
+      "count": 1,
+      "reason": "Re-imports a fixed set of torch._dynamo names, filtered against what the installed torch actually exposes, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "sink": "exec",
+      "digest": "16d352de024d261d",
+      "count": 1,
+      "reason": "Re-imports a fixed set of torch._dynamo names, filtered against what the installed torch actually exposes, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "sink": "exec",
+      "digest": "70146d03d161750a",
+      "count": 1,
+      "reason": "Re-imports a fixed set of torch._dynamo names, filtered against what the installed torch actually exposes, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "sink": "exec",
+      "digest": "7a5e305efb369e7f",
+      "count": 3,
+      "reason": "Re-imports a fixed set of torch._dynamo names, filtered against what the installed torch actually exposes, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "sink": "exec",
+      "digest": "8ef4f95125d70a09",
+      "count": 1,
+      "reason": "Re-imports a fixed set of torch._dynamo names, filtered against what the installed torch actually exposes, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "sink": "exec",
+      "digest": "d5c91cdf1f94e789",
+      "count": 1,
+      "reason": "Re-imports a fixed set of torch._dynamo names, filtered against what the installed torch actually exposes, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/peft_utils.py",
+      "sink": "eval",
+      "digest": "43aec61ea49223f1",
+      "count": 1,
+      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
+    },
+    {
+      "file": "unsloth_zoo/peft_utils.py",
+      "sink": "eval",
+      "digest": "73be47696e5e4b6b",
+      "count": 1,
+      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
+    },
+    {
+      "file": "unsloth_zoo/peft_utils.py",
+      "sink": "eval",
+      "digest": "81cdac2f6f8a2c32",
+      "count": 1,
+      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
+    },
+    {
+      "file": "unsloth_zoo/peft_utils.py",
+      "sink": "exec",
+      "digest": "45bbd24d7d803e73",
+      "count": 1,
+      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
+    },
+    {
+      "file": "unsloth_zoo/peft_utils.py",
+      "sink": "exec",
+      "digest": "582f1edab6ecc7d8",
+      "count": 1,
+      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
+    },
+    {
+      "file": "unsloth_zoo/peft_utils.py",
+      "sink": "exec",
+      "digest": "9c8c2a17a2a67b45",
+      "count": 1,
+      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
+    },
+    {
+      "file": "unsloth_zoo/peft_utils.py",
+      "sink": "exec",
+      "digest": "d467bcd0b437db95",
+      "count": 1,
+      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
+    },
+    {
+      "file": "unsloth_zoo/rl_environments.py",
+      "sink": "compile",
+      "digest": "b31c3643c722ff5c",
+      "count": 1,
+      "reason": "Runs model-generated RL code inside the restricted builtins sandbox added in #1105."
+    },
+    {
+      "file": "unsloth_zoo/rl_environments.py",
+      "sink": "exec",
+      "digest": "75d2bbcd268e2ee9",
+      "count": 1,
+      "reason": "Runs model-generated RL code inside the restricted builtins sandbox added in #1105."
+    },
+    {
+      "file": "unsloth_zoo/saving_utils.py",
+      "sink": "exec",
+      "digest": "691766359b82b093",
+      "count": 1,
+      "reason": "Re-imports transformers save helpers by name and installs a `save_pretrained` this file generated. Its interpolated values are quoted as literals, see #1113 discussion."
+    },
+    {
+      "file": "unsloth_zoo/saving_utils.py",
+      "sink": "exec",
+      "digest": "b9fff86a8c82eb0d",
+      "count": 1,
+      "reason": "Re-imports transformers save helpers by name and installs a `save_pretrained` this file generated. Its interpolated values are quoted as literals, see #1113 discussion."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gemma4.py",
+      "sink": "compile",
+      "digest": "db03349e3b7fe7de",
+      "count": 1,
+      "reason": "Installs a patched method compiled from an AST this file built from transformers source."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gemma4.py",
+      "sink": "exec",
+      "digest": "0ba7fb7724952f06",
+      "count": 1,
+      "reason": "Installs a patched method compiled from an AST this file built from transformers source."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gemma4_float32.py",
+      "sink": "compile",
+      "digest": "8fa7a86eee03b0c6",
+      "count": 1,
+      "reason": "Installs a patched method compiled from an AST this file built from transformers source."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gemma4_float32.py",
+      "sink": "exec",
+      "digest": "785478c6b0e3cc40",
+      "count": 1,
+      "reason": "Installs a patched method compiled from an AST this file built from transformers source."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "sink": "exec",
+      "digest": "13fce184fe981cb2",
+      "count": 1,
+      "reason": "Re-imports a fixed set of transformers quantizer names, filtered against the installed source, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "sink": "exec",
+      "digest": "7a5e305efb369e7f",
+      "count": 1,
+      "reason": "Re-imports a fixed set of transformers quantizer names, filtered against the installed source, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "eval",
+      "digest": "6e5ae3bd4483e267",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "eval",
+      "digest": "e1c0e6e5e72d3992",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "eval",
+      "digest": "e7491ae388bc00d4",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "exec",
+      "digest": "07970955945be5d2",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "exec",
+      "digest": "158d0cb952b9ad6c",
+      "count": 2,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "exec",
+      "digest": "3100e23cb9cda992",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "exec",
+      "digest": "9ba49a34b5d3f94d",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "exec",
+      "digest": "a32b902c145cbbb3",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "exec",
+      "digest": "da7d2cbca432c8bf",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "sink": "exec",
+      "digest": "e1ac0cbebe50a698",
+      "count": 1,
+      "reason": "Assigns and reads vLLM internals by attribute path; the names are this file's own constants and the layer names of the loaded model."
+    }
+  ]
+}

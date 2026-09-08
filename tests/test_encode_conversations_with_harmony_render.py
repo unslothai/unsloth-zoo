@@ -166,7 +166,6 @@ def test_thinking_tool_calls_and_content_keeps_tool_call(real_encoding, gpt_oss_
 
 @pytest.mark.parametrize("thinking", [None, ""])
 def test_nullable_thinking_does_not_crash(real_encoding, gpt_oss_module, thinking):
-    # Nullable / empty thinking columns must not raise; the answer must still be encoded.
     decoded = _decode(
         [{"role": "assistant", "thinking": thinking, "content": "ANSWER_SENTINEL"}],
         gpt_oss_module,

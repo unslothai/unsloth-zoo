@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Re-measures the gemma4 row of _AUDIO_QUALIFIED_FAMILIES on real Apple
+# Silicon, once per candidate mlx-vlm version, against a real checkpoint.
+#
+# That row cannot be reasoned about: the 0.4.4 it used to carry was correct
+# when written and was invalidated by the checkpoint being re-exported on the
+# Hub. A version key cannot express a fact about an artefact, so re-measure.
+#
+# What it found: mlx-vlm 0.6.2 (Blaizzy/mlx-vlm#1301) stopped building k_proj /
+# v_proj / k_norm for layers in the KV-shared range, the 60 tensors E2B does
+# not ship. 0.6.1 red, 0.6.2 green; both stay in the matrix to hold that edge.
+#
+# Opt-in, so it costs no macOS minutes unless asked for. 0.6.5+ is absent
+# because it needs transformers>=5.14 and this package caps it at 5.5.0.
+
+name: Gemma4 audio probe (Apple Silicon)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Checkpoint to probe'
+        required: false
+        default: 'mlx-community/gemma-4-e2b-it-4bit'
+  pull_request:
+    # Label only: replaying the whole matrix takes a deliberate act.
+    types: [labeled]
+
+concurrency:
+  # Never cancel a label-triggered run: concurrency is claimed before the
+  # job-level `if` runs, so an unrelated label would kill a live macOS matrix.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: "gemma4 audio @ mlx-vlm ${{ matrix.mlx_vlm }}"
+    # Match the label just added: `contains(labels.*)` fires on any label event
+    # while the label is attached, replaying all seven macOS jobs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'gemma4-probe'
+    runs-on: macos-15
+    timeout-minutes: 45
+    strategy:
+      # "Where does it start failing" is the point, so one red must not cancel
+      # the rest.
+      fail-fast: false
+      matrix:
+        mlx_vlm: ['0.4.4', '0.5.0', '0.6.0', '0.6.1', '0.6.2', '0.6.3', '0.6.4']
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # pyproject.toml only. The mlx-vlm pin comes from the matrix, and a changed
+      # pin simply misses on that one wheel: a pip HTTP cache cannot serve the
+      # wrong content, so it does not need to be in the key.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: gemma4-audio
+          key-files: |
+            pyproject.toml
+
+      - name: Install zoo with the pinned mlx-vlm
+        # One resolution, so pip honours this package's transformers cap. torch
+        # first, as in mlx-ci.yml: pyproject gates it off on darwin+arm64 but
+        # the zoo import path still wants it.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.13.0"
+          pip install -e .[mlx] "mlx-vlm==${{ matrix.mlx_vlm }}"
+          python -c "
+          import mlx_vlm, transformers
+          print('mlx-vlm', mlx_vlm.__version__, 'transformers', transformers.__version__)
+          assert mlx_vlm.__version__ == '${{ matrix.mlx_vlm }}', mlx_vlm.__version__
+          "
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
+
+      - name: Restore the checkpoint
+        # 3.4 GB, and every job wants the same one. Shared key on purpose: the
+        # first to finish saves it, the rest log a collision and move on.
+        id: hf-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        continue-on-error: true
+        with:
+          path: ~/.cache/huggingface
+          key: hf-gemma4-e2b-4bit-v1
+
+      - name: Probe
+        # No torchvision, matching what a Mac user installing zoo[mlx] gets.
+        # Raw mlx-vlm goes through transformers' AutoProcessor, whose video
+        # processor requires it and so fails; zoo resolves the mlx-vlm
+        # processor directly and does not. Stage 0 records that difference.
+        #
+        # The checkpoint arrives through env rather than interpolation: it is
+        # the one free-text value here.
+        id: probe
+        env:
+          MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e2b-it-4bit' }}
+        run: python tests/gemma4_audio_version_probe.py --model "$MODEL"
+
+      - name: Save the checkpoint
+        # Split out of the restore above, and on the default branch only, for the
+        # reason pip-cache-save carries at length: `actions/cache` saves from its
+        # own post-step on WHATEVER REF the job ran on. This one triggers on a
+        # label, so a labelled PR wrote 3.4 GB to refs/pull/N/merge that only that
+        # PR's re-runs could ever restore, seven legs racing the one key, against
+        # a 20 GiB budget the repo has already been at 99% of. The janitor could
+        # not clean it up either: the key carries no trailing hash, so generation
+        # ranking skips it and only closing the PR would have freed it.
+        #
+        # After the Probe, not before: the probe is what downloads the checkpoint,
+        # so a save placed where the restore sits would store an empty directory
+        # under the key and every later job would hit it and find nothing.
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.hf-cache.outputs.cache-hit != 'true'
+          && steps.probe.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        continue-on-error: true
+        with:
+          path: ~/.cache/huggingface
+          key: hf-gemma4-e2b-4bit-v1

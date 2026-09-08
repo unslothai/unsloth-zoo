@@ -26,8 +26,8 @@ import inspect
 import functools
 import math
 import os
-from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
-from ..device_type import DEVICE_TYPE
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.device_type import DEVICE_TYPE
         
 
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
