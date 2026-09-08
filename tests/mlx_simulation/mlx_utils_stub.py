@@ -15,7 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 # Unsloth Zoo - Utilities for Unsloth
-# MLX utils stub: tree_map, tree_flatten, tree_unflatten, etc.
 """
 mlx.utils — tree functions that walk nested dicts/lists/tuples/namedtuples.
 
@@ -63,7 +62,6 @@ def tree_unflatten(items: list[tuple[str, Any]]) -> Any:
     """Inverse of tree_flatten: rebuild a nested dict from flat keys."""
     if not items:
         return {}
-    # If all top-level keys are integers, rebuild a list.
     out: dict = {}
     for path, value in items:
         parts = path.split(".") if path else []
@@ -152,10 +150,8 @@ def tree_merge(a, b, merge_fn=None):
     return out
 
 
-# ---------------------------------------------------------------------------
 def inject_into_sys_modules():
     this = sys.modules[__name__]
     sys.modules["mlx.utils"] = this
-    # Also expose as attribute on top-level mlx package.
     if "mlx" in sys.modules:
         setattr(sys.modules["mlx"], "utils", this)

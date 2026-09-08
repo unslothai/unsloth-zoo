@@ -161,7 +161,6 @@ def test_the_shim_does_not_implement_the_ops_the_gate_protects():
     )
 
 
-# --------------------------------------------------------------------------- #
 # The same rule, asked of the VALUE rather than of the source.
 #
 # Everything above is syntactic: it proves a module consults mlx_is_simulated(),
@@ -170,7 +169,6 @@ def test_the_shim_does_not_implement_the_ops_the_gate_protects():
 # gate computed before the module installs its own shim would pass too. So each
 # gate is also EVALUATED, in a subprocess with the shim already up, which is the
 # state a sibling module leaves behind during collection.
-# --------------------------------------------------------------------------- #
 
 def _gate_assignments(tree: ast.AST) -> set:
     """Module-level names whose value is derived from a real-mlx probe.
@@ -254,4 +252,65 @@ def test_a_gate_evaluates_to_false_under_the_shim(path: Path, names: list):
         f"satisfied, but the expression still reads the shim as real -- an `or` where an "
         f"`and` belongs, or a probe evaluated before this module installs its own shim. "
         f"Tests behind that gate will run against a stub whose ops raise on CALL."
+    )
+
+
+# `importorskip` is a third spelling of the same mistake, and the one that got
+# through: the rule above reads find_spec calls, and test_mlx_attention_metal.py
+# had none. It gated on `pytest.importorskip("mlx.core")` succeeding, which the
+# shim satisfies just as happily as find_spec does, and ran 40 tests against a
+# simulation that refuses the operation they are built on.
+#
+# Flagging every importorskip("mlx") module would be wrong: 12 of the 14 are
+# fine, because the shim implements what they use. What separates the two that
+# are not is that they call an operation the shim REFUSES, so that is the
+# question asked here, and the refused set is read off the shim rather than
+# listed, so a new refusal widens this automatically.
+
+
+def _shim_refused_ops() -> set:
+    """Public ``mx.*`` names whose shim body raises NotImplementedError."""
+    stub = _TESTS / "mlx_simulation" / "mlx_stub.py"
+    tree = ast.parse(stub.read_text(encoding="utf-8"))
+    refused = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name.startswith("_"):
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Raise):
+                continue
+            exc = sub.exc
+            name = (exc.func.id if isinstance(exc, ast.Call)
+                    and isinstance(exc.func, ast.Name) else getattr(exc, "id", ""))
+            if name == "NotImplementedError":
+                refused.add(node.name)
+    return refused
+
+
+def _consults_the_simulation(source: str) -> bool:
+    """Either spelling of the order-independent question is accepted.
+
+    ``mlx_is_simulated()`` is the helper; test_mlx_quantized_optimizer_state.py
+    open-codes the same check against ``mx.__file__`` and is equally correct.
+    """
+    return "mlx_is_simulated" in source or "mlx_simulation" in source
+
+
+@pytest.mark.parametrize("path", _test_modules(), ids=lambda p: p.name)
+def test_a_module_calling_an_op_the_shim_refuses_asks_whether_it_is_real(path: Path):
+    source = path.read_text(encoding="utf-8")
+    if 'importorskip("mlx' not in source and "importorskip('mlx" not in source:
+        return
+    called = sorted(op for op in _shim_refused_ops() if f"mx.{op}" in source)
+    if not called or _consults_the_simulation(source):
+        return
+    pytest.fail(
+        f"{path.name} gates on importorskip('mlx...') alone but calls "
+        f"mx.{', mx.'.join(called)}, which the shim raises NotImplementedError "
+        f"for. A sibling module installs the shim while being imported, so "
+        f"collection order alone decides whether this file runs against real "
+        f"MLX or against a stub that refuses the operation it is built on. Add:\n"
+        f"    from mlx_simulation import mlx_is_simulated\n"
+        f"    if mlx_is_simulated():\n"
+        f"        pytest.skip(..., allow_module_level = True)"
     )

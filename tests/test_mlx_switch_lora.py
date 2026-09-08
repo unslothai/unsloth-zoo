@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MLX LoRA coverage for routed SwitchLinear expert projections."""
+"""MLX wrapper-selection coverage: routed SwitchLinear experts, and DoRA
+wrappers that accept only exact dense linear bases."""
 
 import json
 import importlib
@@ -559,3 +560,236 @@ def test_legacy_switch_rank_layout(tmp_path):
         "proj.lora_b": module.lora_b.astype(mx.bfloat16),
     })
     assert loader._infer_rank_from_saved_adapter(str(weights), "proj") == 2
+
+
+def _require_real_mlx_wrappers():
+    """A sibling test can install the simulation after import, stubbing both
+    wrapper modules; nothing that wraps a base survives that."""
+    from mlx_lm.tuner.dora import DoRALinear
+    from mlx_lm.tuner.lora import LoRALinear
+    if not all(isinstance(cls, type) for cls in (DoRALinear, LoRALinear)):
+        pytest.skip("real mlx-lm adapter wrappers required; shim stub active")
+
+
+def test_dora_wraps_exact_linears_and_trains_magnitudes():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.loader import (
+        FastMLXModel, _unfreeze_dora_magnitudes,
+    )
+
+    _require_real_mlx_wrappers()
+
+    model = _TinyModel([nn.Linear(64, 16, bias=False)])
+    FastMLXModel.get_peft_model(
+        model, r=4, lora_alpha=8, target_modules=["proj"], use_dora=True,
+        use_gradient_checkpointing=False,
+    )
+    wrapped = model.model.layers[0].proj
+    assert type(wrapped).__name__ == "DoRALinear"
+    trainable = set(dict(tree_flatten(model.trainable_parameters())))
+    assert "model.layers.0.proj.m" in trainable
+    assert "model.layers.0.proj.lora_a" in trainable
+    assert "model.layers.0.proj.lora_b" in trainable
+    assert "model.layers.0.proj.linear.weight" not in trainable
+
+    grads = nn.value_and_grad(
+        model, lambda m: mx.sum(m.model.layers[0].proj(mx.ones((1, 64)))),
+    )(model)[1]
+    assert float(mx.sum(mx.abs(
+        dict(tree_flatten(grads))["model.layers.0.proj.m"]))) > 0
+
+    # The gate needs BOTH the LoRA pair and the DoRA class name.
+    class DoRAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.m = mx.zeros((2,))
+
+    impostor = DoRAttention()
+    holder = nn.Sequential()
+    holder.real, holder.impostor = wrapped, impostor
+    holder.freeze()
+    assert _unfreeze_dora_magnitudes(holder) == 1
+    assert "impostor.m" not in set(
+        dict(tree_flatten(holder.trainable_parameters())))
+
+
+def test_dora_refuses_fused_and_routed_bases_atomically():
+    import mlx.nn as nn
+    from mlx_lm.models.afm7 import FusedLinear
+    from mlx_lm.models.switch_layers import SwitchLinear
+    from unsloth_zoo.mlx.loader import (
+        _mlx_dora_wrapper_type, linear_to_lora_layers,
+    )
+
+    _require_real_mlx_wrappers()
+
+    with pytest.raises(ValueError, match="FusedLinear"):
+        _mlx_dora_wrapper_type(FusedLinear(64, [8, 8]), "layers.0.qkv_proj")
+    with pytest.raises(ValueError, match="SwitchLinear"):
+        _mlx_dora_wrapper_type(SwitchLinear(64, 16, 2), "layers.0.experts")
+    quantized = nn.QuantizedLinear(64, 16, bias=False)
+    wrapper = _mlx_dora_wrapper_type(quantized, "layers.0.proj").from_base(
+        quantized, r=4, scale=2.0, dropout=0.0,
+    )
+    assert type(wrapper).__name__ == "DoRALinear"
+    assert type(wrapper.linear).__name__ == "QuantizedLinear"
+    assert wrapper.m.shape == (16,)
+
+    # A late refusal must not leave earlier layers converted, or the error's
+    # own advice (use_dora=False) fails on a half-wrapped tree.
+    model = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
+    config = {"rank": 4, "alpha": 8, "dropout": 0.0, "scale": 2.0,
+              "use_dora": True, "keys": {"proj"}}
+    with pytest.raises(ValueError, match="FusedLinear"):
+        linear_to_lora_layers(model, num_layers=2, config=config)
+    assert type(model.model.layers[0].proj).__name__ == "Linear"
+
+    # A head sits beside the layers, so the root pass must validate too.
+    head = _TinyModel([nn.Linear(64, 16, bias=False)])
+    head.lm_head = FusedLinear(64, [8, 8])
+    with pytest.raises(ValueError, match="FusedLinear"):
+        linear_to_lora_layers(
+            head, num_layers=1,
+            config={**config, "keys": {"proj", "lm_head"}},
+        )
+    assert type(head.model.layers[0].proj).__name__ == "Linear"
+
+
+def test_dora_validation_mirrors_the_per_layer_selection():
+    import mlx.nn as nn
+    from mlx_lm.models.afm7 import FusedLinear
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers
+
+    _require_real_mlx_wrappers()
+
+    config = {"rank": 4, "alpha": 8, "dropout": 0.0, "scale": 2.0,
+              "use_dora": True, "keys": {"proj"}}
+
+    # Preflight must use the conversion's per-layer predicates: the `keys`
+    # union would refuse a module the conversion never touches.
+    model = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
+    attached = linear_to_lora_layers(
+        model, num_layers=2,
+        config={**config, "layer_keys": [["proj"], []]},
+    )
+    assert attached == 1
+    assert type(model.model.layers[0].proj).__name__ == "DoRALinear"
+    assert type(model.model.layers[1].proj).__name__ == "FusedLinear"
+
+    selected = _TinyModel([nn.Linear(64, 16, bias=False), FusedLinear(64, [8, 8])])
+    with pytest.raises(ValueError, match="FusedLinear"):
+        linear_to_lora_layers(
+            selected, num_layers=2,
+            config={**config, "layer_keys": [["proj"], ["proj"]]},
+        )
+    assert type(selected.model.layers[0].proj).__name__ == "Linear"
+
+    # The root pass walks `shared`, not `keys`.
+    root = _TinyModel([nn.Linear(64, 16, bias=False)])
+    root.proj = FusedLinear(64, [8, 8])
+    attached = linear_to_lora_layers(
+        root, num_layers=1, config={**config, "layer_keys": [["proj"]]},
+    )
+    assert attached == 1
+    assert type(root.model.layers[0].proj).__name__ == "DoRALinear"
+    assert type(root.proj).__name__ == "FusedLinear"
+
+
+def test_dora_refuses_quantized_widths_its_wrapper_cannot_unpack():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import _mlx_dora_wrapper_type
+
+    _require_real_mlx_wrappers()
+
+    # DoRALinear.from_base recovers the unpacked width as `32 // bits`, exact
+    # only when bits divides 32; plain LoRA is fine at 3/5/6.
+    for bits in (2, 4, 8):
+        base = nn.QuantizedLinear(64, 16, bias=False, bits=bits, group_size=64)
+        wrapper = _mlx_dora_wrapper_type(base, "proj").from_base(
+            base, r=4, scale=2.0, dropout=0.0,
+        )
+        out = wrapper(mx.ones((1, 64)))
+        mx.eval(out)
+        assert out.shape == (1, 16)
+
+    for bits in (3, 5, 6):
+        base = nn.QuantizedLinear(64, 16, bias=False, bits=bits, group_size=64)
+        with pytest.raises(ValueError, match=f"{bits}-bit"):
+            _mlx_dora_wrapper_type(base, "proj")
+
+    assert _mlx_dora_wrapper_type(
+        nn.Linear(64, 16, bias=False), "proj",
+    ).__name__ == "DoRALinear"
+
+
+def test_dora_refuses_a_tree_that_already_carries_plain_lora():
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    _require_real_mlx_wrappers()
+
+    model = _TinyModel([
+        nn.Linear(64, 16, bias=False), nn.Linear(64, 16, bias=False),
+    ])
+    model.model.layers[1].proj = LoRALinear.from_base(
+        model.model.layers[1].proj, r=4, scale=2.0, dropout=0.0,
+    )
+    with pytest.raises(ValueError, match="already carries"):
+        FastMLXModel.get_peft_model(
+            model, r=4, target_modules=["proj"], use_dora=True,
+            use_gradient_checkpointing=False, finetune_last_n_layers=1,
+        )
+    assert type(model.model.layers[0].proj).__name__ == "Linear"
+    assert type(model.model.layers[1].proj).__name__ == "LoRALinear"
+
+    clean = _TinyModel([nn.Linear(64, 16, bias=False)])
+    FastMLXModel.get_peft_model(
+        clean, r=4, target_modules=["proj"], use_dora=True,
+        use_gradient_checkpointing=False,
+    )
+    assert type(clean.model.layers[0].proj).__name__ == "DoRALinear"
+
+
+def test_dora_request_refusals_and_positional_compatibility():
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    _require_real_mlx_wrappers()
+
+    def _model():
+        return _TinyModel([nn.Linear(64, 16, bias=False)])
+
+    vlm = _model()
+    vlm._is_vlm_model = True
+    with pytest.raises(ValueError, match="vision"):
+        FastMLXModel.get_peft_model(
+            vlm, r=4, target_modules=["proj"], use_dora=True,
+            train_vision=True, use_gradient_checkpointing=False,
+        )
+    # A truthy non-bool must not quietly select DoRA.
+    with pytest.raises(TypeError, match="use_dora"):
+        FastMLXModel.get_peft_model(
+            _model(), r=4, target_modules=["proj"], use_dora="false",
+            use_gradient_checkpointing=False,
+        )
+    with pytest.raises(ValueError, match="init_lora_weights"):
+        FastMLXModel.get_peft_model(
+            _model(), r=4, target_modules=["proj"], use_dora=True,
+            init_lora_weights=False, use_gradient_checkpointing=False,
+        )
+    drop = _model()
+    FastMLXModel.get_peft_model(
+        drop, r=4, target_modules=["proj"], use_dora=True, lora_dropout=0.1,
+        use_gradient_checkpointing=False,
+    )
+    assert type(drop.model.layers[0].proj).__name__ == "DoRALinear"
+    # use_dora is appended last, so positional callers keep binding.
+    positional = _model()
+    FastMLXModel.get_peft_model(
+        positional, 4, ["proj"], 8, 0.0, "none", False, True,
+    )
+    assert type(positional.model.layers[0].proj).__name__ == "LoRALinear"

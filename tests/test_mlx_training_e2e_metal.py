@@ -572,8 +572,6 @@ def test_reporting_flag_never_changes_update_numerics(tmp_path):
     assert on_t._grad_norm_history and not off_t._grad_norm_history
 
 
-# ---- Compiled global-norm clipping with gradient accumulation ----
-
 @metal_only
 def test_compiled_clip_accum_matches_eager_bitwise(tmp_path, capsys):
     import numpy as np
@@ -715,13 +713,11 @@ def test_lora_plus_scales_layer_wrapped_lora_b_weight(tmp_path, nested):
     )
 
 
-# ---------------------------------------------------------------------------
 # Warm-starting continued training from a saved adapter: reloading a LoRA/DoRA
 # adapter via FastMLXModel.from_pretrained must freeze the base and leave the
 # adapter parameters trainable, together with any non-adapter tensors the
 # checkpoint itself recorded as trainable. Uses a tiny locally-built Llama so
 # the full_finetuning and DoRA branches stay cheap.
-# ---------------------------------------------------------------------------
 
 
 def _trainable_names(model):
@@ -845,7 +841,6 @@ def test_dora_reload_keeps_magnitude_trainable(tmp_path):
     dora_modules = [n for n, m in iter_mlx_lora_modules(model)
                     if type(m).__name__.startswith("DoRA")]
     assert len(dora_modules) > 0
-    # Every DoRA magnitude must stay trainable (not just one).
     assert len([n for n in trainable if n.endswith(".m")]) == len(dora_modules)
     # Exactly the adapter tensors, so no base weight leaks in. (A base parameter
     # literally named "m" does not exist on this fixture, so that pathological
@@ -929,7 +924,6 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     # The base freeze must not silently drop the saved auxiliary trainables.
     assert aux <= trainable, sorted(aux - trainable)
     assert _adapter_keys(reloaded) <= trainable
-    # Still a warm start, not a full finetune: nothing beyond adapters + aux.
     assert trainable == _adapter_keys(reloaded) | aux
 
 
@@ -1049,8 +1043,6 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     planned_result, planned_plan, planned_widths = run(planned=True)
     planned_compiled_calls = len(compiled_invocations)
 
-    # The planned run really executes through mx.compile, one invocation per
-    # training step, while the unplanned eager run never compiles.
     assert unplanned_compiled_calls == 0
     assert planned_compiled_calls == 4
     assert planned_result["compile_enabled"] is True
@@ -1061,8 +1053,6 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     assert planned_result["train_loss"] == pytest.approx(
         unplanned_result["train_loss"], rel=1e-4,
     )
-    # Every compiled width is a planned endpoint at or above the raw width, and
-    # the planned run exposed at most the admitted variants.
     endpoints = {
         planned_plan._shape_plan.endpoint_for(
             planned_plan.batch_family(index),
@@ -1229,7 +1219,8 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
     feeds a model call to cross-entropy has to accept both."""
     import mlx.core as mx
 
-    from unsloth_zoo.mlx.preference import make_dpo_loss_fn, make_orpo_loss_fn
+    from unsloth_zoo.mlx.preference import (
+        make_dpo_loss_fn, make_orpo_loss_fn, resolve_preference_objective)
     from unsloth_zoo.mlx.utils import make_baseline_loss_fn
 
     vocab = 8
@@ -1249,8 +1240,9 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
         return _LanguageModelOutput(logits)
 
     baseline = make_baseline_loss_fn()
-    orpo = make_orpo_loss_fn(beta=0.1)
-    dpo = make_dpo_loss_fn(beta=0.1, reference_free=True)
+    orpo = make_orpo_loss_fn(resolve_preference_objective("orpo", beta=0.1))
+    dpo = make_dpo_loss_fn(resolve_preference_objective(
+        "dpo", beta=0.1, reference_free=True))
     # Chosen and rejected rows differ, so an unwrap that reordered the batch
     # axis would reverse the preference signal instead of comparing equal.
     rejected_ids = mx.array([[1, 5, 6, 7]], dtype=mx.int32)
@@ -1317,7 +1309,6 @@ def test_post_head_multiplier_reaches_the_fused_cce_loss(softcap):
         if softcap:
             del text_model.final_logit_softcapping
 
-    # Reference: cross-entropy over the logits the model's own tail would emit.
     logits = model(ids[:, :-1]).astype(mx.float32) * multiplier
     if softcap:
         logits = mx.tanh(logits / softcap) * softcap
@@ -1451,3 +1442,15 @@ def test_gather_qmm_guard_never_breaks_a_working_call(failing, monkeypatch,
         **kw) == "result"
     assert seen["sorted_indices"] is True
     assert mlx_utils._MLX_GATHER_QMM_UNREADABLE is True   # warns once, not per call
+
+
+@metal_only
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
+def test_the_logit_sum_holds_the_widest_vocabulary_in_float16(dtype):
+    """float16 stops at 65504, far below the 1e9 a wide row of logits sums to."""
+    from unsloth_zoo.mlx.preference import _row_logit_sum
+
+    wide = mx.full((1, 2, 262144), 4000.0, dtype=getattr(mx, dtype))
+    rows = _row_logit_sum(wide)
+    assert bool(mx.all(mx.isfinite(rows))), "the scale does not cover 256K"
+    assert float(rows[0, 0]) == pytest.approx(262144 * 4000.0, rel=1e-3)

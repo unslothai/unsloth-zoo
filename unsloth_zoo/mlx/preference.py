@@ -866,41 +866,46 @@ def _orpo_log_odds(chosen, rejected):
     return chosen_odds - rejected_odds
 
 
-def _orpo_terms(chosen, rejected):
-    return -_log_sigmoid(_orpo_log_odds(chosen, rejected))
+def _require_kind(objective, kind):
+    if objective.kind != kind:
+        raise ValueError(
+            f"Unsloth MLX preference: the {kind.upper()} loss needs an "
+            f"objective of kind '{kind}', not '{objective.kind}'."
+        )
 
 
-def make_orpo_loss_fn(beta=0.1):
+def _require_reference(objective, reference_policy):
+    if objective.kind == "dpo" and not objective.reference_free \
+            and reference_policy is None:
+        raise ValueError(
+            "Unsloth MLX DPO: this objective scores against a reference "
+            "policy, but none was given. Pass one as reference_policy, or "
+            "build the objective with reference_free=True."
+        )
+
+
+def make_orpo_loss_fn(objective):
     """Create an ORPO loss with exact logical-window normalization."""
-    beta = float(beta)
+    _require_kind(objective, "orpo")
+    beta = objective.beta
 
     def loss_fn(model, batch, lengths, normalizers):
-        targets = batch[:, 1:]
-        ce = nn.losses.cross_entropy(
-            _model_logits(model(batch[:, :-1])), targets, reduction="none",
-        ).reshape(targets.shape)
-        mask = _response_mask(targets, lengths)
-        response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
-            mask.sum(axis=1), mx.array(1.0),
+        nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
+            model, batch, lengths, beta,
         )
-        pairs = batch.shape[0] // 2
-        nll_mask = (
-            mx.arange(1, targets.shape[1] + 1) < lengths[:pairs, 1:]
-        ).astype(mx.float32)
-        nll_sum = (ce[:pairs] * nll_mask).sum()
-        odds_sum = _orpo_terms(
-            response_logp[:pairs], response_logp[pairs:],
-        ).sum()
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * (
             nll_sum / mx.maximum(nll_tokens, mx.array(1)).astype(mx.float32)
-            + beta * odds_sum / mx.maximum(
+            - beta * ratio.sum() / mx.maximum(
                 window_pairs, mx.array(1),
             ).astype(mx.float32)
         )
-        return loss, mx.array(1, dtype=mx.int32)
+        return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["orpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["orpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["orpo"]
     return loss_fn
 
 
@@ -997,35 +1002,290 @@ def _response_logps(model, batch, lengths):
     return -(ce * _response_mask(targets, lengths)).sum(axis=1)
 
 
-def make_dpo_loss_fn(
-    *, beta=0.1, label_smoothing=0.0, reference_policy=None, reference_free=False,
+# TRL's own warning list, narrower than the set that drops the value.
+_DPO_SMOOTHING_WARNINGS = frozenset({
+    "hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down",
+})
+
+# These rebuild from the raw reference logps, bypassing TRL's reference_free mask.
+_DPO_NEEDS_REFERENCE = frozenset({
+    "sppo_hard", "nca_pair", "aot_pair", "aot", "discopop",
+})
+
+_DPO_REFUSED = {
+    "bco_pair": (
+        "it subtracts a running mean of rewards carried across optimizer steps, "
+        "so its value would depend on micro-batch order and on what a "
+        "checkpoint happened to hold"
+    ),
+    "kto_pair": "TRL removed it from DPO training in favour of a KTO trainer",
+}
+
+
+@dataclass(frozen=True)
+class _DPOTerms:
+    """``delta`` uses TRL's subtraction grouping; regrouping shifts it in float32."""
+
+    chosen: object
+    rejected: object
+    ref_chosen: object
+    ref_rejected: object
+    chosen_ratio: object
+    rejected_ratio: object
+    delta: object
+
+
+def _dpo_smoothed_sigmoid(objective, delta):
+    scaled = objective.beta * delta
+    epsilon = objective.label_smoothing
+    return -(
+        (1.0 - epsilon) * _log_sigmoid(scaled) + epsilon * _log_sigmoid(-scaled)
+    )
+
+
+def _dpo_robust(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        -_log_sigmoid(scaled) * (1.0 - epsilon) + _log_sigmoid(-scaled) * epsilon
+    ) / (1.0 - 2.0 * epsilon)
+
+
+def _dpo_exo_pair(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        mx.sigmoid(scaled) * (_log_sigmoid(scaled) - math.log(1.0 - epsilon))
+        + mx.sigmoid(-scaled) * (_log_sigmoid(-scaled) - math.log(epsilon))
+    )
+
+
+def _dpo_hinge(objective, terms):
+    value = 1.0 - objective.beta * terms.delta
+    return mx.maximum(value, mx.array(0.0, dtype=value.dtype))
+
+
+def _dpo_ipo(objective, terms):
+    return (terms.delta - 1.0 / (2.0 * objective.beta)) ** 2
+
+
+def _dpo_sppo_hard(objective, terms):
+    half = 0.5 / objective.beta
+    return (terms.chosen_ratio - half) ** 2 + (terms.rejected_ratio + half) ** 2
+
+
+def _dpo_nca_pair(objective, terms):
+    chosen_rewards = terms.chosen_ratio * objective.beta
+    rejected_rewards = terms.rejected_ratio * objective.beta
+    return (
+        -_log_sigmoid(chosen_rewards)
+        - 0.5 * _log_sigmoid(-chosen_rewards)
+        - 0.5 * _log_sigmoid(-rejected_rewards)
+    )
+
+
+def _dpo_aot_pair(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen_ratio, axis=0)
+        - mx.sort(terms.rejected_ratio, axis=0)
+    ))
+
+
+def _dpo_aot(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen - terms.rejected, axis=0)
+        - mx.sort(terms.ref_chosen - terms.ref_rejected, axis=0)
+    ))
+
+
+def _dpo_apo_zero(objective, terms):
+    return (
+        1.0 - mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + mx.sigmoid(objective.beta * terms.rejected_ratio)
+    )
+
+
+def _dpo_apo_down(objective, terms):
+    return (
+        mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + 1.0 - mx.sigmoid(
+            objective.beta * (terms.chosen_ratio - terms.rejected_ratio)
+        )
+    )
+
+
+def _dpo_discopop(objective, terms):
+    scaled = objective.beta * terms.delta
+    modulation = mx.sigmoid(scaled / objective.discopop_tau)
+    return (
+        -_log_sigmoid(scaled) * (1.0 - modulation)
+        + mx.exp(-scaled) * modulation
+    )
+
+
+_DPO_VARIANTS = {
+    "sigmoid": lambda objective, terms: _dpo_smoothed_sigmoid(
+        objective, terms.delta,
+    ),
+    "robust": _dpo_robust,
+    "exo_pair": _dpo_exo_pair,
+    "hinge": _dpo_hinge,
+    "ipo": _dpo_ipo,
+    "sppo_hard": _dpo_sppo_hard,
+    "nca_pair": _dpo_nca_pair,
+    "aot_pair": _dpo_aot_pair,
+    "aot": _dpo_aot,
+    "apo_zero": _dpo_apo_zero,
+    "apo_down": _dpo_apo_down,
+    "discopop": _dpo_discopop,
+}
+
+
+@dataclass(frozen=True)
+class PreferenceObjective:
+    kind: str
+    beta: float
+    label_smoothing: float = 0.0
+    loss_types: tuple = ("sigmoid",)
+    weights: tuple = (1.0,)
+    discopop_tau: float = 0.05
+    reference_free: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(self, "loss_types", tuple(self.loss_types))
+        object.__setattr__(self, "weights", tuple(self.weights))
+        if self.kind not in ("dpo", "orpo"):
+            raise ValueError(
+                f"Unsloth MLX preference: unknown objective kind '{self.kind}'."
+            )
+        if not math.isfinite(self.beta) or self.beta < 0:
+            raise ValueError(
+                "Unsloth MLX preference: beta must be finite and non-negative, "
+                f"not {self.beta}."
+            )
+        if self.kind != "dpo":
+            return
+        if len(self.weights) != len(self.loss_types):
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights has {len(self.weights)} entries "
+                f"for {len(self.loss_types)} loss types; they must be the same "
+                "length."
+            )
+        if not self.loss_types:
+            raise ValueError(
+                "Unsloth MLX DPO: loss_type must name at least one loss."
+            )
+        if not all(math.isfinite(weight) for weight in self.weights):
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights must all be finite, not "
+                f"{list(self.weights)}."
+            )
+        for name in self.loss_types:
+            if name in _DPO_REFUSED:
+                raise ValueError(
+                    f"Unsloth MLX DPO: loss_type '{name}' is not supported "
+                    f"because {_DPO_REFUSED[name]}."
+                )
+            if name not in _DPO_VARIANTS:
+                raise ValueError(
+                    f"Unsloth MLX DPO: unknown loss_type '{name}'. Supported: "
+                    f"{', '.join(sorted(_DPO_VARIANTS))}."
+                )
+        if not 0 <= self.label_smoothing < 0.5:
+            # robust divides by 1 - 2 * it, so 0.5 is a division by zero.
+            raise ValueError(
+                "Unsloth MLX DPO: label_smoothing must be in [0, 0.5), not "
+                f"{self.label_smoothing}."
+            )
+        if self.label_smoothing == 0 and "exo_pair" in self.loss_types:
+            # exo_pair logs label_smoothing, undefined at zero. Floored here at
+            # config time; TRL mutates self.label_smoothing inside exo_pair's own
+            # branch, a state change that leaks into the other losses in the list.
+            object.__setattr__(self, "label_smoothing", 1e-3)
+        if "discopop" in self.loss_types and not 0 < self.discopop_tau < math.inf:
+            # discopop divides by it, and delta is zero at init, so 0 is NaN.
+            raise ValueError(
+                "Unsloth MLX DPO: discopop_tau must be finite and above zero, "
+                f"not {self.discopop_tau}."
+            )
+        unscorable = [
+            name for name in self.loss_types if name in _DPO_NEEDS_REFERENCE
+        ]
+        if self.reference_free and unscorable:
+            raise ValueError(
+                f"Unsloth MLX DPO: {', '.join(unscorable)} score against the "
+                "reference log probabilities themselves, which reference_free "
+                "never computes. Set reference_free=False, or pick a loss_type "
+                "that only reads the policy-minus-reference difference."
+            )
+
+    @property
+    def length_normalized(self):
+        """TRL divides before any variant runs, so ipo normalizes the whole list."""
+        return "ipo" in self.loss_types
+
+
+def resolve_preference_objective(
+    kind, *, beta, label_smoothing=0.0, loss_type="sigmoid",
+    loss_weights=None, discopop_tau=0.05, reference_free=False,
 ):
-    """Create sigmoid DPO with conservative preference-label smoothing."""
     beta = float(beta)
-    epsilon = float(label_smoothing)
+    if kind == "orpo":
+        return PreferenceObjective(kind="orpo", beta=beta)
+    names = (loss_type,) if isinstance(loss_type, str) else tuple(loss_type)
+    if loss_weights is None:
+        weights = (1.0,) * len(names)
+    else:
+        weights = tuple(float(weight) for weight in loss_weights)
+    objective = PreferenceObjective(
+        kind=kind, beta=beta, label_smoothing=float(label_smoothing),
+        loss_types=names, weights=weights,
+        discopop_tau=float(discopop_tau), reference_free=bool(reference_free),
+    )
+    ignored = [name for name in names if name in _DPO_SMOOTHING_WARNINGS]
+    if float(label_smoothing) > 0 and ignored:
+        warnings.warn(
+            f"Unsloth MLX DPO: {', '.join(ignored)} ignore label_smoothing; "
+            "pass label_smoothing=0.0 to silence this.",
+            RuntimeWarning,
+        )
+    return objective
+
+
+def _weighted_rewards(rewards, weights):
+    total = rewards * weights[0]
+    for weight in weights[1:]:
+        total = total + rewards * weight
+    return total
+
+
+def _dpo_pair_loss(objective, terms):
+    total = None
+    for name, weight in zip(objective.loss_types, objective.weights):
+        term = _DPO_VARIANTS[name](objective, terms) * weight
+        total = term if total is None else total + term
+    return total
+
+
+def make_dpo_loss_fn(objective, *, reference_policy=None):
+    _require_kind(objective, "dpo")
+    _require_reference(objective, reference_policy)
 
     def loss_fn(model, batch, lengths, normalizers):
-        policy = _response_logps(model, batch, lengths)
-        pairs = batch.shape[0] // 2
-        if reference_free:
-            reference = mx.zeros(policy.shape, dtype=policy.dtype)
-        else:
-            reference = reference_policy.forward(model, batch, lengths)
-        logits = beta * (
-            (policy[:pairs] - policy[pairs:])
-            - (reference[:pairs] - reference[pairs:])
+        terms, stats = _dpo_scores(
+            model, batch, lengths, objective, reference_policy=reference_policy,
         )
-        pair_loss = -(
-            (1.0 - epsilon) * _log_sigmoid(logits)
-            + epsilon * _log_sigmoid(-logits)
-        )
+        pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * pair_loss.sum() / mx.maximum(
             window_pairs, mx.array(1),
         ).astype(mx.float32)
-        return loss, mx.array(1, dtype=mx.int32)
+        return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["dpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
     return loss_fn
 
 
@@ -1050,39 +1310,110 @@ PREFERENCE_EVAL_METRICS = {
 }
 
 
+# An unscaled float16 vocabulary row sum overflows to inf, which the mask then
+# turns into NaN. This is the smallest normal float16, so undoing it is exact.
+_LOGIT_SUM_SCALE = 2.0 ** -14
+
+
+def _row_logit_sum(logits):
+    """Logit sum per position, accumulated in float32 by the matmul, not mx.sum."""
+    weights = mx.full(
+        (logits.shape[-1], 1), _LOGIT_SUM_SCALE, dtype = logits.dtype,
+    )
+    return (logits @ weights).astype(mx.float32).squeeze(-1) / _LOGIT_SUM_SCALE
+
+
 def _masked_logit_sum(logits, mask):
     """Logit sum over the response positions, and the count it divides by.
 
     Separate so the eval set's mean is taken over all of its positions at once.
     """
     kept = mask.sum() * logits.shape[-1]
-    # The float32 mask promotes the product, so this reduction is already exact.
-    return (logits * mask[..., None]).sum(), kept
+    return (_row_logit_sum(logits) * mask).sum(), kept
 
 
 def _orpo_logit_sum(logits):
-    """Logit sum over every position, and the count it divides by.
-
-    Cast before reducing: mx.sum accumulates in the input dtype, and a bf16
-    batch holds millions of logits, far past where an 8-bit mantissa stops
-    registering the next addend. Casting the result would already be too late.
-    """
-    return logits.astype(mx.float32).sum(), mx.array(float(math.prod(logits.shape)))
+    return _row_logit_sum(logits).sum(), mx.array(float(math.prod(logits.shape)))
 
 
-# Metric index -> index of the stats entry it is divided by. Anything absent is
-# a per-pair sum over the pair count. These are means over tokens, which no pair
-# count recovers once batches hold different numbers of them.
+_PREFERENCE_DENOMINATOR_NAMES = {
+    "dpo": ("chosen_logits", "rejected_logits", "pairs"),
+    "orpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
+}
+
+# Token means, unlike TRL, which weights per-micro-batch means equally and so
+# reports a number that moves with per_device_train_batch_size.
+_PREFERENCE_TOKEN_DENOMINATORS = {
+    "dpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+    },
+    "orpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+        "nll_loss": "nll_tokens",
+    },
+}
+
+
+def _preference_denominators(kind):
+    names = PREFERENCE_EVAL_METRICS[kind]
+    offsets = {
+        name: len(names) + offset
+        for offset, name in enumerate(_PREFERENCE_DENOMINATOR_NAMES[kind])
+    }
+    token_means = _PREFERENCE_TOKEN_DENOMINATORS[kind]
+    return {
+        index: offsets[token_means.get(name, "pairs")]
+        for index, name in enumerate(names)
+    }
+
+
 PREFERENCE_EVAL_DENOMINATORS = {
-    "dpo": {6: 8, 7: 9},
-    "orpo": {6: 11, 7: 12, 8: 13},
+    kind: _preference_denominators(kind) for kind in PREFERENCE_EVAL_METRICS
 }
 
 # Reported metrics, then the denominators the trainer sums alongside them.
 PREFERENCE_EVAL_STATS_WIDTH = {
-    kind: len(names) + len(PREFERENCE_EVAL_DENOMINATORS[kind])
+    kind: len(names) + len(_PREFERENCE_DENOMINATOR_NAMES[kind])
     for kind, names in PREFERENCE_EVAL_METRICS.items()
 }
+
+
+def _preference_stats(
+    kind, logits, mask, *, chosen, rejected, chosen_rewards, rejected_rewards,
+    extra=(), extra_denominators=(),
+):
+    """Numerators then denominators, all sums, so a window average is exact."""
+    pairs = chosen.shape[0]
+    # TRL is inconsistent between its trainers: DPOTrainer averages its logit
+    # metric over completion positions, ORPOTrainer over the whole sequence.
+    if kind == "orpo":
+        chosen_logits, chosen_count = _orpo_logit_sum(logits[:pairs])
+        rejected_logits, rejected_count = _orpo_logit_sum(logits[pairs:])
+    else:
+        chosen_logits, chosen_count = _masked_logit_sum(
+            logits[:pairs], mask[:pairs])
+        rejected_logits, rejected_count = _masked_logit_sum(
+            logits[pairs:], mask[pairs:])
+    values = [
+        chosen_rewards.sum(),
+        rejected_rewards.sum(),
+        (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
+        (chosen_rewards - rejected_rewards).sum(),
+        chosen.sum(),
+        rejected.sum(),
+        chosen_logits,
+        rejected_logits,
+        *extra,
+        chosen_count,
+        rejected_count,
+        *extra_denominators,
+        mx.array(float(pairs)),
+    ]
+    return mx.stop_gradient(
+        mx.stack([value.astype(mx.float32) for value in values])
+    )
 
 
 def _preference_forward(model, batch, lengths):
@@ -1095,86 +1426,94 @@ def _preference_forward(model, batch, lengths):
     return logits, ce, _response_mask(targets, lengths)
 
 
-def make_preference_eval_fn(
-    kind, *, beta=0.1, label_smoothing=0.0,
-    reference_policy=None, reference_free=False,
-):
+def _orpo_scores(model, batch, lengths, beta):
+    """Unreduced: training normalizes over its window, evaluation over the batch."""
+    logits, ce, mask = _preference_forward(model, batch, lengths)
+    pairs = batch.shape[0] // 2
+    response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
+        mask.sum(axis=1), mx.array(1.0),
+    )
+    chosen, rejected = response_logp[:pairs], response_logp[pairs:]
+    nll_mask = (
+        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+    ).astype(mx.float32)
+    nll_tokens = nll_mask.sum()
+    nll_sum = (ce[:pairs] * nll_mask).sum()
+    log_odds = _orpo_log_odds(chosen, rejected)
+    ratio = _log_sigmoid(log_odds)
+    stats = _preference_stats(
+        "orpo", logits, mask,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=beta * chosen, rejected_rewards=beta * rejected,
+        extra=(nll_sum, ratio.sum(), log_odds.sum()),
+        extra_denominators=(nll_tokens,),
+    )
+    return nll_sum, nll_tokens, ratio, stats
+
+
+def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
+    logits, ce, mask = _preference_forward(model, batch, lengths)
+    pairs = batch.shape[0] // 2
+    logps = -(ce * mask).sum(axis=1)
+    if objective.reference_free:
+        reference = mx.zeros(logps.shape, dtype=logps.dtype)
+    else:
+        reference = reference_policy.forward(model, batch, lengths)
+    if objective.length_normalized:
+        counts = mx.maximum(mask.sum(axis=1), mx.array(1.0))
+        logps = logps / counts
+        reference = reference / counts
+    beta = objective.beta
+    chosen, rejected = logps[:pairs], logps[pairs:]
+    ref_chosen, ref_rejected = reference[:pairs], reference[pairs:]
+    # TRL adds the rewards once per loss entry, so a two-entry list reports twice
+    # a one-entry list; summed in its order, not scaled by the summed weights.
+    stats = _preference_stats(
+        "dpo", logits, mask,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=_weighted_rewards(
+            beta * (chosen - ref_chosen), objective.weights),
+        rejected_rewards=_weighted_rewards(
+            beta * (rejected - ref_rejected), objective.weights),
+    )
+    terms = _DPOTerms(
+        chosen=chosen, rejected=rejected,
+        ref_chosen=ref_chosen, ref_rejected=ref_rejected,
+        chosen_ratio=chosen - ref_chosen,
+        rejected_ratio=rejected - ref_rejected,
+        delta=(chosen - rejected) - (ref_chosen - ref_rejected),
+    )
+    return terms, stats
+
+
+def make_preference_eval_fn(objective, *, reference_policy=None):
     """Score one preference batch as ``(loss, pairs, stats)``.
 
     ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
     order, then the denominators ``PREFERENCE_EVAL_DENOMINATORS[kind]`` names.
-    Nothing is a per-batch mean: summing the vector across batches and dividing
-    each numerator by its own total averages the eval set exactly, however
-    unlike the batches are.
+    Nothing is a per-batch mean, so the eval set averages exactly.
     """
-    beta = float(beta)
-    epsilon = float(label_smoothing)
+    _require_reference(objective, reference_policy)
+    kind = objective.kind
+    beta = objective.beta
 
     def eval_fn(model, batch, lengths, _normalizers=None):
-        logits, ce, mask = _preference_forward(model, batch, lengths)
         pairs = batch.shape[0] // 2
-        logps = -(ce * mask).sum(axis=1)
-        # TRL is not consistent between its trainers: DPOTrainer averages its
-        # logit metric over the completion positions only, ORPOTrainer over the
-        # whole sequence. Follow each, so either compares against its own run.
         if kind == "orpo":
-            chosen_logits, chosen_logit_count = _orpo_logit_sum(logits[:pairs])
-            rejected_logits, rejected_logit_count = _orpo_logit_sum(logits[pairs:])
-        else:
-            chosen_logits, chosen_logit_count = _masked_logit_sum(
-                logits[:pairs], mask[:pairs])
-            rejected_logits, rejected_logit_count = _masked_logit_sum(
-                logits[pairs:], mask[pairs:])
-        if kind == "orpo":
-            logps = logps / mx.maximum(mask.sum(axis=1), mx.array(1.0))
-        chosen, rejected = logps[:pairs], logps[pairs:]
-        if kind == "orpo":
-            nll_mask = (
-                mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
-            ).astype(mx.float32)
-            nll_tokens = nll_mask.sum()
-            nll_sum = (ce[:pairs] * nll_mask).sum()
-            nll = nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
-            log_odds = _orpo_log_odds(chosen, rejected)
-            ratio = _log_sigmoid(log_odds)
-            loss = nll - beta * ratio.mean()
-            chosen_rewards = beta * chosen
-            rejected_rewards = beta * rejected
-            extra = [nll_sum, ratio.sum(), log_odds.sum()]
-            denominators = [
-                chosen_logit_count, rejected_logit_count, nll_tokens,
-            ]
-        else:
-            if reference_free:
-                reference = mx.zeros(logps.shape, dtype=logps.dtype)
-            else:
-                reference = reference_policy.forward(model, batch, lengths)
-            margin = beta * (
-                (chosen - rejected) - (reference[:pairs] - reference[pairs:])
+            nll_sum, nll_tokens, ratio, stats = _orpo_scores(
+                model, batch, lengths, beta,
             )
-            loss = -(
-                (1.0 - epsilon) * _log_sigmoid(margin)
-                + epsilon * _log_sigmoid(-margin)
-            ).mean()
-            chosen_rewards = beta * (chosen - reference[:pairs])
-            rejected_rewards = beta * (rejected - reference[pairs:])
-            extra = []
-            denominators = [chosen_logit_count, rejected_logit_count]
-        stats = [
-            chosen_rewards.sum(),
-            rejected_rewards.sum(),
-            (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
-            (chosen_rewards - rejected_rewards).sum(),
-            chosen.sum(),
-            rejected.sum(),
-            chosen_logits,
-            rejected_logits,
-        ] + extra + denominators
-        return (
-            loss,
-            mx.array(pairs, dtype=mx.int32),
-            mx.stack([value.astype(mx.float32) for value in stats]),
-        )
+            loss = (
+                nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
+                - beta * ratio.mean()
+            )
+        else:
+            terms, stats = _dpo_scores(
+                model, batch, lengths, objective,
+                reference_policy=reference_policy,
+            )
+            loss = _dpo_pair_loss(objective, terms).mean()
+        return loss, mx.array(pairs, dtype=mx.int32), stats
 
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]

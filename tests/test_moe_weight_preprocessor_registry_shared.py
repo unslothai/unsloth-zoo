@@ -100,14 +100,24 @@ def test_bare_moe_utils_copy_shares_the_registry(cache_copy, monkeypatch):
     # A third copy: compiler.py puts the compile location on sys.path, so the bare
     # `from moe_utils import ...` generated modules do is its own module too.
     monkeypatch.syspath_prepend(os.environ["UNSLOTH_COMPILE_LOCATION"])
-    monkeypatch.delitem(sys.modules, "moe_utils", raising=False)
-    import moe_utils as bare
-    monkeypatch.setitem(sys.modules, "moe_utils", bare)
-    assert bare is not moe_utils and bare is not cache_copy
+    # Restored by hand rather than through monkeypatch, and that is not a style
+    # choice. delitem() on a name that is absent records nothing, and by the time
+    # setitem() runs the import below has already put `bare` in sys.modules, so
+    # setitem records `bare` as the value to restore. The undo then REINSTATES it
+    # and every later test in the process resolves `moe_utils` to this copy --
+    # loaded from a tmp_path_factory directory that is deleted at session end.
+    # That is what broke test_compiled_cache_collective.py's recovery test, whose
+    # generated module does exactly the bare `from moe_utils import ...` above.
+    previous = sys.modules.pop("moe_utils", None)
     key = "unit_test_registry_shared_arch_bare"
     fn = lambda weight, proj_type, hidden_dim: weight
-    moe_utils.register_weight_preprocessor(key, fn)
     try:
+        import moe_utils as bare
+        assert bare is not moe_utils and bare is not cache_copy
+        moe_utils.register_weight_preprocessor(key, fn)
         assert bare.get_weight_preprocessor(key) is fn
     finally:
         moe_utils._WEIGHT_PREPROCESSORS.pop(key, None)
+        sys.modules.pop("moe_utils", None)
+        if previous is not None:
+            sys.modules["moe_utils"] = previous

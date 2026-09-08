@@ -2540,14 +2540,12 @@ def test_gguf_install_fallback_prefers_prebuilt_then_macos_helper(
         first_conversion="f16",
     )
 
-    # Prebuilt-first is attempted on every platform.
     assert "install_llama_cpp" in calls
     # Export only needs the CPU-only llama-quantize, so gpu_support=False on every
     # platform. On macOS this still resolves the universal unslothai/llama.cpp
     # Metal bundle (same archive from the CPU selector), and the Metal source build
     # is handled by the macOS helper below, not by this flag.
     assert gpu_support_seen["value"] is False
-    # The macOS source helper is reached only on the darwin apt-get path.
     assert ("_install_llama_cpp_macos" in calls) == expect_macos_helper
 
 
@@ -2732,7 +2730,6 @@ def test_macos_helper_refuses_unmanaged_non_source_dir(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="will not be removed"):
         mutils._install_llama_cpp_macos(str(folder))
 
-    # The user's directory and its contents must be left fully intact.
     assert folder.is_dir()
     assert (folder / "important.txt").read_text() == "precious user file"
 
@@ -3073,7 +3070,6 @@ def test_imatrix_file_true_resolves_the_upstream_gguf_repo(monkeypatch, tmp_path
 
     assert seen["looked_up"] == ["unsloth/Missing-GGUF", "unsloth/TestModel-GGUF"]
     assert seen["token"] == "hf_token"
-    # The download must be authenticated too, and aimed at the repo that actually had the file.
     assert seen["downloaded"] == {
         "repo_id": "unsloth/TestModel-GGUF", "filename": upstream_name, "token": "hf_token",
     }
@@ -3351,7 +3347,6 @@ def test_macos_helper_installs_gguf_py_from_operator_named_checkout(monkeypatch,
     assert any(str(folder / "gguf-py") in arg for arg in pip_cmds[0]), pip_cmds[0]
 
 
-# --- _is_trusted_local_llama_cpp_dir path semantics -------------------------
 # `pip install <dir>` runs that directory's build backend, so the containment
 # check that guards it has to be exact. These cover the ways a naive prefix
 # comparison goes wrong.
@@ -3406,7 +3401,6 @@ def test_trusted_dir_rejects_cwd_relative_checkout(monkeypatch, tmp_path):
     monkeypatch.chdir(cwd)
     assert _trusted(monkeypatch, "llama.cpp", home) is False
     assert _trusted(monkeypatch, os.path.join(".", "llama.cpp"), home) is False
-    # An operator who names that same directory does get the local install.
     assert _trusted(monkeypatch, "llama.cpp", home, env_value=cwd / "llama.cpp") is True
 
 
@@ -3419,7 +3413,6 @@ def test_trusted_dir_accepts_operator_named_checkout(monkeypatch, tmp_path):
     assert _trusted(monkeypatch, studio / "gguf-py", home, env_value=studio) is True
     # Whitespace is stripped, matching how Studio itself reads the variable.
     assert _trusted(monkeypatch, studio, home, env_value=f"  {studio}  ") is True
-    # An empty or blank value must not trust anything.
     assert _trusted(monkeypatch, tmp_path / "other", home, env_value="") is False
     assert _trusted(monkeypatch, tmp_path / "other", home, env_value="   ") is False
 
@@ -4239,3 +4232,176 @@ def test_moe_gguf_export_splits_a_tensor_a_sanitizer_fused_from_a_named_group(tm
     rewritten = _staged_tensors(path)
     assert sorted(rewritten) == sorted(model.checkpoint)
     assert all(rewritten[n].tolist() == v.tolist() for n, v in model.checkpoint.items())
+
+
+def test_tokenizer_load_bypasses_model_config_and_preserves_sidecars(monkeypatch, tmp_path):
+    """transformers 5.x resolves the model config before tokenizing and only
+    catches ValueError/OSError from it, so a config raising AttributeError or
+    KeyError takes a loadable tokenizer down with it."""
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import AutoConfig, PreTrainedTokenizerFast
+    import unsloth_zoo.mlx.loader as loader
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1, "world": 2}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    expected = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]", eos_token="[END]")
+    expected.add_tokens(["extra_one", "extra_two"])
+    expected.chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    expected.save_pretrained(tmp_path)
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "unregistered", "rope_scaling": {"type": "longrope"},
+    }))
+
+    def reject_config(*args, **kwargs):
+        raise AssertionError("tokenizer must not resolve model config")
+
+    monkeypatch.setattr(AutoConfig, "from_pretrained", reject_config)
+    actual = loader._load_mlx_tokenizer(tmp_path)
+    assert actual.get_vocab() == expected.get_vocab()
+    assert actual.special_tokens_map == expected.special_tokens_map
+    assert actual.get_added_vocab() == expected.get_added_vocab()
+    assert actual.chat_template == expected.chat_template
+    for text in ("hello extra_two", "extra_one world"):
+        ids = expected.encode(text)
+        assert actual.encode(text) == ids
+        assert actual.decode(ids) == expected.decode(ids)
+
+
+def test_tokenizer_without_declared_class_keeps_class_default_specials(tmp_path):
+    """gpt2 and its relatives declare no tokenizer_class and ship no
+    special_tokens_map.json: bos/eos/unk come from the tokenizer class's
+    __init__ defaults. Loading the bare backend drops them, and an eos_token of
+    None leaves mlx-lm generation with no stop token."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    import unsloth_zoo.mlx.loader as loader
+
+    # gpt2's published shape, built locally: downloading it fails offline, and
+    # this file is a hard gate in the Repo tests (CPU) lane.
+    vocab = {"<|endoftext|>": 0, "hello": 1, "Ġworld": 2}
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    backend.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({"model_max_length": 1024}))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "gpt2"}))
+
+    # What the fast-file branch used to return: no class defaults to fall back on.
+    bare = PreTrainedTokenizerFast.from_pretrained(tmp_path)
+    assert bare.eos_token is None
+
+    loaded = loader._load_mlx_tokenizer(tmp_path)
+    assert loaded.eos_token == "<|endoftext|>"
+    assert loaded.bos_token == "<|endoftext|>"
+    assert loaded.eos_token_id == 0
+    assert loaded("hello world")["input_ids"] == bare("hello world")["input_ids"]
+
+
+def test_model_type_lookup_never_builds_a_model_config(monkeypatch, tmp_path):
+    """The recovery above must not reintroduce the validation this fix removes."""
+    import transformers
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "gpt2"}))
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained",
+        staticmethod(lambda *a, **k: pytest.fail("model config must not be resolved")),
+    )
+    assert loader._tokenizer_class_for_model_type(tmp_path) is not None
+
+
+@pytest.mark.parametrize("bad", [
+    {},                                  # no model_type at all
+    {"model_type": "not_a_real_model"},  # unknown to transformers
+])
+def test_model_type_lookup_returns_none_when_unresolvable(tmp_path, bad):
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "config.json").write_text(json.dumps(bad))
+    assert loader._tokenizer_class_for_model_type(tmp_path) is None
+
+
+def test_model_type_lookup_tolerates_missing_config(tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    assert loader._tokenizer_class_for_model_type(tmp_path) is None
+
+
+def test_tokenizer_scope_routes_mlx_lm_and_restores(tmp_path):
+    """mlx_lm.utils.load_tokenizer calls AutoTokenizer.from_pretrained directly,
+    so the scope is the only way to reach it; it must restore on exit and after
+    an exception, and leave other threads alone."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from transformers import AutoTokenizer
+    import unsloth_zoo.mlx.loader as loader
+
+    pristine = AutoTokenizer.__dict__["from_pretrained"]
+    with loader._mlx_tokenizer_loading_scope():
+        assert AutoTokenizer.__dict__["from_pretrained"] is not pristine
+        # A thread that never entered the scope keeps ordinary behaviour.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(
+                lambda: getattr(loader._TOKENIZER_LOAD_STATE, "active", False)
+            ).result() is False
+    assert AutoTokenizer.__dict__["from_pretrained"] is pristine
+
+    try:
+        with loader._mlx_tokenizer_loading_scope():
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert AutoTokenizer.__dict__["from_pretrained"] is pristine
+
+    with loader._mlx_tokenizer_loading_scope():
+        with loader._mlx_tokenizer_loading_scope():
+            pass
+        assert AutoTokenizer.__dict__["from_pretrained"] is not pristine
+    assert AutoTokenizer.__dict__["from_pretrained"] is pristine
+
+    # Concurrent scopes must not capture each other's patch as the original.
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(10):
+                with loader._mlx_tokenizer_loading_scope():
+                    pass
+        except BaseException as error:  # pragma: no cover - failure path
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert not errors
+    assert AutoTokenizer.__dict__["from_pretrained"] is pristine
+
+
+def test_tokenizer_load_never_prompts_for_remote_code(monkeypatch, tmp_path):
+    """transformers reads a missing trust_remote_code as None, and answers None
+    by prompting on stdin for TIME_OUT_REMOTE_CODE seconds. The blank config
+    _load_mlx_tokenizer injects forces has_local_code False, so a remote-code
+    repo lands on that branch: without an explicit default a plain load blocks
+    ~15s on a question nobody asked, in a notebook or a Studio worker."""
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "RemoteTokenizer",
+        "auto_map": {"AutoTokenizer": ["tokenization_custom.RemoteTokenizer", None]},
+    }))
+    (tmp_path / "tokenization_custom.py").write_text("class RemoteTokenizer: pass\n")
+
+    # Record, never raise: resolve_trust_remote_code catches Exception and
+    # rewrites it into the ValueError the passing path also produces.
+    prompts = []
+
+    def fake_input(*args, **kwargs):
+        prompts.append(args)
+        return "n"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    with pytest.raises(ValueError, match="custom code"):
+        loader._load_mlx_tokenizer(tmp_path)
+    assert not prompts, "tokenizer load prompted on stdin for remote code"

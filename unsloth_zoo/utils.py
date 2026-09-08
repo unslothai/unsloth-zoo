@@ -19,7 +19,9 @@ __all__ = [
     "_get_dtype",
     "is_main_process",
     "is_distributed",
+    "current_rank",
     "distributed_function",
+    "distributed_any",
     "torch_distributed_get_rank",
 ]
 
@@ -148,6 +150,13 @@ def is_distributed():
     return torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
 pass
 
+def current_rank():
+    """Best effort rank, for diagnostics only. RANK is unset outside a launcher."""
+    if torch_distributed_is_initialized():
+        return torch_distributed_get_rank()
+    return os.environ.get("RANK", "0")
+pass
+
 def distributed_function(n = 1, function = None, *args, **kwargs):
     assert function is not None
 
@@ -171,6 +180,20 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         dist.barrier()  # wait until main is done
 
     return obj_list[0] if n == 1 else obj_list
+pass
+
+def distributed_any(value):
+    """True when `value` is truthy on any rank. Every rank has to call this.
+
+    distributed_function() only mirrors rank 0, which is wrong when the condition
+    is rank-local and guards a collective.
+    """
+    if not torch_distributed_is_initialized():
+        return bool(value)
+
+    flags = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(flags, bool(value))
+    return any(flags)
 pass
 
 def _lock_path_for(target: str) -> str:

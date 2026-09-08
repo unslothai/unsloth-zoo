@@ -1940,7 +1940,6 @@ def _install_safe_fused_sdpa_mask_patches():
 
         out = original_fast_sdpa(q, k, v, scale=scale, mask=mask, **kwargs)
         if row_all_masked is not None:
-            # Restore zero-output for fully masked query rows.
             out = mx.where(
                 mx.expand_dims(row_all_masked, axis=-1),
                 mx.zeros_like(out),

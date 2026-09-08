@@ -44,6 +44,7 @@ enable paths the model never claimed to support. Slower is fine; wrong is not.
 
 import ast
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -56,17 +57,84 @@ COMPILER = ROOT / "unsloth_zoo" / "compiler.py"
 SRC = COMPILER.read_text(encoding="utf-8")
 
 
+def _require_index(anchor: str, what: str) -> int:
+    """`SRC.index`, but a miss says which contract broke.
+
+    A bare `.index` raises `ValueError: substring not found` and names neither
+    the anchor nor the test's subject, which is how #967's rename showed up:
+    six tests failed pointing at the test file's own line rather than at the
+    production edit that moved the text out from under them.
+    """
+    i = SRC.find(anchor)
+    assert i != -1, (
+        f"{what}: no `{anchor}` in compiler.py. Either the guard is gone, or "
+        f"it was renamed and this anchor needs to follow it.")
+    return i
+
+
 def _guard_region() -> str:
     """The modeling-file guard and its handler.
 
     Anchored on the call, not on "except (OSError, TypeError)": the torch
     forward guard uses the same clause and is defined earlier in the file.
     """
-    i = SRC.index("full_source = inspect.getsource(modeling_file)")
+    i = _require_index(
+        "full_source = inspect.getsource(modeling_file)",
+        "the modeling-file guard")
     return SRC[max(0, i - 400):i + 2200]
 
 
-# ---- the guard ------------------------------------------------------------
+def _caught_names(handler) -> set:
+    """The exception names an `except` clause catches, spelled as they are written."""
+    node = handler.type
+    if node is None:
+        return set()
+    parts = node.elts if isinstance(node, ast.Tuple) else [node]
+    return {ast.unparse(part) for part in parts}
+
+
+def _catches(caught: set, name: str) -> bool:
+    """Whether `name` is caught under a spelling this module can actually resolve.
+
+    A bare `TokenError` is not interchangeable with `tokenize.TokenError` here:
+    compiler.py imports the module and not the name, so an unqualified handler
+    would raise NameError at the moment it is asked to handle a failure.
+    """
+    if name in caught:
+        return True
+    bare = name.rsplit(".", 1)[-1]
+    return bare in caught and re.search(
+        rf"^from [\w.]+ import [^\n]*\b{bare}\b", SRC, re.M
+    ) is not None
+
+
+def _getsource_guards(call: str) -> list:
+    """What every `try` whose body calls `call` catches, one union per `try`.
+
+    Read off the parse, not matched as one spelling: a wider guard is a stronger
+    premise, yet #1149 widening it to `tokenize.TokenError` failed three tests here
+    while catching strictly more. A union per `try` rather than a set per handler,
+    because `except OSError:` beside `except TypeError:` guards the call exactly as
+    well as the single tuple does.
+
+    The nearest enclosing `try` only. An outer `try` unparses its whole body, so it
+    contains the call too, but a handler out there for something unrelated is not the
+    thing guarding this call and must not be asked to catch what this one catches.
+    """
+    matching = [
+        node for node in ast.walk(ast.parse(SRC))
+        if isinstance(node, ast.Try)
+        and any(call in ast.unparse(stmt) for stmt in node.body)
+    ]
+    return [
+        set().union(set(), *(_caught_names(h) for h in node.handlers))
+        for node in matching
+        if not any(
+            other is not node and any(d is other for d in ast.walk(node))
+            for other in matching
+        )
+    ]
+
 
 def test_getsource_is_wrapped():
     region = _guard_region()
@@ -76,8 +144,13 @@ def test_getsource_is_wrapped():
 
 def test_it_catches_what_getsource_actually_raises():
     """OSError for unreadable source, TypeError for a built-in or C module."""
-    region = _guard_region()
-    assert "except (OSError, TypeError)" in region
+    guards = _getsource_guards("inspect.getsource(modeling_file)")
+    assert guards, "the modeling-file getsource is no longer inside a try"
+    for caught in guards:
+        assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
+            f"the modeling-file guard stopped catching one of them: {sorted(caught)}")
+    # Widened by #1149: getblock's TokenError subclasses Exception directly.
+    assert any(_catches(caught, "tokenize.TokenError") for caught in guards)
 
 
 def test_the_real_exception_type_is_oserror():
@@ -115,19 +188,21 @@ def test_the_warning_says_the_model_still_works():
         "a warning during model load must say whether it is fatal")
 
 
-# ---- what must be preserved ----------------------------------------------
-
 def test_lora_patching_happens_before_the_guard():
     """Returning early is only acceptable because the LoRA forwards have
     already been patched by this point."""
-    lora = SRC.index("patch_lora_forwards(torch_compile_options)")
-    guard = SRC.index("full_source = inspect.getsource(modeling_file)")
+    lora = _require_index(
+        "patch_lora_forwards(torch_compile_options)", "the LoRA forward patch")
+    guard = _require_index(
+        "full_source = inspect.getsource(modeling_file)", "the modeling-file guard")
     assert lora < guard
 
 
 def test_the_patched_marker_is_set_before_the_guard():
-    marker = SRC.index("modeling_file.__UNSLOTH_PATCHED__ = True")
-    guard = SRC.index("full_source = inspect.getsource(modeling_file)")
+    marker = _require_index(
+        "modeling_file.__UNSLOTH_PATCHED__ = True", "the patched marker")
+    guard = _require_index(
+        "full_source = inspect.getsource(modeling_file)", "the modeling-file guard")
     assert marker < guard, (
         "an early return must not leave the module looking unpatched, or a "
         "later pass would try again and fail again")
@@ -149,11 +224,80 @@ def test_a_bare_return_is_the_functions_contract():
     assert any(r.value is None for r in returns)
 
 
-# ---- the second site: loading a SECOND model in one process --------------
+def _nn_forward_read() -> tuple:
+    """The torch.nn forward read, discovered rather than spelled out.
+
+    Returns `(name, statement)` where `name` is whatever local the loop reads
+    the forward's source from and `statement` is the assignment as written.
+
+    Discovered because the spelling is not the contract. #967 renamed this
+    operand from `function.forward` to `original_forward` -- a strictly better
+    version of the same read, pinning the pristine forward so a second pass
+    cannot consume its own generated output -- and six tests here reported it
+    as the guard having been deleted. A test that fails on a correct rename is
+    reporting on the test, not on compiler.py.
+
+    Matched on shape: an assignment to `source` of `inspect.getsource(<Name>)
+    .rstrip()`. The name is then held to its real contract by
+    `test_the_forward_source_is_read_from_the_pinned_original` below, so this
+    stays a rename-tolerant search and not a weaker assertion.
+    """
+    found = []
+    for node in ast.walk(ast.parse(SRC)):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not (isinstance(target, ast.Name) and target.id == "source"):
+            continue
+        call = node.value
+        if not (isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "rstrip"):
+            continue
+        inner = call.func.value
+        if not (isinstance(inner, ast.Call)
+                and ast.unparse(inner.func) == "inspect.getsource"
+                and len(inner.args) == 1
+                and isinstance(inner.args[0], ast.Name)):
+            continue
+        found.append((inner.args[0].id, ast.unparse(node)))
+
+    assert found, (
+        "no `source = inspect.getsource(<name>).rstrip()` in compiler.py at "
+        "all. The torch.nn forward patch loop no longer reads the forward's "
+        "source the way every test below assumes.")
+    assert len({name for name, _ in found}) == 1, (
+        f"several forward-source reads with different operands: {sorted(found)}. "
+        "These tests assume one site and would guard an arbitrary one of them.")
+    return found[0]
+
+
+NN_FORWARD_NAME, NN_FORWARD_READ = _nn_forward_read()
+NN_FORWARD_GETSOURCE = f"inspect.getsource({NN_FORWARD_NAME})"
+
 
 def _nn_patch_region() -> str:
-    i = SRC.index("source = inspect.getsource(function.forward).rstrip()")
+    i = _require_index(NN_FORWARD_READ, "the torch.nn forward patch loop")
     return SRC[max(0, i - 1600):i + 1400]
+
+
+def test_the_forward_source_is_read_from_the_pinned_original():
+    """The operand is discovered, so pin what it must BE.
+
+    Either it is `function.forward` itself, or it is a local assigned from
+    `function.forward` in the same loop -- #967's pin, which is what makes the
+    read idempotent across the two passes a vision load performs. Without this,
+    `_nn_forward_read` would happily latch onto a rename to something that is
+    not the forward at all and every test below would still pass.
+    """
+    if NN_FORWARD_NAME == "function":
+        pytest.skip("read directly off `function.forward`, nothing to pin")
+    pin = f"{NN_FORWARD_NAME} = function.forward"
+    i = _require_index(pin, "the pristine-forward pin")
+    read = _require_index(NN_FORWARD_READ, "the forward source read")
+    assert i < read, (
+        f"`{pin}` must precede `{NN_FORWARD_READ}`, or the loop is not reading "
+        "the forward it pinned")
 
 
 def test_the_nn_forward_patch_loop_is_guarded():
@@ -170,9 +314,12 @@ def test_the_nn_forward_patch_loop_is_guarded():
     forward is unreadable -- both measured, not assumed. This guards a state
     we have observed rather than encoding a theory about how it arises.
     """
-    region = _nn_patch_region()
-    assert "try:" in region
-    assert "except (OSError, TypeError)" in region
+    guards = _getsource_guards(NN_FORWARD_GETSOURCE)
+    assert guards, f"`{NN_FORWARD_GETSOURCE}` is no longer inside a try"
+    for caught in guards:
+        assert _catches(caught, "OSError") and _catches(caught, "TypeError"), (
+            f"the forward guard stopped catching one of them: {sorted(caught)}")
+    assert any(_catches(caught, "tokenize.TokenError") for caught in guards)
 
 
 def test_an_unreadable_forward_is_skipped_not_fatal():
@@ -187,7 +334,7 @@ def test_an_unreadable_forward_is_skipped_not_fatal():
     # Exactly the try whose body IS this assignment -- several other blocks
     # also call getsource on a forward, and their handlers legitimately do
     # something else.
-    target = "source = inspect.getsource(function.forward).rstrip()"
+    target = NN_FORWARD_READ
     handlers = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Try) or len(node.body) != 1:
@@ -217,11 +364,15 @@ def test_the_compiler_config_check_is_kept():
 def test_both_getsource_guards_are_present():
     """Two distinct sites, two distinct failures. Fixing only the first one
     just moves the crash later, which is exactly what happened."""
-    assert SRC.count("except (OSError, TypeError)") >= 2
+    sites = {"inspect.getsource(modeling_file)", NN_FORWARD_GETSOURCE}
+    for call in sites:
+        guards = _getsource_guards(call)
+        assert guards and all(
+            _catches(c, "OSError") and _catches(c, "TypeError") for c in guards
+        ), (
+            f"{call} is unguarded, so an unreadable source is fatal again")
 
 
-# ---- what the fallback must still do -------------------------------------
-#
 # Returning early is a degradation, and a degradation has to be honest about
 # which of the surrounding work it gave up. Three separate questions, and they
 # do not have the same answer.
@@ -343,9 +494,6 @@ def test_gradient_accumulation_needs_that_same_source():
             and patch_gradient_accumulation(modeling, name) is not None
         ]
     assert patched == []
-
-
-# ---- the wrapper that stands in for an unreadable torch forward ----------
 
 
 class _Weighted:
@@ -485,7 +633,8 @@ def test_a_rebuild_wraps_the_original_not_the_wrapper():
 
 def test_the_loop_rebuilds_on_a_mode_change():
     region = _nn_patch_region()
-    i = SRC.index('__unsloth_dtype_wrapped__", False)')
+    i = _require_index(
+        '__unsloth_dtype_wrapped__", False)', "the already-wrapped check")
     window = SRC[i:i + 800]
     assert "__unsloth_dtype_disable__" in window, (
         "a wrapper built for the other compile mode must not be reused")

@@ -48,7 +48,6 @@ class FakeTokenizer:
             for t in added if t in self._vocab
         }
 
-    # ids
     @property
     def pad_token_id(self):
         return self._vocab.get(self.pad_token)
@@ -61,7 +60,6 @@ class FakeTokenizer:
         return dict(self._vocab)
 
     def __call__(self, text, add_special_tokens=False):
-        # Each known token is a single id; unknown text splits into >1 id.
         ids = [self._vocab[text]] if text in self._vocab else [0, 1]
         return type("Enc", (), {"input_ids": ids})()
 
@@ -91,17 +89,14 @@ def _qwen3_text():
 
 
 def test_is_pad_named():
-    # Bracketed pad sentinels qualify ...
     for t in ("<|vision_pad|>", "<|fim_pad|>", "[PAD]", "<pad>", "<|PAD|>"):
         assert _is_pad_named(t)
-    # ... ordinary words containing "pad" and non-pad tokens do not.
     for t in ("keypad", "padding", "Notepad", "pad",
               "<|endoftext|>", "<|im_end|>", "<unk>"):
         assert not _is_pad_named(t)
 
 
 def test_qwen3_vision_pad_is_kept():
-    # <|vision_pad|> is a pad-named token distinct from eos -> kept as-is.
     tok = _qwen3_text()
     res = fix_pad_token(tok)
     assert res["changed"] is False
@@ -373,7 +368,7 @@ def test_zero_token_candidate_does_not_crash():
     # A reserved entry present but encoding to !=1 id must be skipped, not crash.
     class Weird(FakeTokenizer):
         def __call__(self, text, add_special_tokens=False):
-            return type("Enc", (), {"input_ids": []})()  # zero ids for everything
+            return type("Enc", (), {"input_ids": []})()
     tok = Weird({"</s>": 2, "<pad>": 0}, pad_token="</s>", eos_token="</s>")
     res = fix_pad_token(tok, allow_add=False)   # <pad> rejected (0 ids) -> defer, no IndexError
     assert res["changed"] is False
@@ -413,7 +408,6 @@ def test_in_range_valid_pad_is_noop_with_vocab_size():
 
 
 def test_vision_pad_kept_regardless_of_model_type():
-    # A pad-named modality token is kept whether or not the model is multimodal.
     tok = _qwen3_text()  # pad_token = "<|vision_pad|>"
     cfg = type("Cfg", (), {"model_type": "llava"})()
     res = fix_pad_token(tok, model_config = cfg)
@@ -432,7 +426,6 @@ def test_unk_token_fallback_when_no_reserved():
 
 
 def test_pad_equals_eos_reuses_modality_pad_when_only_option():
-    # pad == eos and only a modality pad available -> reuse it instead of adding/raising.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|vision_pad|>": 2},
                         pad_token = "<|im_end|>", eos_token = "<|im_end|>")
     res = fix_pad_token(tok)
@@ -440,15 +433,12 @@ def test_pad_equals_eos_reuses_modality_pad_when_only_option():
 
 
 def test_audio_pad_is_kept():
-    # <|audio_pad|> is pad-named and distinct from eos -> kept as-is.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|audio_pad|>": 2},
                         pad_token = "<|audio_pad|>", eos_token = "<|im_end|>")
     assert fix_pad_token(tok)["changed"] is False
 
 
 def test_pad_name_fallback_ignores_bare_word_token():
-    # pad == eos; "keypad" is a bare word (not a bracketed sentinel) and must not be
-    # promoted, while the bracketed <|custom_pad|> is picked.
     tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5, "<|custom_pad|>": 6},
                         pad_token = "<|endoftext|>", eos_token = "<|endoftext|>")
     res = fix_pad_token(tok)

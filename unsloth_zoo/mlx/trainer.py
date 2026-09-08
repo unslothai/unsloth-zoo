@@ -617,6 +617,7 @@ from .preference import (
     make_dpo_loss_fn,
     make_orpo_loss_fn,
     make_preference_eval_fn,
+    resolve_preference_objective,
     resolve_preference_length_policy,
 )
 from .compile import (
@@ -1339,6 +1340,9 @@ class MLXTrainingConfig:
             "num_generation_prompts",
             "generation_max_tokens",
             "generation_temperature",
+            "loss_type",
+            "loss_weights",
+            "discopop_tau",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1427,6 +1431,10 @@ class MLXDPOConfig(MLXTrainingConfig):
     beta: float = field(default=0.1, kw_only=True)
     reference_free: bool = field(default=False, kw_only=True)
     label_smoothing: float = field(default=0.0, kw_only=True)
+    # A DPOConfig collapses a one-entry list back to a string, so both arrive.
+    loss_type: str | list[str] = field(default="sigmoid", kw_only=True)
+    loss_weights: list[float] | None = field(default=None, kw_only=True)
+    discopop_tau: float = field(default=0.05, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -1987,6 +1995,55 @@ def _resolve_training_steps(args, batches, batch_iter, *, includes_epochs=False)
     raise ValueError("max_steps must be > 0 when using streaming mode.")
 
 
+def _preference_metric_values(names, denominators, summed):
+    """``summed`` is every numerator then every denominator; the mean is exact."""
+    values = {}
+    for index, name in enumerate(names):
+        divisor = summed[denominators[index]]
+        values[name] = summed[index] / divisor if divisor > 0 else 0.0
+    return values
+
+
+def _warn_resume_adapter_mismatch(model, adapter_file):
+    """Say so when a checkpoint does not cover the LoRA modules now wrapped.
+
+    Resume binds with ``strict=False``, so an adapter saved when selection was
+    narrower loads without complaint and leaves the modules it does not name at
+    their initialisation. They train from scratch while the optimizer state
+    restored beside them describes the older, smaller parameter tree.
+    """
+    import warnings
+    if not os.path.exists(adapter_file):
+        return
+    try:
+        saved = set(mx.load(adapter_file).keys())
+        live = [name for name, _ in iter_mlx_lora_modules(model)]
+    except Exception:
+        return                              # never block a resume to report on it
+
+    # An adapter held as a module rather than an array is stored one level down,
+    # so both spellings name the same weights; collect_mlx_lora_adapter_tensors
+    # writes whichever the wrapper uses.
+    def covered(name, leaf):
+        return (f"{name}.{leaf}" in saved
+                or f"{name}.{leaf}.weight" in saved)
+
+    uncovered = sorted(name for name in live
+                       if not (covered(name, "lora_a") and covered(name, "lora_b")))
+    if not uncovered:
+        return
+    warnings.warn(
+        f"Unsloth: resuming from {adapter_file!r}, which has no weights for "
+        f"{len(uncovered)} of the LoRA modules now attached "
+        f"(for example {uncovered[:3]!r}). Those modules restart from their "
+        "initialisation while the restored optimizer state describes the "
+        "checkpoint's own module set. This happens when the checkpoint was "
+        "written by a version that selected fewer modules. Pass the same "
+        "target_modules the checkpoint was trained with to resume exactly.",
+        stacklevel=2,
+    )
+
+
 class MLXTrainer:
     """MLX-native trainer for Apple Silicon, mirroring SFTTrainer's constructor API."""
 
@@ -2031,7 +2088,6 @@ class MLXTrainer:
         self._mlx_train_dataset_for_batches = train_dataset
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
-        # Use args or defaults
         self.args = args or self.config_class()
         if self.preference_kind and not isinstance(self.args, self.config_class):
             raise TypeError(
@@ -2045,10 +2101,8 @@ class MLXTrainer:
             self.args = copy.copy(self.args)
         self.args.greater_is_better = _resolve_greater_is_better(self.args)
 
-        # Auto-detect VLM
         self._is_vlm = _is_vlm_model(model)
 
-        # Constructor params override args if provided
         if dataset_text_field is not None:
             self.args.dataset_text_field = dataset_text_field
         if max_seq_length is not None:
@@ -4025,13 +4079,10 @@ class MLXTrainer:
                 if metric_names is None:
                     metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
                 elif total > 0:
-                    summed = stats.tolist()
-                    for index, name in enumerate(metric_names):
-                        over = metric_denominators.get(index)
-                        divisor = total if over is None else summed[over]
-                        metrics[f"{prefix}{name}"] = (
-                            summed[index] / divisor if divisor > 0 else 0.0
-                        )
+                    for name, metric in _preference_metric_values(
+                        metric_names, metric_denominators, stats.tolist(),
+                    ).items():
+                        metrics[f"{prefix}{name}"] = metric
                 return value
 
             if isinstance(eval_batches, dict):
@@ -4706,7 +4757,6 @@ class MLXTrainer:
                         "compiled signature. Use a finite dataset, or train "
                         "with compile disabled or in best-effort mode."
                     )
-                # No plan to survey: peek one batch, chained back.
                 stream_carries_audio, batch_iter = (
                     self._peek_stream_carries_audio(batch_iter)
                 )
@@ -4847,7 +4897,6 @@ class MLXTrainer:
                     batches, batch_iter, total_steps, report, compile_allowed,
                 )
 
-            # (memory limits already applied above; just log what we configured)
             if self._memory_limits_applied:
                 parts = []
                 if "memory_limit_gb" in self._memory_limits_applied:
@@ -4867,7 +4916,6 @@ class MLXTrainer:
                     f"({', '.join(parts)})."
                 )
 
-            # Apply gradient checkpointing if requested
             if args.gradient_checkpointing:
                 apply_gradient_checkpointing(model)
                 _main_print("Unsloth: Using gradient checkpointing to reduce memory.")
@@ -4964,7 +5012,6 @@ class MLXTrainer:
                     _module.fused_apply = True
                 except Exception:
                     pass
-            # Restore Qwen3-VL vision-block flag to its pre-train value.
             try:
                 from . import compile as _mlx_compile
                 _mlx_compile.set_qwen3_vision_norm_cast_output(
@@ -5234,7 +5281,6 @@ class MLXTrainer:
                     f"({', '.join(frozen_audio)})."
                 )
 
-        # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
 
         # Resume: adapters were already loaded into the model before train(), so
@@ -5293,6 +5339,9 @@ class MLXTrainer:
                 #    already has LoRA wrappers applied (Unsloth pipeline does
                 #    get_peft_model before training); strict=False ensures
                 #    only the LoRA params match and base weights are untouched.
+                _warn_resume_adapter_mismatch(
+                    model, f"{_resume_from}/adapters.safetensors",
+                )
                 model.load_weights(
                     f"{_resume_from}/adapters.safetensors", strict=False,
                 )
@@ -5394,12 +5443,22 @@ class MLXTrainer:
         preference_eval_fn = None
         if preference_kind:
             if preference_kind == "orpo":
-                loss_fn = make_orpo_loss_fn(beta=args.beta)
+                objective = resolve_preference_objective("orpo", beta=args.beta)
+                loss_fn = make_orpo_loss_fn(objective)
                 self._preference_reference_provenance = {
                     "kind": "orpo_no_reference"
                 }
                 _main_print(f"Unsloth: Using ORPO loss (beta={args.beta}).")
             else:
+                objective = resolve_preference_objective(
+                    "dpo",
+                    beta=args.beta,
+                    label_smoothing=args.label_smoothing,
+                    loss_type=args.loss_type,
+                    loss_weights=args.loss_weights,
+                    discopop_tau=args.discopop_tau,
+                    reference_free=bool(args.reference_free),
+                )
                 reference_policy, provenance = build_reference_policy(
                     model,
                     reference_free=bool(args.reference_free),
@@ -5414,23 +5473,18 @@ class MLXTrainer:
                 # the same ones the loss does. NEFTune is already off in eval.
                 _sampling_reference = reference_policy
                 loss_fn = make_dpo_loss_fn(
-                    beta=args.beta,
-                    label_smoothing=args.label_smoothing,
-                    reference_policy=reference_policy,
-                    reference_free=bool(args.reference_free),
+                    objective, reference_policy=reference_policy,
                 )
-                _main_print(f"Unsloth: Using DPO loss (beta={args.beta}).")
+                _main_print(
+                    f"Unsloth: Using DPO loss (beta={args.beta}, "
+                    f"loss_type={list(objective.loss_types)})."
+                )
             self._preference_run_context = PreferenceRunContext(
                 model, enabled=bool(getattr(args, "disable_dropout", True)),
             )
-            # Not the training loss: that one normalizes across an accumulation
-            # window, and reports none of these metrics.
+            # Not the training loss: that one normalizes across a window.
             preference_eval_fn = make_preference_eval_fn(
-                preference_kind,
-                beta=args.beta,
-                label_smoothing=getattr(args, "label_smoothing", 0.0),
-                reference_policy=_sampling_reference,
-                reference_free=bool(getattr(args, "reference_free", False)),
+                objective, reference_policy=_sampling_reference,
             )
 
         self.callback_handler.optimizer = optimizer
@@ -5447,7 +5501,6 @@ class MLXTrainer:
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-        # Per-group learning rates (LoRA+, embedding LR) via post-update rescale
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
         if use_lora_plus:
@@ -5455,7 +5508,6 @@ class MLXTrainer:
 
         embedding_lr = args.embedding_learning_rate
         main_lr = args.learning_rate
-        # Ratio < 1 slows embeddings down; 0 = disabled
         use_embedding_lr = embedding_lr > 0 and main_lr > 0
         embedding_lr_ratio = embedding_lr / main_lr if use_embedding_lr else 1.0
         if use_embedding_lr:
@@ -5527,10 +5579,6 @@ class MLXTrainer:
                 updates.append((name, pre + r * (post - pre)))
             model.update(tree_unflatten(updates))
 
-        # Build step functions following mlx-lm's pattern. `max_grad_value`
-        # remains an elementwise clamp. MLX's cheap default is now the clearer
-        # `max_grad_leaf_norm`, a proportional per-leaf norm cap that avoids
-        # global norm clipping's cross-tree memory overhead.
         (
             max_grad_norm,
             max_grad_value,
@@ -5729,24 +5777,30 @@ class MLXTrainer:
                 )
             return grad, toks_f
 
+        def _scored(batch_data):
+            """``stats`` is None for every SFT and VLM loss, which report none."""
+            scored, grad = _loss_and_grad(batch_data)
+            stats = scored[2] if len(scored) > 2 else None
+            return scored[0], scored[1], stats, grad
+
         def _local_grad_step(batch_data, prev_state):
             """Local loss/grad accumulation step, safe to compile under DDP."""
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
+            lvalue, toks, stats, grad = _scored(batch_data)
             toks_f = toks.astype(mx.float32)
             grad, toks_f = _accumulate_weighted_grad(grad, toks_f, prev_state)
             # Carried as state across loop iterations, or reduced eagerly
             # outside mx.compile under DDP.
             grad = tree_map(mx.stop_gradient, grad)
             toks_f = mx.stop_gradient(toks_f)
-            return lvalue, toks, (grad, toks_f)
+            return lvalue, toks, stats, (grad, toks_f)
 
         # Unified step for VLM (dict batch) and text (tuple batch) training.
         def step_fn(batch_data, prev_state, do_update):
-            (lvalue, toks), grad = _loss_and_grad(batch_data)
+            lvalue, toks, stats, grad = _scored(batch_data)
 
             if _direct_single_step_update:
                 grad_norm = _apply_update_direct(grad, toks.astype(mx.float32))
-                return lvalue, toks, None, grad_norm
+                return lvalue, toks, stats, None, grad_norm
 
             toks_f = toks.astype(mx.float32)
             grad_norm = mx.array(0.0, dtype=mx.float32)
@@ -5754,11 +5808,11 @@ class MLXTrainer:
 
             if do_update:
                 grad_norm = _apply_update(grad, toks_f)
-                return lvalue, toks, None, grad_norm
+                return lvalue, toks, stats, None, grad_norm
 
             grad = tree_map(mx.stop_gradient, grad)
             toks_f = mx.stop_gradient(toks_f)
-            return lvalue, toks, (grad, toks_f), None
+            return lvalue, toks, stats, (grad, toks_f), None
 
         _compile_decision = getattr(self, "_compile_decision", None)
         _use_compile = (
@@ -5841,8 +5895,10 @@ class MLXTrainer:
         _ddp_update_outside_step = distributed_world_size > 1
 
         def _ddp_eager_local_step_fn(batch_data, prev_state, do_update):
-            lvalue, toks, local_state = _local_grad_step(batch_data, prev_state)
-            return lvalue, toks, local_state, None
+            lvalue, toks, stats, local_state = _local_grad_step(
+                batch_data, prev_state,
+            )
+            return lvalue, toks, stats, local_state, None
 
         if _use_compile:
             _uncompiled_step_fn = step_fn
@@ -5899,8 +5955,8 @@ class MLXTrainer:
 
                 def _ddp_compiled_step_fn(batch_data, prev_state, do_update):
                     try:
-                        lvalue, toks, local_state = _compiled_local_grad_step(
-                            batch_data, prev_state,
+                        lvalue, toks, stats, local_state = (
+                            _compiled_local_grad_step(batch_data, prev_state)
                         )
                         mx.eval(
                             _compile_state,
@@ -5908,12 +5964,13 @@ class MLXTrainer:
                             toks,
                             local_state[0],
                             local_state[1],
+                            *(() if stats is None else (stats,)),
                         )
                     except Exception as e:
                         if _is_compile_exception(e):
                             raise _DDPCompiledLocalGradError(str(e)) from e
                         raise
-                    return lvalue, toks, local_state, None
+                    return lvalue, toks, stats, local_state, None
 
                 if _use_compile:
                     step_fn = _ddp_compiled_step_fn
@@ -5938,7 +5995,6 @@ class MLXTrainer:
         if _ddp_update_outside_step and not _ddp_compile_local_grad:
             step_fn = _ddp_eager_local_step_fn
 
-        # Prepare eval batches
         eval_batches = None
         # (split_name, prompt_text, prompt_token_ids), filled by the plan
         # builder's own pass so the eval dataset is never read twice.
@@ -6030,7 +6086,6 @@ class MLXTrainer:
                 getattr(args, "per_device_eval_batch_size", None)
                 or args.per_device_train_batch_size
             )
-            # Use pre-built labeled eval batches if available
             _labeled_eval = getattr(self, '_eval_batches_labeled', None)
             if _labeled_eval is not None:
                 eval_batches = _labeled_eval
@@ -6256,7 +6311,6 @@ class MLXTrainer:
                     f"  - {rec.setting}={rec.recommended_value!r}: {rec.reason}"
                 )
 
-        # Training loop — mlx-lm pattern
         model.train()
         # HF's include_num_input_tokens_seen gate: "no"/False (its default, and the
         # one _ensure_callback_args_compat applies) skips input-token counting
@@ -6288,6 +6342,9 @@ class MLXTrainer:
         supervised_tokens = 0
         pending_supervised_tokens = 0
         pending_steps = 0
+        # Preference metric sums, split like the loss counters; None for SFT/VLM.
+        metric_stats = None
+        pending_stats = None
         trained_tokens = 0
         train_time = 0
         # Wall clock for the PENDING window, split like the loss/token counters
@@ -6373,6 +6430,7 @@ class MLXTrainer:
             on_log fires on every rank and self-gates on is_world_process_zero.
             """
             nonlocal losses, n_tokens, supervised_tokens, steps, train_time, trained_tokens
+            nonlocal metric_stats
             # Nothing accumulated since the last log: a callback can force
             # should_log again on a step that already logged, and the accumulators
             # are plain-int 0 after a reset, so .item() below would raise and a real
@@ -6456,6 +6514,16 @@ class MLXTrainer:
             }
             if grad_norm_val is not None:
                 logs["grad_norm"] = grad_norm_val
+            if metric_stats is not None:
+                summed_stats = self._distributed_all_sum(
+                    metric_stats, stream=mx.cpu,
+                )
+                mx.eval(summed_stats)
+                logs.update(_preference_metric_values(
+                    loss_fn._unsloth_preference_metrics,
+                    loss_fn._unsloth_preference_denominators,
+                    summed_stats.tolist(),
+                ))
             # HF's Trainer.log stamps the epoch onto every payload, so a persisted
             # log_history entry keeps it after state.epoch has moved on.
             if self.state.epoch is not None:
@@ -6479,6 +6547,7 @@ class MLXTrainer:
             n_tokens = 0
             supervised_tokens = 0
             steps = 0
+            metric_stats = None
             train_time = 0
 
         def _sample_generations(current_step):
@@ -6992,11 +7061,12 @@ class MLXTrainer:
             nonlocal _compile_fallback_reason
 
             def _eval_local_result(step_result):
-                lvalue, toks, local_state, _grad_norm = step_result
+                lvalue, toks, stats, local_state, _grad_norm = step_result
+                extra = () if stats is None else (stats,)
                 if local_state is not None:
-                    mx.eval(lvalue, toks, local_state[0], local_state[1])
+                    mx.eval(lvalue, toks, local_state[0], local_state[1], *extra)
                 else:
-                    mx.eval(lvalue, toks)
+                    mx.eval(lvalue, toks, *extra)
 
             local_error = None
             compile_error = None
@@ -7193,7 +7263,6 @@ class MLXTrainer:
 
             tic = time.perf_counter()
 
-            # Get next batch
             batch_error = None
             batch_data = None
             try:
@@ -7316,7 +7385,7 @@ class MLXTrainer:
                 self._distributed_should_stop()
 
             if _ddp_update_outside_step:
-                lvalue, toks, grad_accum_state, grad_norm = _run_ddp_local_step(
+                lvalue, toks, stats, grad_accum_state, grad_norm = _run_ddp_local_step(
                     batch_data, grad_accum_state, do_update,
                 )
                 if do_update:
@@ -7330,7 +7399,7 @@ class MLXTrainer:
                 if _use_compile and not _ddp_compile_local_grad:
                     rng_state_before = _mlx_rng_key()
                 try:
-                    lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                    lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
                         batch_data, grad_accum_state, do_update,
                     )
                 except (ValueError, RuntimeError, TypeError) as e:
@@ -7354,7 +7423,7 @@ class MLXTrainer:
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
                         state = [model.state, optimizer.state, mx.random.state]
-                        lvalue, toks, grad_accum_state, grad_norm = step_fn(
+                        lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
                         )
                     else:
@@ -7374,6 +7443,10 @@ class MLXTrainer:
             pending_n_tokens += toks
             pending_supervised_tokens += supervised_toks
             pending_steps += 1
+            if stats is not None:
+                pending_stats = (
+                    stats if pending_stats is None else pending_stats + stats
+                )
             if do_update:
                 # Window applied: fold pending into committed and reset pending.
                 # Evaluating the committed accumulators here materializes the folded
@@ -7393,6 +7466,13 @@ class MLXTrainer:
                 pending_supervised_tokens = 0
                 pending_steps = 0
                 _metric_eval = (losses, n_tokens, supervised_tokens)
+                if pending_stats is not None:
+                    metric_stats = (
+                        pending_stats if metric_stats is None
+                        else metric_stats + pending_stats
+                    )
+                    pending_stats = None
+                    _metric_eval = (*_metric_eval, metric_stats)
             else:
                 # Substep: only the pending window changed; committed is unchanged
                 # (already materialized at its last fold). Both are always arrays at
@@ -7400,6 +7480,8 @@ class MLXTrainer:
                 _metric_eval = (
                     pending_losses, pending_n_tokens, pending_supervised_tokens,
                 )
+                if pending_stats is not None:
+                    _metric_eval = (*_metric_eval, pending_stats)
             # One evaluation boundary: the reported norm (when present) is
             # evaluated together with model/optimizer state and metric
             # accumulators, never as a separate earlier graph execution.
@@ -7463,7 +7545,6 @@ class MLXTrainer:
                 train_time += pending_time
                 pending_time = 0
 
-            # Only log/eval on actual optimizer steps
             if not do_update:
                 accum_progress += 1
                 _fire("on_substep_end")
@@ -7515,6 +7596,7 @@ class MLXTrainer:
                         pending_losses = 0
                         pending_n_tokens = 0
                         pending_supervised_tokens = 0
+                        pending_stats = None
                         pending_steps = 0
                         # Drop the abandoned window's time with its tokens, else
                         # the next window's tokens/s is deflated by it.
@@ -7591,9 +7673,6 @@ class MLXTrainer:
             if should_log:
                 _run_training_log(current_step, grad_norm)
 
-            # Eval (cadence or a synced callback request). _run_eval builds eval
-            # batches lazily on every rank, runs the collective eval, then fires
-            # on_evaluate on rank 0 and syncs any stop before best tracking.
             # The static cadence mirrors DefaultFlowCallback's step-strategy
             # rule (strategy is STEPS, on a multiple of eval_steps, past
             # eval_delay); an explicit callback request stays independent of
@@ -7714,8 +7793,6 @@ class MLXTrainer:
                 sum(self._train_loss_history) / len(self._train_loss_history)
                 if self._train_loss_history else 0.0
             )
-        # Total wall-clock training time, consumed by the summary line and the
-        # distributed diagnostics / train_runtime metrics below.
         total_time = time.perf_counter() - start_time
 
         # Report the step actually reached, which is < total_steps after an
@@ -8490,7 +8567,6 @@ class MLXTrainer:
                     self.model, "_unsloth_quantized_source", None,
                 ),
             }
-            # Always emit num_layers for mlx-lm.load_adapters() attr-access.
             adapter_config["num_layers"] = _num_layers
             if _lora_rank is not None:
                 adapter_config["lora_parameters"] = {
@@ -8614,7 +8690,6 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
 
-    # 1. Gather all text strings (serial, fast)
     all_texts = []
     for item in dataset:
         if formatting_func is not None:
@@ -8761,7 +8836,6 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
 
-    # Limit if needed
     if num_batches is not None and len(schedule) > num_batches:
         schedule = schedule[:num_batches]
         widths = widths[:num_batches]
@@ -9024,7 +9098,6 @@ def train_on_responses_only(
         train_on_responses_only as _hf_train_on_responses_only,
     )
 
-    # Resolve tokenizer: kwarg > trainer.tokenizer
     _source = tokenizer
     if _source is None and trainer is not None:
         _source = trainer.tokenizer
@@ -9034,7 +9107,6 @@ def train_on_responses_only(
             "kwarg or via trainer.tokenizer."
         )
 
-    # Callable HF tokenizer for token matching and text batch encoding.
     _tokenizer = _resolve_response_mask_tokenizer(_source)
     _lazy_text_eval = False
     eval_dataset = getattr(trainer, "eval_dataset", None)
@@ -9076,7 +9148,6 @@ def train_on_responses_only(
     else:
         _detect_source = _tokenizer
 
-    # Get masking closure from the HF/CUDA implementation
     mask_fn = _hf_train_on_responses_only(
         None,
         instruction_part=instruction_part,
@@ -9098,7 +9169,6 @@ def train_on_responses_only(
         )
 
     if trainer._is_vlm:
-        # VLM path: store mask_fn for application during batch creation
         trainer._vlm_response_mask_fn = mask_fn
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
     else:
@@ -9135,7 +9205,6 @@ def train_on_responses_only(
             print("Unsloth: train_on_responses_only enabled (lazy text mode).")
             return trainer
 
-        # Eager/sized text path: tokenize, mask, and create batches now.
         total_batches_needed = (
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None

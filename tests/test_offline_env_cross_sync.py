@@ -121,7 +121,6 @@ class TestOfflineCrossSync:
             assert os.environ.get("HF_DATASETS_OFFLINE") == "1", spelling
 
     def test_non_truthy_value_leaves_env_unchanged(self, monkeypatch, reload_zoo):
-        # Values outside _OFFLINE_TRUE are passed through untouched.
         monkeypatch.setenv("HF_HUB_OFFLINE", "0")
         reload_zoo()
         assert os.environ.get("HF_HUB_OFFLINE") == "0"

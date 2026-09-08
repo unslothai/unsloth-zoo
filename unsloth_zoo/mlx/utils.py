@@ -2216,10 +2216,6 @@ def make_baseline_loss_fn(label_smoothing=0.0):
     return loss_fn
 
 
-# ---------------------------------------------------------------------------
-# VLM helpers
-# ---------------------------------------------------------------------------
-
 # Image/vision/audio special tokens that should never contribute to loss.
 # Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
 # so the two backends cannot drift apart.
@@ -2800,7 +2796,6 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # Vision token injection can change seq length
             logits, targets = _align_logits_with_labels(logits, targets)
 
-            # Build mask from attention_mask (shifted to match targets)
             if attention_mask is not None:
                 length_mask = attention_mask[:, 1:]
                 length_mask = length_mask[:, :targets.shape[1]]
@@ -2809,7 +2804,6 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
 
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
-            # Exclude masked positions from length_mask
             mask = mx.where(
                 targets == -100,
                 mx.array(0, dtype=length_mask.dtype),
@@ -3013,7 +3007,6 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = mx.where(length_mask, targets, ignore)
 
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
-        # Completion-only: mask prompt before first assistant response
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
 
         ntoks = (masked_targets != -100).sum()
@@ -12460,7 +12453,6 @@ class _LazyTextPrefetcher:
         self._lifecycle_lock = threading.Lock()
         self._close_lock = threading.Lock()
 
-    # -- producer side ----------------------------------------------------
     def _run(self):
         iterator = None
         try:
@@ -12529,7 +12521,6 @@ class _LazyTextPrefetcher:
             if self._closed or self._stop.is_set():
                 raise StopIteration
 
-    # -- consumer side ----------------------------------------------------
     def __iter__(self):
         return self
 
@@ -12553,7 +12544,6 @@ class _LazyTextPrefetcher:
             raise StopIteration
         raise payload
 
-    # -- lifecycle --------------------------------------------------------
     def quiesce(self):
         """RUNNING -> PAUSE_REQUESTED -> QUIESCENT; bounded, actionable."""
         if self._thread is None or not self._thread.is_alive():
@@ -14342,7 +14332,6 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 )
                 lora_dropout = _read_mlx_lora_dropout(module)
 
-        # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
@@ -14475,7 +14464,6 @@ def _get_model_config(model):
     """
     import dataclasses
 
-    # Prefer the raw config dict stashed by our loader
     if hasattr(model, "_config") and isinstance(model._config, dict):
         return _config_to_plain_python(model._config)
 
@@ -14490,7 +14478,6 @@ def _get_model_config(model):
             if isinstance(config, dict):
                 return _config_to_plain_python(config)
 
-    # Reconstruct from the ModelArgs dataclass
     if hasattr(model, "args"):
         if dataclasses.is_dataclass(model.args) and not isinstance(model.args, type):
             return _config_to_plain_python(model.args)
@@ -15165,6 +15152,25 @@ def _mlx_stacked_expert_tensor_names(model, tensor_names):
     return stacked
 
 
+@contextlib.contextmanager
+def _mlx_module_state_restored(modules):
+    """Leave these modules as they were found: an mlx `Module` is a dict of
+    parameters and children plus plain attributes, and both halves are put back.
+    State inside plain objects a module merely references is not reached."""
+    state = [(module, dict(module) if isinstance(module, dict) else None,
+              dict(vars(module))) for module in modules]
+    try:
+        yield
+    finally:
+        for module, items, attributes in state:
+            if items is not None:
+                # Through `dict`: `Module.update` reads a nested parameter tree.
+                dict.clear(module)
+                dict.update(module, items)
+            vars(module).clear()
+            vars(module).update(attributes)
+
+
 class _MlxReplayedSanitizers:
     """Sanitizers replayed in order, leaving no module of the model changed: Gemma 3
     ties its head and drops `lm_head` if handed no `lm_head.weight`."""
@@ -15174,24 +15180,13 @@ class _MlxReplayedSanitizers:
         self.held = tuple(held)
 
     def sanitize(self, weights):
-        # An mlx `Module` is a dict of parameters/children plus plain attributes.
-        state = [(module, dict(module) if isinstance(module, dict) else None,
-                  dict(vars(module))) for module in self.held]
-        try:
+        with _mlx_module_state_restored(self.held):
             for owner in self.owners:
                 weights = owner.sanitize(weights)
                 # A failed replay writes nothing: the export is then what it was without this pass.
                 if not isinstance(weights, Mapping):
                     raise TypeError("sanitize did not return a mapping")
             return weights
-        finally:
-            for module, items, attributes in state:
-                if items is not None:
-                    # Through `dict`: `Module.update` reads a nested parameter tree.
-                    dict.clear(module)
-                    dict.update(module, items)
-                vars(module).clear()
-                vars(module).update(attributes)
 
 
 def _mlx_moe_sanitizers(model):
@@ -16694,7 +16689,6 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
     # Save sharded safetensors + index.json
     save_model(path, de_lora_model, donate_model=False)
 
-    # Save config.json
     config = _get_model_config(model)
     if config:
         is_vlm = _is_vlm_model(model) or _has_vision_config(config)
@@ -16704,14 +16698,12 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
             is_vlm=is_vlm,
         )
 
-    # Save tokenizer
     tokenizer.save_pretrained(str(path))
 
     src_path = _get_src_path(model)
     if src_path is not None:
         _copy_source_sidecars(src_path, path)
 
-    # Model card
     hf_repo = getattr(model, "_hf_repo", None)
     try:
         create_model_card(path, hf_repo)
@@ -17173,7 +17165,6 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
         "llama.cpp cmake build",
     )
 
-    # Copy binaries to llama.cpp root
     bin_dir = os.path.join(build_dir, "bin")
     if os.path.exists(bin_dir):
         import glob as globmod
@@ -17317,7 +17308,6 @@ def save_pretrained_gguf(
         _download_convert_hf_to_gguf,
     )
 
-    # Map friendly names to llama.cpp quant types
     quant_map = {
         "not_quantized": "bf16",
         "fast_quantized": "q8_0",
@@ -17395,7 +17385,6 @@ def save_pretrained_gguf(
             "torch is only needed for GGUF export, not for training."
         )
 
-    # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Before the merge so a bad path fails in seconds, and outside save_directory so the
         # result is never mistaken for an exported model.
@@ -17435,7 +17424,6 @@ def save_pretrained_gguf(
         if _config_path.exists():
             _cfg = json.loads(_config_path.read_text())
             _changed = False
-            # Restore architectures from the original HF config
             if "architectures" not in _cfg:
                 _orig_cfg_path = getattr(tokenizer, "name_or_path", None)
                 if _orig_cfg_path:
@@ -17448,7 +17436,6 @@ def save_pretrained_gguf(
             if _changed:
                 _config_path.write_text(json.dumps(_cfg, indent=2))
 
-        # Step 2: Ensure llama.cpp is installed.
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
@@ -17486,7 +17473,6 @@ def save_pretrained_gguf(
                 quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
 
-        # Step 3: Download and patch convert_hf_to_gguf.py.
         # why: always go through the wrapper so UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
         # is honored even when a cached converter file exists.
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
@@ -17508,7 +17494,6 @@ def save_pretrained_gguf(
         elif isinstance(result, str):
             converter = result
 
-        # Step 4: Get model name for output filename
         hf_repo = getattr(model, "_hf_repo", None)
         if hf_repo:
             model_name = hf_repo.split("/")[-1]
@@ -17517,7 +17502,6 @@ def save_pretrained_gguf(
 
         output_base = str(save_directory / model_name)
 
-        # Step 5: Convert HF -> GGUF
         print(f"Unsloth: Converting to GGUF format...")
         kwargs = dict(
             model_name=output_base,
@@ -17550,7 +17534,6 @@ def save_pretrained_gguf(
                 else:
                     os.environ["PYTHONPATH"] = original_pythonpath
 
-        # Step 6: Quantize if the target quant differs from first_conversion
         if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
             quantizer = quantizer_location
             if not produced_files:
@@ -17580,7 +17563,6 @@ def save_pretrained_gguf(
                 os.remove(stale)
                 print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
-    # List produced files
     gguf_files = _exported_gguf_files(save_directory, imatrix_source)
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
@@ -17625,7 +17607,6 @@ def push_to_hub_merged(
 
     save_directory = Path(save_directory)
 
-    # Save first if not already saved
     if not (save_directory / "model.safetensors.index.json").exists():
         save_merged_model(model, tokenizer, save_directory)
 
@@ -17763,7 +17744,6 @@ def push_to_hub_gguf(
 
     save_directory = Path(save_directory)
 
-    # Export to GGUF
     save_pretrained_gguf(
         model,
         tokenizer,
@@ -17774,7 +17754,6 @@ def push_to_hub_gguf(
         imatrix_file=imatrix_file,
     )
 
-    # Upload GGUF files
     api = HfApi(token=token)
     # Same fail-loud private=True rule as the LoRA / merged paths so a
     # private=True request never silently leaks GGUF shards public.

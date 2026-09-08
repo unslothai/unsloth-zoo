@@ -79,8 +79,6 @@ def _pair(fail_after=0):
     return compiled, eager, calls
 
 
-# ---- the latch -----------------------------------------------------------
-
 def test_a_healthy_compiled_function_is_never_wrapped_out_of_the_way():
     compiled, eager, calls = _pair(fail_after=100)
     w = U._fall_back_to_eager_on_recompile_limit(compiled, eager, "M.forward")
@@ -147,8 +145,6 @@ def test_the_compiled_callable_stays_reachable():
     assert w.__wrapped__ is eager
 
 
-# ---- the graph-break arm is unchanged ------------------------------------
-
 def test_our_own_disabled_hook_falls_back_and_latches(monkeypatch):
     class GraphBreak(Exception):
         pass
@@ -182,8 +178,6 @@ def test_someone_elses_graph_break_still_raises(monkeypatch):
     with pytest.raises(GraphBreak):
         w(1)
 
-
-# ---- force_eager_fallback ------------------------------------------------
 
 def test_force_does_nothing_when_nothing_ever_fell_back():
     """The honest default. A caller getting 0 back knows the activation

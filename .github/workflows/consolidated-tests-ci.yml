@@ -137,6 +137,9 @@ jobs:
             venv=".lanes/venv-$version"
             log=".lanes/$version.log"
             (
+              # Per-lane generated-source dir: else 3.10 imports a cache 3.13 wrote.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$version"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 "$interpreter" -m venv "$venv" &&
@@ -296,6 +299,10 @@ jobs:
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
         #
+        # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
+        # eager fallback: still falls back on a first-call refusal, ends the step
+        # when a compiled pack is outstanding, latches only its own label. CPU-pure.
+        #
         # test_loss_normalization_contract pins num_items_in_batch: the grad-accum
         # guard, and the packed / padding-free boundary count. The second one
         # shipped broken for the same reason this comment keeps repeating -- the
@@ -310,6 +317,16 @@ jobs:
         # at step 0. No job here has an AMD runner, so it stubs device_count to 0 and
         # runs the dtype decision alone on CPU; left to --collect-only it would prove
         # only that it imports, which is the failure this comment already lists twice.
+        #
+        # The two compiled-cache files cover create_new_function's distributed
+        # protocol: the rank-local guard that let one rank skip a broadcast and
+        # hang the group under torchrun, and the digest agreement that stops two
+        # ranks importing different generated implementations. They are CPU-pure
+        # (the gloo file spawns two local ranks over a file:// rendezvous, no
+        # ports and no GPU) and take about 15 seconds together. Listing them here
+        # is the whole point of this block: 42 of the 44 fail against the code
+        # they fix, so left to --collect-only they would prove only that they
+        # import, which is the failure every paragraph above already describes.
         #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
@@ -356,6 +373,10 @@ jobs:
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
+            tests/test_disabled_hook_checkpoint_guard.py \
+            tests/test_conftest_module_leak_gate.py \
+            tests/test_compiled_cache_collective.py \
+            tests/test_compiled_cache_collective_gloo.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -522,15 +543,61 @@ jobs:
           .lanes/venv-suites/bin/python -c "import mlx_vlm, mlx_lm; print('mlx-vlm', mlx_vlm.__version__)"
           # If the joint resolution missed the transformers cap, this job is
           # gating an environment the package forbids.
+          #
+          # Read the cap off our own installed metadata rather than repeating it
+          # as a literal. A literal here says "<=5.5.0" and means "whatever
+          # pyproject pins": the moment pyproject legitimately moves the cap the
+          # gate reports drift that does not exist, which is exactly how #1144
+          # went red. It also only ever checked the ceiling, so a resolution
+          # landing on one of the excluded releases (4.57.4, 5.0.0, ...) passed.
+          # The whole specifier set is the contract, so assert the whole thing.
           .lanes/venv-suites/bin/python - <<'PY'
-          from importlib.metadata import version
+          from importlib.metadata import requires, version
+          from packaging.requirements import Requirement
           from packaging.version import Version
-          transformers = Version(version("transformers"))
-          assert transformers <= Version("5.5.0"), (
-              f"transformers {transformers} exceeds the cap this package pins; "
-              "the MLX packages were resolved without it"
+
+          specifiers = {
+              str(req.specifier)
+              for raw in (requires("unsloth_zoo") or [])
+              for req in [Requirement(raw)]
+              if req.name.lower().replace("_", "-") == "transformers"
+          }
+          assert specifiers, (
+              "unsloth_zoo declares no transformers requirement, so this gate is "
+              "checking nothing. Did the dependency move out of pyproject.toml?"
           )
-          print("transformers", transformers, "within the pinned cap")
+          assert len(specifiers) == 1, (
+              f"unsloth_zoo pins transformers inconsistently across extras: "
+              f"{sorted(specifiers)}. Pick one before this gate can mean anything."
+          )
+          pinned = Requirement(f"transformers{specifiers.pop()}").specifier
+          transformers = Version(version("transformers"))
+          assert transformers in pinned, (
+              f"transformers {transformers} is outside the range this package "
+              f"pins ({pinned}); the MLX packages were resolved without it"
+          )
+          print("transformers", transformers, "within the pinned range", pinned)
+
+          # The ceiling is a deliberate policy choice, not an incidental number,
+          # so state it here as well and on purpose. mlx-vlm >= 0.6.9 requires
+          # transformers >= 5.14, and we are not taking that jump yet; the cap is
+          # what keeps the joint MLX resolution off it. Checking only "matches
+          # pyproject" above would let an automated dependency bump raise the cap
+          # and quietly opt the whole project in -- which is exactly what #1144
+          # did. Raising this is a decision: change CEILING in the same commit
+          # that changes pyproject.toml, deliberately.
+          CEILING = Version("5.5.0")
+          declared = [
+              Version(str(s.version)) for s in pinned if s.operator == "<="
+          ]
+          assert declared and max(declared) <= CEILING, (
+              f"pyproject.toml pins transformers <= {max(declared) if declared else None}, "
+              f"above the {CEILING} ceiling this project holds on purpose. "
+              "mlx-vlm >= 0.6.9 needs transformers >= 5.14 and we are not "
+              "following it yet. If raising it is intended, raise CEILING here "
+              "in the same commit and say why."
+          )
+          print("declared ceiling", max(declared), "at or below the policy ceiling", CEILING)
           PY
 
       - name: pytest tests/test_mlx_quantized_optimizer_state.py (HARD GATE)
@@ -573,6 +640,14 @@ jobs:
 
       # One pytest process per file: tests/mlx_simulation/ replaces
       # sys.modules["mlx.core"] process-wide, disarming whatever runs after it.
+      - name: tests/test_mlx_lora_group_selection.py
+        # Group-flag selection is structural, so real Metal adds nothing to it
+        # and the CPU backend is a full gate.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_lora_group_selection.py -v -rs
+
+      - name: tests/test_mlx_resume_adapter_mismatch.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_resume_adapter_mismatch.py -v -rs
+
       - name: tests/test_mlx_shape_guard.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_shape_guard.py -v -rs
 
@@ -582,6 +657,31 @@ jobs:
 
       - name: tests/test_mlx_batching_and_decay.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
+
+      # The three gated-delta files ran in no workflow at all: this lane's list
+      # omitted them and the Apple Silicon lane, which is opt-in behind the `mlx`
+      # label, names only test_qwen35_vjp_metal.py. So the ops VJP, the batched
+      # gradient regression from #776 and the consumer-binding sweep shipped
+      # ungated. They need mlx core plus mlx-lm, not Metal, so they belong here;
+      # the Metal-only halves skip and stay the macOS lane's job.
+      - name: tests/test_mlx_gated_delta.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta.py -v -rs
+
+      - name: tests/test_mlx_gated_delta_vjp.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_vjp.py -v -rs
+
+      - name: tests/test_mlx_gated_delta_batch_grad.py
+        # Gradient parity vs plain autodiff at B >= 2. Every test here needs the
+        # real runtime, so under the torch shim the file skips wholesale -- which
+        # is exactly what the gate below refuses to accept as a pass.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -v -rs
+
+      - name: Fail if the gated-delta gradient tests skipped
+        run: |
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -q -rs | tee gd.txt
+          if ! grep -qiE '[1-9][0-9]* passed' gd.txt; then
+            echo "real mlx is installed but no gated-delta gradient test ran"; exit 1
+          fi
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
@@ -703,6 +803,10 @@ jobs:
             id="$1"; shift
             venv=".lanes/venv-$id"; log=".lanes/$id.log"
             (
+              # Per-lane generated-source dir, absolute (compiler.py puts it on sys.path):
+              # concurrent lanes sharing one checkout rewrite the default cache under a reader.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$id"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
                 set -x &&
@@ -760,6 +864,9 @@ jobs:
                   tests/test_upstream_source_patterns.py \
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
+                  tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_vision_utils_grid_helpers_eager.py \
+                  tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \

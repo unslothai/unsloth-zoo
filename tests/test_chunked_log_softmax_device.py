@@ -80,9 +80,7 @@ def test_head_on_another_device_matches_single_device():
     hidden_states, lm_head, index = _inputs("cuda:0")
     same = chunked_hidden_states_selective_log_softmax(hidden_states, lm_head, index, **KWARGS)
 
-    # The head is the tensor that moves: accelerate puts the tail of the model
-    # on the last device it fills, while the hidden states arrive from earlier
-    # layers on an earlier device.
+    # The head is the tensor that moves: accelerate puts the model's tail on the last device it fills.
     split = chunked_hidden_states_selective_log_softmax(
         hidden_states, lm_head.to("cuda:1"), index, **KWARGS,
     )
@@ -113,8 +111,7 @@ def test_row_cap_default_keeps_chunk_boundaries():
 
 
 def test_row_cap_splits_further_without_changing_the_answer():
-    # float32 in, so pure loop splitting is exact here. In lower precision the
-    # matmul shape changes and tiny last-bit differences are expected.
+    # float32 in, so pure loop splitting is exact; lower precision changes the matmul shape.
     hidden_states, lm_head, index = _inputs("cpu", batch = 2, seq = 64)
     ref = _run(hidden_states, lm_head, index, **KWARGS)
     capped = _run(hidden_states, lm_head, index, max_rows_per_chunk = 8, **KWARGS)

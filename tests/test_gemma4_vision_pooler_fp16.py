@@ -65,7 +65,7 @@ def make_buggy_classes(standardize=True, model_dtype=torch.float16, return_tuple
 
         def forward(self, pixel_values):
             # Upstream-like: cast pixels to the weight dtype, then run the real
-            # (autocast-eligible) Linear; identity weight keeps amax controlled.
+            # (autocast-eligible) Linear; the identity weight keeps amax controlled.
             return self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
 
     class TinyVisionModel(torch.nn.Module):
@@ -174,9 +174,7 @@ def test_patched_standardize_false_casts_back():
 
 
 def test_mixed_fp32_pixels_fp16_tower_casts_to_tower_dtype():
-    # HF processor output is fp32; the embedder casts it to fp16. The cast-back
-    # target must be the tower dtype, not the pixel dtype, or fp32 features hit
-    # the fp16 embed_vision projection downstream.
+    # Cast back to the tower dtype: fp32 features would hit the fp16 embed_vision.
     TinyPooler, TinyVisionModel = make_buggy_classes()
     assert _patch_gemma4_vision_pooler_fp16(TinyPooler, TinyVisionModel) == "patched"
     out = make_model(TinyVisionModel)(fp16_overflow_input(torch.float32)).last_hidden_state
@@ -233,8 +231,7 @@ def test_bf16_autocast_over_fp16_weights_untouched():
 
 
 def test_captured_hidden_states_stay_consistent():
-    # The capture wrapper ties hidden_states[-1] to the pre-cast final
-    # state; that entry must be cast too.
+    # hidden_states[-1] is the pre-cast final state; it must be cast too.
     TinyPooler, TinyVisionModel = make_buggy_classes()
 
     original_forward = TinyVisionModel.forward
@@ -286,8 +283,7 @@ def test_idempotent():
 
 
 def test_repair_reinstalls_missing_vision_wrapper():
-    # A marked pooler without its paired vision wrapper (only external rebind
-    # can produce this) must be repaired, never reported "already".
+    # A marked pooler missing its vision wrapper is repaired, never "already".
     TinyPooler, TinyVisionModel = make_buggy_classes()
     original_vision = TinyVisionModel.forward
     assert _patch_gemma4_vision_pooler_fp16(TinyPooler, TinyVisionModel) == "patched"

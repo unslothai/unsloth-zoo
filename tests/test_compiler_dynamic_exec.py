@@ -30,6 +30,7 @@ import ast
 import importlib
 import inspect
 import os
+import sys
 import textwrap
 
 import pytest
@@ -56,8 +57,160 @@ def _compile_disabled(monkeypatch):
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
 
 
-# Model types the zoo compiler drives end-to-end (from
-# unsloth_compile_transformers call sites and test_apply_fused_lm_head).
+@pytest.fixture(autouse = True)
+def _unimport_the_compile_folder(monkeypatch):
+    """Take back out of ``sys.modules`` whatever the compile folder put in.
+
+    Driving ``unsloth_compile_transformers`` writes a generated module and then
+    imports it, and a generated MoE module imports its helpers by bare name --
+    ``moe_utils`` and friends resolve only because the compile folder is on
+    ``sys.path``. Nothing in the installed environment provides that name, so
+    the import IS the swap, and the module it leaves behind outlives the
+    directory it was read from. Every later test in the process that imports it
+    bare then gets a stale copy, and because the generated module swallows that
+    import it loads reporting success with its backend names undefined. That is
+    #1168's failure, arriving here by a second route: it fixed the leak in
+    test_moe_weight_preprocessor_registry_shared.py and added the gate that now
+    catches this one on `Core drift`, where a newer transformers takes the
+    qwen3_moe path that emits the import.
+
+    Keyed on where a module was loaded from rather than on a list of names, so a
+    generated module that starts importing some new helper is covered without
+    anyone remembering to add it here.
+
+    ``monkeypatch`` is requested for its teardown ordering, not for its API:
+    depending on it puts this finalizer ahead of the env being unpatched, so
+    ``get_compile_folder()`` below still resolves the folder the test used.
+    """
+    before = dict(sys.modules)
+    try:
+        yield
+    finally:
+        try:
+            folder, _ = compiler.get_compile_folder()
+            root = os.path.realpath(folder)
+        except Exception:
+            return
+        for name, module in list(sys.modules.items()):
+            path = getattr(module, "__file__", None)
+            if not path:
+                continue
+            try:
+                resolved = os.path.realpath(path)
+            except (OSError, ValueError):
+                continue
+            if resolved != root and not resolved.startswith(root + os.sep):
+                continue
+            if name in before:
+                sys.modules[name] = before[name]
+            else:
+                del sys.modules[name]
+
+
+def _own_torch_nn_forwards():
+    """The ``forward`` each ``torch.nn`` class defines in its own ``__dict__``.
+
+    Read off ``vars(cls)`` rather than ``getattr``, so an inherited forward is
+    not recorded as if the class owned one and then installed on it as a real
+    attribute by the restore below.
+    """
+    try:
+        import torch
+    except Exception:
+        return None
+    return {
+        name: vars(obj)["forward"]
+        for name, obj in vars(torch.nn).items()
+        if isinstance(obj, type) and "forward" in vars(obj)
+    }
+
+
+@pytest.fixture(autouse = True)
+def _restore_torch_nn_forwards():
+    """Put ``torch.nn``'s own forwards back after the dtype loop rewrites them.
+
+    ``unsloth_compile_transformers`` patches ``torch.nn.<Module>.forward`` in
+    place, on the real ``torch.nn``, and nothing here undoes it. The wrappers
+    then outlive the test and every later test in the process sees a torch.nn
+    that is already patched.
+
+    That is not theoretical: it fails
+    ``test_compiled_cache_collective.py::test_repeated_dtype_patching_does_not_stack_the_source_rewrite``,
+    which opens by capturing ``pristine = torch.nn.Conv2d.forward`` and then
+    asserts the installed marker carries torch's own forward. Run after this
+    module in one process, what it captures is already a
+    ``_dtype_safe_forward.<locals>.forward``, so the assertion compares a
+    wrapper against the genuine original and fails on a contract that holds.
+    The two files are in different jobs today, `Core drift` and
+    `Repo tests (CPU)`, so CI does not currently put them in one process. That
+    is a scheduling accident and not a property worth relying on.
+
+    Two directions, because the loop patches by assignment and assignment does
+    not care whether the class had a forward of its own.
+
+    A class that owned one gets it put back by identity rather than deleted:
+    several of these legitimately define their own, and deleting would expose
+    an inherited one instead.
+
+    A class that owned none has to have the attribute deleted, not restored,
+    and this is the half worth stating. ``BatchNorm1d``, ``BatchNorm2d`` and
+    ``BatchNorm3d`` inherit ``forward`` from ``_BatchNorm``, so they are absent
+    from the snapshot; the loop then gives each one a real attribute it never
+    had. Restoring only the recorded names leaves those three rewritten, which
+    is exactly what an audit of what survives teardown found still leaking
+    after the first version of this fixture.
+    """
+    before = _own_torch_nn_forwards()
+    try:
+        yield
+    finally:
+        if before is None:
+            return
+        import torch
+        for name, obj in vars(torch.nn).items():
+            if not isinstance(obj, type):
+                continue
+            current = vars(obj).get("forward")
+            if current is None:
+                continue
+            if name in before:
+                if current is not before[name]:
+                    obj.forward = before[name]
+            else:
+                delattr(obj, "forward")
+
+
+@pytest.fixture(autouse = True)
+def _restore_unsloth_env():
+    """Undo the ``UNSLOTH_*`` variables the compiler sets on its way through.
+
+    ``monkeypatch`` only knows about what the *test* set. The compiler writes
+    to ``os.environ`` itself, and an audit of what survives teardown found
+    three escaping every drive:
+
+        UNSLOTH_FULLGRAPH                 unset -> '1'
+        UNSLOTH_HIGH_PRECISION_LAYERNORM  unset -> '0'
+        UNSLOTH_RETURN_LOGITS             unset -> '0'
+
+    ``UNSLOTH_FULLGRAPH`` in particular changes how later tests compile, and
+    the module that set it is long gone by then. Restoring the whole
+    ``UNSLOTH_*`` namespace to its snapshot is idempotent with respect to
+    ``monkeypatch``, which puts the same original values back whichever of the
+    two finalizers runs first.
+    """
+    before = {k: v for k, v in os.environ.items() if k.startswith("UNSLOTH_")}
+    try:
+        yield
+    finally:
+        for key in [k for k in os.environ if k.startswith("UNSLOTH_")]:
+            if key not in before:
+                del os.environ[key]
+        for key, value in before.items():
+            if os.environ.get(key) != value:
+                os.environ[key] = value
+
+
+# Model types the zoo compiler drives end-to-end (from its call sites).
 KNOWN_MODEL_TYPES = [
     "llama",
     "llama4",
@@ -115,9 +268,7 @@ def _load_modeling(model_type: str):
             f"transformers, can't drive compiler"
         )
     except ImportError as exc:
-        # Present but raising on the way in: gemma3n's config imports
-        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
-        # drive either way, but say which.
+        # gemma3n's config imports ImageNetInfo from a timm.data that dropped it.
         pytest.skip(
             f"model_type {model_type} raised on import, so the compiler cannot "
             f"be driven for it: {type(exc).__name__}: {exc}"
@@ -164,9 +315,7 @@ def _assert_execs(rewritten: str, entry_point: str, *, dedent: bool = False):
         pass
 
 
-# Per-rewriter tests against real transformers source. gemma3 is the
-# canonical driver: it exercises almost every rewriter path (RMSNorm,
-# sliding-window attn, RoPE, MoE routing, projector, ForConditionalGeneration).
+# gemma3 is the canonical driver: RMSNorm, sliding attn, RoPE, MoE, ForCondGen.
 
 
 @pytest.fixture(scope="module")
@@ -534,10 +683,8 @@ def test_replace_with_grouped_query_attention_inserts_enable_gqa():
     )
 
 
-# End-to-end: unsloth_compile_transformers(model_type=X) chains every
-# rewriter and emits unsloth_compiled_module_<type>.py to
-# unsloth_compiled_cache/ (see ``unsloth_zoo/compiler.py:66-67``
-# COMBINED_UNSLOTH_NAME). Drive per known model type, AST-parse the cache.
+# unsloth_compile_transformers(X) emits unsloth_compiled_module_<type>.py
+# (``unsloth_zoo/compiler.py:66-67``).
 
 
 def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
@@ -545,7 +692,6 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "1")
 
-    # Clear __UNSLOTH_PATCHED__ so the pipeline rebuilds each time.
     try:
         mod = importlib.import_module(
             f"transformers.models.{model_type}.modeling_{model_type}",
@@ -556,9 +702,7 @@ def _compile_and_get_cache(model_type: str, monkeypatch) -> str:
             f"transformers, can't drive compiler"
         )
     except ImportError as exc:
-        # Present but raising on the way in: gemma3n's config imports
-        # ImageNetInfo from timm.data, which a newer timm dropped. Nothing to
-        # drive either way, but say which.
+        # gemma3n's config imports ImageNetInfo from a timm.data that dropped it.
         pytest.skip(
             f"model_type {model_type} raised on import, so the compiler cannot "
             f"be driven for it: {type(exc).__name__}: {exc}"
@@ -664,8 +808,8 @@ def test_smoke_unsloth_compile_transformers_unknown_model_type(monkeypatch):
     )
 
 
-# AST validity of constant source blocks in compiler.py, exec()'d verbatim
-# by ``create_new_function`` (see ``unsloth_zoo/compiler.py:801-1126``).
+# Constant source blocks exec()'d verbatim by ``create_new_function``
+# (``unsloth_zoo/compiler.py:801-1126``).
 
 
 @pytest.mark.parametrize(
@@ -685,9 +829,7 @@ def test_compiler_constant_source_blocks_parse(const_name):
     block = getattr(compiler, const_name, None)
     if block is None:
         pytest.skip(f"{const_name} not present (renamed?)")
-    # replace_gradient_checkpointing template has LAYER / ARGS /
-    # MODULELIST_ITEM / $ placeholders substituted in the rewriter;
-    # substitute representative values here so the parser sees real source.
+    # The rewriter substitutes LAYER / ARGS / MODULELIST_ITEM / $; do the same.
     if const_name == "replace_gradient_checkpointing":
         block = (
             block.replace("LAYER", "layer")

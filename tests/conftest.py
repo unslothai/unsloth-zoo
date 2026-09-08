@@ -44,11 +44,6 @@ import sys
 import types
 
 
-# ---------------------------------------------------------------------------
-# 1. GPU-free harness: pre-load device_type so importing unsloth_zoo
-#    without CUDA / XPU / HIP visible doesn't raise.
-# ---------------------------------------------------------------------------
-
 def _has_real_accelerator() -> bool:
     try:
         import torch
@@ -215,24 +210,17 @@ if not _has_real_accelerator():
     _patch_torch_cuda_for_import()
 
 
-# ---------------------------------------------------------------------------
-# 2. Make ``tests/mlx_simulation`` importable as ``mlx_simulation`` for
-#    the MLX-on-torch shim suite.
-# ---------------------------------------------------------------------------
-
 _TESTS_DIR = pathlib.Path(__file__).resolve().parent
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 
 
-# ---------------------------------------------------------------------------
 # 3. Apply upstream-drift fixes (triton CompiledKernel attrs, vLLM rename,
 #    peft transformers_weight_conversion shim, etc.) by triggering
 #    ``import unsloth``. Fixes live on ``unsloth/import_fixes.py`` and run
 #    at unsloth import time; zoo no longer carries a copy. Security-only
 #    test suites without unsloth installed keep passing -- ImportError is
 #    swallowed below.
-# ---------------------------------------------------------------------------
 
 def _apply_upstream_import_fixes_for_tests() -> None:
     # Let `import unsloth` succeed on a CPU-only CI runner. The flag is
@@ -297,6 +285,38 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
 # the same and is already used elsewhere in these files: monkeypatch.setitem, which puts
 # the original back.
 _GUARDED_MODULES = ("bitsandbytes", "bitsandbytes.functional", "bitsandbytes.nn")
+
+# Names that nothing in the installed environment provides. A top-level `moe_utils`
+# only ever resolves because something put a compile-cache directory on sys.path.
+# Leaving one behind makes the bare `from moe_utils import ...` in every generated
+# MoE module resolve to it, which is invisible because that import is deliberately
+# swallowed -- the module loads reporting success with its backend names undefined.
+# That is how test_compiled_cache_collective.py's recovery test failed on main while
+# passing when run alone.
+#
+# Flagged only when the copy came out of a pytest temp directory, and that
+# qualification is load-bearing rather than caution. Compiling a MoE architecture
+# imports moe_utils out of the real unsloth_compiled_cache as ordinary production
+# behaviour, and that copy stays valid for the rest of the session; a rule without
+# the qualification fails test_compiler_dynamic_exec.py for doing its job. A copy
+# read from a tmp_path_factory directory is the opposite: it outlives the directory
+# and is a different module from the one the next test means to import.
+_GUARDED_BARE_MODULES = ("moe_utils",)
+
+
+def _is_from_pytest_tmp(mod):
+    import pathlib
+
+    path = getattr(mod, "__file__", None)
+    if not path:
+        return False
+    # Matched on the "pytest-of-<user>" element tmp_path_factory always creates,
+    # rather than on a basetemp looked up from the config: --basetemp overrides it,
+    # xdist gives each worker its own, and a stale entry can outlive the fixture
+    # that made it. The directory name is the stable part.
+    return any(
+        part.startswith("pytest-of-") for part in pathlib.Path(path).parts
+    )
 _MODULE_SNAPSHOT_KEY = "_unsloth_guarded_module_snapshot"
 
 
@@ -311,7 +331,10 @@ def _is_module_stub(mod):
 def pytest_runtest_setup(item):
     import sys as _sys
 
-    setattr(item, _MODULE_SNAPSHOT_KEY, {n: _sys.modules.get(n) for n in _GUARDED_MODULES})
+    setattr(item, _MODULE_SNAPSHOT_KEY, {
+        n: _sys.modules.get(n)
+        for n in _GUARDED_MODULES + _GUARDED_BARE_MODULES
+    })
 
 
 @_pytest.hookimpl(trylast = True)
@@ -334,6 +357,13 @@ def pytest_runtest_teardown(item, nextitem):
         now = _sys.modules.get(name)
         if now is was:
             continue
+        if name in _GUARDED_BARE_MODULES:
+            # See _GUARDED_BARE_MODULES: for these the import itself can be the
+            # swap, so the exemption below does not apply. Narrowed to the copies
+            # that go stale, which are the ones a later test can be misled by.
+            if _is_from_pytest_tmp(now):
+                leaked.append(name)
+            continue
         if was is None and not _is_module_stub(now):
             # Nothing was there and the test imported the real thing. That is an
             # import, not a swap, and flagging it would fail every test that touches
@@ -341,8 +371,17 @@ def pytest_runtest_teardown(item, nextitem):
             continue
         leaked.append(name)
     if leaked:
+        # Naming the file is the whole diagnosis for the bare names: whether the copy
+        # is a leak or the compile folder doing its job is a question about where it
+        # was read from, and without this the report is the same either way.
+        where = ", ".join(
+            f"{n} from {getattr(_sys.modules.get(n), '__file__', None)!r}"
+            for n in leaked
+        )
         raise AssertionError(
-            f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back, "
+            f"{item.nodeid} replaced {leaked} in sys.modules and did not put it back "
+            f"({where}), "
             f"so every later test in this process imports the substitute. Use "
-            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown."
+            f"monkeypatch.setitem(sys.modules, ...), which restores on teardown, or"
+            f"save and restore the entry by hand where the import itself installs it."
         )

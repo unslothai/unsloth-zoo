@@ -43,8 +43,7 @@ from unsloth_zoo import compiler
 PROBE_NAME = "UnslothCompileStampProbe"
 PROBE_SOURCE = "def _unsloth_stamp_probe():\n    return 1\n"
 
-# What unsloth/models/rl.py passes for a generated RL trainer, and what the
-# zoo's own peft / combined-module call sites pass.
+# What unsloth/models/rl.py passes for a generated RL trainer, versus the zoo's own call sites.
 TRL_LOCATION = "trl.trainer.sft_trainer"
 NON_TRL_LOCATION = "transformers.models.qwen2.modeling_qwen2"
 
@@ -278,8 +277,7 @@ def test_the_trl_marker_is_matched_as_a_whole_word(tmp_path, monkeypatch):
         tmp_path, monkeypatch, overwrite=True,
         model_location=NON_TRL_LOCATION, source=ctrl_body,
     )
-    # The body comment above deliberately contains a real whole-word `trl`;
-    # strip it so only `ctrl` remains, which must not trip the backstop.
+    # The fixture body carries a real whole-word `trl`; strip it so only `ctrl` remains.
     path.write_text(path.read_text().replace("# ctrl, not trl", "# ctrl only"))
     _rewrite_trl_stamp(path, "0.0.1-stale")
 

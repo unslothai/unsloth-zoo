@@ -13,16 +13,10 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-# Gated-delta VJP tests:
-#   * consumer-binding sweep: stale `from .gated_delta import ...` bindings
-#     must be rebound by identity, foreign impls left alone (torch shim on CI).
-#   * structural gated-delta detection for the patch trigger.
+# Gated-delta VJP tests, including:
 #   * gradient parity vs PLAIN AUTODIFF for the ops and fused-kernel VJP,
 #     B >= 2 (mx `.at[:, t].add` corrupted rows past the first on mlx 0.31,
 #     fixed by ml-explore/mlx#3483). Metal-only.
-#   * kernel routing: training calls must reach the fused-kernel VJP.
-#   * the training window that turns those patches on, the index detachment it
-#     installs, and the fusions it must disable.
 
 from __future__ import annotations
 
@@ -36,12 +30,11 @@ import pytest
 from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch
 
 # `find_spec("mlx")` alone answers "can mlx be imported", which is NOT the same
-# question once any sibling module has installed the torch shim: that registers
+# question once a sibling module has installed the torch shim: that registers
 # `mlx` in sys.modules and a finder in sys.meta_path, so the spec exists and this
 # file concludes it is on real MLX. It then runs the `requires_real_mlx` tests
-# against a shim where `mx.argpartition` is a `_Noop`. Whether that happens comes
-# down to collection order, which is why it surfaced only when a new sibling
-# sorting before this one began installing the shim at import.
+# against a shim where `mx.argpartition` is a `_Noop`, and whether that happens
+# comes down to collection order.
 _HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None and not mlx_is_simulated()
 if not _HAS_REAL_MLX:
     simulate_mlx_on_torch()
@@ -62,8 +55,8 @@ requires_metal = pytest.mark.skipif(
 )
 requires_real_mlx = pytest.mark.skipif(not _HAS_REAL_MLX, reason="needs real MLX")
 
-# Snapshot the REAL mlx/mlx_lm modules now, before sibling test files install
-# the mlx_simulation torch-stub into sys.modules, so the code under test
+# Snapshot the REAL mlx/mlx_lm modules now, before sibling test files install the
+# mlx_simulation torch-stub into sys.modules, so the code under test
 # resolves the real stack regardless of order. The explicit import pulls in
 # mlx_lm.models.gated_delta (the kernel path from-imports it at call time).
 if _HAS_REAL_MLX:
@@ -102,7 +95,6 @@ def _restore_real_mlx_modules():
                 sys.modules[name] = module
 
 
-# -- consumer-binding sweep ---------------------------------------------------
 
 
 @pytest.fixture()
@@ -189,7 +181,6 @@ def test_second_call_sweeps_consumers_imported_after_first_patch(
     assert fake_mlx_lm.gated_delta.gated_delta_update is patched
 
 
-# -- structural gated-delta detection -----------------------------------------
 
 
 def test_structural_detection():
@@ -248,7 +239,6 @@ def test_structural_detection_matches_unnamed_linear_attention(monkeypatch):
         assert not model_has_gated_delta_layers(_model(mixer, attn))
 
 
-# -- gradient parity vs plain autodiff (Metal only) ---------------------------
 
 
 def _plain_reference(q, k, v, g, beta, state):
@@ -280,7 +270,7 @@ def _make_case(B, T, Hk, Hv, Dk, Dv, dtype, vectorized=False):
 
 
 CASES = [
-    # (B, T, Hk, Hv, Dk, Dv, dtype, tol, vectorized) — B >= 2 everywhere.
+    # (B, T, Hk, Hv, Dk, Dv, dtype, tol, vectorized); B >= 2 everywhere.
     # vectorized=True exercises kimi_linear-style per-column gating.
     (2, 96, 2, 4, 64, 32, mx.float32, 5e-4, False),
     (3, 70, 2, 4, 32, 16, mx.float32, 5e-4, False),
@@ -402,11 +392,71 @@ def test_kernel_dispatch_guards_partial_threadgroup_rows():
     g = mx.zeros((1, 8, 2))
     ok_v = mx.zeros((1, 8, 2, 16))
     bad_v = mx.zeros((1, 8, 2, 30))
-    assert gv.gated_delta_kernel_supported(q, g, None, ok_v)
-    assert not gv.gated_delta_kernel_supported(q, g, None, bad_v)
+    assert gv.gated_delta_kernel_supported(q, g, None, ok_v, q)
+    assert not gv.gated_delta_kernel_supported(q, g, None, bad_v, q)
 
 
-# -- training window and index detachment -------------------------------------
+@pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
+def test_kernel_support_declines_off_metal_without_touching_the_layout_search():
+    """Off Metal the predicate must answer False, not raise.
+
+    The layout search reads `dtype.size`, which only a real mx.Dtype has, so with
+    it ahead of the device guard a training call under the torch shim died with
+    AttributeError instead of falling back to the ops VJP.
+    """
+    import unsloth_zoo.gated_delta_vjp as gv
+
+    q = mx.zeros((1, 8, 2, 64))
+    k = mx.zeros((1, 8, 2, 64))
+    v = mx.zeros((1, 8, 2, 64))
+    for g in (mx.zeros((1, 8, 2)), mx.zeros((1, 8, 2, 64))):
+        assert gv.gated_delta_kernel_supported(q, g, None, v, k) is False
+
+
+@pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
+def test_training_call_falls_back_to_ops_vjp_off_metal(monkeypatch):
+    """The whole dispatch, not just the predicate: an open training window off
+    Metal must reach gated_delta_ops_efficient."""
+    import types
+
+    import unsloth_zoo.gated_delta_vjp as gv
+
+    # patch_gated_delta does `from mlx_lm.models import gated_delta`, which reads
+    # the package ATTRIBUTE, so sys.modules alone is not enough to redirect it.
+    package = types.ModuleType("mlx_lm")
+    models = types.ModuleType("mlx_lm.models")
+    module = types.ModuleType("mlx_lm.models.gated_delta")
+    module.gated_delta_update = lambda *args, **kwargs: ("original", None)
+    module.gated_delta_kernel = lambda *args, **kwargs: ("kernel", None)
+    module.compute_g = lambda A_log, a, dt_bias: mx.zeros(a.shape)
+    models.gated_delta = module
+    package.models = models
+    monkeypatch.setitem(sys.modules, "mlx_lm", package)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models", models)
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.gated_delta", module)
+
+    reached = []
+    real_ops = gv.gated_delta_ops_efficient
+    monkeypatch.setattr(
+        gv, "gated_delta_ops_efficient",
+        lambda *args, **kwargs: (reached.append(True), real_ops(*args, **kwargs))[1],
+    )
+    gv.patch_gated_delta()
+
+    q = mx.zeros((1, 8, 2, 64))
+    v = mx.zeros((1, 8, 2, 64))
+    a = mx.zeros((1, 8, 2))
+    acquire_mlx_training_patches()
+    try:
+        module.gated_delta_update(
+            q, q, v, a, a, mx.zeros((2,)), mx.zeros((2,)),
+            state=None, mask=None, use_kernel=True,
+        )
+    finally:
+        release_mlx_training_patches()
+    assert reached, "training call off Metal did not reach the ops VJP"
+
+
 
 @pytest.fixture
 def index_stop():
@@ -424,9 +474,9 @@ def test_window_depth_accounting():
     assert not mlx_training_patches_active()
     acquire_mlx_training_patches()
     acquire_mlx_training_patches()
-    # The outer run still needs the patches, so removing them is refused -- but
-    # the evaluation doing the pausing must still stop reading as training,
-    # otherwise nesting silently routes it down the training paths.
+    # The outer run still needs the patches, so removing them is refused, but the
+    # evaluation doing the pausing must still stop reading as training, otherwise
+    # nesting silently routes it down the training paths.
     assert pause_mlx_training_patches() is False
     assert not mlx_training_patches_active()
     assert mx.take_along_axis._unsloth_index_stop_gradient
@@ -441,7 +491,6 @@ def test_window_depth_accounting():
     release_mlx_training_patches()
     assert not mlx_training_patches_active()
     assert all(getattr(mx, n) is originals[n] for n in _MLX_INDEX_OP_NAMES)
-    # Outside a run there is nothing to close, and nothing to reopen.
     resume_mlx_training_patches(pause_mlx_training_patches())
     assert not mlx_training_patches_active()
 
@@ -559,7 +608,7 @@ def test_patch_gated_delta_survives_an_mlx_lm_without_the_module(monkeypatch):
     if mlx_lm_models is not None:
         monkeypatch.delattr(mlx_lm_models, "gated_delta", raising=False)
 
-    gated_delta_vjp.patch_gated_delta()          # must not raise
+    gated_delta_vjp.patch_gated_delta()
 
 
 @requires_real_mlx
@@ -647,7 +696,6 @@ def test_only_the_index_argument_is_detached(index_stop):
     assert mx.gather_mm(a, b, lhs_indices=None, rhs_indices=rhs).shape == (4, 3, 2)
 
 
-# -- the shared mlx-vlm gated-delta module ------------------------------------
 
 # mlx-vlm 0.6.5 keeps the shared module under `text_models`; 0.6.6 moved it up.
 _SHARED_GATED_DELTA = ("mlx_vlm.models.gated_delta",
@@ -683,7 +731,6 @@ def test_shared_patch_rebinds_consumers_and_forwards_lower_bound(shared_name, mo
     assert consumer.gated_delta_update is patched
     assert shared._unsloth_gated_delta_patched
 
-    # A cached call keeps the fused kernel and must carry the gate lower bound.
     assert patched(*[object()] * 7, state="kv", lower_bound=-5.0) == ("cached", "kv")
     assert seen["kw"] == {"lower_bound": -5.0}
 
@@ -708,7 +755,6 @@ def test_shared_patch_rebinds_consumers_and_forwards_lower_bound(shared_name, mo
     assert seen["bound"] == -5.0
 
 
-# -- fusions and caches the trainer must turn off -----------------------------
 
 class _FakeModel:
     def __init__(self, *modules):
