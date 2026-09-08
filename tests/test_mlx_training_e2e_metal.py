@@ -568,6 +568,79 @@ def test_lora_sft_baseline_loss_value_clip(tmp_path):
 _NormTok = type("Tok", (), {"pad_token_id": 0, "eos_token_id": 0})
 
 
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
+    import numpy as np
+    from types import SimpleNamespace
+    from mlx.utils import tree_flatten
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(2053, 64)
+
+        def __call__(self, ids):
+            return self.embed_tokens(ids)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = nn.Linear(64, 8192, bias=False)
+            self.args = SimpleNamespace(tie_word_embeddings=False)
+            if quantized:
+                self.lm_head = nn.QuantizedLinear.from_linear(self.lm_head)
+                self.lm_head.freeze()
+
+    rows = []
+    for row in range(4):
+        labels = np.full(513, -100, dtype=np.int64)
+        positions = np.arange(20 + row, 513, 11 + row)
+        labels[positions] = (positions * 17 + row) % 2048
+        labels[1] = 7
+        rows.append(_FiniteTextRow(
+            tuple(range(row * 513, (row + 1) * 513)), offset=10, labels=tuple(labels),
+        ))
+    plan = FiniteTextBatchPlan(rows, [(0, 1), (2, 3)], max_seq_length=513, pad_id=0)
+    plan.configure_cce_compaction()
+    kernel_rows = []
+    original = mlx_utils._get_runtime_cce
+
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+
+        def record(hidden, *args):
+            kernel_rows.append(hidden.shape[0])
+            return runtime(hidden, *args)
+
+        return record
+
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    mx.random.seed(853)
+    model = Model()
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_compaction
+    grad = nn.value_and_grad(model, loss_fn)
+    compiled = mx.compile(lambda *batch: grad(model, *batch), inputs=model.state, outputs=model.state)
+    for index in range(2):
+        batch = plan[index]
+        prepared = plan.prepare_cce_batch(index, batch)
+        assert prepared[3].shape == (256,)
+        assert mx.any(prepared[3] >= 512).item()
+        reference = grad(model, *batch)
+        kernel_rows.clear()
+        actual = compiled(*prepared)
+        mx.eval(reference, actual)
+        assert kernel_rows == ([256] if index == 0 else [])
+        assert actual[0][0].item() == pytest.approx(reference[0][0].item(), abs=3e-5)
+        assert actual[0][1].item() == reference[0][1].item()
+        for (_, expected), (_, got) in zip(tree_flatten(reference[1]), tree_flatten(actual[1])):
+            assert mx.allclose(expected, got, atol=2e-5, rtol=2e-4).item()
+    plan.configure_cce_compaction(False)
+    assert plan.prepare_cce_batch(1, batch) is batch
+
+
 def _norm_model(seed=77, dtype=None):
     class _TinyLM(nn.Module):
         def __init__(self):

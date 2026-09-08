@@ -5199,6 +5199,10 @@ class MLXTrainer:
                 ),
                 vlm_compile_decision=getattr(self, "_compile_decision", None),
             )
+        if isinstance(batches, FiniteTextBatchPlan):
+            batches.configure_cce_compaction(
+                getattr(loss_fn, "_unsloth_cce_compaction", False),
+            )
         # Shared by the preflight and prepared paths: batch_iter is the
         # streaming producer when active, None otherwise.
         _prefetch_active = bool(
@@ -5752,9 +5756,7 @@ class MLXTrainer:
         def _loss_and_grad(batch_data):
             if isinstance(batch_data, dict):
                 return loss_and_grad_fn(model, batch_data)
-            return loss_and_grad_fn(
-                model, batch_data[0], batch_data[1], batch_data[2]
-            )
+            return loss_and_grad_fn(model, *batch_data)
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
@@ -7297,6 +7299,10 @@ class MLXTrainer:
                         )
                     else:
                         batch_data = batches[scheduled_index]
+                    if isinstance(batches, FiniteTextBatchPlan):
+                        batch_data = batches.prepare_cce_batch(
+                            scheduled_index, batch_data,
+                        )
                     batch_idx += 1
             except BaseException as e:
                 batch_error = e
