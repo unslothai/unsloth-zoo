@@ -1,0 +1,223 @@
+# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""Emulate float32 matmul accuracy using split float16 terms.
+
+NOT ENABLED ANYWHERE. Nothing in Unsloth calls this module, and importing it changes no
+behaviour. It is kept because it is correct and measured, so a future workload that needs
+float32-accuracy matmuls on hardware without bfloat16 tensor cores can switch it on rather
+than rediscover it. Enable explicitly with UNSLOTH_FP16_EMULATION=1, or just call
+`fp16_split_mm` directly.
+
+Background. pytorch/pytorch#195301 added `fp32_precision="bfx9"`: split each float32
+operand into three bfloat16 terms and accumulate nine bfloat16 tensor-core products in
+float32. That works because bfloat16 has 8 significand bits (3 terms covers float32's 24)
+AND 8 exponent bits, the same range as float32, so the split is lossless across the whole
+dynamic range.
+
+Porting it to float16 is not a relabel, because float16 has 11 significand bits but only 5
+exponent bits:
+
+  - 2 terms give about 22 bits, 2 short of float32. 3 terms give 33, which is wasteful.
+  - Normal float16 spans [6.104e-5, 65504]. In a 2-term split the low term is about 2^-11
+    of the high term, so both stay normal only for |x| in [0.125, 65504], roughly 19 binary
+    decades against float32's 277.
+
+Typical LLM weights and activations live at 1e-3 to 1e-1, which is BELOW that floor, so the
+low term underflows to subnormal or zero and the split silently degrades to plain float16
+while still costing three matmuls. Power-of-two per-tensor scaling is therefore not an
+optimisation here, it is load-bearing. `scale = False` exists so the failure can be shown
+rather than asserted.
+
+Measured, B200, median relative L2 against a float64 reference over a magnitude sweep:
+
+    method                    1e-6      1e-3       0.1       1.0       1e3
+    float32 IEEE            2.12e-7   2.11e-7   2.11e-7   2.11e-7   2.12e-7
+    fp16x2 3-product scaled 2.16e-7   2.17e-7   2.17e-7   2.17e-7   2.17e-7
+    fp16x2 3-product plain  2.44e-2   2.43e-5   3.22e-7   2.18e-7   2.17e-7
+    float16 direct          2.44e-2   2.93e-4   2.94e-4   2.93e-4   2.94e-4
+
+Scaled, it holds IEEE parity across six orders of magnitude, including on an outlier-heavy
+distribution. Unscaled at 1e-6 it is bit-identical to plain float16: the low term has fully
+underflowed and the split has ceased to exist. The rig was validated with a bf16x3 9-product
+control at 0.9x IEEE, reproducing the relationship the upstream PR published.
+
+Why it is off. On a real T4 (Kaggle T4x2, torch 2.10+cu128, sm75) the emulation only pays on
+large square GEMMs, and loses badly on the small ones that dominate a QLoRA step:
+
+    shape          float32    float16      fp16x2 3-product
+    square-4096    33.54 ms   6.74 ms      27.13 ms   (1.24x vs float32)
+    square-2048     4.40 ms   0.91 ms       4.69 ms   (0.94x)
+    gemma3-QK^T     0.46 ms   0.19 ms       1.33 ms   (0.35x)
+    gemma3-PV       0.41 ms   0.23 ms       1.73 ms   (0.24x)
+
+and in a stock T4 QLoRA step every GEMM is already float16-in, so there is nothing to
+accelerate: NF4 dequant plus base projection, the LoRA addmm, the lm_head, and attention.
+The one genuine float32 target, Gemma3/Gemma4 attention under UNSLOTH_FORCE_FLOAT32, is
+exactly the small-shape regime where this is 3-4x SLOWER than plain float32. Accuracy on the
+T4 itself measured 9.06e-7 against IEEE 2.61e-7, i.e. 3.5x IEEE rather than the 1.0x seen on
+B200, still 324x better than plain float16. That B200/T4 gap is unexplained; plausibly
+different tensor-core accumulate behaviour, but that is a guess and is recorded as one.
+
+So: numerically sound, not currently worth enabling. Kept for the case where a large
+float32 GEMM appears on hardware without bfloat16 tensor cores.
+"""
+from __future__ import annotations
+
+import itertools
+import math
+import os
+
+import torch
+
+__all__ = [
+    "fp16_emulation_enabled",
+    "pow2_scale",
+    "split_terms",
+    "fp16_split_mm",
+    "fp16_split_matmul",
+]
+
+
+def fp16_emulation_enabled() -> bool:
+    """Opt-in switch. Default off; nothing in Unsloth consults this today."""
+    return os.environ.get("UNSLOTH_FP16_EMULATION", "0") == "1"
+
+
+_HAS_OUT_DTYPE = None
+
+
+def _has_out_dtype() -> bool:
+    """torch.mm(..., out_dtype = ) landed in torch 2.8. Probed once, not assumed."""
+    global _HAS_OUT_DTYPE
+    if _HAS_OUT_DTYPE is None:
+        try:
+            zero = torch.zeros(1, 1, dtype = torch.float16)
+            torch.mm(zero, zero, out_dtype = torch.float32)
+            _HAS_OUT_DTYPE = True
+        except (TypeError, RuntimeError):
+            _HAS_OUT_DTYPE = False
+    return _HAS_OUT_DTYPE
+
+
+def _mm_f32_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Low-precision inputs with float32 accumulate, which is what a tensor core does.
+
+    The fallback is numerically equivalent for this use because the operands are already
+    exactly representable in the low precision, so widening them loses nothing.
+    """
+    if _has_out_dtype() and a.is_cuda:
+        return torch.mm(a, b, out_dtype = torch.float32)
+    return torch.mm(a.float(), b.float())
+
+
+def pow2_scale(x: torch.Tensor, target_exp: int = 14) -> float:
+    """Power-of-two scale bringing max|x| to about 2**target_exp.
+
+    A power of two is exact in binary floating point, so the scaling contributes no error of
+    its own. That matters when the entire purpose is to measure error. target_exp = 14 puts
+    the maximum an octave below the float16 ceiling of 65504.
+    """
+    m = x.abs().max().item()
+    if m == 0 or not math.isfinite(m):
+        return 1.0
+    return 2.0 ** (target_exp - math.floor(math.log2(m)))
+
+
+def split_terms(x: torch.Tensor, dtype: torch.dtype, terms: int) -> list:
+    """Split a float32 tensor into `terms` low-precision terms, residual by residual."""
+    out, residual = [], x
+    for _ in range(terms):
+        head = residual.to(dtype)
+        out.append(head)
+        residual = residual - head.float()
+    return out
+
+
+def fp16_split_mm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    dtype: torch.dtype = torch.float16,
+    terms: int = 2,
+    products: int = 3,
+    scale: bool = True,
+) -> torch.Tensor:
+    """Split-term emulation of a float32 matmul. Returns float32.
+
+    `products` keeps only the most significant cross terms: for a 2-term split, 3 products
+    means hi*hi + hi*lo + lo*hi and drops the negligible lo*lo. Terms are ordered by
+    term-index sum, which tracks magnitude.
+
+    On float16, `scale` must stay True for any tensor whose magnitudes fall below 0.125,
+    which is nearly all LLM weights and activations. See the module docstring.
+    """
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError(f"fp16_split_mm expects 2D operands, got {A.shape} and {B.shape}")
+    if products > terms * terms:
+        raise ValueError(f"products={products} exceeds terms*terms={terms * terms}")
+
+    A32, B32 = A.float(), B.float()
+    sA = pow2_scale(A32) if scale else 1.0
+    sB = pow2_scale(B32) if scale else 1.0
+    a_terms = split_terms(A32 * sA, dtype, terms)
+    b_terms = split_terms(B32 * sB, dtype, terms)
+
+    pairs = sorted(itertools.product(range(terms), repeat = 2), key = lambda ij: ij[0] + ij[1])
+    acc = None
+    for i, j in pairs[:products]:
+        part = _mm_f32_accumulate(a_terms[i], b_terms[j])
+        acc = part if acc is None else acc + part
+    return acc / (sA * sB)
+
+
+class _FP16SplitMatmul(torch.autograd.Function):
+    """Autograd wrapper so the emulation can stand in for a float32 matmul in training.
+
+    Both input gradients are emulated the same way, keeping the backward at the same
+    accuracy as the forward rather than silently dropping to plain float16.
+    """
+    @staticmethod
+    def forward(ctx, A, B, dtype, terms, products, scale):
+        ctx.save_for_backward(A, B)
+        ctx.config = (dtype, terms, products, scale)
+        return fp16_split_mm(A, B, dtype, terms, products, scale)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        A, B = ctx.saved_tensors
+        dtype, terms, products, scale = ctx.config
+        grad_A = grad_B = None
+        if ctx.needs_input_grad[0]:
+            grad_A = fp16_split_mm(
+                grad_output.contiguous(), B.t().contiguous(), dtype, terms, products, scale,
+            ).to(A.dtype)
+        if ctx.needs_input_grad[1]:
+            grad_B = fp16_split_mm(
+                A.t().contiguous(), grad_output.contiguous(), dtype, terms, products, scale,
+            ).to(B.dtype)
+        return grad_A, grad_B, None, None, None, None
+    pass
+pass
+
+
+def fp16_split_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    dtype: torch.dtype = torch.float16,
+    terms: int = 2,
+    products: int = 3,
+    scale: bool = True,
+) -> torch.Tensor:
+    """Differentiable form of `fp16_split_mm`."""
+    return _FP16SplitMatmul.apply(A, B, dtype, terms, products, scale)
