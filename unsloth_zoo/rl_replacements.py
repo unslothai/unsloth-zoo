@@ -460,9 +460,7 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
-    # False is the pre-TRL-1.10 default, and the right fallback for TRL versions with no
-    # such field. TRL flipped its own default to True in 1.10.0, and grpo_accumulated_loss
-    # always forwards the trainer's actual value, so this only affects direct callers.
+    # Only direct callers see this fallback; the trainer always forwards an explicit value.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
 
@@ -556,8 +554,7 @@ def grpo_compute_loss(
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
-        # IS-corrected KL as in TRL (use_bias_correction_kl): pre-clamp non-detached
-        # coef_1, applied before the loss_type dispatch; also feeds the mean_kl metric.
+        # TRL order: pre-clamp non-detached coef_1, before the loss_type dispatch.
         if use_bias_correction_kl:
             kl_i = kl_i * coef_1
     else:
@@ -813,12 +810,10 @@ RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 
 def _warn_unsupported_grpo_options(trainer):
-    """Warn once per trainer about TRL GRPOConfig options the optimized GRPO path
-    ignores, so setting them is not silently dropped. UnslothGRPOConfig forwards every
-    field via **kwargs, but the fast path does not implement top_entropy_quantile < 1.0
-    (entropy masking). Its TRL default is 1.0 in every version checked (0.27.0 through
-    1.12.0), so only non-defaults warn. use_bias_correction_kl IS supported
-    (grpo_compute_loss applies kl_i * coef_1), so it must not be listed here.
+    """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
+    them is not silently dropped. Only top_entropy_quantile < 1.0 (entropy masking) is
+    unimplemented; its TRL default is 1.0 in 0.27.0 through 1.12.0, so only non-defaults
+    warn. use_bias_correction_kl is supported and must never be listed here.
     """
     if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
         return
@@ -854,10 +849,8 @@ _n_chunks_deprecation_warned = False
 
 def _warn_deprecated_n_chunks(n_chunks):
     """Warn once per process when unsloth_num_chunks is set to a non-default value.
-    grpo_accumulated_loss still accepts n_chunks because unsloth's generated GRPO
-    trainer passes unsloth_num_chunks, but the caller-side chunk selection was removed
-    and the value never reaches UnslothEfficientGRPO.apply, which is always called with
-    1, so setting it has no effect.
+    The parameter stays because unsloth's generated trainer passes it, but the value
+    never reaches UnslothEfficientGRPO.apply, which is always called with 1.
     """
     global _n_chunks_deprecation_warned
     if _n_chunks_deprecation_warned:
@@ -937,13 +930,10 @@ def grpo_accumulated_loss(
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
-    # KL bias correction: the field exists from TRL 0.27.0 and defaults to False through
-    # 1.9.x and True from 1.10.0, so this follows whatever TRL itself would do. Older TRL
-    # lacks the field entirely, and False is the correct behavior there.
+    # Follows TRL's own value; older TRL has no such field and False is correct there.
     kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
-    # n_chunks stays in the signature (generated trainers still pass unsloth_num_chunks)
-    # but chunking was removed; body-local import for the inlined trainer-cache copy.
+    # Generated trainers still pass unsloth_num_chunks; nothing downstream reads it.
     try:
         from unsloth_zoo.rl_replacements import _warn_deprecated_n_chunks
         _warn_deprecated_n_chunks(n_chunks)

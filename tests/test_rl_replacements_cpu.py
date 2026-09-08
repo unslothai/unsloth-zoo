@@ -188,11 +188,6 @@ def test_RL_REPLACEMENTS_contains_public_api_keys():
     assert not missing, f"RL_REPLACEMENTS missing public-API keys: {sorted(missing)}"
 
 
-# ---------------------------------------------------------------------------
-# _warn_unsupported_grpo_options
-# ---------------------------------------------------------------------------
-
-
 def _make_grpo_trainer(**args):
     return SimpleNamespace(args=SimpleNamespace(**args))
 
@@ -202,12 +197,10 @@ def test_warn_unsupported_grpo_options_silent_on_defaults(caplog):
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
     assert caplog.records == []
-    # Nothing was warned about, so nothing latches.
     assert not hasattr(trainer, "_unsloth_grpo_unsupported_warned")
 
 
 def test_warn_unsupported_grpo_options_warns_after_a_mid_run_config_change(caplog):
-    # A silent first call must not suppress a warning for a later non-default value.
     trainer = _make_grpo_trainer(top_entropy_quantile=1.0)
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
@@ -238,7 +231,6 @@ def test_warn_unsupported_grpo_options_fires_for_top_entropy_quantile(caplog):
 
 
 def test_warn_unsupported_grpo_options_silent_for_use_bias_correction_kl(caplog):
-    # Supported option: enabling it must not warn.
     trainer = _make_grpo_trainer(top_entropy_quantile=1.0, use_bias_correction_kl=True)
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
         rr._warn_unsupported_grpo_options(trainer)
@@ -269,10 +261,7 @@ def test_warn_unsupported_grpo_options_registered():
     assert rr.RL_REPLACEMENTS.get("_warn_unsupported_grpo_options") is rr._warn_unsupported_grpo_options
 
 
-# ---------------------------------------------------------------------------
-# _warn_deprecated_n_chunks: unsloth_num_chunks is accepted but has no effect;
-# non-default values (not None / -1 / 1) warn once per process.
-# ---------------------------------------------------------------------------
+# unsloth_num_chunks is accepted but ignored; non-defaults warn once per process.
 
 
 def test_warn_deprecated_n_chunks_silent_on_defaults(caplog, monkeypatch):
@@ -282,7 +271,6 @@ def test_warn_deprecated_n_chunks_silent_on_defaults(caplog, monkeypatch):
         rr._warn_deprecated_n_chunks(-1)
         rr._warn_deprecated_n_chunks(1)
     assert caplog.records == []
-    # Defaults must not consume the warn-once flag.
     assert rr._n_chunks_deprecation_warned is False
 
 
@@ -311,19 +299,14 @@ def test_warn_deprecated_n_chunks_registered():
 
 
 def test_grpo_accumulated_loss_does_not_forward_n_chunks():
-    # n_chunks must not reach UnslothEfficientGRPO.apply.
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert "UnslothEfficientGRPO.apply" in src
     apply_args = src.split("UnslothEfficientGRPO.apply(", 1)[1].split(")", 1)[0]
     assert "n_chunks" not in apply_args
 
 
-# ---------------------------------------------------------------------------
-# Version skew. unsloth text-copies these function bodies into the generated
-# UnslothGRPOTrainer cache, so a cache written by a new unsloth can be executed
-# against an older installed unsloth_zoo that has neither helper. The helper calls
-# must degrade to a no-op rather than break the training step.
-# ---------------------------------------------------------------------------
+# unsloth text-copies these bodies into its generated trainer cache, so a new cache can
+# run against an older unsloth_zoo with neither helper: the calls must no-op, not raise.
 
 
 def _helper_call_snippets():
@@ -347,7 +330,6 @@ def _helper_call_snippets():
 
 
 def test_helper_calls_no_op_against_an_older_unsloth_zoo(monkeypatch):
-    # Both helpers missing from the installed module, as in an old unsloth_zoo.
     monkeypatch.delattr(rr, "_warn_unsupported_grpo_options", raising=False)
     monkeypatch.delattr(rr, "_warn_deprecated_n_chunks", raising=False)
     snippets = _helper_call_snippets()
@@ -357,7 +339,6 @@ def test_helper_calls_no_op_against_an_older_unsloth_zoo(monkeypatch):
 
 
 def test_warn_unsupported_grpo_options_survives_an_unassignable_trainer():
-    # A trainer with __slots__ cannot take the latch attribute; warning must still fire.
     class Slotted:
         __slots__ = ("args",)
 
@@ -398,8 +379,7 @@ def test_warn_unsupported_grpo_options_fires_for_the_zero_quantile(caplog):
 
 
 def test_bias_correction_follows_the_installed_trl_default():
-    # grpo_accumulated_loss reads trainer.args, so whatever TRL defaults to is what
-    # Unsloth does. TRL's own default is False through 1.9.x and True from 1.10.0.
+    # TRL's own default is False through 1.9.x and True from 1.10.0; we follow it.
     trl_config = pytest.importorskip("trl.trainer.grpo_config")
     fields = {f.name: f for f in dataclasses.fields(trl_config.GRPOConfig)}
     if "use_bias_correction_kl" not in fields:
@@ -410,20 +390,15 @@ def test_bias_correction_follows_the_installed_trl_default():
 
 
 def test_bias_correction_defaults_off_without_the_trl_field():
-    # Older TRL has no such attribute; the getattr fallback must keep the old behavior.
     args = SimpleNamespace()
     assert getattr(args, "use_bias_correction_kl", False) is False
 
 
-# ---------------------------------------------------------------------------
-# UnslothEfficientGRPO single-chunk path (the only path grpo_accumulated_loss uses)
-# must match a naive grpo_compute_loss pass in loss and gradient for every loss type.
-# ---------------------------------------------------------------------------
+# n_chunks=1 is the only path grpo_accumulated_loss uses.
 
 
 @pytest.fixture
 def disable_dynamo():
-    # Run UnslothEfficientGRPO's torch.compile step eagerly on CPU.
     import torch._dynamo
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = True
@@ -500,11 +475,8 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     ), f"{loss_type}: gradient mismatch"
 
 
-# ---------------------------------------------------------------------------
-# use_bias_correction_kl (TRL GRPOConfig, DeepSeek-V3.2): per TRL _compute_loss
-# (main @ f782735), kl_i *= the pre-clamp non-detached coef_1 before the loss_type
-# dispatch, feeding both the loss's beta * kl term and the kl metric.
-# ---------------------------------------------------------------------------
+# Per TRL _compute_loss (main @ f782735): kl_i *= the pre-clamp non-detached coef_1,
+# before the loss_type dispatch, feeding both the beta term and the kl metric.
 
 
 def _trl_mirror_grpo_loss(
@@ -512,8 +484,7 @@ def _trl_mirror_grpo_loss(
     importance_sampling_level="token", use_bias_correction_kl=False,
     epsilon_low=0.2, epsilon_high=0.2,
 ):
-    # Mirror of TRL _compute_loss for loss_type="grpo", independent of unsloth_zoo;
-    # mean_kl uses unsloth's per-row masked-mean convention for comparability.
+    # Independent of unsloth_zoo; mean_kl follows unsloth's per-row masked mean.
     if advantages.dim() == 1:
         advantages = advantages.unsqueeze(1)
     log_ratio = new - old
@@ -565,8 +536,7 @@ def test_grpo_compute_loss_bias_correction_kl_matches_trl_mirror(
 
 
 def test_grpo_compute_loss_bias_correction_kl_changes_loss_and_mean_kl():
-    # Shift old by a constant so coef_1 != 1 everywhere and the correction visibly
-    # changes both the loss and the kl metric (symmetric noise averages it to ~0).
+    # Shift old so coef_1 != 1 everywhere; symmetric noise would average the effect away.
     beta = 0.04
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
     old = old - 0.5
@@ -582,7 +552,6 @@ def test_grpo_compute_loss_bias_correction_kl_changes_loss_and_mean_kl():
 
 
 def test_grpo_compute_loss_bias_correction_kl_defaults_off():
-    # Omitting the kwarg must equal use_bias_correction_kl=False (the TRL default).
     beta = 0.04
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
     loss_default, _, kl_default, *_ = rr.grpo_compute_loss(
@@ -597,7 +566,6 @@ def test_grpo_compute_loss_bias_correction_kl_defaults_off():
 
 
 def test_grpo_compute_loss_bias_correction_kl_noop_when_beta_zero():
-    # With beta == 0 there is no KL term, so the flag must have no effect.
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
     loss_off, *_ = rr.grpo_compute_loss(
         ref, new, old, None, input_ids, mask, 0.0, advantages, **kwargs
@@ -613,12 +581,9 @@ def test_grpo_compute_loss_bias_correction_kl_noop_when_beta_zero():
     "loss_type", ["grpo", "bnpo", "dr_grpo", "dapo", "cispo", "sapo", "luspo", "vespo"]
 )
 def test_efficient_grpo_forwards_use_bias_correction_kl(loss_type, disable_dynamo):
-    # The flag passes through extra_kwargs, so the efficient path with the flag on
-    # must match the naive corrected pass for every loss type.
     beta = 0.04
     lm_head = torch.randn(17, 8, dtype=torch.float64)  # unused on the logps-in path
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
-    # Constant shift so the correction moves the loss past allclose tolerance.
     old = old - 0.5
     kwargs["use_bias_correction_kl"] = True
 
@@ -642,7 +607,6 @@ def test_efficient_grpo_forwards_use_bias_correction_kl(loss_type, disable_dynam
         new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
     ), f"{loss_type}: gradient mismatch"
 
-    # Flag off must produce a different (uncorrected) loss.
     kwargs_off = dict(kwargs)
     kwargs_off["use_bias_correction_kl"] = False
     out_off = rr.UnslothEfficientGRPO.apply(
@@ -655,7 +619,6 @@ def test_efficient_grpo_forwards_use_bias_correction_kl(loss_type, disable_dynam
 
 
 def test_grpo_accumulated_loss_forwards_use_bias_correction_kl():
-    # Read off trainer.args with getattr default False so older TRL stays uncorrected.
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert 'kwargs["use_bias_correction_kl"]' in src
     assert 'getattr(trainer.args, "use_bias_correction_kl", False)' in src
