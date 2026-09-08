@@ -136,15 +136,9 @@ def compute_fused_ce_loss(
 pass
 
 
-# Bytes of chunk-dependent transient per (token x vocab) element in the fused
-# path: bf16 logits (2) + the float32 upcast (4) + the log_softmax output the
-# tape saves (4) + the float32 gradient cross_entropy backward produces (4).
-# Measured on a B200 (torch 2.9.1, bf16): 14.0 flat across vocab 32k-262k,
-# hidden 16-8192 and chunk lengths 64-8192, rising to 16.0 with logit
-# softcapping. torch.compile fuses the upcast and lands near 2.0, but it can
-# fall back to eager at runtime, so the eager figure is the one that must hold.
-# The old value here was 4, which counted the float32 logits alone and missed
-# every other tensor in the chain.
+# Per (token x vocab) element over the whole eager chain: bf16 logits + float32
+# upcast + saved log_softmax + backward gradient = 14, and 16 under softcapping.
+# 4 counted the logits alone.
 _CE_BYTES_PER_LOGIT = 16.0
 
 @functools.cache
@@ -164,11 +158,8 @@ def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     if target_gb <= 1e-9: # Use a small epsilon for float comparison
         raise RuntimeError("Unsloth: No or negligible GPU memory available for fused cross entropy.")
 
-    # Allocations chunking cannot shrink still come out of the same budget, so
-    # the chunk transient only gets what is left. If they already exceed the
-    # target, no chunk count can satisfy it; keep the old budget rather than
-    # driving the chunk count to the token count, since target_gb is a soft cap
-    # (min(50% free, 4GB)), not the real memory limit.
+    # Unchunkable allocations share the budget; if they alone exceed the target
+    # no chunk count helps, so keep the full budget instead.
     if 0.0 < fixed_gb < target_gb:
         target_gb = target_gb - fixed_gb
     pass
@@ -182,16 +173,12 @@ def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
     """Number of chunks that fits the target max memory usage."""
     multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
     n_splits = (bsz*qlen) * multiplier
-    # n_splits * 4 == (chunk transient GiB) / target: the exact number of chunks
-    # needed to keep every chunk within target. Round UP to the next multiple of
-    # 4 so the target stays a real ceiling. Nearest-rounding could round down
-    # (round(0.5) -> 0) and collapse a large logits transient into a single
-    # uncapped chunk; a config that already fits one chunk stays at one.
+    # n_splits * 4 == (chunk transient GiB) / target. Round UP: nearest-rounding
+    # (round(0.5) -> 0) collapses a large transient into one uncapped chunk.
     exact = n_splits * 4
     if exact <= 1.0 + 1e-9:
         return 1
     n_chunks = math.ceil(exact / 4 - 1e-9) * 4
-    # More chunks than tokens is meaningless - torch.chunk caps out there anyway.
     return min(n_chunks, bsz*qlen)
 pass
 
@@ -272,12 +259,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
-            # Memory no chunk count can shrink, charged to the same target:
-            # grad_inputs, and for a trainable head both grad_lm_head and the
-            # same-sized gradient functorch returns for every chunk (measured
-            # as 2*grad_lm_head on a B200, and likewise for the bias).
-            # Under overwrite grad_inputs aliases hidden_states and costs
-            # nothing new, so charging it would only over-chunk.
+            # Memory no chunk count can shrink. Under overwrite grad_inputs
+            # aliases hidden_states; the head gradient counts twice (per chunk).
             fixed_bytes = 0
             if not overwrite:
                 fixed_bytes += grad_inputs.numel() * grad_inputs.element_size()
