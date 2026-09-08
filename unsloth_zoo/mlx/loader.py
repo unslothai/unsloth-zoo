@@ -297,12 +297,11 @@ def _mlx_dora_wrapper_type(module, path):
             "Unsloth MLX: DoRA training needs mlx_lm.tuner.dora.DoRALinear; "
             "upgrade mlx-lm or train with use_dora=False."
         ) from exc
-    # Exact types, not isinstance: a fused projection subclasses nn.Linear
-    # but returns a tuple, so a wrapper attaches cleanly then breaks forward.
+    # Exact types, not isinstance: a fused linear subclasses nn.Linear but
+    # returns a tuple, so a wrapper attaches cleanly then breaks forward.
     if type(module) in (nn.Linear, nn.QuantizedLinear):
-        # DoRALinear.from_base recovers the unpacked width as `32 // bits`,
-        # exact only when bits divides 32; otherwise lora_a is built against
-        # the wrong input dim. Plain LoRA is unaffected.
+        # mlx-lm unpacks a DoRA base only at widths dividing 32; plain LoRA
+        # is unaffected, so refuse only here.
         bits = getattr(module, "bits", None)
         if bits is not None and 32 % int(bits):
             raise ValueError(
@@ -324,8 +323,7 @@ def _mlx_dora_wrapper_type(module, path):
 
 def _mlx_lora_from_base(module, config, *, specs, path=None):
     if config.get("use_dora"):
-        # to_lora() returns plain-LoRA wrappers for fused linears, silently
-        # downgrading the request; mlx-lm skips it for that too.
+        # to_lora() would silently downgrade fused linears to plain LoRA.
         return _mlx_dora_wrapper_type(module, path).from_base(
             module,
             r=config["rank"],
@@ -379,10 +377,9 @@ def linear_to_lora_layers(model, num_layers, config):
         return (set(layer_keys[index]) | shared) if layer_keys else keys
 
     if config.get("use_dora"):
-        # Preflight so a late refusal leaves no layer converted; only the
-        # TYPE refusal is all-or-nothing. Must use the same per-layer
-        # predicates as the conversion, not the `keys` union, which would
-        # refuse over a module that is never wrapped.
+        # Preflight so a late refusal leaves no layer converted; only the TYPE
+        # refusal is all-or-nothing. Same per-layer predicates as the
+        # conversion, not the `keys` union.
         for index, layer in enumerate(layers[offset:], start=offset):
             wanted = _layer_wanted(index)
             for name, module in layer.named_modules():
@@ -8862,7 +8859,6 @@ class FastMLXModel:
 
         if use_dora:
             if lora_dropout:
-                # Reported, not refused: peft interchange caveat only.
                 print(
                     "Unsloth: DoRA with lora_dropout > 0 trains normally in "
                     "MLX format, but peft applies DoRA dropout inside the "
@@ -8872,8 +8868,7 @@ class FastMLXModel:
                     "keep the two equivalent."
                 )
             if init_lora_weights is False:
-                # `m` is seeded from the base weight norm, the adapted norm
-                # only while lora_b is zero.
+                # Seeded norm is the adapted norm only while lora_b is zero.
                 raise ValueError(
                     "Unsloth MLX: DoRA does not support "
                     "init_lora_weights=False; the magnitude vector is "
@@ -8881,8 +8876,6 @@ class FastMLXModel:
                     "randomized adapter. Use init_lora_weights=True (or "
                     "'gaussian'), or train with use_dora=False."
                 )
-            # Pre-existing plain-LoRA wrappers survive the wrap, and a mixed
-            # tree saves under one fine_tune_type and reloads as all-DoRA.
             from .utils import iter_mlx_lora_modules
 
             existing = sorted({
@@ -8900,8 +8893,6 @@ class FastMLXModel:
                     "Reload the base model before requesting DoRA, or train "
                     "with use_dora=False."
                 )
-            # Towers wrap as plain LoRA; the savers accept the mixed tree,
-            # stamp it "dora", and it reloads as all-DoRA.
             if is_vlm and (train_vision or train_projector):
                 raise ValueError(
                     "Unsloth MLX: DoRA is not supported for vision or "
