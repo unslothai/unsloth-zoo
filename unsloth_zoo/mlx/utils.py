@@ -16646,7 +16646,61 @@ def _fuse_mlx_module(module, dequantize):
         return fuse(dequantize=dequantize)
     return fuse()
 
-def save_merged_model(model, tokenizer, path, dequantize=False):
+# MLX's affine defaults, so this matches what load_in_4bit would have produced.
+_MERGED_4BIT_QUANTIZATION = {"bits": 4, "group_size": 64, "mode": "affine"}
+
+
+def _has_quantized_mlx_modules(model):
+    """Whether any layer already holds packed weights: the quantized types share
+    no base class, but each carries the width it was packed at."""
+    return any(
+        hasattr(module, "bits") and hasattr(module, "group_size")
+        for _, module in model.named_modules()
+    )
+
+
+def _quantize_merged_model(model, quantize):
+    """Quantize a fused model that carries no quantization of its own, an
+    already-quantized one needing nothing: ``fuse`` restores its widths."""
+    from mlx_lm.utils import quantize_model
+
+    from .loader import _MLXQuantizationSpec, _compose_mlx_quant_predicate
+
+    if _has_quantized_mlx_modules(model):
+        return
+
+    spec = _MLXQuantizationSpec(
+        enabled=True,
+        bits=quantize["bits"],
+        group_size=quantize["group_size"],
+        mode=quantize.get("mode", "affine"),
+        source="save_merged",
+    )
+    # A leftover block describes weights that are not there, and selects the
+    # fine-grained branch that omits the fallback width.
+    config = _strip_mlx_quantization_metadata(_get_model_config(model) or {})
+    # The loader's skip rules, so a tower stays dense as it would at load time.
+    predicate = _compose_mlx_quant_predicate(
+        model, spec, is_vlm=_is_vlm_model(model) or _has_vision_config(config),
+    )
+    model, updated_config = quantize_model(
+        model, config,
+        group_size=spec.group_size, bits=spec.bits, mode=spec.mode,
+        quant_predicate=predicate,
+    )
+    # mlx-lm writes the block before deciding eligibility; ask the modules.
+    if not _has_quantized_mlx_modules(model):
+        raise RuntimeError(
+            "Unsloth: a quantized merge was requested but no layer could be "
+            "quantized, which would have written a full-precision checkpoint "
+            "under a quantized name. Every layer was either skipped, not "
+            "quantizable, or not a multiple of the group size "
+            f"({spec.group_size})."
+        )
+    model._config = updated_config
+
+
+def save_merged_model(model, tokenizer, path, dequantize=False, quantize=None):
     """Fuse LoRA weights and save the full merged model.
 
     Produces an HF-compatible directory with sharded safetensors,
@@ -16661,6 +16715,10 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
             (saves as fp16/bf16 — needed for GGUF). If False, keep the
             base quantization (smaller checkpoint, only meaningful when
             the base was quantized).
+        quantize: Optional ``{"bits", "group_size", "mode"}`` applied only when
+            the fused model has no quantized layers left, so a quantized export
+            off an unquantized base is honoured rather than written at 16-bit.
+            Ignored alongside ``dequantize=True``.
     """
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
@@ -16683,6 +16741,8 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         cfg = getattr(model, "_config", None)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
+    elif quantize is not None:
+        _quantize_merged_model(model, quantize)
 
     de_lora_model = model
 
@@ -16930,8 +16990,9 @@ def save_pretrained_merged(
             - ``"lora"``: save adapter weights only (smallest, default).
             - ``"merged_16bit"``: fuse LoRA into base, dequantize, save full
               fp16/bf16 model. Needed for GGUF / llama.cpp downstream.
-            - ``"merged_4bit"``: fuse LoRA into base while keeping the
-              base's 4-bit quantization. Only meaningful for QLoRA.
+            - ``"merged_4bit"``: fuse LoRA into base and write a quantized
+              checkpoint, keeping the base's own per-module widths when it was
+              quantized and applying MLX's 4-bit affine defaults when it was not.
         push_to_hub: If True, upload to HuggingFace Hub after saving.
         token: HuggingFace token for pushing.
         private: Whether the HF repo should be private.
@@ -16989,10 +17050,11 @@ def save_pretrained_merged(
             pass
     else:
         # merged_16bit → dequantize fused weights to fp16/bf16
-        # merged_4bit  → keep base quantization (LoRA absorbed)
+        # merged_4bit  → keep the base quantization, or apply one if it has none
         save_merged_model(
             model, tokenizer, save_directory,
             dequantize=(method == "merged_16bit"),
+            quantize=_MERGED_4BIT_QUANTIZATION if method == "merged_4bit" else None,
         )
 
     if push_to_hub:
