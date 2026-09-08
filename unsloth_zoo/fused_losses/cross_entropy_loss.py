@@ -276,7 +276,11 @@ class UnslothFusedLoss(torch.autograd.Function):
             # grad_inputs, and for a trainable head both grad_lm_head and the
             # same-sized gradient functorch returns for every chunk (measured
             # as 2*grad_lm_head on a B200, and likewise for the bias).
-            fixed_bytes = grad_inputs.numel() * grad_inputs.element_size()
+            # Under overwrite grad_inputs aliases hidden_states and costs
+            # nothing new, so charging it would only over-chunk.
+            fixed_bytes = 0
+            if not overwrite:
+                fixed_bytes += grad_inputs.numel() * grad_inputs.element_size()
             if grad_lm_head is not None:
                 fixed_bytes += 2 * grad_lm_head.numel() * grad_lm_head.element_size()
             if grad_lm_head_bias is not None:

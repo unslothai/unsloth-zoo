@@ -98,6 +98,17 @@ def test_fixed_larger_than_target_does_not_explode_chunks(monkeypatch):
     assert swamped <= 16_384
 
 
+def test_overwrite_does_not_charge_the_aliased_grad_inputs(monkeypatch):
+    # Under overwrite, grad_inputs IS hidden_states, so it costs no new memory.
+    # Charging it would shrink the budget and double the chunk count for free.
+    # Measured on a B200 at bsz=1 qlen=8192 hidden=4096: the overwrite peak is
+    # lower by exactly 2*qlen*hidden (0.8750 GiB vs 0.8125 GiB).
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    aliased = ce.get_chunk_size(1, 8_192, 151_936, target_gb=4.0, fixed_gb=0.0)
+    charged = ce.get_chunk_size(1, 8_192, 151_936, target_gb=4.0, fixed_gb=2.0)
+    assert charged > aliased, (aliased, charged)
+
+
 def test_chunks_never_exceed_token_count(monkeypatch):
     # torch.chunk caps at one element per chunk anyway; asking for more is a
     # sizing bug that only costs launches.
