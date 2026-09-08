@@ -2085,7 +2085,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -2117,6 +2117,9 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # cached kernels stay scale-independent.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -2131,7 +2134,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -2157,12 +2160,26 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     return loss_fn
+
+
+def _compact_cce_inputs(hidden, targets, indices):
+    if indices is None:
+        return hidden, targets
+    safe_indices = mx.maximum(indices, 0)
+    hidden = mx.take(hidden, safe_indices, axis=0)
+    targets = mx.take(targets, safe_indices, axis=0)
+    targets = mx.where(indices >= 0, targets, mx.array(-100, targets.dtype))
+    return hidden, targets
 
 
 def _model_logits(output):
@@ -6000,6 +6017,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_seed",
         "_visit_epoch_cache",
         "_cycle_length",
+        "_cce_capacities",
     )
 
     def __init__(
@@ -6026,6 +6044,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.pad_to_multiple = int(pad_to_multiple)
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
+        self._cce_capacities = {}
         self._visit_policy = str(visit_policy)
         # Normalized eagerly so visits never depend on ambient RNG state and a
         # reconstructed plan (fresh-process resume) derives identical visits.
@@ -6127,6 +6146,70 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
+
+    def configure_cce_compaction(self, enabled=True):
+        self._cce_capacities = {}
+        if not enabled:
+            return
+        # tuple.count scans in C and a schedule revisits rows, so neither the
+        # per-label compare nor the repeat visit reaches Python. Label-masked
+        # corpora put every token of every row in this window, which is what
+        # makes the difference worth having.
+        row_counts = {}
+
+        def supervised(row_index):
+            count = row_counts.get(row_index)
+            if count is None:
+                row = self._rows[row_index]
+                end = min(len(row.input_ids), self.max_seq_length)
+                start = max(1, row.offset)
+                if row.labels is None:
+                    count = max(0, end - start)
+                else:
+                    window = row.labels[start:end]
+                    count = len(window) - window.count(-100)
+                row_counts[row_index] = count
+            return count
+
+        counts = {}
+        for index, batch_indices in enumerate(self._schedule):
+            count = sum(
+                supervised(row_index)
+                for row_index in batch_indices if row_index is not None
+            )
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        # A fixed capacity per admitted shape avoids extra compiled variants.
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            tokens = family[1][0][0] * (width - 1)
+            if capacity * 2 <= tokens:
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = batch[0].shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        for batch_row, row_index in enumerate(self._schedule[index]):
+            if row_index is None:
+                continue
+            row = self._rows[row_index]
+            end = min(len(row.input_ids), self.max_seq_length, width)
+            selected.extend(
+                batch_row * (width - 1) + position - 1
+                for position in range(max(1, row.offset), end)
+                if row.labels is None or row.labels[position] != -100
+            )
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch, mx.array(indices))
 
     def materialize(self, index, *, phase=None):
         batch_indices = self._schedule[index]
