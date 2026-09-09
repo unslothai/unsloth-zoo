@@ -520,15 +520,99 @@ def _build_dlogits_kernel() -> Callable:
     )
 
 
-def _build_kernel_set() -> tuple[Callable | None, Callable | None, Callable | None]:
+def _with_single_simd_forward(fallback: Callable, finalize: bool) -> Callable:
+    source = """
+        uint gid = thread_position_in_grid.x;
+        uint row = gid / 32;
+        uint n = logits_shape[0];
+        if (row >= n) {
+            return;
+        }
+
+        uint lid = gid % 32;
+        uint tpg = 32;
+        uint chunk_v = logits_shape[1];
+        int base = int(row * chunk_v);
+        int target = targets[row];
+        int v_start = v_start_arr[0];
+        int ignore_index = ignore_index_arr[0];
+        float local_max = -INFINITY;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            local_max = metal::max(local_max, raw);
+        }
+        float chunk_max = simd_max(local_max);
+        float local_sum = 0.0f;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            local_sum += fast::exp(raw - chunk_max);
+        }
+        float chunk_sum = simd_sum(local_sum);
+        bool found_target = target >= v_start && target < v_start + int(chunk_v);
+        float chunk_target = 0.0f;
+        if (lid == 0 && target != ignore_index && found_target) {
+            chunk_target = logits[base + target - v_start];
+        }
+        if (lid == 0) {
+            float old_max = running_max_in[row];
+            float old_sum = running_sum_in[row];
+            float new_max = metal::max(old_max, chunk_max);
+            float new_sum = old_sum * fast::exp(old_max - new_max) +
+                            chunk_sum * fast::exp(chunk_max - new_max);
+            float new_target = target_in[row];
+            if (target != ignore_index && found_target) {
+                new_target = chunk_target;
+            }
+
+            running_max_out[row] = new_max;
+            running_sum_out[row] = new_sum;
+            target_out[row] = new_target;
+    """
+    if finalize:
+        source += """
+            float lse = new_max + fast::log(new_sum + 1e-9f);
+            lse_out[row] = lse;
+            if (target == ignore_index) {
+                loss_out[row] = 0.0f;
+            } else {
+                loss_out[row] = lse - new_target;
+            }
+    """
+    source += "    }\n"
+    output_names = ["running_max_out", "running_sum_out", "target_out"]
+    if finalize:
+        output_names += ["loss_out", "lse_out"]
+    kernel = mx.fast.metal_kernel(
+        name="cce_runtime_forward_single_simd_" + str(finalize),
+        input_names=["logits", "targets", "running_max_in", "running_sum_in",
+                     "target_in", "v_start_arr", "ignore_index_arr", "softcap_arr"],
+        output_names=output_names, source=source, ensure_row_contiguous=True,
+    )
+
+    def call(**kwargs):
+        logits = kwargs["inputs"][0]
+        rows, width = logits.shape
+        # Small grids need more SIMD groups; wide rows need more lanes per row.
+        if rows >= 256 and width <= 2048 and logits.dtype in (mx.float16, mx.bfloat16):
+            kwargs["grid"] = (rows * 32, 1, 1)
+            kwargs["threadgroup"] = (32, 1, 1)
+            return kernel(**kwargs)
+        return fallback(**kwargs)
+    return call
+
+
+def _build_kernel_set(
+    logit_softcap: float = 0.0,
+) -> tuple[Callable | None, Callable | None, Callable | None]:
     if not mx.metal.is_available():
         return None, None, None
 
-    return (
-        _build_forward_update_kernel(),
-        _build_forward_update_finalize_kernel(),
-        _build_dlogits_kernel(),
-    )
+    update = _build_forward_update_kernel()
+    finalize = _build_forward_update_finalize_kernel()
+    if logit_softcap <= 0.0:
+        update = _with_single_simd_forward(update, False)
+        finalize = _with_single_simd_forward(finalize, True)
+    return update, finalize, _build_dlogits_kernel()
 
 
 def _forward_chunked_fused_finalize(
@@ -771,15 +855,17 @@ def make_runtime_cce_loss_fused_finalize(
     bits: int | None = None,
     mode: str = "affine",
     label_smoothing: float = 0.0,
+    weight_is_frozen: bool = False,
 ):
     label_smoothing = _normalize_label_smoothing(label_smoothing)
-    forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel = _build_kernel_set()
+    forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel = _build_kernel_set(
+        logit_softcap,
+    )
     if label_smoothing > 0.0:
         # Smoothing lives in the chunked python path; the fused Metal kernels
         # do not carry the vocabulary-sum term. eps=0 keeps the kernel path.
         forward_update_kernel = forward_update_finalize_kernel = dlogits_kernel = None
     use_metal_kernel = dlogits_kernel is not None
-
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
     chunk_plan_cache: OrderedDict[
@@ -809,6 +895,23 @@ def make_runtime_cce_loss_fused_finalize(
             vocab_size,
             bytes_per_element=compute_bytes,
         )
+        # A vocabulary small enough that the default 16-chunk split lands under
+        # 4096 gives the GEMM too little work per launch. Widening to 4096 is
+        # worth 1.01-1.47x on the backward for such heads, but only while every
+        # buffer it grows stays small: the logits chunk (tokens), the weight
+        # slice (hidden), and the classifier gradient when the head is trained.
+        # Each is held to 8 MB, which is what confines this to compact heads.
+        promoted_chunk = 4096
+        promoted_bytes = promoted_chunk * compute_bytes
+        if (chunk_size <= 0 and not quantized
+                and hidden.dtype == weight.dtype and hidden.dtype in (mx.bfloat16, mx.float32)
+                and n_tokens >= 256 and resolved_chunk_size < promoted_chunk
+                and vocab_size >= 16384
+                and n_tokens * promoted_bytes <= min(8 * 1024 * 1024, _CHUNK_BUDGET)
+                and hidden.shape[1] * promoted_bytes <= 8 * 1024 * 1024
+                and (weight_is_frozen
+                     or hidden.shape[1] * promoted_chunk * 4 <= 8 * 1024 * 1024)):
+            resolved_chunk_size = promoted_chunk
         key = (
             vocab_size,
             resolved_chunk_size,
@@ -1116,8 +1219,12 @@ def make_chunked_cross_entropy_loss(
     bits: int | None = None,
     mode: str = "affine",
     label_smoothing: float = 0.0,
+    weight_is_frozen: bool = False,
 ):
-    """Return a standalone chunked CCE loss callable and a kernel-usage flag."""
+    """Return a standalone CCE loss and a kernel-usage flag.
+
+    Set weight_is_frozen only when classifier gradients will not be requested.
+    """
 
     return make_runtime_cce_loss_fused_finalize(
         ignore_index=ignore_index,
@@ -1128,4 +1235,5 @@ def make_chunked_cross_entropy_loss(
         bits=bits,
         mode=mode,
         label_smoothing=label_smoothing,
+        weight_is_frozen=weight_is_frozen,
     )
