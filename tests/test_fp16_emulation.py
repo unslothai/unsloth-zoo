@@ -234,6 +234,26 @@ def test_round_to_actually_rounds_under_compile():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_pow2_scale_tensor_matches_pow2_scale_at_extremes():
+    """float32 cannot hold the scale for max|x| near 2**-114, where it is 2**128, so the
+    exported helper is float64. pow2_scale returns a finite Python float there and the two
+    must still agree."""
+    x = torch.tensor([2.0 ** -114])
+    assert pow2_scale_tensor(x).item() == pow2_scale(x)
+    assert torch.isfinite(pow2_scale_tensor(x))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_round_to_does_not_alias_when_dtype_matches():
+    """.to(dtype) returns the input itself when the dtype already matches, and a custom op
+    declaring no aliasing may not return one of its inputs."""
+    A = torch.randn(8, 8, device = "cuda")
+    terms = split_terms(A, torch.float32, 2)
+    assert terms[0] is not A
+    assert torch.equal(terms[0], A)
+    fp16_split_mm(A, A, dtype = torch.float32)      # used to raise an aliasing error
+
+
 def test_pow2_scale_tensor_matches_pow2_scale():
     """The sync-free scale must be the same number, not merely a similar one."""
     for mag in (1e-6, 1e-3, 0.1, 1.0, 1e3):

@@ -186,8 +186,13 @@ def pow2_scale_tensor(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
     torch.compile(fullgraph = True) it is a hard error ("could not guard on data-dependent
     expression"). frexp gives the exponent on device instead. frexp returns
     m = mantissa * 2**exp with mantissa in [0.5, 1), so floor(log2(m)) == exp - 1.
+
+    Materialised in float64 to keep the documented equivalence with `pow2_scale`, which returns
+    a Python float. For max|x| near 2**-114 the scale is 2**128, which float32 cannot hold and
+    would silently hand back inf while `pow2_scale` returns a perfectly good 3.4e38. The main
+    path does not use this at all; it carries `pow2_exponent` and applies it with ldexp.
     """
-    return torch.exp2(pow2_exponent(x, target_exp).float())
+    return torch.exp2(pow2_exponent(x, target_exp).double())
 
 
 def pow2_exponent(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
@@ -217,7 +222,10 @@ _HAS_CUSTOM_OP = hasattr(torch.library, "custom_op")
 if _HAS_CUSTOM_OP:
     @torch.library.custom_op("unsloth_zoo::fp16_emulation_round", mutates_args = ())
     def _round_to(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        return x.to(dtype)
+        # Cloned when the dtype already matches: .to() returns the input itself there, and a
+        # custom op declaring no aliasing may not return one of its inputs. Without this,
+        # split_terms(x, x.dtype, ...) raises instead of splitting.
+        return x.clone() if x.dtype == dtype else x.to(dtype)
 
     @_round_to.register_fake
     def _(x, dtype):
