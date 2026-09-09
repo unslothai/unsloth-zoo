@@ -250,12 +250,23 @@ def test_pow2_scale_tensor_matches_pow2_scale():
 # matmul stand-in, so "wrong but fast" is the one outcome it must not have.
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
-def test_out_dtype_probe_finds_cuda_support():
+def test_out_dtype_probe_matches_a_direct_call():
     """aten::mm.dtype is CUDA-only. Probing it on CPU raises NotImplementedError, which
     subclasses RuntimeError, so a CPU probe would cache False and disable the tensor-core
-    path the module exists for."""
+    path the module exists for.
+
+    Asserted against a direct attempt rather than against True: pyproject allows torch>=2.4,
+    and out_dtype only landed in 2.8, so False is the correct answer on a supported older
+    install and this must not fail there.
+    """
     from unsloth_zoo.fp16_emulation import _has_out_dtype
-    assert _has_out_dtype() is True
+    zero = torch.zeros(1, 1, dtype = torch.float16, device = "cuda")
+    try:
+        torch.mm(zero, zero, out_dtype = torch.float32)
+        supported = True
+    except (TypeError, RuntimeError):
+        supported = False
+    assert _has_out_dtype() is supported
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
@@ -280,6 +291,25 @@ def test_scale_product_overflows_but_operands_do_not():
     A = torch.tensor([[2.0 ** -55]], device = "cuda")
     B = torch.tensor([[2.0 ** -55]], device = "cuda")
     assert torch.allclose(fp16_split_mm(A, B).double(), A.double() @ B.double(), rtol = 1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_large_times_small_does_not_overflow_intermediately():
+    """2**114 @ 2**-113 is 2.0. Applying the inverse scales one at a time passes through inf
+    in either order, so the combined exponent goes on in a single ldexp."""
+    A = torch.tensor([[2.0 ** 114]], device = "cuda")
+    B = torch.tensor([[2.0 ** -113]], device = "cuda")
+    assert torch.allclose(fp16_split_mm(A, B).double(), A.double() @ B.double(), rtol = 1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_ordinary_tensors_are_not_diverted_to_the_fallback():
+    """The dynamic-range guard is a catastrophe guard. A tighter bound would fire on ordinary
+    randn operands, whose hi/lo runs past 2**23 on any near-zero entry, and would quietly
+    replace the emulation with float32 mm on the workload it exists for."""
+    from unsloth_zoo.fp16_emulation import _split_can_represent
+    A, B = _pair(1024, 1024, 1024, mag = 0.02)
+    assert _split_can_represent(A) and _split_can_represent(B)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")

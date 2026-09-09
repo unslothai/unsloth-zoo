@@ -156,7 +156,9 @@ def _mm_f32_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     The fallback is numerically equivalent for this use because the operands are already
     exactly representable in the low precision, so widening them loses nothing.
     """
-    if _has_out_dtype() and a.is_cuda:
+    # Device first: probing allocates a CUDA tensor and initialises a CUDA context, which a
+    # CPU-only call must not pay for, least of all in a forked worker that cannot touch CUDA.
+    if a.is_cuda and _has_out_dtype():
         return torch.mm(a, b, out_dtype = torch.float32)
     return _mm_float32(a, b)
 
@@ -185,12 +187,24 @@ def pow2_scale_tensor(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
     expression"). frexp gives the exponent on device instead. frexp returns
     m = mantissa * 2**exp with mantissa in [0.5, 1), so floor(log2(m)) == exp - 1.
     """
+    return torch.exp2(pow2_exponent(x, target_exp).float())
+
+
+def pow2_exponent(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
+    """The exponent n behind `pow2_scale_tensor`, i.e. the scale is 2**n.
+
+    Carried as an exponent rather than a scale so the scaling and its inverse can be applied
+    with ldexp, which cannot overflow on the way to a representable answer. Materialising 2**n
+    breaks in both directions: 2**n itself overflows float32 below about 2**-113, and for a
+    large-times-small pair like 2**114 @ 2**-113 (which is just 2.0) dividing by one scale
+    before the other passes through inf.
+    """
     if x.numel() == 0:
-        return torch.ones((), device = x.device, dtype = torch.float32)
+        return torch.zeros((), device = x.device, dtype = torch.int32)
     m = x.abs().max()
     _, exp = torch.frexp(m)
-    scale = torch.exp2((target_exp - (exp - 1)).float())
-    return torch.where(torch.isfinite(m) & (m > 0), scale, torch.ones_like(scale))
+    n = target_exp - (exp - 1)
+    return torch.where(torch.isfinite(m) & (m > 0), n, torch.zeros_like(n))
 
 
 # Rounding to low precision has to survive Inductor, and by default it does not: it fuses
@@ -223,20 +237,31 @@ def split_terms(x: torch.Tensor, dtype: torch.dtype, terms: int) -> list:
     return out
 
 
-# hi/lo window in which BOTH split terms stay normal in float16. The high term lands at
-# 2**target_exp = 2**14 and the low term sits about 2**-11 below it, so an entry more than
-# 2**28 under the maximum has already fallen through float16's normal floor.
+# hi/lo window beyond which the smallest entries lose their second term entirely and the
+# split degrades to plain float16 for them.
+#
+# This is deliberately a catastrophe guard, not a precision guard. Reserving the ~11 bits the
+# residual needs would put the limit at 2**17, but ordinary tensors exceed that routinely --
+# randn(256) * 0.02 measures 2**23.9, randn(4096) * 0.02 measures 2**24.4 -- because a matrix
+# only needs one near-zero entry to blow up hi/lo. At 2**17 the guard fires on the exact
+# workload this module is for and silently replaces the emulation with float32 mm.
+#
+# What is left is a real limitation of per-tensor scaling, recorded rather than papered over:
+# an output element that depends only on entries far below the tensor maximum can carry much
+# larger relative error than the aggregate figures in the docstring. diag([a, b*2**-27])
+# against its reciprocal returns 0.999844 rather than 1.0. Per-row or per-block scaling is the
+# fix if that case ever matters; a tighter global limit is not.
 _SPLIT_RANGE_LIMIT = 2.0 ** 28
 
 
-def _split_can_represent(x: torch.Tensor, s: torch.Tensor) -> bool:
+def _split_can_represent(x: torch.Tensor) -> bool:
     """Whether one per-tensor power-of-two scale can actually carry this operand.
 
-    Three ways the split silently returns something wrong, all of which plain float32 mm gets
+    Two ways the split silently returns something wrong, both of which plain float32 mm gets
     right: a non-finite entry, whose residual computes inf - inf and poisons everything to NaN;
-    a magnitude so small the scale itself overflows float32; and a within-tensor dynamic range
-    wider than float16's normal window, which rounds the small entries to zero. A single scale
-    taken from the maximum cannot serve the last case at all.
+    and a within-tensor dynamic range wider than the window above, which leaves the small
+    entries' residuals subnormal or zero. A single scale taken from the maximum cannot serve
+    the second case at all.
 
     Reads tensor values, so it syncs and is skipped under torch.compile, where a host read
     breaks the graph. The compiled path is for the ordinary finite, normal-range operands the
@@ -246,7 +271,7 @@ def _split_can_represent(x: torch.Tensor, s: torch.Tensor) -> bool:
         return True
     absx = x.abs()
     hi = absx.max()
-    if not bool(torch.isfinite(hi)) or not bool(torch.isfinite(s)):
+    if not bool(torch.isfinite(hi)):
         return False
     lo = torch.where(absx == 0, torch.full_like(absx, float("inf")), absx).min()
     if not bool(torch.isfinite(lo)):
@@ -284,23 +309,24 @@ def fp16_split_mm(
     if A32.numel() == 0 or B32.numel() == 0:
         return _mm_float32(A32, B32)
 
-    one = torch.ones((), device = A32.device, dtype = torch.float32)
-    sA = pow2_scale_tensor(A32) if scale else one
-    sB = pow2_scale_tensor(B32) if scale else one
-    if not _split_can_represent(A32, sA) or not _split_can_represent(B32, sB):
+    if not _split_can_represent(A32) or not _split_can_represent(B32):
         return _mm_float32(A32, B32)
 
-    a_terms = split_terms(A32 * sA, dtype, terms)
-    b_terms = split_terms(B32 * sB, dtype, terms)
+    zero = torch.zeros((), device = A32.device, dtype = torch.int32)
+    eA = pow2_exponent(A32) if scale else zero
+    eB = pow2_exponent(B32) if scale else zero
+    a_terms = split_terms(torch.ldexp(A32, eA), dtype, terms)
+    b_terms = split_terms(torch.ldexp(B32, eB), dtype, terms)
 
     pairs = sorted(itertools.product(range(terms), repeat = 2), key = lambda ij: ij[0] + ij[1])
     acc = None
     for i, j in pairs[:products]:
         part = _mm_f32_accumulate(a_terms[i], b_terms[j])
         acc = part if acc is None else acc + part
-    # Divided one scale at a time: sA * sB overflows to inf for two individually representable
-    # small operands (2**-55 each gives 2**69 apiece), which would zero a good result.
-    return acc / sA / sB
+    # One ldexp with the combined exponent. Neither sA * sB nor a division per scale works: the
+    # product overflows for two small operands, and dividing in either order passes through inf
+    # for a large-times-small pair whose answer is perfectly representable.
+    return torch.ldexp(acc, -(eA + eB))
 
 
 class _FP16SplitMatmul(torch.autograd.Function):
