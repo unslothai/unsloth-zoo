@@ -2004,9 +2004,13 @@ def torch_native_forward(
 
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-            # Autocast off keeps the adapter matmuls in float32. The down projection itself
-            # is float32 via _pre_set_compute_dtype, set in unsloth's loader, since
-            # bitsandbytes Linear4bit casts to self.compute_dtype whatever autocast says.
+            # Three separate things keep this float32, none of them redundant. A quantized
+            # down_proj computes in float32 via _pre_set_compute_dtype, set in unsloth's
+            # loader; the float32 gated_output is what Linear4bit restores the output to,
+            # since it captures inp_dtype and casts back; and autocast off is what protects
+            # the unquantized fallback, which takes F.linear and ignores compute_dtype.
+            # It does not keep the adapter matmuls in float32 -- the forced-float32 LoRA
+            # path casts those to float16 itself.
             with torch.autocast(device_type=device_type, enabled=False):
                 out = down_proj(gated_output)
             
@@ -2029,8 +2033,9 @@ def torch_native_forward(
         # glu = gate * torch.sigmoid(gate * self.alpha)
         # fused = (up_h + 1) * glu
 
-        # Autocast off for the down projection only. As above, the float32 comes from
-        # _pre_set_compute_dtype, not from this context manager.
+        # Autocast off for the down projection only. As above, it is the unquantized
+        # fallback that needs this; a quantized layer gets float32 from
+        # _pre_set_compute_dtype instead.
         device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             out_list = [
@@ -2044,10 +2049,10 @@ def torch_native_forward(
     pass
 pass
 
-# torch_native_forward has full float32 protection in float16 training: swiglu in float32,
-# autocast disabled around down_proj, and down_proj itself in float32 via
-# _pre_set_compute_dtype (set in unsloth's loader). The last one is what keeps the down
-# projection output out of float16.
+# torch_native_forward protects the down projection three ways in float16 training: swiglu and
+# gated_output in float32, which is also the dtype Linear4bit restores its output to;
+# _pre_set_compute_dtype (set in unsloth's loader) for the quantized compute; and autocast
+# disabled for the unquantized fallback, which ignores compute_dtype.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():
