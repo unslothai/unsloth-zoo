@@ -350,6 +350,7 @@ jobs:
             tests/test_mlx_trainer_internals.py \
             tests/test_mlx_arrays_cache_advance.py \
             tests/test_mlx_quantized_optimizer_routing.py \
+            tests/test_fp16_emulation.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
             tests/test_quant_status_transport_errors.py \

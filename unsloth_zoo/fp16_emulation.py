@@ -1,8 +1,9 @@
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -12,6 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Emulate float32 matmul accuracy using split float16 terms.
 
 NOT ENABLED ANYWHERE. Nothing in Unsloth calls this module, and importing it changes no
@@ -81,6 +83,13 @@ change to get there, both load-bearing:
     stops existing and lands at plain-float16 error while running faster. Guarded by
     test_compiled_keeps_float32_accuracy.
 
+Degenerate operands fall back to plain float32 mm rather than returning something wrong: a
+non-finite entry (the residual would compute inf - inf and NaN the result), a magnitude so
+small the scale overflows float32, and a within-tensor dynamic range wider than float16's
+normal window, which one per-tensor scale cannot hold and which would round the small entries
+to zero. The check reads tensor values, so it is skipped under torch.compile, where a host
+read breaks the graph and the operands are the ordinary finite ones anyway.
+
 So: numerically sound, not currently worth enabling. Kept for the case where a large
 float32 GEMM appears on hardware without bfloat16 tensor cores.
 """
@@ -111,16 +120,34 @@ _HAS_OUT_DTYPE = None
 
 
 def _has_out_dtype() -> bool:
-    """torch.mm(..., out_dtype = ) landed in torch 2.8. Probed once, not assumed."""
+    """torch.mm(..., out_dtype = ) landed in torch 2.8. Probed once, not assumed.
+
+    Probed on CUDA, because `aten::mm.dtype` is CUDA-only: a CPU probe raises
+    NotImplementedError, which subclasses RuntimeError and so would be caught below and cache
+    False forever, silently costing the tensor-core path this module exists for.
+    """
     global _HAS_OUT_DTYPE
     if _HAS_OUT_DTYPE is None:
-        try:
-            zero = torch.zeros(1, 1, dtype = torch.float16)
-            torch.mm(zero, zero, out_dtype = torch.float32)
-            _HAS_OUT_DTYPE = True
-        except (TypeError, RuntimeError):
+        if not torch.cuda.is_available():
             _HAS_OUT_DTYPE = False
+        else:
+            try:
+                zero = torch.zeros(1, 1, dtype = torch.float16, device = "cuda")
+                torch.mm(zero, zero, out_dtype = torch.float32)
+                _HAS_OUT_DTYPE = True
+            except (TypeError, RuntimeError):
+                _HAS_OUT_DTYPE = False
     return _HAS_OUT_DTYPE
+
+
+def _mm_float32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Plain float32 matmul that autocast cannot downcast.
+
+    `.float()` on the operands is not enough: torch.mm is autocast-eligible, so inside an
+    autocast region it is re-cast to float16 and the result stops being float32-accumulated.
+    """
+    with torch.autocast(device_type = a.device.type, enabled = False):
+        return torch.mm(a.float(), b.float())
 
 
 def _mm_f32_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -131,7 +158,7 @@ def _mm_f32_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
     if _has_out_dtype() and a.is_cuda:
         return torch.mm(a, b, out_dtype = torch.float32)
-    return torch.mm(a.float(), b.float())
+    return _mm_float32(a, b)
 
 
 def pow2_scale(x: torch.Tensor, target_exp: int = 14) -> float:
@@ -158,6 +185,8 @@ def pow2_scale_tensor(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
     expression"). frexp gives the exponent on device instead. frexp returns
     m = mantissa * 2**exp with mantissa in [0.5, 1), so floor(log2(m)) == exp - 1.
     """
+    if x.numel() == 0:
+        return torch.ones((), device = x.device, dtype = torch.float32)
     m = x.abs().max()
     _, exp = torch.frexp(m)
     scale = torch.exp2((target_exp - (exp - 1)).float())
@@ -194,6 +223,37 @@ def split_terms(x: torch.Tensor, dtype: torch.dtype, terms: int) -> list:
     return out
 
 
+# hi/lo window in which BOTH split terms stay normal in float16. The high term lands at
+# 2**target_exp = 2**14 and the low term sits about 2**-11 below it, so an entry more than
+# 2**28 under the maximum has already fallen through float16's normal floor.
+_SPLIT_RANGE_LIMIT = 2.0 ** 28
+
+
+def _split_can_represent(x: torch.Tensor, s: torch.Tensor) -> bool:
+    """Whether one per-tensor power-of-two scale can actually carry this operand.
+
+    Three ways the split silently returns something wrong, all of which plain float32 mm gets
+    right: a non-finite entry, whose residual computes inf - inf and poisons everything to NaN;
+    a magnitude so small the scale itself overflows float32; and a within-tensor dynamic range
+    wider than float16's normal window, which rounds the small entries to zero. A single scale
+    taken from the maximum cannot serve the last case at all.
+
+    Reads tensor values, so it syncs and is skipped under torch.compile, where a host read
+    breaks the graph. The compiled path is for the ordinary finite, normal-range operands the
+    module is meant for.
+    """
+    if torch.compiler.is_compiling():
+        return True
+    absx = x.abs()
+    hi = absx.max()
+    if not bool(torch.isfinite(hi)) or not bool(torch.isfinite(s)):
+        return False
+    lo = torch.where(absx == 0, torch.full_like(absx, float("inf")), absx).min()
+    if not bool(torch.isfinite(lo)):
+        return True         # all zeros: nothing to lose
+    return bool(hi / lo <= _SPLIT_RANGE_LIMIT)
+
+
 def fp16_split_mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -213,13 +273,23 @@ def fp16_split_mm(
     """
     if A.ndim != 2 or B.ndim != 2:
         raise ValueError(f"fp16_split_mm expects 2D operands, got {A.shape} and {B.shape}")
+    if terms < 1 or products < 1:
+        raise ValueError(f"terms and products must be positive, got terms={terms} products={products}")
     if products > terms * terms:
         raise ValueError(f"products={products} exceeds terms*terms={terms * terms}")
 
     A32, B32 = A.float(), B.float()
+    # torch.mm accepts a zero-sized dimension; the max() reduction in the scale does not, and
+    # an empty expert partition is an ordinary outcome of MoE routing.
+    if A32.numel() == 0 or B32.numel() == 0:
+        return _mm_float32(A32, B32)
+
     one = torch.ones((), device = A32.device, dtype = torch.float32)
     sA = pow2_scale_tensor(A32) if scale else one
     sB = pow2_scale_tensor(B32) if scale else one
+    if not _split_can_represent(A32, sA) or not _split_can_represent(B32, sB):
+        return _mm_float32(A32, B32)
+
     a_terms = split_terms(A32 * sA, dtype, terms)
     b_terms = split_terms(B32 * sB, dtype, terms)
 
@@ -228,7 +298,9 @@ def fp16_split_mm(
     for i, j in pairs[:products]:
         part = _mm_f32_accumulate(a_terms[i], b_terms[j])
         acc = part if acc is None else acc + part
-    return acc / (sA * sB)
+    # Divided one scale at a time: sA * sB overflows to inf for two individually representable
+    # small operands (2**-55 each gives 2**69 apiece), which would zero a good result.
+    return acc / sA / sB
 
 
 class _FP16SplitMatmul(torch.autograd.Function):

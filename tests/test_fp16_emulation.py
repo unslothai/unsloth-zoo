@@ -1,8 +1,9 @@
-# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -12,6 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Tests for the dormant float16 matmul emulation.
 
 The important test here is not that the scaled split is accurate, it is that the UNSCALED
@@ -239,3 +241,80 @@ def test_pow2_scale_tensor_matches_pow2_scale():
         assert pow2_scale_tensor(x).item() == pow2_scale(x)
     zero = torch.zeros(8, 8, device = "cuda")
     assert pow2_scale_tensor(zero).item() == pow2_scale(zero) == 1.0
+
+
+# ---------------------------------------------------------------- degenerate operands
+#
+# Each of these returned something silently wrong before: a NaN, a zero, or an exception,
+# where torch.mm returns the right answer. The emulation advertises itself as a float32
+# matmul stand-in, so "wrong but fast" is the one outcome it must not have.
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_out_dtype_probe_finds_cuda_support():
+    """aten::mm.dtype is CUDA-only. Probing it on CPU raises NotImplementedError, which
+    subclasses RuntimeError, so a CPU probe would cache False and disable the tensor-core
+    path the module exists for."""
+    from unsloth_zoo.fp16_emulation import _has_out_dtype
+    assert _has_out_dtype() is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_infinite_operand_matches_torch_mm():
+    A = torch.tensor([[float("inf")]], device = "cuda")
+    B = torch.tensor([[1.0]], device = "cuda")
+    assert torch.isinf(fp16_split_mm(A, B)).all()      # was NaN: inf - inf in the residual
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_scale_that_would_overflow_float32():
+    """max|x| below about 2**-113 makes the scale itself larger than float32 can hold."""
+    A = torch.full((2, 2), 2.0 ** -114, device = "cuda")
+    B = torch.full((2, 2), 2.0 ** 114, device = "cuda")
+    assert torch.allclose(fp16_split_mm(A, B).double(), A.double() @ B.double(), rtol = 1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_scale_product_overflows_but_operands_do_not():
+    """Each scale is representable at 2**69; only sA * sB overflows, so the division is
+    done one scale at a time."""
+    A = torch.tensor([[2.0 ** -55]], device = "cuda")
+    B = torch.tensor([[2.0 ** -55]], device = "cuda")
+    assert torch.allclose(fp16_split_mm(A, B).double(), A.double() @ B.double(), rtol = 1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_within_tensor_range_wider_than_float16():
+    """One per-tensor scale cannot hold a range this wide, so the small entries would round
+    to zero. Falls back to float32 rather than returning an all-zero matrix."""
+    A = torch.diag(torch.tensor([1.0, 2.0 ** -39], device = "cuda"))
+    B = torch.diag(torch.tensor([1.0, 2.0 ** 39], device = "cuda"))
+    assert torch.allclose(fp16_split_mm(A, B).diagonal(), torch.ones(2, device = "cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_empty_dimension_matches_torch_mm():
+    """MoE routing hands out empty expert partitions; torch.mm accepts them, max() does not."""
+    A = torch.zeros(0, 8, device = "cuda")
+    B = torch.zeros(8, 4, device = "cuda")
+    assert fp16_split_mm(A, B).shape == (0, 4)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_float32_accumulate_survives_autocast():
+    """torch.mm is autocast-eligible, so .float() operands alone do not keep the fallback in
+    float32 inside an autocast region."""
+    A, B = _pair(512, 512, 512, mag = 0.02)
+    ref = A.double() @ B.double()
+    with torch.autocast(device_type = "cuda", dtype = torch.float16):
+        out = fp16_split_mm(A, B)
+    assert out.dtype == torch.float32
+    rel = ((out.double() - ref).norm() / ref.norm()).item()
+    assert rel < 1e-5, f"autocast degraded the emulation to {rel:.2e}"
+
+
+@pytest.mark.parametrize("kwargs", [{"terms": 0}, {"products": 0}, {"products": -1}])
+def test_non_positive_counts_rejected(kwargs):
+    """products=-1 used to slice the full product list and silently run a different scheme."""
+    A, B = _pair(4, 4, 4, device = "cpu")
+    with pytest.raises(ValueError):
+        fp16_split_mm(A, B, **kwargs)
