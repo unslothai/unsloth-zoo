@@ -208,14 +208,6 @@ def _is_bnb_4bit_base(module):
 pass
 
 
-def _absmax(t):
-    # Not torch.abs(t).max(): abs() materializes a second full-size tensor and can OOM
-    # a merge that otherwise fits.
-    amin, amax = torch.aminmax(t)
-    return torch.maximum(amin.abs(), amax.abs()).item()
-pass
-
-
 def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
     device = _active_merge_device()
@@ -246,7 +238,6 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         # else: a shape mismatch is structural (e.g. vocab resize handled below), not a dequant
         # failure, so keep the 16bit W here and let the resize path reconcile it.
     W = W.to(device, dtype = torch.float32, non_blocking = True)
-    W_base_absmax = _absmax(W)
     lora_B = lora_stats.lora_B.to(device, dtype = torch.float32, non_blocking = True)
     lora_A = lora_stats.lora_A.to(device, dtype = torch.float32, non_blocking = True)
     # Handle vocab resize: LoRA may have more rows than base safetensors weight
@@ -273,18 +264,6 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         W = (magnitude / weight_norm).unsqueeze(1) * W
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
-    # Finite garbage (~1e12+) slips past the isfinite gate above, so bound the merged
-    # magnitude too. Both arms must hold: a legitimately tiny base weight must not trip
-    # the ratio alone.
-    W_absmax = _absmax(W)
-    if W_absmax > max(64.0 * W_base_absmax, 1e4):
-        raise ValueError(
-            f"Unsloth: Merge failed for {name}: merged |W|max = {W_absmax:.3e} vs "
-            f"base |W|max = {W_base_absmax:.3e}. The LoRA weights read at merge "
-            "time are far too large to be a healthy adapter delta. If a vLLM "
-            "engine is still alive in this process, shut it down and re-merge, "
-            "or merge offline from the last saved adapter checkpoint."
-        )
     return W
 pass
 
@@ -459,16 +438,6 @@ def _get_lora_scaling(module):
 pass
 
 
-def _snapshot_lora_weight(weight):
-    # Storing live references here let anything mutating the adapter between capture and
-    # _merge_lora (a colocated vLLM engine hot-load) change what gets exported.
-    # inference_mode(False): create_lora_statistics is @torch.inference_mode, and an
-    # inference tensor is rejected by downstream code outside inference mode.
-    with torch.inference_mode(False):
-        return weight.detach().to("cpu", copy = True)
-pass
-
-
 @torch.inference_mode
 def create_lora_statistics(model, merge_into_original = False, return_state_dict = True):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -488,19 +457,19 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
         if name == "": continue
 
         elif name.endswith(".lora_A.default"):
-            lora_weights[name[:-len(".lora_A.default")]].lora_A = _snapshot_lora_weight(module.weight)
+            lora_weights[name[:-len(".lora_A.default")]].lora_A = module.weight
             lora_A_count += 1
             expand_module_keys(name, module, remove_keys)
 
         elif name.endswith(".lora_B.default"):
-            lora_weights[name[:-len(".lora_B.default")]].lora_B = _snapshot_lora_weight(module.weight)
+            lora_weights[name[:-len(".lora_B.default")]].lora_B = module.weight
             lora_B_count += 1
             expand_module_keys(name, module, remove_keys)
 
         elif name.endswith(".lora_magnitude_vector.default"):
             # DoRA magnitude vector m; folded onto the merged weight in _merge_lora. Register its
             # key so the key-consistency check does not flag it (the merged model omits it).
-            lora_weights[name[:-len(".lora_magnitude_vector.default")]].magnitude = _snapshot_lora_weight(module.weight)
+            lora_weights[name[:-len(".lora_magnitude_vector.default")]].magnitude = module.weight
             expand_module_keys(name, module, remove_keys)
 
         elif isinstance(module, Linear_LoRA_Layers):

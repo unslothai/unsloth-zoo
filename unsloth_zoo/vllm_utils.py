@@ -2966,17 +2966,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         peft_config = get_peft_config(save_directory)
         state_dict = model.state_dict()
         items = state_dict.items()
-        # Ship CLONES, never the live training tensors: LoRAModel.from_lora_tensors stores
-        # `tensor.to(device, dtype)`, a no-op sharing storage when both already match, and
-        # LoRALayerWeights.optimize() then scales lora_b in place on the training weights.
-        # inference_mode(False): a plain clone would be an inference tensor, which the eager
-        # add_lora path (not wrapped in inference mode) cannot mutate in place.
-        with torch.inference_mode(False):
-            state_dict = {
-                k.replace(".default", ""): v.detach().clone()
-                for k, v in items
-                if ".lora_A." in k or ".lora_B." in k
-            }
+        state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
