@@ -118,6 +118,14 @@ modifications =
         * PR #1000 (issue #999) in ops/gated_delta_rule/wy_fast.py: restrict the
           Blackwell prepare_wy_repr_bwd_kernel autotune to the B200-validated
           config (unstable configs can hang / misaligned-address the bwd).
+          Narrowed by Unsloth: PR #1000 pins num_warps=2 AND num_stages=4, but only
+          num_warps was implicated by #999 and the report was on triton 3.3.1, while
+          num_stages=4 is the expensive half. Measured on one B200 (torch 2.12.1+cu130,
+          triton 3.7.1), chunk_gated_delta_rule fwd+bwd B=2 T=8192 H=48 D=128 bf16:
+          the full pin costs 0.733 ms of 5.309 ms and num_stages alone accounts for
+          0.624 ms of that. So the warp pin is kept unconditionally and num_stages is
+          allowed to autotune from triton 3.6 onward; below 3.6 the exact upstream pin
+          is kept, since that is the era #999 was reported against.
         * PR #983 (issue #640) in ops/common/chunk_o.py (+ TRITON_ABOVE_3_7_1 in
           utils/_compat.py and utils/__init__.py): narrow the Hopper gated
           chunk_bwd_dqkwg guard to Triton [3.4.0, 3.7.1); 3.7.1 fixes the bug.

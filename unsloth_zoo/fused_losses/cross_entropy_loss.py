@@ -136,8 +136,13 @@ def compute_fused_ce_loss(
 pass
 
 
+# Per (token x vocab) element over the whole eager chain: bf16 logits + float32
+# upcast + saved log_softmax + backward gradient = 14, and 16 under softcapping.
+# 4 counted the logits alone.
+_CE_BYTES_PER_LOGIT = 16.0
+
 @functools.cache
-def _get_chunk_multiplier(vocab_size, target_gb = None):
+def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
         # Find current VRAM left in the GPU, and use 50% or less of it
@@ -153,24 +158,28 @@ def _get_chunk_multiplier(vocab_size, target_gb = None):
     if target_gb <= 1e-9: # Use a small epsilon for float comparison
         raise RuntimeError("Unsloth: No or negligible GPU memory available for fused cross entropy.")
 
-    multiplier = (vocab_size * 4 / 1024 / 1024 / 1024) / (target_gb)
+    # Unchunkable allocations share the budget; if they alone exceed the target
+    # no chunk count helps, so keep the full budget instead.
+    if 0.0 < fixed_gb < target_gb:
+        target_gb = target_gb - fixed_gb
+    pass
+
+    multiplier = (vocab_size * _CE_BYTES_PER_LOGIT / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
     """Number of chunks that fits the target max memory usage."""
-    multiplier = _get_chunk_multiplier(vocab_size, target_gb)
+    multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
     n_splits = (bsz*qlen) * multiplier
-    # n_splits * 4 == (full float32 logits GiB) / target: the exact number of
-    # chunks needed to keep every chunk within target. Round UP to the next
-    # multiple of 4 so the target stays a real ceiling. Nearest-rounding could
-    # round down (round(0.5) -> 0) and collapse a 4-8 GiB logits transient into
-    # a single uncapped chunk; a config that already fits one chunk stays at one.
+    # n_splits * 4 == (chunk transient GiB) / target. Round UP: nearest-rounding
+    # (round(0.5) -> 0) collapses a large transient into one uncapped chunk.
     exact = n_splits * 4
     if exact <= 1.0 + 1e-9:
         return 1
-    return math.ceil(exact / 4 - 1e-9) * 4
+    n_chunks = math.ceil(exact / 4 - 1e-9) * 4
+    return min(n_chunks, bsz*qlen)
 pass
 
 class UnslothFusedLoss(torch.autograd.Function):
@@ -250,7 +259,19 @@ class UnslothFusedLoss(torch.autograd.Function):
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
-            n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb)
+            # Memory no chunk count can shrink. Under overwrite grad_inputs
+            # aliases hidden_states; the head gradient counts twice (per chunk).
+            fixed_bytes = 0
+            if not overwrite:
+                fixed_bytes += grad_inputs.numel() * grad_inputs.element_size()
+            if grad_lm_head is not None:
+                fixed_bytes += 2 * grad_lm_head.numel() * grad_lm_head.element_size()
+            if grad_lm_head_bias is not None:
+                fixed_bytes += 2 * grad_lm_head_bias.numel() * grad_lm_head_bias.element_size()
+            n_chunks = get_chunk_size(
+                bsz, qlen, vocab_size, target_gb = target_gb,
+                fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
+            )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)

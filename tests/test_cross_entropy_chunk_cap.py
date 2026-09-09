@@ -56,8 +56,44 @@ def test_cap_effective_in_4_to_8_gib_band(monkeypatch):
 
 def test_small_logits_stay_single_chunk(monkeypatch):
     ce = _load_module(monkeypatch, 180 * 1024 ** 3)
-    # 2 GiB of float32 logits (< 4 GiB cap).
-    assert ce.get_chunk_size(1, 8_192, 65_536) == 1
+    # 2 GiB footprint at 16 bytes/element (< 4 GiB cap).
+    assert ce.get_chunk_size(1, 2_048, 65_536) == 1
+
+
+def test_bytes_per_logit_covers_the_whole_chain(monkeypatch):
+    # Below the eager cost of 14 bytes/element chunks overrun target_gb (#946).
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    assert ce._CE_BYTES_PER_LOGIT >= 14.0
+
+
+def test_unchunkable_memory_is_charged_to_the_target(monkeypatch):
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    none = ce.get_chunk_size(1, 16_384, 151_936, target_gb=4.0, fixed_gb=0.0)
+    some = ce.get_chunk_size(1, 16_384, 151_936, target_gb=4.0, fixed_gb=2.0)
+    assert some > none, (none, some)
+
+
+def test_fixed_larger_than_target_does_not_explode_chunks(monkeypatch):
+    # No chunk count can satisfy it, so sizing falls back to the plain budget.
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    plain = ce.get_chunk_size(1, 16_384, 151_936, target_gb=1.0, fixed_gb=0.0)
+    swamped = ce.get_chunk_size(1, 16_384, 151_936, target_gb=1.0, fixed_gb=8.0)
+    assert swamped == plain, (plain, swamped)
+    assert swamped <= 16_384
+
+
+def test_overwrite_does_not_charge_the_aliased_grad_inputs(monkeypatch):
+    # Under overwrite grad_inputs IS hidden_states, so it costs no new memory.
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    aliased = ce.get_chunk_size(1, 8_192, 151_936, target_gb=4.0, fixed_gb=0.0)
+    charged = ce.get_chunk_size(1, 8_192, 151_936, target_gb=4.0, fixed_gb=2.0)
+    assert charged > aliased, (aliased, charged)
+
+
+def test_chunks_never_exceed_token_count(monkeypatch):
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    n = ce.get_chunk_size(1, 64, 262_144, target_gb=0.001)
+    assert 1 <= n <= 64, n
 
 
 def test_cap_bounds_target_independent_of_free(monkeypatch):

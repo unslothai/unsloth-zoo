@@ -25,6 +25,7 @@ Two parts:
     Triton kernels cannot run (no CUDA / torch<2.7 / triton<3.3).
 """
 
+import ast
 import os
 import sys
 import subprocess
@@ -183,7 +184,9 @@ def test_backported_blackwell_hopper_fixes_present():
 
     wy = (VENDORED / "ops" / "gated_delta_rule" / "wy_fast.py").read_text()
     assert "PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]" in wy
-    assert "PREPARE_WY_REPR_BWD_NUM_STAGES = [4] if IS_NVIDIA_BLACKWELL else [2, 3, 4]" in wy
+    # num_stages is policy-driven (see test_prepare_wy_repr_bwd_num_stages_policy);
+    # the warp pin is the part #1000 actually established, so pin that literally.
+    assert "PREPARE_WY_REPR_BWD_NUM_STAGES = _prepare_wy_repr_bwd_num_stages(" in wy
     assert "for num_warps in PREPARE_WY_REPR_BWD_NUM_WARPS" in wy
     # The fwd recompute kernel keeps its wider space.
     assert "for num_warps in [2, 4, 8]" in wy
@@ -217,6 +220,46 @@ def test_backported_blackwell_hopper_fixes_present():
     assert "TRITON_ABOVE_3_7_1 = " in compat
     utils_init = (VENDORED / "utils" / "__init__.py").read_text()
     assert "TRITON_ABOVE_3_7_1," in utils_init
+
+
+def test_prepare_wy_repr_bwd_num_stages_policy():
+    """fla PR #1000 pinned Blackwell to num_warps=2 AND num_stages=4. Only num_warps
+    was implicated by #999, and that report was on triton 3.3.1, so num_stages is
+    allowed to autotune from triton 3.6 onward and the exact upstream pin is kept
+    below it. The warp pin is never relaxed. No GPU: the policy is a pure function of
+    (is_blackwell, triton_above_3_6_0)."""
+    import importlib.util
+
+    src = VENDORED / "ops" / "gated_delta_rule" / "wy_fast.py"
+    # Load just the helper, without importing fla (which needs torch + triton + CUDA).
+    tree = ast.parse(src.read_text())
+    fn = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "_prepare_wy_repr_bwd_num_stages"
+    )
+    ns = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(src), "exec"), ns)
+    policy = ns["_prepare_wy_repr_bwd_num_stages"]
+
+    # Blackwell + triton < 3.6 -> the exact upstream pin.
+    assert policy(True, False) == [4]
+    # Blackwell + triton >= 3.6 -> more than one num_stages offered.
+    assert len(policy(True, True)) > 1
+    assert 4 in policy(True, True), "the validated config must stay in the space"
+    # Non-Blackwell is untouched by #1000 on either triton.
+    assert policy(False, False) == [2, 3, 4]
+    assert policy(False, True) == [2, 3, 4]
+
+    # The warp pin is separate and unconditional.
+    wy = src.read_text()
+    assert "PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]" in wy
+    # The gate is wired to the real constant, not left hardcoded.
+    assert "PREPARE_WY_REPR_BWD_NUM_STAGES = _prepare_wy_repr_bwd_num_stages(\n" \
+           "    IS_NVIDIA_BLACKWELL, TRITON_ABOVE_3_6_0,\n)" in wy
+    compat = (VENDORED / "utils" / "_compat.py").read_text()
+    assert 'TRITON_ABOVE_3_6_0 = package_version.parse(triton.__version__) >= ' \
+           'package_version.parse("3.6.0")' in compat
+    assert "TRITON_ABOVE_3_6_0," in (VENDORED / "utils" / "__init__.py").read_text()
 
 
 _HYGIENE_SUBPROCESS = textwrap.dedent(

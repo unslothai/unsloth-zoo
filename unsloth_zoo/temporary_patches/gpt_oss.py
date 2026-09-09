@@ -1412,12 +1412,22 @@ elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
+
+# coordinate_descent_tuning used to be driven by use_combo_kernels too, so asking for combo
+# kernels also bought the tuning. Measured apart on T4/L4/A100/B200: combo kernels are free
+# (decode compile 7.36s vs 7.48s off), the tuning costs +28% on A100 and +32% on L4 decode
+# compile for no measurable gain anywhere. Default it off, opt in to re-measure.
+#
+# The 40GB test above is in GiB, so an A100-SXM4-40GB reports 39.49 and falls BELOW it.
+# Left as-is: combo kernels measured as no-effect on both sides of the boundary.
+use_coordinate_descent = os.environ.get("UNSLOTH_COORDINATE_DESCENT_TUNING", "0") == "1"
+
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = use_combo_kernels,
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -1429,7 +1439,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = False, # Breaks on attention
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -2004,7 +2014,16 @@ def torch_native_forward(
 
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-            with torch.autocast(device_type=device_type, enabled=False): # Force float32
+            # Three separate things keep this float32, none of them redundant. On the
+            # forced-float32 path only, a quantized down_proj computes in float32 via
+            # _pre_set_compute_dtype, set in unsloth's loader; without that rule the layer
+            # takes the run's ordinary compute dtype, bfloat16 included. The float32
+            # gated_output is what Linear4bit restores the output to, since it captures
+            # inp_dtype and casts back. And autocast off is what protects the unquantized
+            # fallback, which takes F.linear and ignores compute_dtype. It does not keep the
+            # adapter matmuls in float32 -- the forced-float32 LoRA path casts those to
+            # float16 itself.
+            with torch.autocast(device_type=device_type, enabled=False):
                 out = down_proj(gated_output)
             
             weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
@@ -2026,9 +2045,12 @@ def torch_native_forward(
         # glu = gate * torch.sigmoid(gate * self.alpha)
         # fused = (up_h + 1) * glu
 
-        # Force float32 matrix multiply on down projection only
+        # Autocast off for the down projection only. As above, it is the unquantized
+        # fallback that needs this; on the forced-float32 path a quantized layer gets
+        # float32 from _pre_set_compute_dtype instead. This branch also runs in bfloat16,
+        # where no float32 rule is registered and the layer stays in bfloat16.
         device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):
             out_list = [
                 down_l(fused[e].to(dtype))
                 for e, down_l in enumerate(self.down_projs)
@@ -2040,8 +2062,11 @@ def torch_native_forward(
     pass
 pass
 
-# torch_native_forward has full float32 protection (swiglu in float32, autocast
-# disabled around down_proj) to prevent NaN in fp16 training.
+# torch_native_forward protects the down projection three ways in float16 training: swiglu and
+# gated_output in float32, which is also the dtype Linear4bit restores its output to;
+# _pre_set_compute_dtype (registered by unsloth's loader on the forced-float32 path only) for
+# the quantized compute; and autocast disabled for the unquantized fallback, which ignores
+# compute_dtype. A bfloat16 run registers no float32 rule and keeps the layer in bfloat16.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():
