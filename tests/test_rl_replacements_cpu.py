@@ -399,13 +399,18 @@ def test_bias_correction_defaults_off_without_the_trl_field():
 
 @pytest.fixture
 def disable_dynamo():
-    import torch._dynamo
-    prev = torch._dynamo.config.disable
-    torch._dynamo.config.disable = True
+    # Neutralise the compile wrapper rather than setting torch._dynamo.config.disable:
+    # from torch 2.14 that flag makes fullgraph=True raise "found no compiled frames",
+    # so the flag approach fails on new torch for a reason that has nothing to do with
+    # the code under test. UnslothEfficientGRPO imports this name inside forward(), so
+    # patching the module attribute reaches it at call time on every torch version.
+    import unsloth_zoo.temporary_patches.utils as u
+    prev = u.torch_compile_with_fallback
+    u.torch_compile_with_fallback = lambda *a, **kw: (lambda fn: fn)
     try:
         yield
     finally:
-        torch._dynamo.config.disable = prev
+        u.torch_compile_with_fallback = prev
 
 
 def _vespo_gamma_weights(advantages, log_ratio_per_token, mask, importance_sampling_ratio,
