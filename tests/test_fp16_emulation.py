@@ -34,7 +34,7 @@ from unsloth_zoo.fp16_emulation import (  # noqa: E402
     fp16_split_matmul,
     fp16_split_mm,
     pow2_scale,
-    pow2_scale_tensor,
+    pow2_exponent,
     split_terms,
 )
 
@@ -234,13 +234,13 @@ def test_round_to_actually_rounds_under_compile():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
-def test_pow2_scale_tensor_matches_pow2_scale_at_extremes():
-    """float32 cannot hold the scale for max|x| near 2**-114, where it is 2**128, so the
-    exported helper is float64. pow2_scale returns a finite Python float there and the two
-    must still agree."""
+def test_pow2_exponent_applies_cleanly_at_extremes():
+    """A materialised scale is unusable here however it is stored: 2**128 overflows float32,
+    and a 0-dim float64 scale still promotes down to float32 when applied. ldexp does not."""
     x = torch.tensor([2.0 ** -114])
-    assert pow2_scale_tensor(x).item() == pow2_scale(x)
-    assert torch.isfinite(pow2_scale_tensor(x))
+    n = pow2_exponent(x)
+    assert 2.0 ** n.item() == pow2_scale(x)
+    assert torch.ldexp(x, n).item() == 2.0 ** 14
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
@@ -254,13 +254,14 @@ def test_round_to_does_not_alias_when_dtype_matches():
     fp16_split_mm(A, A, dtype = torch.float32)      # used to raise an aliasing error
 
 
-def test_pow2_scale_tensor_matches_pow2_scale():
-    """The sync-free scale must be the same number, not merely a similar one."""
+def test_pow2_exponent_matches_pow2_scale():
+    """The sync-free form must give the same number, not merely a similar one. Runs on CPU:
+    it is device-independent, and the CPU gate executes this file."""
     for mag in (1e-6, 1e-3, 0.1, 1.0, 1e3):
-        x = torch.randn(256, 256, device = "cuda") * mag
-        assert pow2_scale_tensor(x).item() == pow2_scale(x)
-    zero = torch.zeros(8, 8, device = "cuda")
-    assert pow2_scale_tensor(zero).item() == pow2_scale(zero) == 1.0
+        x = torch.randn(256, 256) * mag
+        assert 2.0 ** pow2_exponent(x).item() == pow2_scale(x)
+    zero = torch.zeros(8, 8)
+    assert 2.0 ** pow2_exponent(zero).item() == pow2_scale(zero) == 1.0
 
 
 # ---------------------------------------------------------------- degenerate operands

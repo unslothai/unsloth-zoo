@@ -76,19 +76,20 @@ torch.compile. `fp16_split_mm` compiles fullgraph and compiling it is worth 1.5-
 torch 2.14), which turns square-4096 from 1.24x into 3.25x against float32. Two things had to
 change to get there, both load-bearing:
 
-  - the scale must not call `.item()`, which syncs and breaks fullgraph. `pow2_scale_tensor`
-    uses frexp instead and returns the identical number.
+  - the scale must not call `.item()`, which syncs and breaks fullgraph. `pow2_exponent`
+    uses frexp instead and is applied with ldexp.
   - the float16 rounding must go through an opaque custom op. Inductor otherwise fuses
     `.to(float16).to(float32)` away, leaving a residual of exactly 0, so the split silently
     stops existing and lands at plain-float16 error while running faster. Guarded by
     test_compiled_keeps_float32_accuracy.
 
 Degenerate operands fall back to plain float32 mm rather than returning something wrong: a
-non-finite entry (the residual would compute inf - inf and NaN the result), a magnitude so
-small the scale overflows float32, and a within-tensor dynamic range wider than float16's
-normal window, which one per-tensor scale cannot hold and which would round the small entries
-to zero. The check reads tensor values, so it is skipped under torch.compile, where a host
-read breaks the graph and the operands are the ordinary finite ones anyway.
+non-finite entry, whose residual would compute inf - inf and NaN the result, and a within-tensor
+dynamic range wider than float16's normal window, which one per-tensor scale cannot hold and
+which would round the small entries to zero. The check reads tensor values, so it is skipped
+under torch.compile, where a host read breaks the graph and the operands are the ordinary finite
+ones anyway. Extreme magnitudes need no fallback: the scaling is an exponent applied with ldexp,
+so nothing is materialised that could overflow.
 
 So: numerically sound, not currently worth enabling. Kept for the case where a large
 float32 GEMM appears on hardware without bfloat16 tensor cores.
@@ -104,7 +105,7 @@ import torch
 __all__ = [
     "fp16_emulation_enabled",
     "pow2_scale",
-    "pow2_scale_tensor",
+    "pow2_exponent",
     "split_terms",
     "fp16_split_mm",
     "fp16_split_matmul",
@@ -170,8 +171,8 @@ def pow2_scale(x: torch.Tensor, target_exp: int = 14) -> float:
     its own. That matters when the entire purpose is to measure error. target_exp = 14 puts
     the maximum an octave below the float16 ceiling of 65504.
 
-    Returns a Python float, so it syncs. `pow2_scale_tensor` is the torch.compile-safe form;
-    this one is kept because it is the readable definition and is what the tests assert on.
+    Returns a Python float, so it syncs. `pow2_exponent` is the torch.compile-safe form.
+    This one is kept because it is the readable definition and is what the tests assert on.
     """
     m = x.abs().max().item()
     if m == 0 or not math.isfinite(m):
@@ -179,30 +180,20 @@ def pow2_scale(x: torch.Tensor, target_exp: int = 14) -> float:
     return 2.0 ** (target_exp - math.floor(math.log2(m)))
 
 
-def pow2_scale_tensor(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
-    """`pow2_scale` without the host sync, returning a 0-dim tensor.
-
-    `.item()` is a data-dependent host read: it forces a device sync, and under
-    torch.compile(fullgraph = True) it is a hard error ("could not guard on data-dependent
-    expression"). frexp gives the exponent on device instead. frexp returns
-    m = mantissa * 2**exp with mantissa in [0.5, 1), so floor(log2(m)) == exp - 1.
-
-    Materialised in float64 to keep the documented equivalence with `pow2_scale`, which returns
-    a Python float. For max|x| near 2**-114 the scale is 2**128, which float32 cannot hold and
-    would silently hand back inf while `pow2_scale` returns a perfectly good 3.4e38. The main
-    path does not use this at all; it carries `pow2_exponent` and applies it with ldexp.
-    """
-    return torch.exp2(pow2_exponent(x, target_exp).double())
-
-
 def pow2_exponent(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
-    """The exponent n behind `pow2_scale_tensor`, i.e. the scale is 2**n.
+    """The exponent n such that the scale is 2**n.
 
-    Carried as an exponent rather than a scale so the scaling and its inverse can be applied
-    with ldexp, which cannot overflow on the way to a representable answer. Materialising 2**n
-    breaks in both directions: 2**n itself overflows float32 below about 2**-113, and for a
-    large-times-small pair like 2**114 @ 2**-113 (which is just 2.0) dividing by one scale
-    before the other passes through inf.
+    There is deliberately no tensor-valued *scale* helper. One existed and was removed: a 0-dim
+    tensor follows scalar promotion, so multiplying a float32 operand by a float64 scale stays
+    in float32, and at max|x| near 2**-114 the scale of 2**128 overflows to inf on the way in
+    however the scale itself is stored. `torch.ldexp(x, pow2_exponent(x))` has no such edge and
+    is what this module uses throughout: it cannot overflow on the way to a representable
+    answer, in either direction. For a large-times-small pair like 2**114 @ 2**-113, which is
+    just 2.0, dividing by one materialised scale before the other passes through inf.
+
+    frexp gives the exponent on device, avoiding the `.item()` host read that would sync and
+    break torch.compile(fullgraph = True). frexp returns m = mantissa * 2**exp with mantissa in
+    [0.5, 1), so floor(log2(m)) == exp - 1.
     """
     if x.numel() == 0:
         return torch.zeros((), device = x.device, dtype = torch.int32)
