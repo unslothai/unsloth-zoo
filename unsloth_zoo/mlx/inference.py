@@ -35,21 +35,29 @@ _PREFILL_ATTENTION_CLASSES = {}
 _PREFILL_KV_OWNERS = ContextVar("prefill_kv_owners", default = None)
 
 
+_PREFILL_BATCH_SCHEDULE = ContextVar("prefill_batch_schedule", default = None)
+
+
+_PREFILL_BATCH_METHODS = None
+
+
 def _prefill_attention(original, queries, keys, values, cache, scale, mask, **kwargs):
-    from mlx_vlm.models.cache import RotatingKVCache
+    from mlx_vlm.models.cache import BatchKVCache, BatchQuantizedKVCache, BatchRotatingKVCache, RotatingKVCache
 
     step = _PREFILL_ARITHMETIC_STEP.get()
     owners = _PREFILL_KV_OWNERS.get()
-    rotating = type(cache) is RotatingKVCache
+    rotating = type(cache) in (RotatingKVCache, BatchRotatingKVCache)
+    batched = type(cache) in (BatchKVCache, BatchQuantizedKVCache)
     window = cache.max_size if rotating else None
-    keep = cache.keep if rotating else 0
+    keep = cache.keep if type(cache) is RotatingKVCache else 0
     identity = (id(keys), id(values))
-    if rotating and owners is not None:
-        owners[identity] = (keys, values, window, keep)
+    if (rotating or batched) and owners is not None:
+        owners[identity] = (keys, values, window, keep, batched)
     elif cache is None and owners is not None and identity in owners:
-        window, keep = owners[identity][2:]
+        window, keep, batched = owners[identity][2:]
     causal = isinstance(mask, str) and mask == "causal"
-    if queries.shape[-2] <= step or not (causal or window is not None):
+    batched = batched and isinstance(mask, mx.array) and mask.ndim >= 2
+    if queries.shape[-2] <= step or not (causal or window is not None or batched):
         return original(queries, keys, values, cache = cache, scale = scale, mask = mask, **kwargs)
     prefix = (keys[0] if isinstance(keys, (tuple, list)) else keys).shape[-2] - queries.shape[-2]
     outputs = []
@@ -68,6 +76,8 @@ def _prefill_attention(original, queries, keys, values, cache, scale, mask, **kw
         cache.keys = _slice_prefill_keys(cache.keys, first, None, keep)
         cache.values = _slice_prefill_keys(cache.values, first, None, keep)
         cache._idx = cache.keys.shape[-2]
+        if type(cache) is BatchRotatingKVCache:
+            cache.left_padding -= first
     return mx.concatenate(outputs, axis = -2)
 
 
@@ -166,13 +176,15 @@ class DynamicPrefillSchedule:
         return boundary
 
     def chunk_size(self, remaining, cache):
-        owners = _PREFILL_KV_OWNERS.get()
-        if owners is not None:
-            owners.clear()
         offsets = [entry.offset for entry in cache if type(getattr(entry, "offset", None)) is int]
         if not offsets or any(offset != offsets[0] for offset in offsets):
             raise ValueError("Dynamic prefill requires a consistent absolute cache offset")
-        offset = offsets[0]
+        return self._chunk_size_at(remaining, offsets[0])
+
+    def _chunk_size_at(self, remaining, offset):
+        owners = _PREFILL_KV_OWNERS.get()
+        if owners is not None:
+            owners.clear()
         chunk = min(self.next_boundary(offset) - offset, remaining)
         # Preserve the small final forward's kernel dispatch, including wide projections.
         if chunk == remaining and remaining > self.step_size and remaining % self.step_size:
@@ -212,8 +224,9 @@ class _PrefillQuantizedLinear(nn.QuantizedLinear):
     def __call__(self, x):
         step = _PREFILL_ARITHMETIC_STEP.get()
         if x.ndim == 3 and x.shape[1] > step:
+            # Preserve the native batch-by-step matrix layout and kernel dispatch.
             return mx.concatenate([
-                nn.QuantizedLinear.__call__(self, x[:, start : start + step])
+                nn.QuantizedLinear.__call__(self, mx.contiguous(x[:, start : start + step]))
                 for start in range(0, x.shape[1], step)
             ], axis = 1)
         return nn.QuantizedLinear.__call__(self, x)
@@ -224,7 +237,7 @@ class _PrefillLinear(nn.Linear):
         step = _PREFILL_ARITHMETIC_STEP.get()
         if x.ndim == 3 and x.shape[1] > step:
             return mx.concatenate([
-                nn.Linear.__call__(self, x[:, start : start + step])
+                nn.Linear.__call__(self, mx.contiguous(x[:, start : start + step]))
                 for start in range(0, x.shape[1], step)
             ], axis = 1)
         return nn.Linear.__call__(self, x)
@@ -340,12 +353,79 @@ def _install_dynamic_prefill():
     return True
 
 
+def _install_dynamic_batch_prefill():
+    global _PREFILL_BATCH_METHODS
+    from mlx_vlm.generate.ar import BatchGenerator, PromptProcessingBatch
+    from mlx_vlm.models.cache import ArraysCache, BatchKVCache, BatchQuantizedKVCache, BatchRotatingKVCache, KVCache, QuantizedKVCache, RotatingKVCache
+
+    if _PREFILL_BATCH_METHODS is not None:
+        return
+    original_init = BatchGenerator.__init__
+    original_next = BatchGenerator._next
+    original_step = PromptProcessingBatch.prompt_step
+
+    @functools.wraps(original_init)
+    def initialize(self, *args, _unsloth_prefill_schedule = None, **kwargs):
+        if _unsloth_prefill_schedule is not None:
+            model = inspect.signature(original_init).bind(self, *args, **kwargs).arguments["model"]
+            if (
+                type(_unsloth_prefill_schedule) is not DynamicPrefillSchedule
+                or getattr(_unsloth_prefill_schedule.model, "language_model", None) is not model or model.training
+            ):
+                raise ValueError("Dynamic prefill requires an inference schedule for this model")
+            kwargs.setdefault("prefill_step_size", _unsloth_prefill_schedule.step_size)
+        original_init(self, *args, **kwargs)
+        self._unsloth_prefill_schedule = _unsloth_prefill_schedule
+
+    @functools.wraps(original_next)
+    def advance(self, *args, **kwargs):
+        token = _PREFILL_BATCH_SCHEDULE.set(getattr(self, "_unsloth_prefill_schedule", None))
+        try:
+            return original_next(self, *args, **kwargs)
+        finally:
+            _PREFILL_BATCH_SCHEDULE.reset(token)
+
+    @functools.wraps(original_step)
+    def prompt_step(self):
+        schedule = _PREFILL_BATCH_SCHEDULE.get()
+        step = self.prefill_step_size
+        if (
+            schedule is None or step is None or not self.needs_processing()
+            or self.model is not schedule.model.language_model or self.model.training
+            or self.draft_model is not None or self._apc_manager is not None
+            or self._right_pad_per_row is not None
+            or any(type(cache) not in (ArraysCache, BatchKVCache, BatchQuantizedKVCache, BatchRotatingKVCache, KVCache, QuantizedKVCache, RotatingKVCache) for cache in self.prompt_cache)
+        ):
+            return original_step(self)
+        # Batch offsets include per-row padding; the native arithmetic grid uses columns.
+        batch_schedule = DynamicPrefillSchedule(schedule.model, step)
+        self.prefill_step_size = batch_schedule._chunk_size_at(
+            self._inputs_embeds.shape[1] - 1, self._processed_prompt_columns,
+        )
+        # Some models strip each row's padding before choosing attention kernels.
+        if self._processed_prompt_columns < max(self._left_padding_per_row):
+            self.prefill_step_size = min(self.prefill_step_size, step)
+        try:
+            with schedule.arithmetic(schedule.model, step):
+                return original_step(self)
+        finally:
+            self.prefill_step_size = step
+
+    BatchGenerator.__init__ = initialize
+    BatchGenerator._next = advance
+    PromptProcessingBatch.prompt_step = prompt_step
+    _PREFILL_BATCH_METHODS = (initialize, advance, prompt_step)
+
+
 def create_dynamic_prefill_schedule(model, step_size = _PREFILL_CANONICAL_STEP, quantized_kv_start = None):
     """Return a dynamic prefill schedule, or None to retain native prefill.
 
     Native modality policies decide whether embeddings can be chunked. Uniform
     quantized KV is supported; other quantization schemes, speculative decoding,
-    checkpoints, and batch generation retain the native path. Cache reuse must
+    and checkpoints retain the native path. Cold batches support unequal prompt
+    lengths; batched prefix reuse and speculative decoding retain native prefill.
+    Pass the schedule as ``_unsloth_prefill_schedule`` to ``batch_generate`` or
+    ``BatchGenerator``, with ``prefill_step_size=schedule.step_size``. Cache reuse must
     use this schedule's step size, boundaries, and a separate cache namespace.
     Obtain a new schedule after changing the model.
     """
@@ -375,4 +455,5 @@ def create_dynamic_prefill_schedule(model, step_size = _PREFILL_CANONICAL_STEP, 
         return None
     if any(type(cache) not in (ArraysCache, KVCache, QuantizedKVCache, RotatingKVCache) for cache in caches):
         return None
+    _install_dynamic_batch_prefill()
     return DynamicPrefillSchedule(model, step_size, quantized_kv_start)

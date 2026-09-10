@@ -431,3 +431,136 @@ def test_packed_attention_preserves_all_rows_and_cache_components(bits, containe
     for old, new in zip(fixed.state, dynamic.state):
         for a, b in zip(old, new):
             assert np.array_equal(np.array(a.view(mx.uint8)), np.array(b.view(mx.uint8)))
+
+
+@pytest.mark.parametrize("kind", ["plain", "quantized", "rotating"])
+@pytest.mark.parametrize("prefix", [0, 768])
+def test_batched_attention_preserves_padding_and_every_cache_row(kind, prefix):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models import cache as caches
+    from mlx_vlm.models.base import scaled_dot_product_attention
+    mx.random.seed(71)
+    q = mx.random.normal((2, 4, 768, 64)).astype(mx.bfloat16)
+    k = mx.random.normal((2, 2, prefix + 768, 64)).astype(mx.bfloat16)
+    v = mx.random.normal(k.shape).astype(mx.bfloat16)
+    constructors = {
+        "plain": lambda: caches.BatchKVCache([0, 333]),
+        "quantized": lambda: caches.BatchQuantizedKVCache([0, 333], bits = 4),
+        "rotating": lambda: caches.BatchRotatingKVCache(512, [0, 333]),
+    }
+    fixed, dynamic = constructors[kind](), constructors[kind]()
+    if prefix:
+        for cache in (fixed, dynamic):
+            cache.update_and_fetch(k[..., :prefix, :], v[..., :prefix, :])
+    parts = []
+    for start in range(0, 768, 256):
+        mask = fixed.make_mask(256)
+        keys, values = fixed.update_and_fetch(k[..., prefix + start:prefix + start + 256, :], v[..., prefix + start:prefix + start + 256, :])
+        parts.append(scaled_dot_product_attention(q[..., start:start + 256, :], keys, values, fixed, 0.125, mask))
+    mask = dynamic.make_mask(768)
+    keys, values = dynamic.update_and_fetch(k[..., prefix:, :], v[..., prefix:, :])
+    with prefill.DynamicPrefillSchedule.arithmetic(SimpleNamespace(language_model = nn.Sequential())):
+        actual = prefill._prefill_attention(scaled_dot_product_attention, q, keys, values, dynamic, 0.125, mask)
+        if kind != "quantized":
+            shared = prefill._prefill_attention(scaled_dot_product_attention, q, keys, values, None, 0.125, mask)
+            assert np.array_equal(np.array(shared.view(mx.uint8)), np.array(actual.view(mx.uint8)))
+    expected = mx.concatenate(parts, axis = -2)
+    for row in (0, 1):
+        assert np.array_equal(np.array(actual[row].view(mx.uint8)), np.array(expected[row].view(mx.uint8)))
+    for (_, left), (_, right) in zip(tree_flatten(fixed.state), tree_flatten(dynamic.state)):
+        assert np.array_equal(np.array(left.view(mx.uint8)), np.array(right.view(mx.uint8)))
+    assert fixed._idx == dynamic._idx
+    assert fixed.meta_state == dynamic.meta_state
+
+
+@pytest.mark.parametrize("cache_kind", ["plain", "quantized", "rotating"])
+def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(monkeypatch, cache_kind):
+    from mlx_vlm.generate.ar import BatchGenerator
+    from mlx_vlm.models.llama.config import ModelConfig
+    from mlx_vlm.models.llama.language import LanguageModel
+
+    class NoStop:
+        def add_eos_token_ids(self, tokens):
+            pass
+
+        def __call__(self, token):
+            return False
+
+    mx.random.seed(23)
+    language = LanguageModel(ModelConfig(
+        model_type = "llama", hidden_size = 128, num_hidden_layers = 2,
+        intermediate_size = 256, num_attention_heads = 2, num_key_value_heads = 1,
+        rms_norm_eps = 1e-5, vocab_size = 128, tie_word_embeddings = False,
+        layer_types = ["full_attention", "sliding_attention" if cache_kind == "rotating" else "full_attention"],
+        sliding_window = 512,
+    ))
+    nn.quantize(language, bits = 8, group_size = 64)
+    language.eval()
+    model = nn.Module()
+    model.language_model = language
+    model.eval()
+    schedule = prefill.create_dynamic_prefill_schedule(model)
+    assert schedule is not None
+    prompts = [[(i * 7 + 3) % 128 for i in range(1808)], [(i * 5 + 17) % 128 for i in range(1395)]]
+    prompt_kwargs = [{"inputs_embeds": language.model.embed_tokens(mx.array([ids]))} for ids in prompts]
+    calls = []
+    original = LanguageModel.__call__
+
+    def forward(self, inputs = None, **kwargs):
+        calls.append((inputs.shape, type(self.layers[0].self_attn.q_proj)))
+        return original(self, inputs, **kwargs)
+
+    monkeypatch.setattr(LanguageModel, "__call__", forward)
+    outputs, traces = [], []
+    for dynamic in (False, True):
+        calls.clear()
+        gen = BatchGenerator(
+            language, SimpleNamespace(stopping_criteria = NoStop()),
+            prefill_batch_size = 2, completion_batch_size = 2, prefill_step_size = 256,
+            kv_bits = 4 if cache_kind == "quantized" else None,
+            _unsloth_prefill_schedule = schedule if dynamic else None,
+        )
+        result = {uid: [] for uid in gen.insert(prompts, max_tokens = [4, 6], prompt_kwargs = prompt_kwargs)}
+        try:
+            while gen.has_work:
+                _, responses = gen.next()
+                assert prefill._PREFILL_BATCH_SCHEDULE.get() is None
+                assert type(language.layers[0].self_attn.q_proj) is nn.QuantizedLinear
+                for response in responses:
+                    result[response.uid].append((response.token, response.token_logprob))
+        finally:
+            gen.close()
+        outputs.append(result)
+        traces.append(list(calls))
+    assert outputs[0] == outputs[1]
+    assert len(outputs[0][0]) == 4 and len(outputs[0][1]) == 6
+    assert outputs[0][0][0] != outputs[0][1][0]
+    assert [shape[1] for shape, _ in traces[0] if shape[1] > 1] == [256] * 7 + [15]
+    assert [shape[1] for shape, _ in traces[1] if shape[1] > 1] == [256, 256, 256, 1024, 15]
+    assert all(shape[0] == 2 for shape, _ in traces[1] if shape[1] > 1)
+    assert all(cls is not nn.QuantizedLinear for shape, cls in traces[1] if shape[1] > 1)
+    assert all(cls is nn.QuantizedLinear for shape, cls in traces[1] if shape[1] == 1)
+
+    def fail(self, *args, **kwargs):
+        raise RuntimeError("prefill interrupted")
+
+    monkeypatch.setattr(LanguageModel, "__call__", fail)
+    gen = BatchGenerator(
+        language, SimpleNamespace(stopping_criteria = NoStop()),
+        prefill_batch_size = 2, completion_batch_size = 2,
+        _unsloth_prefill_schedule = schedule,
+    )
+    gen.insert(prompts, max_tokens = 4, prompt_kwargs = prompt_kwargs)
+    try:
+        with pytest.raises(RuntimeError, match = "prefill interrupted"):
+            gen.next()
+        assert prefill._PREFILL_BATCH_SCHEDULE.get() is None
+        assert type(language.layers[0].self_attn.q_proj) is nn.QuantizedLinear
+        assert gen._prompt_batch.prefill_step_size == 256
+        monkeypatch.setattr(LanguageModel, "__call__", forward)
+        gen._prompt_batch._apc_manager = object()
+        calls.clear()
+        gen.next()
+        assert calls[0] == ((2, 256), nn.QuantizedLinear)
+    finally:
+        gen.close()
