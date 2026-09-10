@@ -16,14 +16,9 @@
 
 """Quantized-state detection for the merged_4bit save path.
 
-`save_method="merged_4bit"` used to be a silent no-op on an unquantized model:
-`LoRALinear.fuse(dequantize=False)` only requantizes when the base was already
-quantized, so a model loaded with `load_in_16bit=True` or `full_finetuning=True`
-was written at full precision with no warning.
-
-Deciding whether to quantize hinges entirely on "is anything here quantized",
-so that predicate is enumerated here across every MLX quantized module type and
-grid rather than only the affine-4bit one the default loader happens to produce.
+`merged_4bit` used to be a silent no-op on an unquantized model, and the whole
+decision hinges on "is anything here quantized", so that predicate is enumerated
+across every MLX quantized type and grid, not just the loader's affine 4-bit.
 """
 
 import importlib
@@ -81,11 +76,8 @@ def test_unquantized_model_is_detected_as_unquantized():
     ],
 )
 def test_every_quantized_grid_is_detected(mode, group_size, bits):
-    """The decision must not depend on the grid, only on 'is it quantized'.
-
-    Enumerated rather than assumed: the default loader produces affine 4-bit,
-    so testing only that would leave load_in_8bit / load_in_mxfp4 models silently
-    re-quantized on save.
+    """Only "is it quantized" may matter, not the grid: testing affine 4-bit
+    alone would leave load_in_8bit / mxfp4 models re-quantized on save.
     """
     quantized = nn.QuantizedLinear.from_linear(
         _linear(), group_size=group_size, bits=bits, mode=mode)
@@ -99,12 +91,9 @@ def test_quantized_embedding_is_detected():
 
 
 def test_partially_quantized_model_counts_as_quantized():
-    """A normally-loaded 4-bit model *is* partial.
-
-    The loader's predicate skips `embed_tokens` / `lm_head`, so a model loaded
-    with load_in_4bit=True has unquantized modules in it. Treating "some
-    unquantized modules" as "needs quantizing" would re-quantize an
-    already-quantized checkpoint.
+    """A normally-loaded 4-bit model is partial: the predicate skips
+    embed_tokens / lm_head, so "some unquantized modules" must not mean
+    "needs quantizing".
     """
     quantized = nn.QuantizedLinear.from_linear(
         _linear(), group_size=64, bits=4, mode="affine")
@@ -118,14 +107,6 @@ def test_switch_linear_experts_are_detected():
     experts = experts.to_quantized(group_size=64, bits=4, mode="affine")
     assert _model_has_quantized_module(_Stack(experts))
 
-
-# ---------------------------------------------------------------------------
-# What the quantize step hands to mlx-lm
-#
-# `_quantize_merged_model_for_save` is driven directly on a real (tiny) mlx-lm
-# llama so the config it produces can be checked against mlx-lm's load-time
-# contract without downloading a published checkpoint.
-# ---------------------------------------------------------------------------
 
 def _tiny_llama(dtype, hidden_size=128, intermediate_size=256, vocab_size=512):
     """A real mlx-lm llama, small enough to build in-process."""
@@ -163,13 +144,10 @@ def _tiny_llama_config(hidden_size=128, intermediate_size=256, vocab_size=512,
 
 
 def test_quantize_for_save_emits_a_loadable_top_level_grid():
-    """mlx-lm's loader indexes ``quantization["group_size"]`` unconditionally.
-
-    ``quantize_model`` writes that top-level grid only when the config it is
-    handed has no ``quantization`` key; with one present it emits per-layer
-    entries instead. Nothing is quantized when this branch runs, so inherited
-    metadata is stale by construction and must not flip that switch — the
-    artifact would raise KeyError on reload.
+    """mlx-lm's loader indexes ``quantization["group_size"]`` unconditionally,
+    and ``quantize_model`` emits per-layer entries instead of that grid when the
+    config already has a ``quantization`` key. Stale metadata must not flip that
+    switch: the artifact would raise KeyError on reload.
     """
     model = _tiny_llama(mx.float16)
     model._config = _tiny_llama_config(quantization={}, quantization_config={})
@@ -187,8 +165,7 @@ def test_quantize_for_save_emits_a_loadable_top_level_grid():
 
 
 def test_quantize_for_save_does_not_inherit_a_stale_grid():
-    """A populated stale grid is carried through verbatim and mislabels the
-    artifact: the tensors are written at 4-bit/64 whatever the config claims."""
+    """A populated stale grid is copied verbatim and mislabels the artifact."""
     model = _tiny_llama(mx.float16)
     model._config = _tiny_llama_config(
         quantization={"group_size": 32, "bits": 8, "mode": "affine"},
@@ -203,12 +180,8 @@ def test_quantize_for_save_does_not_inherit_a_stale_grid():
 
 
 def test_quantize_for_save_casts_to_the_config_dtype():
-    """full_finetuning trains in float32; the checkpoint must not stay there.
-
-    mlx-lm's own conversion casts every floating parameter to the config dtype
-    before quantizing, so a float32-trained model and a float16-trained one
-    produce the same artifact. Without the cast the "4-bit" checkpoint carries
-    float32 scales, biases, embeddings and norms.
+    """full_finetuning trains in float32, and mlx-lm casts before quantizing, so
+    a float32-trained and a float16-trained model must produce the same artifact.
     """
     model = _tiny_llama(mx.float32)
     model._config = _tiny_llama_config(torch_dtype="float16")
@@ -229,10 +202,8 @@ def test_quantize_for_save_casts_to_the_config_dtype():
 
 
 def test_quantize_for_save_leaves_dtype_alone_when_config_says_nothing():
-    """No usable dtype in the config is mlx-lm's "do not cast" signal.
-
-    Guards the fix against over-reach: it must not invent a dtype mlx-lm would
-    not itself have picked.
+    """No usable dtype is mlx-lm's "do not cast" signal; the fix must not invent
+    one mlx-lm would not have picked.
     """
     model = _tiny_llama(mx.float32)
     model._config = _tiny_llama_config()
@@ -244,13 +215,9 @@ def test_quantize_for_save_leaves_dtype_alone_when_config_says_nothing():
 
 
 def test_quantize_for_save_does_not_claim_a_grid_it_could_not_apply():
-    """Nothing quantizable must not produce a checkpoint that claims 4-bit.
-
-    ``quantize_model`` writes the grid into the config from its arguments, not
-    from what it managed to convert, so a model whose dimensions are not a
-    multiple of the group size comes back untouched but labelled 4-bit. That is
-    the same silent full-precision-on-a-4-bit-request this path exists to fix,
-    one level down.
+    """``quantize_model`` writes the grid from its arguments, not from what it
+    converted, so dimensions incompatible with the group size come back
+    untouched but labelled 4-bit.
     """
     dims = dict(hidden_size=48, intermediate_size=96, vocab_size=100)
     model = _tiny_llama(mx.float16, **dims)
@@ -263,24 +230,15 @@ def test_quantize_for_save_does_not_claim_a_grid_it_could_not_apply():
     assert "quantization_config" not in _get_model_config(model)
 
 
-# ---------------------------------------------------------------------------
-# The save must not keep the model it quantized
-#
-# Driven through ``save_merged_model`` because the mutation is only observable
-# after the checkpoint is written.
-# ---------------------------------------------------------------------------
-
 class _StubTokenizer:
     def save_pretrained(self, path):
         pass
 
 
 def test_merged_4bit_save_hands_the_live_model_back_unchanged(tmp_path):
-    """The user's model is still fp32/fp16 after a merged_4bit save.
-
-    The quantize step rewrites the live model, so without a restore the session
-    silently keeps a 4-bit model: a later ``merged_16bit`` export writes weights
-    dequantized from 4-bit, and continued training trains quantized layers.
+    """Without a restore the session keeps a 4-bit model: a later merged_16bit
+    export writes weights dequantized from 4-bit, and training continues on
+    quantized layers.
     """
     from unsloth_zoo.mlx.utils import save_merged_model
 
@@ -319,13 +277,9 @@ def test_merged_4bit_save_still_writes_a_quantized_checkpoint(tmp_path):
 
 
 def test_merged_4bit_save_removes_a_config_it_had_to_invent(tmp_path):
-    """A model that arrived without ``_config`` must not keep the quantized one.
-
-    The quantize step assigns ``_config`` unconditionally, so restoring only
-    when there was something to restore leaves the live model advertising a
-    4-bit grid over the full-precision weights just handed back -- which the
-    next save, or a ``lora`` save stamping the base grid into
-    adapter_config.json, then writes out.
+    """The quantize step assigns ``_config`` unconditionally, so restoring only
+    when there was something to restore leaves a 4-bit grid over the
+    full-precision weights just handed back, which the next save writes out.
     """
     from unsloth_zoo.mlx.utils import save_merged_model
 
@@ -339,12 +293,9 @@ def test_merged_4bit_save_removes_a_config_it_had_to_invent(tmp_path):
 
 
 def test_a_failed_merged_4bit_save_still_returns_the_model(tmp_path, monkeypatch):
-    """The restore has to cover the quantize itself, not just the write.
-
-    Quantizing a large full-finetuned model is exactly where an out-of-memory
-    failure happens, and it fails *after* the modules have been replaced -- so
-    a snapshot taken but only applied on the success path hands back a 4-bit
-    model from a save that did not happen.
+    """The restore must cover the quantize, not just the write: an OOM there
+    fails after the modules are replaced, so a success-path-only restore hands
+    back a 4-bit model from a save that did not happen.
     """
     import mlx_lm.utils
 

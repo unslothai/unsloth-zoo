@@ -16647,7 +16647,6 @@ def _fuse_mlx_module(module, dequantize):
     return fuse()
 
 def _model_has_quantized_module(model):
-    """True when any module carries MLX quantized weights."""
     import mlx.nn as nn
 
     quantized_types = [nn.QuantizedLinear, nn.QuantizedEmbedding]
@@ -16661,26 +16660,22 @@ def _model_has_quantized_module(model):
     def _is_quantized(module):
         if isinstance(module, quantized_types):
             return True
-        # The named classes do not cover every family: mlx_lm's MLA models use
-        # QuantizedMultiLinear and the distributed layers use
-        # Quantized{AllToSharded,ShardedToAll}Linear, none of which subclass
-        # anything above. Missing one is not a near-miss -- the model reads as
-        # unquantized, its real grid is stripped as stale, and the checkpoint is
-        # written with quantized tensors and no metadata to load them by.
+        # MLA's QuantizedMultiLinear and the distributed Quantized*Linear
+        # subclass none of the above; missing one writes quantized tensors
+        # with no metadata to load them by.
         return type(module).__name__.startswith("Quantized")
 
     return any(_is_quantized(module) for _, module in model.named_modules())
 
 
-# Matches the loader's runtime-quantization defaults so a save-quantized model
-# and a load-quantized one land on the same grid.
+# The loader's runtime-quantization defaults, so save- and load-quantized models
+# land on the same grid.
 _MERGED_SAVE_QUANT_BITS = 4
 _MERGED_SAVE_QUANT_GROUP_SIZE = 64
 _MERGED_SAVE_QUANT_MODE = "affine"
 
 
 def _merged_save_cast_dtypes():
-    """The dtypes mlx-lm is willing to write a converted checkpoint in."""
     try:
         from mlx_lm.convert import MODEL_CONVERSION_DTYPES
         return tuple(MODEL_CONVERSION_DTYPES)
@@ -16689,12 +16684,10 @@ def _merged_save_cast_dtypes():
 
 
 def _merged_save_cast_dtype(config):
-    """Resolve the checkpoint dtype the way ``mlx_lm.convert`` resolves it.
+    """The checkpoint dtype, as ``mlx_lm.convert`` resolves it.
 
-    mlx-lm reads ``torch_dtype`` and falls back to ``text_config.dtype``.
-    transformers >= 4.56 writes the key as plain ``dtype``, which mlx-lm does
-    not look at yet, so accept both spellings — otherwise a model from a
-    modern repo silently gets no cast at all.
+    Both spellings: mlx-lm reads only ``torch_dtype``, but transformers >= 4.56
+    writes plain ``dtype``, which would otherwise get no cast at all.
     """
     if not isinstance(config, dict):
         return None
@@ -16711,18 +16704,9 @@ def _merged_save_cast_dtype(config):
 
 
 def _cast_merged_model_to_config_dtype(model, config):
-    """Normalize floating parameters to the config dtype before quantizing.
-
-    ``mlx_lm.convert`` casts every floating parameter to the config dtype
-    *before* calling ``quantize_model`` (its ``set_dtype`` pass runs ahead of
-    the quantize step). Skipping that leaves whatever dtype training happened
-    to use. ``full_finetuning=True`` runs in float32 by design, so without this
-    a "4-bit" checkpoint is written with float32 scales, biases, embeddings,
-    ``lm_head`` and norms — measurably larger than the same model saved from a
-    16-bit LoRA run, for weights that are supposed to be identical.
-
-    ``cast_predicate`` is honored because some mlx-lm architectures expose it
-    to keep specific parameters out of the cast.
+    """Cast floating parameters to the config dtype, as ``mlx_lm.convert`` does
+    before quantizing: ``full_finetuning=True`` trains in float32, which would
+    otherwise leave float32 scales, norms and embeddings in a "4-bit" file.
     """
     from mlx.utils import tree_map_with_path
 
@@ -16745,15 +16729,10 @@ def _cast_merged_model_to_config_dtype(model, config):
 def _quantize_merged_model_for_save(model):
     """Quantize an unquantized merged model so ``merged_4bit`` really is 4-bit.
 
-    ``LoRALinear.fuse(dequantize=False)`` only requantizes when the base was
-    already quantized, so on a model loaded with ``load_in_16bit=True`` or
-    ``full_finetuning=True`` the 4-bit request used to be silently ignored and
-    a full-precision checkpoint was written instead.
-
-    Quantization goes through the loader's own predicate rather than a bare
-    ``nn.quantize``: the loader skips embeddings and the ``lm_head`` /
-    ``embed_tokens`` fragments, and an artifact that quantized those would not
-    match a model quantized at load time.
+    ``LoRALinear.fuse(dequantize=False)`` requantizes only an already-quantized
+    base, so ``load_in_16bit`` / ``full_finetuning`` used to write full precision
+    silently. Uses the loader's predicate, not a bare ``nn.quantize``, so the
+    artifact matches a model quantized at load time (embeddings / lm_head skipped).
     """
     from mlx_lm.utils import quantize_model
     from .loader import _MLXQuantizationSpec, _compose_mlx_quant_predicate
@@ -16767,16 +16746,9 @@ def _quantize_merged_model_for_save(model):
     )
     predicate = _compose_mlx_quant_predicate(model, spec, is_vlm=False)
     config = _get_model_config(model) or {}
-    # This runs only when nothing in the model is quantized, so any quantization
-    # metadata still on the config describes weights that are not there. Left in
-    # place, quantize_model() reads it as "already partially quantized" and
-    # switches to per-layer config output: the result carries per-path entries
-    # but no top-level group_size/bits, and mlx-lm's loader indexes those
-    # unconditionally (`quantization["group_size"]` in its load-time
-    # `_quantize`), so the artifact fails to reload with KeyError. A stale
-    # *populated* grid fails the other way: it is carried through verbatim and
-    # the checkpoint advertises a grid its tensors do not use. mlx_lm.convert
-    # pops both keys on the mirror-image dequantize path for the same reason.
+    # Any grid here is stale. Kept, quantize_model() emits per-layer entries
+    # with no top-level group_size (reload raises KeyError), or copies a
+    # populated one verbatim over tensors that do not use it.
     config = _strip_mlx_quantization_metadata(config)
     model = _cast_merged_model_to_config_dtype(model, config)
     model, updated_config = quantize_model(
@@ -16788,11 +16760,9 @@ def _quantize_merged_model_for_save(model):
         quant_predicate=predicate,
     )
     if not _model_has_quantized_module(model):
-        # quantize_model() writes the grid into the config even when its own
-        # shape checks skipped every module (a hidden size that is not a
-        # multiple of the group size quantizes nothing). Keeping that grid
-        # would advertise 4-bit weights the checkpoint does not contain --
-        # the same silent mismatch this whole path exists to remove.
+        # quantize_model() writes the grid from its arguments, not from what
+        # it converted, so dimensions incompatible with the group size would
+        # label a full-precision checkpoint 4-bit.
         model._config = _strip_mlx_quantization_metadata(updated_config)
         print(
             "Unsloth: save_method='merged_4bit' could not quantize any layer of "
@@ -16817,12 +16787,8 @@ _ABSENT = object()
 def _snapshot_mlx_model_state(model):
     """Everything needed to undo a save-time cast + quantize on a live model.
 
-    MLX arrays are immutable, so nothing is copied -- but the whole parameter
-    tree is pinned for the duration of the save, so the original weights are
-    held alongside the cast and quantized ones instead of being freed as
-    ``nn.quantize`` swaps each module out. Peak memory during a ``merged_4bit``
-    save rises accordingly; ``_restore_mlx_model_state`` drops the reference and
-    clears the cache as soon as the checkpoint is written.
+    Nothing is copied, but pinning the tree holds the originals alongside the
+    cast and quantized copies, so the save peaks higher.
     """
     return (model.leaf_modules(), model.parameters(),
             getattr(model, "_config", _ABSENT))
@@ -16831,23 +16797,17 @@ def _snapshot_mlx_model_state(model):
 def _restore_mlx_model_state(model, snapshot):
     """Put the live model back the way the caller handed it over.
 
-    ``merged_4bit`` on an unquantized model quantizes and down-casts the model
-    that is still in the user's hands. Without this, a save silently turns the
-    session's fp16/fp32 model into a 4-bit one: a later ``merged_16bit`` export
-    writes weights dequantized from 4-bit, and continued training trains a
-    quantized model. Fusing LoRA into the base is a deliberate part of a merged
-    save and is *not* undone here; losing precision is not.
+    Otherwise a ``merged_4bit`` save leaves the session holding a 4-bit model: a
+    later ``merged_16bit`` export writes weights dequantized from 4-bit, and
+    training continues on quantized layers. The LoRA fuse is deliberate and stays.
     """
     leaf_modules, parameters, config = snapshot
     model.update_modules(leaf_modules)
     model.update(parameters)
     if config is _ABSENT:
-        # The quantize step assigns `_config` even to a model that never had
-        # one, so "there was nothing here" has to remove it again -- otherwise
-        # the live model keeps a config advertising a 4-bit grid over the
-        # full-precision weights just restored, and the next save (or a `lora`
-        # save, which stamps the base grid into adapter_config.json) writes it.
-        # mlx Modules keep attributes in the dict they subclass, not __dict__.
+        # Quantizing assigns `_config` unconditionally, so a model that had
+        # none must lose it again or the next save writes 4-bit metadata over
+        # full-precision weights. delattr: mlx Modules subclass dict.
         try:
             delattr(model, "_config")
         except AttributeError:
@@ -16873,11 +16833,10 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
             (saves as fp16/bf16 — needed for GGUF). If False, keep the
             base quantization.
         quantize_unquantized: If True and nothing in the model is quantized,
-            quantize the merged weights before writing. Only the explicit
-            ``save_method='merged_4bit'`` request sets this. It is deliberately
-            NOT inferred from ``dequantize=False``, because that is also the
-            default for ``push_to_hub_merged``, which must keep saving at the
-            model's existing precision.
+            quantize the merged weights before writing. Set only by
+            ``save_method='merged_4bit'``, never inferred from
+            ``dequantize=False`` -- that is also ``push_to_hub_merged``'s
+            default, which must keep the model's existing precision.
     """
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
@@ -16902,29 +16861,25 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
     elif quantize_unquantized and not _model_has_quantized_module(model):
-        # 4-bit was requested but nothing in the model is quantized, so the
-        # fuse above had nothing to requantize. Either quantize now or say so;
-        # never write a full-precision checkpoint in silence.
+        # The fuse had nothing to requantize: quantize now or say so, but
+        # never write full precision in silence.
         if _is_vlm_model(model) or _has_vision_config(_get_model_config(model)):
             print(
                 "Unsloth: save_method='merged_4bit' on an unquantized VLM is "
                 "not supported yet — saving at full precision instead. Load "
                 "the VLM quantized (the default) to get a 4-bit merge."
             )
-            # This branch only runs when nothing is quantized, so any grid still
-            # on the config describes weights that are not there; writing it
-            # would label a full-precision artifact 4-bit.
+            # Nothing is quantized, so a surviving grid would label this
+            # full-precision artifact 4-bit.
             cfg = getattr(model, "_config", None)
             if isinstance(cfg, dict):
                 model._config = _strip_mlx_quantization_metadata(cfg)
         else:
-            # The quantize step rewrites the caller's live model, so keep what
-            # is needed to hand it back unchanged once the checkpoint is out --
-            # including when the quantize itself is what fails.
+            # Quantizing rewrites the caller's live model; snapshot it before
+            # the try, restore even when the quantize is what fails.
             restore_after_save = _snapshot_mlx_model_state(model)
 
-    # The object the caller still holds, which is what has to come back intact:
-    # `model` is rebound below.
+    # `model` is rebound below; this is what the caller still holds.
     caller_model = model
 
     try:

@@ -16,14 +16,10 @@
 
 """merged_4bit really produces 4-bit, driven through save_pretrained_merged.
 
-Every branch is reached through the public save entry point rather than by
-calling the helper directly: a save-path branch that is unreachable from
-`save_pretrained_merged` would be dead code that still passed a helper-level
-test.
-
-The paths that must NOT change are covered too -- an already-quantized base,
-`merged_16bit`, and `push_to_hub_merged` (which shares `save_merged_model` but
-has no save_method and must keep writing the model's existing precision).
+Every branch goes through the public entry point: one reachable only from the
+helper would be dead code that still passed a helper-level test. The paths that
+must NOT change are covered too (already-quantized base, `merged_16bit`,
+`push_to_hub_merged`).
 """
 
 from __future__ import annotations
@@ -77,10 +73,6 @@ def _load_and_adapt(model_name, **load_kwargs):
     return model, tokenizer
 
 
-# --------------------------------------------------------------------------
-# The bug: merged_4bit on an unquantized model
-# --------------------------------------------------------------------------
-
 def test_merged_4bit_quantizes_a_16bit_lora_model():
     model, tokenizer = _load_and_adapt(
         FP_MODEL, load_in_16bit=True, load_in_4bit=False)
@@ -98,19 +90,14 @@ def test_merged_4bit_quantizes_a_full_finetuned_model():
     quantization, weight_bytes = _saved_artifact(model, tokenizer, "merged_4bit")
 
     assert quantization == {"group_size": 64, "bits": 4, "mode": "affine"}
-    # full_finetuning trains in float32, but the checkpoint dtype comes from the
-    # config (bfloat16 here), the same as mlx-lm's own conversion. The training
-    # dtype must not leak into the artifact, so hold this to the same bound as
-    # the 16-bit LoRA case rather than to a looser float32-tolerant one.
+    # The checkpoint dtype comes from the config (bfloat16), not from the
+    # float32 training, so this holds to the 16-bit LoRA bound.
     assert weight_bytes < 700e6, f"weights still {weight_bytes / 1e6:.1f}MB"
 
 
 def test_full_finetuned_and_lora_merges_agree_on_size():
-    """The training dtype must not change the artifact.
-
-    A float32 full-finetune and a 16-bit LoRA run over the same base produce
-    the same tensors at the same grid, so a size gap between them means a
-    training-time dtype leaked into the saved checkpoint.
+    """Same base, same grid: a size gap between a float32 full-finetune and a
+    16-bit LoRA run means a training dtype leaked into the checkpoint.
     """
     lora_model, tokenizer = _load_and_adapt(
         FP_MODEL, load_in_16bit=True, load_in_4bit=False)
@@ -127,10 +114,8 @@ def test_full_finetuned_and_lora_merges_agree_on_size():
 
 
 def test_merged_4bit_artifact_has_no_float32_tensors():
-    """float32 scales/biases/embeddings in a '4-bit' checkpoint are the tell.
-
-    Packed 4-bit weights are stored as uint32, so this checks the float dtype
-    specifically rather than "32 appears in the name".
+    """float32 scales/embeddings are the tell. Packed weights are uint32, so
+    this checks the float dtype, not "32 appears in the name".
     """
     model, tokenizer = _load_and_adapt(FP_MODEL, full_finetuning=True)
     with tempfile.TemporaryDirectory() as directory:
@@ -161,16 +146,10 @@ def test_quantized_save_reloads_and_runs():
     assert bool(mx.all(mx.isfinite(logits)).item()), "reloaded model produced non-finite logits"
 
 
-# --------------------------------------------------------------------------
-# Paths that must not change
-# --------------------------------------------------------------------------
-
 def test_already_quantized_merged_4bit_is_unchanged():
-    """Regression guard: an already-4bit base must not be re-quantized.
-
-    The source repo's metadata is passed through verbatim rather than
-    rewritten, and published mlx-community configs may omit ``mode`` entirely
-    (this one does), so assert the grid rather than an exact dict.
+    """An already-4bit base must not be re-quantized. Its metadata passes
+    through verbatim and mlx-community configs may omit ``mode``, so assert the
+    grid, not an exact dict.
     """
     model, tokenizer = _load_and_adapt(QUANTIZED_MODEL)
     quantization, weight_bytes = _saved_artifact(model, tokenizer, "merged_4bit")
@@ -190,11 +169,9 @@ def test_merged_16bit_still_writes_full_precision():
 
 
 def test_push_to_hub_merged_does_not_quantize():
-    """`push_to_hub_merged` shares save_merged_model but has no save_method.
-
-    It calls it with the default dequantize=False, so inferring "quantize" from
-    that flag would silently 4-bit every hub push of an unquantized model. The
-    quantize step is opt-in from the merged_4bit branch only.
+    """`push_to_hub_merged` calls save_merged_model with the default
+    dequantize=False, so inferring "quantize" from that flag would 4-bit every
+    hub push of an unquantized model.
     """
     from unsloth_zoo.mlx.utils import save_merged_model
 
