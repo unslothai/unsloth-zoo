@@ -143,7 +143,7 @@ jobs:
               rc=0
               {
                 "$interpreter" -m venv "$venv" &&
-                "$venv/bin/python" -m pip install --upgrade pip &&
+                retry "$venv/bin/python" -m pip install --upgrade pip &&
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" &&
                 retry "$venv/bin/pip" install -e .[core] &&
@@ -481,7 +481,7 @@ jobs:
             rc=0
             {
               python -m venv .lanes/venv-numerics &&
-              .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-numerics/bin/pip install -e .[core] &&
@@ -502,7 +502,7 @@ jobs:
             rc=0
             {
               python -m venv .lanes/venv-suites &&
-              .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
@@ -818,7 +818,7 @@ jobs:
                 spec_p="$(echo "$specs" | sed -n 3p)" &&
                 echo "resolved: $spec_t | $spec_r | $spec_p" &&
                 python -m venv "$venv" &&
-                "$venv/bin/python" -m pip install --upgrade pip &&
+                retry "$venv/bin/python" -m pip install --upgrade pip &&
                 # torchvision: transformers' qwen2_vl / qwen2_5_vl image processors
                 # import it at module top, so without it the existence probes go red
                 # on ModuleNotFoundError rather than on drift. CPU build is plenty.
