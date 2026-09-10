@@ -453,8 +453,6 @@ def test_assistant_thinking_only_emits_single_analysis(
     monkeypatch,
     gpt_oss_module,
 ):
-    # A pure-reasoning turn (thinking present, no/empty content) must produce only the
-    # analysis message carrying the reasoning, and no final message.
     messages = [
         {"role": "assistant", "thinking": "just reasoning", "content": ""},
     ]
@@ -471,7 +469,6 @@ def test_assistant_plain_content_unchanged_final_only(
     monkeypatch,
     gpt_oss_module,
 ):
-    # No thinking and no tool_calls: exactly one final-channel message from content.
     messages = [
         {"role": "assistant", "content": "plain answer"},
     ]
@@ -501,7 +498,6 @@ def test_mixed_multi_turn_preserves_channels_and_branches(
     gpt_oss_module.encode_conversations_with_harmony(messages)
     conversation = encoding.calls[0][1]
 
-    # Drop the leading system message, then assert the channel sequence.
     body = [m for m in conversation if m.role != _Role.SYSTEM]
     channels = [m.channel for m in body]
     assert channels == [None, "analysis", "final", "commentary", "final"]
@@ -565,8 +561,6 @@ def test_assistant_thinking_empty_string_falls_back_to_final(
     monkeypatch,
     gpt_oss_module,
 ):
-    # Empty-string thinking is treated as absent (no empty analysis message); only the
-    # final-channel message from content is emitted.
     messages = [
         {"role": "assistant", "thinking": "", "content": "the answer"},
     ]

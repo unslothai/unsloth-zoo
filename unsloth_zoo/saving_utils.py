@@ -24,7 +24,7 @@ from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
 # Import each independently: convert_moe_packed_tensors_cpu is injected at runtime by Unsloth's
@@ -275,23 +275,24 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
 pass
 
 
-def _get_modules_to_save_weight(module):
+def _get_modules_to_save_weight(module, attr = "weight"):
     modules_to_save = getattr(module, "modules_to_save", None)
     if modules_to_save is None:
         return None
 
+    # `attr` so a head's bias travels with its weight; defaulted for existing callers.
     # Prefer the default adapter, else first entry with a weight
     for key in ("default",):
         try:
             candidate = modules_to_save[key]
-            if hasattr(candidate, "weight"):
-                return candidate.weight
+            if hasattr(candidate, attr):
+                return getattr(candidate, attr)
         except Exception:
             continue
 
     for _, candidate in modules_to_save.items():
-        if hasattr(candidate, "weight"):
-            return candidate.weight
+        if hasattr(candidate, attr):
+            return getattr(candidate, attr)
 
     return None
 
@@ -652,6 +653,10 @@ except:
         'U16': torch.uint16,
     }
 pass
+
+# Labels a tensor appended to a shard, which has no header entry to copy from. Reversed so
+# it cannot drift from the table above.
+_SAFETENSORS_DTYPE_NAMES = {v : k for k, v in SAFETENSORS_DTYPES.items()}
 
 @torch.inference_mode
 def _merge_and_overwrite_lora(
@@ -2220,6 +2225,22 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     count += 1
                     W = _merge_lora(W, lora_stats, output_key)
                     action_logged = True
+            elif (W is not None and lora_stats is not None and not action_logged
+                  and getattr(lora_stats, "lora_A", None) is None
+                  and getattr(lora_stats, "module", None) is not None):
+                # modules_to_save with no LoRA delta (a seeded head). The dense path writes and
+                # counts these; without the same branch Step-7 sees one extra backed module and aborts.
+                saved_weight = _get_modules_to_save_weight(lora_stats.module)
+                if saved_weight is None and hasattr(lora_stats.module, "weight"):
+                    saved_weight = lora_stats.module.weight
+                if saved_weight is not None:
+                    W = saved_weight.to(
+                        W.device,
+                        dtype = output_dtype if output_dtype is not None else W.dtype,
+                        non_blocking = True,
+                    )
+                    count += 1
+                    action_logged = True
 
             if W is None:
                 continue
@@ -2684,7 +2705,12 @@ def prepare_saving(
     pass
 
     if output_dtype is None: output_dtype = _get_dtype(dtype_from_config(model.config))
-    assert(output_dtype in (torch.float32, torch.float16, torch.float64, torch.bfloat16))
+    # `output_dtype` defaults to a value derived from the downloaded config.json and is
+    # interpolated into the generated `save_pretrained` source below, so this is the only
+    # thing pinning it to a real dtype. An `assert` disappears under `python -O`, which
+    # would leave the interpolation unguarded, so raise instead.
+    if output_dtype not in (torch.float32, torch.float16, torch.float64, torch.bfloat16):
+        raise ValueError(f"Unsloth: Unsupported output dtype `{output_dtype}`.")
     assert(type(torch.bfloat16) is torch.dtype)
     element_size = torch.tensor([], dtype = output_dtype).element_size()
 
@@ -2877,6 +2903,62 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
+def _text_configs(config):
+    # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
+    # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
+    holders = []
+    try: holders.append(config.get_text_config())
+    except Exception: pass
+    holders.append(getattr(config, "text_config", None))
+    seen = []
+    for holder in holders:
+        if holder is not None and not any(holder is s for s in seen): seen.append(holder)
+    return seen
+pass
+
+
+def _config_vocab_size(config):
+    # Nested first: a composite can carry both, and `resize_token_embeddings` updates only the
+    # nested one (PaliGemma leaves a stale top-level copy that would read as "no resize").
+    for holder in _text_configs(config):
+        if holder is config: continue
+        vocab_size = getattr(holder, "vocab_size", None)
+        if vocab_size is not None: return vocab_size
+    pass
+    return getattr(config, "vocab_size", None)
+pass
+
+
+def _carry_over_vocab_size(base_config, trained_config):
+    # The merge writes the trained (possibly resized) embeddings, so the base checkpoint's own
+    # `vocab_size` would rebuild smaller layers and fail the reload. Only the text vocab moves.
+    trained_vocab_size = _config_vocab_size(trained_config)
+    if trained_vocab_size is None: return
+    holders = [h for h in _text_configs(base_config) if h is not base_config]
+    base_vocab_size = getattr(base_config, "vocab_size", None)
+    # A top level mirroring the text vocab is a compatibility copy and moves with it (PaliGemma).
+    # One that differs is a DIFFERENT vocabulary: Ovis2 ships 151643 against a text 151936 and
+    # sizes its lm_head from the top level, so writing there breaks the reload this protects.
+    if base_vocab_size is not None and all(
+        getattr(holder, "vocab_size", base_vocab_size) == base_vocab_size for holder in holders
+    ):
+        holders.append(base_config)
+    for holder in holders:
+        if getattr(holder, "vocab_size", None) is None: continue
+        try: holder.vocab_size = trained_vocab_size
+        except Exception: pass  # read-only on some composite configs
+    pass
+    # Never silently ship a config that disagrees with the rows we are about to write.
+    if _config_vocab_size(base_config) != trained_vocab_size:
+        warnings.warn(
+            f"Unsloth: could not set vocab_size={trained_vocab_size} on the base config of "
+            f"`{getattr(base_config, 'model_type', '?')}`; the exported config may not match "
+            f"the embedding rows written."
+        )
+    pass
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -2938,6 +3020,16 @@ def merge_and_overwrite_lora(
                 f"`{save_directory}`. Use `save_method=\"forced_merged_4bit\"` instead."
             )
         if final_model_name is None:
+            # A repo that exists but ships no safetensors also lands here.
+            _bin_only = _hub_repo_weights_without_safetensors(model_name, token)
+            if _bin_only is not None:
+                raise RuntimeError(
+                    f"Unsloth: Model {model_name} exists on Hugging Face but ships no "
+                    f"safetensors weights (found {', '.join(sorted(_bin_only)[:4])}), and "
+                    f"the {save_method} merge reads safetensors only. Nothing was written "
+                    f"to `{save_directory}`. Convert the base to safetensors, or point at "
+                    f"a sibling repo that already publishes them."
+                )
             # Never return None: `save_pretrained_merged` would look like it succeeded
             # while creating no output directory, signalled only by a UserWarning.
             raise RuntimeError(
@@ -3204,7 +3296,27 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
-        config.save_pretrained(save_directory)
+        # `config` is `model.config`, already the nested text config under `text_only = True`,
+        # while the weights come from `model_name` and keep their VLM prefixes. Saving it wrote
+        # a text-only config beside VLM weights and every tensor was silently re-initialized on
+        # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
+        from transformers import AutoConfig
+        try:
+            base_config = AutoConfig.from_pretrained(
+                model_name,
+                token = token,
+                trust_remote_code = False,
+            )
+        except Exception as base_config_error:
+            warnings.warn(
+                f"Unsloth: Could not read the base config from `{model_name}` "
+                f"({base_config_error}). Falling back to the in-memory config, which might not "
+                f"describe the exported weights (see #969)."
+            )
+            base_config = config
+        else:
+            _carry_over_vocab_size(base_config, config)
+        base_config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         # #5410: keep trained eos / sampling defaults on reload.
@@ -3220,7 +3332,7 @@ def merge_and_overwrite_lora(
         from transformers import AutoConfig
         model_config = AutoConfig.from_pretrained(
             model_name,
-            token = None,
+            token = token,  # was None, which cannot read a gated or private base
             trust_remote_code = False,
         )
         model_config.save_pretrained(save_directory)
@@ -3461,6 +3573,27 @@ def merge_and_overwrite_lora(
     # cleanup anchors on weights that were actually FP8 (not a `*_scale` name heuristic).
     _fp8_prerewrite_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list) if _fp8_post_cleanup else set()
     _defer_low_disk = low_disk_space_usage and push_to_hub and _fp8_post_cleanup
+
+    # A trained head the base checkpoint never had is invisible to the in-place shard rewrite,
+    # so put it on disk before the loop. Scoped to merged_16bit: the mxfp4 and native-quant
+    # paths preserve packed base tensors, so a seeded 16bit head there would not reload.
+    _seeded_head_keys = _seed_unbacked_trained_tensors(
+        save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
+        output_dtype = output_dtype, tie_word_embeddings = _merge_tie_word_embeddings,
+    ) if save_method == "merged_16bit" else {}
+    if _seeded_head_keys:
+        print(f"Unsloth: Writing {len(_seeded_head_keys)} trained tensor(s) absent from the "
+              f"base checkpoint: {', '.join(sorted(_seeded_head_keys))}")
+        _carry_over_trained_head_config(save_directory, model, _merge_model_class_name)
+        # Step 2 uploaded config.json before the head existed and Step 7's folder re-upload is
+        # skipped in low-disk mode, so push the corrected one now. Otherwise the remote keeps a
+        # causal-LM config beside shards that do hold the head.
+        if push_to_hub: upload_items("config.json")
+        # The index was copied (and, when pushing, already uploaded) before the seeding, so
+        # re-upload it if the new key had to be added there.
+        if _add_keys_to_index(save_directory, _seeded_head_keys) and push_to_hub:
+            upload_items("model.safetensors.index.json")
+
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
@@ -4408,6 +4541,15 @@ def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_n
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, safetensor_keys_seen, model_class_name = model_class_name,
     )
+    return len(_backed_lora_keys(converted, safetensor_keys_seen, tie_word_embeddings,
+                                 count_packed_mxfp4 = count_packed_mxfp4))
+pass
+
+
+def _backed_lora_keys(converted, safetensor_keys_seen, tie_word_embeddings,
+                      count_packed_mxfp4 = True):
+    """The converted keys the merge can actually write, shared with the seeding pass so
+    both agree on what "the base has no counterpart for this" means."""
     # Pre-build parent prefixes once so the MoE backing check is O(1) per key, not O(N).
     valid_prefixes = _build_valid_prefixes(safetensor_keys_seen, count_packed_mxfp4 = count_packed_mxfp4)
 
@@ -4434,7 +4576,174 @@ def _count_backed_lora_modules(lora_weights, safetensor_keys_seen, model_class_n
                     return True
         return False
 
-    return sum(1 for key in converted if _backed(key))
+    return {key for key in converted if _backed(key)}
+pass
+
+
+# Backbone tensors, never a task head. When the merge cannot place one (tied embeddings, or a
+# composite-VLM prefix it will not bridge) a bare top-level copy is wrong: gemma3 ties its text
+# embeddings, so seeding `lm_head.weight` puts a key in the export with no slot for it.
+_NEVER_SEEDED = ("lm_head", "embed_tokens")
+
+
+def _unbacked_trained_tensors(lora_weights, shard_keys, model_class_name,
+                              tie_word_embeddings = False):
+    """Trained `modules_to_save` weights with no counterpart in the base checkpoint.
+
+    A sequence-classification head trained on a causal-LM base exists ONLY in memory. The
+    shard rewrite overwrites in place, so a key the base never had is never written, and
+    `_count_backed_lora_modules` excludes it from both sides of the Step-7 check, so the
+    head is dropped with no error and the reload silently builds a random one.
+
+    Scoped to `modules_to_save` on purpose. A LoRA adapter whose target is absent from the
+    base (a vision tower under `text_only`) has no trained tensor of its own to lose, and
+    the merge is right to skip it.
+
+    "No counterpart" has to mean what the MERGE means by it, not just a literal key miss:
+    a tied or prefix-bridged `lm_head` reaches the base through `embed_tokens`, and seeding
+    a bare `lm_head.weight` for it puts an unexpected key in the export.
+    """
+    converted = _convert_lora_keys_to_safetensor_format(
+        lora_weights, shard_keys, model_class_name = model_class_name,
+    )
+    backed = _backed_lora_keys(converted, shard_keys, tie_word_embeddings)
+    tensors = {}
+    for key, lora_stats in converted.items():
+        if not isinstance(key, str) or f"{key}.weight" in shard_keys: continue
+        if key in backed or key.rpartition(".")[2] in _NEVER_SEEDED: continue
+        module = getattr(lora_stats, "module", None)
+        if module is None: continue
+        weight = _get_modules_to_save_weight(module)
+        if weight is None: continue
+        tensors[f"{key}.weight"] = weight
+        bias = _get_modules_to_save_weight(module, "bias")
+        if bias is not None: tensors[f"{key}.bias"] = bias
+    return tensors
+pass
+
+
+def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weights,
+                                   model_class_name, output_dtype = None,
+                                   tie_word_embeddings = False):
+    """Append the tensors `_unbacked_trained_tensors` finds into a shard, returning their keys.
+
+    Deliberately runs BEFORE the merge loop: once the key is on disk, the in-place rewrite,
+    the index build and the Step-7 count all treat it as an ordinary shard key, so no
+    downstream stage needs to know a head was added.
+    """
+    if not safetensors_list: return {}
+    shard_keys, sizes = set(), {}
+    for filename in safetensors_list:
+        path = os.path.join(save_directory, filename)
+        if not os.path.exists(path): continue
+        with safe_open(path, framework = "pt", device = "cpu") as f:
+            shard_keys.update(f.keys())
+        sizes[filename] = os.path.getsize(path)
+    if not sizes: return {}
+
+    tensors = _unbacked_trained_tensors(lora_weights, shard_keys, model_class_name,
+                                        tie_word_embeddings = tie_word_embeddings)
+    if not tensors: return {}
+    # The seeded key carries its own dtype into the header, and the in-place merge that
+    # follows cannot change it. Cast here or the head is the one fp32 tensor in a bf16 export.
+    if output_dtype is not None:
+        tensors = {key : tensor.to(output_dtype) for key, tensor in tensors.items()}
+
+    # Smallest shard: the rewrite byte-copies everything it does not replace, so this is the
+    # cheapest place to put a head measured in kilobytes.
+    target = min(sizes, key = sizes.get)
+    path = os.path.join(save_directory, target)
+
+    # safetensors is flat, so adding a key rewrites the shard through a temp copy that has to
+    # fit. Appending moves every offset, so there is no in-place fallback like a resize has.
+    # Refuse loudly rather than drop the head, since a silent drop is the bug this fixes.
+    needed = sizes[target] + sum(t.numel() * t.element_size() for t in tensors.values())
+    margin = 64 * 1024 * 1024
+    try: free_bytes = shutil.disk_usage(save_directory).free
+    except OSError: free_bytes = None
+    if free_bytes is not None and free_bytes < needed + margin:
+        raise RuntimeError(
+            f"Unsloth: not enough free disk to write the trained tensor(s) "
+            f"{', '.join(sorted(tensors))} into {target} (free={free_bytes}, "
+            f"need~={needed + margin}). They exist only in memory, so the export would "
+            f"otherwise reload with a randomly initialized head. Free disk space, or point "
+            f"the save directory at a larger volume."
+        )
+
+    with open(path, "rb") as f:
+        length_of_header = int.from_bytes(f.read(8), "little")
+        header_metadata = json.loads(f.read(length_of_header))
+    temp_path = path + ".unsloth_seed_tmp"
+    try:
+        _stream_rewrite_resized_shard(path, temp_path, header_metadata, length_of_header, tensors)
+        os.replace(temp_path, path)
+    except Exception:
+        if os.path.exists(temp_path): os.remove(temp_path)
+        raise
+    return {key : target for key in tensors}
+pass
+
+
+def _add_keys_to_index(save_directory, seeded_keys):
+    """Record seeded keys in an existing shard index, returning whether it changed.
+
+    A sharded base ships its own `model.safetensors.index.json`, copied verbatim before the
+    merge. transformers loads a sharded checkpoint through that map alone, so a key missing
+    from it is a key that does not exist as far as the reload is concerned.
+    """
+    index_path = Path(save_directory) / "model.safetensors.index.json"
+    if not index_path.exists(): return False
+    try:
+        data = json.loads(index_path.read_text(encoding = "utf-8"))
+    except Exception as index_error:
+        warnings.warn(f"Unsloth: could not read {index_path} to record "
+                      f"{', '.join(sorted(seeded_keys))} ({index_error}); the reload may not "
+                      f"find them.")
+        return False
+    weight_map = data.get("weight_map")
+    if not isinstance(weight_map, dict): return False
+    changed = False
+    for key, filename in seeded_keys.items():
+        if weight_map.get(key) != filename:
+            weight_map[key] = filename
+            changed = True
+    if changed:
+        index_path.write_text(json.dumps(data, indent = 4), encoding = "utf-8")
+    return changed
+pass
+
+
+# Fields describing the head, not the backbone. Written only alongside the head's own tensors:
+# advertising a classifier whose weights are absent is the same silent failure in reverse.
+_TRAINED_HEAD_CONFIG_FIELDS = ("id2label", "label2id", "problem_type")
+
+
+def _carry_over_trained_head_config(save_directory, model, model_class_name):
+    """Point the exported config at the head that was actually written.
+
+    #1073 made the config come from the base checkpoint so it would describe the base's
+    weights. A seeded head is the one part of the export that does NOT come from there, so
+    its architecture and label maps have to come from the trained model instead.
+    """
+    config_path = Path(save_directory) / "config.json"
+    if not config_path.exists(): return
+    trained_config = getattr(model, "config", None)
+    if trained_config is None: return
+    try:
+        data = json.loads(config_path.read_text(encoding = "utf-8"))
+    except Exception as config_error:
+        warnings.warn(f"Unsloth: could not read {config_path} to record the trained head "
+                      f"({config_error}); the exported config may not match it.")
+        return
+
+    data["architectures"] = [model_class_name]
+    for field in _TRAINED_HEAD_CONFIG_FIELDS:
+        value = getattr(trained_config, field, None)
+        if value is None: continue
+        # JSON object keys are strings, and transformers reads id2label back through int().
+        if field == "id2label": value = {str(k) : v for k, v in value.items()}
+        data[field] = value
+    config_path.write_text(json.dumps(data, indent = 2), encoding = "utf-8")
 pass
 
 def find_lora_base_model(model_to_inspect):
@@ -4743,6 +5052,27 @@ def check_hf_model_exists(model_name, token=None):
         raise _hub_unreachable_error(model_name, e) from e
 pass
 
+def _hub_repo_weights_without_safetensors(model_name, token = None):
+    """Weight files in a repo that exists but ships no safetensors, else None.
+
+    `check_hf_model_exists` answers False both for a missing repo and for one
+    in a format the merge cannot read, like `unsloth/bge-m3`, so callers blame
+    the name. Diagnosis only: None whenever unanswerable, so the caller's
+    original message stands.
+    """
+    if not _is_hub_repo_id(model_name): return None
+    try:
+        file_list = HfFileSystem(token = token).ls(model_name, detail = True)
+    except Exception:
+        # Absent, gated, or unreachable: all already described by the caller.
+        return None
+    names = [os.path.basename(x["name"]) for x in file_list]
+    if any(n.endswith(".safetensors") for n in names): return None
+    weights = [n for n in names
+               if n.endswith((".bin", ".pt", ".pth", ".h5", ".msgpack", ".gguf"))]
+    return weights or None
+
+
 def check_local_model_exists(model_path):
     """
     Check if model exists locally with case insensitive naming patterns.
@@ -5031,6 +5361,46 @@ def _strip_fp8_suffix(model_name):
     return model_name[:idx] or None
 pass
 
+def _sibling_content_reads_anonymously(model_name):
+    """How a reader with no credentials fares on `model_name`'s content: `"public"`,
+    `"restricted"` (refused) or `"unreachable"` (the Hub could not be asked, which is no
+    answer about the repo).
+
+    Listing is not the test, since a gated repo lists publicly and still refuses its
+    content. Nor is a download: `hf_hub_download` answers from the cache whenever its HEAD
+    fails (`if head_call_error is not None: ... return pointer_path`), handing back a copy
+    an earlier CREDENTIALED download left behind, so a warm cache makes a gated repo read
+    as public. Measured on `meta-llama/Llama-3.2-1B`: anonymous `ls` succeeds, and after a
+    credentialed fetch `token = False` returns the cached path rather than raising.
+    `get_hf_file_metadata` has no cache path, and access is repo wide, so one anonymously
+    HEADable file stands for the weights.
+    """
+    from huggingface_hub import get_hf_file_metadata, hf_hub_url
+    repo_id, revision = _hub_repo_and_revision(model_name)
+    try:
+        get_hf_file_metadata(
+            hf_hub_url(repo_id, "config.json", revision = revision), token = False,
+        )
+        return "public"
+    except EntryNotFoundError:
+        # Discussing a missing file with an anonymous reader is itself proof of anonymous
+        # access, and a sibling with safetensors but no config.json resolved before this
+        # gate existed: `check_model_quantization_status` reads an absent config as
+        # unquantized.
+        return "public"
+    except (GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError):
+        return "restricted"
+    except Exception:
+        return "unreachable"
+pass
+
+def _allow_restricted_fp8_sibling():
+    """Opt in to resolving an FP8 base onto a gated or private 16bit sibling with the
+    caller's token. Off by default so a broad token cannot be aimed at an unrequested
+    repo; callers holding access to both repos set it to `1`."""
+    return os.environ.get("UNSLOTH_ALLOW_RESTRICTED_FP8_SIBLING") == "1"
+pass
+
 def _resolve_fp8_16bit_sibling(model_name, token=None):
     """If model_name is an FP8 variant with an existing, non-quantized 16bit sibling
     (e.g. unsloth/GLM-5.2-FP8 -> unsloth/GLM-5.2), return the sibling so a 16bit merge
@@ -5050,14 +5420,38 @@ def _resolve_fp8_16bit_sibling(model_name, token=None):
         local_rejected = True
     except Exception:
         return None
+    # `org/model-FP8` -> `org/model` is a guess, and the caller asked for the FP8 repo, so
+    # the sibling is resolved with NO credentials: whatever that finds, the requester could
+    # have fetched themselves. Spending a token broader than the request on the rewritten
+    # name is what would fold unreachable weights into the output.
+    opted_in = _allow_restricted_fp8_sibling()
+    sibling_token = token if opted_in else False
     try:
         # `local_ok` only when it has to be: passing it always would break any caller that
         # replaced this function with a two argument stand-in.
         _ask_the_hub = {"local_ok": False} if local_rejected else {}
-        if check_hf_model_exists(base, token) and not check_model_quantization_status(
-            base, token, **_ask_the_hub,
-        )[0]:
-            return base
+        if check_hf_model_exists(base, sibling_token):
+            # Existence came from a listing, which a gated repo also answers.
+            anonymous = "public" if opted_in else _sibling_content_reads_anonymously(base)
+            if anonymous == "unreachable":
+                raise _hub_unreachable_error(
+                    base, RuntimeError("anonymous read failed"),
+                    action = f"checking whether `{base}` is readable without a token",
+                    mistaken_for = "a missing model",
+                )
+            if anonymous != "public":
+                warnings.warn(
+                    f"Unsloth: the 16bit sibling `{base}` of `{model_name}` is gated or "
+                    f"private, so reaching it would depend on the current token rather "
+                    f"than on what was asked for. Merging onto the FP8 weights instead. "
+                    f"Set `UNSLOTH_ALLOW_RESTRICTED_FP8_SIBLING=1` if you have access to "
+                    f"both repos and want the 16bit sibling."
+                )
+                return None
+            if not check_model_quantization_status(
+                base, sibling_token, **_ask_the_hub,
+            )[0]:
+                return base
     except RuntimeError as e:
         # An unreachable Hub is not "there is no 16bit sibling". None is still right,
         # since the merge can dequantize the FP8 weights, but say so: the base used is
@@ -5671,17 +6065,23 @@ pass
 def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of_header, resized):
     # Stream one tensor at a time (peak RAM ~ one tensor): resized tensors from
     # `resized`, the rest byte-copied from src. Tensor-identical to dict+save_file.
+    # A key of `resized` absent from the source header is APPENDED rather than replaced,
+    # which is how a trained head with no base counterpart reaches the shard.
     import struct
     src_data_start = 8 + length_of_header
     meta = header_metadata.get("__metadata__", None)
     tensor_keys = [k for k in header_metadata.keys() if k != "__metadata__"]
     tensor_keys.sort(key = lambda k: header_metadata[k]["data_offsets"][0])
 
-    # Cast resized tensors to the header dtype so bytes match the label.
+    # Cast resized tensors to the header dtype so bytes match the label. An appended key has
+    # no header to match, so it keeps its own dtype and labels itself.
     res_t = {}
     for k in resized:
-        dt = SAFETENSORS_DTYPES[header_metadata[k]["dtype"]]
-        res_t[k] = resized[k].detach().to(dt).contiguous().cpu()
+        entry = header_metadata.get(k)
+        tensor = resized[k].detach()
+        if entry is not None: tensor = tensor.to(SAFETENSORS_DTYPES[entry["dtype"]])
+        res_t[k] = tensor.contiguous().cpu()
+    tensor_keys += [k for k in res_t if k not in header_metadata]
 
     new_header = {}
     if meta is not None:
@@ -5689,19 +6089,21 @@ def _stream_rewrite_resized_shard(src_path, dst_path, header_metadata, length_of
     layout = []  # (key, src_off0, nbytes, is_resized)
     cursor = 0
     for k in tensor_keys:
-        entry = header_metadata[k]
+        entry = header_metadata.get(k)
         if k in res_t:
             t = res_t[k]
             shape = list(t.shape)
             nbytes = t.numel() * t.element_size()
+            # dtype is unchanged by a vocab resize; an appended key labels its own.
+            dtype = entry["dtype"] if entry is not None else _SAFETENSORS_DTYPE_NAMES[t.dtype]
         else:
             shape = list(entry["shape"])
             o0, o1 = entry["data_offsets"]
             nbytes = o1 - o0
-        # dtype is unchanged by a vocab resize
-        new_header[k] = {"dtype": entry["dtype"], "shape": shape,
+            dtype = entry["dtype"]
+        new_header[k] = {"dtype": dtype, "shape": shape,
                          "data_offsets": [cursor, cursor + nbytes]}
-        layout.append((k, entry["data_offsets"][0], nbytes, k in res_t))
+        layout.append((k, entry["data_offsets"][0] if entry is not None else 0, nbytes, k in res_t))
         cursor += nbytes
 
     header_bytes = json.dumps(new_header, separators = (",", ":")).encode("utf-8")

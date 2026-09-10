@@ -135,7 +135,6 @@ def _moment(optimizer, key="m"):
     return optimizer.state["layers"][0]["weight"][key]
 
 
-# 1 ------------------------------------------------------------------------
 def test_loss_decreases_with_quantized_first_moment():
     x, y = _batch()
     losses = _train(QuantizedMomentAdam(1e-3, bias_correction=True), _build_model(), x, y)
@@ -146,7 +145,6 @@ def test_loss_decreases_with_quantized_first_moment():
     assert losses[-1] < losses[0]
 
 
-# 2 ------------------------------------------------------------------------
 def test_loss_trajectory_tracks_fp32_baseline():
     """Compare the whole trajectory over a target the model CANNOT fit. On the
     overparameterised fixture the loss reaches ~1e-9, where a relative comparison
@@ -167,7 +165,6 @@ def test_loss_trajectory_tracks_fp32_baseline():
     assert all(l == l for l in int8), "quantized run produced a NaN"
 
 
-# 3 ------------------------------------------------------------------------
 def test_optimizer_state_is_measurably_smaller():
     x, y = _batch()
     fp32_opt = optim.Adam(learning_rate=1e-3, bias_correction=True)
@@ -186,7 +183,6 @@ def test_optimizer_state_is_measurably_smaller():
     )
 
 
-# 4 ------------------------------------------------------------------------
 def test_quantized_state_saves_reloads_and_resumes_identically():
     """Compares POST-update parameters and every state leaf. ``_train`` returns the
     loss computed before the update, so comparing that would pass even with
@@ -228,7 +224,6 @@ def test_quantized_state_saves_reloads_and_resumes_identically():
         assert delta == 0.0, f"resumed state leaf {name} differs by {delta:.3e}"
 
 
-# 5 ------------------------------------------------------------------------
 def test_second_moment_is_never_quantized():
     """Quantizing v diverges to NaN; it must not be silently enabled."""
     x, y = _batch()
@@ -249,7 +244,6 @@ def test_second_moment_is_never_quantized():
     )
 
 
-# 6 ------------------------------------------------------------------------
 def test_compiled_and_uncompiled_agree():
     x, y = _batch()
     plain = _train(QuantizedMomentAdam(1e-3, bias_correction=True), _build_model(), x, y)
@@ -258,10 +252,26 @@ def test_compiled_and_uncompiled_agree():
     )
 
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
-    assert worst == 0.0, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
+    # Tolerance, not equality. MLX documents compiled and uncompiled output as
+    # "the same up to numerical precision", never bit-identical: mx.compile fuses
+    # elementwise chains, so intermediates stay in registers instead of being
+    # rounded to fp32 on every store, and the fused arithmetic reassociates.
+    #
+    # This asserted `== 0.0` and held on macos-14, where the fused kernel happened
+    # to land on the same bits. On macos-15 it does not: the trajectory differs by
+    # 5.96e-08 at worst, which is 2**-24, half an fp32 ULP on an O(1) loss.
+    #
+    # The point of the test is that compiling does not BREAK the quantized
+    # optimizer, and that still holds at this bar. A compiled path that diverged
+    # for real would grow monotonically across steps as the error fed back through
+    # the moments; this one does not compound (steps 1, 3, 4 and 8 match exactly)
+    # and stays ~1e5 times under the int8-vs-fp32 gap the neighbouring tests
+    # already tolerate. 1e-6 is ~8 fp32 ULP here: loose enough for fusion to pick
+    # a different but equally valid kernel, tight enough that real divergence
+    # still fails loudly.
+    assert worst <= 1e-6, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
 
 
-# 7 ------------------------------------------------------------------------
 def test_model_with_no_quantizable_parameters_still_trains():
     """Nothing eligible -> every moment fp32, must still train."""
     model = _build_ineligible_model()
@@ -283,7 +293,6 @@ def test_model_with_no_quantizable_parameters_still_trains():
     )
 
 
-# 8 ------------------------------------------------------------------------
 @pytest.mark.parametrize("bits", [2, 4, 16, 32])
 def test_bit_widths_other_than_8_are_rejected(bits):
     """Narrower widths are refused, not offered untested."""
@@ -293,7 +302,6 @@ def test_bit_widths_other_than_8_are_rejected(bits):
         QuantizedMomentAdamW(1e-3, bits=bits)
 
 
-# 9 ------------------------------------------------------------------------
 @pytest.mark.parametrize("group_size", SUPPORTED_GROUP_SIZES)
 def test_every_supported_group_size_trains(group_size):
 
@@ -313,8 +321,6 @@ def test_unsupported_group_size_is_rejected(group_size):
         QuantizedMomentAdam(1e-3, group_size=group_size)
 
 
-# 10 -----------------------------------------------------------------------
-# 11 -----------------------------------------------------------------------
 def test_zero_gradient_coordinates_never_move():
     """A coordinate whose gradient is identically zero keeps v == 0, so the Adam
     denominator is eps alone and any dequantization residue is amplified ~1e8x.
@@ -345,7 +351,6 @@ def test_zero_gradient_coordinates_never_move():
     assert float(got[0, 0]) != 0.0, "the live coordinate should still train"
 
 
-# 12 -----------------------------------------------------------------------
 def test_plain_checkpoint_migrates_to_packed_on_resume():
     """Before this optimizer existed, adamw_8bit produced plain AdamW state. Such a
     checkpoint must not leave the moment full width for the rest of the run."""
@@ -368,7 +373,6 @@ def test_plain_checkpoint_migrates_to_packed_on_resume():
     )
 
 
-# 13 -----------------------------------------------------------------------
 def test_packed_checkpoint_loads_into_plain_optimizer():
     """Switching back to optim="adamw" must not hand a list to mlx's b1 * m."""
     x, y = _batch()
@@ -386,7 +390,6 @@ def test_packed_checkpoint_loads_into_plain_optimizer():
     _train(plain, plain_model, x, y, steps=1)
 
 
-# 13b ----------------------------------------------------------------------
 def test_unpacking_does_not_carry_the_zero_residue_out():
     """Dequantization leaves a residue where the true moment is zero. Handing that
     to a plain optimizer would divide it by eps while v == 0, reintroducing the
@@ -421,7 +424,6 @@ def test_unpacking_does_not_carry_the_zero_residue_out():
     assert drift == 0.0, f"zero-gradient coordinates drifted {drift:.3e} after unpacking"
 
 
-# 14 -----------------------------------------------------------------------
 @pytest.mark.parametrize("saved,resumed", [(32, 128), (128, 32)])
 def test_group_size_is_read_back_from_the_checkpoint(saved, resumed):
     """group_size is an instance attribute, so it rides in safetensors metadata."""
@@ -439,7 +441,6 @@ def test_group_size_is_read_back_from_the_checkpoint(saved, resumed):
     _train(other, other_model, x, y, steps=1)
 
 
-# 15 -----------------------------------------------------------------------
 @pytest.mark.parametrize("kwargs", [{"bits": 8.9}, {"group_size": 64.9}, {"bits": True}])
 def test_non_integral_settings_are_rejected(kwargs):
     """int() truncates, so bits=8.9 would silently pass the bits == 8 check."""
@@ -447,7 +448,6 @@ def test_non_integral_settings_are_rejected(kwargs):
         QuantizedMomentAdam(1e-3, **kwargs)
 
 
-# 16 -----------------------------------------------------------------------
 def test_moments_follow_the_parameter_dtype():
     """The saving is 8-bit against the parameter dtype, not against float32."""
     mx.random.seed(0)
@@ -478,7 +478,6 @@ def test_adamw_variant_also_quantizes():
     assert (DEFAULT_GROUP_SIZE, DEFAULT_BITS) == (opt.group_size, opt.bits)
 
 
-# 12 -----------------------------------------------------------------------
 # Eligibility counts elements, not axes. The earlier rule was 2-D with a
 # divisible last axis, which excluded the shapes below while packing their
 # partner matrices, so a LoRA run saved half of what it reported.

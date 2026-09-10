@@ -70,12 +70,9 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
     emb2 = model.get_input_embeddings().weight
     head2 = model.get_output_embeddings().weight
 
-    # 1. No shrink: all trained rows survive byte-identical.
     assert emb2.shape[0] == PADDED, "padded embedding must not shrink"
     assert torch.equal(emb2[:VOCAB_TOK], trained_rows), "trained rows corrupted"
 
-    # 2. New tokens land at their real tokenizer IDs, each pointing at its OWN
-    #    mean-initialised row (not a leftover padding row).
     new_len = len(tokenizer)
     for offset, tok in enumerate(new_tokens):
         tid = tokenizer.convert_tokens_to_ids(tok)
@@ -92,11 +89,9 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
     assert torch.equal(emb2[new_len:PADDED], sentinel_rows[new_len - VOCAB_TOK:]), \
         "alignment padding rows were overwritten"
 
-    # 4. Tied weights stay tied, and share storage at a new-token row.
     assert emb2.data_ptr() == head2.data_ptr(), "tie broken by resize"
     assert torch.equal(emb2[VOCAB_TOK], head2[VOCAB_TOK])
 
-    # 5. config.vocab_size tracks the matrix, so the model round-trips.
     assert model.config.vocab_size == PADDED
     with tempfile.TemporaryDirectory() as d:
         model.save_pretrained(d)
@@ -104,7 +99,6 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
     assert reloaded.get_input_embeddings().weight.shape[0] == PADDED
     assert reloaded.config.vocab_size == PADDED
 
-    # 6. Forward pass over the new IDs works.
     with torch.no_grad():
         logits = model(torch.tensor([[VOCAB_TOK, VOCAB_TOK + 1, 3, 4]])).logits
     assert logits.shape[-1] == PADDED

@@ -30,6 +30,7 @@ import sys
 import sysconfig
 from pathlib import Path
 import functools
+import importlib
 import types
 import __future__
 import builtins as _py_builtins
@@ -483,6 +484,212 @@ def validate_single_function_source(
 pass
 
 
+# Importable by generated code. Excludes anything reaching the filesystem,
+# network or another process (os, subprocess, socket, ctypes, ...), plus two
+# whose whole module has to go:
+#   string -- Formatter.get_field resolves a dotted runtime string and returns
+#     the object, reaching the real builtins with nothing in the source to
+#     match. str.format resolves the same way but only returns text, never the
+#     object, so it is not an execution path and stays.
+#   dataclasses -- resolves annotations via sys.modules[cls.__module__], which
+#     cannot work for synthetic globals.
+_SAFE_IMPORT_MODULES = frozenset({
+    "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
+    "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
+    "numbers", "operator", "random", "re", "statistics", "textwrap", "time",
+    "typing", "unicodedata",
+})
+
+# Members denied individually, where the module itself is worth keeping.
+# Three reasons, all of them invisible to the AST check:
+#   string-to-object resolvers -- operator.attrgetter walks dunders from a
+#     dotted string (itemgetter takes an index and stays); functools
+#     update_wrapper/wraps copy whatever `assigned` names, so ("__globals__",)
+#     plus a custom __setattr__ yields a real globals dict to index.
+#   evaluators -- typing.get_type_hints runs string annotations, and
+#     ForwardRef/evaluate_forward_ref are the same evaluator made public in
+#     3.14. Denied on every version; 3.13 reaches it only via private
+#     _evaluate, which the private-attribute rule already covers.
+#   mutators -- time.clock_settime(_ns) sets the host clock given the
+#     privilege a root container has. Read-only clocks stay.
+_DENIED_MODULE_ATTRS = frozenset({
+    "functools.update_wrapper",
+    "functools.wraps",
+    "time.clock_settime",
+    "time.clock_settime_ns",
+    "operator.attrgetter",
+    "operator.methodcaller",
+    "typing.ForwardRef",
+    "typing.evaluate_forward_ref",
+    "typing.get_type_hints",
+})
+
+# Attributes that walk the interpreter's own object graph. None of these start
+# with an underscore, and none of them go through a module, so neither the
+# private-attribute rule nor the import allowlist can see them: a running
+# generator reaches gi_frame.f_back.f_back.f_builtins, which is the trusted
+# caller's real builtins, and indexing "__import__" out of it restores
+# everything. Frames, generators, coroutines, async generators and tracebacks
+# all expose the same walk.
+_DENIED_ATTR_NAMES = frozenset({
+    "ag_await", "ag_code", "ag_frame",
+    "cr_await", "cr_code", "cr_frame", "cr_origin",
+    "f_back", "f_builtins", "f_code", "f_globals", "f_lasti", "f_lineno",
+    "f_locals", "f_trace",
+    "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
+    "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
+})
+
+# Dunder methods a generated helper class may define. A method name is
+# FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
+# it; without this, generated code defines __setattr__ or __getattr__ and hooks
+# the attribute machinery that copy helpers drive. __init__ and the comparison
+# and arithmetic protocol are ordinary in helper classes, so they stay.
+_ALLOWED_DUNDER_DEFS = frozenset({
+    "__abs__", "__add__", "__bool__", "__call__", "__contains__", "__enter__",
+    "__eq__", "__exit__", "__float__", "__floordiv__", "__ge__", "__getitem__",
+    "__gt__", "__hash__", "__index__", "__init__", "__int__", "__iter__",
+    "__le__", "__len__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__",
+    "__next__", "__pos__", "__pow__", "__repr__", "__round__", "__setitem__",
+    "__str__", "__sub__", "__truediv__",
+})
+
+
+class _SafeModule:
+    """
+    Facade over an allowlisted module.
+
+    Returning the real module is not enough: modules re-export other modules,
+    and `random._os` / `typing.sys` lead straight back to the capabilities the
+    allowlist removes. Denies private names, and nested modules unless their
+    dotted name is allowlisted too.
+    """
+    __slots__ = ("_module", "_name")
+
+    def __init__(self, module, name):
+        object.__setattr__(self, "_module", module)
+        object.__setattr__(self, "_name", name)
+
+    def __getattr__(self, attr):
+        if attr.startswith("_"):
+            raise AttributeError(
+                f"Access to '{self._name}.{attr}' is not allowed in generated code."
+            )
+        if f"{self._name}.{attr}" in _DENIED_MODULE_ATTRS:
+            raise AttributeError(
+                f"Access to '{self._name}.{attr}' is not allowed in generated code."
+            )
+        value = getattr(self._module, attr)
+        if isinstance(value, types.ModuleType):
+            dotted = f"{self._name}.{attr}"
+            if dotted not in _SAFE_IMPORT_MODULES:
+                raise AttributeError(
+                    f"Access to module '{dotted}' is not allowed in generated code."
+                )
+            return _SafeModule(value, dotted)
+        return value
+
+    def __repr__(self):
+        return f"<safe module '{self._name}'>"
+pass
+
+
+def _safe_import(name, globals = None, locals = None, fromlist = (), level = 0):
+    """
+    __import__ replacement for generated code: only _SAFE_IMPORT_MODULES
+    resolve, and always behind a _SafeModule facade.
+
+    Dotted names reach here in full (`import collections.abc` passes
+    "collections.abc"), so allowlist membership is checked on the whole name.
+    """
+    if level != 0:
+        raise ImportError("Relative imports are not allowed in generated code.")
+    if name not in _SAFE_IMPORT_MODULES:
+        raise ImportError(f"Import of '{name}' is not allowed in generated code.")
+    if fromlist:
+        return _SafeModule(importlib.import_module(name), name)
+    # A bare `import a.b` binds `a`, so hand back the root; the facade re-checks
+    # `a.b` when the attribute is reached.
+    root = name.split(".")[0]
+    importlib.import_module(name)
+    return _SafeModule(importlib.import_module(root), root)
+pass
+
+
+def _allowlist_builtins():
+    """
+    Safe builtins for generated code: enough for the list/numeric/sorting work
+    the RL prompts ask for, minus every capability primitive (open, eval, exec,
+    compile, input, getattr, globals, vars, breakpoint, and __import__ except
+    the shim above).
+    """
+    names = (
+        "abs", "all", "any", "ascii", "bin", "bool", "bytes", "callable", "chr",
+        "complex", "dict", "divmod", "enumerate", "filter", "float", "format",
+        "frozenset", "hash", "hex", "id", "int", "isinstance", "issubclass",
+        "iter", "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
+        "print", "range", "repr", "reversed", "round", "set", "slice", "sorted",
+        "str", "sum", "tuple", "type", "zip",
+        # Class machinery: generated helpers are occasionally written as a
+        # small class. hasattr only ever answers yes or no, and object/super
+        # hand back nothing that is not already reachable, since getting
+        # anywhere from them needs a dunder the AST check rejects.
+        "bytearray", "classmethod", "hasattr", "object", "property",
+        "staticmethod", "super",
+        # Generated code routinely uses try/except.
+        "ArithmeticError", "AssertionError", "AttributeError", "BaseException",
+        "Exception", "FloatingPointError", "IndexError", "KeyError",
+        "MemoryError", "NotImplementedError", "OverflowError", "RecursionError",
+        "RuntimeError", "StopIteration", "TypeError", "ValueError",
+        "ZeroDivisionError",
+    )
+    exposed = {name: getattr(_py_builtins, name) for name in names}
+    # The comparison and arithmetic dunders allowed below are expected to
+    # return NotImplemented for operands they do not handle, so the singleton
+    # has to be reachable. It is a value, not a capability.
+    exposed["NotImplemented"] = _py_builtins.NotImplemented
+    # Required for `class` statements.
+    exposed["__build_class__"] = _py_builtins.__build_class__
+    exposed["__name__"] = "__user_code__"
+    exposed["__import__"] = _safe_import
+    return exposed
+pass
+
+
+def _reject_dunder_access(tree):
+    """
+    Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
+    which walks from any literal to already-imported classes (subprocess.Popen
+    included) using only attribute access. Generated code has no reason to touch
+    dunders, so refuse them outright.
+    """
+    for node in ast.walk(tree):
+        # Definition names are strings on the node, invisible to the Name and
+        # Attribute checks below, so they get their own fail-closed rule.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name.startswith("__") and node.name not in _ALLOWED_DUNDER_DEFS:
+                raise RuntimeError(
+                    f"Defining '{node.name}' is not allowed in generated code."
+                )
+        # One underscore for attributes: private ones reach modules and
+        # internals just as well (random._os, ABCMeta._abc_impl).
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise RuntimeError(
+                f"Attribute '{node.attr}' is not allowed in generated code."
+            )
+        if isinstance(node, ast.Attribute) and node.attr in _DENIED_ATTR_NAMES:
+            raise RuntimeError(
+                f"Attribute '{node.attr}' is not allowed in generated code."
+            )
+        # Two for names: a bare `_` or `_total` local is ordinary and reaches
+        # nothing on its own.
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            raise RuntimeError(
+                f"Name '{node.id}' is not allowed in generated code."
+            )
+pass
+
+
 def load_single_function(
     source: str,
     *,
@@ -508,28 +715,9 @@ def load_single_function(
     if builtins_policy == "full":
         exposed_builtins = _py_builtins.__dict__
     elif builtins_policy == "allowlist":
-        exposed_builtins = {
-            "abs": _py_builtins.abs,
-            "all": _py_builtins.all,
-            "any": _py_builtins.any,
-            "bool": _py_builtins.bool,
-            "dict": _py_builtins.dict,
-            "enumerate": _py_builtins.enumerate,
-            "float": _py_builtins.float,
-            "int": _py_builtins.int,
-            "len": _py_builtins.len,
-            "list": _py_builtins.list,
-            "max": _py_builtins.max,
-            "min": _py_builtins.min,
-            "pow": _py_builtins.pow,
-            "range": _py_builtins.range,
-            "reversed": _py_builtins.reversed,
-            "round": _py_builtins.round,
-            "str": _py_builtins.str,
-            "sum": _py_builtins.sum,
-            "tuple": _py_builtins.tuple,
-            "zip": _py_builtins.zip,
-        }
+        exposed_builtins = _allowlist_builtins()
+        # Only meaningful alongside the restricted builtins above.
+        _reject_dunder_access(tree)
     else:
         raise ValueError("builtins_policy must be 'full' or 'allowlist'")
 
@@ -554,14 +742,37 @@ def load_single_function(
     return fn
 pass
 
-def create_locked_down_function(function):
+def create_locked_down_function(function, *, builtins_policy: str = "allowlist"):
     """
     Creates a singular Python function which disallows globals.
+
+    Defaults to builtins_policy = "allowlist": generated code cannot reach
+    __import__ / open / eval / exec / compile, import outside
+    _SAFE_IMPORT_MODULES, or walk dunder attributes. Pass "full" for the old
+    permissive behaviour.
+
+    Defence in depth, not a real sandbox. It does not bound CPU, memory or
+    recursion. Run genuinely untrusted code in a container.
     """
-    f = load_single_function(function)
-    # Locks down function so it can see global variables of nothingness
-    f = types.FunctionType(f.__code__, {})
-    return f
+    f = load_single_function(function, builtins_policy = builtins_policy)
+    # Binding to an empty dict is not enough: CPython injects the real builtins
+    # module into any globals mapping without a __builtins__ key, handing back
+    # everything the policy just removed.
+    exposed_builtins = (
+        _py_builtins.__dict__ if builtins_policy == "full" else _allowlist_builtins()
+    )
+    locked = types.FunctionType(
+        f.__code__,
+        {"__builtins__": exposed_builtins},
+        f.__name__,
+        f.__defaults__,
+        f.__closure__,
+    )
+    # Assigned rather than passed: the constructor only grew a kwdefaults
+    # parameter recently, but the attribute is writable on every version we
+    # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
+    locked.__kwdefaults__ = f.__kwdefaults__
+    return locked
 pass
 
 

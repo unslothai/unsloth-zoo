@@ -24,6 +24,7 @@ __all__ = [
     "patch_compiling_bitsandbytes",
     "patch_layernorm",
     "patch_torch_compile",
+    "stop_compiling_weak_dictionary_writes",
     "patch_model_and_tokenizer",
     "patch_compiled_autograd",
 ]
@@ -101,6 +102,56 @@ def patch_layernorm(fast_layernorm):
         torch.nn.LayerNorm = Unsloth_LayerNorm
     return
 pass
+
+
+# Dynamo inlines the stdlib, so checkpointing's bookkeeping gets these compiled.
+_WEAK_DICTIONARY_WRITERS = (
+    ("WeakKeyDictionary",   "__setitem__"),
+    ("WeakKeyDictionary",   "__delitem__"),
+    ("WeakValueDictionary", "__setitem__"),
+    ("WeakValueDictionary", "__delitem__"),
+)
+
+
+def stop_compiling_weak_dictionary_writes():
+    """Mark `weakref`'s dictionary writes never-compile. Returns how many.
+
+    Fine-tuning gemma-4-E2B-it on a T4 dies in the second step with
+    "AssertionError: Something went unexpectedly wrong in activation
+    checkpoint". The exhausted recompile budget is `weakref.__setitem__`'s --
+    1030 compiles against a `recompile_limit` of 1024 in that step -- NOT the
+    gemma4 RMSNorm kernel the warning names, which compiles six times in the
+    whole run and is only named because the failure surfaces inside whichever
+    compiled kernel is on the stack.
+
+    Non-reentrant checkpointing saves recomputed intermediates through weakly
+    keyed bookkeeping, which runs on the autograd thread under a compiled
+    region with a fresh key object per region: one unusable compilation each.
+    The budget runs out after the kernel has packed its activations, so the
+    eager retry packs them again and torch's recomputation hook asserts.
+
+    Compiling a weak-dictionary insert buys nothing, so skipping these four
+    code objects costs nothing and keeps the model compiled.
+    """
+    try:
+        import weakref
+        from torch._dynamo.eval_frame import skip_code
+    except Exception:
+        # Older torch, or no Dynamo: not worth failing an import over.
+        return 0
+    marked = 0
+    for owner_name, method_name in _WEAK_DICTIONARY_WRITERS:
+        owner = getattr(weakref, owner_name, None)
+        method = getattr(owner, method_name, None)
+        code = getattr(method, "__code__", None)
+        if code is None:
+            continue
+        try:
+            skip_code(code)
+        except Exception:
+            continue
+        marked += 1
+    return marked
 
 
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
@@ -230,6 +281,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         try:    exec(_try_dynamo_argument)
         except: pass
     pass
+    # Must happen before anything compiles.
+    stop_compiling_weak_dictionary_writes()
 pass
 
 def get_model(model):
@@ -364,6 +417,21 @@ def patch_model_and_tokenizer(
                 module.to(setted_dtype)
             if "bias" in name:
                 module.to(setted_dtype)
+        pass
+        # empty_cache() used to run here once per module, and that corrupted memory on a
+        # model split across GPUs: the casts above are async, and empty_cache() cudaFrees
+        # cached blocks on EVERY device with no device guard, while cudaFree only
+        # synchronises the current one. Blocks on the other card went back to the driver
+        # mid-write, surfacing as an illegal memory access at a later, unrelated sync.
+        # Only FORCE_FLOAT32 architectures reach this pass, which is why llama never
+        # showed it. Sync the devices this model occupies, then release once -- taking the
+        # set from the model rather than device_count() keeps a DDP rank from creating a
+        # CUDA context on a card it never uses.
+        _model_devices  = {p.device for p in model.parameters() if p.device.type == "cuda"}
+        _model_devices |= {b.device for b in model.buffers()    if b.device.type == "cuda"}
+        for _device in _model_devices:
+            torch.cuda.synchronize(_device)
+        if _model_devices:
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters
@@ -396,7 +464,23 @@ def patch_model_and_tokenizer(
             if key == "torch_dtype" or key == "dtype":
                 setattr(config, key, correct_dtype)
             else:
-                __fix_dtype(getattr(config, key, None))
+                # getattr's default only covers AttributeError, and transformers
+                # >= 5.15 raises AmbiguousGlobalPerLayerAttributeError straight
+                # out of PretrainedConfig.__getattribute__ for any attribute
+                # that varies per layer on a heterogeneous config. So reading a
+                # key that to_dict() itself just listed can raise, and it kills
+                # the whole load: unsloth/gemma-4-E2B-it on transformers 5.15.1
+                # dies here on 'head_dim' before a single weight is touched.
+                #
+                # Not fatal, because of what this walk is FOR. It descends
+                # looking for nested config objects that might carry a dtype
+                # key; a per-layer scalar like head_dim is never one, so an
+                # unreadable key has nothing to contribute either way.
+                try:
+                    child = getattr(config, key, None)
+                except Exception:
+                    continue
+                __fix_dtype(child)
     m = model
     while hasattr(m, "model"):
         if hasattr(m, "dtype"):
@@ -677,13 +761,19 @@ class WrapRecursiveCall(ast.NodeTransformer):
 
 # Patch for dynamic 4bit quantization
 import inspect
-import transformers.integrations.bitsandbytes
-if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
-    (transformers.integrations.bitsandbytes._replace_with_bnb_linear.__name__ != "_unsloth_replace_with_bnb_linear"):
+try:
+    import transformers.integrations.bitsandbytes as _transformers_bnb
+except Exception:
+    # Not just ImportError: this transformers module imports bitsandbytes at its own module
+    # scope, and a bitsandbytes mismatched with torch fails its own import with AttributeError.
+    _transformers_bnb = None
+if _transformers_bnb is not None and \
+    hasattr(_transformers_bnb, "_replace_with_bnb_linear") and \
+    (_transformers_bnb._replace_with_bnb_linear.__name__ != "_unsloth_replace_with_bnb_linear"):
 
     # All Unsloth Zoo code licensed under LGPLv3
-    source = inspect.getsource(transformers.integrations.bitsandbytes._replace_with_bnb_linear)
-    functions = dir(transformers.integrations.bitsandbytes)
+    source = inspect.getsource(_transformers_bnb._replace_with_bnb_linear)
+    functions = dir(_transformers_bnb)
     functions = [x for x in functions if f" {x}" in source or f"{x}." in source or f"{x}(" in source]
     functions = [x for x in functions if x != "_replace_with_bnb_linear"]
     x = ", ".join(functions)
@@ -751,7 +841,7 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
     source = re.sub(pattern, add_score_code, source, flags=re.MULTILINE)
 
     exec(source, globals())
-    transformers.integrations.bitsandbytes._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
+    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
 pass
 
 # Patch for transformers 5.x: should_convert_module uses re.match + endswith
@@ -760,7 +850,10 @@ pass
 # 4.x patches _replace_with_bnb_linear (substring matching); on 5.x that no
 # longer exists, so patch should_convert_module instead.
 import transformers.quantizers.quantizers_utils as _quantizers_utils
-if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
+# A bitsandbytes too broken to import leaves _transformers_bnb None, which rules out 4.x's
+# _replace_with_bnb_linear the same way 5.x does. should_convert_module below is the marker
+# that actually separates the two, so the 5.x patch still applies instead of being skipped.
+if (_transformers_bnb is None or not hasattr(_transformers_bnb, "_replace_with_bnb_linear")) and \
     hasattr(_quantizers_utils, "should_convert_module") and \
     getattr(_quantizers_utils.should_convert_module, "__name__", "") != "_unsloth_should_convert_module":
 
@@ -780,8 +873,8 @@ if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear
 
     _quantizers_utils.should_convert_module = _unsloth_should_convert_module
     # Also patch the imported reference in bitsandbytes module
-    if hasattr(transformers.integrations.bitsandbytes, "should_convert_module"):
-        transformers.integrations.bitsandbytes.should_convert_module = _unsloth_should_convert_module
+    if _transformers_bnb is not None and hasattr(_transformers_bnb, "should_convert_module"):
+        _transformers_bnb.should_convert_module = _unsloth_should_convert_module
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

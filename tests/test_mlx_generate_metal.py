@@ -81,18 +81,42 @@ def test_generation_mode_restores_flags_and_limits_when_nested_or_raised():
 def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
     from mlx_lm import load, stream_generate
     from mlx_lm.sample_utils import make_sampler
+    import unsloth_zoo.mlx.generate as generate_module
     from unsloth_zoo.mlx.generate import (
         GenerationDefaults,
         GenerationRequest,
         generate_batch,
     )
     model, tokenizer = load(MODEL)
+    generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED = False
     requests = [
         GenerationRequest(prompt="The capital of France is", max_tokens=8),
         GenerationRequest(prompt="Two plus two equals", max_tokens=8),
     ]
     defaults = GenerationDefaults()
-    batched = generate_batch(model, tokenizer, requests, defaults=defaults)
+    order = []
+    real_install = generate_module._install_arrays_cache_advance_fix
+    real_adapter_stream = generate_module._TextBatchAdapter.stream
+
+    def record_install():
+        order.append("install")
+        return real_install()
+
+    def record_stream(self, requests):
+        order.append("stream")
+        return real_adapter_stream(self, requests)
+
+    generate_module._install_arrays_cache_advance_fix = record_install
+    generate_module._TextBatchAdapter.stream = record_stream
+    try:
+        batched = generate_batch(model, tokenizer, requests, defaults=defaults)
+    finally:
+        generate_module._install_arrays_cache_advance_fix = real_install
+        generate_module._TextBatchAdapter.stream = real_adapter_stream
+    from mlx_lm.models.cache import ArraysCache
+    assert order == ["install", "stream"]
+    assert generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED
+    assert isinstance(ArraysCache.left_padding, property)
     sequential = []
     for request in requests:
         prompt_ids = tokenizer.encode(request.prompt, add_special_tokens=False)
@@ -161,8 +185,6 @@ def test_compiled_training_state_survives_generation():
         # Sampling consumes the global RNG stream, so the same seed reproduces.
         result, repeat = [types.SimpleNamespace(token_ids=sample(11))], sample(11)
         assert result[0].token_ids and repeat == result[0].token_ids
-        # Parameters untouched, block runs in eval with the checkpoint patch
-        # installed, flags restored, and the compiled step keeps training.
         assert snapshot() == state_after_train
         assert (False, True) in model.layers[0].seen_states
         assert hasattr(_CompileBlock, "_orig_call")
@@ -198,7 +220,6 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     results = generate_batch(model, processor, requests, defaults=defaults)
     assert len(results) == 3
     for result in results:
-        # The RL contract: ids come from sampled events, logprobs align to them.
         assert result.token_ids
         assert result.logprobs is None or len(result.logprobs) == len(result.token_ids)
         assert result.finish_reason in ("stop", "length")
@@ -209,16 +230,12 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     events = [event for event in stream_generate(
         model, processor, requests[0].prompt, image=[requests[0].image],
         max_tokens=4, sampler=make_sampler(temp=0.0))]
-    # The terminal event contributes text only: its token is the stopping token,
-    # or a repeat of the last body token when the budget ran out.
     tail = events[-1]
     body = events[:-1]
     assert results[0].token_ids == [int(event.token) for event in body]
     assert results[0].logprobs == pytest.approx(
         [float(event.logprobs[event.token].item()) for event in body], abs=0.02)
     assert results[0].text == "".join(event.text for event in events)
-    # Derived from the stream, not our own rule: fewer body events than the
-    # budget means it stopped early.
     assert tail is not None
     assert results[0].finish_reason == ("stop" if len(body) < 4 else "length")
     # Chunking must not pair a prompt with an earlier chunk's embeddings.
@@ -228,7 +245,6 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     # Concurrent sequences must not share a detokenizer buffer, so text must
     # match too, not just ids.
     assert [item.text for item in chunked] == [item.text for item in results]
-    # Independent buffers: no result may carry another's decoded text appended.
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
 
 
@@ -249,12 +265,157 @@ def test_vlm_stop_strings_cut_generation_through_the_public_path():
     free = generate_batch(model, processor, [request],
                           defaults=GenerationDefaults(max_tokens=12))[0]
     assert len(free.text) > 1
-    # The whole public path must carry stop strings, not just the event loop.
     stop = free.text[1]
     stopped = generate_batch(model, processor, [request], defaults=GenerationDefaults(
         max_tokens=12, stop_strings=(stop,)))[0]
     assert (stopped.finish_reason, stopped.stop_match) == ("stop_string", stop)
-    # Trimming is token-aligned: whole tokens before the match survive, possibly
-    # none, and never the stop string itself.
     assert free.text.startswith(stopped.text) and stop not in stopped.text
     assert len(stopped.token_ids) < len(free.token_ids)
+
+@metal_only
+def test_arrays_cache_advance_patch_only_replaces_the_body_it_reproduces():
+    from mlx_lm.models.cache import ArraysCache
+    import unsloth_zoo.mlx.generate as generate_module
+    from unsloth_zoo.mlx.generate import (
+        _has_replaceable_advance,
+        _install_arrays_cache_advance_fix,
+    )
+
+    _install_arrays_cache_advance_fix()
+    # Descriptors now mediate these reads, so a second install must be a no-op.
+    assert not _has_replaceable_advance(ArraysCache)
+    installed = (ArraysCache.left_padding, ArraysCache.lengths)
+    generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED = False
+    _install_arrays_cache_advance_fix()
+    assert (ArraysCache.left_padding, ArraysCache.lengths) == installed
+
+    # Candidacy follows the compiled body, however similar a different one reads.
+    class Incrementing:
+        lengths = left_padding = None
+
+        def advance(self, N):
+            if self.lengths is not None:
+                self.lengths += N
+            if self.left_padding is not None:
+                self.left_padding += N
+
+    class Decrementing(Incrementing):
+        def __init__(self):
+            raise AssertionError("candidacy must not instantiate the candidate")
+
+        def advance(self, N):
+            if self.lengths is not None:
+                self.lengths -= N
+            if self.left_padding is not None:
+                self.left_padding -= N
+
+    class DefaultedStep(Incrementing):
+        def advance(self, N=1):
+            if self.lengths is not None:
+                self.lengths -= N
+            if self.left_padding is not None:
+                self.left_padding -= N
+
+    assert not _has_replaceable_advance(Incrementing)
+    assert not _has_replaceable_advance(DefaultedStep)
+    assert _has_replaceable_advance(Decrementing)
+
+    # A failed attempt is not a decision, so installation stays available afterwards.
+    def raise_transient(arrays_cache):
+        raise RuntimeError("transient")
+
+    generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED = False
+    generate_module._has_replaceable_advance = raise_transient
+    try:
+        _install_arrays_cache_advance_fix()
+        assert not generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED
+    finally:
+        generate_module._has_replaceable_advance = _has_replaceable_advance
+    _install_arrays_cache_advance_fix()
+    assert generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED
+
+@metal_only
+def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
+    from mlx_lm.models.cache import ArraysCache
+    from unsloth_zoo.mlx.generate import _install_arrays_cache_advance_fix
+
+    _install_arrays_cache_advance_fix()
+    cache = ArraysCache(1)
+    cache[0] = mx.zeros((2, 4))
+    cache.left_padding, cache.lengths = mx.array([0, 3]), mx.array([9, 5])
+    mx.eval(cache[0], cache.left_padding, cache.lengths)
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    advances = [1] * 4000 + [2] * 4000
+    for step in advances:
+        cache.advance(step)
+    # Stock strands a live scalar per field per call; clear_cache() cannot reclaim it.
+    assert mx.get_active_memory() - before < len(advances)
+    total = sum(advances)
+    assert cache.left_padding.tolist() == [-total, 3 - total]
+    assert cache.lengths.tolist() == [9 - total, 5 - total]
+
+    # Deferred advances have to survive mlx-lm's own metadata plumbing.
+    batch = ArraysCache.merge([ArraysCache(1), ArraysCache(1)])
+    batch[0] = mx.zeros((2, 4))
+    batch.left_padding = mx.array([0, 2])
+    batch.advance(1)
+    assert batch.make_mask(3).tolist() == [[True] * 3, [False, True, True]]
+    batch.filter(mx.array([1]))
+    assert batch.left_padding.tolist() == [1] and batch.batch_size == 1
+    batch.prepare(lengths=[4])
+    batch.advance(2)
+    assert (batch.lengths.tolist(), batch.left_padding.tolist()) == ([2], [-1])
+    batch.advance(3)
+    batch.prepare(lengths=[7])
+    assert batch.lengths.tolist() == [7]
+    batch.finalize()
+    batch.advance(5)
+    assert batch.lengths is None and batch.left_padding is None
+
+    # A pre-patch cache keeps its metadata despite the descriptors now shadowing it.
+    legacy = ArraysCache(1)
+    legacy.__dict__.clear()
+    legacy.__dict__.update(cache=[None], left_padding=mx.array([2]), lengths=None)
+    legacy.advance(1)
+    assert legacy.left_padding.tolist() == [1] and legacy.lengths is None
+
+    left = ArraysCache(1)
+    left[0] = mx.zeros((2, 4))
+    left.left_padding, left.lengths = mx.array([0, 4]), mx.array([6, 9])
+    right = ArraysCache(1)
+    right[0] = mx.zeros((1, 4))
+    right.left_padding, right.lengths = mx.array([7]), mx.array([3])
+    left.advance(2)
+    right.advance(5)
+    left.extend(right)
+    assert left.left_padding.tolist() == [-2, 2, 2]
+    assert left.lengths.tolist() == [4, 7, -2]
+
+
+@metal_only
+def test_a_penalised_row_answers_the_same_batched_and_alone():
+    """A row shown its whole prompt is penalised against text it never sees alone, and the
+    two prompts differ in length, so one offset cannot serve both rows."""
+    from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+    from unsloth_zoo.mlx.generate import (
+        GenerationDefaults, GenerationRequest, generate_batch,
+    )
+
+    model, tokenizer = load(MODEL)
+    prompts = ("red red red red red red red red. Name a colour:", "one one one. Count:")
+    penalty = dict(repetition_penalty = 1.6, repetition_context_size = 20)
+    batched = generate_batch(model, tokenizer, [
+        GenerationRequest(prompt = prompt, max_tokens = 12,
+                          logits_processors = make_logits_processors(**penalty))
+        for prompt in prompts
+    ], defaults = GenerationDefaults())
+
+    for prompt, result in zip(prompts, batched):
+        alone = [int(event.token) for event in stream_generate(
+            model, tokenizer, tokenizer.encode(prompt, add_special_tokens = False),
+            max_tokens = 12, sampler = make_sampler(temp = 0.0),
+            logits_processors = make_logits_processors(**penalty),
+        ) if event.finish_reason != "stop"]
+        assert result.token_ids == alone, prompt

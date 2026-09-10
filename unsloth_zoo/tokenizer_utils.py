@@ -302,7 +302,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     )
     for special_token in special_tokens:
         if hasattr(tokenizer, special_token + "_id"):
-            token_id = eval(f"tokenizer.{special_token}_id")
+            token_id = getattr(tokenizer, special_token + "_id")
             if token_id is not None and token_id < indicator_untrained.shape[0]:
                 indicator_untrained[token_id] = False
         pass

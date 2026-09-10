@@ -52,7 +52,6 @@ class _Stats:
 
 
 def test_partial_low_index_shard_does_not_lower_module_count():
-    # Live module exposes the true count (64); this shard only holds experts 0..15.
     module = types.SimpleNamespace(num_experts=64)
     stats = _Stats(module=module)
     moe_num_experts = {}
@@ -100,8 +99,6 @@ def test_header_raises_a_degenerate_derived_count():
 
 
 def test_fused_lora_shape_count_not_lowered_by_partial_shard():
-    # No module, but a fused LoRA encodes 64 experts (total_rank // rank == 64).
-    # A partial shard reporting 16 must not lower it.
     import torch
 
     stats = _Stats(
@@ -120,7 +117,6 @@ def test_fused_lora_shape_count_not_lowered_by_partial_shard():
 
 
 def test_no_per_expert_tensors_returns_none():
-    # Header has no per-expert tensors for this prefix and nothing else resolves.
     stats = _Stats(module=None)
     moe_num_experts = {}
     header = {"model.layers.0.self_attn.q_proj.weight": object()}

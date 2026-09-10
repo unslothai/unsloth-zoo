@@ -23,14 +23,20 @@ import inspect
 import os
 import math
 import logging
-import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from unsloth_zoo.temporary_patches.common import (
+    torch_compile_options,
+    _maybe_compile,
+)
+from unsloth_zoo.log import logger
+
+
+
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -40,7 +46,7 @@ def selective_log_softmax(logits, index):
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
     logits,
     index,
@@ -67,7 +73,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -77,10 +83,46 @@ def chunked_hidden_states_selective_log_softmax(
     logit_scale_divide: float = 0.0,
     logit_softcapping: float = 0.0,
     temperature: float = 1.0,
+    # Rows per chunk cap. Read HERE, in the default, not in the body: the body
+    # is traced with fullgraph = True, and `os.environ` is an unsupported op
+    # there on torch 2.4 -- Dynamo raises
+    #   torch._dynamo.exc.Unsupported: const method call bytes.decode
+    # from os._Environ.__getitem__, which the eager fallback does not catch
+    # (it only catches recompile-limit and disabled-hook breaks), so the very
+    # first call would die even with the variable unset. A default is evaluated
+    # once when the def runs, which is import time, outside any traced region.
+    # It is also a plain int argument, so Dynamo guards on it instead of
+    # constant-folding an unguarded read (2.7+ never notice a later change).
+    # A non-numeric value is ignored rather than raised on, so a typo cannot
+    # break the import. 0 keeps the previous chunk boundaries exactly.
+    max_rows_per_chunk: int = (
+        int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip())
+        if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
+        else 0
+    ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
+    # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
+    # cannot have its row count silently rewritten and instead fails at the
+    # matmul below, which prints both operands. Do not swap in a bare
+    # torch._check: it reports only "Expected cond to be True", naming neither
+    # operand, and Dynamo rejects a message-carrying one. Callers dispatch on
+    # the width first -- see `compute_logprobs_chunk`, the packed path and
+    # `_pg_grad_forward`.
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
+
+    # Each chunk materialises rows x vocab logits and then a float32 copy of
+    # them, all on the device holding the output head. With a large vocabulary
+    # and a fixed chunk count that grows with the batch, so the peak scales with
+    # the batch rather than staying bounded. max_rows_per_chunk caps the rows
+    # per chunk instead, which is pure loop splitting: more, smaller chunks,
+    # same concatenated result. 0 (the default) keeps the previous chunk
+    # boundaries exactly.
+    if max_rows_per_chunk > 0:
+        n_rows = flat_hidden_states.shape[0]
+        chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
+        chunks = min(chunks, max(n_rows, 1))
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
     chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
@@ -88,7 +130,17 @@ def chunked_hidden_states_selective_log_softmax(
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        # When the model is dispatched over several devices, the output head can
+        # sit on a different one from the hidden states, because accelerate
+        # places the tail of the model on the last device it fills. Co-locate on
+        # the head's device before the matmul, otherwise this raises
+        #   Unhandled FakeTensor Device Propagation for aten.mm.default,
+        #   found two different devices cuda:0, cuda:1
+        # On a single device every .to() here is a no-op and the result is
+        # bit-identical to before.
+        chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+        chunk_index = chunk_index.to(lm_head.device)
+        chunk_logits = chunk_hidden_states @ lm_head.t()
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
@@ -105,7 +157,9 @@ def chunked_hidden_states_selective_log_softmax(
         selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
         logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
         per_token_logps = selected_logits - logsumexp_values
-        all_per_token_logps.append(per_token_logps)
+        # Return to the caller's device so the concatenation below and every
+        # downstream consumer see the device they started on.
+        all_per_token_logps.append(per_token_logps.to(hidden_states.device))
 
     all_per_token_logps = torch.concat(all_per_token_logps)
 
@@ -406,6 +460,8 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
+    # Only direct callers see this fallback; the trainer always forwards an explicit value.
+    use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -498,7 +554,9 @@ def grpo_compute_loss(
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
-
+        # TRL order: pre-clamp non-detached coef_1, before the loss_type dispatch.
+        if use_bias_correction_kl:
+            kl_i = kl_i * coef_1
     else:
         # Zeros with the correct shape.
         if importance_sampling_level == "sequence":
@@ -595,8 +653,11 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
+# Same eager fallback as every other fullgraph region: a bare decorator leaves
+# cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
-    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
+    f"@torch_compile_with_fallback(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
     f"{inspect.getsource(grpo_compute_loss)}"
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
@@ -663,13 +724,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
-        accumulate_chunk = torch.compile(
-            accumulate_chunk,
+        from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
+        accumulate_chunk = torch_compile_with_fallback(
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
             options = torch_compile_options,
-        )
+        )(accumulate_chunk)
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_logps  = torch.chunk(_new_logps, chunks = n_chunks, dim = 0)
@@ -748,6 +809,70 @@ pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 
+def _warn_unsupported_grpo_options(trainer):
+    """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
+    them is not silently dropped. Only top_entropy_quantile < 1.0 (entropy masking) is
+    unimplemented; its TRL default is 1.0 in 0.22.2 through 1.12.0, so only non-defaults
+    warn. use_bias_correction_kl is supported and must never be listed here.
+    """
+    if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
+        return
+    args = getattr(trainer, "args", None)
+
+    unsupported = []
+    top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
+    if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
+        unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
+
+    if unsupported:
+        message = (
+            "Unsloth: GRPOConfig option(s) " + ", ".join(unsupported) + " are set but "
+            "are not supported by Unsloth's optimized GRPO path and will be ignored "
+            "(training proceeds as standard GRPO)."
+        )
+        try:
+            logger.warning(message)
+        except Exception:
+            import warnings as _warnings
+            _warnings.warn(message)
+        # Only latch after warning, so a config changed mid-run still gets one warning.
+        try:
+            trainer._unsloth_grpo_unsupported_warned = True
+        except Exception:
+            pass
+    return
+pass
+RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
+
+
+_n_chunks_deprecation_warned = False
+
+def _warn_deprecated_n_chunks(n_chunks):
+    """Warn once per process when unsloth_num_chunks is set to a non-default value.
+    The parameter stays because unsloth's generated trainer passes it, but the value
+    never reaches UnslothEfficientGRPO.apply, which is always called with 1.
+    """
+    global _n_chunks_deprecation_warned
+    if _n_chunks_deprecation_warned:
+        return
+    if n_chunks is None or n_chunks == -1 or n_chunks == 1:
+        return
+    _n_chunks_deprecation_warned = True
+    message = (
+        "Unsloth: unsloth_num_chunks is deprecated and is ignored; the GRPO loss now "
+        "always runs as a single chunk, since memory is managed by "
+        "unsloth_grpo_mini_batch and unsloth_logit_chunk_multiplier."
+    )
+    try:
+        logger.warning(message)
+    except Exception:
+        import warnings as _warnings
+        _warnings.warn(message)
+    return
+pass
+RL_REPLACEMENTS["_warn_deprecated_n_chunks"] = _warn_deprecated_n_chunks
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -762,7 +887,12 @@ def grpo_accumulated_loss(
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under AGPL3
-    bsz, qlen = input_ids.shape
+    # Body-local import so the copy inlined into the generated trainer cache resolves.
+    try:
+        from unsloth_zoo.rl_replacements import _warn_unsupported_grpo_options
+        _warn_unsupported_grpo_options(trainer)
+    except Exception:
+        pass
 
     pixel_values = kwargs.get('pixel_values',None)
     image_grid_thw = kwargs.get('image_grid_thw',None)
@@ -800,11 +930,15 @@ def grpo_accumulated_loss(
     kwargs["vespo_lambda_neg"] = trainer.args.vespo_lambda_neg if hasattr(trainer.args, "vespo_lambda_neg") else 2.0
     kwargs["get_off_policy_mask"] = trainer.get_off_policy_mask if hasattr(trainer, "get_off_policy_mask") else None
     kwargs["off_policy_mask_threshold"] = trainer.args.off_policy_mask_threshold  if hasattr(trainer.args, "off_policy_mask_threshold") else None
+    # Follows TRL's own value; older TRL has no such field and False is correct there.
+    kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
-    # Snap n_chunks to the closest divisor of bsz.
-    factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
-    if n_chunks == -1: n_chunks = bsz
-    n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
+    # Generated trainers still pass unsloth_num_chunks; nothing downstream reads it.
+    try:
+        from unsloth_zoo.rl_replacements import _warn_deprecated_n_chunks
+        _warn_deprecated_n_chunks(n_chunks)
+    except Exception:
+        pass
 
     if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
         kwargs["vllm_importance_sampling_clip_min"] = 0
@@ -1156,11 +1290,23 @@ def grpo_accumulated_loss(
                         packed_seq_lengths = _pack_psl,
                         use_cache = False,
                     ).logits
-                    _pack_sel = chunked_hidden_states_selective_log_softmax(
-                        _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0), lm_head,
-                        _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0), _pack_chunks,
-                        logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                    )[0]
+                    # `.logits` carries hidden states only when the forward is the
+                    # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
+                    # otherwise it is real [T, vocab] logits and the lm_head matmul
+                    # dies. Dispatch on width, as the padded path already does.
+                    _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
+                    _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
+                    if _pack_h.shape[-1] == lm_head.shape[1]:
+                        _pack_sel = chunked_hidden_states_selective_log_softmax(
+                            _pack_h, lm_head, _pack_tid, _pack_chunks,
+                            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                        )[0]
+                    else:
+                        # Raw logits: the forward already applied scale/softcap.
+                        _pack_sel = chunked_selective_log_softmax(
+                            _pack_h, _pack_tid,
+                            temperature = temperature, chunks = _pack_chunks,
+                        )[0]
                 # GPT-OSS offload race guard (matches the padded loop)
                 device_synchronize()
                 # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded
@@ -1186,10 +1332,19 @@ def grpo_accumulated_loss(
                             _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
                             _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
                             _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
-                            _pack_rsel = chunked_hidden_states_selective_log_softmax(
-                                _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
-                                logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                            )[0]
+                            # same width dispatch as the packed call above: this forward
+                            # returns raw logits whenever that one did, and the first
+                            # packed batch always lands here
+                            if _pack_rh.shape[-1] == lm_head.shape[1]:
+                                _pack_rsel = chunked_hidden_states_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
+                                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                )[0]
+                            else:
+                                _pack_rsel = chunked_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], _pack_real[:, 1:],
+                                    temperature = temperature, chunks = 1,
+                                )[0]
                             _pack_rcols = _pack_rmask.nonzero(as_tuple = False).squeeze(1)[1:] - (_pack_L - _pack_W)
                             _pack_rkeep = _pack_rcols >= 0
                             _pack_ref[_pack_i, _pack_rcols[_pack_rkeep]] = _pack_rsel[_pack_rkeep].to(torch.float32)
@@ -1250,8 +1405,21 @@ def grpo_accumulated_loss(
                 prefix_seg_info = _pg_layout.prefix_seg_info,
                 use_cache = False,
             ).logits
+            # Same width dispatch as the packed path and compute_logprobs_chunk.
+            # `.logits` carries hidden states only when the forward is the Unsloth
+            # generated one honouring UNSLOTH_RETURN_HIDDEN_STATES; otherwise it is
+            # real [T, vocab] logits. extract_logps always calls its helper as
+            # (hidden, lm_head, ids, chunks, ...), so pass a raw-logits helper with
+            # that same signature, which skips the lm_head matmul and the scale /
+            # softcap the forward already applied.
+            _pg_fn = chunked_hidden_states_selective_log_softmax
+            if _h.shape[-1] != lm_head.shape[1]:
+                def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
+                    return chunked_selective_log_softmax(
+                        _pg_h, _pg_ids, temperature = _pg_t, chunks = _pg_n,
+                    )
             _pg_lp = _pg_layout.extract_logps(
-                _h, lm_head, chunked_hidden_states_selective_log_softmax,
+                _h, lm_head, _pg_fn,
                 _pg_chunks, logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature,
             )  # [total_rows, W] with grad

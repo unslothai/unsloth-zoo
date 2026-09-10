@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 import os
-from .temporary_patches.common import torch_compile, UNSLOTH_ENABLE_LOGGING
+from unsloth_zoo.temporary_patches.common import torch_compile, UNSLOTH_ENABLE_LOGGING
 from .log import logger
 from torch import Tensor
 import torch

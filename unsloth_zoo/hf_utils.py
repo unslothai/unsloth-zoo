@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import functools
 import os
 import tempfile
 import shutil
@@ -104,6 +105,29 @@ def _normalize_dict_dtypes(obj):
     return _dtype_stringify(obj)
 
 
+
+@functools.lru_cache(maxsize = 1)
+def _transformers_model_module_names() -> tuple:
+    """Names of every module under `transformers.models`, read once per process.
+
+    `dir()` on the lazy `transformers.models` module walks its whole import structure:
+    about 64ms for roughly 5400 names on transformers 4.57. `get_transformers_model_type`
+    is on the model-load path and called it on every invocation, so each call paid that
+    cost to answer a question whose answer cannot change once transformers is imported.
+
+    Order is preserved because the caller below takes the first name whose normalized
+    form matches, and a set would make that choice arbitrary.
+    """
+    import transformers.models
+    return tuple(dir(transformers.models))
+
+
+@functools.lru_cache(maxsize = 1)
+def _transformers_model_module_name_set() -> frozenset:
+    """Membership form of the above: the two lookups below were linear scans."""
+    return frozenset(_transformers_model_module_names())
+
+
 def get_transformers_model_type(config, trust_remote_code=False):
     """ Gets model_type from config file - can be PEFT or normal HF """
     if config is None:
@@ -144,8 +168,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
                 model_type = str(model_type)
                 model_type = model_type.rsplit("For", 1)[0].lower()
                 # Find exact modeling-path name
-                import transformers.models
-                supported_model_types = dir(transformers.models)
+                supported_model_types = _transformers_model_module_names()
                 for modeling_file in supported_model_types:
                     if model_type == modeling_file.lower().replace("_", "").replace(".", "_").replace("-", "_"):
                         model_types = [modeling_file]
@@ -215,13 +238,23 @@ def get_transformers_model_type(config, trust_remote_code=False):
         model_type = model_type.replace("-", "_")
         model_type = model_type.replace("/", "_")
         model_type = model_type.replace(".", "_")
+        # PretrainedConfig.model_type defaults to "", so any nested sub-config that does
+        # not override it (dbrx attn_config/ffn_config, got_ocr2, qwen3_omni_moe) shows up
+        # here as an empty sentinel that says nothing about the architecture
+        if not model_type.strip():
+            continue
+        # model_type is interpolated into an import path, so it must be a plain module name
+        if not re.fullmatch(r"[a-z0-9_]+", model_type):
+            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
         final_model_types.append(model_type)
+    # Every candidate was an empty sentinel, so the architecture is still unknown
+    if not final_model_types:
+        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
     final_model_types = sorted(final_model_types)
 
     # Check if model type is correct
     # Gemma-3 270M has `gemma3_text` which is wrong
-    import transformers.models
-    all_model_types = dir(transformers.models)
+    all_model_types = _transformers_model_module_name_set()
     # Models with trust_remote_code that are NOT in transformers.models
     # but should be kept as-is (not truncated).
     _REMOTE_CODE_MODEL_TYPES = {"nemotron_h", "nemotronh_nano_vl_v2",}

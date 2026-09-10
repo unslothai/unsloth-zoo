@@ -62,10 +62,16 @@ def _grouped_mm_supported() -> bool:
         ok = bool(_check_torch_grouped_mm_supported())
     except Exception:
         try:
-            if hasattr(torch, "_grouped_mm") and torch.cuda.is_available():
-                x = torch.ones((1, 8), device="cuda", dtype=torch.bfloat16)
-                w = torch.ones((1, 8, 8), device="cuda", dtype=torch.bfloat16)
-                torch._grouped_mm(x, w, offs=torch.tensor([1], device="cuda", dtype=torch.int32))
+            if torch.cuda.is_available():
+                dev = "cuda"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                dev = "xpu"
+            else:
+                dev = None
+            if hasattr(torch, "_grouped_mm") and dev is not None:
+                x = torch.ones((1, 8), device=dev, dtype=torch.bfloat16)
+                w = torch.ones((1, 8, 8), device=dev, dtype=torch.bfloat16)
+                torch._grouped_mm(x, w, offs=torch.tensor([1], device=dev, dtype=torch.int32))
                 ok = True
         except Exception:
             ok = False
@@ -82,12 +88,19 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
     except RuntimeError as e:
         if "strides should be multiple of 16 bytes" not in str(e):
             raise
-        outs, start = [], 0
-        for i, end in enumerate(offs.detach().cpu().tolist()):
-            if start < end:
-                outs.append(torch.matmul(x[start:end], w[i]))
-            start = end
-        return torch.cat(outs, 0) if outs else x.new_empty((0, w.shape[-1]))
+        # Shared with moe_utils, not looped here: a loop tapes every per-group SLICE,
+        # whose shape is the router-decided group size, so non-reentrant checkpointing
+        # aborts the backward. Two callers tape this, so the hazard is reachable.
+        try:
+            from .moe_utils import _manual_grouped_mm
+        except Exception:
+            outs, start = [], 0
+            for i, end in enumerate(offs.detach().cpu().tolist()):
+                if start < end:
+                    outs.append(torch.matmul(x[start:end], w[i]))
+                start = end
+            return torch.cat(outs, 0) if outs else x.new_empty((0, w.shape[-1]))
+        return _manual_grouped_mm(x, w, offs)
 
 
 def _expert_weight(lin, dtype):
@@ -201,7 +214,7 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     experts = self.experts
     # Run the original loop unless this is the frozen-expert CUDA path in a low-precision dtype
     # with every expert grouped-ready (CPU/offload, LoRA, fp32, dtype/device mismatch fall back).
-    if (not hidden_states.is_cuda) \
+    if hidden_states.device.type not in ("cuda", "xpu") \
             or hidden_states.dtype not in (torch.bfloat16, torch.float16) \
             or not _experts_grouped_ready(experts, spec, hidden_states.device, hidden_states.dtype):
         return self._orig_moe_forward(hidden_states)

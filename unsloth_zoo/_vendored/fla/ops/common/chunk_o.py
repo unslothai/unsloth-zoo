@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -14,6 +16,7 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
 from fla.utils import (
+    IS_NVIDIA,
     IS_NVIDIA_HOPPER,
     TRITON_ABOVE_3_4_0,
     TRITON_ABOVE_3_7_1,
@@ -23,6 +26,57 @@ from fla.utils import (
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
+
+
+# Unsloth: per-device Hopper probe for the fla #640 tile workaround below.
+#
+# ``IS_NVIDIA_HOPPER`` (fla/utils/_device.py) is a module constant frozen at import
+# time from device 0 only:
+#     IS_NVIDIA_HOPPER = (IS_NVIDIA and ('NVIDIA H' in torch.cuda.get_device_name(0)
+#                                        or torch.cuda.get_device_capability()[0] == 9))
+# while chunk_bwd_dqkwg picks CONST_TILING per tensor via ``k.device.index``. On a
+# mixed host (cuda:0 Ada/Blackwell, cuda:1 H100) the global is False even though the
+# tensor lives on Hopper, so the BK=64 step-down would not fire and the miscompiled
+# tile would silently corrupt dk/dg. Probe the tensor's own device instead.
+#
+# Only ever ORed with the global, never used to clear it, so this can add a
+# step-down but never remove one.
+#
+# Capability, not shared memory: ``check_shared_mem('hopper', idx)`` is a
+# shared-memory *tier* test (>= 232448 bytes) that Blackwell B200 also passes, so it
+# is not a Hopper detector. SM90 == Hopper. HIP is excluded because an AMD Instinct
+# reports capability major 9 on a ROCm build without being Hopper, matching how
+# fla_vendor._hopper_dqkwg_suspect gates the bare major==9 signal.
+@functools.lru_cache(maxsize=None)
+def _device_is_nvidia_hopper(index):
+    if not IS_NVIDIA:
+        return False
+    try:
+        if getattr(torch.version, 'hip', None) is not None:
+            return False
+        if index is None:
+            index = torch.cuda.current_device()
+        if torch.cuda.get_device_capability(index)[0] == 9:
+            return True
+        return 'NVIDIA H' in torch.cuda.get_device_name(index)
+    except Exception:
+        return None  # unknown, not "no": see _is_hopper_tensor
+
+
+def _is_hopper_tensor(x):
+    """True / False for a CUDA tensor whose device we could inspect, else None.
+
+    The tri-state matters. ``None`` means "could not tell", and the caller then
+    falls back to the import-time global, so an unexpected probe failure on a real
+    Hopper still gets the step-down. Collapsing that into ``False`` would fail open
+    into the miscompile, which is the one direction this must never take.
+    """
+    try:
+        if x is None or not x.is_cuda:
+            return None
+        return _device_is_nvidia_hopper(x.device.index)
+    except Exception:
+        return None
 
 
 @triton.heuristics({
@@ -680,15 +734,6 @@ def chunk_bwd_dqkwg(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Unsloth: backported from fla PR #983 (issue #640). Triton 3.7.1 fixes the
-    # precision bug, so only block the affected [3.4.0, 3.7.1) range on Hopper.
-    if g is not None and IS_NVIDIA_HOPPER and TRITON_ABOVE_3_4_0 and not TRITON_ABOVE_3_7_1:
-        raise RuntimeError(
-            "Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs produces incorrect results for "
-            "gated chunk_bwd_dqkwg (see #640). Please upgrade Triton to >= 3.7.1 or "
-            "install tilelang: `pip install tilelang`"
-        )
-
     B, T, H, K, V, HV = *k.shape, v.shape[-1], v.shape[2]
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
@@ -703,6 +748,53 @@ def chunk_bwd_dqkwg(
         CONST_TILING = 32
     BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
     BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
+
+    # Unsloth: extends the fla PR #983 (issue #640) backport. Upstream narrowed the
+    # Hopper guard to Triton [3.4.0, 3.7.1) but still refused to run at all. The
+    # root cause reported in #640 is narrower than that: a Triton codegen bug that
+    # only corrupts dk (and, through it, dg and dbeta) at BK == 64 on Hopper. The
+    # upstream CONST_TILING sweep measured BK 32 and BK 128 clean (< 0.02) and only
+    # BK 64 broken (dk max error 14.65, dg 5.47), and explicitly ruled out the
+    # autotune config space as the trigger. Hopper's CONST_TILING of 128 means the
+    # bad tile is reachable only for head dims 33 <= K <= 64, so step those down to
+    # the measured-clean 32 and keep the fast kernels instead of falling back to a
+    # pure-torch layer. Scoped to the gated path (g is not None), matching the
+    # upstream guard. Triton >= 3.7.1 fixes the miscompile, so nothing is stepped
+    # down there.
+    #
+    # Whether *this* call runs on Hopper is a per-tensor question, so ask the
+    # tensor's own device first. ``IS_NVIDIA_HOPPER`` is frozen at import from
+    # device 0 and is wrong in both directions on a mixed host: it misses a Hopper
+    # card at a nonzero index, and it also marks a call on an Ada / Ampere /
+    # Blackwell card as affected when device 0 happens to be the Hopper one, which
+    # would narrow BK for a miscompile that cannot occur there. The global is used
+    # only as the fallback for when the probe cannot tell (``None``), so an
+    # unexpected probe failure on a real Hopper still gets the step-down.
+    _on_hopper = _is_hopper_tensor(k)
+    if _on_hopper is None:
+        _on_hopper = IS_NVIDIA_HOPPER
+    HOPPER_DQKWG_BROKEN = (
+        g is not None
+        and _on_hopper
+        and TRITON_ABOVE_3_4_0
+        and not TRITON_ABOVE_3_7_1
+    )
+    if HOPPER_DQKWG_BROKEN and BK == 64:
+        BK = 32
+
+    # Unreachable fence: BK can no longer be 64 in the affected range. Kept so a
+    # future edit that reintroduces the bad tile fails loudly instead of silently
+    # training on corrupted gradients.
+    if HOPPER_DQKWG_BROKEN and BK == 64:
+        raise RuntimeError(
+            "Triton >= 3.4.0 and < 3.7.1 on Hopper GPUs produces incorrect results for "
+            "gated chunk_bwd_dqkwg at BK=64 (see fla issue #640). Fix this with: "
+            'pip install -U "triton>=3.7.1"\n'
+            "Note: upstream also suggests `pip install tilelang`, which cannot help "
+            "here because this vendored snapshot prunes the TileLang kernels. To take "
+            "the slower pure-PyTorch path instead, set UNSLOTH_DISABLE_HOPPER_FLA_BWD=1."
+        )
+
     NK = triton.cdiv(K, BK)
     dq = q.new_empty(B, T, HV, K)
     dk = k.new_empty(B, T, HV, K)

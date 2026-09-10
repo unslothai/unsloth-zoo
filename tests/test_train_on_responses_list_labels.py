@@ -136,3 +136,51 @@ def test_no_labels_column_still_masks_from_input_ids():
     labels = out["labels"][0]
     assert len(labels) == len(ROW)
     assert any(label != -100 for label in labels)
+
+
+def test_an_explicit_one_maps_in_process(monkeypatch):
+    """``num_proc = 1`` means "no multiprocessing" to every caller that passes it.
+
+    ``datasets`` >= 4.1 pools for any count >= 1, so forwarding the 1 verbatim
+    built a ``Pool(1)``: one forked child holding a whole tokenizer, on a split
+    over ``_MIN_ROWS_FOR_MULTIPROC`` where the small-split guard no longer
+    applies. That left ``UNSLOTH_DATASET_NUM_PROC=0``, the remedy the
+    dead-worker message recommends, still forking. ``datasets`` 3.x already ran
+    ``1`` in-process, so ``None`` is the encoding that means the same on both.
+    """
+    import types
+
+    # Over the 5,000-row threshold: below it the per-split guard already returns
+    # None for an auto request, so this only says something above it.
+    rows = 5_001
+    dataset = Dataset.from_dict({"input_ids": [list(ROW)] * rows})
+
+    requested = []
+    real_map = Dataset.map
+
+    def _spy(self, *args, **kwargs):
+        requested.append(kwargs.get("num_proc"))
+        # Run in-process whatever was asked, so the assertion is about the
+        # request rather than about this runner's ability to fork.
+        kwargs["num_proc"] = None
+        return real_map(self, *args, **kwargs)
+
+    monkeypatch.setattr(Dataset, "map", _spy)
+
+    trainer = types.SimpleNamespace(
+        train_dataset = dataset,
+        eval_dataset = None,
+        args = types.SimpleNamespace(packing = False),
+    )
+    train_on_responses_only(
+        trainer,
+        INSTRUCTION_PART,
+        RESPONSE_PART,
+        tokenizer = StubTokenizer(),
+        num_proc = 1,
+    )
+
+    assert requested, "Dataset.map was never called"
+    assert all(value is None for value in requested), (
+        f"an explicit 1 reached Dataset.map as {requested}, which datasets >= 4.1 pools"
+    )

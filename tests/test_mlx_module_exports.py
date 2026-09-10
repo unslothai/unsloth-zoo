@@ -32,10 +32,6 @@ def _install_shim():
     simulate_mlx_on_torch()
 
 
-# ---------------------------------------------------------------------------
-# 1. Top-level imports must succeed.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("module_path", [
     "unsloth_zoo.mlx.loader",
     "unsloth_zoo.mlx.trainer",
@@ -50,11 +46,6 @@ def test_mlx_module_imports(module_path):
     mod = importlib.import_module(module_path)
     assert mod is not None
 
-
-# ---------------------------------------------------------------------------
-# 2. Unsloth backend contract: FastMLXModel and the dynamically-attached save methods
-#    must be reachable.
-# ---------------------------------------------------------------------------
 
 def test_fast_mlx_model_class_exists():
     from unsloth_zoo.mlx.loader import FastMLXModel
@@ -90,11 +81,9 @@ def test_fast_mlx_model_save_helpers_exist():
     loader.py and attached via types.MethodType after load.
     """
     import unsloth_zoo.mlx.loader as ml
-    # Free functions must exist.
     assert hasattr(ml, "_mlx_save_pretrained_merged")
     assert hasattr(ml, "_mlx_save_lora_adapters")
     assert hasattr(ml, "_mlx_push_to_hub_merged")
-    # And the underlying utils targets.
     import unsloth_zoo.mlx.utils as mu
     assert hasattr(mu, "save_pretrained_merged")
     assert hasattr(mu, "save_lora_adapters")
@@ -111,23 +100,14 @@ def test_trainer_classes():
     assert hasattr(mt, "train_on_responses_only") or hasattr(mt, "MLXTrainer")
 
 
-# ---------------------------------------------------------------------------
-# 3. MLX loader: dequantize-and-replace logic surface
-# ---------------------------------------------------------------------------
-
 def test_mlx_loader_dequantize_replace_callable():
     """The dequantize-and-replace helper used by FastMLXModel.from_pretrained."""
     import unsloth_zoo.mlx.loader as ml
-    # The loader names this `_dequantize_selected_mlx_modules`.
     assert hasattr(ml, "_dequantize_selected_mlx_modules"), (
         "expected _dequantize_selected_mlx_modules in unsloth_zoo.mlx.loader. "
         f"Got dequant-related: {[a for a in dir(ml) if 'dequant' in a.lower()]}"
     )
 
-
-# ---------------------------------------------------------------------------
-# 4. CCE: pure-Python fallback fires when mx.metal.is_available() is False.
-# ---------------------------------------------------------------------------
 
 def test_cce_fallback_path_runs():
     """Construct a tiny CCE loss and verify the no-kernel branch fires."""
@@ -169,17 +149,9 @@ def test_cce_forward_chunked_pure_python():
     assert torch.isfinite(lse).all(), f"non-finite lse: {lse}"
 
 
-# ---------------------------------------------------------------------------
-# 5. compile: VLM dispatcher should at minimum import.
-# ---------------------------------------------------------------------------
-
 def test_compile_import_does_not_error():
     import unsloth_zoo.mlx.compile  # full module-level execution
 
-
-# ---------------------------------------------------------------------------
-# 6. gated_delta_vjp: custom_function decorator should be applied.
-# ---------------------------------------------------------------------------
 
 def test_gated_delta_vjp_imports():
     import unsloth_zoo.gated_delta_vjp as gd
@@ -187,10 +159,6 @@ def test_gated_delta_vjp_imports():
     # gated_delta_ops_efficient is the main entry
     assert hasattr(gd, "gated_delta_ops_efficient")
 
-
-# ---------------------------------------------------------------------------
-# 7. Optimizer construction: each MLXTrainingConfig optim string maps cleanly.
-# ---------------------------------------------------------------------------
 
 def test_trainer_config_smoke():
     """MLXTrainingConfig should construct with sane defaults."""
@@ -205,12 +173,10 @@ def test_trainer_config_smoke():
     assert ok
 
 
-# ---------------------------------------------------------------------------
 # 8. Warm-start contract: the documented from_pretrained behaviour must match
 #    the adapter-reload code. The reload restores the non-adapter tensors a
 #    save_trainable_adapters checkpoint recorded as trainable, so the docstring
 #    must describe that instead of promising an adapter-only trainable set.
-# ---------------------------------------------------------------------------
 
 def test_from_pretrained_documents_restored_non_adapter_trainables():
     import inspect

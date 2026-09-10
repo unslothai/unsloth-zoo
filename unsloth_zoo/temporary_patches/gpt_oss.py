@@ -31,7 +31,7 @@ from .common import (
     logger,
 )
 from importlib.metadata import version as importlib_version
-from ..utils import Version
+from unsloth_zoo.utils import Version
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -44,7 +44,7 @@ from .utils import (
     Cache,
     process_return,
 )
-from ..hf_utils import dtype_from_config
+from unsloth_zoo.hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
 # UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels); else dequantized to bf16 for LoRA.
@@ -457,10 +457,17 @@ def patch_gpt_oss():
         except Exception as e:
             return raise_error("triton_kernels.matmul_ogs", e)
 
-    try:
-        from transformers.integrations.tensor_parallel import shard_and_distribute_module
-    except Exception as e:
-        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+    # Legacy per-parameter TP loader hook. transformers 5.16.0 (upstream PR #47579,
+    # the DTensor tensor parallel rewrite) reduced it to a tombstone that raises when
+    # called, and dropped load_and_swizzle_mxfp4, so the patch below is inert there.
+    # The import itself still succeeds; skipping it is defensive.
+    if transformers_version < Version("5.16.0"):
+        try:
+            from transformers.integrations.tensor_parallel import shard_and_distribute_module
+        except Exception as e:
+            return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+    else:
+        shard_and_distribute_module = None
 
     def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
         model = kwargs.get("model", None)
@@ -473,6 +480,12 @@ def patch_gpt_oss():
         for proj in ["gate_up_proj", "down_proj"]:
             if proj in param_name:
                 if device_mesh is not None:
+                    if shard_and_distribute_module is None:
+                        raise RuntimeError(
+                            "Unsloth: tensor parallel MXFP4 loading needs transformers < 5.16.0, "
+                            "which still provides shard_and_distribute_module. On 5.16.0 and newer "
+                            "load with from_pretrained(..., tp_plan=...) instead."
+                        )
                     shard_and_distribute_module(model, param_value, empty_param, param_name, casting_dtype, to_contiguous, rank, device_mesh)
                 else:
                     setattr(module, param_name.rsplit(".", 1)[1], torch.nn.Parameter(param_value, requires_grad=False))
@@ -1386,23 +1399,35 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 
 
 # Combo kernels uses too much VRAM for low memory GPUs
-from ..device_type import DEVICE_TYPE
+from unsloth_zoo.device_type import DEVICE_TYPE
 
 # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
 # with is_available() like device_synchronize() does.
 if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-    device_memory = torch.xpu.memory.mem_get_info(0)[-1]
+    # Only total capacity is needed. mem_get_info() can create a device context at
+    # import time, leaving otherwise idle processes with persistent device memory.
+    device_memory = torch.xpu.get_device_properties(0).total_memory
 elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-    device_memory = torch.cuda.memory.mem_get_info(0)[-1]
+    device_memory = torch.cuda.get_device_properties(0).total_memory
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
+
+# coordinate_descent_tuning used to be driven by use_combo_kernels too, so asking for combo
+# kernels also bought the tuning. Measured apart on T4/L4/A100/B200: combo kernels are free
+# (decode compile 7.36s vs 7.48s off), the tuning costs +28% on A100 and +32% on L4 decode
+# compile for no measurable gain anywhere. Default it off, opt in to re-measure.
+#
+# The 40GB test above is in GiB, so an A100-SXM4-40GB reports 39.49 and falls BELOW it.
+# Left as-is: combo kernels measured as no-effect on both sides of the boundary.
+use_coordinate_descent = os.environ.get("UNSLOTH_COORDINATE_DESCENT_TUNING", "0") == "1"
+
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = use_combo_kernels,
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -1414,7 +1439,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = False, # Breaks on attention
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -1989,7 +2014,16 @@ def torch_native_forward(
 
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-            with torch.autocast(device_type=device_type, enabled=False): # Force float32
+            # Three separate things keep this float32, none of them redundant. On the
+            # forced-float32 path only, a quantized down_proj computes in float32 via
+            # _pre_set_compute_dtype, set in unsloth's loader; without that rule the layer
+            # takes the run's ordinary compute dtype, bfloat16 included. The float32
+            # gated_output is what Linear4bit restores the output to, since it captures
+            # inp_dtype and casts back. And autocast off is what protects the unquantized
+            # fallback, which takes F.linear and ignores compute_dtype. It does not keep the
+            # adapter matmuls in float32 -- the forced-float32 LoRA path casts those to
+            # float16 itself.
+            with torch.autocast(device_type=device_type, enabled=False):
                 out = down_proj(gated_output)
             
             weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
@@ -2011,9 +2045,12 @@ def torch_native_forward(
         # glu = gate * torch.sigmoid(gate * self.alpha)
         # fused = (up_h + 1) * glu
 
-        # Force float32 matrix multiply on down projection only
+        # Autocast off for the down projection only. As above, it is the unquantized
+        # fallback that needs this; on the forced-float32 path a quantized layer gets
+        # float32 from _pre_set_compute_dtype instead. This branch also runs in bfloat16,
+        # where no float32 rule is registered and the layer stays in bfloat16.
         device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):
             out_list = [
                 down_l(fused[e].to(dtype))
                 for e, down_l in enumerate(self.down_projs)
@@ -2025,8 +2062,11 @@ def torch_native_forward(
     pass
 pass
 
-# torch_native_forward has full float32 protection (swiglu in float32, autocast
-# disabled around down_proj) to prevent NaN in fp16 training.
+# torch_native_forward protects the down projection three ways in float16 training: swiglu and
+# gated_output in float32, which is also the dtype Linear4bit restores its output to;
+# _pre_set_compute_dtype (registered by unsloth's loader on the forced-float32 path only) for
+# the quantized compute; and autocast disabled for the unquantized fallback, which ignores
+# compute_dtype. A bfloat16 run registers no float32 rule and keeps the layer in bfloat16.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():
@@ -2079,7 +2119,7 @@ def patch_GptOssAttention():
     if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
-        from ..flex_attention import (
+        from unsloth_zoo.flex_attention import (
             flex_attention_with_sink,
             is_flex_attention_decoding,
             flex_attention_with_sink_decoding,
@@ -2519,7 +2559,7 @@ def patch_GptOssModel():
             mk["cache_position"] = cache_position
         return mk
 
-    from ..flex_attention import (
+    from unsloth_zoo.flex_attention import (
         is_flex_attention_decoding,
         flex_attention_with_sink_decoding,
         flex_attention_add_sinks,

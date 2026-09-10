@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import re
 
 import numpy as np
 import pytest
 from pathlib import Path
+from unittest import mock
 
 
 mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 if "mlx_simulation" in str(getattr(mx, "__file__", "")):
     pytest.skip("requires real MLX runtime", allow_module_level=True)
 
@@ -962,6 +965,372 @@ def test_text_only_vlm_wrapper_uses_text_training_path():
     assert _is_vlm_model(TextOnlyVLMWrapper()) is False
 
 
+_VLM_CONFIG = {"model_type": "fake_vlm", "vision_config": {"hidden_size": 8}}
+
+
+def _skip_unless_mlx_vlm_ships(model_type):
+    """Asking the resolver would turn its own regressions into skips."""
+    import pkgutil
+
+    import mlx_vlm.models
+
+    shipped = {module.name for module in pkgutil.iter_modules(mlx_vlm.models.__path__)}
+    if model_type not in shipped:
+        pytest.skip(f"installed mlx-vlm does not ship {model_type}")
+
+
+class _VLMOnlyClass:
+    """Stands in for a class only mlx-vlm ships; routing never calls it."""
+
+
+def _route_text_only(monkeypatch, *, mlx_lm_class, vlm_class, config=_VLM_CONFIG):
+    from unsloth_zoo.mlx import loader
+
+    monkeypatch.setattr(loader, "_get_mlx_lm_model_class", lambda _t: mlx_lm_class)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _t: vlm_class)
+    return loader._prefer_vlm_loader_for_text(config, config["model_type"])
+
+
+class _StripSanitizeModel:
+    def sanitize(self, weights):
+        return {k: v for k, v in weights.items() if not k.startswith("vision_tower")}
+
+
+class _PlainModel:
+    def sanitize(self, weights):
+        return weights
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["muse_glimmer", "qwen4_exp", "glm5_next", "lfm2_vl", "mage_vl", "kimi_k3"],
+)
+def test_vlm_only_families_reach_the_text_path_without_being_listed(model_type):
+    """Against the installed packages rather than a monkeypatched resolver."""
+    from unsloth_zoo.mlx import loader
+
+    _skip_unless_mlx_vlm_ships(model_type)
+    config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+    assert loader._get_mlx_lm_model_class(model_type) is None
+    assert loader._prefer_vlm_loader_for_text(config, model_type) is True
+
+
+def test_a_capitalised_model_type_routes_like_its_lowercase_spelling():
+    """mlx-vlm lower-cases before it remaps, so a `Muse_Glimmer` config loads."""
+    from unsloth_zoo.mlx import loader
+
+    _skip_unless_mlx_vlm_ships("muse_glimmer")
+
+    def route(model_type):
+        config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+        return loader._prefer_vlm_loader_for_text(config, model_type)
+
+    assert route("Muse_Glimmer") is route("muse_glimmer") is True
+
+
+@pytest.mark.parametrize("alias, target", [("qwen2_5_vl", "qwen2_vl"), ("llava", "mistral3")])
+def test_an_aliased_model_type_loads_like_the_architecture_it_aliases(alias, target):
+    """mlx_lm remaps before it imports, so both spellings must decide alike."""
+    from unsloth_zoo.mlx import loader
+
+    assert loader._get_mlx_lm_model_class(alias) is loader._get_mlx_lm_model_class(target)
+
+    def route(model_type):
+        config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+        return loader._prefer_vlm_loader_for_text(config, model_type)
+
+    assert route(alias) == route(target)
+
+
+def _causal_logits(input_ids, vocab=7):
+    running = mx.cumsum(input_ids.astype(mx.float32), axis=1)
+    return mx.repeat(running[:, :, None], vocab, axis=2)
+
+
+def _sees_everything(values):
+    """What bidirectional attention looks like from outside."""
+    everything = values.astype(mx.float32).sum(axis=1, keepdims=True)
+    return mx.repeat(mx.broadcast_to(everything, values.shape)[:, :, None], 5, axis=2)
+
+
+class _PooledOutput:
+    """Shaped like mlx-vlm's pooled wrappers: no `logits` at all."""
+    text_embeds = "embeddings"
+
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        pytest.param(
+            lambda self, ids: (_ for _ in ()).throw(ValueError("You have to specify pixel_values")),
+            "cannot be fine-tuned on text alone",
+            id="demands pixels it was not given",
+        ),
+        pytest.param(
+            lambda self, ids: mx.zeros((1, ids.shape[1] + 3, 7)),
+            "not a causal language model",
+            id="answers a different sequence length",
+        ),
+        pytest.param(
+            lambda self, ids: _PooledOutput(),
+            "cannot be fine-tuned on text alone",
+            id="returns pooled embeddings",
+        ),
+        pytest.param(
+            lambda self, ids, a, b, c, d: _causal_logits(ids),
+            "cannot be fine-tuned on text alone",
+            id="demands more modalities than the path can invent",
+        ),
+        pytest.param(
+            lambda self, ids: _sees_everything(ids),
+            "attends bidirectionally",
+            id="sees the whole sequence",
+        ),
+        pytest.param(
+            lambda self, ids: _sees_everything(mx.maximum(ids, 4)),
+            "attends bidirectionally",
+            id="sees it only above the ids that share an embedding row",
+        ),
+        pytest.param(
+            lambda self, ids: mx.repeat(
+                mx.broadcast_to(1.0 + ids[:, -1:].astype(mx.float32) * 1e-6, ids.shape)[:, :, None], 5, axis=2),
+            "attends bidirectionally",
+            id="leaks far below any numerical tolerance",
+        ),
+        pytest.param(
+            lambda self, ids: mx.zeros((*ids.shape, 5)),
+            "answered every probe identically",
+            id="no probe can move it",
+        ),
+    ],
+)
+def test_a_wrapper_that_cannot_be_trained_on_text_is_refused_by_name(call, expected):
+    """Only running one tells these apart, and the refusal has to name it."""
+    from unsloth_zoo.mlx import loader
+
+    cls = type("Wrapper", (), {"__call__": call})
+    try:
+        with pytest.raises(ValueError, match=expected) as raised:
+            loader._verify_text_only_wrapper(cls(), "fake_vlm")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(cls)
+    assert "fake_vlm" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda self, ids: _causal_logits(ids), id="plain causal"),
+        pytest.param(
+            lambda self, ids: _causal_logits(mx.where(ids < 4, ids // 2, ids)),
+            id="two probe pairs cannot move it",
+        ),
+    ],
+)
+def test_a_causal_wrapper_is_accepted_and_left_unpatched(call):
+    """The second ties ids 0/1 and 2/3, so only the wider pairs settle it."""
+    from unsloth_zoo.mlx import loader
+
+    cls = type("Wrapper", (), {"__call__": call})
+    original, model = cls.__call__, cls()
+    loader._mark_text_only_vlm(model, "fake_vlm")
+    assert model._unsloth_text_only_vlm is True
+    assert cls.__call__ is original
+
+
+def test_the_text_only_path_flags_the_model_makes_it_callable_and_checks_it():
+    """Checked but not bound, or bound but not flagged, fails on the first step."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def __call__(self, input_ids, pixel_values, mask):
+            return _causal_logits(input_ids)
+
+    model = Wrapper()
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model._unsloth_text_only_vlm is True
+        assert model(mx.ones((1, 2), dtype=mx.int32)).shape == (1, 2, 7)
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_a_refused_wrapper_leaves_the_process_as_it_found_it():
+    """A class patch would outlive the refusal and reach the next load."""
+    from unsloth_zoo.mlx import loader
+
+    class Bidirectional:
+        def __call__(self, input_ids, pixel_values):
+            return _sees_everything(input_ids)
+
+    original, model = Bidirectional.__call__, Bidirectional()
+    try:
+        with pytest.raises(ValueError, match="attends bidirectionally"):
+            loader._mark_text_only_vlm(model, "fake_vlm")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Bidirectional)
+
+    assert Bidirectional.__call__ is original
+    assert not hasattr(model, "_unsloth_text_only_vlm")
+
+
+def test_a_wrapper_bound_for_text_still_takes_its_modalities_by_name():
+    """The image path names `pixel_values`; that must not become a duplicate."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def __call__(self, input_ids, pixel_values, mask=None):
+            if pixel_values is None:
+                return _causal_logits(input_ids)
+            return pixel_values, mask
+
+    model = Wrapper()
+    ids = mx.ones((1, 2), dtype=mx.int32)
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model(ids).shape == (1, 2, 7)
+        assert model(ids, pixel_values="pixels", mask="mask") == ("pixels", "mask")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_a_wrapper_whose_signature_hides_what_it_demands_is_still_called():
+    """`_install_paligemma_causal_mask` rewrites `__call__` as `(*args, **kwargs)`."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def _forward(self, input_ids, pixel_values, mask=None):
+            return _causal_logits(input_ids)
+
+        def __call__(self, *args, **kwargs):
+            return self._forward(*args, **kwargs)
+
+    assert str(inspect.signature(Wrapper.__call__)) == "(self, *args, **kwargs)"
+
+    model = Wrapper()
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model(mx.ones((1, 2), dtype=mx.int32)).shape == (1, 2, 7)
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
+    """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
+    from unsloth_zoo.mlx import loader
+
+    class Cacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.ones((4, 5))
+            self._position_ids = None
+
+        def __call__(self, input_ids):
+            self._position_ids = mx.arange(input_ids.shape[1])
+            return _causal_logits(input_ids, vocab=5)
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = Cacher()
+
+        def __call__(self, input_ids):
+            return self.language_model(input_ids)
+
+    model = Wrapper()
+    weight = model.language_model.weight
+    loader._verify_text_only_wrapper(model, "fake_vlm")
+
+    assert model.language_model._position_ids is None
+    assert model.language_model.weight is weight
+
+
+@pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
+def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
+    """mlx_lm names these modules after the raw config spelling.
+
+    Asserted on the resolved module name, which is what this change decides.
+    Reaching the class as well needs mlx_lm to import, and it does not everywhere:
+    `mlx_lm/utils.py` imports `resource`, a Unix-only stdlib module, so on Windows
+    -- where mlx now does ship a wheel -- every one of these resolves to None for
+    a reason that has nothing to do with hyphens.
+    """
+    from unsloth_zoo.mlx import loader
+
+    assert loader._mlx_lm_module_name(model_type) == model_type
+
+    try:
+        import mlx_lm  # noqa: F401
+    except Exception as error:
+        pytest.skip(f"installed mlx_lm does not import here ({error})")
+    assert loader._get_mlx_lm_model_class(model_type) is not None
+
+
+def test_vlm_generate_prefers_the_processor_over_the_published_tokenizer():
+    """A text-only multimodal load stays on the vision path but publishes its
+    inner tokenizer, which cannot drive mlx-vlm preprocessing."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import loader
+
+    seen = {}
+
+    def fake_stream_generate(model, processor, *args, **kwargs):
+        seen["processor"] = processor
+        raise _StopProbe
+
+    class _StopProbe(Exception):
+        pass
+
+    model = SimpleNamespace(
+        _processor = "the-processor",
+        _tokenizer = "the-inner-tokenizer",
+        _is_vlm_model = True,
+    )
+    with mock.patch.dict(
+        "sys.modules",
+        {"mlx_vlm": SimpleNamespace(stream_generate = fake_stream_generate)},
+    ):
+        with pytest.raises(Exception):
+            loader._mlx_generate_vlm(model, input_ids = [[1, 2]])
+
+    assert seen.get("processor", "the-inner-tokenizer") == "the-processor"
+
+
+def test_text_capable_mlx_lm_architecture_still_decides_by_its_sanitize(monkeypatch):
+    """An mlx_lm class keeps deciding on whether its sanitize strips towers."""
+    assert _route_text_only(
+        monkeypatch, mlx_lm_class=_StripSanitizeModel, vlm_class=_VLMOnlyClass
+    ) is True
+    assert _route_text_only(
+        monkeypatch, mlx_lm_class=_PlainModel, vlm_class=_VLMOnlyClass
+    ) is False
+
+
+def test_text_only_config_is_never_routed_to_the_vlm_loader(monkeypatch):
+    assert _route_text_only(
+        monkeypatch,
+        mlx_lm_class=None,
+        vlm_class=_VLMOnlyClass,
+        config={"model_type": "fake_text"},
+    ) is False
+
+
+def test_text_path_fallback_resolves_mlx_vlm_model_type_aliases():
+    """mlx-vlm maps several config spellings onto one module."""
+    from unsloth_zoo.mlx import loader
+
+    _skip_unless_mlx_vlm_ships("fastvlm")
+    with mock.patch.dict(
+        "mlx_vlm.utils.MODEL_REMAPPING", {"llava_qwen2": "fastvlm"}, clear = False,
+    ):
+        # Only the remap reaches fastvlm, and only from the lower-cased spelling.
+        fastvlm = loader._resolve_mlx_vlm_model_class("fastvlm")
+        assert loader._resolve_mlx_vlm_model_class("llava_qwen2") is fastvlm
+        assert loader._resolve_mlx_vlm_model_class("LLaVA_Qwen2") is fastvlm
+        assert loader._resolve_mlx_vlm_model_class("not_a_real_arch") is None
+
+
 def test_gemma3_vlm_cce_does_not_forward_outer_product_attention_mask():
     from types import SimpleNamespace
 
@@ -1302,7 +1671,6 @@ def test_vlm_host_label_authority_and_staged_finalize():
         completion_only_loss=False)
     assert off["labels"].dtype == off["input_ids"].dtype
 
-    # MLX-returning processors flag host_valued=False, nested too; reject raises first.
     assert _vlm_inputs_host_valued(
         {"input_ids": np.array([[1]])}) is True
     assert _vlm_inputs_host_valued(
@@ -1333,7 +1701,6 @@ def test_vlm_host_label_authority_and_staged_finalize():
             yield_host_staged=True))
     assert probe.pulls == 0 and probe.epochs == []
 
-    # Value-carrying closures finalize through the legacy pipeline unchanged.
     from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
     def _value_closure(mask_batch):
         width = len(mask_batch["input_ids"][0])
@@ -1412,7 +1779,6 @@ def test_vlm_prefetch_identity_laziness_and_masked_rejection():
     assert prefetched == sync  # bit-for-bit consumer-visible sequence
     assert control["prefetcher"].close()
 
-    # Trainer wiring: eligibility, control registration, and cleanup.
     shell_probe = _LifecycleVLMRows(6)
     trainer = _vlm_trainer_shell_for(shell_probe, prefetch=2)
     _b, shell_stream = trainer._prepare_data(is_vlm=True)
@@ -1768,11 +2134,9 @@ def test_a_natively_shared_backbone_gets_no_legacy_slots():
     # Native: no slots at all, so `cache` stays unset and every layer runs.
     assert _build_shared_kv_caches(_model(4, 2, native=True)) is None
 
-    # Legacy backbones still get exactly one slot per producer layer.
     legacy = _build_shared_kv_caches(_model(4, 2, native=False))
     assert legacy is not None and len(legacy) == 2
 
-    # And a stack that shares nothing is unaffected either way.
     assert _build_shared_kv_caches(_model(4, 0, native=False)) is None
     assert _build_shared_kv_caches(_model(4, 0, native=True)) is None
 
@@ -1975,7 +2339,6 @@ def test_paligemma_mask_is_left_alone_without_token_types():
     assert _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=None),
         mx_.zeros((1, 4), dtype=mx_.int32), padding).attention_mask_4d is None
-    # But it is replaced once the token types are there.
     replaced = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=outer_product),
         mx_.array([[0, 0, 1, 1]], dtype=mx_.int32), padding)
@@ -2001,7 +2364,6 @@ def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
     got = wrapped(object(), mx_.zeros((1, 4), dtype=mx_.int32), None,
                   mx_.ones((1, 4), dtype=mx_.int32),
                   token_type_ids=mx_.array([[0, 0, 1, 1]], dtype=mx_.int32))
-    # Upstream still runs and still sees its kwargs.
     assert "token_type_ids" in seen["kwargs"]
     # And its all-visible mask does not survive: the suffix cannot read ahead.
     assert got.attention_mask_4d is not outer_product
@@ -2041,7 +2403,6 @@ def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
 
     assert seen["mask"] is not outer_product
     assert not np.asarray(seen["mask"]).reshape(4, 4)[2, 3]
-    # And nothing is left pending once the call returns.
     assert _paligemma_pending_token_types() is None
 
 
@@ -2126,7 +2487,6 @@ def test_paligemma_token_types_do_not_cross_between_concurrent_callers():
     for thread in threads:
         thread.join(timeout=10)
 
-    # Each caller saw its own token types, not the other's.
     for name, mark in marks.items():
         assert _Model.seen[name] is mark, f"{name} saw another caller's batch"
     assert _paligemma_pending_token_types() is None
@@ -2233,7 +2593,6 @@ def test_gemma3n_altup_patch_declines_a_release_that_is_already_correct():
         model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
     assert not _fix_gemma3n_altup_batch(model)
     assert cls.correct is fixed, "an already-correct release must be left alone"
-# --- Audio input collation -------------------------------------------------
 
 
 class _FakeGemmaAudioProcessor(_ConversationalPromptCompletionProcessor):
@@ -2297,7 +2656,7 @@ def _qualify(monkeypatch, processor=None, version=None):
         processor or _FakeGemmaAudioProcessor())
     pinned = version or mlx_utils._installed_mlx_vlm_version()
     monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES",
-                        {family: mlx_utils._AudioVersions(pinned, pinned)})
+                        {family: mlx_utils._AudioVersions(pinned)})
 
 
 @pytest.mark.parametrize("gate,message", [
@@ -2502,7 +2861,6 @@ def test_processors_taking_audio_pairs_are_accommodated(monkeypatch):
     assert is_pc and "input_features" in batch
 
 
-
 def test_placeholders_without_features_are_rejected(monkeypatch):
     _qualify(monkeypatch)
     # Pre-rendered text can keep the placeholder after the clip is gone.
@@ -2695,30 +3053,61 @@ def test_audio_merge_compacts_valid_features_per_row():
 def test_qualified_families_carry_their_probed_requirements():
     """The table itself: which families, over which mlx-vlm releases.
 
-    Bounded at both ends, so an unreleased version is refused rather than
-    assumed good. Gemma 4 stays at the version its probes ran on: its processor
-    changed in 0.5.0, upstream reports it failing to load from 0.6.4
-    (Blaizzy/mlx-vlm#1526), and 0.6.3 split off a separate `gemma4_unified`.
+    Gemma 4 starts higher than the rest because below 0.6.2 mlx-vlm cannot load
+    the checkpoint at all: E2B's KV-shared layers ship no k_proj/v_proj/k_norm,
+    and mlx-vlm built those modules regardless until Blaizzy/mlx-vlm#1301.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
     versions = mlx_utils._AudioVersions
     assert mlx_utils._AUDIO_QUALIFIED_FAMILIES == {
-        "gemma3n": versions("0.4.4", "0.6.4"),
-        "gemma4": versions("0.4.4", "0.4.4"),
-        "phi4mm": versions("0.4.4", "0.6.4"),
-        "minicpmo": versions("0.4.4", "0.6.4"),
+        "gemma3n": versions("0.4.4"),
+        "gemma4": versions("0.6.2"),
+        "gemma4_unified": versions("0.6.5"),
+        "nemotron_h_nano_omni": versions("0.6.10"),
+        "qwen3_omni_moe": versions("0.6.7"),
+        "phi4mm": versions("0.4.4"),
+        "minicpmo": versions("0.4.4"),
     }
+
+
+@pytest.mark.parametrize("installed,admitted", [
+    ("0.4.4", False),        # loads nothing: 60 KV-shared tensors missing
+    ("0.5.0", False),
+    ("0.6.0", False),
+    ("0.6.1", False),        # last release before #1301
+    ("0.6.2", True),         # #1301: KV-shared layers stop building k/v proj
+    ("0.6.3", True),
+    ("0.6.4", True),         # double conv transpose, undone by loader.py (PR 879)
+    ("0.6.5", True),         # later compatible final releases follow the floor
+    ("0.6.2.post1", False),  # post-releases and prereleases were not probed
+    ("0.6.2rc1", False),
+])
+def test_gemma4_admits_final_releases_from_the_loadable_floor(
+        installed, admitted):
+    """The boundary, measured rather than argued.
+
+    Every released row from 0.4.4 to 0.6.4 was run end to end on macos-14
+    against mlx-community/gemma-4-e2b-it-4bit: model load, placeholder counts
+    against what the audio tower returns, and two clips giving two losses.
+    0.6.1 red, 0.6.2 green.
+
+    Later compatible final releases follow the package resolver policy.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    floor = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
+    assert floor.admits(installed) is admitted, installed
 
 
 @pytest.mark.parametrize("installed,admitted", [
     ("0.4.3", False),        # below the probed floor
     ("0.4.4", True),         # the probed version
     ("0.5.0", True),
-    ("0.6.4", True),         # ceiling: 0.6.5+ needs transformers>=5.14,
-    ("0.6.5", False),        # which this package caps at 5.5.0
-    ("0.6.9", False),
-    ("0.5.0rc1", False),     # prereleases inside the window: never qualified
+    ("0.6.4", True),
+    ("0.6.5", True),
+    ("99.0.0", True),        # no manually maintained release ceiling
+    ("0.5.0rc1", False),     # prereleases above the floor: never qualified
     ("0.4.5.dev0", False),
     ("0.4.4.post1", False),  # nor post-releases or local builds
     ("0.6.4.post1", False),
@@ -2726,11 +3115,11 @@ def test_qualified_families_carry_their_probed_requirements():
     ("", False),             # unreadable: not evidence of anything
     ("not-a-version", False),
 ])
-def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
+def test_the_gate_admits_final_releases_at_or_above_its_floor(installed, admitted):
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    window = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma3n"]
-    assert window.admits(installed) is admitted, installed
+    floor = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma3n"]
+    assert floor.admits(installed) is admitted, installed
 
 
 @pytest.mark.parametrize("installed,allowed", [
@@ -2740,16 +3129,14 @@ def test_the_gate_admits_exactly_its_qualified_window(installed, admitted):
     ("0.5.0", True),
     ("0.5.0rc1", False),
     ("0.6.4", True),
-    ("0.6.5", False),
-    ("0.6.9", False),
+    ("0.6.5", True),
+    ("99.0.0", True),
 ])
-def test_the_gate_itself_honours_the_range_not_just_the_range_object(
+def test_the_gate_itself_honours_the_floor_not_just_the_version_object(
         monkeypatch, installed, allowed):
     """Drives `_check_audio_family_gate`, not `_AudioVersions.admits`.
 
-    Asserting the range object alone would pass just as happily with the gate
-    still comparing strings, which is the whole defect. Whether an audio row
-    trains or is refused is decided here.
+    Whether an audio row trains or is refused is decided here.
     """
     from unsloth_zoo.mlx import utils as mlx_utils
 
@@ -2766,7 +3153,7 @@ def test_the_gate_itself_honours_the_range_not_just_the_range_object(
             mlx_utils._check_audio_family_gate(gemma3n_like())
 
 
-def test_only_a_published_final_release_is_inside_the_window():
+def test_only_a_published_final_release_is_at_or_above_the_floor():
     """The qualification covers published final releases and nothing else.
 
     A post-release is conventionally the same code repackaged, but nothing
@@ -2778,31 +3165,53 @@ def test_only_a_published_final_release_is_inside_the_window():
     from unsloth_zoo.mlx import utils as mlx_utils
 
     gemma4 = mlx_utils._AUDIO_QUALIFIED_FAMILIES["gemma4"]
-    assert gemma4.admits("0.4.4") is True
-    for unqualified in ("0.4.4.post1", "0.4.4.post2", "0.4.4+local",
-                        "0.4.4rc1", "0.4.4.dev0"):
+    assert gemma4.admits("0.6.2") is True
+    for unqualified in ("0.6.2.post1", "0.6.2.post2", "0.6.2+local",
+                        "0.6.2rc1", "0.6.2.dev0"):
         assert gemma4.admits(unqualified) is False, unqualified
-    # Nor the next release, which is a different processor.
-    assert gemma4.admits("0.4.5") is False
-    assert gemma4.admits("0.5.0") is False
+    # The measured floor stays closed while later compatible finals stay open.
+    assert gemma4.admits("0.6.1") is False
+    assert gemma4.admits("99.0.0") is True
 
 
-def test_the_renamed_gemma4_family_is_refused_by_the_name_it_now_loads_under():
-    """mlx-vlm 0.6.3 added `gemma4_unified` beside `gemma4`, so a gemma 4
-    checkpoint can present under a family key this gate never qualified.
-    Refusing it as simply unrecognised tells the user nothing they can act on;
-    the refusal names the entry they are actually looking for."""
+def test_new_audio_families_start_at_their_complete_audio_implementation(monkeypatch):
     from unsloth_zoo.mlx import utils as mlx_utils
+    def make_processor(module):
+        cls = type("Processor", (), {})
+        cls.__module__ = f"mlx_vlm.models.{module}.processing_{module}"
+        return cls()
+    unified = make_processor("gemma4_unified")
+    assert mlx_utils._audio_family_from_processor(unified) == "gemma4_unified"
+    for processor, family, floor, below in (
+        (unified, "gemma4_unified", "0.6.5", "0.6.4"),
+        (make_processor("nemotron_h_nano_omni"), "nemotron_h_nano_omni", "0.6.10", "0.6.7"),
+        (make_processor("qwen3_omni_moe"), "qwen3_omni_moe", "0.6.7", "0.6.6"),
+    ):
+        monkeypatch.setattr(
+            mlx_utils, "_installed_mlx_vlm_version", lambda floor=floor: floor,
+        )
+        assert mlx_utils._check_audio_family_gate(processor) == family
+        monkeypatch.setattr(
+            mlx_utils, "_installed_mlx_vlm_version", lambda: "99.0.0",
+        )
+        assert mlx_utils._check_audio_family_gate(processor) == family
+        monkeypatch.setattr(
+            mlx_utils, "_installed_mlx_vlm_version", lambda below=below: below,
+        )
+        with pytest.raises(NotImplementedError, match="only been verified"):
+            mlx_utils._check_audio_family_gate(processor)
 
-    unified = type("Gemma4UnifiedProcessor", (), {})
-    unified.__module__ = "mlx_vlm.models.gemma4_unified.processing_gemma4_unified"
-    assert mlx_utils._audio_family_from_processor(unified()) == "gemma4_unified"
 
-    with pytest.raises(NotImplementedError) as excinfo:
-        mlx_utils._check_audio_family_gate(unified())
-    message = str(excinfo.value)
-    assert "gemma4_unified" in message and "'gemma4'" in message
-    assert "0.4.4" in message, "the version to pin is not named"
+def test_diffusion_gemma_uses_the_generic_unsupported_family_refusal():
+    from unsloth_zoo.mlx import utils as mlx_utils
+    processor = type("DiffusionGemmaProcessor", (), {})
+    processor.__module__ = "mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma"
+    with pytest.raises(
+        NotImplementedError,
+        match="audio training is not supported for 'diffusion_gemma'",
+    ) as excinfo:
+        mlx_utils._check_audio_family_gate(processor())
+    assert "published checkpoint" not in str(excinfo.value)
 
 
 def test_the_transformers_floor_refuses_a_prerelease_for_the_right_reason(
@@ -3060,8 +3469,8 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
     monkeypatch.setattr(mlx_utils, "_AUDIO_MIN_TRANSFORMERS", {})
     _here = mlx_utils._installed_mlx_vlm_version()
     monkeypatch.setattr(mlx_utils, "_AUDIO_QUALIFIED_FAMILIES", {
-        "gemma4": mlx_utils._AudioVersions(_here, _here),
-        "fakegemmaaudio": mlx_utils._AudioVersions(_here, _here),
+        "gemma4": mlx_utils._AudioVersions(_here),
+        "fakegemmaaudio": mlx_utils._AudioVersions(_here),
     })
     processor = Gemma4Processor(_Gemma4Extractor(True))
     assert mlx_utils._check_audio_family_gate(processor) == "gemma4"
@@ -3076,8 +3485,6 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
 
     # Same family name, so the repair is reached, but not independently
     # copyable -- correcting either would correct the caller's own processor.
-    # A copy that is the original, and one that keeps its own attributes but
-    # writes just that hook through -- the narrowest sharing there is.
     for cls in (type("Gemma4Processor", (Gemma4Processor,),
                      {"__copy__": lambda self: self}),
                 type("Gemma4Processor", (_ForwardsTheHook,), {})):
@@ -3149,7 +3556,6 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
 
     model = _Model()
     original = model.get_input_embeddings
-    # Every caller taking a hold is told so, and releases exactly one.
     assert install_audio_merge_patch(model, 1) is True
     assert install_audio_merge_patch(model, 1) is True    # second holder
     assert remove_audio_merge_patch(model) is False       # first release
@@ -3163,7 +3569,6 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
     install_audio_merge_patch(model, 1)
     remove_audio_merge_patch(model)
     assert model.get_input_embeddings() == "instance wrapper"
-
 
 
 def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
@@ -3368,7 +3773,6 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
 
     # The real checkpoint's shape: model_type present, neither index declared.
     assert _phi4mm_token_ids({"model_type": "phi4mm"}) == expected
-    # A config that does declare them wins over the defaults.
     assert _phi4mm_token_ids(
         {"image_token_index": -7, "audio_token_index": 11}
     ) == (-7, 11)
@@ -3416,6 +3820,57 @@ def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
         [7, image_id, 8, audio_id, 9]
     ]
 
+def _prepared_grid(model_type):
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    # "content" is the phase that fixes the grid form; "positions" needs the
+    # per-family token ids a bare model_type config does not carry.
+    return _prepare_vlm_batch_for_compile({
+        "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
+        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
+        "image_grid_thw": mx.array([[1, 16, 16]], dtype=mx.int32),
+    }, {"model_type": model_type, "vision_config": {"hidden_size": 8}},
+        phase="content")
+
+
+def test_array_grid_families_keep_an_indexable_grid():
+    """These vision towers open with `grid_thw.tolist()`; tuples raise there."""
+    for model_type in ("glm4v", "glm_ocr", "muse_glimmer", "glm5_next"):
+        grid = _prepared_grid(model_type)["image_grid_thw"]
+        assert isinstance(grid, mx.array), model_type
+        assert grid.tolist() == [[1, 16, 16]], model_type
+
+
+def test_compile_patched_families_keep_the_traceable_tuple_grid():
+    """Qwen/Paddle patches trace the grid as static metadata, not an array."""
+    for model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "paddleocr_vl"):
+        grid = _prepared_grid(model_type)["image_grid_thw"]
+        assert grid == ((1, 16, 16),), model_type
+
+
+def _prepared_positions(model_type):
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    return _prepare_vlm_batch_for_compile({
+        "input_ids": mx.array([[1, 5, 5, 5, 5, 2]], dtype=mx.int32),
+        "attention_mask": mx.array([[1] * 6], dtype=mx.int32),
+        "image_grid_thw": mx.array([[1, 4, 4]], dtype=mx.int32),
+    }, {"model_type": model_type, "image_token_id": 5, "video_token_id": 6,
+        "vision_config": {"spatial_merge_size": 2}})
+
+
+def test_qwen_mrope_families_get_pipeline_built_position_ids():
+    """Without them the decoder falls back to mlx-vlm's `get_rope_index`, which
+    calls `.item()` on grid entries the pipeline hands it as plain ints."""
+    for model_type in ("qwen2_vl", "qwen3_vl", "qwen3_5", "qwen4_exp"):
+        prepared = _prepared_positions(model_type)
+        assert prepared["_unsloth_collated_position_ids"] is True, model_type
+        assert np.asarray(prepared["position_ids"]).shape == (3, 1, 6), model_type
+
+    # GLM-5.x reaches its vision grid directly instead, so it must not be here.
+    assert "position_ids" not in _prepared_positions("glm5_next")
+
+
 # --- audio alignment from stated spans, for families whose run carries no id ---
 
 
@@ -3446,6 +3901,12 @@ def test_the_delimiters_around_an_audio_run_are_not_targets():
     assert {151697, 151699} <= set(_get_vlm_ignore_token_ids(processor=_Delimited()))
 
 
+def test_nemotron_declares_its_sampling_rate_on_the_processor():
+    from unsloth_zoo.mlx.utils import audio_extractor_sampling_rate
+    processor = type("NemotronProcessor", (), {"audio_sampling_rate": 16000})()
+    assert audio_extractor_sampling_rate(processor) == 16000
+
+
 def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
     """A row that is itself a list of messages is a supported shape, which
     _collate_vlm_batch normalizes. The pre-formatter scan has to see it too:
@@ -3465,8 +3926,6 @@ def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
     assert _raw_row_has_audio({"messages": messages}) is True
     assert _raw_row_has_audio(messages) is True, "the same row, unwrapped"
 
-    # An unqualified family must still be refused when the formatter hides the
-    # clips, which is the whole point of scanning before formatting.
     from unsloth_zoo.mlx import utils as mlx_utils
 
     monkeypatch.setattr(
@@ -3497,11 +3956,9 @@ def test_a_row_that_is_one_message_dict_is_scanned_for_audio(monkeypatch):
     row = {"role": "user", "content": [{"type": "audio", "audio": clip},
                                        {"type": "text", "text": "transcribe"}]}
 
-    # Supported: collation turns this row into exactly one message.
     assert len(_normalize_vlm_messages(row)) == 1
     assert _raw_row_has_audio(row) is True
 
-    # A message dict carrying no audio must not be gated.
     assert _raw_row_has_audio(
         {"role": "user", "content": [{"type": "text", "text": "hi"}]}
     ) is False
@@ -3609,7 +4066,6 @@ def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
                     assert np.array_equal(
                         np.asarray(clip), ramp["array"]), (part, content)
 
-    # A type outside the audio spellings is never rewritten.
     kept = _normalize_vlm_messages(
         [{"role": "user", "content": [{"type": "video", "video": "v.mp4"}]}])
     assert kept[0]["content"][0]["type"] == "video"
@@ -3703,6 +4159,91 @@ def test_the_projection_after_the_audio_tower_is_frozen_too():
         "audio_tower", "audio_projection_layer",
     }
     assert model.audio_tower.frozen and model.audio_projection_layer.frozen
+
+
+class _FrozenAudioModule:
+    frozen = False
+    def freeze(self, recurse=False):
+        self.frozen = recurse
+
+
+def test_nemotron_sound_modules_are_frozen_and_not_quantized():
+    import unsloth_zoo.mlx.loader as mlx_loader
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+    names = ("sound_encoder", "sound_projection")
+    model = type("Nemotron", (), {name: _FrozenAudioModule() for name in names})()
+    assert set(freeze_audio_modules(model)) == set(names)
+    assert all(getattr(model, name).frozen for name in names)
+    predicate = mlx_loader._compose_mlx_quant_predicate(model, mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    assert all(not predicate(name, object()) for name in names)
+
+
+def test_qwen3_omni_nested_audio_tower_is_frozen():
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+    audio_tower = _FrozenAudioModule()
+    model = type("Qwen3Omni", (), {
+        "thinker": type("Thinker", (), {"audio_tower": audio_tower})(),
+    })()
+    assert freeze_audio_modules(model) == ["audio_tower"]
+    assert audio_tower.frozen
+
+
+def test_qwen3_omni_audio_output_modules_are_frozen():
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+    model = type("Qwen3Omni", (), {
+        "talker": _FrozenAudioModule(),
+        "code2wav": _FrozenAudioModule(),
+    })()
+    assert set(freeze_audio_modules(model)) == {"talker", "code2wav"}
+    assert model.talker.frozen and model.code2wav.frozen
+
+
+def test_every_owner_of_an_audio_name_is_frozen_not_just_the_first():
+    """Stopping at the first owner left a distinct nested tower trainable."""
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    outer, nested = _FrozenAudioModule(), _FrozenAudioModule()
+    model = type("TwoLevel", (), {
+        "audio_tower": outer,
+        "thinker": type("Thinker", (), {"audio_tower": nested})(),
+    })()
+
+    assert freeze_audio_modules(model).count("audio_tower") == 2
+    assert outer.frozen and nested.frozen
+
+
+def test_a_module_shared_by_two_owners_is_frozen_once():
+    """Identity dedupe: an alias must not be reported as a second module."""
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    shared = _FrozenAudioModule()
+    model = type("Aliased", (), {
+        "audio_tower": shared,
+        "language_model": type("LM", (), {"audio_tower": shared})(),
+    })()
+
+    assert freeze_audio_modules(model) == ["audio_tower"]
+    assert shared.frozen
+
+
+def test_nemotron_floor_clears_the_unconditional_sound_conv_sanitize():
+    """Below 0.6.10, `sanitize_audio_weights` double-transposes a pre-converted
+    sound conv ((128,3,3,1) -> (128,3,1,3)) and the checkpoint cannot load."""
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    floor = mlx_utils._AUDIO_QUALIFIED_FAMILIES["nemotron_h_nano_omni"]
+    assert floor.minimum == "0.6.10"
+    assert not floor.admits("0.6.7")
+    assert floor.admits("0.6.10")
+
+
+def test_a_turn_without_content_is_returned_untouched():
+    """A dict with no "content" key raised KeyError where every other shape
+    check in this helper returns the message unchanged."""
+    from unsloth_zoo.mlx.loader import _normalize_qwen3_omni_counted_message
+
+    for message in ({"role": "user"}, {"role": "assistant", "content": None}):
+        assert _normalize_qwen3_omni_counted_message(message, 1, 1, {}) == message
 
 
 def test_stated_spans_refuse_the_left_padding_repair():
@@ -3968,6 +4509,56 @@ def test_clips_of_unequal_duration_all_reach_the_model():
     assert tuple(stacked.shape) == (2, 80, 300)
 
 
+def test_nemotron_sound_clips_stay_a_list_even_when_shapes_match():
+    """Equal-length Nemotron waveforms must retain the list contract."""
+    from unsloth_zoo.mlx.utils import (
+        _assert_audio_features_present, _to_mx_vlm_batch,
+        _vlm_batch_carries_audio,
+    )
+    inputs = {"sound_clips": [np.zeros(1600, np.float32),
+                              np.ones(1600, np.float32)]}
+    _assert_audio_features_present(inputs, 2, _FakeProcessor())
+    clips = _to_mx_vlm_batch(inputs)["sound_clips"]
+    assert isinstance(clips, list) and len(clips) == 2
+    assert all(tuple(clip.shape) == (1600,) for clip in clips)
+    assert _vlm_batch_carries_audio({"sound_clips": clips}) is True
+
+
+def test_mixed_aspect_ratio_images_all_reach_the_model():
+    """Gemma 4 keeps differently shaped processed images as a ragged list.
+
+    The generic conversion used to catch the failed stack and retain only the
+    first tensor, so a batch of two OCR examples reached the vision tower as one
+    unbatched 3-D image. Preserve every image and its row order instead.
+    """
+    from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
+
+    source = (
+        np.full((3, 4, 7), 11, dtype=np.float32),
+        np.full((3, 6, 5), 29, dtype=np.float32),
+    )
+    for images in (source, source[::-1]):
+        pixels = _to_mx_vlm_batch({"pixel_values": list(images)})["pixel_values"]
+
+        assert isinstance(pixels, list)
+        assert [tuple(image.shape) for image in pixels] == [tuple(image.shape) for image in images]
+        assert [float(np.asarray(image)[1, -1, -1]) for image in pixels] == [
+            float(image[1, -1, -1]) for image in images
+        ]
+
+
+def test_equal_shape_images_stack_without_data_loss():
+    from unsloth_zoo.mlx.utils import _to_mx_vlm_batch
+
+    dense_source = [
+        np.full((3, 4, 7), 41, dtype=np.float32),
+        np.full((3, 4, 7), 73, dtype=np.float32),
+    ]
+    dense = _to_mx_vlm_batch({"pixel_values": dense_source})["pixel_values"]
+    assert tuple(dense.shape) == (2, *dense_source[0].shape)
+    assert [float(np.asarray(dense)[row, 1, -1, -1]) for row in (0, 1)] == [41.0, 73.0]
+
+
 def test_nested_audio_rows_are_paired_clip_by_clip():
     """A processor that wants ``(samples, rate)`` pairs may also want its audio
     nested per row (MiniCPM-o). Pairing the payload as though its entries were
@@ -4175,6 +4766,7 @@ def test_an_empty_audio_payload_is_not_audio():
     # audio than an empty array is.
     assert not _vlm_batch_carries_audio({"input_audio_embeds": []})
     assert _vlm_batch_carries_audio({"input_audio_embeds": [object()]})
+    assert not _vlm_batch_carries_audio({"sound_clips": []})
 
 
 def test_audio_spans_are_checked_against_attended_positions():
@@ -4560,7 +5152,8 @@ def test_audio_modules_are_found_wherever_the_family_nests_them():
 
     for names in (("audio_tower", "embed_audio"),
                   ("audio_tower", "audio_projection_layer"),
-                  ("embed_tokens_extend.audio_embed.audio_encoder",)):
+                  ("embed_tokens_extend.audio_embed.audio_encoder",),
+                  ("sound_encoder", "sound_projection")):
         verdict = audio_input_capability(_AudioModel(names), _ProbeProcessor())
         assert verdict.model_ok is True and verdict.capable is True, names
     absent = audio_input_capability(
@@ -4655,3 +5248,284 @@ def test_the_repeated_audio_placeholder_is_never_a_target(monkeypatch):
     ignored = _get_vlm_ignore_token_ids(processor=processor) or []
     for token_id in soft:
         assert token_id in ignored, token_id
+
+
+class _TruncationDivertingAudioProcessor:
+    """A processor that fans its flat keywords out to its audio extractor.
+
+    This is what transformers' `_merge_kwargs` does: a flat keyword reaches
+    every modality that declares it, and `AudioKwargs` declares `max_length`
+    and `truncation`. Gemma 3n shows the result -- a one-second clip under
+    `max_length=512` comes back as zero mel frames, the waveform cut to 512
+    samples, while `input_ids` is untouched.
+
+    An empty `audio_kwargs` is what stops it: a modality present in kwargs
+    stops reading flat keywords. This fixture reproduces exactly that rule,
+    including the part that matters most -- the text side must keep reading
+    its flat keywords, or padding and `add_special_tokens` go with it.
+    """
+
+    tokenizer = _FakeTokenizer()
+    image_processor = object()
+    feature_extractor = object()
+    chat_template = "{{ messages }}"
+
+    def __init__(self):
+        self.text_saw = {}
+
+    def __call__(self, text, audio=None, **kwargs):
+        # The `_merge_kwargs` rule, both ways round.
+        audio_reads_flat = "audio_kwargs" not in kwargs
+        text_reads_flat = "text_kwargs" not in kwargs
+        self.text_saw = {
+            "max_length": kwargs.get("max_length") if text_reads_flat else None,
+            "padding": kwargs.get("padding") if text_reads_flat else None,
+        }
+        cap = kwargs.get("max_length")
+
+        rows = [[101, 10, 11, 0] for _ in text]
+        out = {
+            "input_ids": np.array(rows, dtype=np.int32),
+            "attention_mask": np.array(
+                [[1, 1, 1, 0] for _ in text], dtype=np.int32),
+        }
+        clips = len(audio) if audio is not None else 0
+        if clips:
+            # The waveform is cut to the cap when the audio side reads it.
+            frames = 0 if (audio_reads_flat and cap is not None) else 97
+            out["input_features"] = np.zeros((clips, frames, 128), np.float32)
+            out["input_features_mask"] = np.ones((clips, frames), np.int32)
+        return out
+
+
+def test_a_text_cap_does_not_reach_the_audio_extractor():
+    """`max_length` is a token budget and must not be read as a sample budget.
+
+    Left flat, it fans out to every modality that declares it, and
+    `AudioKwargs` declares it. Every clip longer than `max_seq_length` samples
+    -- which is every clip, at any realistic cap -- then loses its audio while
+    the row keeps its placeholders, leaving placeholders with nothing behind.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    inputs = mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+
+    assert inputs["input_features"].shape[1] > 0, (
+        "the clip was truncated to the token budget and framed to nothing"
+    )
+
+
+def test_shielding_the_audio_side_leaves_the_text_side_flat():
+    """The shield goes on the audio modality, never the text one.
+
+    Putting `text_kwargs` in instead would stop the text modality reading its
+    flat keywords, taking `padding`, `add_special_tokens` and `return_tensors`
+    with the cap -- ragged output and a doubled BOS. So the text side must
+    still see both the cap and its padding flag.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(
+        processor, ["<|audio|>"], [[]], 512,
+        all_audio=[[np.zeros(16000, np.float32)]],
+    )
+    assert processor.text_saw == {"max_length": 512, "padding": True}
+
+
+def test_processor_forwarding_kwargs_to_its_tokenizer_drops_audio_shield():
+    """Drop Gemma 4's modality shield before its tokenizer sees it."""
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+    class _Gemma4Style(_FakeProcessor):
+        feature_extractor = type("_Extractor", (), {"sampling_rate": 16000})()
+        def __init__(self):
+            self.calls = []
+        def __call__(self, text, audio=None, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "audio_kwargs" in kwargs:
+                raise TypeError(
+                    "PreTrainedTokenizerFast._batch_encode_plus() got an "
+                    "unexpected keyword argument 'audio_kwargs'"
+                )
+            return {
+                "input_ids": np.ones((len(text), 4), np.int32),
+                "attention_mask": np.ones((len(text), 4), np.int32),
+                "input_features": np.ones((len(audio), 8, 4), np.float32),
+            }
+    processor = _Gemma4Style()
+    result = _processor_vlm_inputs(
+        processor, ["prompt"], [[]], 128, all_audio=[[_CLIP]],
+    )
+    assert result["input_features"].shape[0] == 1
+    assert len(processor.calls) == 2
+    assert processor.calls[1]["max_length"] == 128
+    assert "audio_kwargs" not in processor.calls[1]
+
+
+def test_a_text_only_batch_is_collated_exactly_as_before():
+    """The shield is for batches carrying audio, and only those.
+
+    A processor with no audio to fan the keyword into should see the call it
+    always did, so this cannot change collation for text or images.
+    """
+    from unsloth_zoo.mlx import utils as mlx_utils
+
+    processor = _TruncationDivertingAudioProcessor()
+    mlx_utils._processor_vlm_inputs(processor, ["hello"], [[]], 512)
+    assert processor.text_saw == {"max_length": 512, "padding": True}
+
+
+def test_qwen3_omni_counts_video_url_as_video():
+    """`video_url` carries no "video" key, so the two counters disagreed on an
+    alias one of them accepts. Grouping only; the native template renders no
+    placeholder for this shape, verified against its own chat_template.jinja."""
+    from unsloth_zoo.mlx.loader import (
+        _qwen3_omni_media_counts,
+        _normalize_qwen3_omni_counted_message,
+        _structured_multimodal_counts,
+    )
+
+    item = {"type": "video_url", "video_url": "v.mp4"}
+    assert _qwen3_omni_media_counts([item]) == (0, 0, 1)
+    # Agrees with the structured counter, which already accepted the alias.
+    assert _structured_multimodal_counts(item) == (0, 0, 1)
+
+    message = {"role": "user", "content": [item, {"type": "text", "text": "describe"}]}
+    ordered = _normalize_qwen3_omni_counted_message(message, 0, 1, {})
+    assert [part.get("type") for part in ordered["content"]] == ["video_url", "audio", "text"]
+
+
+def test_qwen3_omni_normalizes_media_turns_after_the_first():
+    """Only the anchor was normalized, so a later turn ordered `text, audio`
+    kept that order and the audio lost Thinker conditioning."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
+        {"role": "user", "content": [
+            {"type": "text", "text": "transcribe"},
+            {"type": "audio", "audio": "a.wav"},
+        ]},
+    ]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 0, num_audios = 1, kwargs = {},
+    )
+
+    assert [part.get("type") for part in template[2]["content"]] == ["audio", "text"]
+    # The assistant turn is left alone and the caller's list is not mutated.
+    assert [part.get("type") for part in template[1]["content"]] == ["text"]
+    assert [part.get("type") for part in messages[2]["content"]] == ["text", "audio"]
+
+
+def test_qwen3_omni_deficit_still_lands_only_on_the_anchor():
+    """Normalizing every turn must not scatter the conversation-wide deficit."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [
+        {"role": "user", "content": [
+            {"type": "text", "text": "one"},
+            {"type": "image", "image": "i.png"},
+        ]},
+        {"role": "user", "content": [
+            {"type": "text", "text": "two"},
+            {"type": "audio", "audio": "a.wav"},
+        ]},
+    ]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 1, num_audios = 2, kwargs = {},
+    )
+
+    assert [part.get("type") for part in template[0]["content"]] == ["image", "audio", "text"]
+    assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]
+
+
+def test_key_only_audio_parts_are_extracted_like_the_template_renders_them():
+    """Qwen's template emits a placeholder for a key-only `{"audio": clip}`
+    (`content.type == 'audio' or 'audio' in content or 'audio_url' in content`),
+    but the extractor keyed on `part["type"]` alone and supplied no waveform,
+    leaving the row one placeholder short of a tensor."""
+    import numpy as np
+    from unsloth_zoo.mlx.loader import _qwen3_omni_media_counts
+    from unsloth_zoo.mlx.utils import _vlm_audio_part_state
+
+    clip = np.zeros(16000, dtype = np.float32)
+    for part in (
+        {"type": "audio", "audio": clip},
+        {"type": "input_audio", "audio": clip},
+        {"audio": clip},                          # key-only, the regression
+    ):
+        messages = [{"role": "user", "content": [part, {"type": "text", "text": "t"}]}]
+        bare, payloads = _vlm_audio_part_state(messages)
+        # Whatever the counter counts, the extractor must supply.
+        assert _qwen3_omni_media_counts([part])[1] == len(payloads) == 1
+        assert bare is False
+
+
+def test_a_bare_audio_placeholder_still_reports_itself_as_bare():
+    """A typed part with no payload keeps signalling a bare placeholder, and
+    non-audio parts are still ignored."""
+    from unsloth_zoo.mlx.utils import _vlm_audio_part_state
+
+    bare, payloads = _vlm_audio_part_state(
+        [{"role": "user", "content": [{"type": "audio"}]}]
+    )
+    assert bare is True and payloads == []
+
+    bare, payloads = _vlm_audio_part_state(
+        [{"role": "user", "content": [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "image": "i.png"},
+        ]}]
+    )
+    assert bare is False and payloads == []
+
+
+def test_qwen3_omni_normalizes_embedded_media_without_scalar_counts():
+    """Media embedded in the messages leaves `num_images`/`num_audios` at zero,
+    and the ordering is wrong on its own merits, so gating normalization on the
+    counts let `text, audio` reach the template unchanged."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "transcribe"},
+        {"type": "audio", "audio": "a.wav"},
+    ]}]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 0, num_audios = 0, kwargs = {},
+    )
+
+    assert [part.get("type") for part in template[0]["content"]] == ["audio", "text"]
+    # Counts still drive the deficit, they just no longer gate the reordering.
+    assert [part.get("type") for part in messages[0]["content"]] == ["text", "audio"]
+
+
+def test_qwen3_omni_leaves_assistant_turns_alone_without_counts():
+    """Reordering every turn must still skip the roles the renderer treats as
+    non-user, otherwise assistant history gets rewritten."""
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.loader import _prepare_vlm_template_messages
+
+    messages = [
+        {"role": "assistant", "content": [
+            {"type": "text", "text": "prior"},
+            {"type": "audio", "audio": "a.wav"},
+        ]},
+        {"role": "user", "content": [
+            {"type": "audio", "audio": "b.wav"},
+            {"type": "text", "text": "next"},
+        ]},
+    ]
+    _, template, _ = _prepare_vlm_template_messages(
+        prompt_utils, "qwen3_omni_moe", messages, num_images = 0, num_audios = 0, kwargs = {},
+    )
+
+    assert [part.get("type") for part in template[0]["content"]] == ["text", "audio"]
+    assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]

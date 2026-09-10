@@ -131,13 +131,11 @@ def test_decorated_forward_emits_the_real_body_and_no_unbound_name(tmp_path, mon
     module = _load_fake_modeling_module(tmp_path, monkeypatch, "fake_bare_closure_codegen")
     generated = _generate("fake_bare_closure_codegen", "FakeGatedDeltaNet", module)
 
-    # The real body is emitted, and the decorator's wrapper is not.
     assert "real_body_ran = self.in_proj(hidden_states)" in generated
     assert "def wrapped(" not in generated
     assert "return wrapped(" not in generated
 
-    # The forwarding call is built from the real signature, so `args` / `kwargs`
-    # are never referenced without being bound.
+    # The forwarding call is built from the real signature, so nothing is unbound.
     assert "return FakeGatedDeltaNet_forward(" in generated
     assert "hidden_states=hidden_states" in generated
     assert "cache_params=cache_params" in generated
@@ -158,7 +156,9 @@ def test_decorated_forward_keeps_the_disable_classification(tmp_path, monkeypatc
     compiled = compiler.create_standalone_class(
         "FakeGatedDeltaNet", "fake_bare_closure_disable", dir(module), disable = False,
     )
-    assert "@torch.compile(" in compiled
+    # A compile decorator, whichever spelling: fullgraph regions are emitted
+    # as `torch_compile_with_fallback` so cache exhaustion cannot hard-fail.
+    assert "@torch_compile_with_fallback(" in compiled or "@torch.compile(" in compiled
 
 
 def test_decorated_forward_runs_and_fires_the_decorator_exactly_once(tmp_path, monkeypatch):
@@ -206,9 +206,7 @@ def test_undecorated_forward_is_untouched(tmp_path, monkeypatch):
     compile(generated, "<fake-bare-closure-plain>", "exec")
 
 
-# ---------------------------------------------------------------------------
 # _unwrap_undecorated_method must be inert for every other shape.
-# ---------------------------------------------------------------------------
 
 def test_unwrap_returns_plain_method_identically():
     class Plain:

@@ -671,6 +671,74 @@ def _is_gemma4_attr(node, owner, attr):
     )
 
 
+def _gemma4_receiver_is_inputs_embeds(node):
+    """Does this `masked_scatter` receiver expression START from `inputs_embeds`?
+
+    Matched at the BASE, so a transformed receiver
+    (`inputs_embeds.to(...).masked_scatter(...)`) still counts while a different
+    tensor that merely names it (`scratch.to(inputs_embeds.device)`) does not: an
+    aligned merge onto that scratch buffer would land in `fixed_casts` and read to
+    the caller as "upstream fixed it".
+    """
+    while True:
+        if isinstance(node, ast.Name):
+            return node.id == "inputs_embeds"
+        if isinstance(node, ast.Call):
+            node = node.func
+        elif isinstance(node, (ast.Attribute, ast.Subscript)):
+            node = node.value
+        else:
+            return False
+
+
+def _gemma4_audio_merge_casts(forward_node):
+    """Split the audio `masked_scatter` source casts this patch can act on.
+
+    Returns `(buggy_casts, fixed_casts)`: `inputs_embeds.masked_scatter(mask,
+    audio_features.to(inputs_embeds.device[, inputs_embeds.dtype]))` argument
+    nodes, split by whether the dtype is already carried. Anything else (a wrapped
+    or reshaped source argument, a different call shape) matches NEITHER list,
+    which is exactly when this patch silently no-ops - so the drift canary in
+    tests/test_gemma4_dtype_drift_guards.py calls this same matcher on the real
+    transformers source rather than re-deriving it.
+
+    The receiver must be `inputs_embeds` (`_gemma4_receiver_is_inputs_embeds`):
+    only the embedding merge makes audio features reach the model, so a
+    `masked_scatter` onto any other tensor says nothing about our dtype.
+    """
+    buggy_casts = []
+    fixed_casts = []
+    for node in ast.walk(forward_node):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "masked_scatter"
+            and len(node.args) >= 2
+        ):
+            continue
+        if not _gemma4_receiver_is_inputs_embeds(node.func.value):
+            continue
+        source = node.args[1]
+        if not (
+            isinstance(source, ast.Call)
+            and _is_gemma4_attr(source.func, "audio_features", "to")
+            and source.args
+            and _is_gemma4_attr(source.args[0], "inputs_embeds", "device")
+        ):
+            continue
+        has_dtype = (
+            len(source.args) >= 2
+            and _is_gemma4_attr(source.args[1], "inputs_embeds", "dtype")
+        ) or any(
+            keyword.arg == "dtype"
+            and _is_gemma4_attr(keyword.value, "inputs_embeds", "dtype")
+            for keyword in source.keywords
+        )
+        (fixed_casts if has_dtype else buggy_casts).append(source)
+    return buggy_casts, fixed_casts
+pass
+
+
 def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
     """Align audio features to the actual text-embedding dtype at the merge site."""
     marker = "_unsloth_audio_feature_dtype_patched"
@@ -698,33 +766,7 @@ def _patch_gemma4_audio_feature_dtype_on_class(model_cls):
         return False
     forward_node = forward_nodes[0]
 
-    buggy_casts = []
-    fixed_casts = []
-    for node in ast.walk(forward_node):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "masked_scatter"
-            and len(node.args) >= 2
-        ):
-            continue
-        source = node.args[1]
-        if not (
-            isinstance(source, ast.Call)
-            and _is_gemma4_attr(source.func, "audio_features", "to")
-            and source.args
-            and _is_gemma4_attr(source.args[0], "inputs_embeds", "device")
-        ):
-            continue
-        has_dtype = (
-            len(source.args) >= 2
-            and _is_gemma4_attr(source.args[1], "inputs_embeds", "dtype")
-        ) or any(
-            keyword.arg == "dtype"
-            and _is_gemma4_attr(keyword.value, "inputs_embeds", "dtype")
-            for keyword in source.keywords
-        )
-        (fixed_casts if has_dtype else buggy_casts).append(source)
+    buggy_casts, fixed_casts = _gemma4_audio_merge_casts(forward_node)
 
     if not buggy_casts and len(fixed_casts) == 1:
         setattr(model_cls, marker, True)
