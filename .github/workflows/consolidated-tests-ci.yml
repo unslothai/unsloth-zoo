@@ -666,6 +666,16 @@ jobs:
       - name: tests/test_mlx_quantized_merge_save.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
 
+      - name: Fail if the merged_4bit quantize tests skipped
+        # The file skips wholesale on anything that stops mlx_lm.tuner.lora
+        # importing, so without this the every-PR quantize gate can go green
+        # having run nothing.
+        run: |
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -q -rs | tee qms.txt
+          if ! grep -qiE '[1-9][0-9]* passed' qms.txt; then
+            echo "real mlx is installed but no merged_4bit quantize test ran"; exit 1
+          fi
+
       # The three gated-delta files ran in no workflow at all: this lane's list
       # omitted them and the Apple Silicon lane, which is opt-in behind the `mlx`
       # label, names only test_qwen35_vjp_metal.py. So the ops VJP, the batched

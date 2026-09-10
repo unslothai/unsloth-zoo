@@ -16870,8 +16870,10 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
                 "the VLM quantized (the default) to get a 4-bit merge."
             )
             # Nothing is quantized, so a surviving grid would label this
-            # full-precision artifact 4-bit.
-            cfg = getattr(model, "_config", None)
+            # full-precision artifact 4-bit. Strip the config that is actually
+            # saved, which _get_model_config may resolve from `model.config` or
+            # `model.args` rather than from `_config`.
+            cfg = _get_model_config(model)
             if isinstance(cfg, dict):
                 model._config = _strip_mlx_quantization_metadata(cfg)
         else:

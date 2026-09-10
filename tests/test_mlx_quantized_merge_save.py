@@ -340,3 +340,32 @@ def test_unquantized_vlm_merge_does_not_claim_to_be_quantized(tmp_path):
     config = json.loads((tmp_path / "merged" / "config.json").read_text())
     assert "quantization" not in config, config
     assert "quantization_config" not in config, config
+
+
+def test_vlm_merge_strips_a_grid_that_lives_on_model_config(tmp_path):
+    """The strip has to cover the config that is actually saved.
+
+    ``_get_model_config`` falls back to ``model.config`` / ``model.args``, so
+    sanitizing only ``_config`` leaves a raw mlx-vlm model writing its stale
+    grid over full-precision weights.
+    """
+    import json
+
+    pytest.importorskip("mlx_vlm")
+
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    model = _tiny_llama(mx.float16)
+    assert not hasattr(model, "_config")
+    model.config = _tiny_llama_config(
+        vision_config={"hidden_size": 32},
+        quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        quantization_config={"group_size": 64, "bits": 4, "mode": "affine"},
+    )
+
+    save_merged_model(model, _StubTokenizer(), tmp_path / "merged",
+                      quantize_unquantized=True)
+
+    config = json.loads((tmp_path / "merged" / "config.json").read_text())
+    assert "quantization" not in config, config
+    assert "quantization_config" not in config, config
