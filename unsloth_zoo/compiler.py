@@ -2875,7 +2875,13 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.get_text_config\(\)\.vocab_size"
                 ")",
             )
-            .replace("$KWARGS$", r"(?:, \*\*(loss_kwargs|kwargs))?")
+            # Any identifier, not a list of the two names we had seen. transformers
+            # 5.17 renamed gemma3's to `lm_kwargs`, and because a finder that does
+            # not match is a silent no-op, the only symptom was Gemma 3 quietly
+            # losing fused linear cross entropy. One capture group either way, and
+            # the replacements splice the captured NAME in, so a new spelling
+            # works without being enumerated here.
+            .replace("$KWARGS$", r"(?:, \*\*([A-Za-z_]\w*))?")
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")
             .replace(
