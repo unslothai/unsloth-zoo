@@ -28,6 +28,9 @@ branch runs BEFORE the forward and injects forward kwargs, so "pretend liger is
 on" is only safe there if those kwargs are kept out of the model call.
 """
 import collections
+import contextlib
+import inspect
+import logging
 import sys
 import warnings
 from pathlib import Path
@@ -117,6 +120,11 @@ def _trainer(sftmod = None):
     self._metrics = {"train": collections.defaultdict(list),
                      "eval": collections.defaultdict(list)}
     self._total_train_tokens = 0
+    # Tensor parallel ranks see the same batch, so trl divides the gathered token
+    # count by this. One process here, so one. `object.__new__` skips the
+    # __init__ that would have set it; see test_the_stub_covers_what_trl_reads
+    # for the guard that catches the next attribute trl adds.
+    self._tp_size = 1
     self.aux_loss_enabled = False
     self.compute_loss_func = None
     return self
@@ -262,6 +270,37 @@ def test_it_is_registered(sft):
     from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
     assert any(getattr(f, "__name__", "") == "patch_trl_sft_logits_metrics"
                for f in TEMPORARY_PATCHES)
+
+
+def _self_reads(func):
+    """Every `self.NAME` this function reads."""
+    import ast, textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    return {node.attr for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name) and node.value.id == "self"
+            and isinstance(node.ctx, ast.Load)}
+
+
+def test_the_stub_covers_what_trl_reads(sft):
+    """`_trainer` builds an SFTTrainer with `object.__new__` and hand-seeds the
+    instance state, so trl adding one attribute to __init__ breaks every test in
+    this module at once with an AttributeError from deep inside trl. That is what
+    `_tp_size` did on trl 1.13: 29 failures, none of them naming the cause.
+
+    This is the one test that should go red instead. `hasattr` runs against a real
+    SFTTrainer instance, so class attributes and methods answer for themselves --
+    only genuinely new per-instance state trips it, which is exactly the case the
+    stub has to keep up with.
+    """
+    self = _trainer(sft)
+    missing = sorted(name for name in _self_reads(sft.SFTTrainer.compute_loss)
+                     if not hasattr(self, name))
+    assert not missing, (
+        f"trl's SFTTrainer.compute_loss reads self.{{{', '.join(missing)}}}, which "
+        f"`_trainer` does not provide. Seed each one there with the value trl's "
+        f"__init__ would have given it for a single-process CPU run."
+    )
 
 
 # ---- against a stand-in for trl 1.x --------------------------------------
@@ -550,11 +589,44 @@ def test_an_explicit_none_logits_is_still_the_sentinel(sft):
     assert self._metrics["train"]["mean_token_accuracy"] == []
 
 
-def test_the_entropy_warning_is_not_shown_when_both_are_omitted(sft, caplog):
+class _Records(logging.Handler):
+    """Reads the warnings off the logger that emits them.
+
+    `caplog` installs its handler on the ROOT logger, so it only sees what
+    propagates there. misc.py borrows a transformers logger, and once `unsloth`
+    is installed and imported that logger no longer propagates -- the warning
+    still reaches the user on stderr, but caplog.text is empty and the test reads
+    as "the warning was not shown". Attaching to the logger itself asks the
+    question the test is actually asking, whatever else configured logging first.
+    """
+
+    def __init__(self):
+        super().__init__(level = logging.WARNING)
+        self.text = ""
+
+    def emit(self, record):
+        self.text += record.getMessage() + "\n"
+
+
+@contextlib.contextmanager
+def _warnings_from(logger):
+    handler = _Records()
+    was_level, was_disabled = logger.level, logger.disabled
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
+    logger.disabled = False
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(was_level)
+        logger.disabled = was_disabled
+
+
+def test_the_entropy_warning_is_not_shown_when_both_are_omitted(sft):
     """The entropy patch promises "Entropy will be reported as 0.0". When the
     accuracy read then fails, the wrapper reports that BOTH are omitted, so the
     first message is wrong and the user sees two contradictory ones on step 1."""
-    import logging
     from unsloth_zoo.temporary_patches.misc import logger as misc_logger
     import trl.trainer.utils as trl_utils
     flag = getattr(trl_utils.entropy_from_logits, "_unsloth_warned", None)
@@ -563,9 +635,9 @@ def test_the_entropy_warning_is_not_shown_when_both_are_omitted(sft, caplog):
     was = flag[0]
     flag[0] = False
     try:
-        with caplog.at_level(logging.WARNING, logger = misc_logger.name):
+        with _warnings_from(misc_logger) as records:
             _run_steps(sft, EmptyLogits(), steps = 2)
-        text = caplog.text
+        text = records.text
     finally:
         flag[0] = was
     assert "Both will be omitted" in text
