@@ -16923,6 +16923,10 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
             # including when the quantize itself is what fails.
             restore_after_save = _snapshot_mlx_model_state(model)
 
+    # The object the caller still holds, which is what has to come back intact:
+    # `model` is rebound below.
+    caller_model = model
+
     try:
         if restore_after_save is not None:
             model = _quantize_merged_model_for_save(model)
@@ -16936,7 +16940,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
         config = _get_model_config(model)
     finally:
         if restore_after_save is not None:
-            _restore_mlx_model_state(model, restore_after_save)
+            _restore_mlx_model_state(caller_model, restore_after_save)
             restore_after_save = None
 
     if config:
@@ -17180,7 +17184,10 @@ def save_pretrained_merged(
             - ``"merged_16bit"``: fuse LoRA into base, dequantize, save full
               fp16/bf16 model. Needed for GGUF / llama.cpp downstream.
             - ``"merged_4bit"``: fuse LoRA into base while keeping the
-              base's 4-bit quantization. Only meaningful for QLoRA.
+              base's 4-bit quantization, or quantize the merged weights to
+              4-bit when the base was loaded unquantized (``load_in_16bit``
+              or ``full_finetuning``). Unquantized VLMs are saved at full
+              precision with a notice; quantizing those is not supported yet.
         push_to_hub: If True, upload to HuggingFace Hub after saving.
         token: HuggingFace token for pushing.
         private: Whether the HF repo should be private.
