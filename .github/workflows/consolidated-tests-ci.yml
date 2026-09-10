@@ -668,8 +668,7 @@ jobs:
 
       - name: Fail if the merged_4bit quantize tests skipped
         # The file skips wholesale on anything that stops mlx_lm.tuner.lora
-        # importing, so without this the every-PR quantize gate can go green
-        # having run nothing.
+        # importing, so without this the gate can go green having run nothing.
         run: |
           .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -q -rs | tee qms.txt
           if ! grep -qiE '[1-9][0-9]* passed' qms.txt; then

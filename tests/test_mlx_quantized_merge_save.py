@@ -343,11 +343,9 @@ def test_unquantized_vlm_merge_does_not_claim_to_be_quantized(tmp_path):
 
 
 def test_vlm_merge_strips_a_grid_that_lives_on_model_config(tmp_path):
-    """The strip has to cover the config that is actually saved.
-
-    ``_get_model_config`` falls back to ``model.config`` / ``model.args``, so
-    sanitizing only ``_config`` leaves a raw mlx-vlm model writing its stale
-    grid over full-precision weights.
+    """``_get_model_config`` falls back to ``model.config`` / ``model.args``, so
+    sanitizing only ``_config`` leaves a raw mlx-vlm model writing its stale grid
+    over full-precision weights.
     """
     import json
 
