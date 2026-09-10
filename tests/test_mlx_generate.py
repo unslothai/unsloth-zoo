@@ -164,6 +164,11 @@ def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
             raise ValueError("body")
 
 def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
+    for name in (
+        "mlx_lm.generate", "mlx_vlm.generate", "mlx_vlm.generate.dispatch",
+        "mlx_vlm.generate.ar", "mlx_vlm.speculative.common",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.SimpleNamespace())
     events = []
     monkeypatch.setattr(
         "mlx.core.synchronize",
