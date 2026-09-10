@@ -47,6 +47,32 @@ def test_resumed_grid_uses_absolute_offset_and_rejects_inconsistent_cache():
         schedule.chunk_size(512, [SimpleNamespace(offset = 0), SimpleNamespace(offset = 256)])
 
 
+@pytest.mark.parametrize("rows,offset,threshold,chunks", [
+    (7936, 0, None, [2048, 2048, 2048, 1024, 512, 256]),
+    (7953, 0, None, [2048, 2048, 2048, 1024, 512, 256, 17]),
+    (4096, 0, None, [2048, 2048]),
+    (1024, 7936, None, [1024]),
+    (6144, 1792, 2500, [512, 256, 2048, 2048, 1024, 256]),
+    (784, 17, None, [239, 512, 33]),
+    (255, 0, None, [255]),
+])
+def test_largest_first_preserves_tail_boundaries_and_counts_resume(rows, offset, threshold, chunks):
+    schedule = prefill.DynamicPrefillSchedule(quantized_kv_start = threshold, largest_first = True)
+    end = rows + offset
+    boundary = schedule.boundary_at(end)
+    assert boundary == end // 256 * 256
+    cache = [SimpleNamespace(offset = offset)]
+    actual, ends = [], []
+    while rows:
+        size = schedule.chunk_size(rows, cache)
+        actual.append(size)
+        rows -= size
+        cache[0].offset += size
+        ends.append(cache[0].offset)
+    assert actual == chunks
+    assert schedule.steps_until(offset, boundary) == sum(end <= boundary for end in ends)
+
+
 @pytest.mark.parametrize("width,bits,group,dtype", [(256, 4, 32, mx.float16), (512, 8, 64, mx.bfloat16), (1024, 4, 128, mx.float32)])
 def test_canonical_projection_matches_256_row_arithmetic_and_restores(width, bits, group, dtype):
     mx.random.seed(51)
@@ -119,7 +145,7 @@ def test_install_preserves_native_call_forms_and_falls_back_for_native_modes(mon
         yield "native"
 
     def adapted(*args, **kwargs):
-        yield "dynamic"
+        yield "largest-first" if kwargs["_unsloth_prefill_schedule"].largest_first else "dynamic"
 
     monkeypatch.setattr(ar, "generate_step", original)
     monkeypatch.setattr(dispatch, "generate_step", original)
@@ -137,6 +163,9 @@ def test_install_preserves_native_call_forms_and_falls_back_for_native_modes(mon
     assert list(ar.generate_step(ids, model, None, None, kv_bits = 4, **options)) == ["dynamic"]
     assert list(ar.generate_step(ids, model, object(), None, **options)) == ["dynamic"]
     assert list(ar.generate_step(ids, model, None, None, audio_features = object(), **options)) == ["dynamic"]
+    options["_unsloth_prefill_schedule"].largest_first = True
+    assert list(ar.generate_step(ids, model, None, None, **options)) == ["largest-first"]
+    options["_unsloth_prefill_schedule"].largest_first = False
     for extra in ({"prompt_cache": [object()]}, {"draft_model": object()}, {"kv_bits": 4, "kv_quant_scheme": "turboquant"}, {"prompt_cache_checkpoint": object()}):
         assert list(ar.generate_step(ids, model, None, None, **options, **extra)) == ["native"]
     options["prefill_step_size"] = None
@@ -476,8 +505,9 @@ def test_batched_attention_preserves_padding_and_every_cache_row(kind, prefix):
     assert fixed.meta_state == dynamic.meta_state
 
 
+@pytest.mark.parametrize("largest_first", [False, True])
 @pytest.mark.parametrize("cache_kind", ["plain", "quantized", "rotating"])
-def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(monkeypatch, cache_kind):
+def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(monkeypatch, cache_kind, largest_first):
     from mlx_vlm.generate.ar import BatchGenerator
     from mlx_vlm.models.llama.config import ModelConfig
     from mlx_vlm.models.llama.language import LanguageModel
@@ -502,7 +532,7 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
     model = nn.Module()
     model.language_model = language
     model.eval()
-    schedule = prefill.create_dynamic_prefill_schedule(model)
+    schedule = prefill.create_dynamic_prefill_schedule(model, largest_first = largest_first)
     assert schedule is not None
     prompts = [[(i * 7 + 3) % 128 for i in range(3860)], [(i * 5 + 17) % 128 for i in range(3447)]]
     prompt_kwargs = [{"inputs_embeds": language.model.embed_tokens(mx.array([ids]))} for ids in prompts]
@@ -539,7 +569,8 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
     assert len(outputs[0][0]) == 4 and len(outputs[0][1]) == 6
     assert outputs[0][0][0] != outputs[0][1][0]
     assert [shape[1] for shape, _ in traces[0] if shape[1] > 1] == [256] * 15 + [19]
-    assert [shape[1] for shape, _ in traces[1] if shape[1] > 1] == [256, 256, 256, 1024, 2048, 19]
+    expected = [256, 256, 2048, 1024, 256, 19] if largest_first else [256, 256, 256, 1024, 2048, 19]
+    assert [shape[1] for shape, _ in traces[1] if shape[1] > 1] == expected
     assert all(shape[0] == 2 for shape, _ in traces[1] if shape[1] > 1)
     assert all(cls is not nn.QuantizedLinear for shape, cls in traces[1] if shape[1] > 1)
     assert all(cls is nn.QuantizedLinear for shape, cls in traces[1] if shape[1] == 1)
