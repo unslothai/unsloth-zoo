@@ -14,10 +14,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-_PREFILL_CANONICAL_STEP = 256
+_PREFILL_LEGACY_STEP_SIZE = 256
 
 
-_PREFILL_ARITHMETIC_STEP = ContextVar("prefill_arithmetic_step", default = 256)
+_PREFILL_ARITHMETIC_STEP = ContextVar("prefill_arithmetic_step", default = _PREFILL_LEGACY_STEP_SIZE)
 
 
 _PREFILL_MAX_CHUNK_SIZE = 2048
@@ -135,14 +135,19 @@ def _prefill_attention_class(base):
 
 
 class DynamicPrefillSchedule:
-    """Grow prefill chunks while preserving a configurable fixed-step arithmetic grid."""
+    """Schedule prefill on a fixed arithmetic grid; optionally consume largest chunks first.
 
-    def __init__(self, model = None, step_size = _PREFILL_CANONICAL_STEP, quantized_kv_start = None):
+    Prefix-cache integrations enabling ``largest_first`` must use ``steps_until``
+    to count forwards, since tail chunks depend on the remaining prompt length.
+    """
+
+    def __init__(self, model = None, step_size = _PREFILL_LEGACY_STEP_SIZE, quantized_kv_start = None, *, largest_first = False):
         if type(step_size) is not int or step_size <= 0:
             raise ValueError("prefill step_size must be a positive integer")
         self.model = model
         self.step_size = step_size
         self.quantized_kv_start = quantized_kv_start
+        self.largest_first = largest_first
         # Conversion follows the first fixed-step append reaching this threshold.
         self._quantization_boundary = None if quantized_kv_start is None else max(
             step_size, ((quantized_kv_start + step_size - 1) // step_size) * step_size,
@@ -165,6 +170,8 @@ class DynamicPrefillSchedule:
         return boundary
 
     def boundary_at(self, rows):
+        if self.largest_first:
+            return max(0, rows // self.step_size * self.step_size)
         boundary, chunk = 0, self.step_size
         limit = max(self.step_size, _PREFILL_MAX_CHUNK_SIZE // self.step_size * self.step_size)
         while chunk < limit and boundary + chunk <= rows:
@@ -174,6 +181,14 @@ class DynamicPrefillSchedule:
         if self._quantization_boundary is not None and self._quantization_boundary <= rows:
             boundary = max(boundary, self._quantization_boundary)
         return boundary
+
+    def steps_until(self, offset, boundary):
+        """Count prefill forwards from a cached offset through a snapshot boundary."""
+        count = 0
+        while offset < boundary:
+            offset += self._chunk_size_at(boundary - offset, offset)
+            count += 1
+        return count
 
     def chunk_size(self, remaining, cache):
         offsets = [entry.offset for entry in cache if type(getattr(entry, "offset", None)) is int]
@@ -185,6 +200,16 @@ class DynamicPrefillSchedule:
         owners = _PREFILL_KV_OWNERS.get()
         if owners is not None:
             owners.clear()
+        if self.largest_first:
+            limit = max(self.step_size, _PREFILL_MAX_CHUNK_SIZE // self.step_size * self.step_size)
+            budget = min(remaining, limit)
+            if self._quantization_boundary is not None and offset < self._quantization_boundary:
+                budget = min(budget, self._quantization_boundary - offset)
+            if offset % self.step_size:
+                return min(budget, self.step_size - offset % self.step_size)
+            if budget < self.step_size:
+                return budget
+            return self.step_size * (1 << ((budget // self.step_size).bit_length() - 1))
         chunk = min(self.next_boundary(offset) - offset, remaining)
         # Preserve the small final forward's kernel dispatch, including wide projections.
         if chunk == remaining and remaining > self.step_size and remaining % self.step_size:
@@ -193,7 +218,7 @@ class DynamicPrefillSchedule:
 
     @staticmethod
     @contextmanager
-    def arithmetic(model, step_size = _PREFILL_CANONICAL_STEP):
+    def arithmetic(model, step_size = _PREFILL_LEGACY_STEP_SIZE):
         changed = []
         token = _PREFILL_KV_OWNERS.set({})
         step_token = _PREFILL_ARITHMETIC_STEP.set(step_size)
@@ -203,7 +228,7 @@ class DynamicPrefillSchedule:
                 if _has_supported_prefill_attention(base):
                     module.__class__ = _prefill_attention_class(base)
                 elif base is nn.QuantizedLinear and (
-                    step_size != _PREFILL_CANONICAL_STEP
+                    step_size != _PREFILL_LEGACY_STEP_SIZE
                     or module.weight.shape[0] <= _PREFILL_MAX_QUANTIZED_OUTPUT_DIM
                 ):
                     module.__class__ = _PrefillQuantizedLinear
@@ -342,7 +367,7 @@ def _install_dynamic_prefill():
         quantized_start = None
         if kwargs.get("kv_bits") is not None:
             quantized_start = kwargs.get("quantized_kv_start", original.__globals__.get("DEFAULT_QUANTIZED_KV_START", 0))
-        schedule = DynamicPrefillSchedule(model, step, quantized_start)
+        schedule = DynamicPrefillSchedule(model, step, quantized_start, largest_first = _unsloth_prefill_schedule.largest_first)
         kwargs["prefill_step_size"] = step
         yield from adapted(
             *args,
@@ -398,7 +423,7 @@ def _install_dynamic_batch_prefill():
         ):
             return original_step(self)
         # Batch offsets include per-row padding; the native arithmetic grid uses columns.
-        batch_schedule = DynamicPrefillSchedule(schedule.model, step)
+        batch_schedule = DynamicPrefillSchedule(schedule.model, step, largest_first = schedule.largest_first)
         self.prefill_step_size = batch_schedule._chunk_size_at(
             self._inputs_embeds.shape[1] - 1, self._processed_prompt_columns,
         )
@@ -417,7 +442,7 @@ def _install_dynamic_batch_prefill():
     _PREFILL_BATCH_METHODS = (initialize, advance, prompt_step)
 
 
-def create_dynamic_prefill_schedule(model, step_size = _PREFILL_CANONICAL_STEP, quantized_kv_start = None):
+def create_dynamic_prefill_schedule(model, step_size = _PREFILL_LEGACY_STEP_SIZE, quantized_kv_start = None, *, largest_first = False):
     """Return a dynamic prefill schedule, or None to retain native prefill.
 
     Native modality policies decide whether embeddings can be chunked. Uniform
@@ -427,6 +452,11 @@ def create_dynamic_prefill_schedule(model, step_size = _PREFILL_CANONICAL_STEP, 
     Pass the schedule as ``_unsloth_prefill_schedule`` to ``batch_generate`` or
     ``BatchGenerator``, with ``prefill_step_size=schedule.step_size``. Cache reuse must
     use this schedule's step size, boundaries, and a separate cache namespace.
+    Enable ``largest_first`` to start at the largest fitting chunk and shrink the
+    tail; prefix-cache integrations must then count forwards with ``steps_until``.
+    The factory keeps its legacy 256-step default for older cache integrations.
+    Pass ``step_size=2048`` to match native mlx-vlm arithmetic; with a 2048 cap,
+    largest-first uses full 2048 chunks followed by one exact remainder.
     Obtain a new schedule after changing the model.
     """
     language = getattr(model, "language_model", None)
@@ -456,4 +486,4 @@ def create_dynamic_prefill_schedule(model, step_size = _PREFILL_CANONICAL_STEP, 
     if any(type(cache) not in (ArraysCache, KVCache, QuantizedKVCache, RotatingKVCache) for cache in caches):
         return None
     _install_dynamic_batch_prefill()
-    return DynamicPrefillSchedule(model, step_size, quantized_kv_start)
+    return DynamicPrefillSchedule(model, step_size, quantized_kv_start, largest_first = largest_first)

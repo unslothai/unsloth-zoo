@@ -16,6 +16,30 @@ import mlx.nn as nn
 from unsloth_zoo.mlx import inference as prefill
 
 
+@pytest.mark.parametrize("rows,chunks,boundary", [
+    (2047, [2047], 0), (2048, [2048], 2048),
+    (4095, [2048, 2047], 2048),
+    (7900, [2048, 2048, 2048, 1756], 6144),
+])
+def test_largest_first_matches_native_2048_grid(rows, chunks, boundary):
+    from mlx_vlm.generate.common import DEFAULT_PREFILL_STEP_SIZE
+    schedule = prefill.DynamicPrefillSchedule(step_size = 2048, largest_first = True)
+    assert schedule.step_size == DEFAULT_PREFILL_STEP_SIZE == 2048
+    assert schedule.boundary_at(rows) == boundary
+    assert schedule.steps_until(0, boundary) == boundary // 2048
+    with schedule.arithmetic(SimpleNamespace(language_model = nn.Sequential()), schedule.step_size):
+        assert prefill._PREFILL_ARITHMETIC_STEP.get() == 2048
+    cache = [SimpleNamespace(offset = 0)]
+    actual = []
+    while rows:
+        n = schedule.chunk_size(rows, cache)
+        actual.append(n)
+        rows -= n
+        cache[0].offset += n
+    assert actual == chunks
+    assert schedule.chunk_size(4096, [SimpleNamespace(offset = boundary)]) == 2048
+
+
 @pytest.mark.parametrize("rows,chunks", [
     (255, [255]), (256, [256]), (257, [256, 1]),
     (767, [256, 256, 255]), (768, [256, 512]),
@@ -45,6 +69,32 @@ def test_resumed_grid_uses_absolute_offset_and_rejects_inconsistent_cache():
         assert schedule.boundary_at(rows) == expected
     with pytest.raises(ValueError, match = "consistent absolute"):
         schedule.chunk_size(512, [SimpleNamespace(offset = 0), SimpleNamespace(offset = 256)])
+
+
+@pytest.mark.parametrize("rows,offset,threshold,chunks", [
+    (7936, 0, None, [2048, 2048, 2048, 1024, 512, 256]),
+    (7953, 0, None, [2048, 2048, 2048, 1024, 512, 256, 17]),
+    (4096, 0, None, [2048, 2048]),
+    (1024, 7936, None, [1024]),
+    (6144, 1792, 2500, [512, 256, 2048, 2048, 1024, 256]),
+    (784, 17, None, [239, 512, 33]),
+    (255, 0, None, [255]),
+])
+def test_largest_first_preserves_tail_boundaries_and_counts_resume(rows, offset, threshold, chunks):
+    schedule = prefill.DynamicPrefillSchedule(quantized_kv_start = threshold, largest_first = True)
+    end = rows + offset
+    boundary = schedule.boundary_at(end)
+    assert boundary == end // 256 * 256
+    cache = [SimpleNamespace(offset = offset)]
+    actual, ends = [], []
+    while rows:
+        size = schedule.chunk_size(rows, cache)
+        actual.append(size)
+        rows -= size
+        cache[0].offset += size
+        ends.append(cache[0].offset)
+    assert actual == chunks
+    assert schedule.steps_until(offset, boundary) == sum(end <= boundary for end in ends)
 
 
 @pytest.mark.parametrize("width,bits,group,dtype", [(256, 4, 32, mx.float16), (512, 8, 64, mx.bfloat16), (1024, 4, 128, mx.float32)])
@@ -113,13 +163,15 @@ def test_install_preserves_native_call_forms_and_falls_back_for_native_modes(mon
     ar = importlib.import_module("mlx_vlm.generate.ar")
     dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
     calls = []
+    steps = []
 
     def original(input_ids, model, pixel_values, mask, **kwargs):
         calls.append((input_ids, model, pixel_values, mask, kwargs))
         yield "native"
 
     def adapted(*args, **kwargs):
-        yield "dynamic"
+        steps.append(kwargs["_unsloth_prefill_schedule"].step_size)
+        yield "largest-first" if kwargs["_unsloth_prefill_schedule"].largest_first else "dynamic"
 
     monkeypatch.setattr(ar, "generate_step", original)
     monkeypatch.setattr(dispatch, "generate_step", original)
@@ -137,12 +189,19 @@ def test_install_preserves_native_call_forms_and_falls_back_for_native_modes(mon
     assert list(ar.generate_step(ids, model, None, None, kv_bits = 4, **options)) == ["dynamic"]
     assert list(ar.generate_step(ids, model, object(), None, **options)) == ["dynamic"]
     assert list(ar.generate_step(ids, model, None, None, audio_features = object(), **options)) == ["dynamic"]
+    options["_unsloth_prefill_schedule"].largest_first = True
+    assert list(ar.generate_step(ids, model, None, None, **options)) == ["largest-first"]
+    options["_unsloth_prefill_schedule"].largest_first = False
     for extra in ({"prompt_cache": [object()]}, {"draft_model": object()}, {"kv_bits": 4, "kv_quant_scheme": "turboquant"}, {"prompt_cache_checkpoint": object()}):
         assert list(ar.generate_step(ids, model, None, None, **options, **extra)) == ["native"]
     options["prefill_step_size"] = None
     assert list(ar.generate_step(ids, model, None, None, **options)) == ["native"]
     options["prefill_step_size"] = 512
     assert list(ar.generate_step(ids, model, None, None, **options)) == ["dynamic"]
+    assert steps[-1] == 512
+    options["prefill_step_size"] = 2048
+    assert list(ar.generate_step(ids, model, None, None, **options)) == ["dynamic"]
+    assert steps[-1] == 2048
     ids.shape = (2, 10)
     assert list(ar.generate_step(ids, model, None, None, **options)) == ["native"]
 
@@ -156,7 +215,7 @@ def test_factory_accepts_native_formats_and_declines_training_or_adapters(monkey
     model.freeze()
     model.eval()
     monkeypatch.setattr(prefill, "_install_dynamic_prefill", lambda: True)
-    assert prefill.create_dynamic_prefill_schedule(model) is not None
+    assert prefill.create_dynamic_prefill_schedule(model).step_size == 256
     model.language_model.layers[0].lora_a = mx.zeros((1, 1))
     model.freeze()
     assert prefill.create_dynamic_prefill_schedule(model) is None
@@ -476,8 +535,10 @@ def test_batched_attention_preserves_padding_and_every_cache_row(kind, prefix):
     assert fixed.meta_state == dynamic.meta_state
 
 
+@pytest.mark.parametrize("step_size", [256, 2048])
+@pytest.mark.parametrize("largest_first", [False, True])
 @pytest.mark.parametrize("cache_kind", ["plain", "quantized", "rotating"])
-def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(monkeypatch, cache_kind):
+def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(monkeypatch, cache_kind, largest_first, step_size):
     from mlx_vlm.generate.ar import BatchGenerator
     from mlx_vlm.models.llama.config import ModelConfig
     from mlx_vlm.models.llama.language import LanguageModel
@@ -502,7 +563,7 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
     model = nn.Module()
     model.language_model = language
     model.eval()
-    schedule = prefill.create_dynamic_prefill_schedule(model)
+    schedule = prefill.create_dynamic_prefill_schedule(model, step_size = step_size, largest_first = largest_first)
     assert schedule is not None
     prompts = [[(i * 7 + 3) % 128 for i in range(3860)], [(i * 5 + 17) % 128 for i in range(3447)]]
     prompt_kwargs = [{"inputs_embeds": language.model.embed_tokens(mx.array([ids]))} for ids in prompts]
@@ -519,7 +580,7 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
         calls.clear()
         gen = BatchGenerator(
             language, SimpleNamespace(stopping_criteria = NoStop()),
-            prefill_batch_size = 2, completion_batch_size = 2, prefill_step_size = 256,
+            prefill_batch_size = 2, completion_batch_size = 2, prefill_step_size = step_size,
             kv_bits = 4 if cache_kind == "quantized" else None,
             _unsloth_prefill_schedule = schedule if dynamic else None,
         )
@@ -538,8 +599,10 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
     assert outputs[0] == outputs[1]
     assert len(outputs[0][0]) == 4 and len(outputs[0][1]) == 6
     assert outputs[0][0][0] != outputs[0][1][0]
-    assert [shape[1] for shape, _ in traces[0] if shape[1] > 1] == [256] * 15 + [19]
-    assert [shape[1] for shape, _ in traces[1] if shape[1] > 1] == [256, 256, 256, 1024, 2048, 19]
+    native_chunks = [256] * 15 + [19] if step_size == 256 else [2048, 1811]
+    assert [shape[1] for shape, _ in traces[0] if shape[1] > 1] == native_chunks
+    expected = [256, 256, 2048, 1024, 256, 19] if largest_first else [256, 256, 256, 1024, 2048, 19]
+    assert [shape[1] for shape, _ in traces[1] if shape[1] > 1] == (expected if step_size == 256 else native_chunks)
     assert all(shape[0] == 2 for shape, _ in traces[1] if shape[1] > 1)
     assert all(cls is not nn.QuantizedLinear for shape, cls in traces[1] if shape[1] > 1)
     assert all(cls is nn.QuantizedLinear for shape, cls in traces[1] if shape[1] == 1)
@@ -559,11 +622,11 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
             gen.next()
         assert prefill._PREFILL_BATCH_SCHEDULE.get() is None
         assert type(language.layers[0].self_attn.q_proj) is nn.QuantizedLinear
-        assert gen._prompt_batch.prefill_step_size == 256
+        assert gen._prompt_batch.prefill_step_size == step_size
         monkeypatch.setattr(LanguageModel, "__call__", forward)
         gen._prompt_batch._apc_manager = object()
         calls.clear()
         gen.next()
-        assert calls[0] == ((2, 256), nn.QuantizedLinear)
+        assert calls[0] == ((2, step_size), nn.QuantizedLinear)
     finally:
         gen.close()
