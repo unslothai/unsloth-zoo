@@ -127,34 +127,35 @@ def test_switch_linear_experts_are_detected():
 # contract without downloading a published checkpoint.
 # ---------------------------------------------------------------------------
 
-def _tiny_llama(dtype):
+def _tiny_llama(dtype, hidden_size=128, intermediate_size=256, vocab_size=512):
     """A real mlx-lm llama, small enough to build in-process."""
     llama = pytest.importorskip("mlx_lm.models.llama")
     args = llama.ModelArgs(
         model_type="llama",
-        hidden_size=128,
+        hidden_size=hidden_size,
         num_hidden_layers=2,
-        intermediate_size=256,
+        intermediate_size=intermediate_size,
         num_attention_heads=4,
         num_key_value_heads=2,
         rms_norm_eps=1e-5,
-        vocab_size=512,
+        vocab_size=vocab_size,
     )
     model = llama.Model(args)
     model.update(mlx_tree_map(lambda v: v.astype(dtype), model.parameters()))
     return model
 
 
-def _tiny_llama_config(**overrides):
+def _tiny_llama_config(hidden_size=128, intermediate_size=256, vocab_size=512,
+                       **overrides):
     config = {
         "model_type": "llama",
-        "hidden_size": 128,
+        "hidden_size": hidden_size,
         "num_hidden_layers": 2,
-        "intermediate_size": 256,
+        "intermediate_size": intermediate_size,
         "num_attention_heads": 4,
         "num_key_value_heads": 2,
         "rms_norm_eps": 1e-5,
-        "vocab_size": 512,
+        "vocab_size": vocab_size,
         "torch_dtype": "float16",
     }
     config.update(overrides)
@@ -240,3 +241,78 @@ def test_quantize_for_save_leaves_dtype_alone_when_config_says_nothing():
     _quantize_merged_model_for_save(model)
 
     assert model.model.norm.weight.dtype == mx.float32
+
+
+def test_quantize_for_save_does_not_claim_a_grid_it_could_not_apply():
+    """Nothing quantizable must not produce a checkpoint that claims 4-bit.
+
+    ``quantize_model`` writes the grid into the config from its arguments, not
+    from what it managed to convert, so a model whose dimensions are not a
+    multiple of the group size comes back untouched but labelled 4-bit. That is
+    the same silent full-precision-on-a-4-bit-request this path exists to fix,
+    one level down.
+    """
+    dims = dict(hidden_size=48, intermediate_size=96, vocab_size=100)
+    model = _tiny_llama(mx.float16, **dims)
+    model._config = _tiny_llama_config(**dims)
+
+    _quantize_merged_model_for_save(model)
+
+    assert not _model_has_quantized_module(model), "fixture is quantizable"
+    assert "quantization" not in _get_model_config(model)
+    assert "quantization_config" not in _get_model_config(model)
+
+
+# ---------------------------------------------------------------------------
+# The save must not keep the model it quantized
+#
+# Driven through ``save_merged_model`` because the mutation is only observable
+# after the checkpoint is written.
+# ---------------------------------------------------------------------------
+
+class _StubTokenizer:
+    def save_pretrained(self, path):
+        pass
+
+
+def test_merged_4bit_save_hands_the_live_model_back_unchanged(tmp_path):
+    """The user's model is still fp32/fp16 after a merged_4bit save.
+
+    The quantize step rewrites the live model, so without a restore the session
+    silently keeps a 4-bit model: a later ``merged_16bit`` export writes weights
+    dequantized from 4-bit, and continued training trains quantized layers.
+    """
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    model = _tiny_llama(mx.float32)
+    model._config = _tiny_llama_config()
+    tokens = mx.array([[1, 2, 3]])
+    before = model(tokens)
+    mx.eval(before)
+
+    save_merged_model(model, _StubTokenizer(), tmp_path / "merged",
+                      quantize_unquantized=True)
+
+    assert not _model_has_quantized_module(model)
+    assert model.model.norm.weight.dtype == mx.float32
+    assert "quantization" not in _get_model_config(model)
+    after = model(tokens)
+    mx.eval(after)
+    assert mx.array_equal(before, after)
+
+
+def test_merged_4bit_save_still_writes_a_quantized_checkpoint(tmp_path):
+    """Restoring the live model must not walk back the artifact."""
+    import json
+
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    model = _tiny_llama(mx.float32)
+    model._config = _tiny_llama_config()
+
+    save_merged_model(model, _StubTokenizer(), tmp_path / "merged",
+                      quantize_unquantized=True)
+
+    config = json.loads((tmp_path / "merged" / "config.json").read_text())
+    assert config["quantization"]["bits"] == 4
+    assert config["quantization"]["group_size"] == 64

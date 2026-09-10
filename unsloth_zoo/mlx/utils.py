@@ -14159,6 +14159,20 @@ def _quantize_merged_model_for_save(model):
         mode=_MERGED_SAVE_QUANT_MODE,
         quant_predicate=predicate,
     )
+    if not _model_has_quantized_module(model):
+        # quantize_model() writes the grid into the config even when its own
+        # shape checks skipped every module (a hidden size that is not a
+        # multiple of the group size quantizes nothing). Keeping that grid
+        # would advertise 4-bit weights the checkpoint does not contain --
+        # the same silent mismatch this whole path exists to remove.
+        model._config = _strip_mlx_quantization_metadata(updated_config)
+        print(
+            "Unsloth: save_method='merged_4bit' could not quantize any layer of "
+            "this model (no layer is compatible with "
+            f"group_size={_MERGED_SAVE_QUANT_GROUP_SIZE}), so it is saved at "
+            "full precision, without quantization metadata."
+        )
+        return model
     model._config = updated_config
     print(
         f"Unsloth: quantizing the merged model to "
@@ -14167,6 +14181,32 @@ def _quantize_merged_model_for_save(model):
         f"mode={_MERGED_SAVE_QUANT_MODE!r}) for save_method='merged_4bit'."
     )
     return model
+
+
+def _snapshot_mlx_model_state(model):
+    """Everything needed to undo a save-time cast + quantize on a live model.
+
+    MLX arrays are immutable, so the parameter tree is captured by reference;
+    only the module objects the quantize step replaces are held alive.
+    """
+    return (model.leaf_modules(), model.parameters(), getattr(model, "_config", None))
+
+
+def _restore_mlx_model_state(model, snapshot):
+    """Put the live model back the way the caller handed it over.
+
+    ``merged_4bit`` on an unquantized model quantizes and down-casts the model
+    that is still in the user's hands. Without this, a save silently turns the
+    session's fp16/fp32 model into a 4-bit one: a later ``merged_16bit`` export
+    writes weights dequantized from 4-bit, and continued training trains a
+    quantized model. Fusing LoRA into the base is a deliberate part of a merged
+    save and is *not* undone here; losing precision is not.
+    """
+    leaf_modules, parameters, config = snapshot
+    model.update_modules(leaf_modules)
+    model.update(parameters)
+    if config is not None:
+        model._config = config
 
 
 def save_merged_model(model, tokenizer, path, dequantize=False,
@@ -14196,6 +14236,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
 
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
+    restore_after_save = None
 
     # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
@@ -14223,15 +14264,23 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
                 "the VLM quantized (the default) to get a 4-bit merge."
             )
         else:
+            # The quantize step rewrites the caller's live model, so keep what
+            # is needed to hand it back unchanged once the checkpoint is out.
+            restore_after_save = _snapshot_mlx_model_state(model)
             model = _quantize_merged_model_for_save(model)
 
     de_lora_model = model
 
-    # Save sharded safetensors + index.json
-    save_model(path, de_lora_model, donate_model=False)
+    try:
+        # Save sharded safetensors + index.json
+        save_model(path, de_lora_model, donate_model=False)
 
-    # Save config.json
-    config = _get_model_config(model)
+        # Save config.json
+        config = _get_model_config(model)
+    finally:
+        if restore_after_save is not None:
+            _restore_mlx_model_state(model, restore_after_save)
+
     if config:
         is_vlm = _is_vlm_model(model) or _has_vision_config(config)
         _save_mlx_config(

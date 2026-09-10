@@ -449,3 +449,8 @@ jobs:
 
       - name: tests/test_mlx_batching_and_decay.py
         run: python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
+
+      - name: tests/test_mlx_quantized_merge_save.py
+        # Needs the real mlx runtime but not Metal, so the merged_4bit quantize
+        # is gated on every PR here rather than only in the label-gated Mac job.
+        run: python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
