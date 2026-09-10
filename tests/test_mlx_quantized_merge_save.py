@@ -316,3 +316,76 @@ def test_merged_4bit_save_still_writes_a_quantized_checkpoint(tmp_path):
     config = json.loads((tmp_path / "merged" / "config.json").read_text())
     assert config["quantization"]["bits"] == 4
     assert config["quantization"]["group_size"] == 64
+
+
+def test_merged_4bit_save_removes_a_config_it_had_to_invent(tmp_path):
+    """A model that arrived without ``_config`` must not keep the quantized one.
+
+    The quantize step assigns ``_config`` unconditionally, so restoring only
+    when there was something to restore leaves the live model advertising a
+    4-bit grid over the full-precision weights just handed back -- which the
+    next save, or a ``lora`` save stamping the base grid into
+    adapter_config.json, then writes out.
+    """
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    model = _tiny_llama(mx.float16)
+    assert not hasattr(model, "_config")
+
+    save_merged_model(model, _StubTokenizer(), tmp_path / "merged",
+                      quantize_unquantized=True)
+
+    assert not hasattr(model, "_config")
+
+
+def test_a_failed_merged_4bit_save_still_returns_the_model(tmp_path, monkeypatch):
+    """The restore has to cover the quantize itself, not just the write.
+
+    Quantizing a large full-finetuned model is exactly where an out-of-memory
+    failure happens, and it fails *after* the modules have been replaced -- so
+    a snapshot taken but only applied on the success path hands back a 4-bit
+    model from a save that did not happen.
+    """
+    import mlx_lm.utils
+
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    model = _tiny_llama(mx.float32)
+    model._config = _tiny_llama_config()
+
+    def _explode(*args, **kwargs):
+        import mlx.nn as _nn
+        _nn.quantize(args[0], group_size=64, bits=4)
+        raise RuntimeError("simulated failure after the modules were replaced")
+
+    monkeypatch.setattr(mlx_lm.utils, "quantize_model", _explode)
+
+    with pytest.raises(RuntimeError):
+        save_merged_model(model, _StubTokenizer(), tmp_path / "merged",
+                          quantize_unquantized=True)
+
+    assert not _model_has_quantized_module(model)
+    assert model.model.norm.weight.dtype == mx.float32
+
+
+def test_unquantized_vlm_merge_does_not_claim_to_be_quantized(tmp_path):
+    """The VLM bail-out saves full precision, so it must not label it 4-bit."""
+    import json
+
+    pytest.importorskip("mlx_vlm")
+
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    model = _tiny_llama(mx.float16)
+    model._config = _tiny_llama_config(
+        vision_config={"hidden_size": 32},
+        quantization={"group_size": 64, "bits": 4, "mode": "affine"},
+        quantization_config={"group_size": 64, "bits": 4, "mode": "affine"},
+    )
+
+    save_merged_model(model, _StubTokenizer(), tmp_path / "merged",
+                      quantize_unquantized=True)
+
+    config = json.loads((tmp_path / "merged" / "config.json").read_text())
+    assert "quantization" not in config, config
+    assert "quantization_config" not in config, config

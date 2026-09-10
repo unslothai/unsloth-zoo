@@ -14038,10 +14038,19 @@ def _model_has_quantized_module(model):
     except Exception:
         pass
     quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
-    return any(
-        isinstance(module, quantized_types)
-        for _, module in model.named_modules()
-    )
+
+    def _is_quantized(module):
+        if isinstance(module, quantized_types):
+            return True
+        # The named classes do not cover every family: mlx_lm's MLA models use
+        # QuantizedMultiLinear and the distributed layers use
+        # Quantized{AllToSharded,ShardedToAll}Linear, none of which subclass
+        # anything above. Missing one is not a near-miss -- the model reads as
+        # unquantized, its real grid is stripped as stale, and the checkpoint is
+        # written with quantized tensors and no metadata to load them by.
+        return type(module).__name__.startswith("Quantized")
+
+    return any(_is_quantized(module) for _, module in model.named_modules())
 
 
 # Matches the loader's runtime-quantization defaults so a save-quantized model
@@ -14183,13 +14192,21 @@ def _quantize_merged_model_for_save(model):
     return model
 
 
+_ABSENT = object()
+
+
 def _snapshot_mlx_model_state(model):
     """Everything needed to undo a save-time cast + quantize on a live model.
 
-    MLX arrays are immutable, so the parameter tree is captured by reference;
-    only the module objects the quantize step replaces are held alive.
+    MLX arrays are immutable, so nothing is copied -- but the whole parameter
+    tree is pinned for the duration of the save, so the original weights are
+    held alongside the cast and quantized ones instead of being freed as
+    ``nn.quantize`` swaps each module out. Peak memory during a ``merged_4bit``
+    save rises accordingly; ``_restore_mlx_model_state`` drops the reference and
+    clears the cache as soon as the checkpoint is written.
     """
-    return (model.leaf_modules(), model.parameters(), getattr(model, "_config", None))
+    return (model.leaf_modules(), model.parameters(),
+            getattr(model, "_config", _ABSENT))
 
 
 def _restore_mlx_model_state(model, snapshot):
@@ -14205,8 +14222,20 @@ def _restore_mlx_model_state(model, snapshot):
     leaf_modules, parameters, config = snapshot
     model.update_modules(leaf_modules)
     model.update(parameters)
-    if config is not None:
+    if config is _ABSENT:
+        # The quantize step assigns `_config` even to a model that never had
+        # one, so "there was nothing here" has to remove it again -- otherwise
+        # the live model keeps a config advertising a 4-bit grid over the
+        # full-precision weights just restored, and the next save (or a `lora`
+        # save, which stamps the base grid into adapter_config.json) writes it.
+        # mlx Modules keep attributes in the dict they subclass, not __dict__.
+        try:
+            delattr(model, "_config")
+        except AttributeError:
+            pass
+    else:
         model._config = config
+    mx.clear_cache()
 
 
 def save_merged_model(model, tokenizer, path, dequantize=False,
@@ -14263,15 +14292,24 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
                 "not supported yet — saving at full precision instead. Load "
                 "the VLM quantized (the default) to get a 4-bit merge."
             )
+            # This branch only runs when nothing is quantized, so any grid still
+            # on the config describes weights that are not there; writing it
+            # would label a full-precision artifact 4-bit.
+            cfg = getattr(model, "_config", None)
+            if isinstance(cfg, dict):
+                model._config = _strip_mlx_quantization_metadata(cfg)
         else:
             # The quantize step rewrites the caller's live model, so keep what
-            # is needed to hand it back unchanged once the checkpoint is out.
+            # is needed to hand it back unchanged once the checkpoint is out --
+            # including when the quantize itself is what fails.
             restore_after_save = _snapshot_mlx_model_state(model)
-            model = _quantize_merged_model_for_save(model)
-
-    de_lora_model = model
 
     try:
+        if restore_after_save is not None:
+            model = _quantize_merged_model_for_save(model)
+
+        de_lora_model = model
+
         # Save sharded safetensors + index.json
         save_model(path, de_lora_model, donate_model=False)
 
@@ -14280,6 +14318,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
     finally:
         if restore_after_save is not None:
             _restore_mlx_model_state(model, restore_after_save)
+            restore_after_save = None
 
     if config:
         is_vlm = _is_vlm_model(model) or _has_vision_config(config)
