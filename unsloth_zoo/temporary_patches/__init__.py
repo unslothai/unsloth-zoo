@@ -16,6 +16,7 @@
 
 
 from .common import *
+from .notebook_deps import *
 from .fla_vendor import *
 from .gemma import *
 from .misc import *
