@@ -21,6 +21,8 @@ from unsloth_zoo.mlx import inference as prefill
     (767, [256, 256, 255]), (768, [256, 512]),
     (1792, [256, 512, 1024]), (1807, [256, 512, 1024, 15]),
     (1040, [256, 512, 256, 16]),
+    (3840, [256, 512, 1024, 2048]),
+    (4097, [256, 512, 1024, 2048, 256, 1]),
 ])
 def test_dynamic_grid_preserves_partial_tail(rows, chunks):
     schedule = prefill.DynamicPrefillSchedule()
@@ -37,8 +39,9 @@ def test_dynamic_grid_preserves_partial_tail(rows, chunks):
 def test_resumed_grid_uses_absolute_offset_and_rejects_inconsistent_cache():
     schedule = prefill.DynamicPrefillSchedule()
     assert schedule.chunk_size(2048, [SimpleNamespace(offset = 768)]) == 1024
+    assert schedule.chunk_size(2048, [SimpleNamespace(offset = 1792)]) == 2048
     assert schedule.chunk_size(2048, [SimpleNamespace(offset = 0)]) == 256
-    for rows, expected in [(255, 0), (256, 256), (767, 256), (768, 768), (1807, 1792), (4096, 3840)]:
+    for rows, expected in [(255, 0), (256, 256), (767, 256), (768, 768), (1807, 1792), (2816, 1792), (4096, 3840)]:
         assert schedule.boundary_at(rows) == expected
     with pytest.raises(ValueError, match = "consistent absolute"):
         schedule.chunk_size(512, [SimpleNamespace(offset = 0), SimpleNamespace(offset = 256)])
@@ -501,7 +504,7 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
     model.eval()
     schedule = prefill.create_dynamic_prefill_schedule(model)
     assert schedule is not None
-    prompts = [[(i * 7 + 3) % 128 for i in range(1808)], [(i * 5 + 17) % 128 for i in range(1395)]]
+    prompts = [[(i * 7 + 3) % 128 for i in range(3860)], [(i * 5 + 17) % 128 for i in range(3447)]]
     prompt_kwargs = [{"inputs_embeds": language.model.embed_tokens(mx.array([ids]))} for ids in prompts]
     calls = []
     original = LanguageModel.__call__
@@ -535,8 +538,8 @@ def test_native_batch_generator_uses_dynamic_chunks_and_restores_between_steps(m
     assert outputs[0] == outputs[1]
     assert len(outputs[0][0]) == 4 and len(outputs[0][1]) == 6
     assert outputs[0][0][0] != outputs[0][1][0]
-    assert [shape[1] for shape, _ in traces[0] if shape[1] > 1] == [256] * 7 + [15]
-    assert [shape[1] for shape, _ in traces[1] if shape[1] > 1] == [256, 256, 256, 1024, 15]
+    assert [shape[1] for shape, _ in traces[0] if shape[1] > 1] == [256] * 15 + [19]
+    assert [shape[1] for shape, _ in traces[1] if shape[1] > 1] == [256, 256, 256, 1024, 2048, 19]
     assert all(shape[0] == 2 for shape, _ in traces[1] if shape[1] > 1)
     assert all(cls is not nn.QuantizedLinear for shape, cls in traces[1] if shape[1] > 1)
     assert all(cls is nn.QuantizedLinear for shape, cls in traces[1] if shape[1] == 1)
