@@ -657,7 +657,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.compiled_autograd import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture  # noqa: F821
 
     # From https://github.com/pytorch/pytorch/pull/135795/files
     try:
@@ -683,7 +684,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.variables.misc import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method  # noqa: F821
     return
 pass
 
@@ -841,7 +843,8 @@ if _transformers_bnb is not None and \
     source = re.sub(pattern, add_score_code, source, flags=re.MULTILINE)
 
     exec(source, globals())
-    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
+    # Defined by the exec(source, globals()) directly above.
+    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear  # noqa: F821
 pass
 
 # Patch for transformers 5.x: should_convert_module uses re.match + endswith

@@ -67,10 +67,14 @@ jobs:
 
       - name: Python ruff check (narrow gate)
         # E9 / F63 / F7 / F82: syntax errors, broken comparisons, undefined names.
-        # continue-on-error during CI bootstrap: first run on main surfaced 13
-        # latent findings (rl_replacements.py L1128 F821). The gpt_oss match-on-3.9
-        # one is fixed; the rest still need clearing before this can gate.
-        continue-on-error: true
+        # The 13 findings that kept this on continue-on-error are cleared, so it gates.
+        # Two of them were real: rl_replacements called nullcontext() without importing
+        # it, and peft_utils listed two names in __all__ that had moved to saving_utils.
+        # The rest are names an exec(source, globals()) defines a line earlier, and carry
+        # an inline noqa saying so.
+        #
+        # Leaving it non-gating was not free. It still annotated every run red, which is
+        # what a real failure on a PR then had to be picked out of.
         run: |
           ruff check --select E9,F63,F7,F82 unsloth_zoo tests scripts
 

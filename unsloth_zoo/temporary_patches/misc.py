@@ -162,7 +162,8 @@ def patch_merge_quantization_configs():
     except Exception as e:
         return raise_error("", e)
 
-    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs)
+    # Defined by the exec(source, globals()) in the try above.
+    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs)  # noqa: F821
 pass
 TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 

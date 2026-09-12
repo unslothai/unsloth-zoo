@@ -498,6 +498,11 @@ jobs:
           # pins: measured 5.5.0 -> 5.14.1. Together, pip honours the cap and lands
           # on the newest mlx-vlm that fits, which is the 0.6.4 ceiling the audio
           # gate records.
+          #
+          # The <0.7.0 bound is repeated here because pyproject's copy is marker-gated
+          # to darwin + arm64 and so constrains nothing on this Linux lane. Without it
+          # the lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
+          # gating a combination pyproject forbids.
           (
             rc=0
             {
@@ -506,7 +511,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<0.7.0" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
