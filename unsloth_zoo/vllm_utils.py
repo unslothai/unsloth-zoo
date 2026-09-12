@@ -2754,21 +2754,6 @@ def load_vllm(
     # float8 KV cache fits more sequences -> more throughput
     if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
-    # vLLM default max_num_batched_tokens is 2048
-    chunked_prefill_tokens = 2048
-    if not is_vision_model:
-        if   memory_left_for_kv_cache_gb <=  8: chunked_prefill_tokens = 1024 # + 0
-        elif memory_left_for_kv_cache_gb <= 12: chunked_prefill_tokens = 1536 # + 512
-        elif memory_left_for_kv_cache_gb <= 16: chunked_prefill_tokens = 2048 # + 512
-        elif memory_left_for_kv_cache_gb <= 24: chunked_prefill_tokens = 3072 # + 1024
-        elif memory_left_for_kv_cache_gb <= 40: chunked_prefill_tokens = 4096 # + 1024
-        elif memory_left_for_kv_cache_gb <= 48: chunked_prefill_tokens = 4608 # + 512
-        elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
-        else: chunked_prefill_tokens = 8192 # + 0
-
-        # vLLM errors if max_seq_length exceeds chunked_prefill_tokens
-        chunked_prefill_tokens = max_seq_length
-
     # Scale num_seqs by conservativeness
     approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
     approx_max_num_seqs = max(approx_max_num_seqs, 1)
@@ -2798,7 +2783,7 @@ def load_vllm(
     print(
         f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
         f"Unsloth: Your GPU has {message} with VRAM = {total_memory_gb} GB.\n"\
-        f"Unsloth: Using conservativeness = {conservativeness}. Chunked prefill tokens = {chunked_prefill_tokens}. Num Sequences = {approx_max_num_seqs}.\n"\
+        f"Unsloth: Using conservativeness = {conservativeness}. Chunked prefill tokens = {max_num_batched_tokens}. Num Sequences = {approx_max_num_seqs}.\n"\
         f"Unsloth: vLLM's KV Cache can use up to {round(memory_left_for_kv_cache_gb, 2)} GB. Also swap space = {swap_space} GB."
     )
 
