@@ -5889,7 +5889,8 @@ def unsloth_compile_transformers(
         "False",
     )
     exec(inner_training_loop, globals())
-    Trainer._inner_training_loop = _fast_inner_training_loop
+    # Defined by the exec(inner_training_loop, globals()) directly above.
+    Trainer._inner_training_loop = _fast_inner_training_loop  # noqa: F821
 
     # All other functions
     if compile_function_calls:

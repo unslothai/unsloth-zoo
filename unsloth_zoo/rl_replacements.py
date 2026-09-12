@@ -1115,6 +1115,12 @@ def grpo_accumulated_loss(
         completion_ids_chunks
     )
 
+    # Bound in the body, not at module scope, for the reason spelled out just below: this
+    # function's source is copied into the generated UnslothGRPOTrainer cache without
+    # unsloth_zoo's module imports, so a module-level import reaches the import path and
+    # not the one that actually runs in production.
+    from contextlib import nullcontext
+
     if trainer._autocast_dtype is None:
         autocaster = nullcontext()
     else:
@@ -1745,21 +1751,6 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
-    # Old non-efficient code path (dead).
-    new_logits = torch.matmul(new_hidden_states, lm_head.t())
-    new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-    old_logits = torch.matmul(old_hidden_states, lm_head.t())
-    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-    loss, completion_length, mean_kl = grpo_compute_loss(
-        old_logits,
-        new_logits,
-        completion_input_ids,
-        completion_mask,
-        trainer.beta,
-        advantages,
-    )
-    return loss, completion_length, mean_kl
-    pass
 pass
 RL_REPLACEMENTS["grpo_accumulated_loss"] = grpo_accumulated_loss
 
