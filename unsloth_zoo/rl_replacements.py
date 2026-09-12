@@ -23,7 +23,6 @@ import inspect
 import os
 import math
 import logging
-from contextlib import nullcontext
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
 from unsloth_zoo.temporary_patches.common import (
@@ -1115,6 +1114,12 @@ def grpo_accumulated_loss(
         mm_token_type_ids_chunks,
         completion_ids_chunks
     )
+
+    # Bound in the body, not at module scope, for the reason spelled out just below: this
+    # function's source is copied into the generated UnslothGRPOTrainer cache without
+    # unsloth_zoo's module imports, so a module-level import reaches the import path and
+    # not the one that actually runs in production.
+    from contextlib import nullcontext
 
     if trainer._autocast_dtype is None:
         autocaster = nullcontext()

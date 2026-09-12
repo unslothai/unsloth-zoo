@@ -379,6 +379,7 @@ jobs:
             tests/test_conftest_module_leak_gate.py \
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
+            tests/test_undefined_name_gate.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

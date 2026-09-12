@@ -35,16 +35,31 @@ REPO = Path(__file__).resolve().parents[1]
 
 def test_the_float32_grpo_path_can_build_its_autocast_context():
     """`grpo_accumulated_loss` takes `nullcontext()` whenever the trainer has no autocast
-    dtype, which is exactly what `UNSLOTH_FORCE_FLOAT32=1` sets. The name was never
-    imported, so that branch raised `NameError` instead of running unautocast."""
+    dtype, which is exactly what `UNSLOTH_FORCE_FLOAT32=1` sets. The name was never bound,
+    so that branch raised `NameError` instead of running unautocast.
+
+    Asserted against the FUNCTION SOURCE in a bare namespace, because that is the shape the
+    production path has: this function is copied into the generated `UnslothGRPOTrainer`
+    cache without unsloth_zoo's module imports, as the comment beside the PrefixGrouper
+    import in its body says. A module-level import satisfies `import unsloth_zoo` and still
+    leaves the generated trainer raising, so checking the module would pass while the path
+    users actually run stayed broken.
+    """
+    import inspect
+
     import unsloth_zoo.rl_replacements as rl
 
-    assert hasattr(rl, "nullcontext"), (
-        "rl_replacements calls nullcontext() on the UNSLOTH_FORCE_FLOAT32 path; "
-        "without the import that branch is a NameError"
+    source = inspect.getsource(rl.grpo_accumulated_loss)
+    namespace = {"torch": rl.torch, "os": rl.os}
+    exec(compile(source, "<generated-trainer>", "exec"), namespace)
+    rebuilt = namespace["grpo_accumulated_loss"]
+
+    # A name bound by an import inside the body is a LOCAL; one that relies on the module
+    # is a global, and a global is exactly what the generated trainer does not carry.
+    assert "nullcontext" in rebuilt.__code__.co_varnames, (
+        "nullcontext resolves as a global, so the generated UnslothGRPOTrainer raises "
+        "NameError on the UNSLOTH_FORCE_FLOAT32 path; bind it inside the function body"
     )
-    with rl.nullcontext():
-        pass
 
 
 def test_peft_utils_exports_only_names_it_has():
