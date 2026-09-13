@@ -371,10 +371,53 @@ class CachedAutotuner(Autotuner):
             return True
         return key.autotune_key not in self.cache
 
+    @staticmethod
+    def _runtime_autotune_tuple(
+        arg_names: list[str],
+        key_names: list[str],
+        positional_args: tuple[Any, ...],
+        runtime_kwargs: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        """Triton-compatible autotune key (matches ``Autotuner.run``)."""
+        named_args = dict(zip(arg_names, positional_args))
+        all_args = {**named_args, **runtime_kwargs}
+        tracked = {k: v for k, v in all_args.items() if k in arg_names}
+        tuning_key = [tracked[name] for name in key_names if name in tracked]
+        for arg in tracked.values():
+            if hasattr(arg, "dtype"):
+                tuning_key.append(str(arg.dtype))
+        return tuple(tuning_key)
+
+    def _run_with_stored_config(self, config, *args, **kwargs):
+        """Launch ``fn`` with a config already in the autotune cache (no key rebuild)."""
+        self.nargs = dict(zip(self.arg_names, args))
+        self.best_config = config
+        if config.pre_hook is not None:
+            full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+            config.pre_hook(full_nargs)
+        try:
+            return self.fn.run(*args, **kwargs, **config.all_kwargs())
+        finally:
+            self.nargs = None
+
     def run(self, *args, **kwargs):
-        key = AutotuneKey.build(self.arg_names, self.keys, args, kwargs)
-        if self.should_check_fla_cache(key):
-            self.maybe_load_cached_config(key)
+        # Steady state after ``compile_fla_no_autotune``'s ``_ReuseBestCache``: one tuned
+        # config is reused for every runtime key — skip per-launch key construction.
+        if (
+            len(self.configs) > 1
+            and getattr(self.cache, "_unsloth_reuse_best", False)
+            and len(self.cache) > 0
+        ):
+            return self._run_with_stored_config(next(iter(self.cache.values())), *args, **kwargs)
+
+        if FLA_CACHE_MODE is not FlaCacheMode.DISABLED:
+            triton_key = self._runtime_autotune_tuple(
+                self.arg_names, self.keys, args, kwargs,
+            )
+            if FLA_CACHE_MODE is FlaCacheMode.ALWAYS or triton_key not in self.cache:
+                fla_key = AutotuneKey(autotune_key=triton_key)
+                if self.should_check_fla_cache(fla_key):
+                    self.maybe_load_cached_config(fla_key)
         return super().run(*args, **kwargs)
 
     def maybe_load_cached_config(self, key: AutotuneKey):
