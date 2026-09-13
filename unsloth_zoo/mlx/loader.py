@@ -793,7 +793,7 @@ def _materialize_mlx_vlm_config_override(
                     supports_list_extra_special_tokens=supports_list_extra_special_tokens,
                 )
             )
-        if not allow_tokenizer_remote_code:
+        if not allow_tokenizer_remote_code and os.path.isfile(os.path.join(local_path, "tokenizer.json")):
             auto_map = patched_tokenizer_config.get("auto_map")
             if isinstance(auto_map, dict) and auto_map:
                 patched_tokenizer_config = dict(patched_tokenizer_config)
@@ -875,6 +875,34 @@ def _remote_code_reference(metadata, auto_class):
     return reference if isinstance(reference, str) else None
 
 
+class _MLXRemoteCodeError(ValueError):
+    pass
+
+
+def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
+    if "trust_remote_code" not in str(error) and "custom code" not in str(error):
+        return
+    for filename, auto_class in (
+        ("processor_config.json", "AutoProcessor"),
+        ("preprocessor_config.json", "AutoProcessor"),
+        ("config.json", "AutoProcessor"),
+        ("tokenizer_config.json", "AutoTokenizer"),
+        ("preprocessor_config.json", "AutoImageProcessor"),
+    ):
+        if tokenizer_only and auto_class != "AutoTokenizer":
+            continue
+        reference = _remote_code_reference(
+            _read_json_file(os.path.join(str(model_path), filename)), auto_class,
+        )
+        if reference:
+            code_file = reference.split("--")[-1].rsplit(".", 1)[0] + ".py"
+            raise _MLXRemoteCodeError(
+                f"Unsloth: loading {model_path} requires {code_file} "
+                f"(declared in {filename}). Pass trust_remote_code=True "
+                "to allow this repository's custom code."
+            ) from error
+
+
 def _tokenizer_class_for_model_type(model_path):
     """Resolve the tokenizer class from config.json's model_type STRING.
 
@@ -934,18 +962,17 @@ def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
     # Tokenizer metadata selects the class; model validators have no role here.
     if class_name or remote:
         kwargs["config"] = PretrainedConfig()
-    return auto_loader(model_path, *args, **kwargs)
+    try:
+        return auto_loader(model_path, *args, **kwargs)
+    except ValueError as error:
+        if not kwargs["trust_remote_code"]:
+            _raise_mlx_remote_code_refusal(model_path, error, tokenizer_only=True)
+        raise
 
 
 @contextmanager
-def _mlx_tokenizer_loading_scope():
-    """Route mlx-lm's internal AutoTokenizer call through _load_mlx_tokenizer.
-
-    mlx_lm.utils.load_tokenizer calls AutoTokenizer.from_pretrained directly, so
-    the only way to reach it is to patch the class. The active flag is
-    thread-local, so other threads keep ordinary behaviour, and the lock keeps
-    two scopes from capturing each other's patch as the original.
-    """
+def _mlx_tokenizer_loading_scope(trust_remote_code=False):
+    """Cover nested processor tokenizer loads without changing other threads."""
     from transformers import AutoTokenizer
 
     with _TOKENIZER_LOAD_LOCK:
@@ -955,15 +982,24 @@ def _mlx_tokenizer_loading_scope():
         _TOKENIZER_LOAD_STATE.active = True
         _TOKENIZER_LOAD_STATE.original = original
 
+        refusals = []
+
         @classmethod
         def load(cls, model_path, *args, **kwargs):
             if not getattr(_TOKENIZER_LOAD_STATE, "active", False):
                 return original(model_path, *args, **kwargs)
-            return _load_mlx_tokenizer(model_path, *args, _auto_loader=original, **kwargs)
+            kwargs["trust_remote_code"] = bool(trust_remote_code)
+            try:
+                return _load_mlx_tokenizer(
+                    model_path, *args, _auto_loader=original, **kwargs,
+                )
+            except _MLXRemoteCodeError as error:
+                refusals.append(error)
+                raise
 
         AutoTokenizer.from_pretrained = load
         try:
-            yield
+            yield refusals
         finally:
             AutoTokenizer.from_pretrained = original_descriptor
             _TOKENIZER_LOAD_STATE.active = previous
@@ -1019,7 +1055,7 @@ def _load_mlx_lm_with_strict_fallback(
             model_config=model_config,
         )
 
-    with _mlx_tokenizer_loading_scope():
+    with _mlx_tokenizer_loading_scope(tokenizer_config.get("trust_remote_code", False)):
         tokenizer = load_tokenizer(
             model_path,
             tokenizer_config,
@@ -1216,7 +1252,7 @@ def _load_mlx_lm_distributed(
         cleanup_final_model_path = True
 
         try:
-            with _mlx_tokenizer_loading_scope():
+            with _mlx_tokenizer_loading_scope(tokenizer_config.get("trust_remote_code", False)):
                 tokenizer = load_tokenizer(
                     final_model_path,
                     tokenizer_config,
@@ -1550,10 +1586,11 @@ def _load_declared_mlx_vlm_processor(model_path, model_type, **kwargs):
             allow_tokenizer_remote_code=False,
         )
     try:
-        return scoped_processor_class.from_pretrained(
-            processor_load_path,
-            **kwargs,
-        )
+        with _mlx_tokenizer_loading_scope(kwargs.get("trust_remote_code", False)):
+            return scoped_processor_class.from_pretrained(
+                processor_load_path,
+                **kwargs,
+            )
     finally:
         if str(processor_load_path) != str(model_path):
             shutil.rmtree(processor_load_path, ignore_errors=True)
@@ -1562,6 +1599,8 @@ def _load_declared_mlx_vlm_processor(model_path, model_type, **kwargs):
 def _is_mlx_vlm_processor_resolution_error(error):
     """Return whether AutoProcessor failed before native MLX construction."""
 
+    if isinstance(error, _MLXRemoteCodeError):
+        return True
     message = str(error).lower()
     if isinstance(error, ValueError):
         return any(
@@ -1637,30 +1676,35 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
                         config_data,
                         allow_tokenizer_remote_code=False,
                     )
-            try:
+            with _mlx_tokenizer_loading_scope(allow_remote_code) as refusals:
                 try:
-                    return original_auto_processor.from_pretrained(
-                        processor_load_path,
-                        *args,
-                        **call_kwargs,
-                    )
-                except Exception as error:
-                    if not _is_mlx_vlm_processor_resolution_error(error):
-                        raise
-                    config_data = _read_json_file(
-                        os.path.join(str(processor_load_path), "config.json")
-                    )
-                    processor = _load_declared_mlx_vlm_processor(
-                        processor_load_path,
-                        config_data.get("model_type"),
-                        **call_kwargs,
-                    )
-                    if processor is None:
-                        raise
-                    return processor
-            finally:
-                if str(processor_load_path) != str(model_path):
-                    shutil.rmtree(processor_load_path, ignore_errors=True)
+                    try:
+                        return original_auto_processor.from_pretrained(
+                            processor_load_path,
+                            *args,
+                            **call_kwargs,
+                        )
+                    except Exception as error:
+                        if not _is_mlx_vlm_processor_resolution_error(error):
+                            raise
+                        config_data = _read_json_file(
+                            os.path.join(str(processor_load_path), "config.json")
+                        )
+                        processor = _load_declared_mlx_vlm_processor(
+                            processor_load_path,
+                            config_data.get("model_type"),
+                            **call_kwargs,
+                        )
+                        if processor is None:
+                            if refusals:
+                                raise refusals[-1] from error
+                            if not allow_remote_code:
+                                _raise_mlx_remote_code_refusal(model_path, error)
+                            raise
+                        return processor
+                finally:
+                    if str(processor_load_path) != str(model_path):
+                        shutil.rmtree(processor_load_path, ignore_errors=True)
 
     processor_globals = dict(processor_loader.__globals__)
     processor_globals["AutoProcessor"] = ScopedAutoProcessor
@@ -1856,6 +1900,7 @@ def get_class_predicate(p, m):
 
 def _build_vlm_image_processor_from_config(
     model_path, processor_config, preprocessor_config, model_type=None,
+    *, trust_remote_code=False,
 ):
     """Recreate the image processor from saved processor sidecar configs."""
     image_config = processor_config.get("image_processor")
@@ -1892,7 +1937,9 @@ def _build_vlm_image_processor_from_config(
 
     try:
         from transformers import AutoImageProcessor
-        return AutoImageProcessor.from_pretrained(model_path)
+        return AutoImageProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code,
+        )
     except Exception:
         return None
 
@@ -1952,6 +1999,7 @@ def _repair_degraded_vlm_processor(
 
     image_processor = _build_vlm_image_processor_from_config(
         model_path, processor_config, preprocessor_config, model_type,
+        trust_remote_code=trust_remote_code,
     )
     if image_processor is None:
         return processor
@@ -8441,11 +8489,9 @@ class FastMLXModel:
         else:
             is_vlm = _is_vlm(config_data)
 
-        extra_kwargs = {}
+        extra_kwargs = {"trust_remote_code": bool(trust_remote_code)}
         if token:
             extra_kwargs["token"] = token
-        if trust_remote_code:
-            extra_kwargs["trust_remote_code"] = True
 
         if is_vlm:
             # VLM path via mlx-vlm

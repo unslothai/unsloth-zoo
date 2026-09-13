@@ -174,7 +174,9 @@ def test_apply_mlx_distributed_sharding_modes_and_guards():
         _apply_mlx_distributed_sharding(object(), tensor_group=tensor_group, model_name="fake")
 
 
-def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_path):
+@pytest.mark.parametrize("trust", [False, True])
+def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_path, trust):
+    from transformers import AutoTokenizer
     import mlx_lm.utils as mlx_lm_utils
     from unsloth_zoo.mlx.loader import _load_mlx_lm_distributed
 
@@ -227,12 +229,23 @@ def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_
 
     monkeypatch.setattr(mlx_lm_utils, "_download", _download)
     monkeypatch.setattr(mlx_lm_utils, "load_model", _load_model)
-    monkeypatch.setattr(mlx_lm_utils, "load_tokenizer", lambda *_a, **_k: types.SimpleNamespace(name="tok"))
+    (model_path / "tokenizer_config.json").write_text('{"tokenizer_class":"RemoteTokenizer"}')
+    tokenizer_calls = []
+
+    def tokenizer(path, **kwargs):
+        tokenizer_calls.append(kwargs)
+        return types.SimpleNamespace(name="tok")
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(tokenizer))
+    monkeypatch.setattr(
+        mlx_lm_utils, "load_tokenizer",
+        lambda path, *_a, **_k: AutoTokenizer.from_pretrained(path),
+    )
 
     model, tokenizer, config = _load_mlx_lm_distributed(
         "fake/repo",
         "llama",
-        {"return_config": True},
+        {"return_config": True, "tokenizer_config": {"trust_remote_code": trust}},
         pipeline_group=_FakeGroup(name="pipeline"),
     )
 
@@ -245,6 +258,7 @@ def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_
     assert ("download", local_shards) in events
     assert ("load", list(local_shards)) in events
     assert all(not path.exists() for path in load_paths)
+    assert tokenizer_calls[0]["trust_remote_code"] is trust
     assert config["eos_token_id"] == 3
     assert config["model_type"] == "llama"
     assert model._unsloth_mlx_distributed_parallel_mode == "pipeline"
