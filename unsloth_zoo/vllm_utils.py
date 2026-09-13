@@ -107,6 +107,21 @@ def get_mem_info():
     return free_memory, total_memory
 pass
 
+def _set_registered_quant_config(method, config_cls):
+    # An out-of-tree plugin registers the CLASS OBJECT, so swapping the module
+    # attribute leaves vLLM building the unpatched config and ignoring
+    # UNSLOTH_bnb_4bit_compute_dtype. In-tree vLLM re-imports the attribute on
+    # every get_quantization_config call and registers nothing here, so only
+    # touch a key the plugin actually registered.
+    try:
+        from vllm.model_executor.layers.quantization import (
+            _CUSTOMIZED_METHOD_TO_QUANT_CONFIG as registry,
+        )
+    except ImportError:
+        return
+    if method in registry: registry[method] = config_cls
+pass
+
 if importlib.util.find_spec("vllm") is not None:
     # Every `vllm.<...>` below used to be bound as a side effect of the
     # try-guarded submodule imports, which 0.28 removed, leaving it NameError.
@@ -344,6 +359,7 @@ if importlib.util.find_spec("vllm") is not None:
         os.environ["UNSLOTH_bnb_4bit_compute_dtype"] = dtype
 
         _vllm_bnb.BitsAndBytesConfig = BitsAndBytesConfig
+        _set_registered_quant_config("bitsandbytes", BitsAndBytesConfig)
         return old_config
     pass
 
@@ -351,6 +367,7 @@ if importlib.util.find_spec("vllm") is not None:
         # All Unsloth Zoo code licensed under LGPLv3
         if _vllm_bnb is None: return
         _vllm_bnb.BitsAndBytesConfig = old_config
+        _set_registered_quant_config("bitsandbytes", old_config)
         del os.environ["UNSLOTH_bnb_4bit_compute_dtype"]
     pass
 
