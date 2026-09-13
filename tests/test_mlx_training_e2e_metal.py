@@ -1185,7 +1185,8 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_dpo_compaction_preserves_pair_ownership(monkeypatch, quantized, reference, dtype):
+@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+def test_preference_compaction_preserves_pair_ownership(monkeypatch, quantized, reference, dtype, kind):
     from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
     mx.random.seed(937)
@@ -1200,16 +1201,19 @@ def test_dpo_compaction_preserves_pair_ownership(monkeypatch, quantized, referen
         policy = p.LoRAReferencePolicy([adapter])
     model.set_dtype(getattr(mx, dtype))
     rows = []
-    for i in range(4):
-        chosen = tuple((j * 7 + i) % 2053 for j in range(513))
-        rejected = tuple((j * 11 + i) % 2053 for j in range(507 - i))
+    for i in range(8):
+        chosen = tuple((j * 7 + i) % 2053 for j in range(513 if i % 4 == 0 else 45 + i))
+        rejected = tuple((j * 11 + i) % 2053 for j in range(507 if i % 4 == 0 else 43 + i))
         rows.append(p.TokenizedPreferenceRow(chosen[:-13-i], chosen[-13-i:],
                     rejected[:-14+i], rejected[-14+i:]))
-    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1), (2, 3)], normalizers=[(1024, 4, 2)] * 2,
+    normalizers = [(sum(len(row.chosen) - 1 for row in rows), 8, 2)] * 2
+    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1, 2, 3), (4, 5, 6, 7)], normalizers=normalizers,
                                      cycle_length=2, max_seq_length=513, pad_id=0)
-    plan.configure_cce_compaction()
-    objective = p.resolve_preference_objective("dpo", beta=0.2, reference_free=not reference)
-    loss = p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy)
+    plan.configure_cce_compaction(kind=kind)
+    objective = p.resolve_preference_objective(kind, beta=0.2, **({"reference_free": not reference} if kind == "dpo" else {}))
+    loss = (p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy) if kind == "dpo" else
+            p.make_orpo_cce_loss_fn(model, objective))
+    capacity = 256 if kind == "dpo" else 768
     grad = nn.value_and_grad(model, loss)
     run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
     original, projected = nn.losses.cross_entropy, []
@@ -1220,13 +1224,13 @@ def test_dpo_compaction_preserves_pair_ownership(monkeypatch, quantized, referen
     for index in range(2):
         batch = plan[index]
         compact = plan.prepare_cce_batch(index, batch)
-        assert len(batch) == 3 and compact[3].shape == (256,)
+        assert len(batch) == 3 and compact[3].shape == (capacity,)
         expected = grad(model, *batch)
         mx.eval(expected)
         projected.clear()
         actual = run(*compact)
         mx.eval(actual)
-        assert projected == ([256] * (2 if reference else 1) if index == 0 else [])
+        assert projected == ([capacity] * (2 if reference and kind == "dpo" else 1) if index == 0 else [])
         for want, got in zip(expected[0], actual[0]):
             assert mx.allclose(want, got, atol=2e-5, rtol=2e-5).item()
         for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):

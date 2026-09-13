@@ -627,7 +627,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     __slots__ = (
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
-        "_visit_seed", "_visit_epoch_cache", "_cce_capacities",
+        "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
     )
 
     def __init__(
@@ -641,6 +641,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self.pad_id = int(pad_id)
         self._shape_plan = None
         self._cce_capacities = {}
+        self._cce_kind = "dpo"
         self._visit_policy = "identity"
         self._visit_seed = None
         self._visit_epoch_cache = None
@@ -692,8 +693,9 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
 
-    def configure_cce_compaction(self, enabled=True):
+    def configure_cce_compaction(self, enabled=True, *, kind="dpo"):
         self._cce_capacities = {}
+        self._cce_kind = kind
         if not enabled:
             return
         counts = {}
@@ -706,17 +708,19 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
                 count = 0
                 for row_index in row_indices:
                     row = self._rows[row_index]
-                    for values, prompt in (
+                    for branch, (values, prompt) in enumerate((
                         (row.chosen, len(row.chosen_prompt_ids)),
                         (row.rejected, len(row.rejected_prompt_ids)),
-                    ):
-                        count += max(0, min(len(values), width, self.max_seq_length) - max(1, prompt))
+                    )):
+                        start = 1 if kind == "orpo" and branch == 0 else max(1, prompt)
+                        count += max(0, min(len(values), width, self.max_seq_length) - start)
                 key = (family, width)
                 counts[key] = max(counts.get(key, 0), count)
         for (family, width), count in counts.items():
             capacity = max(256, ((count + 255) // 256) * 256)
             tokens = family[1][0][0] * (width - 1)
-            if tokens >= 1024 and capacity * 2 <= tokens:
+            limit = family[1][0][0] * width // 4 if kind == "orpo" else tokens // 2
+            if tokens >= 1024 and capacity <= limit:
                 self._cce_capacities[family, width] = capacity
 
     def prepare_cce_batch(self, index, batch):
@@ -731,8 +735,9 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
                 values, prompt = ((row.chosen, len(row.chosen_prompt_ids)) if branch == 0 else
                                   (row.rejected, len(row.rejected_prompt_ids)))
                 end = min(len(values), width, self.max_seq_length)
+                start = 1 if self._cce_kind == "orpo" and branch == 0 else max(1, prompt)
                 selected.extend((offset + branch * len(rows)) * (width - 1) + step - 1
-                                for step in range(max(1, prompt), end))
+                                for step in range(start, end))
         indices = np.full(capacity, -1, dtype=np.int32)
         indices[:len(selected)] = selected
         return (*batch, mx.array(indices))
@@ -930,14 +935,15 @@ def _require_reference(objective, reference_policy):
         )
 
 
-def make_orpo_loss_fn(objective):
+def make_orpo_loss_fn(objective, *, _cce_compaction=False):
     """Create an ORPO loss with exact logical-window normalization."""
     _require_kind(objective, "orpo")
     beta = objective.beta
 
-    def loss_fn(model, batch, lengths, normalizers):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
         nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
             model, batch, lengths, beta,
+            cce_indices=cce_indices if _cce_compaction else None,
         )
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * (
@@ -952,6 +958,18 @@ def make_orpo_loss_fn(objective):
     loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["orpo"]
     loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["orpo"]
     loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["orpo"]
+    return loss_fn
+
+
+def make_orpo_cce_loss_fn(model, objective):
+    from .utils import describe_output_head
+
+    weight = getattr(describe_output_head(model).module, "weight", None)
+    enabled = weight is not None and weight.shape[0] >= 8192
+    loss_fn = make_orpo_loss_fn(objective, _cce_compaction=enabled)
+    loss_fn._unsloth_cce_compaction = enabled
+    if enabled:
+        loss_fn._unsloth_cce_backend = "compact-native-preference"
     return loss_fn
 
 
@@ -1553,19 +1571,29 @@ def _preference_stats(
     )
 
 
-def _preference_forward(model, batch, lengths):
+def _preference_forward(model, batch, lengths, cce_indices=None):
     """Logits, per-token cross entropy, and the response mask for one batch."""
     targets = batch[:, 1:]
     logits = _model_logits(model(batch[:, :-1]))
-    ce = nn.losses.cross_entropy(
-        logits, targets, reduction="none",
-    ).reshape(targets.shape)
-    return logits, ce, _response_mask(targets, lengths)
+    if cce_indices is None:
+        ce = nn.losses.cross_entropy(logits, targets, reduction="none")
+    else:
+        safe = mx.maximum(cce_indices, 0)
+        selected = mx.take(logits.reshape((-1, logits.shape[-1])), safe, axis=0)
+        labels = mx.take(targets.reshape((-1,)), safe, axis=0)
+        values = nn.losses.cross_entropy(selected, labels, reduction="none")
+        values = mx.where(cce_indices >= 0, values, mx.array(0, values.dtype))
+        ce = mx.zeros((targets.size,), values.dtype).at[safe].add(values)
+    return logits, ce.reshape(targets.shape), _response_mask(targets, lengths)
 
 
-def _orpo_scores(model, batch, lengths, beta):
+def _orpo_scores(model, batch, lengths, beta, *, cce_indices=None):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
-    logits, ce, mask = _preference_forward(model, batch, lengths)
+    if cce_indices is not None and (
+        batch.shape[0] * (batch.shape[1] - 1) < 1024 or cce_indices.size * 4 > batch.size
+    ):
+        cce_indices = None
+    logits, ce, mask = _preference_forward(model, batch, lengths, cce_indices)
     pairs = batch.shape[0] // 2
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
         mask.sum(axis=1), mx.array(1.0),
