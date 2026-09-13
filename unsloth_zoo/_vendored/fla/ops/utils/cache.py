@@ -407,6 +407,7 @@ class CachedAutotuner(Autotuner):
             len(self.configs) > 1
             and getattr(self.cache, "_unsloth_reuse_best", False)
             and len(self.cache) > 0
+            and FLA_CACHE_MODE is not FlaCacheMode.ALWAYS
         ):
             return self._run_with_stored_config(next(iter(self.cache.values())), *args, **kwargs)
 
