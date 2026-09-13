@@ -1617,10 +1617,7 @@ def _is_mlx_vlm_processor_resolution_error(error):
 def _is_degraded_mlx_vlm_processor(processor):
     """Return whether a VLM "processor" came back without its tokenizer.
 
-    A tokenizer refusal swallowed upstream leaves AutoProcessor free to return
-    the image-processor half on its own, which then fails much later with an
-    unrelated AttributeError. Both a processor's `.tokenizer` and a tokenizer
-    returned directly (what a text-only repo yields) count as usable.
+    A bare tokenizer counts as usable: that is what a text-only repo yields.
     """
     if processor is None:
         return True
@@ -1716,18 +1713,12 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
                             if not allow_remote_code:
                                 _raise_mlx_remote_code_refusal(model_path, error)
                             raise
-                        # A native fallback that produced a processor takes
-                        # precedence over a refusal recorded on the way there.
+                        # A fallback that produced a processor outranks a refusal.
                         return processor
-                    # mlx-vlm's own AutoProcessor shim (models/base.py) wraps its
-                    # native processor construction in `except Exception: pass`
-                    # and chains to Transformers on failure, so a refusal raised
-                    # inside that native processor never reaches the handler
-                    # above: the call SUCCEEDS and returns whatever Transformers
-                    # could still assemble, which for a VLM whose tokenizer was
-                    # refused is a bare image processor with no `.tokenizer`.
-                    # Surface the refusal rather than a processor that silently
-                    # lost half of itself.
+                    # mlx_vlm.models.base's AutoProcessor shim swallows what its
+                    # native processor raises and chains to Transformers, so a
+                    # refusal comes back as a SUCCESSFUL call returning the image
+                    # processor alone.
                     if refusals and _is_degraded_mlx_vlm_processor(processor):
                         raise refusals[-1]
                     return processor

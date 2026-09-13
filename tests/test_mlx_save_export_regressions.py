@@ -4560,11 +4560,8 @@ def test_image_processor_builder_forwards_trust(monkeypatch, tmp_path, trust):
 def test_swallowed_processor_refusal_is_not_returned_as_a_half_processor(
     monkeypatch, tmp_path, native_tokenizer,
 ):
-    """mlx-vlm's own AutoProcessor shim catches everything its native processor
-    raises and chains to Transformers, so a tokenizer refusal does not surface
-    as an error: the call succeeds and hands back the image-processor half.
-    Returning that silently strands the caller with a processor that has no
-    tokenizer, so the refusal has to win."""
+    """A swallowed refusal comes back as a successful call returning the
+    image-processor half, so the refusal has to win over that."""
     from transformers import AutoTokenizer
     import unsloth_zoo.mlx.loader as loader
 
