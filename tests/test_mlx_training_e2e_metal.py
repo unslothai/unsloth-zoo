@@ -1183,6 +1183,60 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
 
 @metal_only
 @pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_dpo_compaction_preserves_pair_ownership(monkeypatch, quantized, reference, dtype):
+    from unsloth_zoo.mlx import preference as p
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    mx.random.seed(937)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    policy = None
+    if reference:
+        adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
+        adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.02
+        model.model.embed_tokens = adapter
+        model.freeze()
+        adapter.unfreeze(keys=["lora_a", "lora_b"])
+        policy = p.LoRAReferencePolicy([adapter])
+    model.set_dtype(getattr(mx, dtype))
+    rows = []
+    for i in range(4):
+        chosen = tuple((j * 7 + i) % 2053 for j in range(513))
+        rejected = tuple((j * 11 + i) % 2053 for j in range(507 - i))
+        rows.append(p.TokenizedPreferenceRow(chosen[:-13-i], chosen[-13-i:],
+                    rejected[:-14+i], rejected[-14+i:]))
+    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1), (2, 3)], normalizers=[(1024, 4, 2)] * 2,
+                                     cycle_length=2, max_seq_length=513, pad_id=0)
+    plan.configure_cce_compaction()
+    objective = p.resolve_preference_objective("dpo", beta=0.2, reference_free=not reference)
+    loss = p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy)
+    grad = nn.value_and_grad(model, loss)
+    run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    original, projected = nn.losses.cross_entropy, []
+    def ce(logits, *args, **kwargs):
+        projected.append(logits.shape[0])
+        return original(logits, *args, **kwargs)
+    monkeypatch.setattr(nn.losses, "cross_entropy", ce)
+    for index in range(2):
+        batch = plan[index]
+        compact = plan.prepare_cce_batch(index, batch)
+        assert len(batch) == 3 and compact[3].shape == (256,)
+        expected = grad(model, *batch)
+        mx.eval(expected)
+        projected.clear()
+        actual = run(*compact)
+        mx.eval(actual)
+        assert projected == ([256] * (2 if reference else 1) if index == 0 else [])
+        for want, got in zip(expected[0], actual[0]):
+            assert mx.allclose(want, got, atol=2e-5, rtol=2e-5).item()
+        for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+            assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+        if reference:
+            assert adapter.scale == 2.0
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
 def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     mx.random.seed(735)
     model = _cce_text_model(2053, 64, quantized=quantized)

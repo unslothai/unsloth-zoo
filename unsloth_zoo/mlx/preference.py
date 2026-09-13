@@ -627,7 +627,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     __slots__ = (
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
-        "_visit_seed", "_visit_epoch_cache",
+        "_visit_seed", "_visit_epoch_cache", "_cce_capacities",
     )
 
     def __init__(
@@ -640,6 +640,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self.max_seq_length = int(max_seq_length)
         self.pad_id = int(pad_id)
         self._shape_plan = None
+        self._cce_capacities = {}
         self._visit_policy = "identity"
         self._visit_seed = None
         self._visit_epoch_cache = None
@@ -690,6 +691,51 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
+
+    def configure_cce_compaction(self, enabled=True):
+        self._cce_capacities = {}
+        if not enabled:
+            return
+        counts = {}
+        for index, row_indices in enumerate(self._schedule):
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                count = 0
+                for row_index in row_indices:
+                    row = self._rows[row_index]
+                    for values, prompt in (
+                        (row.chosen, len(row.chosen_prompt_ids)),
+                        (row.rejected, len(row.rejected_prompt_ids)),
+                    ):
+                        count += max(0, min(len(values), width, self.max_seq_length) - max(1, prompt))
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            tokens = family[1][0][0] * (width - 1)
+            if tokens >= 1024 and capacity * 2 <= tokens:
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = batch[0].shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        rows = [self._rows[i] for i in self._schedule[index]]
+        for branch in (0, 1):
+            for offset, row in enumerate(rows):
+                values, prompt = ((row.chosen, len(row.chosen_prompt_ids)) if branch == 0 else
+                                  (row.rejected, len(row.rejected_prompt_ids)))
+                end = min(len(values), width, self.max_seq_length)
+                selected.extend((offset + branch * len(rows)) * (width - 1) + step - 1
+                                for step in range(max(1, prompt), end))
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch, mx.array(indices))
 
     def materialize(self, index, *, phase=None):
         indices = self._schedule[index]
@@ -974,7 +1020,7 @@ class LoRAReferencePolicy:
         self.modules = tuple(modules)
         self.neftune_modules = tuple(neftune_modules)
 
-    def forward(self, model, batch, lengths):
+    def forward(self, model, batch, lengths, *, response_scorer=None):
         scales = [module.scale for module in self.modules]
         noise = [
             getattr(module, "_neftune_noise_enabled", True)
@@ -985,7 +1031,8 @@ class LoRAReferencePolicy:
                 module.scale = 0.0
             for module in self.neftune_modules:
                 module._neftune_noise_enabled = False
-            values = _response_logps(model, batch, lengths)
+            scorer = _response_logps if response_scorer is None else response_scorer
+            values = scorer(model, batch, lengths)
             return mx.stop_gradient(values)
         finally:
             for module, scale in zip(self.modules, scales):
@@ -1267,13 +1314,14 @@ def _dpo_pair_loss(objective, terms):
     return total
 
 
-def make_dpo_loss_fn(objective, *, reference_policy=None):
+def make_dpo_loss_fn(objective, *, reference_policy=None, _cce_forward=None):
     _require_kind(objective, "dpo")
     _require_reference(objective, reference_policy)
 
-    def loss_fn(model, batch, lengths, normalizers):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
         terms, stats = _dpo_scores(
             model, batch, lengths, objective, reference_policy=reference_policy,
+            cce_forward=_cce_forward, cce_indices=cce_indices,
         )
         pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
@@ -1286,6 +1334,93 @@ def make_dpo_loss_fn(objective, *, reference_policy=None):
     loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["dpo"]
     loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
     loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
+    return loss_fn
+
+
+def _make_compact_preference_projection(head, *, frozen):
+    quantized = hasattr(head, 'scales')
+    group_size = getattr(head, 'group_size', 64)
+    bits = getattr(head, 'bits', 4)
+    mode = getattr(head, 'mode', 'affine')
+
+    def native(hidden, weight, scales, biases):
+        if quantized:
+            return mx.quantized_matmul(hidden, weight, scales, biases, transpose=True,
+                                       group_size=group_size, bits=bits, mode=mode)
+        return hidden @ weight.T
+
+    @mx.custom_function
+    def projection(hidden, weight, scales, biases, indices):
+        flat_hidden = hidden.reshape((-1, hidden.shape[-1]))
+        selected = mx.take(flat_hidden, mx.maximum(indices, 0), axis=0)
+        return native(selected, weight, scales, biases)
+
+    @projection.vjp
+    def backward(primals, cotangents, output):
+        hidden, weight, scales, biases, indices = primals
+        # Preserve the native backward shape: bf16 GEMM tiling can change Adam updates.
+        compact_grad = mx.where(indices[:, None] >= 0, cotangents,
+                                mx.array(0, cotangents.dtype))
+        full_grad = mx.zeros((hidden.size // hidden.shape[-1], weight.shape[0]), compact_grad.dtype)
+        full_grad = full_grad.at[mx.maximum(indices, 0)].add(compact_grad)
+        full_grad = full_grad.reshape((*hidden.shape[:-1], weight.shape[0]))
+        if quantized or frozen:
+            _, (grad_hidden,) = mx.vjp(
+                lambda h: native(h, weight, scales, biases), (hidden,), (full_grad,),
+            )
+            grad_weight = mx.zeros_like(weight)
+        else:
+            _, (grad_hidden, grad_weight) = mx.vjp(
+                lambda h, w: native(h, w, scales, biases), (hidden, weight), (full_grad,),
+            )
+        return (grad_hidden, grad_weight,
+                None if scales is None else mx.zeros_like(scales),
+                None if biases is None else mx.zeros_like(biases), mx.zeros_like(indices))
+
+    return projection
+
+
+def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
+    from . import utils
+
+    baseline = make_dpo_loss_fn(objective, reference_policy=reference_policy)
+    desc = utils.describe_output_head(model)
+    tm = utils._get_text_model(model)
+    if (utils._cce_head_ineligibility(desc) is not None
+            or (getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model))):
+        return baseline
+    scale, problem = utils._detect_head_transform(model, desc.status)
+    softcap, cap_problem = utils._detect_logit_softcap(model)
+    if (problem or cap_problem or scale is not None or softcap
+            or desc.module.weight.shape[0] < 8192
+            or (desc.quantized and desc.module.trainable_parameters())):
+        return baseline
+
+    projection = _make_compact_preference_projection(
+        desc.module, frozen=not utils._is_lm_head_trainable(model),
+    )
+
+    def forward(model, batch, lengths, indices):
+        tokens = batch.shape[0] * (batch.shape[1] - 1)
+        if indices is None or tokens < 1024 or indices.shape[0] * 2 > tokens:
+            return None
+        targets = batch[:, 1:]
+        mask = _response_mask(targets, lengths)
+        hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
+        labels = mx.take(targets.reshape((-1,)), mx.maximum(indices, 0), axis=0)
+        head = utils._resolve_module_path(model, desc.path)
+        logits = projection(hidden, head.weight, head.get("scales"), head.get("biases"), indices)
+        ce = nn.losses.cross_entropy(logits, mx.maximum(labels, 0), reduction="none")
+        sums = _row_logit_sum(logits)
+        valid = indices >= 0
+        safe = mx.maximum(indices, 0)
+        ce = mx.zeros((targets.size,), ce.dtype).at[safe].add(mx.where(valid, ce, mx.array(0, ce.dtype)))
+        sums = mx.zeros((targets.size,), sums.dtype).at[safe].add(mx.where(valid, sums, mx.array(0, sums.dtype)))
+        return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape)), mask
+
+    loss_fn = make_dpo_loss_fn(objective, reference_policy=reference_policy, _cce_forward=forward)
+    loss_fn._unsloth_cce_backend = "compact-native-preference"
+    loss_fn._unsloth_cce_compaction = True
     return loss_fn
 
 
@@ -1382,13 +1517,15 @@ PREFERENCE_EVAL_STATS_WIDTH = {
 
 def _preference_stats(
     kind, logits, mask, *, chosen, rejected, chosen_rewards, rejected_rewards,
-    extra=(), extra_denominators=(),
+    extra=(), extra_denominators=(), logit_totals=None,
 ):
     """Numerators then denominators, all sums, so a window average is exact."""
     pairs = chosen.shape[0]
     # TRL is inconsistent between its trainers: DPOTrainer averages its logit
     # metric over completion positions, ORPOTrainer over the whole sequence.
-    if kind == "orpo":
+    if logit_totals is not None:
+        chosen_logits, rejected_logits, chosen_count, rejected_count = logit_totals
+    elif kind == "orpo":
         chosen_logits, chosen_count = _orpo_logit_sum(logits[:pairs])
         rejected_logits, rejected_count = _orpo_logit_sum(logits[pairs:])
     else:
@@ -1451,12 +1588,32 @@ def _orpo_scores(model, batch, lengths, beta):
     return nll_sum, nll_tokens, ratio, stats
 
 
-def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
-    logits, ce, mask = _preference_forward(model, batch, lengths)
+def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
+                cce_forward=None, cce_indices=None):
+    compact = None if cce_forward is None else cce_forward(model, batch, lengths, cce_indices)
     pairs = batch.shape[0] // 2
+    logit_totals = None
+    if compact is None:
+        logits, ce, mask = _preference_forward(model, batch, lengths)
+    else:
+        ce, row_sums, mask = compact
+        logits = None
+        from .utils import describe_output_head
+        vocab = describe_output_head(model).module.weight.shape[0]
+        row_sums = row_sums * mask
+        logit_totals = (row_sums[:pairs].sum(), row_sums[pairs:].sum(),
+                        mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
     logps = -(ce * mask).sum(axis=1)
     if objective.reference_free:
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
+    elif compact is not None and type(reference_policy) is LoRAReferencePolicy:
+        def response_scorer(model, batch, lengths):
+            result = cce_forward(model, batch, lengths, cce_indices)
+            if result is None:
+                return _response_logps(model, batch, lengths)
+            reference_ce, _, reference_mask = result
+            return -(reference_ce * reference_mask).sum(axis=1)
+        reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
     else:
         reference = reference_policy.forward(model, batch, lengths)
     if objective.length_normalized:
@@ -1469,7 +1626,7 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
     # TRL adds the rewards once per loss entry, so a two-entry list reports twice
     # a one-entry list; summed in its order, not scaled by the summed weights.
     stats = _preference_stats(
-        "dpo", logits, mask,
+        "dpo", logits, mask, logit_totals=logit_totals,
         chosen=chosen, rejected=rejected,
         chosen_rewards=_weighted_rewards(
             beta * (chosen - ref_chosen), objective.weights),
