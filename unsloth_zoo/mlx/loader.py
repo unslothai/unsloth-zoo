@@ -1715,10 +1715,9 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
                             raise
                         # A fallback that produced a processor outranks a refusal.
                         return processor
-                    # mlx_vlm.models.base's AutoProcessor shim swallows what its
-                    # native processor raises and chains to Transformers, so a
-                    # refusal comes back as a SUCCESSFUL call returning the image
-                    # processor alone.
+                    # mlx_vlm.models.base's AutoProcessor shim swallows what its native
+                    # processor raises and chains to Transformers, so a refusal returns
+                    # SUCCESSFULLY with the image processor alone.
                     if refusals and _is_degraded_mlx_vlm_processor(processor):
                         raise refusals[-1]
                     return processor

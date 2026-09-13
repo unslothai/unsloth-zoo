@@ -4560,8 +4560,7 @@ def test_image_processor_builder_forwards_trust(monkeypatch, tmp_path, trust):
 def test_swallowed_processor_refusal_is_not_returned_as_a_half_processor(
     monkeypatch, tmp_path, native_tokenizer,
 ):
-    """A swallowed refusal comes back as a successful call returning the
-    image-processor half, so the refusal has to win over that."""
+    """A swallowed refusal returns successfully with the image-processor half."""
     from transformers import AutoTokenizer
     import unsloth_zoo.mlx.loader as loader
 
@@ -4600,7 +4599,6 @@ def test_swallowed_processor_refusal_is_not_returned_as_a_half_processor(
 
     scoped = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
     if native_tokenizer:
-        # The shim recovered a usable tokenizer on its own: that still wins.
         assert isinstance(scoped(tmp_path), WithTokenizer)
     else:
         with pytest.raises(
