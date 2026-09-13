@@ -3818,7 +3818,10 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
             value = batch_dict[key]
             batch_dict[key] = value if isinstance(value, (mx.array, np.ndarray)) else normalized
             static_metadata[key] = normalized
-    batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
+    # Only when there is metadata: every VLM batch goes through here, and an
+    # always-present empty dict is a new key in every text-only batch's pytree.
+    if static_metadata:
+        batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
     if audio_embed_sizes is not None:
         # The model calls .item() on each entry, so hand over an array; the
         # tuple above is only for this function's span arithmetic.

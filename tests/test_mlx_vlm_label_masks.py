@@ -5763,3 +5763,20 @@ def test_rendering_does_not_copy_the_row_media():
                              {"type": "text", "text": "Q"}]}]
     assert _render_vlm_messages(_Processor(), messages) == "<image>Q"
     assert copied == []
+
+
+def test_compile_preparation_adds_no_metadata_key_without_metadata():
+    """Every VLM batch goes through the compile preparation, so writing the
+    static-metadata dict unconditionally puts a new key in every text-only
+    batch's pytree."""
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    text_only = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "attention_mask": mx.array([[1, 1, 1]])},
+        {"model_type": "some_new_arch"}, phase="content")
+    assert "_unsloth_static_vlm_metadata" not in text_only
+
+    with_grid = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "image_grid_thw": mx.array([[1, 16, 12]])},
+        {"model_type": "some_new_arch"}, phase="content")
+    assert with_grid["_unsloth_static_vlm_metadata"] == {"image_grid_thw": ((1, 16, 12),)}
