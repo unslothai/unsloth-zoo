@@ -4,13 +4,92 @@
 import ast
 import copy
 import functools
+import hashlib
 import inspect
+import logging
+import re
+import sys
 import textwrap
 from contextlib import contextmanager
 from types import FunctionType
 
 import mlx.core as mx
 import mlx.nn as nn
+
+
+logger = logging.getLogger(__name__)
+
+
+# Pin the upstream function bodies the fusions read, rewrite or reimplement, since a fusion
+# mirroring an upstream body would compute the old arithmetic once that body changes.
+_ALIASES = (("mx", mx), ("nn", nn))
+_CONTRACT_MISSES = set()
+
+
+@functools.cache
+def _function_ast(function):
+    return ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+
+
+def _ast_fingerprint(function):
+    # ast.unparse is version-stable once the 3.9/3.10 tuple parentheses are dropped; ast.dump is not.
+    source = ast.unparse(_function_ast(function))
+    source = re.sub(r"^(\s*)\(([^()\n]+)\) = ", r"\1\2 = ", source, flags = re.M)
+    source = re.sub(r"\bfor \(([^()\n]+)\) in ", r"for \1 in ", source)
+    return hashlib.sha256(source.encode()).hexdigest()[:16]
+
+
+def _resolve_dotted(module, path):
+    target = module
+    for part in path.split("."):
+        target = getattr(target, part, None)
+        if target is None:
+            return None
+    return target
+
+
+def _resolved_bindings(contract):
+    """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
+
+    Returns what each name resolved to, for `_bindings_intact` to recheck, or None when an entry
+    differs. A fusion has to recheck the bindings of the resolution that produced the callables it
+    captured, so these are returned rather than written into a list a later resolution would reuse.
+    """
+    holds, found = True, {}
+    for module_name, names in contract.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue  # never imported, so no model instance can use it
+        for path, expected in names.items():
+            owner, _, name = path.rpartition(".")
+            holder = _resolve_dotted(module, owner) if owner else module
+            target = getattr(holder, name, None)
+            try:
+                # inspect follows __wrapped__ to the original source, so a wrapped target is refused.
+                matches = target is not None and (expected is None or (
+                    not hasattr(target, "__wrapped__") and _ast_fingerprint(target) == expected
+                    and all(target.__globals__.get(alias, mod) is mod for alias, mod in _ALIASES)))
+            except (OSError, TypeError, SyntaxError, AttributeError):
+                matches = False
+            if matches:
+                found[id(holder), name] = (vars(holder), name, target)
+                for alias, mod in (_ALIASES if expected is not None else ()):
+                    if alias in target.__globals__:
+                        found[id(target.__globals__), alias] = (target.__globals__, alias, mod)
+            else:
+                holds = False
+                if (module_name, path) not in _CONTRACT_MISSES:
+                    _CONTRACT_MISSES.add((module_name, path))
+                    logger.warning("%s.%s differs from the version the MLX fusions were written "
+                                   "against; the native method stays in use", module_name, path)
+    return list(found.values()) if holds else None
+
+
+def _bindings_intact(bindings):
+    for namespace, name, target in bindings:
+        if namespace.get(name) is not target:
+            return False
+    return True
 
 
 @functools.cache
@@ -57,9 +136,7 @@ def _decode_conv_silu(x, weight):
     )[0]
 
 
-@functools.cache
-def _function_ast(call):
-    return ast.parse(textwrap.dedent(inspect.getsource(call))).body[0]
+_CONV_SILU_CONTRACT = {"mlx.nn": {"silu": "78867fdb7e42731c"}}
 
 
 def _source_expression(node):
@@ -98,7 +175,7 @@ def _decode_conv_silu_contract(base):
                 and not target.keywords):
             return None
         conv = prepare.__globals__.get(target.func.id)
-        if any(hasattr(f, "__wrapped__") for f in (call, prepare, conv, nn.silu)):
+        if any(hasattr(f, "__wrapped__") for f in (call, prepare, conv)):
             return None
         arithmetic = _function_ast(conv)
         if [_source_expression(n) for n in arithmetic.body] != [
@@ -106,7 +183,7 @@ def _decode_conv_silu_contract(base):
             "return out.astype(conv_input.dtype)[:, None, :]",
         ] or inspect.unwrap(conv).__globals__.get("mx") is not mx:
             return None
-        if [_source_expression(n) for n in _function_ast(nn.silu).body if not isinstance(n, ast.Expr)] != ["return x * mx.sigmoid(x)"]:
+        if _resolved_bindings(_CONV_SILU_CONTRACT) is None:
             return None
         if call.__closure__ or prepare.__closure__:
             return None
@@ -129,6 +206,7 @@ def _decode_conv_silu_contract(base):
 
 @functools.cache
 def _fused_decode_conv_silu_class(base, call, prepare, conv, silu):
+    bindings = _resolved_bindings(_CONV_SILU_CONTRACT) or []  # this resolution's, not a later one's
     outer, inner = copy.deepcopy(_function_ast(call)), copy.deepcopy(_function_ast(prepare))
 
     class Rewrite(ast.NodeTransformer):
@@ -155,7 +233,7 @@ def _fused_decode_conv_silu_class(base, call, prepare, conv, silu):
 
     def fused_call(self, *args, **kwargs):
         if (self.training or prepare.__globals__.get(conv_name) is not conv
-                or nn.silu is not silu):
+                or not _bindings_intact(bindings)):
             return call(self, *args, **kwargs)
         return adapted_call(self, *args, **kwargs)
 

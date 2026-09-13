@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-from types import SimpleNamespace
+from types import FunctionType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -123,9 +123,41 @@ def test_live_globals_and_changed_arithmetic_keep_native(monkeypatch):
         monkeypatch.setattr(native, "gated_delta_update", observed)
         mx.eval(model(x))
         assert calls
+        silu = nn.silu
+        monkeypatch.setattr(nn, "silu", lambda value: silu(value) * 2)
+        _equal(model(x), native.Qwen3_5GatedDeltaNet.__call__(model, x))
+        monkeypatch.setattr(nn, "silu", silu)
         conv = native._qwen3_5_decode_depthwise_conv
         monkeypatch.setattr(native, "_qwen3_5_decode_depthwise_conv", lambda *args: conv(*args) * 2)
         _equal(model(x), native.Qwen3_5GatedDeltaNet.__call__(model, x))
+    with decode.fused_decode_conv_silu(model):
+        assert type(model) is native.Qwen3_5GatedDeltaNet
+
+
+@pytest.mark.parametrize("drift", ["replaced", "globals"])
+def test_silu_drifting_inside_an_open_scope_keeps_native(drift, monkeypatch):
+    model = _model(9 if drift == "replaced" else 4)
+    x = mx.random.normal((2, 1, 32)).astype(mx.bfloat16)
+    plain = getattr(nn.silu, "__wrapped__", nn.silu)
+    twin = lambda: FunctionType(plain.__code__, dict(plain.__globals__), plain.__name__)
+    captured = twin()
+    monkeypatch.setattr(nn, "silu", captured)
+    with decode.fused_decode_conv_silu(model):
+        if drift == "replaced":
+            monkeypatch.setattr(nn, "silu", twin())  # same source, so a later scope entry still finds it held
+            with decode.fused_decode_conv_silu(_model(9)):
+                pass
+        captured.__globals__["mx"] = SimpleNamespace(sigmoid = lambda value: mx.sigmoid(value) * 2)
+        _equal(model(x), native.Qwen3_5GatedDeltaNet.__call__(model, x))
+
+
+@pytest.mark.parametrize("drift", ["hash", "body"])
+def test_a_changed_silu_body_keeps_native(drift, monkeypatch):
+    if drift == "hash":
+        monkeypatch.setitem(decode._CONV_SILU_CONTRACT["mlx.nn"], "silu", "stale")
+    else:
+        monkeypatch.setattr(nn, "silu", nn.gelu)  # a real function whose body is not the pinned one
+    model = _model()
     with decode.fused_decode_conv_silu(model):
         assert type(model) is native.Qwen3_5GatedDeltaNet
 
