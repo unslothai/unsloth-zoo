@@ -284,8 +284,25 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
+_AUTO_INSTALL_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+
+
+def _auto_install_enabled() -> bool:
+    """Read at the attempt, not at import, so setting it after `import unsloth` works."""
+    return os.environ.get("UNSLOTH_AUTO_INSTALL", "1").strip().upper() \
+        in _AUTO_INSTALL_TRUE_VALUES
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
+
+    # Checked before the platform branch. The Windows arm returns early and the Colab
+    # and Kaggle paths skip the prompt, so an opt out placed any lower would miss them.
+    if not _auto_install_enabled():
+        raise RuntimeError(
+            f"Unsloth: Installation of `{package}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
 
     if IS_WINDOWS:
         # Per-package winget config aligned with setup.ps1
@@ -346,7 +363,29 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        # input() raises in non-interactive contexts. Under `docker run` without -i, or with
+        # stdin from /dev/null, this used to propagate through save_pretrained_gguf as
+        # `RuntimeError: Unsloth: GGUF conversion failed: EOF when reading a line`.
+        try:
+            acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        except (EOFError, RuntimeError) as exception:
+            # CPython raises RuntimeError for a lost stdout or stderr too, and an unrelated
+            # failure must not read as consent. Accept it only when stdin itself is gone.
+            if isinstance(exception, RuntimeError) and sys.stdin is not None:
+                raise
+            # EOFError on a terminal is Ctrl-D and still cancels. EOFError with no terminal
+            # means there was never anyone to ask, which is the same implicit ENTER the
+            # prompt already documents. A stdin whose isatty() raises counts as no terminal.
+            try:
+                _stdin_is_a_tty = sys.stdin is not None and sys.stdin.isatty()
+            except Exception:
+                _stdin_is_a_tty = False
+            if _stdin_is_a_tty:
+                raise RuntimeError(
+                    f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
+                    "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
+            acceptance = ""
         if "no" in str(acceptance).lower():
             raise RuntimeError(
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
