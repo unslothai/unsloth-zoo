@@ -79,3 +79,22 @@ def test_an_unregistered_method_is_left_alone(monkeypatch):
 
     set_config("bitsandbytes", object)
     assert registry == {}, "must not create an entry vLLM never registered"
+
+
+def test_the_missing_plugin_error_is_raised_where_4bit_is_decided():
+    """The install hint must sit on a reachable path.
+
+    It used to live only in an `_apply_4bit_weight` defined in the no-bnb
+    branch, which `patch_vllm_bitsandbytes` never installs, so a 4-bit load on
+    vLLM >= 0.28 without the plugin hit vLLM's generic quantization error.
+    """
+    import inspect
+
+    from unsloth_zoo import vllm_utils
+
+    source = inspect.getsource(vllm_utils.load_vllm)
+    assert "vllm-bnb-plugin" in source, (
+        "load_vllm must raise the install hint once it knows bitsandbytes is "
+        "wanted; an unreachable stub leaves users with vLLM's generic error"
+    )
+    assert "_vllm_bnb is None" in source, "the hint must be gated on the resolution failing"

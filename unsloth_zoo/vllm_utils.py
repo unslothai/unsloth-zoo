@@ -107,6 +107,11 @@ def get_mem_info():
     return free_memory, total_memory
 pass
 
+# Whichever bitsandbytes module we resolved below, if vLLM is installed at all.
+# Defined out here because load_vllm reads it and lives outside that branch.
+_vllm_bnb = None
+
+
 def _set_registered_quant_config(method, config_cls):
     # A plugin registers the CLASS OBJECT, so a module attribute swap alone
     # leaves vLLM ignoring UNSLOTH_bnb_4bit_compute_dtype. In-tree re-imports
@@ -209,13 +214,10 @@ if importlib.util.find_spec("vllm") is not None:
         except ImportError:
             continue
     if _vllm_bnb is None:
-        # Only 4-bit fast_inference needs the plugin, so fail on use, not import.
+        # No bnb to wrap. Only 4-bit needs it, and load_vllm raises there with
+        # the install instructions, so leave the rest of this module usable.
         def _apply_4bit_weight(self, layer, x, bias = None):
-            raise RuntimeError(
-                "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
-                "Install it with `pip install vllm-bnb-plugin` to use "
-                "load_in_4bit with fast_inference."
-            )
+            raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin` for load_in_4bit.")
         pass
     elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
         # Make the compute dtype dynamic instead of forcing torch.bfloat16
@@ -2569,6 +2571,14 @@ def load_vllm(
     quant_method = get_quant_type(config)
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
+
+    # vLLM absent is a different failure with its own message, so say nothing here.
+    if use_bitsandbytes and _vllm_bnb is None and importlib.util.find_spec("vllm"):
+        raise RuntimeError(
+            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
+            "Install it with `pip install vllm-bnb-plugin` to use "
+            "load_in_4bit with fast_inference."
+        )
 
     if _is_gemma4_config(config):
         if enable_lora:
