@@ -1,11 +1,94 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Scoped MLX quantized MoE gate and up projection fusion."""
 
+import ast
+import functools
+import hashlib
+import inspect
+import logging
+import re
 import sys
+import textwrap
 from contextlib import contextmanager
 from threading import RLock
 
 import mlx.core as mx
+import mlx.nn as nn
+
+
+logger = logging.getLogger(__name__)
+
+
+# Pin the upstream function bodies the fusions read, rewrite or reimplement, since a fusion
+# mirroring an upstream body would compute the old arithmetic once that body changes.
+_ALIASES = (("mx", mx), ("nn", nn))
+_CONTRACT_MISSES = set()
+
+
+@functools.cache
+def _function_ast(function):
+    return ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+
+
+def _ast_fingerprint(function):
+    # ast.unparse is version-stable once the 3.9/3.10 tuple parentheses are dropped; ast.dump is not.
+    source = ast.unparse(_function_ast(function))
+    source = re.sub(r"^(\s*)\(([^()\n]+)\) = ", r"\1\2 = ", source, flags = re.M)
+    source = re.sub(r"\bfor \(([^()\n]+)\) in ", r"for \1 in ", source)
+    return hashlib.sha256(source.encode()).hexdigest()[:16]
+
+
+def _resolve_dotted(module, path):
+    target = module
+    for part in path.split("."):
+        target = getattr(target, part, None)
+        if target is None:
+            return None
+    return target
+
+
+def _resolved_bindings(contract):
+    """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
+
+    Returns what each name resolved to, for `_bindings_intact` to recheck, or None when an entry
+    differs. A fusion has to recheck the bindings of the resolution that produced the callables it
+    captured, so these are returned rather than written into a list a later resolution would reuse.
+    """
+    holds, found = True, {}
+    for module_name, names in contract.items():
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue  # never imported, so no model instance can use it
+        for path, expected in names.items():
+            owner, _, name = path.rpartition(".")
+            holder = _resolve_dotted(module, owner) if owner else module
+            target = getattr(holder, name, None)
+            try:
+                # inspect follows __wrapped__ to the original source, so a wrapped target is refused.
+                matches = target is not None and (expected is None or (
+                    not hasattr(target, "__wrapped__") and _ast_fingerprint(target) == expected
+                    and all(target.__globals__.get(alias, mod) is mod for alias, mod in _ALIASES)))
+            except (OSError, TypeError, SyntaxError, AttributeError):
+                matches = False
+            if matches:
+                found[id(holder), name] = (vars(holder), name, target)
+                for alias, mod in (_ALIASES if expected is not None else ()):
+                    if alias in target.__globals__:
+                        found[id(target.__globals__), alias] = (target.__globals__, alias, mod)
+            else:
+                holds = False
+                if (module_name, path) not in _CONTRACT_MISSES:
+                    _CONTRACT_MISSES.add((module_name, path))
+                    logger.warning("%s.%s differs from the version the MLX fusions were written "
+                                   "against; the native method stays in use", module_name, path)
+    return list(found.values()) if holds else None
+
+
+def _bindings_intact(bindings):
+    for namespace, name, target in bindings:
+        if namespace.get(name) is not target:
+            return False
+    return True
 
 
 _MOE_PROJECTION_FIELDS = ("weight", "scales", "biases", "bias")
@@ -18,13 +101,26 @@ _MOE_GATE_UP_CLASSES = {}
 _MOE_GATE_UP_LOCK = RLock()
 
 
+# Bodies the fused expert call reimplements. Both switch layer packages carry the same sources,
+# so one set of hashes covers either namespace.
+_MOE_GATE_UP_FUNCTIONS = {
+    "SwitchGLU.__call__": "ed00798a68bad37d",
+    "QuantizedSwitchLinear.__call__": "59bbb193612cbe06",
+    "_gather_sort": "75657d7fb03060c6",
+    "_scatter_unsort": "78d5aa7dbef7183e",
+}
+
+
 def _moe_switch_specs():
     specs = {}
     for path in ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers"):
         native = sys.modules.get(path)
-        if native is not None and hasattr(native, "QuantizedSwitchLinear"):
+        if native is None or not hasattr(native, "QuantizedSwitchLinear"):
+            continue
+        bindings = _resolved_bindings({path: _MOE_GATE_UP_FUNCTIONS})
+        if bindings is not None:  # one drifted package still leaves the other
             specs[native.SwitchGLU] = (
-                native.QuantizedSwitchLinear, native._gather_sort, native._scatter_unsort,
+                native.QuantizedSwitchLinear, native._gather_sort, native._scatter_unsort, bindings,
             )
     return specs
 
@@ -120,12 +216,13 @@ class _PackedMoEGateUp:
         return mx.split(result, 2, axis = -1)
 
 
-def _fused_moe_gate_up_class(original_class, gather_sort, scatter_unsort):
-    if original_class not in _MOE_GATE_UP_CLASSES:
+def _fused_moe_gate_up_class(original_class, projection_type, gather_sort, scatter_unsort, bindings):
+    key = (original_class, projection_type, gather_sort, scatter_unsort)  # each class guards its own resolution
+    if key not in _MOE_GATE_UP_CLASSES:
 
         def fused_call(self, x, indices):
             packed = self._unsloth_moe_gate_up
-            if self.training or not packed.matches(self):
+            if self.training or not packed.matches(self) or not _bindings_intact(bindings):
                 return original_class.__call__(self, x, indices)
             x = mx.expand_dims(x, (-2, -3))
             do_sort = indices.size >= 64
@@ -139,10 +236,10 @@ def _fused_moe_gate_up_class(original_class, gather_sort, scatter_unsort):
                 x = scatter_unsort(x, inv_order, indices.shape)
             return x.squeeze(-2)
 
-        _MOE_GATE_UP_CLASSES[original_class] = type(
+        _MOE_GATE_UP_CLASSES[key] = type(
             f"_FusedMoEGateUp{original_class.__name__}", (original_class,), {"__call__": fused_call}
         )
-    return _MOE_GATE_UP_CLASSES[original_class]
+    return _MOE_GATE_UP_CLASSES[key]
 
 
 @contextmanager
@@ -161,7 +258,7 @@ def fused_moe_gate_up(model):
                 for _, module in modules:
                     packed = getattr(module, "_unsloth_moe_gate_up", None)
                     if (isinstance(packed, _PackedMoEGateUp)
-                            and type(module) is _MOE_GATE_UP_CLASSES.get(packed.original_class)):
+                            and type(module) in _MOE_GATE_UP_CLASSES.values()):
                         original, fused = packed.original_class, type(module)
                     else:
                         original = type(module)
@@ -169,7 +266,7 @@ def fused_moe_gate_up(model):
                         if spec is None or not _moe_gate_up_eligible(module, spec[0]):
                             continue
                         packed = _PackedMoEGateUp(module)
-                        fused = _fused_moe_gate_up_class(original, spec[1], spec[2])
+                        fused = _fused_moe_gate_up_class(original, *spec)
                     packed.active_scopes += 1
                     patched.append((module, original, fused, packed))
                     if type(module) is not fused:

@@ -12,7 +12,11 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason = "Requires 
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 from mlx_lm.models import switch_layers as lm
+from mlx_lm.models.gpt_oss import SwiGLU
 from mlx_vlm.models import switch_layers as vlm
+from mlx_vlm.models.gemma4.language import GeGLU
+from unsloth_zoo.mlx import inference as fusion
+from unsloth_zoo.mlx.generate import generation_mode
 from unsloth_zoo.mlx.inference import fused_moe_gate_up
 
 
@@ -24,8 +28,7 @@ def _model(native, dtype = mx.bfloat16, dims = (2048, 512), quantization = (8, "
            activation = None, bias = True):
     mx.random.seed(19)
     bits, mode, group_size = quantization
-    kwargs = {} if activation is None else {"activation": activation}
-    model = native.SwitchGLU(*dims, 8, bias = bias, **kwargs)
+    model = native.SwitchGLU(*dims, 8, bias = bias, **({} if activation is None else {"activation": activation}))
     model.set_dtype(dtype)
     nn.quantize(model, bits = bits, group_size = group_size, mode = mode,
                 # a hidden width the group size does not divide leaves down_proj native, which the pack ignores
@@ -40,11 +43,24 @@ def _equal(a, b):
     assert np.array_equal(np.array(a.view(mx.uint8)), np.array(b.view(mx.uint8)))
 
 
+def _samples(model, dtype, width, shapes):
+    built = []
+    for batch, length in shapes:
+        x, indices = mx.random.normal((batch, length, width)).astype(dtype), mx.random.randint(0, 8, (batch, length, 8))
+        built.append((x, indices, model(x, indices)))
+    mx.eval(built)
+    return built
+
+
+def _counting_gather_qmm(monkeypatch):
+    native_gather_qmm, calls = mx.gather_qmm, []
+    monkeypatch.setattr(mx, "gather_qmm", lambda *a, **k: calls.append(None) or native_gather_qmm(*a, **k))
+    return calls
+
+
 def _sample(width = 2048):
-    return (
-        mx.random.normal((1, 2, width)).astype(mx.bfloat16),
-        mx.array([[[7, 2, 0, 5], [6, 4, 1, 3]]]),
-    )
+    return (mx.random.normal((1, 2, width)).astype(mx.bfloat16),
+            mx.array([[[7, 2, 0, 5], [6, 4, 1, 3]]]))
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
@@ -54,21 +70,9 @@ def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dim
     model = _model(native, dtype, dims, quantization)
     original_call = native.SwitchGLU.__call__
     names = {name for name, _ in tree_flatten(model.parameters())}
-    samples = []
-    for batch, length in [(1, 1), (2, 1), (1, 8), (1, 64), (1, 256)]:
-        x = mx.random.normal((batch, length, dims[0])).astype(dtype)
-        indices = mx.random.randint(0, 8, (batch, length, 8))
-        expected = model(x, indices)
-        mx.eval(x, indices, expected)
-        samples.append((x, indices, expected))
-    gather_qmm = mx.gather_qmm
-    calls = []
-
-    def counted(*args, **kwargs):
-        calls.append(None)
-        return gather_qmm(*args, **kwargs)
-
-    monkeypatch.setattr(mx, "gather_qmm", counted)
+    samples = _samples(model, dtype, dims[0], [(1, 1), (2, 1), (1, 8), (1, 64), (1, 256)])
+    calls, clears = _counting_gather_qmm(monkeypatch), []
+    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(None))
     with fused_moe_gate_up(model):
         assert type(model) is not native.SwitchGLU
         assert native.SwitchGLU.__call__ is original_call
@@ -77,8 +81,22 @@ def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dim
             calls.clear()
             _equal(model(x, indices), expected)
             assert len(calls) == 2
+        monkeypatch.setattr(native, "_gather_sort", None)  # a rebound switch layer function falls back per call
+        calls.clear()
+        _equal(model(*samples[0][:2]), samples[0][2])
+        assert len(calls) == 3
     assert type(model) is native.SwitchGLU
     assert {name for name, _ in tree_flatten(model.parameters())} == names
+    assert clears == []  # the scope never clears the allocator other models share
+
+
+def test_each_contract_resolution_gets_its_own_bindings():
+    # one list shared between resolutions would vouch for helpers a cached fused class never captured
+    first, second = fusion._moe_switch_specs(), fusion._moe_switch_specs()
+    assert first[lm.SwitchGLU][3] is not second[lm.SwitchGLU][3]
+    fused = [fusion._fused_moe_gate_up_class(lm.SwitchGLU, kind, None, None, []) for kind in
+             (lm.QuantizedSwitchLinear, type("Other", (lm.QuantizedSwitchLinear,), {}))]
+    assert fused[0] is not fused[1]  # one class cached across projection types would guard the wrong one
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
@@ -116,13 +134,13 @@ def test_overlapping_scopes_keep_shared_modules_patched(native, first_exit):
     expected = [module(x, indices) for module in modules]
     mx.eval(expected)
     scopes = [fused_moe_gate_up(root), fused_moe_gate_up(modules[1])]
-    active = []
+    entered = []
     try:
         for scope in scopes:
             scope.__enter__()
-            active.append(scope)
+            entered.append(scope)
         bound_call = modules[1].__call__
-        active.remove(scopes[first_exit])
+        entered.remove(scopes[first_exit])
         scopes[first_exit].__exit__(None, None, None)
         for index, module in enumerate(modules):
             still_active = first_exit == 1 or index == 1
@@ -131,7 +149,7 @@ def test_overlapping_scopes_keep_shared_modules_patched(native, first_exit):
             _equal(module(x, indices), expected[index])
         _equal(bound_call(x, indices), expected[1])
     finally:
-        for scope in reversed(active):
+        for scope in reversed(entered):
             scope.__exit__(None, None, None)
     for module, answer in zip(modules, expected):
         assert type(module) is native.SwitchGLU
@@ -139,33 +157,20 @@ def test_overlapping_scopes_keep_shared_modules_patched(native, first_exit):
         _equal(module(x, indices), answer)
 
 
-def test_fusion_does_not_clear_the_global_allocator(monkeypatch):
-    model = _model(lm)
-    clears = []
-    monkeypatch.setattr(mx, "clear_cache", lambda: clears.append(None))
-    with fused_moe_gate_up(model):
-        assert type(model) is not lm.SwitchGLU
-    assert clears == []
-
-
 @pytest.mark.parametrize("native", [lm, vlm])
 def test_inplace_edits_between_scopes_are_used(native):
     model = _model(native)
     x, indices = _sample()
     with fused_moe_gate_up(model):
-        before = model(x, indices)
-        mx.eval(before)
+        mx.eval(before := model(x, indices))
     for projection in (model.gate_proj, model.up_proj):
         weight = projection.weight
         weight[-1, -64:, :] = 0
         projection.scales[-2, :, :] *= 1.5
         projection.bias[-1, :] += 0.25
         assert projection.weight is weight
-        expected = model(x, indices)
-        mx.eval(expected)
-        assert not np.array_equal(
-            np.array(before.view(mx.uint8)), np.array(expected.view(mx.uint8)),
-        )
+        mx.eval(expected := model(x, indices))
+        assert not np.array_equal(np.array(before.view(mx.uint8)), np.array(expected.view(mx.uint8)))
         with fused_moe_gate_up(model):
             _equal(model(x, indices), expected)
         _equal(model(x, indices), expected)
@@ -177,12 +182,7 @@ def test_training_replacement_and_adapters_use_native_path(native, monkeypatch):
     model = _model(native)
     x, indices = _sample()
     original_call = native.SwitchGLU.__call__
-    gather_qmm = mx.gather_qmm
-    calls = []
-
-    def counted(*args, **kwargs):
-        calls.append(None)
-        return gather_qmm(*args, **kwargs)
+    calls = _counting_gather_qmm(monkeypatch)
 
     class AdaptedProjection(nn.Module):
         def __init__(self, base):
@@ -192,29 +192,25 @@ def test_training_replacement_and_adapters_use_native_path(native, monkeypatch):
         def __call__(self, inputs, indices, sorted_indices = False):
             return self.base(inputs, indices, sorted_indices = sorted_indices) + 0.5
 
-    monkeypatch.setattr(mx, "gather_qmm", counted)
+    def assert_native_path():
+        calls.clear()
+        actual = model(x, indices)
+        assert len(calls) == 3
+        _equal(actual, original_call(model, x, indices))
+
     with fused_moe_gate_up(model):
         model.train()
-        calls.clear()
-        actual = model(x, indices)
-        assert len(calls) == 3
-        _equal(actual, original_call(model, x, indices))
+        assert_native_path()
         model.eval()
         model.gate_proj.scales = model.gate_proj.scales * 1.25
-        calls.clear()
-        actual = model(x, indices)
-        assert len(calls) == 3
-        _equal(actual, original_call(model, x, indices))
+        assert_native_path()
     with fused_moe_gate_up(model):
         model.up_proj = AdaptedProjection(model.up_proj)
-        calls.clear()
-        actual = model(x, indices)
-        assert len(calls) == 3
-        _equal(actual, original_call(model, x, indices))
+        assert_native_path()
 
 
-@pytest.mark.parametrize("reason", ["rows", "mixed", "partial", "custom", "training", "trainable", "distributed"])
-def test_ineligible_models_stay_native(reason):
+@pytest.mark.parametrize("reason", ["rows", "mixed", "partial", "stale", "helper", "custom", "training", "trainable", "distributed"])
+def test_ineligible_models_stay_native(reason, monkeypatch):
     # 516 rows pack to 1032, which MLX sends to the aligned kernel the 516-row pair cannot use.
     model = _model(vlm, dims = (2048, 516) if reason == "rows" else (2048, 512),
                    quantization = (4, "affine", 64) if reason == "partial" else (8, "affine", 64))
@@ -222,6 +218,10 @@ def test_ineligible_models_stay_native(reason):
         model.up_proj = _model(vlm, quantization = (4, "affine", 64)).up_proj
     elif reason == "partial":
         model.gate_proj.biases = None  # one projection carrying a field the other lacks cannot pack
+    elif reason == "stale":
+        monkeypatch.setitem(fusion._MOE_GATE_UP_FUNCTIONS, "SwitchGLU.__call__", "stale")
+    elif reason == "helper":  # a sort helper whose body is not the one the fused call was written against
+        monkeypatch.setattr(vlm, "_gather_sort", vlm._scatter_unsort)
     elif reason == "custom":
         class CustomSwitch(vlm.SwitchGLU):
             pass
@@ -238,39 +238,23 @@ def test_ineligible_models_stay_native(reason):
 
 
 def test_generation_mode_applies_fusion_and_restores_training():
-    from unsloth_zoo.mlx.generate import generation_mode
-
     model = _model(lm)
-    x, indices = _sample()
-    expected = model(x, indices)
-    mx.eval(expected)
+    (x, indices, expected), = _samples(model, mx.bfloat16, 2048, [(1, 2)])
     model.train()
     with generation_mode(model):
         assert type(model) is not lm.SwitchGLU
         assert not model.training
         _equal(model(x, indices), expected)
-    assert type(model) is lm.SwitchGLU
-    assert model.training
+    assert type(model) is lm.SwitchGLU and model.training
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("family", ["gemma", "gpt_oss"])
 @pytest.mark.parametrize("bias", [False, True])
 def test_family_activation_is_preserved(dtype, family, bias):
-    if family == "gemma":
-        from mlx_vlm.models.gemma4.language import GeGLU
-        activation, dims = GeGLU(), (2816, 704)
-    else:
-        from mlx_lm.models.gpt_oss import SwiGLU
-        activation, dims = SwiGLU(), (2880, 2880)
+    activation, dims = (GeGLU(), (2816, 704)) if family == "gemma" else (SwiGLU(), (2880, 2880))
     model = _model(vlm, dtype, dims, activation = activation, bias = bias)
-    samples = []
-    for batch, length in [(1, 1), (2, 1), (1, 32)]:
-        x = mx.random.normal((batch, length, dims[0])).astype(dtype)
-        indices = mx.random.randint(0, 8, (batch, length, 8))
-        expected = model(x, indices)
-        mx.eval(x, indices, expected)
-        samples.append((x, indices, expected))
+    samples = _samples(model, dtype, dims[0], [(1, 1), (2, 1), (1, 32)])
     with fused_moe_gate_up(model):
         assert type(model) is not vlm.SwitchGLU
         for x, indices, expected in samples:
