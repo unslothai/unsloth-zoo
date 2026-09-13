@@ -111,6 +111,31 @@ def _mode(path):
     return stat.S_IMODE(os.stat(path).st_mode)
 
 
+@pytest.mark.parametrize("failure", [None, TypeError, AttributeError])
+def test_vlm_processor_failure_preserves_finished_adapter(tmp_path, failure):
+    from pathlib import Path
+    from types import SimpleNamespace
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    processor = SimpleNamespace()
+    def broken_save(directory):
+        (Path(directory) / "processor_config.json").write_text('{"broken":')
+        raise failure("processor runtime state is not serializable")
+    if failure is not None:
+        processor.save_pretrained = broken_save
+    model = nn.Module()
+    model.q_proj = LoRALinear.from_base(nn.Linear(4, 4, bias=False), r=2, scale=2)
+    model.q_proj.lora_b = mx.ones_like(model.q_proj.lora_b) * 3
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model, trainer.processor, trainer.tokenizer = model, processor, processor
+    trainer.args = SimpleNamespace(output_dir=str(tmp_path / "saved"), learning_rate=1e-3,
+                                   max_steps=2, max_seq_length=8, use_cce=True)
+    trainer._save_model_impl()
+    saved = Path(trainer.args.output_dir)
+    assert mx.array_equal(mx.load(str(saved / "adapters.safetensors"))["q_proj.lora_b"], model.q_proj.lora_b)
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_resaving_adapters_keeps_the_targets_permissions(tmp_path, monkeypatch):
     """os.replace() installs a new inode, so the temp file must inherit the mode.

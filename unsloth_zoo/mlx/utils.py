@@ -768,13 +768,20 @@ def apply_gather_qmm_nax_guard() -> bool:
 
 
 def _get_transformer_layers(model):
-    """Find transformer layers, unwrapping VLM wrappers if needed.
-
-    VLMs: model.language_model.model.layers; text: model.(model.)layers.
-    """
-    m = getattr(model, 'language_model', model)
-    m = getattr(m, 'model', m)
-    return getattr(m, 'layers', None)
+    pending = collections.deque([getattr(model, "language_model", model)])
+    seen = set()
+    while pending:
+        module = pending.popleft()
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        for name in ("layers", "blocks"):
+            layers = getattr(module, name, None)
+            if isinstance(layers, (list, tuple)):
+                return layers
+        for name in ("decoder", "model", "transformer", "layers", "blocks"):
+            pending.append(getattr(module, name, None))
+    return None
 
 
 def _get_vision_encoder_layers(model):
@@ -1235,7 +1242,7 @@ def _identify_vlm_embedding_module(model):
             embed_result = model.get_input_embeddings(ids, None)
         except TypeError:
             embed_result = model.get_input_embeddings(ids)
-        merged, _ = _unpack_embed_result(embed_result, model)
+        merged, _ = _unpack_embed_result(embed_result, model, input_ids=ids)
     except Exception:
         return None
     finally:
@@ -2453,6 +2460,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         if attention_np.dtype == np.float64:
             attention_np = attention_np.astype(np.float32)
         mask = mask | (attention_np.astype(np.int32) == 0)
+    if inputs.get("_unsloth_suffix_only_loss", False):
+        mask = mask | (np.asarray(inputs["token_type_ids"]) == 0)
     return mask
 
 def _reject_mlx_valued_vlm(context):
@@ -2637,6 +2646,9 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     if attention_mask is not None:
         ignore = mx.array(ignore_index, dtype=labels.dtype)
         labels = mx.where(attention_mask == 0, ignore, labels)
+    if batch_dict.get("_unsloth_suffix_only_loss", False):
+        labels = mx.where(batch_dict["token_type_ids"] == 0,
+                          mx.array(ignore_index, dtype=labels.dtype), labels)
     return labels
 
 
@@ -2735,6 +2747,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             and not k.startswith("_unsloth_")
             and v is not None
         }
+        _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
         # Always sent: 13 families declare `mask` without a default. None lets
         # them build the mask they would use for generation.
@@ -2759,7 +2772,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                 **{k: v for k, v in fwd_kwargs.items()
                    if k not in ("mask", "cache")},
             )
-            merged_embeds, embed_kwargs = _unpack_embed_result(embed_result, model)
+            merged_embeds, embed_kwargs = _unpack_embed_result(
+                embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+            )
             scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
             # per_layer_inputs and friends: the merge produced them, and
             # recomputing from ids inside the stack would redo the work.
@@ -2773,7 +2788,8 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # it by forwarding straight to the language model; do that here on
             # every version, which is what `_vlm_cce_forward` already does.
             output = _get_text_model(model)(
-                inputs, inputs_embeds=scaled_embeds, **fwd_kwargs
+                inputs, inputs_embeds=scaled_embeds,
+                **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
             )
         else:
             output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
@@ -2832,7 +2848,34 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
-def _unpack_embed_result(embed_result, model):
+def _drop_pair_token_type_ids(batch_dict, kwargs):
+    """Keep suffix/prefix pair markers out of the text stack.
+
+    A suffix-supervised text-only row is encoded as a tokenizer pair, so its
+    `token_type_ids` mean "1 = suffix". Gemma3's stack reads the same key as
+    "1 = image" and makes every marked span bidirectional, which would let the
+    answer attend to its own future tokens. The model-level kwargs still carry
+    it, because PaliGemma's prefix-LM wrapper is the consumer that wants it.
+    """
+    if not batch_dict.get("_unsloth_suffix_only_loss", False):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k != "token_type_ids"}
+
+
+def _apply_static_vlm_metadata(model, batch_dict, kwargs):
+    embedder = getattr(model, "get_input_embeddings", None)
+    keys = getattr(embedder, "_unsloth_static_vlm_metadata", ())
+    if getattr(embedder, "_unsloth_static_metadata_with_positions", False) and (
+        not getattr(model, "training", False) or kwargs.get("position_ids") is None
+    ):
+        return
+    static = batch_dict.get("_unsloth_static_vlm_metadata", {})
+    for key in keys:
+        if key in static:
+            kwargs[key] = static[key]
+
+
+def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=None):
     """Unpack get_input_embeddings result into embeds + backbone kwargs.
 
     Handles plain mx.array returns and the InputEmbeddingsFeatures dataclass
@@ -2870,33 +2913,15 @@ def _unpack_embed_result(embed_result, model):
     else:
         merged_embeds = embed_result
 
-    # Qwen-VL family: some get_input_embeddings paths stash position_ids on the
-    # language model wrapper; the inner backbone needs them explicitly.
-    # Do not override position_ids explicitly returned by InputEmbeddingsFeatures
-    # (for example when the collator passed CUDA-parity mRoPE IDs through the
-    # embedder).
-    # When no position_ids were stashed (e.g. text-only samples or simple
-    # images without grid_thw), generate sequential ones so the backbone
-    # doesn't crash accessing cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
     if lm is not None and "position_ids" not in backbone_kwargs:
-        _MISSING = object()
-        pos_ids = getattr(lm, "_position_ids", _MISSING)
-        if pos_ids is not _MISSING and pos_ids is not None:
+        pos_ids = getattr(lm, "_position_ids", None)
+        if pos_ids is not None:
             backbone_kwargs["position_ids"] = pos_ids
-        elif pos_ids is None:
-            # Fallback: sequential position_ids. Correct for text-only and
-            # single-image samples. For multi-image with spatial m-RoPE
-            # (Qwen VL), the per-axis positions should differ for image
-            # regions — but grid_thw metadata is unavailable here so we
-            # use sequential as an approximation.
-            seq_len = merged_embeds.shape[1]
-            pos_ids = mx.arange(seq_len).reshape(1, -1)
-            pos_ids = mx.broadcast_to(pos_ids, (merged_embeds.shape[0], seq_len))
-            # Qwen VL m-RoPE uses 3 axes: temporal, height, width
-            MROPE_AXES = 3
-            pos_ids = mx.expand_dims(pos_ids, axis=0)
-            pos_ids = mx.tile(pos_ids, (MROPE_AXES, 1, 1))
+        elif (hasattr(lm, "_position_ids") and input_ids is not None
+              and callable(getattr(lm, "get_rope_index", None))):
+            # The model owns the positional axes; a cached field alone says nothing about rank.
+            pos_ids, _ = lm.get_rope_index(input_ids, attention_mask=attention_mask)
             backbone_kwargs["position_ids"] = pos_ids
 
     return merged_embeds, backbone_kwargs
@@ -2921,6 +2946,13 @@ def _filter_backbone_kwargs(backbone, kwargs):
         params = inspect.signature(backbone.__call__).parameters
     except (TypeError, ValueError):
         return kwargs
+    cache = params.get("cache")
+    if (
+        cache is not None and cache.default is inspect.Parameter.empty
+        and cache.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and "cache" not in kwargs
+    ):
+        kwargs = {**kwargs, "cache": None}
     if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
         return kwargs
     allowed = set(params)
@@ -2951,6 +2983,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         and not k.startswith("_unsloth_")
         and v is not None
     }
+    _apply_static_vlm_metadata(model, batch_dict, extra_kwargs)
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
 
     embed_result = model.get_input_embeddings(
@@ -2959,14 +2992,16 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         mask=fwd_attn_mask,
         **extra_kwargs,
     )
-    merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
+    merged_embeds, backbone_kwargs = _unpack_embed_result(
+        embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+    )
     merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
     if use_collated_position_ids and "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
-    if "token_type_ids" in extra_kwargs:
+    if "token_type_ids" in _drop_pair_token_type_ids(batch_dict, extra_kwargs):
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
@@ -3108,8 +3143,10 @@ def _mlx_vlm_canonical_model_type(model_type):
 
 
 # Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
-# `.prod()`, `[:, 1:]`). Everything else keeps the tuple the Qwen/Paddle compile
-# patches trace: an array becomes a tracer under mx.compile and `.tolist()` raises.
+# `.prod()`, `[:, 1:]`), so a tuple raises inside their tower. Everything else
+# keeps the tuple the Qwen/Paddle compile patches trace: an array becomes a
+# tracer under mx.compile and `.tolist()` raises there instead. Pinned by
+# tests/test_mlx_text_path_contract.py.
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
@@ -3119,26 +3156,14 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
 })
 
 
-def _grid_thw_to_mx_array(grid_thw):
-    if grid_thw is None:
-        return None
-    return mx.array(grid_thw, dtype=mx.int32)
-
-
 def _normalize_size_tuples(values):
     if values is None:
         return None
-    if isinstance(values, mx.array):
+    if hasattr(values, "tolist"):
         values = values.tolist()
-    elif hasattr(values, "tolist"):
-        values = values.tolist()
-
-    normalized = []
-    for item in values:
-        if hasattr(item, "tolist"):
-            item = item.tolist()
-        normalized.append(tuple(int(x) for x in item))
-    return tuple(normalized)
+    if isinstance(values, (list, tuple)):
+        return tuple(_normalize_size_tuples(item) for item in values)
+    return int(values)
 
 
 def _normalize_int_tuple(values):
@@ -3804,25 +3829,33 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    # Resolved, not raw: an aliased config is routed to the canonical family's tower,
-    # so the grid form has to follow it there.
+    # Resolved, not raw: an aliased config is routed to the canonical family's
+    # tower, so the grid form has to follow it there.
     grid_as_array = (
         _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
     )
-    if image_grid_thw is not None:
-        batch_dict["image_grid_thw"] = (
-            _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
-        )
-    if video_grid_thw is not None:
-        batch_dict["video_grid_thw"] = (
-            _grid_thw_to_mx_array(video_grid_thw) if grid_as_array else video_grid_thw
-        )
-    if image_sizes is not None:
-        batch_dict["image_sizes"] = image_sizes
-    if spatial_shapes is not None:
-        batch_dict["spatial_shapes"] = spatial_shapes
-    if images_spatial_crop is not None:
-        batch_dict["images_spatial_crop"] = images_spatial_crop
+    static_metadata = {}
+    for key, normalized in (
+        ("image_grid_thw", image_grid_thw),
+        ("video_grid_thw", video_grid_thw),
+        ("spatial_shapes", spatial_shapes),
+        ("image_sizes", image_sizes),
+        ("images_spatial_crop", images_spatial_crop),
+    ):
+        if normalized is not None:
+            value = batch_dict[key]
+            if isinstance(value, (mx.array, np.ndarray)):
+                pass  # Never downgrade what the processor emitted.
+            elif grid_as_array and key in ("image_grid_thw", "video_grid_thw"):
+                value = mx.array(normalized, dtype=mx.int32)
+            else:
+                value = normalized
+            batch_dict[key] = value
+            static_metadata[key] = normalized
+    # Only when there is metadata: every VLM batch goes through here, and an
+    # always-present empty dict is a new key in every text-only batch's pytree.
+    if static_metadata:
+        batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
     if audio_embed_sizes is not None:
         # The model calls .item() on each entry, so hand over an array; the
         # tuple above is only for this function's span arithmetic.
@@ -4341,8 +4374,18 @@ def normalize_mlx_chat_template(
         setattr(target, "_unsloth_model_type", model_type)
 
     tokenizer = _get_processor_tokenizer(target)
-    if is_vlm and not _has_chat_template(target) and _has_chat_template(tokenizer):
-        target.chat_template = tokenizer.chat_template
+    if is_vlm and not _has_chat_template(target):
+        if not _has_chat_template(tokenizer):
+            for source in (getattr(target, "_unsloth_model_name", None),
+                           getattr(tokenizer, "name_or_path", None)):
+                if not source or not Path(source).is_dir():
+                    continue
+                template_path = Path(source) / "chat_template.jinja"
+                if template_path.is_file():
+                    tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+                    break
+        if not _has_chat_template(target) and _has_chat_template(tokenizer):
+            target.chat_template = tokenizer.chat_template
 
     template_target = target if is_vlm else tokenizer
     if strict and not _has_chat_template(template_target):
@@ -4542,6 +4585,9 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         parts.append({"type": "text", "text": part})
                     elif isinstance(part, dict):
                         clean = _clean_vlm_none_keys(part)
+                        for key in ("input_image", "image_url"):
+                            if key in clean:
+                                clean.setdefault("image", clean.pop(key))
                         # Gemma 3n's template renders a placeholder for
                         # "audio" alone, so a part left under an alias carries
                         # a clip with nothing behind it, and an untyped one
@@ -4553,6 +4599,8 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                                 clean["type"] = "image"
                             elif any(alias in clean for alias in _AUDIO_PART_TYPES):
                                 clean["type"] = "audio"
+                        elif clean["type"] in ("image_url", "input_image"):
+                            clean["type"] = "image"
                         elif clean["type"] in _AUDIO_PART_TYPES:
                             clean["type"] = "audio"
                         parts.append(clean)
@@ -4592,20 +4640,28 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
-def _flatten_vlm_content_for_text_template(messages):
-    """Render list-style VLM content as text for text-only chat templates."""
-    flattened = copy.deepcopy(messages)
-    for message in flattened:
+def _flatten_vlm_content_for_text_template(messages, image_token=None):
+    """Render list-style VLM content as text for text-only chat templates.
+
+    Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
+    deepcopy would clone every PIL image on the row. This runs per training
+    sample, so that cost is the whole collator's.
+    """
+    flattened = []
+    for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
+            flattened.append(message)
             continue
         texts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
                 texts.append(str(part.get("text", "")))
+            elif isinstance(part, dict) and part.get("type") == "image" and image_token:
+                texts.append(image_token)
             elif isinstance(part, str):
                 texts.append(part)
-        message["content"] = "".join(texts)
+        flattened.append({**message, "content": "".join(texts)})
     return flattened
 
 
@@ -4641,24 +4697,35 @@ def _count_vlm_image_parts(messages):
     return count
 
 
-def _repair_deepseek_rendered_image_tokens(processor, text, messages):
+def _vlm_image_token(processor):
+    for owner in (processor, _get_processor_tokenizer(processor)):
+        for name in ("image_token", "boi_token"):
+            token = getattr(owner, name, None)
+            if isinstance(token, str) and token:
+                return token
+    module = sys.modules.get(type(processor).__module__)
+    for name in ("DEFAULT_IMAGE_TOKEN", "IMAGE_TOKEN", "IMAGE_PLACEHOLDER"):
+        token = getattr(module, name, None)
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
+def _vlm_render_preserves_content(text, messages):
     if not isinstance(text, str) or not text.strip():
-        return text
-    marker = (
-        f"{processor.__class__.__module__}.{processor.__class__.__name__}"
-    ).lower()
-    if "deepseek" not in marker:
-        return text
-    image_count = _count_vlm_image_parts(messages)
-    if image_count <= 0:
-        return text
-    image_token = getattr(processor, "image_token", None)
-    if not image_token:
-        return text
-    missing = image_count - text.count(image_token)
-    if missing <= 0:
-        return text
-    return (image_token * missing) + text
+        return False
+    normalized = " ".join(text.split())
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            if content and str(content) in text:
+                return False
+            parts = [p.get("text", "") if isinstance(p, dict) else p for p in content]
+        else:
+            parts = [content]
+        if any(" ".join(str(part).split()) not in normalized for part in parts):
+            return False
+    return True
 
 
 def _processor_accepts_assistant_list_content(processor):
@@ -4731,69 +4798,96 @@ def _vlm_token_messages(processor, messages):
     return rendered
 
 
+def _mark_vlm_image_parts(messages, image_token):
+    """Replace image parts with a literal image token, sharing everything else.
+
+    Shallow by construction: the copy exists to swap one part dict, and deep
+    copying would duplicate the row's PIL images on every render.
+    """
+    if not image_token:
+        return messages
+    marked = []
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            message = {**message, "content": [
+                {"type": "text", "text": image_token}
+                if isinstance(part, dict) and part.get("type") == "image" else part
+                for part in content
+            ]}
+        marked.append(message)
+    return marked
+
+
 def _render_vlm_messages(
     processor,
     messages,
     *,
     add_generation_prompt=False,
 ):
-    normalize_vlm_processor_chat_template(processor, strict=True)
     if isinstance(messages, str):
         return messages
+    messages = _normalize_vlm_messages(messages)
+    normalize_vlm_processor_chat_template(processor, strict=False)
+    tokenizer = _get_processor_tokenizer(processor)
+    renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
+    image_token = _vlm_image_token(processor)
+    if not _has_chat_template(renderer):
+        return "\n".join(
+            message.get("content", "")
+            for message in _flatten_vlm_content_for_text_template(messages, image_token)
+        )
 
     render_messages = _vlm_token_messages(processor, messages)
-    if not _processor_accepts_assistant_list_content(processor):
+    if not _processor_accepts_assistant_list_content(renderer):
         render_messages = _collapse_vlm_assistant_content(render_messages)
+    image_count = _count_vlm_image_parts(messages)
+    image_tokens = {token for token in (image_token, getattr(processor, "boi_token", None),
+                                        getattr(tokenizer, "boi_token", None)) if token}
 
-    first_error = None
-    second_error = None
-    third_error = None
+    def _candidates():
+        # Built lazily: the later shapes allocate, and the first one renders for
+        # nearly every family.
+        yield render_messages
+        marked = _mark_vlm_image_parts(render_messages, image_token)
+        yield marked
+        yield _flatten_vlm_content_for_text_template(messages, image_token)
+        yield _flatten_vlm_messages_to_content_parts(marked)
 
-    try:
-        text = processor.apply_chat_template(
-            render_messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        first_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_messages_to_content_parts(messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        second_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_content_for_text_template(render_messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        third_error = exc
-
-    if first_error is not None:
-        raise RuntimeError(
-            "Unsloth MLX VLM: failed to render chat messages with this "
-            "processor chat_template. Check that the dataset roles/content "
-            "schema matches the model family, or pass a formatting_func that "
-            "returns pre-rendered text."
-        ) from (third_error or second_error or first_error)
-
-    return ""
+    error = None
+    rendered = None
+    for candidate in _candidates():
+        try:
+            text = renderer.apply_chat_template(
+                candidate,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception as exc:
+            error = exc
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if rendered is None:
+            rendered = text
+        if not all(_vlm_render_preserves_content(text, source) for source in (messages, candidate)):
+            continue
+        if image_tokens and max(text.count(token) for token in image_tokens) < image_count:
+            continue
+        return text
+    if rendered is not None:
+        # A template is allowed to transform what it renders: Qwen3/QwQ strip
+        # <think> from history, autoescaping ones rewrite `<` and `&`, others
+        # drop roles they do not model. The checks above pick the best-preserved
+        # candidate, but they cannot tell a deliberate transform from damage, so
+        # they do not get to fail a render the template itself accepted.
+        return rendered
+    raise RuntimeError(
+        "Unsloth MLX VLM: failed to render chat messages with this "
+        "processor chat_template. Check that the dataset roles/content "
+        "schema matches the model family, or pass a formatting_func that "
+        "returns pre-rendered text."
+    ) from error
 
 
 def _looks_like_mlx_chat_messages(value):
@@ -6242,6 +6336,22 @@ def _resize_vlm_images(images, image_size):
     target = (image_size, image_size) if isinstance(image_size, int) else image_size
     resized = []
     for image in images:
+        if isinstance(image, (bytes, dict, str, os.PathLike)):
+            from io import BytesIO
+            if isinstance(image, dict):
+                image = image.get("bytes") or image.get("path") or image.get("url")
+            if isinstance(image, str) and image.startswith(("http://", "https://")):
+                from unsloth_zoo.vision_utils import fetch_remote_media_bytes
+                image = fetch_remote_media_bytes(image)
+            elif isinstance(image, str) and image.startswith("data:image"):
+                from base64 import b64decode
+                image = b64decode(image.split("base64,", 1)[1])
+            elif isinstance(image, str) and image.startswith("file://"):
+                from unsloth_zoo.vision_utils import resolve_file_uri_to_path
+                image = resolve_file_uri_to_path(image)
+            if isinstance(image, bytes):
+                image = BytesIO(image)
+            image = Image.open(image)
         if isinstance(image, Image.Image):
             image = image.convert("RGB")
             if _is_vlm_no_resize_image_size(image_size):
@@ -6318,6 +6428,10 @@ def _extract_vlm_images(
                 if isinstance(part, dict) and part.get("type") == "image":
                     image = part.get("image")
                     if image is not None:
+                        if any(key in part for key in ("resized_height", "resized_width", "min_pixels", "max_pixels")):
+                            from unsloth_zoo.vision_utils import fetch_image
+                            image = _resize_vlm_images([image], None)[0]
+                            image = fetch_image({**part, "image": image})
                         images.append(image)
 
     if (
@@ -7914,12 +8028,64 @@ def _convert_vlm_processor_output(value, return_tensors):
     return value
 
 
+_VLM_COMPONENT_KWARGS = contextvars.ContextVar("vlm_component_kwargs", default={})
+
+
+def _scope_vlm_component_call(component):
+    cls = type(component)
+    original = cls.__call__
+    if getattr(original, "_unsloth_vlm_component_kwargs", False):
+        return
+
+    @wraps(original)
+    def scoped(self, *args, **kwargs):
+        options = _VLM_COMPONENT_KWARGS.get().get(id(self))
+        if options is not None:
+            excluded, defaults = options
+            kwargs = {**defaults, **kwargs}
+            kwargs = {k: v for k, v in kwargs.items() if k not in excluded}
+        return original(self, *args, **kwargs)
+
+    scoped._unsloth_vlm_component_kwargs = True
+    try:
+        cls.__call__ = scoped
+    except (TypeError, AttributeError):
+        # Native callables cannot be patched and keep their own dispatch.
+        pass
+
+
+def _invoke_vlm_processor(processor_call, args, kwargs):
+    processor = args[0] if args and hasattr(args[0], "image_processor") else processor_call
+    tokenizer = getattr(processor, "tokenizer", None)
+    image_processor = getattr(processor, "image_processor", None)
+    if not callable(tokenizer) or not callable(image_processor):
+        return processor_call(*args, **kwargs)
+    from transformers.processing_utils import ImagesKwargs, TextKwargs
+
+    text_keys = set(TextKwargs.__annotations__)
+    image_keys = set(ImagesKwargs.__annotations__)
+    _scope_vlm_component_call(tokenizer)
+    _scope_vlm_component_call(image_processor)
+    # Keep component identity/state, and isolate options from other calls/threads.
+    options = dict(_VLM_COMPONENT_KWARGS.get())
+    options[id(image_processor)] = (text_keys - image_keys, {})
+    options[id(tokenizer)] = (
+        image_keys - text_keys,
+        {"padding": kwargs["padding"]} if "padding" in kwargs else {},
+    )
+    token = _VLM_COMPONENT_KWARGS.set(options)
+    try:
+        return processor_call(*args, **kwargs)
+    finally:
+        _VLM_COMPONENT_KWARGS.reset(token)
+
+
 def _call_vlm_processor(processor_call, args, kwargs):
-    """Retry only the Transformers fast-processor PyTorch output contract."""
+    """Scope modality options and negotiate PyTorch-only processor output."""
 
     return_tensors = kwargs.get("return_tensors")
     try:
-        return processor_call(*args, **kwargs)
+        return _invoke_vlm_processor(processor_call, args, kwargs)
     except ValueError as error:
         if (
             return_tensors not in {"mlx", "np"}
@@ -7929,7 +8095,7 @@ def _call_vlm_processor(processor_call, args, kwargs):
 
     retry_kwargs = dict(kwargs)
     retry_kwargs["return_tensors"] = "pt"
-    output = processor_call(*args, **retry_kwargs)
+    output = _invoke_vlm_processor(processor_call, args, retry_kwargs)
     return _convert_vlm_processor_output(output, return_tensors)
 
 
@@ -8150,6 +8316,15 @@ def validate_legacy_image_batch(batch):
         )
 
 
+def _ensure_vlm_pad_token(processor):
+    tokenizer = _get_processor_tokenizer(processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        eos = getattr(tokenizer, "eos_token", None)
+        if eos is not None:
+            tokenizer.pad_token = eos
+    return tokenizer
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -8163,6 +8338,12 @@ def _processor_vlm_inputs(
     legacy = legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation)
     if legacy is not None:
         return legacy
+    tokenizer = _ensure_vlm_pad_token(processor)
+    images = _format_vlm_images_for_processor(all_images, processor=processor)
+    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
+    text_only = images is None and audio is None and callable(tokenizer)
+    if text_only:
+        processor = tokenizer
     base_kwargs = dict(
         text=texts,
         padding=True,
@@ -8170,7 +8351,6 @@ def _processor_vlm_inputs(
         add_special_tokens=False,
     )
     base_kwargs = _drop_unsupported_processor_kwargs(processor, base_kwargs)
-    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
     audio_kwarg = None
     if audio is not None:
         audio_kwarg = _vlm_processor_audio_kwarg(processor)
@@ -8209,7 +8389,6 @@ def _processor_vlm_inputs(
             ))
     if padding_side is not None:
         base_kwargs["padding_side"] = padding_side
-    images = _format_vlm_images_for_processor(all_images, processor=processor)
     if images is not None:
         image_layouts = (
             ("nested", "flat")
@@ -8219,7 +8398,12 @@ def _processor_vlm_inputs(
     else:
         image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
-        base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
+        base_kwargs["text_pair" if text_only else "suffix"] = [
+            (suffix or "") + (getattr(tokenizer, "eos_token", None) or "")
+            if text_only else (suffix or "") for suffix in suffixes
+        ]
+        if text_only:
+            base_kwargs["return_token_type_ids"] = True
     if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
@@ -8292,7 +8476,14 @@ def _processor_vlm_inputs(
         raise first_error
 
     if audio_kwarg is None:
-        return _run_layouts()
+        inputs = _run_layouts()
+        if text_only and "text_pair" in base_kwargs:
+            inputs["labels"] = np.where(
+                np.asarray(inputs["token_type_ids"]) == 0, -100,
+                np.asarray(inputs["input_ids"]),
+            )
+            inputs["_unsloth_suffix_only_loss"] = True
+        return inputs
 
     def _run_audio_layouts():
         return _repair_audio_batch(
@@ -16780,6 +16971,133 @@ _MODEL_WEIGHT_SUFFIXES = (
     ".pth",
 )
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
+
+
+def _asset_link_stays_in_the_model(file, source):
+    """Refuse a sidecar symlink that points outside the model it came from.
+
+    A writable model directory is otherwise enough to aim `generation_config.json`
+    at a credential file and have the save dereference it into an adapter that is
+    then published. A Hugging Face snapshot is itself a tree of symlinks into a
+    sibling `blobs/` directory, so the allowed root is the cache repo directory
+    when the source sits under `snapshots/<sha>`, not the source alone.
+    """
+    try:
+        if not file.is_symlink():
+            return True
+        source = Path(source).resolve()
+        roots = [source]
+        for parent in (source, *source.parents):
+            if parent.name == "snapshots":
+                roots.append(parent.parent)
+                break
+        target = file.resolve()
+        return any(target.is_relative_to(root) for root in roots)
+    except OSError:
+        return False
+
+
+def _save_vlm_processor_assets(processor, path, sources=()):
+    path = Path(path)
+    failures = []
+    saved = set()
+    asset_names = set()
+
+    def valid_asset(file):
+        try:
+            if not file.is_file():
+                return False
+            if file.suffix == ".json":
+                json.loads(file.read_text())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def copy_assets(source, overwrite=False, source_only=False, complete=True):
+        for file in Path(source).rglob("*"):
+            relative = file.relative_to(source)
+            if not file.is_file() or file.suffix in _MODEL_WEIGHT_SUFFIXES:
+                continue
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if file.resolve().is_relative_to(path.resolve()):
+                continue
+            if not _asset_link_stays_in_the_model(file, source):
+                failures.append(f"{relative}: symlink leaves the model directory")
+                continue
+            if file.name in _CORE_SAVE_FILENAMES or file.name == "adapter_config.json":
+                continue
+            if file.name.startswith(("model-", "pytorch_model")):
+                continue
+            if source_only and file.suffix not in _MODEL_SIDECAR_SUFFIXES and file.name not in asset_names:
+                continue
+            if not complete and file.suffix != ".json":
+                continue
+            target = path / relative
+            if relative in saved or (
+                not overwrite and target.suffix == ".json" and valid_asset(target)
+            ):
+                continue
+            try:
+                if file.suffix == ".json":
+                    json.loads(file.read_text())
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file, target)
+                saved.add(relative)
+            except Exception as error:
+                failures.append(f"{relative}: {error}")
+
+    def save_component(component, overwrite=True):
+        vocab_files = getattr(component, "vocab_files_names", None)
+        if isinstance(vocab_files, dict):
+            asset_names.update(Path(name).name for name in vocab_files.values() if isinstance(name, str))
+        save = getattr(component, "save_pretrained", None)
+        if not callable(save):
+            return False
+        success = True
+        try:
+            with tempfile.TemporaryDirectory() as staging:
+                try:
+                    save(staging)
+                except Exception as error:
+                    failures.append(f"{type(component).__name__}: {error}")
+                    success = False
+                # Only JSON can be validated after an interrupted writer.
+                copy_assets(staging, overwrite=overwrite, complete=success)
+        except Exception as error:
+            failures.append(f"{type(component).__name__}: {error}")
+            success = False
+        return success
+
+    if not save_component(processor, overwrite=True):
+        if not failures:
+            failures.append(f"{type(processor).__name__} has no save_pretrained")
+    # Some processors' save methods omit components or are entirely no-ops.
+    names = ("tokenizer", "image_processor", "feature_extractor")
+    names += tuple(getattr(processor, "attributes", ()) or ())
+    seen = {id(processor)}
+    for name in names:
+        component = getattr(processor, name, None)
+        if component is not None and id(component) not in seen:
+            seen.add(id(component))
+            save_component(component)
+
+    for source in sources:
+        if source is None:
+            continue
+        try:
+            source = Path(source)
+            copy_assets(source, source_only=True)
+            config = source / "config.json"
+            target = path / "config.json"
+            if config.is_file() and not valid_asset(target):
+                json.loads(config.read_text())
+                shutil.copy2(config, target)
+        except Exception as error:
+            failures.append(f"processor source: {error}")
+    if failures:
+        print("Unsloth: Adapter saved; processor assets recovered where available: "
+              + "; ".join(dict.fromkeys(failures)))
 
 
 def _copy_source_sidecars(src_path, path):
