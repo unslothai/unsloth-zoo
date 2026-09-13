@@ -108,10 +108,8 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
-    # Bind the bare name explicitly. Every `vllm.<...>` reference below relied on
-    # it being bound as a side effect of the try-guarded submodule imports that
-    # follow, and vLLM 0.28 removed BOTH of those bitsandbytes modules, so on
-    # >= 0.28 the name was left unbound and the first `vllm.` use NameError'd.
+    # Every `vllm.<...>` below used to be bound as a side effect of the
+    # try-guarded submodule imports, which 0.28 removed, leaving it NameError.
     import vllm
     try:
         from vllm import __version__ as vllm_version
@@ -162,8 +160,7 @@ if importlib.util.find_spec("vllm") is not None:
     def _dequantize_dq(self, quant_states):
         return quant_states
     try:
-        # Same two homes as the quantization module above: in tree up to 0.27.1,
-        # vllm-bnb-plugin from 0.28.
+        # Same two homes as the quantization module: in tree, else the plugin.
         _bnb_loader = None
         for _loader_path in (
             "vllm.model_executor.model_loader.bitsandbytes_loader",
@@ -186,12 +183,8 @@ if importlib.util.find_spec("vllm") is not None:
 
     # Patch apply_bnb_4bit
     # vLLM 0.28 (PR #43529) moved bitsandbytes out of tree into vllm-bnb-plugin,
-    # so the in-tree module is absent from >= 0.28. The plugin re-exports the
-    # same names from vllm_bnb_plugin.bitsandbytes, so resolve whichever is
-    # installed and patch that; the patches below are identical either way.
-    #
-    # Hard-importing the in-tree path used to take out the whole of vllm_utils,
-    # and with it EVERY fast_inference GRPO run rather than only the 4-bit ones.
+    # which re-exports the same names, so patch whichever is installed. Hard
+    # importing the in-tree path took out every fast_inference run, not just 4-bit.
     _vllm_bnb = None
     for _bnb_path in (
         "vllm.model_executor.layers.quantization.bitsandbytes",  # vLLM <= 0.27.1
@@ -203,9 +196,7 @@ if importlib.util.find_spec("vllm") is not None:
         except ImportError:
             continue
     if _vllm_bnb is None:
-        # vLLM >= 0.28 without vllm-bnb-plugin installed. 4-bit fast_inference
-        # needs it; everything else in this file still works, so warn rather
-        # than take the whole module down.
+        # Only 4-bit fast_inference needs the plugin, so fail on use, not import.
         def _apply_4bit_weight(self, layer, x, bias = None):
             raise RuntimeError(
                 "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
@@ -327,8 +318,7 @@ if importlib.util.find_spec("vllm") is not None:
         del vllm_config_logger
     pass
 
-    # `object` keeps this definition legal on a vLLM with no in-tree bnb; the
-    # patch functions below never install it there.
+    # `object` keeps the class definition legal with no bnb; it is never installed then.
     _BitsAndBytesConfigBase = (
         _vllm_bnb.BitsAndBytesConfig if _vllm_bnb is not None else object
     )

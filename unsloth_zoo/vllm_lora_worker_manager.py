@@ -75,25 +75,20 @@ pass
 def _drop_stacked_weight_maps(mapper):
     """Return `mapper` with its stacked weight maps removed, or None.
 
-    A WeightsMapper is needed for models like Qwen2VL to resolve LoRA module
-    names, but on vLLM >= 0.25.0 the same mapper also folds q/k/v into qkv_proj
-    and gate/up into gate_up_proj through `orig_to_new_stacked`. LoRA loading
-    maps names without the shard id, so those constituents collide onto one key:
-    the packed module then holds a single 2D lora_a instead of a list of them,
-    and set_lora indexes a row and dies on `lora_a_i.shape[1]` with
+    vLLM >= 0.25.0 folds q/k/v into qkv_proj and gate/up into gate_up_proj via
+    `orig_to_new_stacked`. LoRA loading maps names without the shard id, so the
+    constituents collide onto one key, the packed module holds a single 2D
+    lora_a instead of a list, and set_lora dies on `lora_a_i.shape[1]` with
     `IndexError: tuple index out of range`.
 
-    vLLM's own worker_manager strips the stacked maps first. The helper that
-    does it is `get_unstacked_mapper` on 0.25.0 - 0.28.x and was renamed to
-    `get_rename_mapper` in 0.29.0, so try both, then fall back to clearing the
-    field directly for any future rename. Returns None when there is nothing to
-    map, which is what pre-0.25.0 vLLM expects anyway.
+    vLLM's own worker_manager strips them first, with `get_unstacked_mapper` on
+    0.25.0 - 0.28.x and `get_rename_mapper` from 0.29.0.
     """
     if mapper is None: return None
     for name in ("get_rename_mapper", "get_unstacked_mapper"):
         method = getattr(mapper, name, None)
         if callable(method): return method()
-    # No known helper: drop the stacked maps ourselves if the field is there.
+    # Renamed again: drop the maps ourselves.
     if hasattr(mapper, "orig_to_new_stacked"):
         try:
             import dataclasses

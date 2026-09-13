@@ -22,13 +22,11 @@ parser calls mapper._map_name which drops the shard id, so the constituent
 projections collapse onto one fused key and collide in the in-memory LoRA tensor
 dict, crashing GRPO fast_inference=True with IndexError during activation.
 
-The fix in vllm_lora_worker_manager.py drops the stacked maps while keeping
-genuine renames. vLLM's helper for that is get_unstacked_mapper() on 0.25.0 -
-0.28.x and was renamed to get_rename_mapper() in 0.29.0, so both names are
-tried, then the orig_to_new_stacked field is cleared directly as a last resort.
-These tests drive the real WorkerLoRAManager._load_adapter with light fakes (no
-GPU, no real vLLM init) and assert which mapper reaches the loader, for both the
-in-memory and local-checkpoint paths and both loader signatures.
+vllm_lora_worker_manager.py drops the stacked maps while keeping genuine
+renames, via get_unstacked_mapper() on 0.25.0 - 0.28.x, get_rename_mapper()
+from 0.29.0, else clearing the field. These tests drive the real
+WorkerLoRAManager._load_adapter with light fakes (no GPU, no vLLM init) and
+assert which mapper reaches the loader, over both paths and both signatures.
 """
 
 import dataclasses
