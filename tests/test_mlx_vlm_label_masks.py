@@ -5634,3 +5634,132 @@ def test_crop_arrays_reach_the_image_tower_without_boolean_conversion(monkeypatc
         modules["mlx_vlm.models.deepseekocr.deepseekocr"].Model.get_input_embeddings(
             model, mx.array([[1, 2]]), (mx.zeros((0, 3, 1, 1)), mx.zeros((2, 3, 1, 1))),
             images_spatial_crop=mx.array([[1, 1], [2, 1]]))
+
+
+class _PairTokenizer:
+    """Tokenizer with real `text_pair` semantics: 1 marks the second segment."""
+    eos_token = "<eos>"
+    pad_token_id = None
+    pad_token = None
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __call__(self, text=None, text_pair=None, return_token_type_ids=None, **kwargs):
+        self.seen = dict(kwargs, text=text, text_pair=text_pair)
+        pairs = text_pair if text_pair is not None else [None] * len(text)
+        rows = [([1] * len(a), [2] * len(b or "")) for a, b in zip(text, pairs)]
+        width = max(len(a) + len(b) for a, b in rows)
+        pad = lambda values: np.array([v + [0] * (width - len(v)) for v in values])
+        out = {"input_ids": pad([a + b for a, b in rows]),
+               "attention_mask": pad([[1] * (len(a) + len(b)) for a, b in rows])}
+        if return_token_type_ids:
+            out["token_type_ids"] = pad([[0] * len(a) + [1] * len(b) for a, b in rows])
+        return out
+
+
+def _suffix_pair_batch(suffixes=("answer",)):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+    processor = SimpleNamespace(tokenizer=_PairTokenizer(), image_processor=None)
+    return _processor_vlm_inputs(
+        processor, ["prompt"] * len(suffixes), [[] for _ in suffixes], 64,
+        suffixes=list(suffixes),
+    )
+
+
+def test_suffix_pair_markers_never_reach_the_text_stack():
+    """A text-only row is encoded as a tokenizer pair, so its `token_type_ids`
+    mean "1 = suffix". Gemma3's stack reads that key as "1 = image" and turns
+    every marked span bidirectional, which would let the answer attend to its
+    own future tokens. The model-level kwargs still carry it, because
+    PaliGemma's prefix-LM wrapper is the consumer that wants that meaning."""
+    from unsloth_zoo.mlx.utils import _drop_pair_token_type_ids
+
+    batch = _suffix_pair_batch()
+    assert batch["_unsloth_suffix_only_loss"] is True
+    forwarded = {"token_type_ids": batch["token_type_ids"], "position_ids": None}
+    assert "token_type_ids" not in _drop_pair_token_type_ids(batch, forwarded)
+    assert "position_ids" in _drop_pair_token_type_ids(batch, forwarded)
+
+    # Real image markers, from a processor rather than a pair, still go through.
+    image_batch = {k: v for k, v in batch.items() if k != "_unsloth_suffix_only_loss"}
+    assert "token_type_ids" in _drop_pair_token_type_ids(image_batch, forwarded)
+
+
+def test_gemma_image_mask_is_bidirectional_over_a_marked_span():
+    """Pins why the test above matters, independently of the collator."""
+    from unsloth_zoo.mlx.utils import _build_gemma_image_attention_mask
+
+    token_type_ids = mx.array([[0, 0, 0, 1, 1, 1, 1]], dtype=mx.int32)
+    built = _build_gemma_image_attention_mask(
+        token_type_ids, attention_mask=mx.ones((1, 7), dtype=mx.int32))
+    visible = np.asarray(built).reshape(7, 7)
+    assert visible[3, 6] and not visible[1, 2]
+
+
+@pytest.mark.parametrize("template,expected", [
+    # Qwen3 / QwQ / DeepSeek-R1 strip <think> from history.
+    ("{% for m in messages %}{{ m['content'].split('</think>')[-1] }}{% endfor %}",
+     "answer"),
+    # Templates that transform the case of what they render.
+    ("{% for m in messages %}{{ m['content']|upper }}{% endfor %}",
+     "<THINK>R</THINK>ANSWER"),
+])
+def test_a_template_that_transforms_content_still_renders(template, expected):
+    """The content-preservation checks choose between candidates; they do not
+    get to fail a render the template itself accepted."""
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class _Processor:
+        image_token = None
+        boi_token = None
+        chat_template = template
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False):
+            import jinja2
+            return jinja2.Template(template).render(messages=messages)
+
+    messages = [{"role": "user", "content": "<think>r</think>answer"}]
+    assert _render_vlm_messages(_Processor(), messages) == expected
+
+
+def test_a_template_that_renders_nothing_is_still_an_error():
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class _Empty:
+        image_token = None
+        boi_token = None
+        chat_template = "x"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "   "
+
+    with pytest.raises(RuntimeError):
+        _render_vlm_messages(_Empty(), [{"role": "user", "content": "hi"}])
+
+
+def test_rendering_does_not_copy_the_row_media():
+    """`_render_vlm_messages` runs per training sample, so deep-copying the
+    message list clones every image on every row."""
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    copied = []
+
+    class _CountingImage:
+        def __deepcopy__(self, memo):
+            copied.append(self)
+            return self
+
+    class _Processor:
+        image_token = "<image>"
+        boi_token = None
+        chat_template = "x"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "<image>Q"
+
+    messages = [{"role": "user",
+                 "content": [{"type": "image", "image": _CountingImage()},
+                             {"type": "text", "text": "Q"}]}]
+    assert _render_vlm_messages(_Processor(), messages) == "<image>Q"
+    assert copied == []

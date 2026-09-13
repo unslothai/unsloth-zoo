@@ -2780,7 +2780,8 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # it by forwarding straight to the language model; do that here on
             # every version, which is what `_vlm_cce_forward` already does.
             output = _get_text_model(model)(
-                inputs, inputs_embeds=scaled_embeds, **fwd_kwargs
+                inputs, inputs_embeds=scaled_embeds,
+                **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
             )
         else:
             output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
@@ -2837,6 +2838,20 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
 
     loss_fn._unsloth_cce_backend = "baseline-ce"
     return loss_fn
+
+
+def _drop_pair_token_type_ids(batch_dict, kwargs):
+    """Keep suffix/prefix pair markers out of the text stack.
+
+    A suffix-supervised text-only row is encoded as a tokenizer pair, so its
+    `token_type_ids` mean "1 = suffix". Gemma3's stack reads the same key as
+    "1 = image" and makes every marked span bidirectional, which would let the
+    answer attend to its own future tokens. The model-level kwargs still carry
+    it, because PaliGemma's prefix-LM wrapper is the consumer that wants it.
+    """
+    if not batch_dict.get("_unsloth_suffix_only_loss", False):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k != "token_type_ids"}
 
 
 def _apply_static_vlm_metadata(model, batch_dict, kwargs):
@@ -2978,7 +2993,7 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
     if use_collated_position_ids and "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
-    if "token_type_ids" in extra_kwargs:
+    if "token_type_ids" in _drop_pair_token_type_ids(batch_dict, extra_kwargs):
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
@@ -4589,11 +4604,17 @@ def _collapse_vlm_assistant_content(messages):
 
 
 def _flatten_vlm_content_for_text_template(messages, image_token=None):
-    """Render list-style VLM content as text for text-only chat templates."""
-    flattened = copy.deepcopy(messages)
-    for message in flattened:
+    """Render list-style VLM content as text for text-only chat templates.
+
+    Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
+    deepcopy would clone every PIL image on the row. This runs per training
+    sample, so that cost is the whole collator's.
+    """
+    flattened = []
+    for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
+            flattened.append(message)
             continue
         texts = []
         for part in content:
@@ -4603,7 +4624,7 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None):
                 texts.append(image_token)
             elif isinstance(part, str):
                 texts.append(part)
-        message["content"] = "".join(texts)
+        flattened.append({**message, "content": "".join(texts)})
     return flattened
 
 
@@ -4697,6 +4718,27 @@ def _processor_accepts_assistant_list_content(processor):
             return True
 
 
+def _mark_vlm_image_parts(messages, image_token):
+    """Replace image parts with a literal image token, sharing everything else.
+
+    Shallow by construction: the copy exists to swap one part dict, and deep
+    copying would duplicate the row's PIL images on every render.
+    """
+    if not image_token:
+        return messages
+    marked = []
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            message = {**message, "content": [
+                {"type": "text", "text": image_token}
+                if isinstance(part, dict) and part.get("type") == "image" else part
+                for part in content
+            ]}
+        marked.append(message)
+    return marked
+
+
 def _render_vlm_messages(
     processor,
     messages,
@@ -4710,42 +4752,56 @@ def _render_vlm_messages(
     tokenizer = _get_processor_tokenizer(processor)
     renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
     image_token = _vlm_image_token(processor)
-    flat_messages = _flatten_vlm_content_for_text_template(messages, image_token)
     if not _has_chat_template(renderer):
-        return "\n".join(message.get("content", "") for message in flat_messages)
+        return "\n".join(
+            message.get("content", "")
+            for message in _flatten_vlm_content_for_text_template(messages, image_token)
+        )
 
     render_messages = messages
     if not _processor_accepts_assistant_list_content(renderer):
         render_messages = _collapse_vlm_assistant_content(render_messages)
-    marked_messages = copy.deepcopy(render_messages)
-    if image_token:
-        for message in marked_messages:
-            content = message.get("content", "")
-            if isinstance(content, list):
-                message["content"] = [
-                    {"type": "text", "text": image_token}
-                    if isinstance(part, dict) and part.get("type") == "image" else part
-                    for part in content
-                ]
     image_count = _count_vlm_image_parts(messages)
     image_tokens = {token for token in (image_token, getattr(processor, "boi_token", None),
                                         getattr(tokenizer, "boi_token", None)) if token}
+
+    def _candidates():
+        # Built lazily: the later shapes allocate, and the first one renders for
+        # nearly every family.
+        yield render_messages
+        marked = _mark_vlm_image_parts(render_messages, image_token)
+        yield marked
+        yield _flatten_vlm_content_for_text_template(messages, image_token)
+        yield _flatten_vlm_messages_to_content_parts(marked)
+
     error = None
-    for candidate in (render_messages, marked_messages, flat_messages,
-                      _flatten_vlm_messages_to_content_parts(marked_messages)):
+    rendered = None
+    for candidate in _candidates():
         try:
             text = renderer.apply_chat_template(
                 candidate,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
             )
-            if not all(_vlm_render_preserves_content(text, source) for source in (messages, candidate)):
-                continue
-            if image_tokens and max(text.count(token) for token in image_tokens) < image_count:
-                continue
-            return text
         except Exception as exc:
             error = exc
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if rendered is None:
+            rendered = text
+        if not all(_vlm_render_preserves_content(text, source) for source in (messages, candidate)):
+            continue
+        if image_tokens and max(text.count(token) for token in image_tokens) < image_count:
+            continue
+        return text
+    if rendered is not None:
+        # A template is allowed to transform what it renders: Qwen3/QwQ strip
+        # <think> from history, autoescaping ones rewrite `<` and `&`, others
+        # drop roles they do not model. The checks above pick the best-preserved
+        # candidate, but they cannot tell a deliberate transform from damage, so
+        # they do not get to fail a render the template itself accepted.
+        return rendered
     raise RuntimeError(
         "Unsloth MLX VLM: failed to render chat messages with this "
         "processor chat_template. Check that the dataset roles/content "
