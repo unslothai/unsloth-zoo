@@ -595,7 +595,7 @@ def test_generated_image_labels_ignore_negative_placeholders_only(pixel_key):
 
 @pytest.mark.parametrize("row", [0, 1])
 def test_legacy_image_validation_checks_each_row(row):
-    from unsloth_zoo.mlx.legacy_vision import validate_legacy_image_batch
+    from unsloth_zoo.mlx.utils import validate_legacy_image_batch
     batch = {"input_ids": [[1, -200, -200, 2], [-200, -200, 3, 4]],
              "_unsloth_legacy_image_spec": (-200, 2)}
     validate_legacy_image_batch(batch)

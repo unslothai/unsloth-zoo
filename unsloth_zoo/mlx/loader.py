@@ -234,7 +234,7 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
             )
         )
     if include_convolutions:
-        from .lora import LoRAPointwiseConv2d
+        from .utils import LoRAPointwiseConv2d
         specs.append(_MLXLoRATypeSpec((nn.Conv2d,), LoRAPointwiseConv2d))
     return tuple(specs)
 
@@ -7233,7 +7233,7 @@ def _vision_projection_paths(module, attention, mlp, skip_subtrees=()):
     paths = _role_selected_paths(module, attention, mlp, skip_subtrees)
     if paths or not (attention and mlp):
         return paths
-    from .lora import LoRAPointwiseConv2d
+    from .utils import LoRAPointwiseConv2d
     paths = [path for path, linear in _subtree_linears(module)
              if _projects(linear) and _linear_role(path) is None
              and not _under_any(path, skip_subtrees)]
@@ -8769,7 +8769,7 @@ class FastMLXModel:
             for fixup in _VLM_MODEL_FIXUPS:
                 _run_with_vlm_config_view(fixup, model)
             if not force_vlm_text_path and patch_mode == "patched":
-                from .legacy_vision import bind_legacy_image_processor
+                from .utils import bind_legacy_image_processor
                 _run_with_vlm_config_view(bind_legacy_image_processor, model, processor)
 
             model._config = getattr(model, "_config", config_data)
