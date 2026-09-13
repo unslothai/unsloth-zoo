@@ -22,13 +22,16 @@ parser calls mapper._map_name which drops the shard id, so the constituent
 projections collapse onto one fused key and collide in the in-memory LoRA tensor
 dict, crashing GRPO fast_inference=True with IndexError during activation.
 
-The fix in vllm_lora_worker_manager.py calls WeightsMapper.get_unstacked_mapper()
-(present only on vLLM >= 0.25.0) to drop the stacked maps while keeping genuine
-renames. These tests drive the real WorkerLoRAManager._load_adapter with light
-fakes (no GPU, no real vLLM init) and assert which mapper reaches the loader,
-for both the in-memory and local-checkpoint paths and both loader signatures.
+The fix in vllm_lora_worker_manager.py drops the stacked maps while keeping
+genuine renames. vLLM's helper for that is get_unstacked_mapper() on 0.25.0 -
+0.28.x and was renamed to get_rename_mapper() in 0.29.0, so both names are
+tried, then the orig_to_new_stacked field is cleared directly as a last resort.
+These tests drive the real WorkerLoRAManager._load_adapter with light fakes (no
+GPU, no real vLLM init) and assert which mapper reaches the loader, for both the
+in-memory and local-checkpoint paths and both loader signatures.
 """
 
+import dataclasses
 import types
 import pytest
 
@@ -36,7 +39,9 @@ import unsloth_zoo.vllm_lora_worker_manager as wm
 
 
 class _StackedMapper:
-    """Fake vLLM >= 0.25.0 WeightsMapper exposing get_unstacked_mapper()."""
+    """Fake vLLM 0.25.0 - 0.28.x WeightsMapper exposing get_unstacked_mapper()."""
+
+    method_name = "get_unstacked_mapper"
 
     def __init__(self):
         self.calls = 0
@@ -45,6 +50,25 @@ class _StackedMapper:
     def get_unstacked_mapper(self):
         self.calls += 1
         return self.unstacked
+
+
+class _RenameMapper(_StackedMapper):
+    """Fake vLLM >= 0.29.0 WeightsMapper: the helper is get_rename_mapper()."""
+
+    method_name = "get_rename_mapper"
+    get_unstacked_mapper = None  # gone in 0.29.0
+
+    def get_rename_mapper(self):
+        self.calls += 1
+        return self.unstacked
+
+
+@dataclasses.dataclass
+class _FieldOnlyMapper:
+    """A future vLLM that renames the helper again but keeps the field."""
+
+    orig_to_new_stacked: dict
+    orig_to_new_substr: dict
 
 
 class _FakePEFTHelper:
@@ -130,24 +154,26 @@ def _patch_vllm_helpers(monkeypatch):
     monkeypatch.setattr(wm, "LoRAModel", types.SimpleNamespace, raising=False)
 
 
+@pytest.mark.parametrize("mapper_cls", [_StackedMapper, _RenameMapper])
 @pytest.mark.parametrize("new_signature", [True, False])
-def test_unstacked_mapper_used_for_in_memory_tensors(new_signature):
+def test_unstacked_mapper_used_for_in_memory_tensors(mapper_cls, new_signature):
     record = {}
-    mapper = _StackedMapper()
+    mapper = mapper_cls()
     mgr = _make_manager(record, mapper=mapper, new_signature=new_signature)
 
     mgr._load_adapter(_in_memory_request())
 
-    assert mapper.calls == 1, "get_unstacked_mapper must be called exactly once"
+    assert mapper.calls == 1, f"{mapper_cls.method_name} must be called exactly once"
     assert record["weights_mapper"] is mapper.unstacked
     assert record["weights_mapper"] is not mapper
     assert record["weights_mapper"] is not None
     assert record["tensors"] is not None, "should hit the in-memory branch"
 
 
-def test_unstacked_mapper_used_for_local_checkpoint():
+@pytest.mark.parametrize("mapper_cls", [_StackedMapper, _RenameMapper])
+def test_unstacked_mapper_used_for_local_checkpoint(mapper_cls):
     record = {}
-    mapper = _StackedMapper()
+    mapper = mapper_cls()
     mgr = _make_manager(record, mapper=mapper)
 
     mgr._load_adapter(_checkpoint_request())
@@ -158,8 +184,43 @@ def test_unstacked_mapper_used_for_local_checkpoint():
     assert record["lora_dir"] == "/tmp/does-not-need-to-exist"
 
 
+def test_rename_mapper_wins_when_both_helpers_exist():
+    # A version exposing both must not be served by the deprecated spelling.
+    record = {}
+
+    class _Both(_StackedMapper):
+        def get_rename_mapper(self):
+            self.calls += 1
+            return self.unstacked
+
+    mapper = _Both()
+    mgr = _make_manager(record, mapper=mapper)
+    mgr._load_adapter(_in_memory_request())
+
+    assert mapper.calls == 1
+    assert record["weights_mapper"] is mapper.unstacked
+
+
+def test_stacked_field_is_cleared_when_no_helper_exists():
+    # Belt and braces for a third rename: strip orig_to_new_stacked ourselves
+    # and leave every other mapping untouched.
+    record = {}
+    mapper = _FieldOnlyMapper(
+        orig_to_new_stacked={".q_proj": (".qkv_proj", "q")},
+        orig_to_new_substr={"visual.": "vision_tower."},
+    )
+    mgr = _make_manager(record, mapper=mapper)
+    mgr._load_adapter(_in_memory_request())
+
+    got = record["weights_mapper"]
+    assert got.orig_to_new_stacked == {}
+    assert got.orig_to_new_substr == {"visual.": "vision_tower."}
+    # The original must not be mutated; it belongs to the model.
+    assert mapper.orig_to_new_stacked == {".q_proj": (".qkv_proj", "q")}
+
+
 def test_legacy_mapper_without_unstack_is_forwarded_unchanged():
-    # vLLM < 0.25.0: mapper has no get_unstacked_mapper -> pass through intact
+    # vLLM < 0.25.0: no helper and no stacked field -> pass through intact
     record = {}
     legacy_mapper = object()
     mgr = _make_manager(record, mapper=legacy_mapper)
