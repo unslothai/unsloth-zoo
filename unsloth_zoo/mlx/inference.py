@@ -11,6 +11,9 @@ import mlx.core as mx
 _MOE_PROJECTION_FIELDS = ("weight", "scales", "biases", "bias")
 
 
+_MOE_PACK_ROW_MULTIPLE = 8
+
+
 _MOE_GATE_UP_CLASSES = {}
 _MOE_GATE_UP_LOCK = RLock()
 
@@ -33,9 +36,7 @@ def _moe_gate_up_eligible(module, projection_type):
     if (module.training or gate.training or up.training
             or gate.trainable_parameters() or up.trainable_parameters()):
         return False
-    if gate.bits != 8 or gate.mode != "affine" or up.mode != "affine":
-        return False
-    if (gate.group_size, gate.bits) != (up.group_size, up.bits):
+    if (gate.group_size, gate.bits, gate.mode) != (up.group_size, up.bits, up.mode):
         return False
     for name in _MOE_PROJECTION_FIELDS:
         a, b = gate.get(name), up.get(name)
@@ -48,10 +49,15 @@ def _moe_gate_up_eligible(module, projection_type):
             or a.dtype != b.dtype
         ):
             return False
-    if gate.weight.ndim != 3 or gate.scales.ndim != 3 or gate.biases is None:
+    if gate.weight.ndim != 3 or gate.scales.ndim != 3:
+        return False
+    # MLX reads a row-count remainder to pick the single-row gather matmul, so a pack whose
+    # doubled rows cross that boundary would take a different kernel than the pair it replaces.
+    if gate.weight.shape[1] % _MOE_PACK_ROW_MULTIPLE:
         return False
     return all(
-        gate[name].shape[:-1] == gate.weight.shape[:-1] for name in ("scales", "biases")
+        gate[name].shape[:-1] == gate.weight.shape[:-1]
+        for name in ("scales", "biases") if gate.get(name) is not None
     ) and (gate.get("bias") is None or gate.bias.shape == gate.weight.shape[:-1])
 
 
@@ -101,7 +107,7 @@ class _PackedMoEGateUp:
             x,
             self.arrays["weight"],
             self.arrays["scales"],
-            self.arrays["biases"],
+            self.arrays.get("biases"),
             rhs_indices = indices,
             transpose = True,
             group_size = group_size,

@@ -16,12 +16,20 @@ from mlx_vlm.models import switch_layers as vlm
 from unsloth_zoo.mlx.inference import fused_moe_gate_up
 
 
-def _model(native, dtype = mx.bfloat16, dims = (2048, 512), bits = 8, activation = None, bias = True):
+QUANTIZATIONS = [(8, "affine", 64), (4, "affine", 64), (4, "affine", 32), (6, "affine", 32),
+                 (4, "mxfp4", 32), (8, "mxfp8", 32), (4, "nvfp4", 16)]
+
+
+def _model(native, dtype = mx.bfloat16, dims = (2048, 512), quantization = (8, "affine", 64),
+           activation = None, bias = True):
     mx.random.seed(19)
+    bits, mode, group_size = quantization
     kwargs = {} if activation is None else {"activation": activation}
     model = native.SwitchGLU(*dims, 8, bias = bias, **kwargs)
     model.set_dtype(dtype)
-    nn.quantize(model, bits = bits, group_size = 64)
+    nn.quantize(model, bits = bits, group_size = group_size, mode = mode,
+                # a hidden width the group size does not divide leaves down_proj native, which the pack ignores
+                class_predicate = lambda _, m: hasattr(m, "to_quantized") and not m.weight.shape[-1] % group_size)
     model.eval()
     model.freeze()
     mx.eval(model.parameters())
@@ -40,10 +48,10 @@ def _sample(width = 2048):
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("dims", [(2048, 512), (4096, 1408)])
-def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dims, monkeypatch):
-    model = _model(native, dtype, dims)
+@pytest.mark.parametrize("dtype, dims", [(mx.bfloat16, (2048, 512)), (mx.float16, (4096, 1408))])
+@pytest.mark.parametrize("quantization", QUANTIZATIONS)
+def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dims, quantization, monkeypatch):
+    model = _model(native, dtype, dims, quantization)
     original_call = native.SwitchGLU.__call__
     names = {name for name, _ in tree_flatten(model.parameters())}
     samples = []
@@ -205,10 +213,16 @@ def test_training_replacement_and_adapters_use_native_path(native, monkeypatch):
         _equal(actual, original_call(model, x, indices))
 
 
-@pytest.mark.parametrize("reason", ["4bit", "custom", "training", "trainable", "distributed"])
+@pytest.mark.parametrize("reason", ["rows", "mixed", "partial", "custom", "training", "trainable", "distributed"])
 def test_ineligible_models_stay_native(reason):
-    model = _model(vlm, bits = 4 if reason == "4bit" else 8)
-    if reason == "custom":
+    # 516 rows pack to 1032, which MLX sends to the aligned kernel the 516-row pair cannot use.
+    model = _model(vlm, dims = (2048, 516) if reason == "rows" else (2048, 512),
+                   quantization = (4, "affine", 64) if reason == "partial" else (8, "affine", 64))
+    if reason == "mixed":
+        model.up_proj = _model(vlm, quantization = (4, "affine", 64)).up_proj
+    elif reason == "partial":
+        model.gate_proj.biases = None  # one projection carrying a field the other lacks cannot pack
+    elif reason == "custom":
         class CustomSwitch(vlm.SwitchGLU):
             pass
         model.__class__ = CustomSwitch
