@@ -108,6 +108,11 @@ def get_mem_info():
 pass
 
 if importlib.util.find_spec("vllm") is not None:
+    # Bind the bare name explicitly. Every `vllm.<...>` reference below relied on
+    # it being bound as a side effect of the try-guarded submodule imports that
+    # follow, and vLLM 0.28 removed BOTH of those bitsandbytes modules, so on
+    # >= 0.28 the name was left unbound and the first `vllm.` use NameError'd.
+    import vllm
     try:
         from vllm import __version__ as vllm_version
     except ImportError:
@@ -157,27 +162,58 @@ if importlib.util.find_spec("vllm") is not None:
     def _dequantize_dq(self, quant_states):
         return quant_states
     try:
-        import vllm.model_executor.model_loader.bitsandbytes_loader
-        if hasattr(
-            vllm.model_executor.model_loader.bitsandbytes_loader,
-            "dequantize_dq",
+        # Same two homes as the quantization module above: in tree up to 0.27.1,
+        # vllm-bnb-plugin from 0.28.
+        _bnb_loader = None
+        for _loader_path in (
+            "vllm.model_executor.model_loader.bitsandbytes_loader",
+            "vllm_bnb_plugin.bitsandbytes_loader",
         ):
-            vllm.model_executor.model_loader.bitsandbytes_loader.dequantize_dq = dequantize_dq
-        elif hasattr(
-            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader,
-            "_dequantize_dq",
-        ):
-            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
+            try:
+                _bnb_loader = importlib.import_module(_loader_path)
+                break
+            except ImportError:
+                continue
+        if _bnb_loader is None:
+            raise ImportError("no bitsandbytes model loader")
+        if hasattr(_bnb_loader, "dequantize_dq"):
+            _bnb_loader.dequantize_dq = dequantize_dq
+        elif hasattr(_bnb_loader.BitsAndBytesModelLoader, "_dequantize_dq"):
+            _bnb_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
         pass
     except:
         pass
 
     # Patch apply_bnb_4bit
-    import vllm.model_executor.layers.quantization.bitsandbytes
-    if not hasattr(
-        vllm.model_executor.layers.quantization.bitsandbytes,
-        "apply_bnb_4bit"
+    # vLLM 0.28 (PR #43529) moved bitsandbytes out of tree into vllm-bnb-plugin,
+    # so the in-tree module is absent from >= 0.28. The plugin re-exports the
+    # same names from vllm_bnb_plugin.bitsandbytes, so resolve whichever is
+    # installed and patch that; the patches below are identical either way.
+    #
+    # Hard-importing the in-tree path used to take out the whole of vllm_utils,
+    # and with it EVERY fast_inference GRPO run rather than only the 4-bit ones.
+    _vllm_bnb = None
+    for _bnb_path in (
+        "vllm.model_executor.layers.quantization.bitsandbytes",  # vLLM <= 0.27.1
+        "vllm_bnb_plugin.bitsandbytes",                          # vLLM >= 0.28
     ):
+        try:
+            _vllm_bnb = importlib.import_module(_bnb_path)
+            break
+        except ImportError:
+            continue
+    if _vllm_bnb is None:
+        # vLLM >= 0.28 without vllm-bnb-plugin installed. 4-bit fast_inference
+        # needs it; everything else in this file still works, so warn rather
+        # than take the whole module down.
+        def _apply_4bit_weight(self, layer, x, bias = None):
+            raise RuntimeError(
+                "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
+                "Install it with `pip install vllm-bnb-plugin` to use "
+                "load_in_4bit with fast_inference."
+            )
+        pass
+    elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
         # Make the compute dtype dynamic instead of forcing torch.bfloat16
         def _apply_4bit_weight(
             self,
@@ -232,7 +268,7 @@ if importlib.util.find_spec("vllm") is not None:
         pass
     else:
         # Newer vLLM versions have _apply_bnb_4bit
-        apply_bnb_4bit = vllm.model_executor.layers.quantization.bitsandbytes.apply_bnb_4bit
+        apply_bnb_4bit = _vllm_bnb.apply_bnb_4bit
         def _apply_4bit_weight(
             self,
             layer: torch.nn.Module,
@@ -274,9 +310,9 @@ if importlib.util.find_spec("vllm") is not None:
 
     def patch_vllm_bitsandbytes():
         # All Unsloth Zoo code licensed under LGPLv3
-        import vllm.model_executor.layers.quantization.bitsandbytes
-        vllm.model_executor.layers.quantization.bitsandbytes.is_layer_skipped_bnb = is_layer_skipped_bnb
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
+        if _vllm_bnb is None: return
+        _vllm_bnb.is_layer_skipped_bnb = is_layer_skipped_bnb
+        _vllm_bnb.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
 
         # Disable all not supported messages
         try:
@@ -291,9 +327,13 @@ if importlib.util.find_spec("vllm") is not None:
         del vllm_config_logger
     pass
 
-    class BitsAndBytesConfig(
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
-    ):
+    # `object` keeps this definition legal on a vLLM with no in-tree bnb; the
+    # patch functions below never install it there.
+    _BitsAndBytesConfigBase = (
+        _vllm_bnb.BitsAndBytesConfig if _vllm_bnb is not None else object
+    )
+
+    class BitsAndBytesConfig(_BitsAndBytesConfigBase):
         # All Unsloth Zoo code licensed under LGPLv3
         def __init__(self, *args, **kwargs):
             dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
@@ -306,20 +346,21 @@ if importlib.util.find_spec("vllm") is not None:
     def patch_vllm_compute_dtype(dtype = torch.float16):
         # All Unsloth Zoo code licensed under LGPLv3
         # vLLM uses the config file's compute_dtype; override it dynamically.
-        old_config = vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
+        if _vllm_bnb is None: return None
+        old_config = _vllm_bnb.BitsAndBytesConfig
 
         dtype = str(dtype)
         if dtype.startswith("torch."): dtype = dtype[len("torch."):]
         os.environ["UNSLOTH_bnb_4bit_compute_dtype"] = dtype
 
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig = BitsAndBytesConfig
+        _vllm_bnb.BitsAndBytesConfig = BitsAndBytesConfig
         return old_config
     pass
 
     def unpatch_vllm_compute_dtype(old_config):
         # All Unsloth Zoo code licensed under LGPLv3
-        import vllm.model_executor.layers.quantization.bitsandbytes
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig = old_config
+        if _vllm_bnb is None: return
+        _vllm_bnb.BitsAndBytesConfig = old_config
         del os.environ["UNSLOTH_bnb_4bit_compute_dtype"]
     pass
 
