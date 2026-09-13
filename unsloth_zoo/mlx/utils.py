@@ -57,7 +57,7 @@ import warnings
 import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import NamedTuple
@@ -4235,6 +4235,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Cohere2-MoE apply logit_scale in their forward tails).
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -4259,11 +4265,18 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     return loss_fn
 
 
@@ -10490,6 +10503,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_shape_plan",
         "_planned_widths",
         "_cycle_length",
+        "_cce_compaction",
+        "_cce_dense_batches",
     )
 
     def __init__(
@@ -10540,6 +10555,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._forbidden = None
         self._shape_plan = None
         self._planned_widths = None
+        self._cce_compaction = False
+        self._cce_dense_batches = set()
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -10619,6 +10636,43 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._shape_plan = shape_plan
         self._planned_widths = planned_widths
         self._mru = None
+
+    def configure_cce_compaction(self, enabled=True, *, max_variants=None):
+        self._cce_compaction = bool(enabled)
+        self._cce_dense_batches.clear()
+        plan = self._shape_plan
+        if plan is None:
+            return None
+        raw = frozenset(key for key in plan.raw_catalog if not key[1].endswith(":cce"))
+        planned = frozenset(key for key in plan.planned_catalog if not key[1].endswith(":cce"))
+        max_variants = plan.report.cap if max_variants is None else max_variants
+        self._cce_compaction &= 2 * len(planned) <= max_variants
+        if self._cce_compaction:
+            # Budget both pytrees: changed processor labels can require the dense fallback.
+            raw |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in raw)
+            planned |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in planned)
+        cap = max(plan.report.cap, len(planned))
+        report = replace(plan.report, raw_signatures=len(raw), planned_signatures=len(planned),
+                         cap=cap, effective_cap=cap)
+        self._shape_plan = replace(plan, raw_catalog=raw, planned_catalog=planned, report=report)
+        return report
+
+    def prepare_cce_batch(self, index, batch):
+        labels = batch.get("labels")
+        if not self._cce_compaction or index in self._cce_dense_batches or labels is None or labels.ndim != 2:
+            return batch
+        tokens = labels.shape[0] * (labels.shape[1] - 1)
+        capacity = tokens // 512 * 256
+        if capacity <= 0:
+            return batch
+        selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
+        if len(selected) > capacity:
+            # Keep dense slots off the fast path, including later stochastic rebuilds.
+            self._cce_dense_batches.add(index)
+            return batch
+        indices = np.full((capacity, 2), -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return {**batch, "_unsloth_cce_indices": mx.array(indices)}
 
     def materialize(self, index, target_width=None, *, phase=None):
         """Build one batch through the complete existing VLM builder.
