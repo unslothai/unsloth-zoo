@@ -24,22 +24,17 @@ function needs a live GPU, so this checks the source-level invariant the way
 tests/test_vllm_utils_xpu_sm_cap.py does.
 """
 
-import importlib.util
 import pathlib
 import re
 
 
-def _module_source_text(module_name: str) -> str:
-    # find_spec is metadata-only, so importing vllm_utils (and its import-time
-    # torch.cuda probes) is avoided on a CPU-only box.
-    spec = importlib.util.find_spec(module_name)
-    if spec is None or spec.origin in (None, "built-in"):
-        raise ImportError(f"could not locate source for {module_name!r}")
-    return pathlib.Path(spec.origin).read_text(encoding="utf-8")
+def _module_source_text() -> str:
+    path = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo" / "vllm_utils.py"
+    return path.read_text(encoding="utf-8")
 
 
 def test_chunked_prefill_line_reports_the_value_vllm_receives():
-    src = _module_source_text("unsloth_zoo.vllm_utils")
+    src = _module_source_text()
 
     printed = re.search(r"Chunked prefill tokens = \{(\w+)\}", src)
     assert printed is not None, "the chunked prefill line vanished from vllm_utils.py"
@@ -53,7 +48,7 @@ def test_chunked_prefill_line_reports_the_value_vllm_receives():
 
 
 def test_no_second_chunked_prefill_variable_is_computed_and_dropped():
-    src = _module_source_text("unsloth_zoo.vllm_utils")
+    src = _module_source_text()
 
     # Every assignment to the old local was overwritten before anything read it, so the
     # eight-branch ladder that produced them could not change the run.
