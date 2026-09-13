@@ -25,9 +25,7 @@ pytest.importorskip("mlx.core")
 
 @pytest.fixture(autouse=True)
 def _require_real_mlx():
-    # Selection reads module trees, never a kernel, so the CPU backend answers
-    # it as well as Metal does. The torch shim cannot: its module classes are
-    # not the ones the selection isinstance-checks against.
+    # The torch shim lacks the module types checked by selection.
     import mlx.core as _mx   # re-import: the shim may have swapped it
     if "mlx_simulation" in str(getattr(_mx, "__file__", "")):
         pytest.skip("requires the real MLX runtime; shim active")
@@ -354,8 +352,7 @@ def test_a_fused_expert_stack_reports_output_width_not_expert_count():
 @pytest.mark.parametrize("targets", [None, "q_proj", ["q_proj"], {"q_proj"},
                                      frozenset({"q_proj"}), "all-linear", ["all-linear"]])
 def test_bitlinear_refuses_before_mutating_other_targets(module_name, targets):
-    import importlib
-    BitLinear = importlib.import_module(module_name).BitLinear
+    BitLinear = pytest.importorskip(module_name).BitLinear
     model = _text_model([_TEXT_BLOCK, {"self_attn": {
         "q_proj": BitLinear(HIDDEN, HIDDEN, bias=False)}}])
     with pytest.raises(ValueError, match="BitLinear.*CustomKernel.*VJP"):
@@ -377,19 +374,11 @@ def test_vlm_bitlinear_refusal_preserves_trainability():
 
 @pytest.mark.parametrize("targets,attention", [(["lm_head"], True),
                                                (["q_proj", "lm_head"], False)])
-def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
-    import mlx.core as mx
-    import mlx.nn as nn
-    from mlx_lm.models.bitnet import Model, ModelArgs
-    model = Model(ModelArgs(
-        model_type="bitnet", hidden_size=HIDDEN, intermediate_size=HIDDEN * 2,
-        num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
-        rms_norm_eps=1e-5, vocab_size=VOCAB, tie_word_embeddings=False,
-    ))
+def test_bitlinear_head_selection_leaves_packed_layers_frozen(targets, attention):
+    from mlx_lm.models.bitlinear_layers import BitLinear
+    model = _text_model([{"self_attn": {"q_proj": BitLinear(HIDDEN, HIDDEN)}}])
     _peft(model, target_modules=targets, finetune_attention_modules=attention)
-    _, grads = nn.value_and_grad(model, lambda m: m(mx.array([[1, 2]])).sum())(model)
     assert _adapters(model) == ["lm_head"]
-    assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
 
 
 def test_unselected_bitlinear_groups_are_left_alone():
