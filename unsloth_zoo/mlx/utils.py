@@ -13652,6 +13652,11 @@ def iter_mlx_lora_modules(model):
             yield module_name, module
 
 
+def is_mlx_dora_module(module):
+    """Class-name gated: a LoRA wrapper with an unrelated ``m`` is not DoRA."""
+    return hasattr(module, "m") and type(module).__name__.startswith("DoRA")
+
+
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 
@@ -13668,9 +13673,7 @@ def collect_mlx_lora_adapter_tensors(model):
         adapter_keys.add(f"{prefix}lora_b")
         adapter_keys.add(f"{prefix}lora_a.weight")
         adapter_keys.add(f"{prefix}lora_b.weight")
-        # Include DoRA magnitude `m`, gated on the DoRA class name so a
-        # future LoRA wrapper with an unrelated `m` attribute isn't exported.
-        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+        if is_mlx_dora_module(module):
             adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
