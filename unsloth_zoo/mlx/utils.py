@@ -3134,6 +3134,20 @@ def _mlx_vlm_canonical_model_type(model_type):
     return name.replace("-", "_")
 
 
+# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
+# `.prod()`, `[:, 1:]`), so a tuple raises inside their tower. Everything else
+# keeps the tuple the Qwen/Paddle compile patches trace: an array becomes a
+# tracer under mx.compile and `.tolist()` raises there instead. Pinned by
+# tests/test_mlx_text_path_contract.py.
+_VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
+    "glm4v",
+    "glm_ocr",
+    # Not compile-patched, and opens with `grid_thw.tolist()`.
+    "muse_glimmer",
+    "glm5_next",
+})
+
+
 def _normalize_size_tuples(values):
     if values is None:
         return None
@@ -3806,6 +3820,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
+    # Resolved, not raw: an aliased config is routed to the canonical family's
+    # tower, so the grid form has to follow it there.
+    grid_as_array = (
+        _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
+    )
     static_metadata = {}
     for key, normalized in (
         ("image_grid_thw", image_grid_thw),
@@ -3816,7 +3835,13 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     ):
         if normalized is not None:
             value = batch_dict[key]
-            batch_dict[key] = value if isinstance(value, (mx.array, np.ndarray)) else normalized
+            if isinstance(value, (mx.array, np.ndarray)):
+                pass  # Never downgrade what the processor emitted.
+            elif grid_as_array and key in ("image_grid_thw", "video_grid_thw"):
+                value = mx.array(normalized, dtype=mx.int32)
+            else:
+                value = normalized
+            batch_dict[key] = value
             static_metadata[key] = normalized
     # Only when there is metadata: every VLM batch goes through here, and an
     # always-present empty dict is a new key in every text-only batch's pytree.

@@ -5780,3 +5780,41 @@ def test_compile_preparation_adds_no_metadata_key_without_metadata():
         {"input_ids": mx.array([[1, 2, 3]]), "image_grid_thw": mx.array([[1, 16, 12]])},
         {"model_type": "some_new_arch"}, phase="content")
     assert with_grid["_unsloth_static_vlm_metadata"] == {"image_grid_thw": ((1, 16, 12),)}
+
+
+@pytest.mark.parametrize("model_type,wants_array", [
+    ("glm4v", True), ("glm_ocr", True), ("muse_glimmer", True), ("glm5_next", True),
+    ("qwen2_vl", False), ("qwen2_5_vl", False), ("qwen3_vl", False), ("paddleocr_vl", False),
+])
+def test_grid_form_follows_the_family_when_the_processor_emits_a_list(model_type, wants_array):
+    """These vision towers open with `grid_thw.tolist()` and a tuple raises there,
+    while the Qwen/Paddle compile patches trace the grid as static metadata and an
+    array becomes a tracer. A processor that hands over a plain list has to be
+    coerced to whichever form its own family reads.
+
+    Also pinned by tests/test_mlx_text_path_contract.py, which no workflow runs.
+    """
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    out = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "image_grid_thw": [[1, 16, 16]]},
+        {"model_type": model_type, "vision_config": {"hidden_size": 8}},
+        phase="content")
+    if wants_array:
+        assert isinstance(out["image_grid_thw"], mx.array), model_type
+        assert out["image_grid_thw"].tolist() == [[1, 16, 16]], model_type
+    else:
+        assert out["image_grid_thw"] == ((1, 16, 16),), model_type
+
+
+def test_a_processor_emitted_grid_array_is_never_downgraded():
+    """The point of the change this pins: an array the processor built stays an
+    array even for a family whose default form is the tuple."""
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    out = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "image_grid_thw": mx.array([[1, 16, 16]])},
+        {"model_type": "qwen2_vl", "vision_config": {"hidden_size": 8}},
+        phase="content")
+    assert isinstance(out["image_grid_thw"], mx.array)
+    assert out["_unsloth_static_vlm_metadata"]["image_grid_thw"] == ((1, 16, 16),)
