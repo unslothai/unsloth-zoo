@@ -181,7 +181,11 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     else:
         DEBUGGING = ""
         os.environ.pop("TORCHDYNAMO_VERBOSE", None)
-        os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+        # Keep _gpu_init's single worker forcing. Inductor's compile worker subprocesses
+        # cannot enumerate a cgroup pinned GPU (docker --gpus '"device=N"'), so popping
+        # this lets them respawn and raise "Could not find an active GPU backend".
+        if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") != "1":
+            os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
         os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)
         os.environ.pop("TORCH_LOGS", None)
         torch._logging.set_logs(all = logging.CRITICAL)

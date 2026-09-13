@@ -52,6 +52,10 @@ def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
     # Windows thread count = 1. See https://github.com/unslothai/unsloth-zoo/pull/187
     if sys.platform == "win32": return 1
+    # Honour an explicit single worker forcing. get_torch_compile_options puts this value
+    # into the Inductor options dict, which takes precedence over TORCHINDUCTOR_COMPILE_THREADS,
+    # so returning the cpu count here would silently undo the env var.
+    if os.environ.get("TORCHINDUCTOR_COMPILE_THREADS") == "1": return 1
     cpu_count = os.cpu_count()
     return min(32, max(4, cpu_count))
 pass
