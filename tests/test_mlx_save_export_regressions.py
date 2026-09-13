@@ -4554,3 +4554,64 @@ def test_image_processor_builder_forwards_trust(monkeypatch, tmp_path, trust):
         tmp_path, {}, {}, trust_remote_code=trust,
     ) is processor
     assert calls == [trust]
+
+
+@pytest.mark.parametrize("native_tokenizer", [False, True])
+def test_swallowed_processor_refusal_is_not_returned_as_a_half_processor(
+    monkeypatch, tmp_path, native_tokenizer,
+):
+    """mlx-vlm's own AutoProcessor shim catches everything its native processor
+    raises and chains to Transformers, so a tokenizer refusal does not surface
+    as an error: the call succeeds and hands back the image-processor half.
+    Returning that silently strands the caller with a processor that has no
+    tokenizer, so the refusal has to win."""
+    from transformers import AutoTokenizer
+    import unsloth_zoo.mlx.loader as loader
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "custom_vlm"}))
+    (tmp_path / "tokenizer_config.json").write_text(json.dumps({
+        "tokenizer_class": "RemoteTokenizer",
+        "auto_map": {"AutoTokenizer": ["tokenization_custom.RemoteTokenizer", None]},
+    }))
+
+    class ImageProcessorOnly:
+        tokenizer = None
+
+    class WithTokenizer:
+        tokenizer = object()
+
+    class SwallowingAutoProcessor:
+        """Mirrors mlx_vlm.models.base's `except Exception: pass` shim."""
+
+        @classmethod
+        def from_pretrained(cls, path, **kwargs):
+            try:
+                AutoTokenizer.from_pretrained(path)
+            except Exception:
+                pass
+            return WithTokenizer() if native_tokenizer else ImageProcessorOnly()
+
+    def tokenizer(path, **kwargs):
+        if not kwargs["trust_remote_code"]:
+            raise ValueError("custom code requires trust_remote_code=True")
+        return "remote"
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(tokenizer))
+    monkeypatch.setitem(globals(), "AutoProcessor", SwallowingAutoProcessor)
+    monkeypatch.setitem(globals(), "load_processor", _test_bound_load_processor)
+    monkeypatch.setattr(loader, "_ensure_vlm_detokenizer_copy", lambda: None)
+
+    scoped = loader._bind_mlx_vlm_processor_loader(_test_bound_vlm_load)
+    if native_tokenizer:
+        # The shim recovered a usable tokenizer on its own: that still wins.
+        assert isinstance(scoped(tmp_path), WithTokenizer)
+    else:
+        with pytest.raises(
+            ValueError, match=r"tokenization_custom.py.*trust_remote_code=True",
+        ):
+            scoped(tmp_path)
+
+    trusted = loader._bind_mlx_vlm_processor_loader(
+        _test_bound_vlm_load, allow_remote_code=True,
+    )
+    assert trusted(tmp_path) is not None

@@ -1614,6 +1614,21 @@ def _is_mlx_vlm_processor_resolution_error(error):
     return isinstance(error, ImportError) and "tensorflow" in message
 
 
+def _is_degraded_mlx_vlm_processor(processor):
+    """Return whether a VLM "processor" came back without its tokenizer.
+
+    A tokenizer refusal swallowed upstream leaves AutoProcessor free to return
+    the image-processor half on its own, which then fails much later with an
+    unrelated AttributeError. Both a processor's `.tokenizer` and a tokenizer
+    returned directly (what a text-only repo yields) count as usable.
+    """
+    if processor is None:
+        return True
+    if getattr(processor, "tokenizer", None) is not None:
+        return False
+    return not hasattr(processor, "encode")
+
+
 def _inherit_mlx_vlm_processor_runtime(processor, repaired):
     """Carry mlx-vlm's runtime generation state onto a rebuilt processor."""
 
@@ -1679,7 +1694,7 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
             with _mlx_tokenizer_loading_scope(allow_remote_code) as refusals:
                 try:
                     try:
-                        return original_auto_processor.from_pretrained(
+                        processor = original_auto_processor.from_pretrained(
                             processor_load_path,
                             *args,
                             **call_kwargs,
@@ -1701,7 +1716,21 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
                             if not allow_remote_code:
                                 _raise_mlx_remote_code_refusal(model_path, error)
                             raise
+                        # A native fallback that produced a processor takes
+                        # precedence over a refusal recorded on the way there.
                         return processor
+                    # mlx-vlm's own AutoProcessor shim (models/base.py) wraps its
+                    # native processor construction in `except Exception: pass`
+                    # and chains to Transformers on failure, so a refusal raised
+                    # inside that native processor never reaches the handler
+                    # above: the call SUCCEEDS and returns whatever Transformers
+                    # could still assemble, which for a VLM whose tokenizer was
+                    # refused is a bare image processor with no `.tokenizer`.
+                    # Surface the refusal rather than a processor that silently
+                    # lost half of itself.
+                    if refusals and _is_degraded_mlx_vlm_processor(processor):
+                        raise refusals[-1]
+                    return processor
                 finally:
                     if str(processor_load_path) != str(model_path):
                         shutil.rmtree(processor_load_path, ignore_errors=True)
