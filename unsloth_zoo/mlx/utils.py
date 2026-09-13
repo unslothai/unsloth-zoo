@@ -16788,6 +16788,30 @@ _MODEL_WEIGHT_SUFFIXES = (
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
 
 
+def _asset_link_stays_in_the_model(file, source):
+    """Refuse a sidecar symlink that points outside the model it came from.
+
+    A writable model directory is otherwise enough to aim `generation_config.json`
+    at a credential file and have the save dereference it into an adapter that is
+    then published. A Hugging Face snapshot is itself a tree of symlinks into a
+    sibling `blobs/` directory, so the allowed root is the cache repo directory
+    when the source sits under `snapshots/<sha>`, not the source alone.
+    """
+    try:
+        if not file.is_symlink():
+            return True
+        source = Path(source).resolve()
+        roots = [source]
+        for parent in (source, *source.parents):
+            if parent.name == "snapshots":
+                roots.append(parent.parent)
+                break
+        target = file.resolve()
+        return any(target.is_relative_to(root) for root in roots)
+    except OSError:
+        return False
+
+
 def _save_vlm_processor_assets(processor, path, sources=()):
     path = Path(path)
     failures = []
@@ -16812,6 +16836,9 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             if any(part.startswith(".") for part in relative.parts):
                 continue
             if file.resolve().is_relative_to(path.resolve()):
+                continue
+            if not _asset_link_stays_in_the_model(file, source):
+                failures.append(f"{relative}: symlink leaves the model directory")
                 continue
             if file.name in _CORE_SAVE_FILENAMES or file.name == "adapter_config.json":
                 continue

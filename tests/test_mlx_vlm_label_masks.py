@@ -5818,3 +5818,45 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
         phase="content")
     assert isinstance(out["image_grid_thw"], mx.array)
     assert out["_unsloth_static_vlm_metadata"]["image_grid_thw"] == ((1, 16, 16),)
+
+
+def test_a_sidecar_symlink_out_of_the_model_is_not_dereferenced(tmp_path):
+    """A writable model directory is otherwise enough to aim a sidecar at a
+    credential file and have the save copy it into a published adapter."""
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    secret = tmp_path / "credentials.json"
+    secret.write_text('{"token": "SECRET"}')
+    src = tmp_path / "model"; src.mkdir()
+    (src / "config.json").write_text('{"model_type": "x"}')
+    (src / "generation_config.json").symlink_to(secret)
+    out = tmp_path / "out"; out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(src),))
+    assert (out / "config.json").is_file()
+    assert not (out / "generation_config.json").exists()
+    assert "SECRET" not in "".join(p.read_text() for p in out.rglob("*.json"))
+
+
+def test_a_hugging_face_snapshot_symlink_is_still_followed(tmp_path):
+    """Every file in an HF snapshot is a symlink into a sibling blobs/ dir, so
+    the rule cannot be "must resolve inside the source"."""
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    repo = tmp_path / "models--org--name"
+    blobs = repo / "blobs"; blobs.mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"; snapshot.mkdir(parents=True)
+    (blobs / "deadbeef").write_text('{"model_type": "real"}')
+    (snapshot / "config.json").symlink_to(blobs / "deadbeef")
+    out = tmp_path / "out"; out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(snapshot),))
+    assert (out / "config.json").read_text() == '{"model_type": "real"}'
