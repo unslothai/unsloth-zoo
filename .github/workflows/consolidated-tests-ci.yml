@@ -340,10 +340,6 @@ jobs:
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
-            tests/test_notebook_deps_patch_targets.py \
-            tests/test_notebook_deps_guarded_import_replay.py \
-            tests/test_notebook_deps_user_site.py \
-            tests/test_notebook_deps_dummy_export.py \
             tests/test_loss_normalization_contract.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
@@ -369,6 +365,10 @@ jobs:
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_python39_compatibility.py \
+            tests/test_notebook_deps_dummy_export.py \
+            tests/test_notebook_deps_user_site.py \
+            tests/test_notebook_deps_guarded_import_replay.py \
+            tests/test_notebook_deps_patch_targets.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
             tests/test_inductor_codegen_fallback.py \
