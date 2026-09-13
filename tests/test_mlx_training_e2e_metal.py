@@ -568,6 +568,55 @@ def test_lora_sft_baseline_loss_value_clip(tmp_path):
 _NormTok = type("Tok", (), {"pad_token_id": 0, "eos_token_id": 0})
 
 
+def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0):
+    from types import SimpleNamespace
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(rows, dim)
+
+        def __call__(self, ids):
+            if calls is not None:
+                calls.append("backbone")
+            return self.embed_tokens(ids)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = LoRALinear(dim, 8192, r=8, scale=2.0) if lora else nn.Linear(dim, 8192, bias=False)
+            base = self.lm_head.linear if lora else self.lm_head
+            if lora and (softcap or dim > 1024):
+                dtype = mx.float16 if softcap and not quantized else mx.bfloat16
+                self.model.set_dtype(dtype)
+                base.set_dtype(dtype)
+                self.model.embed_tokens.weight *= 50 if softcap else 1
+                if softcap and not quantized:
+                    self.model.embed_tokens.weight = mx.full((rows, dim), 200, dtype=dtype)
+                    base.weight = mx.full((8192, dim), 200, dtype=dtype)
+                    base.bias = mx.full((8192,), -40000 * dim, dtype=mx.float32)
+            if quantized:
+                base = nn.QuantizedLinear.from_linear(base)
+            if lora or quantized:
+                base.freeze()
+            if lora:
+                self.lm_head.linear = base
+                self.lm_head.lora_b = mx.random.normal((8, 8192)) * 0.02
+            else:
+                self.lm_head = base
+            self.args = SimpleNamespace(tie_word_embeddings=False, final_logit_softcapping=softcap)
+
+        def __call__(self, ids):
+            if calls is not None:
+                calls.append("model")
+            return _apply_softcap(self.lm_head(self.model(ids)), softcap)
+
+    return Model()
+
+
 @metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
@@ -1130,6 +1179,33 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert aux <= trainable, sorted(aux - trainable)
     assert _adapter_keys(reloaded) <= trainable
     assert trainable == _adapter_keys(reloaded) | aux
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
+    mx.random.seed(735)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    ids = mx.arange(1026).reshape(2, 513)
+    batch = {"input_ids": ids, "labels": mx.where((ids % 11) == 5, ids, -100)}
+    plan = mlx_utils.FiniteVLMBatchPlan([], [], None, processor=None, config={}, max_seq_length=1024, image_size=None)
+    plan.configure_cce_compaction()
+    compact = plan.prepare_cce_batch(0, batch)
+    assert compact["_unsloth_cce_indices"].shape == (512, 2) and "_unsloth_cce_indices" not in batch
+    def forward(m, b, **kwargs):
+        target = b["labels"][:, 1:-4]
+        return m.model.embed_tokens(b["input_ids"])[:, :-5], target, (target != -100).sum()
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", forward)
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    grad = nn.value_and_grad(model, loss)
+    run = mx.compile(lambda b: grad(model, b), inputs=model.state, outputs=model.state)
+    expected, actual = grad(model, batch), run(compact)
+    mx.eval(expected, actual)
+    assert actual[0][1].item() == expected[0][1].item()
+    assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=2e-5)
+    for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
 
 
 @metal_only

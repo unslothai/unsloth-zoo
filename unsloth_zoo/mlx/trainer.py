@@ -5203,6 +5203,13 @@ class MLXTrainer:
             batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False),
             )
+        if isinstance(batches, FiniteVLMBatchPlan):
+            compaction_report = batches.configure_cce_compaction(
+                getattr(loss_fn, "_unsloth_cce_compaction", False) and distributed_world_size == 1,
+                max_variants=resolve_compile_max_variants(getattr(args, "compile_max_variants", None)),
+            )
+            if compaction_report is not None:
+                _compile_shape_guard_report = compaction_report
         # Shared by the preflight and prepared paths: batch_iter is the
         # streaming producer when active, None otherwise.
         _prefetch_active = bool(
@@ -7299,7 +7306,7 @@ class MLXTrainer:
                         )
                     else:
                         batch_data = batches[scheduled_index]
-                    if isinstance(batches, FiniteTextBatchPlan):
+                    if isinstance(batches, (FiniteTextBatchPlan, FiniteVLMBatchPlan)):
                         batch_data = batches.prepare_cce_batch(
                             scheduled_index, batch_data,
                         )
