@@ -617,6 +617,7 @@ from .preference import (
     make_dpo_loss_fn,
     make_dpo_cce_loss_fn,
     make_orpo_loss_fn,
+    make_orpo_cce_loss_fn,
     make_preference_eval_fn,
     resolve_preference_objective,
     resolve_preference_length_policy,
@@ -5456,7 +5457,9 @@ class MLXTrainer:
         if preference_kind:
             if preference_kind == "orpo":
                 objective = resolve_preference_objective("orpo", beta=args.beta)
-                loss_fn = make_orpo_loss_fn(objective)
+                loss_fn = (make_orpo_cce_loss_fn(model, objective)
+                           if args.use_cce else make_orpo_loss_fn(objective))
+                use_cce = getattr(loss_fn, "_unsloth_cce_compaction", False)
                 self._preference_reference_provenance = {
                     "kind": "orpo_no_reference"
                 }
@@ -5499,7 +5502,9 @@ class MLXTrainer:
                 objective, reference_policy=_sampling_reference,
             )
             if isinstance(batches, FinitePreferenceBatchPlan):
-                batches.configure_cce_compaction(getattr(loss_fn, "_unsloth_cce_compaction", False))
+                batches.configure_cce_compaction(
+                    getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
+                )
 
         self.callback_handler.optimizer = optimizer
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
