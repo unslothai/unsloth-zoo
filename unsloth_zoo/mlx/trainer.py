@@ -615,6 +615,7 @@ from .preference import (
     create_preference_batch_plan,
     encode_generation_prompt_text,
     make_dpo_loss_fn,
+    make_dpo_cce_loss_fn,
     make_orpo_loss_fn,
     make_preference_eval_fn,
     resolve_preference_objective,
@@ -5483,9 +5484,9 @@ class MLXTrainer:
                 # Sampling borrows this policy's adapter modules so it zeroes
                 # the same ones the loss does. NEFTune is already off in eval.
                 _sampling_reference = reference_policy
-                loss_fn = make_dpo_loss_fn(
-                    objective, reference_policy=reference_policy,
-                )
+                loss_fn = (make_dpo_cce_loss_fn(model, objective, reference_policy=reference_policy)
+                           if args.use_cce else make_dpo_loss_fn(objective, reference_policy=reference_policy))
+                use_cce = getattr(loss_fn, "_unsloth_cce_compaction", False)
                 _main_print(
                     f"Unsloth: Using DPO loss (beta={args.beta}, "
                     f"loss_type={list(objective.loss_types)})."
@@ -5497,6 +5498,8 @@ class MLXTrainer:
             preference_eval_fn = make_preference_eval_fn(
                 objective, reference_policy=_sampling_reference,
             )
+            if isinstance(batches, FinitePreferenceBatchPlan):
+                batches.configure_cce_compaction(getattr(loss_fn, "_unsloth_cce_compaction", False))
 
         self.callback_handler.optimizer = optimizer
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
@@ -7306,7 +7309,7 @@ class MLXTrainer:
                         )
                     else:
                         batch_data = batches[scheduled_index]
-                    if isinstance(batches, (FiniteTextBatchPlan, FiniteVLMBatchPlan)):
+                    if isinstance(batches, (FiniteTextBatchPlan, FiniteVLMBatchPlan, FinitePreferenceBatchPlan)):
                         batch_data = batches.prepare_cce_batch(
                             scheduled_index, batch_data,
                         )
