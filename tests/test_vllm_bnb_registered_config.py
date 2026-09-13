@@ -16,15 +16,10 @@
 
 """The bnb compute-dtype override must reach vLLM's quantization registry.
 
-In-tree vLLM (<= 0.27.1) re-imports `BitsAndBytesConfig` from its module on
-every `get_quantization_config` call, so swapping the module attribute is
-enough. An out-of-tree plugin instead registers the CLASS OBJECT once, in
-`_CUSTOMIZED_METHOD_TO_QUANT_CONFIG`, and `get_quantization_config` merges that
-dict in last: the module swap is then invisible and vLLM builds the unpatched
-config, silently ignoring `UNSLOTH_bnb_4bit_compute_dtype`.
-
-These run without vLLM by driving `_set_registered_quant_config` against a
-stub registry module.
+In-tree vLLM (<= 0.27.1) re-imports `BitsAndBytesConfig` per
+`get_quantization_config` call, so a module attribute swap suffices. A plugin
+registers the CLASS OBJECT in `_CUSTOMIZED_METHOD_TO_QUANT_CONFIG`, merged in
+last, so the swap is invisible and `UNSLOTH_bnb_4bit_compute_dtype` is ignored.
 """
 
 import importlib.machinery

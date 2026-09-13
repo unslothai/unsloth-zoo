@@ -108,11 +108,9 @@ def get_mem_info():
 pass
 
 def _set_registered_quant_config(method, config_cls):
-    # An out-of-tree plugin registers the CLASS OBJECT, so swapping the module
-    # attribute leaves vLLM building the unpatched config and ignoring
-    # UNSLOTH_bnb_4bit_compute_dtype. In-tree vLLM re-imports the attribute on
-    # every get_quantization_config call and registers nothing here, so only
-    # touch a key the plugin actually registered.
+    # A plugin registers the CLASS OBJECT, so a module attribute swap alone
+    # leaves vLLM ignoring UNSLOTH_bnb_4bit_compute_dtype. In-tree re-imports
+    # the attribute per call and registers nothing, hence the `in registry`.
     try:
         from vllm.model_executor.layers.quantization import (
             _CUSTOMIZED_METHOD_TO_QUANT_CONFIG as registry,
