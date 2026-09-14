@@ -24,13 +24,12 @@ import os
 
 import pytest
 
-# Before the import: CI installs unsloth with `|| true`, and without it unsloth_zoo/__init__
-# raises "Please install Unsloth" at import, so collection of this file would error out.
+# Before the import: CI installs unsloth with `|| true`, and zoo raises without this flag.
 os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
 
 from unsloth_zoo.compiler import higher_precision_layernorms  # noqa: E402
 
-# Llama 4 shape: the norm multiplies in the input dtype, so this is a float16 norm.
+# Llama 4 shape: the weight multiplies in the input dtype.
 FLOAT16_NORM = """
 class Llama4TextRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -46,7 +45,6 @@ class Llama4TextRMSNorm(nn.Module):
         return output * self.weight
 """
 
-# A neighbour that is not a norm at all, but does contain the float32 marker.
 FLOAT32_MARKER_NEIGHBOUR = """
 
 class Llama4TextExperts(nn.Module):
@@ -76,7 +74,6 @@ def test_marker_in_the_next_class_does_not_upcast(precision_flag):
 
 
 def test_marker_in_the_norm_itself_still_upcasts(precision_flag):
-    # The control: move the same marker into the norm class and the decision must flip.
     upcasting_norm = FLOAT16_NORM.replace(
         "output = self._norm(x.float()).type_as(x)",
         "output = self._norm(x.float()).type_as(x)\n        scale = self.weight.float()",
@@ -87,8 +84,8 @@ def test_marker_in_the_norm_itself_still_upcasts(precision_flag):
 
 
 def test_a_marker_in_the_next_class_can_also_suppress_a_real_upcast(precision_flag):
-    # The ladder is priority ordered, so a float16 marker next door also hides a real float32
-    # norm. Qwen4Exp is the live case, and it was silently losing its upcast.
+    # The ladder is priority ordered, so a float16 marker next door hides a real float32 norm.
+    # Qwen4Exp is the live case, and it was silently losing its upcast.
     float32_norm = FLOAT16_NORM.replace(
         "return output * self.weight", "return output * (1.0 + self.weight.float())"
     )
@@ -104,8 +101,7 @@ class Llama4TextRMSNormGated(nn.Module):
 
 
 def test_decorated_next_class_does_not_leak_either(precision_flag):
-    # The next class usually has a decorator, so stop at its "\nclass", not the decorator.
-    # Kimi Linear and Cohere2 MoE both look like this.
+    # Stop at the next class's "\nclass", not its decorator. Kimi Linear and Cohere2 MoE.
     decorated_neighbour = '''
 
 @use_kernel_forward_from_hub("RMSNormGated")
@@ -119,7 +115,6 @@ class Llama4TextRMSNormGated(nn.Module):
 
 
 def test_the_norm_class_is_read_in_full(precision_flag):
-    # The narrower slice must still reach past forward() to the end of the norm class.
     norm_with_trailing_method = FLOAT16_NORM + """
     def extra_repr(self):
         scale = self.weight.float()
