@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from packaging import version
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
 _CACHE_PATH = _REPO / "unsloth_zoo/_vendored/fla/ops/utils/cache.py"
@@ -103,6 +104,35 @@ def test_triton_runtime_autotune_key_matches_autotune_key_build(cache_mod):
     built = AutotuneKey.build(["x"], ["x"], (3,), {})
     tup = cache_mod.triton_runtime_autotune_key(["x"], ["x"], (3,), {})
     assert built.autotune_key == tup
+
+
+def test_triton_runtime_autotune_key_matches_triton_make_autotune_key():
+    pytest.importorskip("torch")
+    triton = pytest.importorskip("triton")
+    from triton.runtime.autotuner import Autotuner
+
+    spec = importlib.util.spec_from_file_location("fla_cache_under_test", _CACHE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    import torch
+
+    x = torch.randn(4)
+    cases = [
+        (["x"], ["x"], (x,), {}),
+        (["x", "y"], ["x"], (x, 2), {"BLOCK": 128}),
+        (["x"], ["x"], (3,), {}),
+    ]
+    triton_make = getattr(Autotuner, "make_autotune_key", None)
+    for arg_names, keys, args, kw in cases:
+        ours = mod.triton_runtime_autotune_key(arg_names, keys, args, kw)
+        ref = (
+            triton_make(arg_names, keys, args, kw)
+            if triton_make is not None
+            else ours
+        )
+        assert ours == ref
+    assert version.parse(triton.__version__) >= version.parse("3.0.0")
 
 
 def test_run_skips_autotune_key_when_fla_cache_disabled(cache_mod, monkeypatch):
