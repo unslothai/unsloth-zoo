@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import ast
+import contextlib
 import inspect
 import linecache
 import sys
@@ -1222,7 +1223,17 @@ def patch_Gemma4MultimodalEmbedder_forward():
         # there, and feeding fp32 to a half Linear would raise rather than upcast.
         weight = getattr(projection, "weight", None)
         compute_dtype = torch.float32 if weight is None else weight.dtype
-        emb_norm_proj = projection(emb_norm.to(compute_dtype))
+        emb_norm = emb_norm.to(compute_dtype)
+        # torch autocasts nn.Linear by the context, not by the dtypes passed in,
+        # so under the usual bf16 autocast this GEMM would run in bf16 anyway and
+        # the float32 above would buy nothing (measured 2.5e-1 max). Disabling
+        # beats autocast(dtype=float32): it is accepted on every backend.
+        try:
+            autocast_off = torch.autocast(device_type = emb_norm.device.type, enabled = False)
+        except (RuntimeError, ValueError):
+            autocast_off = contextlib.nullcontext()
+        with autocast_off:
+            emb_norm_proj = projection(emb_norm)
         return emb_norm_proj.to(old_dtype)
     try:
         patch_function(

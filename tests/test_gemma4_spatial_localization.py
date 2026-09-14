@@ -157,3 +157,64 @@ def test_temporary_patch_registered():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_projection_stays_float32_inside_an_autocast_context():
+    """The patch exists to keep this GEMM in float32. torch autocasts nn.Linear
+    by context, not by the dtypes handed to it, so without disabling autocast the
+    float32 cast buys nothing. Tests that ran outside autocast could not see it.
+    """
+    import torch
+
+    from unsloth_zoo.temporary_patches.gemma4 import (
+        _Gemma4MultimodalEmbedder_RMSNorm_forward,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    class _StubRMSNorm(torch.nn.Module):
+        """Shaped like the transformers Gemma norm, which exposes `_norm`."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(16))
+            self.eps = 1e-6
+
+        def _norm(self, t):
+            return t * torch.rsqrt(t.pow(2).mean(-1, keepdim = True) + self.eps)
+
+    class Embedder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding_pre_projection_norm = _StubRMSNorm()
+            self.embedding_projection = torch.nn.Linear(16, 16, bias = False)
+
+        def forward(self, inputs_embeds):
+            old_dtype = inputs_embeds.dtype
+            emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(
+                self.embedding_pre_projection_norm, inputs_embeds
+            )
+            projection = self.embedding_projection
+            weight = getattr(projection, "weight", None)
+            compute_dtype = torch.float32 if weight is None else weight.dtype
+            emb_norm = emb_norm.to(compute_dtype)
+            with torch.autocast(device_type = emb_norm.device.type, enabled = False):
+                out = projection(emb_norm)
+            assert out.dtype == torch.float32, (
+                f"projection ran in {out.dtype}, autocast was not disabled"
+            )
+            return out.to(old_dtype)
+
+    torch.manual_seed(0)
+    model = Embedder().to(device, torch.float32)
+    x = (torch.randn(2, 16, device = device) * 10.0).to(torch.bfloat16)
+
+    with torch.autocast(device_type = device, dtype = torch.bfloat16):
+        out = model(x)
+    assert out.dtype == torch.bfloat16      # caller-facing dtype is unchanged
+
+    # Negative control: without disabling autocast the same call runs in bfloat16,
+    # so the assertion above is testing the guard and not the dtypes.
+    emb = torch.randn(2, 16, device = device, dtype = torch.float32)
+    with torch.autocast(device_type = device, dtype = torch.bfloat16):
+        assert model.embedding_projection(emb).dtype == torch.bfloat16
