@@ -1189,18 +1189,15 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4VisionPoolerFP16)
 
 
-# Force float32 through embedding_projection, which loses spatial precision in
-# bf16/fp16. Mirror of patch_Gemma3nMultimodalEmbedder_forward.
-# ============================================================================
+# Force float32 through embedding_projection. Mirrors patch_Gemma3nMultimodalEmbedder_forward.
 
 @torch_compile
 def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
     output = self._norm(x.float())
     if getattr(self, "with_scale", True) and hasattr(self, "weight"):
         output = output * self.weight.float()
-    # Stay in float32: the only caller casts to the projection's own dtype next,
-    # and a bfloat16 hop here would throw away the precision this patch exists
-    # to keep (measured 1.9e-3 relative on an fp32 projector).
+    # Stay in float32: the caller casts next, and a bfloat16 hop here costs
+    # 1.9e-3 relative on an fp32 projector.
     return output
 
 def patch_Gemma4MultimodalEmbedder_forward():
@@ -1214,21 +1211,17 @@ def patch_Gemma4MultimodalEmbedder_forward():
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         old_dtype = inputs_embeds.dtype
         emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
-        # Call the module, never `.weight`: on a PEFT `lora.Linear` the delta
-        # lives only in `forward`, so reading `.weight` trains the adapter that
-        # finetune_vision_layers attaches here to exactly zero effect.
+        # Call the module, never `.weight`: a PEFT lora.Linear applies its delta
+        # only in forward, so reading the weight trains the adapter to no effect.
         projection = self.embedding_projection
-        # Match the projection's own dtype. Promoting a half weight would need
-        # either autocast(dtype=float32), which several backends and older torch
-        # refuse and then feed float32 into a half Linear, or rebuilding the
-        # Parameter, which Dynamo cannot trace in this fullgraph forward. So the
-        # float32 GEMM is delivered for a float32 projector, which is the
-        # SKIP_QUANTIZATION_MODULES configuration this patch is for, and a half
-        # projector keeps upstream behaviour rather than risking a crash.
+        # Match the weight dtype. Promoting a half one is not reachable here:
+        # autocast(dtype=float32) is refused on several backends and older torch,
+        # and Dynamo cannot trace a Parameter rebuild in a fullgraph forward. So
+        # only a float32 projector (SKIP_QUANTIZATION_MODULES) gets float32.
         weight = getattr(projection, "weight", None)
         compute_dtype = torch.float32 if weight is None else weight.dtype
-        # An enclosing bf16 autocast would downcast the GEMM even with float32
-        # operands. enabled=False is accepted on every backend and torch version.
+        # An enclosing bf16 autocast downcasts even float32 operands; enabled=False
+        # is accepted on every backend and torch version.
         with torch.autocast(device_type = emb_norm.device.type, enabled = False):
             emb_norm_proj = projection(emb_norm.to(compute_dtype))
         return emb_norm_proj.to(old_dtype)
@@ -1253,8 +1246,7 @@ def patch_Gemma4_static_cache_backport(phase = "post_compile"):
     hence the guard below: it runs only when unsloth has no gate of its own.
     """
     if phase != "post_compile": return
-    # unsloth_zoo must not import unsloth: sys.modules only, and absent means
-    # too early to tell, so do nothing.
+    # unsloth_zoo must not import unsloth; absent means too early to tell.
     vision = sys.modules.get("unsloth.models.vision")
     if vision is None or hasattr(vision, "_needs_bidirectional_multimodal_mask"): return
     for name in ("gemma4", "gemma4_unified"):

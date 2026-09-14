@@ -5497,9 +5497,8 @@ def unsloth_compile_transformers(
             pass
         pass
     pass
-    # `functions` is the generated cache's import allow-list, not a compile list.
-    # Uncompiled modules are still referenced by the emitted classes, so dropping
-    # them here makes the cache raise NameError when it constructs them.
+    # Import allow-list for the generated cache, not a compile list: the emitted
+    # classes still reference uncompiled modules and NameError without them.
     functions += list(bad_torch_modules)
 
     if len(pretrained_modules) > 0:
