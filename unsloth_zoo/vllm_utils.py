@@ -2812,9 +2812,8 @@ def load_vllm(
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
 
-        # vLLM rejects a budget under max_model_len only when it cannot chunk the
-        # prefill, so clamp exactly there. A blanket floor would make every prefill
-        # fit in one batch and disable chunking for text models.
+        # vLLM only rejects a budget under max_model_len when it cannot chunk. A
+        # blanket floor instead would disable chunking for text models.
         if not enable_chunked_prefill:
             max_num_batched_tokens = max(max_num_batched_tokens, max_seq_length)
 
