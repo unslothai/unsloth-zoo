@@ -206,7 +206,8 @@ def test_projection_stays_float32_inside_an_autocast_context():
                     f"projection ran in {out.dtype}, float32 autocast did not hold"
                 )
             else:
-                out = projection(emb_norm.to(compute_dtype))
+                with torch.autocast(device_type = device_type, enabled = False):
+                    out = projection(emb_norm.to(compute_dtype))
             return out.to(old_dtype)
 
     torch.manual_seed(0)

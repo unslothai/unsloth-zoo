@@ -1203,9 +1203,11 @@ def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Te
     # to keep (measured 1.9e-3 relative on an fp32 projector).
     return output
 
-# Devices whose autocast accepts float32. ROCm reports "cuda", so AMD is covered;
-# CPU and MPS reject it and take the weight-dtype path.
-_FLOAT32_AUTOCAST_DEVICES = ("cuda", "xpu")
+# Only CUDA autocast accepts float32 (ROCm reports "cuda", so AMD is covered).
+# CPU, MPS and XPU refuse it and merely warn, which would leave the weight in
+# half and make a float32 input raise, so those keep the weight-dtype path and
+# do not get the precision improvement.
+_FLOAT32_AUTOCAST_DEVICES = ("cuda",)
 
 
 def patch_Gemma4MultimodalEmbedder_forward():
@@ -1223,10 +1225,10 @@ def patch_Gemma4MultimodalEmbedder_forward():
         # lives only in `forward`, so reading `.weight` trains the adapter that
         # finetune_vision_layers attaches here to exactly zero effect.
         projection = self.embedding_projection
-        # autocast(dtype=float32) is the only form that delivers a float32 GEMM
-        # here: it promotes the weight too, so a plain bfloat16 load is covered.
-        # enabled=False leaves a half weight half, and the float32 input then
-        # raises. CPU autocast rejects float32, so there match the weight instead.
+        # float32 autocast promotes the weight too, so a plain bf16 load runs the
+        # GEMM in float32. Promoting the parameters directly would be better
+        # still, but this forward is compiled fullgraph and Dynamo cannot trace a
+        # Parameter being rebuilt. Elsewhere, match the weight so nothing raises.
         device_type = emb_norm.device.type
         if device_type in _FLOAT32_AUTOCAST_DEVICES:
             with torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True):
@@ -1234,7 +1236,8 @@ def patch_Gemma4MultimodalEmbedder_forward():
         else:
             weight = getattr(projection, "weight", None)
             compute_dtype = torch.float32 if weight is None else weight.dtype
-            emb_norm_proj = projection(emb_norm.to(compute_dtype))
+            with torch.autocast(device_type = device_type, enabled = False):
+                emb_norm_proj = projection(emb_norm.to(compute_dtype))
         return emb_norm_proj.to(old_dtype)
     try:
         patch_function(
