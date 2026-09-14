@@ -253,3 +253,39 @@ def test_positional_embeds_are_recognised(wrapper, flex_installed):
     with torch.enable_grad():
         got = wrapper.fn(_config("eager", training = False), _embeds(True))
     assert got == "DENSE_MASK"
+
+
+def test_model_forward_drops_the_mask_only_when_the_flex_forward_is_installed():
+    """zoo's own GptOssModel.forward drops attention_mask during training for the same
+    reason the wrapper skips it, so it has to be gated on the same flag. Read as AST:
+    a bare `if self.training: attention_mask = None` is the defect."""
+    import ast
+    import inspect
+    import textwrap
+
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    source = inspect.getsource(gpt_oss.patch_GptOssModel)
+    tree = ast.parse(textwrap.dedent(source))
+
+    drops = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        assigns_none = any(
+            isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is None
+            and any(getattr(t, "id", None) == "attention_mask" for t in stmt.targets)
+            for stmt in node.body
+        )
+        if assigns_none:
+            drops.append(node)
+
+    assert drops, "expected the training mask drop in patch_GptOssModel"
+    for node in drops:
+        names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+        assert "_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED" in names, (
+            "the model-level mask drop must require the patched attention forward, "
+            f"but its condition is {ast.unparse(node.test)}"
+        )

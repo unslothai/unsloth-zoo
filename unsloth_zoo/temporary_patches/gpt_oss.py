@@ -3012,10 +3012,12 @@ def patch_GptOssModel():
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
             # During training, flex_attention_with_sink creates its own sparse
-            # BlockMask and ignores the attention_mask argument entirely.
-            # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
-            # which causes OOM at long context lengths (e.g. 500K tokens).
-            if self.training:
+            # BlockMask and ignores the attention_mask argument entirely, so dropping
+            # the dense 4D mask avoids an O(seq_len^2) allocation that OOMs at long
+            # context (e.g. 500K tokens). Only that forward ignores it: if the
+            # attention patch did not install, stock attention runs and a dropped mask
+            # would mean no causal masking at all.
+            if self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 attention_mask = None
 
             # Accumulate hidden states if requested
