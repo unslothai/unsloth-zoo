@@ -21,6 +21,29 @@ from packaging import version
 from triton.runtime.autotuner import Autotuner
 
 TRITON_ABOVE_3_5_1 = version.parse(triton.__version__) >= version.parse("3.5.1")
+
+
+def triton_runtime_autotune_key(
+    arg_names: list[str],
+    key_names: list[str],
+    positional_args: tuple[Any, ...],
+    runtime_kwargs: dict[str, Any],
+) -> tuple[Any, ...]:
+    """Build the autotune cache key the same way ``Autotuner.run`` does."""
+    triton_make = getattr(Autotuner, "make_autotune_key", None)
+    if triton_make is not None:
+        return triton_make(arg_names, key_names, positional_args, runtime_kwargs)
+
+    nargs = dict(zip(arg_names, positional_args))
+    all_args = {**nargs, **runtime_kwargs}
+    _args = {k: v for (k, v) in all_args.items() if k in arg_names}
+    key = [_args[name] for name in key_names if name in _args]
+    for _, arg in _args.items():
+        if hasattr(arg, "dtype"):
+            key.append(str(arg.dtype))
+    return tuple(key)
+
+
 TRITON_ABOVE_3_4_0 = version.parse(triton.__version__) >= version.parse("3.4.0")
 
 
@@ -163,14 +186,11 @@ class AutotuneKey:
         positional_args: tuple[Any, ...],
         runtime_kwargs: dict[str, Any],
     ) -> "AutotuneKey":
-        named_args = dict(zip(arg_names, positional_args))
-        all_args = {**named_args, **runtime_kwargs}
-        tracked_args = {k: v for (k, v) in all_args.items() if k in arg_names}
-        tuning_key = [tracked_args[name] for name in key_names if name in tracked_args]
-        for arg in tracked_args.values():
-            if hasattr(arg, "dtype"):
-                tuning_key.append(str(arg.dtype))
-        return cls(autotune_key=tuple(tuning_key))
+        return cls(
+            autotune_key=triton_runtime_autotune_key(
+                arg_names, key_names, positional_args, runtime_kwargs,
+            ),
+        )
 
     def exact_matches(self, entry_key: Any) -> bool:
         return self.serialize(self.autotune_key) == self.serialize(entry_key)
@@ -371,32 +391,22 @@ class CachedAutotuner(Autotuner):
             return True
         return key.autotune_key not in self.cache
 
-    @staticmethod
-    def _runtime_autotune_tuple(
-        arg_names: list[str],
-        key_names: list[str],
-        positional_args: tuple[Any, ...],
-        runtime_kwargs: dict[str, Any],
-    ) -> tuple[Any, ...]:
-        """Triton-compatible autotune key (matches ``Autotuner.run``)."""
-        named_args = dict(zip(arg_names, positional_args))
-        all_args = {**named_args, **runtime_kwargs}
-        tracked = {k: v for k, v in all_args.items() if k in arg_names}
-        tuning_key = [tracked[name] for name in key_names if name in tracked]
-        for arg in tracked.values():
-            if hasattr(arg, "dtype"):
-                tuning_key.append(str(arg.dtype))
-        return tuple(tuning_key)
-
     def _run_with_stored_config(self, config, *args, **kwargs):
-        """Launch ``fn`` with a config already in the autotune cache (no key rebuild)."""
+        """Launch with a pinned config; same hooks as ``Autotuner._bench`` / ``Autotuner.run``."""
         self.nargs = dict(zip(self.arg_names, args))
         self.best_config = config
+        full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
         if config.pre_hook is not None:
-            full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
             config.pre_hook(full_nargs)
+        self.pre_hook(full_nargs)
         try:
-            return self.fn.run(*args, **kwargs, **config.all_kwargs())
+            try:
+                ret = self.fn.run(*args, **kwargs, **config.all_kwargs())
+            except Exception as exc:
+                self.post_hook(full_nargs, exc)
+                raise
+            self.post_hook(full_nargs, None)
+            return ret
         finally:
             self.nargs = None
 
@@ -412,7 +422,7 @@ class CachedAutotuner(Autotuner):
             return self._run_with_stored_config(next(iter(self.cache.values())), *args, **kwargs)
 
         if FLA_CACHE_MODE is not FlaCacheMode.DISABLED:
-            triton_key = self._runtime_autotune_tuple(
+            triton_key = triton_runtime_autotune_key(
                 self.arg_names, self.keys, args, kwargs,
             )
             if FLA_CACHE_MODE is FlaCacheMode.ALWAYS or triton_key not in self.cache:
