@@ -575,6 +575,10 @@ def test_a_critical_package_that_is_simply_absent_does_not_block(monkeypatch):
         importlib.util, "find_spec",
         lambda name, *a, **k: None if name == "vllm" else real_find_spec(name, *a, **k),
     )
+    # sys.modules is consulted before find_spec, and this host really does have vllm
+    # imported, which would be a correct "unpinnable" answer rather than the case here.
+    for name in [k for k in list(sys.modules) if k == "vllm" or k.startswith("vllm.")]:
+        monkeypatch.delitem(sys.modules, name, raising = False)
     assert nd._unpinnable_critical() == []
 
 
@@ -585,3 +589,72 @@ def test_the_import_names_that_differ_from_the_dist_names_are_mapped():
     assert nd._PINNED_IMPORT_NAMES["flash-attn"] == "flash_attn"
     for dist in nd._PINNED_DISTRIBUTIONS:
         assert dist in nd._PINNED_IMPORT_NAMES or "-" not in dist, dist
+
+
+# ------------------------------------------------- our own MLX shims are not installs
+
+def test_the_injected_mlx_stubs_do_not_disable_the_installer(monkeypatch):
+    """unsloth_zoo/__init__.py injects a synthetic `triton` (and `bitsandbytes` when the
+    real one is absent) into sys.modules on an MLX host, plus a meta_path finder. Both
+    sys.modules and find_spec then report them present while they have no metadata, so
+    counting them as unpinnable refused every install across Apple Silicon."""
+    from unsloth_zoo.stubs.triton_stub import inject_into_sys_modules as inject_triton
+    from unsloth_zoo.stubs.bitsandbytes_stub import inject_into_sys_modules as inject_bnb
+
+    saved = {k: v for k, v in sys.modules.items()
+             if k.split(".")[0] in ("triton", "bitsandbytes")}
+    saved_meta_path = list(sys.meta_path)
+    try:
+        for name in list(saved):
+            del sys.modules[name]
+        inject_triton()
+        inject_bnb()
+
+        real_version = importlib.metadata.version
+
+        def _mac_metadata(name):
+            if name in ("triton", "bitsandbytes"):
+                raise importlib.metadata.PackageNotFoundError(name)
+            return real_version(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", _mac_metadata)
+        assert nd._unpinnable_critical() == [], (
+            "the MLX shims were mistaken for unpinnable installs"
+        )
+        assert nd._is_unsloth_stub(sys.modules["triton"]) is True
+        assert nd._is_unsloth_stub(sys.modules["bitsandbytes"]) is True
+    finally:
+        for name in [k for k in sys.modules
+                     if k.split(".")[0] in ("triton", "bitsandbytes")]:
+            del sys.modules[name]
+        sys.modules.update(saved)
+        sys.meta_path[:] = saved_meta_path
+
+
+def test_a_real_install_without_metadata_is_still_refused(monkeypatch):
+    """The stub exemption must not swallow the case the check exists for."""
+    real = types.ModuleType("torch")
+    real.__spec__ = types.SimpleNamespace(name = "torch", loader = object())
+    monkeypatch.setitem(sys.modules, "torch", real)
+
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(
+        importlib.metadata, "version",
+        lambda n: (_ for _ in ()).throw(importlib.metadata.PackageNotFoundError(n))
+        if n == "torch" else real_version(n),
+    )
+    assert nd._is_unsloth_stub(real) is False
+    assert "torch" in nd._unpinnable_critical()
+
+
+def test_an_unwritable_constraints_file_blocks_the_install(monkeypatch):
+    """Without -c the resolver is free to replace the running CUDA torch, which is the
+    one thing this file exists to prevent. A temp dir that is full or read-only must not
+    silently become permission to continue."""
+    monkeypatch.setattr(nd, "_constraints_file", lambda: "")
+    monkeypatch.setattr(nd, "_auto_install_enabled", lambda: True)
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: ran.append(a))
+
+    assert nd._pip_install("timm") is False
+    assert ran == [], "pip ran unconstrained after the constraints file failed"

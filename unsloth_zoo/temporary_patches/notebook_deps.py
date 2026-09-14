@@ -165,6 +165,25 @@ _constraints_path = None
 _constraints_lock = threading.Lock()
 
 
+def _is_unsloth_stub(obj) -> bool:
+    """Whether this module or spec is one of our own MLX shims rather than a real install.
+
+    unsloth_zoo/__init__.py injects a synthetic `triton` (and often `bitsandbytes`) into
+    sys.modules on an MLX host, along with a meta_path finder, so both sys.modules and
+    find_spec report them present while they have no metadata at all. Counting those as
+    unpinnable would refuse every install on Apple Silicon."""
+    for candidate in (obj, getattr(obj, "loader", None)):
+        if candidate is None:
+            continue
+        for attribute in ("__name__", "__module__"):
+            name = getattr(candidate, attribute, "") or ""
+            if name.startswith("unsloth_zoo.stubs"):
+                return True
+        if type(candidate).__module__.startswith("unsloth_zoo.stubs"):
+            return True
+    return False
+
+
 def _unpinnable_critical():
     """Critical distributions that are importable but carry no readable version.
 
@@ -180,12 +199,18 @@ def _unpinnable_critical():
         except Exception:
             pass
         import_name = _PINNED_IMPORT_NAMES.get(dist, dist.replace("-", "_"))
-        try:
-            if importlib.util.find_spec(import_name) is not None:
+        module = sys.modules.get(import_name)
+        if module is not None:
+            if not _is_unsloth_stub(module):
                 unpinnable.append(dist)
+            continue
+        try:
+            spec = importlib.util.find_spec(import_name)
         except Exception:
             # A parent package that refuses to import is not evidence either way.
             continue
+        if spec is not None and not _is_unsloth_stub(spec):
+            unpinnable.append(dist)
     return unpinnable
 
 
@@ -217,6 +242,9 @@ def _constraints_file():
                 handle.write("\n".join(lines) + "\n")
             _constraints_path = handle.name
         except Exception:
+            # "" means we could not build the file. _pip_install refuses on it rather than
+            # falling back to an unconstrained install, which is the very thing this file
+            # exists to prevent.
             _constraints_path = ""
         return _constraints_path
 
@@ -349,6 +377,13 @@ def _pip_install(pkg: str) -> bool:
     # distribution we cannot read a version for is one we cannot pin. Refusing leaves the
     # original ImportError in place, which is the honest outcome: we could not repair this
     # without risking something worse.
+    if not _constraints_file():
+        logger.warning(
+            f"Unsloth: not auto-installing `{pkg}`: the constraints file could not be "
+            f"written, so an install could not be stopped from replacing torch. "
+            f"Install `{pkg}` manually if you need it."
+        )
+        return False
     unpinnable = _unpinnable_critical()
     if unpinnable:
         logger.warning(
