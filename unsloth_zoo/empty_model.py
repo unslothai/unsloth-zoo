@@ -31,6 +31,7 @@ import torch
 import re
 import os
 import functools
+import inspect
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
@@ -894,23 +895,23 @@ def finalize_huggingface_model(
                         f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
                     )
             if hasattr(module, "rotary_pos_emb") and vision_config is not None:
-                # Qwen2.5-VL / Qwen3-VL take a positional dim; Qwen3.5's
-                # Qwen3_5VisionRotaryEmbedding takes the vision config instead. Try the
-                # dim first so the VL models keep the exact call they had, and warn
-                # rather than abort the load on a signature we do not know.
+                # transformers 4 takes a positional dim, transformers 5 takes the vision
+                # config. Dispatch on the signature rather than guessing, since an int
+                # is silently accepted as a config. device= is deprecated in 5.18, so
+                # construct then move, and warn rather than abort on a signature we do
+                # not know.
                 rotary_class = module.rotary_pos_emb.__class__
                 try:
-                    head_dim = vision_config.hidden_size // vision_config.num_heads
-                    module.rotary_pos_emb = rotary_class(head_dim//2).to(target_device)
-                except Exception:
-                    try:
-                        module.rotary_pos_emb = rotary_class(
-                            config = vision_config, device = target_device,
-                        )
-                    except Exception as rotary_reinit_error:
-                        logger.warning(
-                            f"Unsloth: skipped rotary_pos_emb reinit for {module_name}: {rotary_reinit_error}"
-                        )
+                    if "config" in inspect.signature(rotary_class.__init__).parameters:
+                        new_rotary = rotary_class(vision_config)
+                    else:
+                        head_dim = vision_config.hidden_size // vision_config.num_heads
+                        new_rotary = rotary_class(head_dim//2)
+                    module.rotary_pos_emb = new_rotary.to(target_device)
+                except Exception as rotary_reinit_error:
+                    logger.warning(
+                        f"Unsloth: skipped rotary_pos_emb reinit for {module_name}: {rotary_reinit_error}"
+                    )
             if hasattr(module, "rotary_emb_local"):
                 if local_rope_config is None:
                     local_rope_config = deepcopy(text_config)
