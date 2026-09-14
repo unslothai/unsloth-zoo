@@ -15,10 +15,11 @@ shape/dtype-only versions did not:
 import pytest
 import torch
 
-
-@pytest.fixture(scope="module", autouse=True)
-def _apply_patches():
-    import unsloth_zoo.temporary_patches  # noqa: F401  (applies TEMPORARY_PATCHES)
+# Imported at module scope, not from a fixture: applying TEMPORARY_PATCHES
+# installs entries in sys.modules (bitsandbytes.nn among them), and conftest's
+# hygiene guard attributes any sys.modules mutation made during a test to that
+# test. Doing it at collection keeps the guard quiet.
+import unsloth_zoo.temporary_patches  # noqa: F401,E402
 
 
 def _configs(mm_dim=64, text_dim=32):
