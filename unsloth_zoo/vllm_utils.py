@@ -1329,6 +1329,20 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 pass
 
 
+# lm_head is tied to the embeddings, so it may legitimately be absent from either side
+TIED_LM_HEAD_KEYS = frozenset((
+    "lm_head.weight",
+    "model.lm_head.weight",
+    "model.language_model.lm_head.weight",
+    "model.text_model.lm_head.weight",
+))
+TIED_EMBED_KEYS = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "model.text_model.embed_tokens.weight",
+)
+
+
 @torch.inference_mode
 def assert_same_state_dict(old_state_dict, new_state_dict):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1344,7 +1358,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         return value.contiguous()
 
     difference = new_state_dict.keys() ^ old_state_dict.keys()
-    difference -= set(("model.lm_head.weight","model.language_model.lm_head.weight", "lm_head.weight"))
+    difference -= TIED_LM_HEAD_KEYS
     if len(difference) != 0:
         missing_from_hf = new_state_dict.keys() - old_state_dict.keys()
         missing_from_vllm = old_state_dict.keys() - new_state_dict.keys()
@@ -1369,10 +1383,10 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             else:
                 torch.testing.assert_close(old_val, new_val, check_stride = False)
         except Exception as error:
-            if key == "lm_head.weight":
-                # Try tied embeddings fallback
-                key1 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in old_state_dict), None)
-                key2 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in new_state_dict), None)
+            if key in TIED_LM_HEAD_KEYS:
+                # excused above: compare against the embedding it is tied to
+                key1 = next((k for k in (key,) + TIED_EMBED_KEYS if k in old_state_dict), None)
+                key2 = next((k for k in (key,) + TIED_EMBED_KEYS if k in new_state_dict), None)
 
                 if key1 is not None and key2 is not None:
                     try:
@@ -1390,6 +1404,24 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             else:
                 failures[key] = error
         pass
+
+    # The loop above walks old_state_dict, so a new-only tied head met no comparison.
+    for key in sorted(TIED_LM_HEAD_KEYS & (new_state_dict.keys() - old_state_dict.keys())):
+        ref = next((k for k in (key.replace("lm_head", "embed_tokens"),) + TIED_EMBED_KEYS
+                    if k in old_state_dict), None)
+        if ref is None: continue
+        old_val = _normalize_state_dict_tensor(old_state_dict[ref])
+        new_val = _normalize_state_dict_tensor(new_state_dict[key])
+        if old_val is None or new_val is None: continue
+        try:
+            torch.testing.assert_close(
+                old_val.to(torch.float32), new_val.to(torch.float32),
+                check_stride = False, atol = 1e-4, rtol = 1e-3,
+            )
+        except Exception as error:
+            failures[key] = error
+    pass
+
     if len(failures) > 0:
         error_message = "\n".join([f"[{key}]\n{str(error)}" for key, error in failures.items()])
         raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(failures)}: {error_message}")
