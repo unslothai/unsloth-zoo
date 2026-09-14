@@ -34,8 +34,7 @@ from unsloth_zoo.compiler import (
     get_mask_functions,
 )
 
-# Every model whose modeling file defines a module-level mask builder. gemma4 /
-# gemma4_unified do not exist on older transformers, so each is probed, not required.
+# Probed, not required: gemma4* are absent on older transformers.
 _VISION_MASK_MODELS = ("gemma3", "gemma4", "gemma4_unified")
 
 
@@ -147,8 +146,7 @@ def test_a_mask_builder_really_is_uncapturable_fullgraph():
 
     length = 16
     inputs_embeds = torch.zeros(1, length, config.hidden_size)
-    # A padded row is the point: `fast_all` is False, so `flex_attention_mask` takes
-    # the branch that cannot be captured.
+    # A padded row is the point: it makes `fast_all` False, taking the uncapturable branch.
     attention_mask = torch.ones(1, length, dtype=torch.long)
     attention_mask[:, -4:] = 0
     position_ids = torch.arange(length).unsqueeze(0)
@@ -165,19 +163,15 @@ def test_a_mask_builder_really_is_uncapturable_fullgraph():
         block_sequence_ids=block_sequence_ids,
     )
 
-    # The flex mask builder compiles `create_block_mask` internally, so on a runner
-    # with no triton (Windows and macOS images ship none) even this eager reference
-    # raises out of inductor. That says nothing about the rule, so skip rather than
-    # fail; the classification tests above still run everywhere.
+    # Flex compiles `create_block_mask` internally, so a runner without triton dies
+    # here. That is the runner, not the rule: skip.
     try:
         eager = builder(**kwargs)
     except Exception as exception:
         pytest.skip(f"platform cannot build a flex block mask: {type(exception).__name__}")
     assert set(eager) == {"full_attention", "sliding_attention"}
 
-    # backend = "eager" on purpose: data-dependent branching is a Dynamo TRACING
-    # failure, raised before any backend runs, so this reproduces the production
-    # error without needing inductor or triton on the runner.
+    # backend="eager": the break is a Dynamo tracing failure, so no inductor needed.
     torch._dynamo.reset()
     try:
         torch.compile(builder, fullgraph=True, dynamic=True, backend="eager")(**kwargs)
@@ -236,8 +230,7 @@ def test_disable_compile_functions_outranks_the_mask_rule():
     bare'. Nothing on the list builds masks today, which is why this needs pinning."""
     source = inspect.getsource(compiler_module)
 
-    # Loop B: the mask rule is skipped for a listed name, so the branch below that
-    # emits @torch.compiler.disable is still reached.
+    # Loop B: skipped for a listed name, so the disable branch below is still reached.
     assert "if not bad and module not in disable_compile_functions:" in source, (
         "the copy loop applies the mask rule to names in DISABLE_COMPILE_FUNCTIONS, "
         "so such a function is emitted bare instead of with "
