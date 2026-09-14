@@ -152,6 +152,20 @@ def _install_is_idle() -> bool:
 # held across a subprocess.
 _install_lock = threading.Lock()
 
+# Backends we installed mid-process. Once one is installed `requires_backends` starts
+# SUCCEEDING, so every later call short-circuits past the repair path and its checks.
+# These two sets are what survives that, and they are deliberately never cleared: only a
+# restart can actually fix either condition.
+#
+# _installed_backends distinguishes "this object was already a placeholder before we did
+# anything", which is upstream's business, from "our install is why the check now passes
+# while the object is still frozen", which is ours to report.
+_installed_backends: set = set()
+# Backends whose guarded imports could not be replayed into already-imported modules.
+# Those modules still have the guarded names unbound, so letting a later call through
+# hands the consumer the bare NameError this whole path exists to prevent.
+_replay_failed: set = set()
+
 # Distributions whose REPLACEMENT would corrupt the running process: compiled
 # extensions already loaded by torch, and torch itself. Nothing in _ALLOW_LIST is
 # one of these, but pip resolves the whole transitive closure, so an allowed
@@ -805,8 +819,17 @@ def patch_requires_backends_autoinstall():
     _orig = current
 
     def requires_backends(obj, backends):
+        _names = [b for b in (backends if isinstance(backends, (list, tuple)) else [backends])
+                  if isinstance(b, str)]
+        _stuck = [b for b in _names if b in _replay_failed]
+        if _stuck:
+            raise ImportError(
+                f"Unsloth: `{'`, `'.join(_stuck)}` is installed, but its guarded imports "
+                f"could not be replayed into transformers modules that were already "
+                f"imported without it. Please restart the runtime/kernel."
+            )
         try:
-            return _orig(obj, backends)
+            _result = _orig(obj, backends)
         except ImportError as original:
             if not _auto_install_enabled() or _no_network():
                 raise
@@ -822,10 +845,14 @@ def patch_requires_backends_autoinstall():
             installed = [b for b in wanted if _try_install_and_import(b)]
             if not installed:
                 raise
+            _installed_backends.update(installed)
             for b in installed:
                 _refresh_backend_availability(iu, b)
                 # On replay failure the consumer is still unbound; the original error names the package.
                 if not _replay_skipped_guarded_imports(iu, b):
+                    # Remembered, or the next call sails past _orig and hands the consumer
+                    # a module whose guarded name was never bound.
+                    _replay_failed.add(b)
                     raise
             try:
                 # A dummy can want backends this allow list does not carry, as
@@ -842,6 +869,17 @@ def patch_requires_backends_autoinstall():
                     f"first imported without it. Please restart the runtime/kernel."
                 ) from None
             return result
+        # _orig succeeding does not mean this object is usable. Once we have installed the
+        # backend, a placeholder transformers froze at first import passes the check just
+        # as happily, and running its body returns None. Gated on us having installed the
+        # backend: a dummy that predates anything we did would have raised above.
+        if _is_dummy_export(obj) and any(b in _installed_backends for b in _names):
+            raise ImportError(
+                f"Unsloth: `{'`, `'.join(b for b in _names if b in _installed_backends)}` "
+                f"is installed, but transformers bound this object to a placeholder when "
+                f"it was first imported without it. Please restart the runtime/kernel."
+            )
+        return _result
 
     requires_backends._unsloth_patched = True
     requires_backends._unsloth_original = _orig

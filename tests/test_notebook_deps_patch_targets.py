@@ -784,3 +784,85 @@ def test_an_importable_package_is_reported_without_reinstalling(monkeypatch):
 
     assert notebook_deps._try_install_and_import("timm") is True
     assert installs == []
+
+
+# ------------------------------------------- state that must survive a second call
+#
+# Once a backend is installed the ORIGINAL requires_backends stops raising, so every
+# later call short-circuits past the repair path. Two conditions that only a restart can
+# clear have to survive that, or the second run of the same notebook cell silently does
+# the wrong thing.
+
+@pytest.fixture
+def clean_restart_state(monkeypatch):
+    monkeypatch.setattr(notebook_deps, "_installed_backends", set())
+    monkeypatch.setattr(notebook_deps, "_replay_failed", set())
+
+
+def test_a_frozen_dummy_is_still_rejected_on_the_second_call(
+    fake_transformers, clean_restart_state, monkeypatch
+):
+    """First call installs timm and reports "restart". Second call finds timm available,
+    returns straight out of the original, and used to run the frozen placeholder body and
+    hand back None: the silent failure this guard exists to prevent."""
+    notebook_deps.patch_requires_backends_autoinstall()
+    monkeypatch.setattr(notebook_deps, "_installed_backends", {_BACKEND})
+    monkeypatch.setattr(notebook_deps, "_is_dummy_export", lambda obj: True)
+    # The install already happened, so the backend now reads as present.
+    fake_transformers_state["available"] = {_BACKEND: True}
+
+    patched = sys.modules["transformers.utils.import_utils"].requires_backends
+    with pytest.raises(ImportError, match = "restart"):
+        patched(object(), [_BACKEND])
+
+
+def test_a_real_object_still_works_after_an_install(
+    fake_transformers, clean_restart_state, monkeypatch
+):
+    """The gate must not reject everything for that backend: a class imported after the
+    install is genuine and must pass."""
+    notebook_deps.patch_requires_backends_autoinstall()
+    monkeypatch.setattr(notebook_deps, "_installed_backends", {_BACKEND})
+    monkeypatch.setattr(notebook_deps, "_is_dummy_export", lambda obj: False)
+    fake_transformers_state["available"] = {_BACKEND: True}
+
+    patched = sys.modules["transformers.utils.import_utils"].requires_backends
+    assert patched(object(), [_BACKEND]) is None
+
+
+def test_a_dummy_we_never_installed_for_is_left_alone(
+    fake_transformers, clean_restart_state, monkeypatch
+):
+    """A placeholder predating anything we did is upstream's business."""
+    notebook_deps.patch_requires_backends_autoinstall()
+    monkeypatch.setattr(notebook_deps, "_is_dummy_export", lambda obj: True)
+    fake_transformers_state["available"] = {_BACKEND: True}
+
+    patched = sys.modules["transformers.utils.import_utils"].requires_backends
+    assert patched(object(), [_BACKEND]) is None
+
+
+def test_a_failed_replay_keeps_failing_until_restart(
+    fake_transformers, clean_restart_state, monkeypatch
+):
+    """The availability refresh leaves the backend marked present, so the next call used to
+    return cleanly and let the consumer run with the guarded names still unbound, which is
+    the bare NameError this path was added to avoid."""
+    notebook_deps.patch_requires_backends_autoinstall()
+    monkeypatch.setattr(notebook_deps, "_replay_failed", {_BACKEND})
+    fake_transformers_state["available"] = {_BACKEND: True}
+
+    patched = sys.modules["transformers.utils.import_utils"].requires_backends
+    with pytest.raises(ImportError, match = "replayed"):
+        patched(object(), [_BACKEND])
+
+
+def test_an_unrelated_backend_is_unaffected_by_a_failed_replay(
+    fake_transformers, clean_restart_state, monkeypatch
+):
+    notebook_deps.patch_requires_backends_autoinstall()
+    monkeypatch.setattr(notebook_deps, "_replay_failed", {_BACKEND})
+    fake_transformers_state["available"] = {"einops": True}
+
+    patched = sys.modules["transformers.utils.import_utils"].requires_backends
+    assert patched(object(), ["einops"]) is None
