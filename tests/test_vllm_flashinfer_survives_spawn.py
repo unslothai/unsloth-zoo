@@ -31,6 +31,7 @@ synthetic module rather than the real flashinfer, so they run anywhere.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import multiprocessing as mp
 import contextlib
@@ -104,14 +105,14 @@ def test_sys_modules_block_is_inherited_only_by_fork(tmp_path, monkeypatch, meth
 # ------------------------------------------------- the durable channel
 
 def test_engine_arg_is_set_only_when_flashinfer_was_rejected():
-    """An explicit backend is a HARD PIN: vLLM raises on an unsupported value
-    instead of falling through. Setting it unconditionally would break hosts
-    where FlashInfer works, and ROCm, which never reaches the blocker."""
+    """An explicit backend is a HARD PIN: vLLM raises on an unsupported value instead of
+    falling through. Setting one unconditionally would break hosts where FlashInfer works,
+    and ROCm, which never reaches the blocker."""
     source = inspect.getsource(vllm_utils.load_vllm)
-    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable()" in source
-    guard = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable()")
-    assign = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
-    assert guard < assign, "the assignment is not behind the guard"
+    guard = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:")
+    for backend in ('"FLASH_ATTN"', '"TRITON_MLA"'):
+        assign = source.index('engine_args["attention_backend"] = %s' % backend)
+        assert guard < assign, "%s is not behind the pre-flight verdict" % backend
 
 
 def test_engine_arg_is_set_before_the_signature_filter():
@@ -216,10 +217,11 @@ def test_an_unknown_device_does_not_get_a_hard_pin(monkeypatch):
 
 
 def test_the_engine_arg_is_gated_on_the_capability_check():
-    """Both conditions, not just the pre-flight verdict. The MLA arm is asserted
-    separately below; this one pins the device check."""
+    """The non-MLA pin still needs the device check: FLASH_ATTN requires sm_80+."""
     source = inspect.getsource(vllm_utils.load_vllm)
-    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable()" in source
+    assign = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
+    guard = source.rindex("elif ", 0, assign)
+    assert "_flash_attn_is_selectable()" in source[guard:assign]
 
 
 def test_installed_vllm_still_requires_sm80_for_flash_attn():
@@ -334,8 +336,45 @@ def test_an_unreadable_config_is_assumed_to_be_mla(monkeypatch):
 
 
 def test_the_pin_is_gated_on_both_the_device_and_the_config():
+    """Device capability alone is not enough: an MLA model on an sm_80+ host must not get
+    the non-MLA FLASH_ATTN."""
     source = inspect.getsource(vllm_utils.load_vllm)
-    marker = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
-    guard = source[source.rindex("if ", 0, marker):marker]
-    assert "_flash_attn_is_selectable()" in guard
-    assert "_config_uses_mla(config)" in guard, "the MLA check is not on the pin's guard"
+    assign = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
+    window = source[source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:"):assign]
+    assert "_config_uses_mla(config)" in window, "the MLA check does not gate the pin"
+    assert "_flash_attn_is_selectable()" in window
+
+
+def test_an_mla_model_gets_an_mla_backend_not_nothing(monkeypatch):
+    """The engine arg is the only exclusion that survives into a spawned EngineCore, so
+    dropping it for MLA would let the worker re-probe FlashInfer and pick FLASHINFER_MLA,
+    reintroducing the missing-nvcc failure this change exists to avoid."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    marker = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:")
+    window = source[marker:marker + 500]
+    assert '"TRITON_MLA"' in window, "MLA models are left with no durable exclusion"
+    assert '"FLASH_ATTN"' in window
+    assert window.index("_config_uses_mla(config)") < window.index('"TRITON_MLA"')
+
+
+def test_triton_mla_is_a_real_backend_with_no_nvcc_requirement():
+    """Pin the premise against the installed vLLM rather than trusting it. TRITON_MLA is
+    chosen because it is pure Triton and accepts every compute capability, which makes it
+    the fallback vLLM would reach anyway once the FlashInfer MLA backends are excluded."""
+    import pathlib
+    spec = importlib.util.find_spec("vllm")
+    if spec is None or not spec.origin:
+        pytest.skip("vLLM not installed")
+    root = pathlib.Path(spec.origin).parent
+    registry = root / "v1" / "attention" / "backends" / "registry.py"
+    if not registry.is_file():
+        pytest.skip("backend registry not at the expected path")
+    assert "TRITON_MLA" in registry.read_text(), "TRITON_MLA is not a known backend name"
+
+    triton_mla = root / "v1" / "attention" / "backends" / "mla" / "triton_mla.py"
+    if triton_mla.is_file():
+        text = triton_mla.read_text()
+        capability = text.index("def supports_compute_capability")
+        assert "return True" in text[capability:capability + 200], (
+            "TRITON_MLA now restricts compute capability, so the pin needs re-checking"
+        )

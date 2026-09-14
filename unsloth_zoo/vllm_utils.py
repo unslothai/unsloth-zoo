@@ -3218,9 +3218,20 @@ def load_vllm(
         # it is not an XPU backend at all. Restrict the pin to CUDA sm_80+, which covers
         # the Blackwell case this exists for; everywhere else the sys.modules block still
         # applies and vLLM picks its own compatible fallback.
-        if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable() \
-                and not _config_uses_mla(config):
-            engine_args["attention_backend"] = "FLASH_ATTN"
+        # The engine arg is the only exclusion that survives into a spawned EngineCore:
+        # the sys.modules block is not inherited under spawn, so a worker with no explicit
+        # backend re-probes the installed package and can pick a FlashInfer one again.
+        # Dropping the arg for MLA would therefore reintroduce the original failure, so
+        # MLA gets an MLA backend rather than nothing. TRITON_MLA is the right choice:
+        # it is pure Triton, needs no nvcc/ninja/libcuda, its
+        # supports_compute_capability() returns True unconditionally, and it is the last
+        # entry in the MLA priority list, which is exactly what vLLM would fall back to
+        # once the FlashInfer-backed ones are excluded.
+        if _UNSLOTH_FLASHINFER_UNUSABLE:
+            if _config_uses_mla(config):
+                engine_args["attention_backend"] = "TRITON_MLA"
+            elif _flash_attn_is_selectable():
+                engine_args["attention_backend"] = "FLASH_ATTN"
 
         # Older vLLM has no such arg; the filter below drops unknown keys, so this is a
         # no-op there rather than a TypeError.
