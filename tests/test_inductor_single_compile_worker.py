@@ -3,24 +3,13 @@
 
 """The single compile worker forcing survives patch_torch_compile and the options dict.
 
-``unsloth/_gpu_init.py`` fingerprints the cgroup pinned GPU case
-(``docker --gpus '"device=N"'``) and sets both ``TORCHINDUCTOR_COMPILE_THREADS=1``
-and the ``UNSLOTH_FORCE_SINGLE_COMPILE_WORKER=1`` sentinel. It has to, because
-Inductor's compile worker subprocesses cannot enumerate a GPU that the cgroup
-pinned, and raise from ``torch/_inductor/runtime/triton_helpers.py``:
+``unsloth/_gpu_init.py`` sets TORCHINDUCTOR_COMPILE_THREADS=1 plus the
+UNSLOTH_FORCE_SINGLE_COMPILE_WORKER sentinel on a cgroup pinned GPU, because Inductor's
+compile workers cannot enumerate one and raise "Could not find an active GPU backend".
+Two consumers here used to undo that: patch_torch_compile popped the variable, and
+determine_compile_threads returned the cpu count into the options dict, which outranks it.
 
-    RuntimeError: Could not find an active GPU backend
-
-Two consumers in this repo used to undo that:
-
-1. ``patch_torch_compile``'s non debug branch unconditionally popped
-   ``TORCHINDUCTOR_COMPILE_THREADS``, letting the worker pool respawn.
-2. ``determine_compile_threads`` returned the cpu count, and
-   ``get_torch_compile_options`` puts that into the Inductor options dict,
-   which takes precedence over the env var.
-
-Both tests here are CPU only. They set and clear the env vars themselves so
-they are valid on a bare metal host, which is the case that must stay unchanged.
+CPU only; the tests set and clear both variables themselves.
 """
 
 from __future__ import annotations
@@ -60,8 +49,6 @@ def test_pop_is_skipped_when_single_worker_is_forced(monkeypatch):
 
 
 def test_pop_still_happens_without_the_sentinel(monkeypatch):
-    """The control. Nothing on a bare metal host sets the sentinel, so the
-    pre-existing cleanup must be untouched there."""
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "8")
     _run_patch_torch_compile()
     assert "TORCHINDUCTOR_COMPILE_THREADS" not in os.environ
@@ -69,8 +56,7 @@ def test_pop_still_happens_without_the_sentinel(monkeypatch):
 
 @pytest.mark.parametrize("sentinel", ["0", "", "auto", "true"])
 def test_only_the_exact_sentinel_value_keeps_the_variable(monkeypatch, sentinel):
-    """``_gpu_init`` writes the literal "1". Anything else, including the "auto"
-    default of the opt out knob, must not be read as forcing."""
+    """"auto" is the opt-out knob's own default, so it must not read as forcing."""
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "1")
     monkeypatch.setenv("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", sentinel)
     _run_patch_torch_compile()
@@ -84,8 +70,6 @@ def test_determine_compile_threads_honours_the_sentinel(monkeypatch):
 
 
 def test_determine_compile_threads_unchanged_when_unset(monkeypatch):
-    """The control for the options dict half. Without the env var the auto
-    detection from https://github.com/unslothai/unsloth-zoo/pull/187 stands."""
     import sys
     threads = determine_compile_threads()
     if sys.platform == "win32":
@@ -95,8 +79,7 @@ def test_determine_compile_threads_unchanged_when_unset(monkeypatch):
 
 
 def test_determine_compile_threads_ignores_other_values(monkeypatch):
-    """A user asking for 4 workers gets the auto detected value, not 4. That is
-    pre-existing behaviour and this change must not widen it."""
+    """A request for 4 still gets the auto detected value; do not widen that."""
     import sys
     monkeypatch.setenv("TORCHINDUCTOR_COMPILE_THREADS", "4")
     threads = determine_compile_threads()
@@ -129,9 +112,7 @@ def test_the_env_var_alone_does_not_force_a_single_worker(monkeypatch):
 
 
 def test_vllm_really_does_set_the_variable_unconditionally():
-    """The premise of the test above, pinned against the installed vLLM rather
-    than taken on trust. If upstream ever stops doing this the gate is still
-    correct, so this is informational and skips when vLLM is absent."""
+    """Pin the premise against the installed vLLM rather than trusting it."""
     import importlib.util, pathlib
     spec = importlib.util.find_spec("vllm")
     if spec is None or not spec.origin:
