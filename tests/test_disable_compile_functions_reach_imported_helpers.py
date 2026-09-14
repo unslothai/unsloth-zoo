@@ -64,10 +64,12 @@ def test_bare_calls_are_detected_and_attribute_calls_are_not():
 def test_every_fullgraph_emit_site_consults_the_detector():
     """Miss one emit site and an imported helper is inlined into a fullgraph region again."""
     source = inspect.getsource(compiler_module)
-    assert source.count("calls_disable_compile_function(") == 4, (
-        "expected one definition plus three call sites (module scan + the two "
-        "generated-source emit sites); a fullgraph = True emit no longer "
-        "consults DISABLE_COMPILE_FUNCTIONS membership of the CALLEE."
+    assert source.count("calls_disable_compile_function(") == 5, (
+        "expected one definition plus four call sites (module scan, the two "
+        "generated-source emit sites, and calls_mask_creation_function, which "
+        "reuses the same detector for transformers.masking_utils factories); a "
+        "fullgraph = True emit no longer consults DISABLE_COMPILE_FUNCTIONS "
+        "membership of the CALLEE."
     )
 
 

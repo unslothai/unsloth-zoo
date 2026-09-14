@@ -135,7 +135,9 @@ DISABLED_KEYWORDS = [
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
     "causal_mask[start:end, start:end] = 0",  # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING",  # Gemma3 create_masks_for_generate
-    "create_causal_mask(**mask_kwargs)",  # Gemma3 create_masks_for_generate
+    # No `create_causal_mask(**mask_kwargs)` literal here: transformers added a kwarg
+    # inside those parens and Gemma3 silently started compiling. Use
+    # `calls_mask_creation_function`, which matches the call at any arity.
     "create_causal_mask_mapping",        # Gemma3 5.x (raises ValueError, can't be compiled)
     "return inner_mask",  # Gemma3 token_type_ids_mask_function returns closure, can't trace generator
     "compute_mup_vector",  # used in falcon h1 init and not needed to compile + inductor complains
@@ -185,6 +187,17 @@ def calls_disable_compile_function(source, disable_compile_functions):
         for name in disable_compile_functions
         if re.search(r"[^\w.]" + re.escape(name) + r"[\s]{0,}\(", source)
     )
+
+
+def calls_mask_creation_function(source):
+    """`transformers.masking_utils` `create*` factories that `source` CALLS.
+
+    Mask builders branch on tensor VALUES (`flex_attention_mask` does `if not
+    fast_all(attention_mask)`), so fullgraph = True cannot capture a caller; they
+    are emitted uncompiled. Matched by call rather than by source substring: the
+    literal this replaced stopped matching the moment transformers added a kwarg.
+    Names come from the installed transformers, so no version gate is needed."""
+    return calls_disable_compile_function(source, get_mask_functions())
 
 
 # Re-exported from .model_lists so callers can keep using
@@ -5962,10 +5975,16 @@ def unsloth_compile_transformers(
                 parameters = sig + ":\n" + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
+            _mask_builders = calls_mask_creation_function(parameters)
             if module in disable_compile_functions:
                 parameters = (
                     "@torch.compiler.disable(recursive = False)\n"
                     + parameters
+                )
+            elif len(_mask_builders) != 0:
+                print(
+                    f"Unsloth: Cannot compile function {module} since it builds "
+                    f"attention masks via {', '.join(_mask_builders)}."
                 )
             elif not disable:
                 _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
@@ -6015,10 +6034,23 @@ def unsloth_compile_transformers(
 
             # Check erroring out
             bad = False
+            bad_reason = ""
             for keyword in DISABLED_KEYWORDS:
                 if keyword in source:
                     bad = True
+                    bad_reason = "disabled keyword is in it"
                     break
+            pass
+            # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
+            # also stops Dynamo inlining it into a compiled caller, so downgrading it
+            # to "emit bare" would be weaker. Nothing on that list builds masks today.
+            if not bad and module not in disable_compile_functions:
+                mask_builders = calls_mask_creation_function(source)
+                if len(mask_builders) != 0:
+                    bad = True
+                    bad_reason = (
+                        f"it builds attention masks via {', '.join(mask_builders)}"
+                    )
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented
@@ -6042,7 +6074,7 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
-                    f"Unsloth: Cannot compile function {module} since disabled keyword is in it."
+                    f"Unsloth: Cannot compile function {module} since {bad_reason}."
                 )
             # Skip mask creation functions
             bad = False
