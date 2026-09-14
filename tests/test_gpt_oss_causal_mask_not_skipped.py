@@ -38,6 +38,15 @@ import types
 import pytest
 import torch
 
+# Installing the patch pulls transformers' lazy quantization imports (bitsandbytes.nn
+# among them) into sys.modules. On a runner where they are not already loaded, conftest
+# blames the first test that touched them, so warm them at collection time instead.
+for _warm in ("transformers.models.gpt_oss.modeling_gpt_oss", "bitsandbytes.nn"):
+    try:
+        __import__(_warm)
+    except Exception:
+        pass
+
 
 @pytest.fixture
 def wrapper(monkeypatch):
