@@ -25,6 +25,8 @@ import os
 import shutil
 import site
 import subprocess
+import tempfile
+import threading
 import sys
 
 # Absolute on purpose: `from ..log` makes transformers' custom_object_save write
@@ -81,6 +83,57 @@ def _no_network() -> bool:
         or _env_is_true("HF_DATASETS_OFFLINE")
     )
 _attempted: set = set()
+# Guards the check-then-act on _attempted. Two threads hitting the same missing
+# backend could otherwise both pass the membership test and launch two pip
+# processes against one prefix, which is a known way to leave a half-unpacked
+# dist-info behind.
+_attempt_lock = threading.Lock()
+
+# Distributions whose REPLACEMENT would corrupt the running process: compiled
+# extensions already loaded by torch, and torch itself. Nothing in _ALLOW_LIST is
+# one of these, but pip resolves the whole transitive closure, so an allowed
+# package can still drag one in. `timm` is the worked example: it requires
+# torchvision, and torchvision pins an exact torch, so an unconstrained
+# `pip install timm` can uninstall a CUDA torch mid-session.
+_PINNED_DISTRIBUTIONS = (
+    "torch", "torchvision", "torchaudio", "triton",
+    "numpy", "pillow", "transformers",
+    "bitsandbytes", "xformers", "flash-attn", "vllm",
+)
+_constraints_path = None
+_constraints_lock = threading.Lock()
+
+
+def _constraints_file():
+    """A pip constraints file pinning the critical distributions that are ALREADY
+    installed to their exact current versions.
+
+    Constraints only bind packages the resolver actually touches, so this does not
+    force anything to be installed. It means an install that would have replaced
+    torch now fails and leaves the session intact, and the caller re-raises the
+    original ImportError, which is the honest outcome: we could not repair this
+    without breaking something else."""
+    global _constraints_path
+    with _constraints_lock:
+        if _constraints_path is not None:
+            return _constraints_path
+        lines = []
+        for dist in _PINNED_DISTRIBUTIONS:
+            try:
+                lines.append(f"{dist}=={importlib.metadata.version(dist)}")
+            except Exception:
+                # Not installed, so there is nothing to protect.
+                continue
+        try:
+            handle = tempfile.NamedTemporaryFile(
+                mode = "w", suffix = ".txt", prefix = "unsloth-pins-", delete = False,
+            )
+            with handle:
+                handle.write("\n".join(lines) + "\n")
+            _constraints_path = handle.name
+        except Exception:
+            _constraints_path = ""
+        return _constraints_path
 
 
 def _is_running_prefix(root: str) -> bool:
@@ -106,14 +159,22 @@ def _in_venv() -> bool:
 
 def _uv_command(pkg: str) -> list:
     # `--python` is required: uv otherwise targets VIRTUAL_ENV/CONDA_PREFIX/a .venv.
-    return ["uv", "pip", "install", "--quiet", "--python", sys.executable, pkg]
+    cmd = ["uv", "pip", "install", "--quiet", "--python", sys.executable]
+    constraints = _constraints_file()
+    if constraints:
+        cmd += ["-c", constraints]
+    return cmd + [pkg]
 
 
 def _pip_command(pkg: str) -> list:
     cmd = [
         sys.executable, "-m", "pip", "install", "--quiet",
-        "--disable-pip-version-check", "--no-input", pkg,
+        "--disable-pip-version-check", "--no-input",
     ]
+    constraints = _constraints_file()
+    if constraints:
+        cmd += ["-c", constraints]
+    cmd.append(pkg)
     if not _in_venv() and hasattr(os, "geteuid") and os.geteuid() != 0:
         try:
             sp = site.getsitepackages()[0]
@@ -150,6 +211,15 @@ def _run_install(pkg: str, cmd: list) -> tuple:
     )
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        # Distinct from a launch failure: an air-gapped host with no offline flag
+        # set burns the full timeout on pip's own connection retries.
+        logger.warning(
+            f"Unsloth: auto-install of `{pkg}` timed out after 300s. If this machine "
+            f"has no network, set UNSLOTH_AUTO_INSTALL=0 or one of UNSLOTH_OFFLINE / "
+            f"HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE to skip this immediately."
+        )
+        return False, False
     except Exception as e:
         logger.warning(f"Unsloth: auto-install of `{pkg}` failed to launch: {e}")
         return False, False
@@ -176,9 +246,15 @@ def _run_install(pkg: str, cmd: list) -> tuple:
 
 
 def _pip_install(pkg: str) -> bool:
-    if pkg in _attempted:
+    # Re-checked here and not only in _try_install_and_import: this is the last
+    # point before a package name reaches a command line, and the name can come
+    # from a downloaded trust_remote_code modeling file.
+    if pkg not in _ALLOW_LIST:
         return False
-    _attempted.add(pkg)
+    with _attempt_lock:
+        if pkg in _attempted:
+            return False
+        _attempted.add(pkg)
     if shutil.which("uv") and _in_venv():
         ok, retry_with_pip = _run_install(pkg, _uv_command(pkg))
         if ok:
@@ -379,19 +455,19 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
         name = getattr(module, "__name__", "")
         if name != "transformers" and not name.startswith("transformers."):
             continue
-        path = getattr(module, "__file__", None)
-        if not path or not path.endswith(".py"):
-            continue
-        try:
-            with open(path, encoding = "utf-8") as handle:
-                source = handle.read()
-        except OSError:
+        source = _module_source(module)
+        if source is None:
             continue
         if guard not in source and import_name not in source:
             continue
         try:
             tree = ast.parse(source)
         except SyntaxError:
+            # We CAN see the source and it does mention this backend, so this
+            # module plausibly holds the guarded import we need to replay. A
+            # silent skip here is what produced the bare NameError the replay
+            # exists to prevent, so report it instead.
+            ok = _uninspectable(module, "its source could not be parsed")
             continue
         for statement in _skipped_import_statements(tree, guard, import_name):
             if any(alias.name == "*" for alias in statement.names):
@@ -412,6 +488,47 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
         if not _rerun_for_guarded_state(module, tree, guard, backend):
             ok = False
     return ok
+
+
+def _module_source(module):
+    """Source for a loaded module, or None if it genuinely has none.
+
+    Asks the module's own loader first. That is what makes a zipimported or
+    otherwise non-plain-file transformers readable: reading `__file__` directly
+    only ever worked for a loose `.py` on disk, and every other layout was
+    skipped silently, which is indistinguishable from a successful replay and
+    ends in the bare NameError this module exists to prevent."""
+    loader = getattr(module, "__loader__", None)
+    get_source = getattr(loader, "get_source", None)
+    if get_source is not None:
+        try:
+            source = get_source(getattr(module, "__name__", ""))
+            if source is not None:
+                return source
+        except Exception:
+            pass
+    path = getattr(module, "__file__", None)
+    if not path or not path.endswith(".py"):
+        return None
+    try:
+        with open(path, encoding = "utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _uninspectable(module, why) -> bool:
+    """Report a module we could not replay into, and return False for `ok`.
+
+    A skip used to be indistinguishable from a success, so the caller carried on
+    into a module whose guarded name was never bound and the user got the bare
+    NameError this replay exists to prevent. Saying so is better: the caller
+    re-raises the original ImportError, which at least names the package."""
+    logger.warning(
+        f"Unsloth: installed the package, but could not restore "
+        f"`{module.__name__}` because {why}. Please restart the runtime or kernel."
+    )
+    return False
 
 
 def _rerun_for_guarded_state(module, tree, guard, backend) -> bool:
@@ -490,6 +607,10 @@ def patch_requires_backends_autoinstall():
             if not wanted:
                 raise
             # Only genuinely importable backends: on 4.x the refresh flips `_<backend>_available` blindly.
+            # Deliberately NOT short-circuited on the first failure. A backend
+            # that did install must still have its availability refreshed, or a
+            # later retry sees a stale flag. `_attempted` already bounds this to
+            # one attempt per package per process, and a timeout now says so.
             installed = [b for b in wanted if _try_install_and_import(b)]
             if not installed:
                 raise
@@ -591,10 +712,29 @@ def patch_notebook_deps_autoinstall():
     _ensure_notebook_chain()
 
 
-TEMPORARY_PATCHES.append(patch_notebook_deps_autoinstall)
+def _patch_notebook_deps_autoinstall_safe():
+    """The TEMPORARY_PATCHES entry, which must never raise.
+
+    unsloth/models/_utils.py runs the patch list with `except (ValueError,
+    TypeError)`, and that handler RE-INVOKES the patch rather than skipping it.
+    So anything else we raise propagates out of a module-level call and aborts
+    `import unsloth` outright, and every patch registered after us is skipped.
+    That is a real hazard for a user who upgrades unsloth_zoo without upgrading
+    unsloth, since there is no version pin between them. A dependency installer
+    is never worth breaking the import over."""
+    try:
+        patch_notebook_deps_autoinstall()
+    except Exception as exception:
+        logger.warning(
+            f"Unsloth: notebook dependency hooks unavailable "
+            f"({type(exception).__name__}: {exception}). Continuing without them."
+        )
+
+
+TEMPORARY_PATCHES.append(_patch_notebook_deps_autoinstall_safe)
 
 # Also run at import: a trust_remote_code modeling file can load before the TEMPORARY_PATCHES pass.
-if os.environ.get("UNSLOTH_NOTEBOOK_DEPS_NO_AUTORUN", "0") != "1":
+if not _env_is_true("UNSLOTH_NOTEBOOK_DEPS_NO_AUTORUN"):
     try:
         patch_notebook_deps_autoinstall()
     except Exception as _e:

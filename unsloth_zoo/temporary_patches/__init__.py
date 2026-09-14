@@ -16,7 +16,6 @@
 
 
 from .common import *
-from .notebook_deps import *
 from .fla_vendor import *
 from .gemma import *
 from .misc import *
@@ -47,6 +46,10 @@ from .moe_utils_bnb4bit import *
 from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
 from .flex_attention_bwd import *
+# Registered LAST on purpose. This one can shell out to pip, and unsloth's
+# patch loop aborts `import unsloth` on any exception it does not expect,
+# skipping every patch behind it. Last position means nothing is behind it.
+from .notebook_deps import *
 # The eager-fallback recovery hook unsloth calls when a backward dies inside
 # activation checkpointing. Named rather than star-imported: `utils` also
 # exports names this package has never re-exported.
