@@ -260,12 +260,13 @@ def test_delete_vllm_hands_flashinfer_back(monkeypatch):
 
 
 def test_the_unblock_is_the_first_thing_delete_vllm_does():
-    """Ordering is the whole point: the teardown below it can raise."""
+    """Ordering is the whole point: the distributed teardown below it can raise, and the
+    caller who asked for the engine to be deleted should not be left with a hidden module
+    either way. Ownership bookkeeping comes first, but nothing that can fail does."""
     source = inspect.getsource(vllm_utils.delete_vllm)
-    body = [line.strip() for line in source.splitlines() if line.strip()
-            and not line.strip().startswith("#")]
-    # body[0] is the def line.
-    assert "_unblock_flashinfer_import()" in body[:4], body[:5]
+    assert source.index("_unblock_flashinfer_import()") < source.index(
+        "from vllm.distributed.parallel_state import"
+    ), "the teardown runs before the restore"
 
 
 def test_a_failed_load_vllm_restores_flashinfer():
@@ -274,7 +275,7 @@ def test_a_failed_load_vllm_restores_flashinfer():
     source = inspect.getsource(vllm_utils.load_vllm)
     assert "except BaseException:" in source, "no restore arm on the failure path"
     restore = source.index("except BaseException:")
-    tail = source[restore:restore + 600]
+    tail = source[restore:restore + 1200]
     assert "_unblock_flashinfer_import()" in tail
     assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in tail
     assert "raise" in tail, "the original error must still propagate"
@@ -386,7 +387,7 @@ def test_the_dry_run_unblock_is_skipped_when_the_arg_was_filtered():
     and vLLM free to select FlashInfer again. A hidden module is the lesser harm."""
     source = inspect.getsource(vllm_utils.load_vllm)
     marker = source.index("if return_args:")
-    window = source[marker:marker + 900]
+    window = source[marker:marker + 1400]
     guard = window.index('"attention_backend" in engine_args')
     unblock = window.index("_unblock_flashinfer_import()")
     assert guard < unblock, "the unblock is not gated on the argument surviving"
@@ -399,3 +400,50 @@ def test_the_filter_runs_before_the_dry_run_exit():
     """The gate reads engine_args AFTER filtering, so the order matters."""
     source = inspect.getsource(vllm_utils.load_vllm)
     assert source.index("good_keys = inspect.signature") < source.index("if return_args:")
+
+
+# ------------------------------------------------- the block is owned, not global state
+
+def test_a_second_failed_load_keeps_a_live_engine_s_block(monkeypatch):
+    """The block is process-wide. A later load_vllm that fails must not lift the block an
+    already-running engine still depends on for its lazy FlashInfer imports."""
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    vllm_utils._block_flashinfer_import()
+    monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_UNUSABLE", True, raising = False)
+    # One engine is alive and owns the block.
+    monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_BLOCK_OWNERS", 1, raising = False)
+
+    source = inspect.getsource(vllm_utils.load_vllm)
+    arm = source.index("except BaseException:")
+    window = source[arm:arm + 900]
+    guard = window.index("_UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0")
+    assert guard < window.index("_unblock_flashinfer_import()"), (
+        "the failure arm unblocks without checking for a live owner"
+    )
+    assert sys.modules.get("flashinfer") is None, "precondition: still blocked"
+
+
+def test_delete_vllm_only_unblocks_for_the_last_engine():
+    source = inspect.getsource(vllm_utils.delete_vllm)
+    assert "_UNSLOTH_FLASHINFER_BLOCK_OWNERS -= 1" in source, "ownership is never released"
+    guard = source.index("_UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0")
+    assert guard < source.index("_unblock_flashinfer_import()")
+
+
+def test_a_successful_load_takes_ownership():
+    source = inspect.getsource(vllm_utils.load_vllm)
+    assert "_UNSLOTH_FLASHINFER_BLOCK_OWNERS += 1" in source, (
+        "a successful engine never registers its dependence on the block"
+    )
+    # Only when something was actually blocked.
+    take = source.index("_UNSLOTH_FLASHINFER_BLOCK_OWNERS += 1")
+    assert "if _UNSLOTH_FLASHINFER_UNUSABLE:" in source[take - 200:take]
+
+
+def test_the_dry_run_exit_also_respects_ownership():
+    source = inspect.getsource(vllm_utils.load_vllm)
+    marker = source.index("if return_args:")
+    window = source[marker:marker + 1400]
+    assert "_UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0" in window, (
+        "a dry run can still strip a live engine's block"
+    )

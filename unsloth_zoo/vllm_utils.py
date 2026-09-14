@@ -2290,6 +2290,10 @@ _UNSLOTH_BLOCKED_FLASHINFER_MODULES = {}
 # which Unsloth always has by then, so the child starts with an empty sys.modules.
 # VLLM_ATTENTION_BACKEND was removed in 0.13.0, leaving the pickled engine arg.
 _UNSLOTH_FLASHINFER_UNUSABLE = False
+# How many successfully built engines still need the block. The block is process-wide, so
+# a second load_vllm that fails, or a dry run, must not lift the block belonging to an
+# engine that is still alive and still lazily importing FlashInfer at run time.
+_UNSLOTH_FLASHINFER_BLOCK_OWNERS = 0
 
 
 def _block_flashinfer_import():
@@ -2594,7 +2598,7 @@ def load_vllm(
             "vLLM state at import, so installing into a live session is not enough."
         )
 
-    global _UNSLOTH_FLASHINFER_UNUSABLE
+    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS
     _UNSLOTH_FLASHINFER_UNUSABLE = False
 
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
@@ -3255,7 +3259,9 @@ def load_vllm(
             # so unblocking would leave the caller with no exclusion at all and vLLM free
             # to pick FlashInfer again. Keep the block in that case: a hidden module is
             # the lesser harm next to the JIT failure this exists to avoid.
-            if not _UNSLOTH_FLASHINFER_UNUSABLE or "attention_backend" in engine_args:
+            if _UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0 and (
+                not _UNSLOTH_FLASHINFER_UNUSABLE or "attention_backend" in engine_args
+            ):
                 _unblock_flashinfer_import()
                 _UNSLOTH_FLASHINFER_UNUSABLE = False
             return engine_args
@@ -3362,14 +3368,22 @@ def load_vllm(
         pass
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
+        if _UNSLOTH_FLASHINFER_UNUSABLE:
+            # This engine now depends on the block for its lazy run time imports.
+            _UNSLOTH_FLASHINFER_BLOCK_OWNERS += 1
 
     except BaseException:
         # The block exists to protect an engine. If we never got one, there is nothing to
         # protect, and leaving flashinfer hidden would break an unrelated later import in
         # the same session for no reason. A successful load keeps the block, because vLLM
         # imports FlashInfer lazily at run time, long after the engine is built.
-        _unblock_flashinfer_import()
-        _UNSLOTH_FLASHINFER_UNUSABLE = False
+        #
+        # Unless an earlier engine is still alive and still owns it. The block is
+        # process-wide, so clearing it here would expose FlashInfer to that engine and
+        # hand it the very JIT failure this avoids.
+        if _UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0:
+            _unblock_flashinfer_import()
+            _UNSLOTH_FLASHINFER_UNUSABLE = False
         raise
     finally:
         unpatch_vllm_compute_dtype(BitsAndBytesConfig)
@@ -3685,9 +3699,13 @@ def delete_vllm(llm = None):
     # The engine the block was protecting is going away, so hand flashinfer back to the
     # session. Done first: the teardown below can raise, and the caller who asked for the
     # engine to be deleted should not be left with a hidden module either way.
-    global _UNSLOTH_FLASHINFER_UNUSABLE
-    _unblock_flashinfer_import()
-    _UNSLOTH_FLASHINFER_UNUSABLE = False
+    global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS
+    if _UNSLOTH_FLASHINFER_BLOCK_OWNERS > 0:
+        _UNSLOTH_FLASHINFER_BLOCK_OWNERS -= 1
+    # Only once the last engine that needed it is gone.
+    if _UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0:
+        _unblock_flashinfer_import()
+        _UNSLOTH_FLASHINFER_UNUSABLE = False
     # From https://github.com/vllm-project/vllm/issues/1908
     from vllm.distributed.parallel_state import (
         destroy_model_parallel,
