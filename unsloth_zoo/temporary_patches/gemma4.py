@@ -129,7 +129,14 @@ class _Gemma4KVSharedSafeProxy:
     # PreTrainedConfig.__iter__ yields attribute names from self.__dict__.
     # Validators such as validate_token_ids rely on this iteration.
     def __iter__(self):
-        return iter(object.__getattribute__(self, "_real"))
+        # Must agree with __getattr__ / __contains__ / __getitem__, which all
+        # hide num_kv_shared_layers. Upstream's validate_token_ids does
+        # `for name in text_config: getattr(text_config, name)`, so yielding a
+        # name whose getattr raises turns validation into an AttributeError.
+        return (
+            name for name in object.__getattribute__(self, "_real")
+            if name != "num_kv_shared_layers"
+        )
 
     def __len__(self):
         real = object.__getattribute__(self, "_real")
@@ -743,14 +750,24 @@ def patch_Gemma4MultimodalEmbedder_forward():
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         old_dtype = inputs_embeds.dtype
-        # Compute norm in float32 (in-place to avoid extra allocation)
+        # Compute norm in float32
         emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
-        # Project in float32 to preserve spatial precision - use linear with fp32 weight
-        # Avoid redundant downcast-upcast: compute directly in fp32 and return in original dtype
-        emb_norm_proj = torch.nn.functional.linear(
-            emb_norm.to(torch.float32),
-            self.embedding_projection.weight.to(torch.float32)
-        )
+        # Call the module rather than reading `.weight`: PEFT replaces
+        # `embedding_projection` with a `lora.Linear` whose delta is applied only
+        # inside its `forward`, and `.weight` on the wrapper resolves to the
+        # frozen base weight. Reading it drops the LoRA contribution entirely,
+        # so an adapter on this projector would train to zero effect
+        # (`finetune_vision_layers` / `finetune_audio_layers` attach one here).
+        # The projector is in SKIP_QUANTIZATION_MODULES, so in a real load both
+        # the base GEMM and the LoRA delta still run in fp32. Matches gemma3n.
+        projection = self.embedding_projection
+        # Feed the projection the dtype its weights actually hold. When the
+        # projector is kept in fp32 (the SKIP_QUANTIZATION_MODULES case) this is
+        # fp32 and the spatial precision is preserved; when it is not, passing
+        # fp32 into a half-precision Linear would raise rather than upcast.
+        weight = getattr(projection, "weight", None)
+        compute_dtype = torch.float32 if weight is None else weight.dtype
+        emb_norm_proj = projection(emb_norm.to(compute_dtype))
         return emb_norm_proj.to(old_dtype)
     try:
         patch_function(
@@ -760,39 +777,3 @@ def patch_Gemma4MultimodalEmbedder_forward():
         return raise_error("Gemma4MultimodalEmbedder.forward", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4MultimodalEmbedder_forward)
-
-
-# ============================================================================
-# Gemma4VisionPatchEmbedder patch - force float32 for position embeddings
-# The position embedding computation (one_hot @ table) loses precision in bf16/fp16,
-# causing y-coordinate collapse in spatial localization tasks.
-# ============================================================================
-
-def patch_Gemma4VisionPatchEmbedder_position_embeddings():
-    """Force float32 computation for Gemma4VisionPatchEmbedder position embeddings."""
-    try:
-        import transformers.models.gemma4.modeling_gemma4 as mod
-        Gemma4VisionPatchEmbedder = mod.Gemma4VisionPatchEmbedder
-    except (ImportError, AttributeError) as e:
-        return raise_error("Gemma4VisionPatchEmbedder._position_embeddings", e)
-
-    def _position_embeddings(self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor) -> torch.Tensor:
-        """Prepare patch positions map for matmul with position embedding table."""
-        # Compute in float32 for numerical stability of position embeddings
-        clamped_positions = pixel_position_ids.clamp(min=0)
-        one_hot = torch.nn.functional.one_hot(clamped_positions, num_classes=self.position_embedding_size)
-        one_hot = one_hot.permute(0, 2, 1, 3).to(dtype=torch.float32)
-        position_embeddings = one_hot @ self.position_embedding_table.to(torch.float32)
-        position_embeddings = position_embeddings.sum(dim=1)
-        # Use Python float 0.0 instead of torch.tensor to avoid device mismatch
-        position_embeddings = torch.where(padding_positions.unsqueeze(-1), 0.0, position_embeddings)
-        return position_embeddings.to(self.position_embedding_table.dtype)
-
-    try:
-        patch_function(
-            Gemma4VisionPatchEmbedder, "_position_embeddings", _position_embeddings, fullgraph=True,
-        )
-    except Exception as e:
-        return raise_error("Gemma4VisionPatchEmbedder._position_embeddings", e)
-pass
-TEMPORARY_PATCHES.append(patch_Gemma4VisionPatchEmbedder_position_embeddings)

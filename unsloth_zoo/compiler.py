@@ -3881,10 +3881,13 @@ def unsloth_compile_transformers(
             pass
         pass
     pass
-    # Do NOT add bad_torch_modules back to functions - they failed compilation
-    # for a reason (attention, padding, data-dependent control flow, etc.)
-    # and should not be compiled as standalone functions either.
-    # functions += list(bad_torch_modules)  # BUG FIX: This line was causing vision modules to be compiled as functions
+    # Add back to functions since failed compiling.
+    # `functions` is the import allow-list for the generated cache (see
+    # `create_new_function`), not a compile list: compilation is gated by the
+    # `bad_torch_modules` checks further down. Modules that failed to compile
+    # are still *referenced* by the emitted classes, so they must stay
+    # importable or the cache raises NameError when it constructs them.
+    functions += list(bad_torch_modules)
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
@@ -4288,10 +4291,6 @@ def unsloth_compile_transformers(
         mask_functions = get_mask_functions()
         # Fix up function signatures
         for module in called_functions:
-            # Skip modules that should not be compiled (vision components, etc.)
-            if any(module.endswith(x) for x in DISABLE_COMPILE_MODULES):
-                print(f"Unsloth: Skipping function {module} since it's marked for disabling.")
-                continue
             function = eval(f"{model_location}.{module}")
 
             # This does not always succeed, so need to check:
@@ -4369,10 +4368,6 @@ def unsloth_compile_transformers(
 
         for module in called_functions:
             if module in all_standalone_classes:
-                continue
-            # Skip modules that should not be compiled (vision components, etc.)
-            if any(module.endswith(x) for x in DISABLE_COMPILE_MODULES):
-                print(f"Unsloth: Skipping function {module} since it's marked for disabling.")
                 continue
             function = eval(f"{model_location}.{module}")
 

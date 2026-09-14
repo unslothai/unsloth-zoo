@@ -1,153 +1,141 @@
-"""
-Test for Gemma4 spatial localization fix (Issue #6028).
+"""Tests for the Gemma4 multimodal projection patch (issue #6028 follow-up).
 
-This test verifies that the patches for Gemma4MultimodalEmbedder and
-Gemma4VisionPatchEmbedder correctly force float32 computation to preserve
-spatial precision in position embeddings and multimodal projections.
+These tests are written to FAIL if the patch regresses, which the previous
+shape/dtype-only versions did not:
+
+  - `test_projection_preserves_lora_delta` fails if the patch reads
+    `embedding_projection.weight` instead of calling the module, because a PEFT
+    LoRA adapter on that projector would then contribute nothing and receive no
+    gradient.
+  - `test_projection_matches_fp64_reference` pins the numerics against an fp64
+    reference rather than only checking the output dtype.
+  - `test_upstream_signatures` pins the upstream signature the patch relies on,
+    matching the convention in tests/test_temporary_patches_exhaustive.py.
 """
-import torch
 import pytest
+import torch
 
 
-class TestGemma4SpatialLocalization:
-    """Tests for Gemma4 spatial localization precision fixes."""
+@pytest.fixture(scope="module", autouse=True)
+def _apply_patches():
+    import unsloth_zoo.temporary_patches  # noqa: F401  (applies TEMPORARY_PATCHES)
 
-    @pytest.fixture(autouse=True)
-    def setup(self):
-        """Import unsloth to apply patches."""
-        import unsloth
-        self.unsloth = unsloth
 
-    def test_gemma4_multimodal_embedder_float32_precision(self):
-        """Test that Gemma4MultimodalEmbedder uses float32 for projection."""
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4MultimodalEmbedder
-        from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig, Gemma4TextConfig
+def _configs(mm_dim=64, text_dim=32):
+    from transformers.models.gemma4.configuration_gemma4 import (
+        Gemma4TextConfig,
+        Gemma4VisionConfig,
+    )
+    vision_config = Gemma4VisionConfig(
+        output_proj_dims=mm_dim, hidden_size=mm_dim, rms_norm_eps=1e-6,
+    )
+    text_config = Gemma4TextConfig(hidden_size=text_dim)
+    return vision_config, text_config
 
-        vision_config = Gemma4VisionConfig(
-            output_proj_dims=3840,
-            hidden_size=3840,
-            rms_norm_eps=1e-6,
-        )
-        text_config = Gemma4TextConfig(
-            hidden_size=2048,
-        )
 
-        embedder = Gemma4MultimodalEmbedder(vision_config, text_config)
+def _embedder(mm_dim=64, text_dim=32):
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4MultimodalEmbedder
+    vision_config, text_config = _configs(mm_dim, text_dim)
+    return Gemma4MultimodalEmbedder(vision_config, text_config).float()
 
-        # Test with bfloat16 input
-        batch_size = 2
-        seq_len = 16
-        inputs_embeds = torch.randn(batch_size, seq_len, 3840, dtype=torch.bfloat16)
 
-        result = embedder(inputs_embeds)
+def test_config_construction_does_not_raise():
+    """The KV-shared proxy hides `num_kv_shared_layers`; it must hide it from
+    iteration too, or upstream's validate_token_ids raises AttributeError."""
+    _configs()
 
-        # Result should be in the same dtype as input (bfloat16)
-        # but computation should happen in float32 internally
-        assert result.dtype == torch.bfloat16
-        assert result.shape == (batch_size, seq_len, 2048)
 
-    def test_gemma4_multimodal_embedder_fp16_precision(self):
-        """Test that Gemma4MultimodalEmbedder works with fp16 input."""
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4MultimodalEmbedder
-        from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig, Gemma4TextConfig
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_projection_shape_and_dtype(dtype):
+    embedder = _embedder().to(dtype)
+    out = embedder(torch.randn(2, 16, 64, dtype=dtype))
+    assert out.shape == (2, 16, 32)
+    assert out.dtype == dtype
 
-        vision_config = Gemma4VisionConfig(
-            output_proj_dims=3840,
-            hidden_size=3840,
-            rms_norm_eps=1e-6,
-        )
-        text_config = Gemma4TextConfig(
-            hidden_size=2048,
-        )
 
-        embedder = Gemma4MultimodalEmbedder(vision_config, text_config)
+def test_projection_matches_fp64_reference():
+    """Patched forward must stay close to an fp64 reference of the same math."""
+    embedder = _embedder()
+    x = torch.randn(2, 16, 64)
 
-        # Test with fp16 input
-        batch_size = 2
-        seq_len = 16
-        inputs_embeds = torch.randn(batch_size, seq_len, 3840, dtype=torch.float16)
+    norm = embedder.embedding_pre_projection_norm
+    ref = (norm._norm(x.double())) @ embedder.embedding_projection.weight.double().T
 
-        result = embedder(inputs_embeds)
+    out = embedder(x)
+    assert torch.allclose(out.double(), ref, atol=1e-4), (
+        f"max|out-ref| = {float((out.double() - ref).abs().max())}"
+    )
 
-        assert result.dtype == torch.float16
-        assert result.shape == (batch_size, seq_len, 2048)
 
-    def test_gemma4_vision_patch_embedder_position_embeddings_float32(self):
-        """Test that Gemma4VisionPatchEmbedder position embeddings use float32."""
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionPatchEmbedder
-        from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+def test_projection_preserves_lora_delta():
+    """A LoRA adapter on `embedding_projection` must affect the output AND get
+    a gradient. Reading `.weight` instead of calling the module silently drops
+    both, which is what `finetune_vision_layers` / `finetune_audio_layers`
+    attach here."""
+    peft = pytest.importorskip("peft")
 
-        config = Gemma4VisionConfig(
-            hidden_size=768,
-            patch_size=16,
-            position_embedding_size=100,
-            pooling_kernel_size=3,
-        )
+    embedder = _embedder()
+    x = torch.randn(2, 16, 64)
+    with torch.no_grad():
+        baseline = embedder(x).clone()
 
-        embedder = Gemma4VisionPatchEmbedder(config)
+    wrapped = peft.get_peft_model(
+        _embedder(),
+        peft.LoraConfig(
+            r=8, lora_alpha=16, lora_dropout=0.0,
+            target_modules=["embedding_projection"], bias="none",
+        ),
+    )
+    inner = wrapped.base_model.model
+    proj = inner.embedding_projection
+    with torch.no_grad():
+        proj.base_layer.weight.copy_(embedder.embedding_projection.weight)
+        # PEFT zero-inits lora_B, so without this the delta is zero and this
+        # test would pass even with the projection bypassed.
+        torch.nn.init.normal_(proj.lora_A["default"].weight, std=0.5)
+        torch.nn.init.normal_(proj.lora_B["default"].weight, std=0.5)
 
-        batch_size = 2
-        num_patches = 20
-        pixel_position_ids = torch.randint(0, 100, (batch_size, num_patches, 2))
-        padding_positions = torch.zeros(batch_size, num_patches, dtype=torch.bool)
+    with torch.no_grad():
+        adapted = inner(x)
+    assert not torch.allclose(adapted, baseline), (
+        "LoRA adapter on embedding_projection had no effect on the output: "
+        "the projection path is bypassing the PEFT wrapper"
+    )
 
-        # The internal computation should use float32
-        result = embedder._position_embeddings(pixel_position_ids, padding_positions)
+    inner.zero_grad(set_to_none=True)
+    out = inner(x)
+    assert out.requires_grad, (
+        "patched forward produced an output with no grad_fn: nothing in the "
+        "projection path is trainable"
+    )
+    out.square().sum().backward()
+    grad = proj.lora_B["default"].weight.grad
+    assert grad is not None and float(grad.norm()) > 0.0, (
+        "lora_B received no gradient: the adapter cannot train"
+    )
 
-        # Result dtype should match position_embedding_table dtype (typically float32 or bfloat16)
-        # but computation happens in float32
-        assert result.shape == (batch_size, num_patches, 768)
-        # The computation is done in float32, result may be cast back
 
-    def test_gemma4_vision_patch_embedder_forward_float32(self):
-        """Test that Gemma4VisionPatchEmbedder forward uses float32 for position embeddings."""
-        from transformers.models.gemma4.modeling_gemma4 import Gemma4VisionPatchEmbedder
-        from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+def test_upstream_signatures():
+    """Pin the upstream signature the patch replaces (see
+    tests/test_temporary_patches_exhaustive.py for this convention)."""
+    import inspect
 
-        config = Gemma4VisionConfig(
-            hidden_size=768,
-            patch_size=16,
-            position_embedding_size=100,
-            pooling_kernel_size=3,
-        )
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4MultimodalEmbedder
 
-        embedder = Gemma4VisionPatchEmbedder(config)
+    unpatched = getattr(
+        Gemma4MultimodalEmbedder,
+        "_unsloth_original_forward",
+        Gemma4MultimodalEmbedder.forward,
+    )
+    params = list(inspect.signature(unpatched).parameters)
+    assert params[:2] == ["self", "inputs_embeds"], params
 
-        batch_size = 2
-        num_patches = 20
-        pixel_values = torch.randn(batch_size, num_patches, 3 * 16 * 16)
-        pixel_position_ids = torch.randint(0, 100, (batch_size, num_patches, 2))
-        padding_positions = torch.zeros(batch_size, num_patches, dtype=torch.bool)
 
-        result = embedder(pixel_values, pixel_position_ids, padding_positions)
+def test_temporary_patch_registered():
+    from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
 
-        assert result.shape == (batch_size, num_patches, 768)
-
-    def test_compiler_disables_vision_components(self):
-        """Test that the compiler disables compilation for Gemma4 vision components."""
-        from unsloth_zoo.compiler import DISABLE_COMPILE_MODULES
-
-        vision_components = [
-            "Gemma4VisionPatchEmbedder",
-            "Gemma4VisionModel",
-            "Gemma4VisionEncoder",
-            "Gemma4VisionEncoderLayer",
-            "Gemma4MultimodalEmbedder",
-        ]
-
-        for component in vision_components:
-            # Check that each component is in the disable list
-            is_disabled = any(component.endswith(x) for x in DISABLE_COMPILE_MODULES)
-            assert is_disabled, f"{component} should be in DISABLE_COMPILE_MODULES"
-
-    def test_temporary_patches_registered(self):
-        """Test that the new patches are registered in TEMPORARY_PATCHES."""
-        from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
-
-        patch_names = [p.__name__ for p in TEMPORARY_PATCHES]
-
-        assert "patch_Gemma4MultimodalEmbedder_forward" in patch_names
-        assert "patch_Gemma4VisionPatchEmbedder_position_embeddings" in patch_names
+    names = [p.__name__ for p in TEMPORARY_PATCHES]
+    assert "patch_Gemma4MultimodalEmbedder_forward" in names
 
 
 if __name__ == "__main__":
