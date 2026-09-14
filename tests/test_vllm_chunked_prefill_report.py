@@ -16,11 +16,8 @@
 
 """The chunked prefill number load_vllm prints must be the one vLLM is given.
 
-`chunked_prefill_tokens` was sized by its own ladder, overwritten by
-`max_seq_length`, then printed, so the reported budget described nothing that
-reached EngineArgs. Matched on the AST, not on text, so reformatting the print
-or the engine_args call is free and only a real regression fails. Source-level
-because load_vllm needs a live GPU, as in tests/test_vllm_utils_xpu_sm_cap.py.
+On the AST, not on text, so reformatting the print or engine_args is free.
+Source-level because load_vllm needs a live GPU, as in test_vllm_utils_xpu_sm_cap.py.
 """
 
 import ast
@@ -31,8 +28,7 @@ LOG_PREFIX = "Chunked prefill tokens = "
 
 def _module_source_text() -> str:
     path = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo" / "vllm_utils.py"
-    # utf-8-sig: CPython strips a BOM, so a file saved by a Windows editor imports
-    # fine but would hand ast.parse a leading U+FEFF.
+    # utf-8-sig: a BOM CPython itself strips would otherwise break ast.parse.
     return path.read_text(encoding = "utf-8-sig")
 
 
@@ -59,7 +55,6 @@ def _printed_name(load_vllm : ast.FunctionDef) -> str:
 
 
 def _engine_args_value(load_vllm : ast.FunctionDef, keyword : str) -> str:
-    """The variable passed as `keyword` in `engine_args = dict(...)`."""
     for node in ast.walk(load_vllm):
         if not isinstance(node, ast.Assign): continue
         if not any(isinstance(t, ast.Name) and t.id == "engine_args"
@@ -88,8 +83,7 @@ def test_chunked_prefill_line_reports_the_value_vllm_receives():
 def test_no_second_chunked_prefill_variable_is_computed_and_dropped():
     load_vllm = _load_vllm_node()
 
-    # Assignments only, not a substring: prose about the old bug may stay in
-    # comments, a revived variable may not.
+    # Assignments only: prose about the old bug may stay, a revived variable may not.
     assigned = {
         target.id
         for node in ast.walk(load_vllm)
