@@ -562,6 +562,32 @@ def cpu_offload_globals(monkeypatch):
     return gc_module
 
 
+@pytest.mark.parametrize("preserve_rng_state", [None, True, False])
+def test_offloaded_wrapper_matches_torch_checkpoint(cpu_offload_globals, preserve_rng_state):
+    gc_module = cpu_offload_globals
+    checkpoint = getattr(
+        torch.utils.checkpoint, "_unsloth_pristine_checkpoint", torch.utils.checkpoint.checkpoint,
+    )
+    kwargs = {} if preserve_rng_state is None else {"preserve_rng_state": preserve_rng_state}
+
+    def run(checkpoint_fn):
+        torch.manual_seed(123)
+        hidden = torch.randn(2, 16, requires_grad = True)
+        side = torch.randn(2, 16, requires_grad = True)
+
+        def block(hidden, side):
+            return torch.nn.functional.dropout(hidden + side, p = 0.5, training = True)
+
+        output = checkpoint_fn(block, hidden, side, use_reentrant = True, **kwargs)
+        output.sum().backward()
+        return output, hidden.grad, side.grad, torch.get_rng_state()
+
+    expected = run(checkpoint)
+    actual = run(gc_module.unsloth_offloaded_gradient_checkpoint)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference)
+
+
 class _SideLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()

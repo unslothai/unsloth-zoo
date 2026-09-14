@@ -1293,8 +1293,9 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     global CPU_BUFFERS
     if len(CPU_BUFFERS) == 0:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
+    preserve = kwargs.pop("preserve_rng_state", True)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
-    return UnslothCheckpointFunction.apply(function, *args, *tensor_args)
+    return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
