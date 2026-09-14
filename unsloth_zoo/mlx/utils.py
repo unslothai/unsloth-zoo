@@ -16981,7 +16981,17 @@ def _model_has_quantized_module(model):
         # MLA's QuantizedMultiLinear and the distributed Quantized*Linear
         # subclass none of the above; missing one writes quantized tensors
         # with no metadata to load them by.
-        return type(module).__name__.startswith("Quantized")
+        if type(module).__name__.startswith("Quantized"):
+            return True
+        # mlx.nn's QQLinear is neither: not a subclass, not Quantized*-named.
+        # Ask for a packed weight rather than just the attributes, so a module
+        # that merely carries bits/group_size cannot suppress the quantize.
+        # save_merged_model has already called .eval(), which is when QQLinear
+        # holds its weights packed.
+        if hasattr(module, "bits") and hasattr(module, "group_size"):
+            weight = getattr(module, "weight", None)
+            return weight is not None and weight.dtype == mx.uint32
+        return False
 
     return any(_is_quantized(module) for _, module in model.named_modules())
 
