@@ -1215,10 +1215,9 @@ def patch_Gemma4MultimodalEmbedder_forward():
         # Call the module, never `.weight`: a PEFT lora.Linear applies its delta
         # only in forward, so reading the weight trains the adapter to no effect.
         projection = self.embedding_projection
-        # Match the weight dtype. Promoting a half one is not reachable here:
-        # autocast(dtype=float32) is refused on several backends and older torch,
-        # and Dynamo cannot trace a Parameter rebuild in a fullgraph forward. So
-        # only a float32 projector (SKIP_QUANTIZATION_MODULES) gets float32.
+        # Match the weight dtype: only a float32 projector computes in float32.
+        # Promoting a half one needs an autocast several backends refuse, or a
+        # Parameter rebuild Dynamo cannot trace.
         weight = getattr(projection, "weight", None)
         compute_dtype = torch.float32 if weight is None else weight.dtype
         # An enclosing bf16 autocast downcasts even float32 operands. Guarded
@@ -1246,9 +1245,8 @@ def patch_Gemma4_static_cache_backport(phase = "post_compile"):
     A static cache makes transformers skip mask materialisation at prefill, which
     drops Gemma's bidirectional image block overlay, so image tokens attend
     causally. Current unsloth gates this per request; older ones consult only
-    `_supports_static_cache` (models/vision.py), so clear it on the Gemma 4
-    generation classes. That costs text-only generation the static cache too,
-    hence the guard below: it runs only when unsloth has no gate of its own.
+    `_supports_static_cache`, so clear it on the Gemma 4 generation classes. That
+    costs text-only generation the static cache, hence the guard below.
     """
     if phase != "post_compile": return
     # unsloth_zoo must not import unsloth; absent means too early to tell.
