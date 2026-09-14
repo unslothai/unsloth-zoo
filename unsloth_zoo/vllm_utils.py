@@ -2286,6 +2286,17 @@ _UNSLOTH_FLASHINFER_ABSENT = object()
 # What `_block_flashinfer_import` evicted from sys.modules, keyed by module name.
 _UNSLOTH_BLOCKED_FLASHINFER_MODULES = {}
 
+# Set by the pre-flight when it has decided FlashInfer cannot run here. Read when
+# the engine args are built, because the sys.modules block alone does NOT reach
+# the worker: vLLM re-resolves the attention backend inside the EngineCore child
+# (platforms/cuda.py get_attn_backend_cls), and forces the `spawn` start method
+# whenever CUDA is already initialised (utils/system_utils.py _maybe_force_spawn).
+# Unsloth always has CUDA initialised by then, so under spawn the child is a fresh
+# interpreter with an empty sys.modules and FlashInfer visible again. os.environ
+# is inherited but VLLM_ATTENTION_BACKEND was removed in vLLM 0.13.0, so the
+# durable channel is the engine arg, which is pickled into the child with the config.
+_UNSLOTH_FLASHINFER_UNUSABLE = False
+
 
 def _block_flashinfer_import():
     """Hide FlashInfer from vLLM by making `import flashinfer` fail.
@@ -2547,6 +2558,9 @@ def load_vllm(
             "vLLM state at import, so installing into a live session is not enough."
         )
 
+    global _UNSLOTH_FLASHINFER_UNUSABLE
+    _UNSLOTH_FLASHINFER_UNUSABLE = False
+
     unsloth_vllm_standby = unsloth_vllm_standby or (os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0")
     # vLLM standby (sleep mode) corrupts the CuMemAllocator sleep/wake cycle for
     # multimodal models (cudaErrorIllegalAddress at empty_cache on the first
@@ -2767,6 +2781,7 @@ def load_vllm(
             # JIT failure the opt-out exists to avoid.
             if importlib.util.find_spec("flashinfer") is not None:
                 _block_flashinfer_import()
+            _UNSLOTH_FLASHINFER_UNUSABLE = True
         elif importlib.util.find_spec("flashinfer"):
             # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
             # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
@@ -2818,6 +2833,7 @@ def load_vllm(
                 # Deliberately not lifted after backend selection: vLLM also imports
                 # FlashInfer lazily at run time, well after the engine is built.
                 _block_flashinfer_import()
+                _UNSLOTH_FLASHINFER_UNUSABLE = True
             else:
                 # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
                 if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
@@ -3170,6 +3186,22 @@ def load_vllm(
             engine_args["quantization"] = "torchao"
             engine_args["hf_overrides"] = hf_overrides
 
+        # Pin the backend for the worker process. The sys.modules block only reaches
+        # a FORKED child; vLLM forces spawn once CUDA is initialised, which is always
+        # true by the time Unsloth gets here, and a spawned child re-resolves the
+        # backend from scratch. This arg travels inside VllmConfig, which IS pickled
+        # into the child, so it survives either start method.
+        #
+        # Only set when the pre-flight actually rejected FlashInfer: an explicit
+        # backend is a hard pin that makes vLLM RAISE on an unsupported value rather
+        # than falling through, so setting it unconditionally would break hosts where
+        # FlashInfer is fine, and AMD/ROCm which never reaches the blocker at all.
+        if _UNSLOTH_FLASHINFER_UNUSABLE:
+            engine_args["attention_backend"] = "FLASH_ATTN"
+
+        # Older vLLM has no `attention_backend` arg. The filter below deletes any key
+        # the installed EngineArgs does not accept, so this is a no-op there rather
+        # than a TypeError, which is what keeps it safe across versions both ways.
         good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
         old_keys = list(engine_args.keys())
         for key in old_keys:

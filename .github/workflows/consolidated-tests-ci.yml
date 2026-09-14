@@ -361,6 +361,7 @@ jobs:
             tests/test_find_common_token_ids_no_match.py \
             tests/test_vllm_direct_lora_loading.py \
             tests/test_vllm_flashinfer_block_reversible.py \
+            tests/test_vllm_flashinfer_survives_spawn.py \
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
