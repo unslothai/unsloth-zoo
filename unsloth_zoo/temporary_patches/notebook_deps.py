@@ -66,9 +66,33 @@ def _env_is_true(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().upper() in _TRUE_VALUES
 
 
+def _in_interactive_session() -> bool:
+    """Whether a person is driving this interpreter through an IPython kernel.
+
+    IPython being importable proves nothing: it is a transitive dependency of plenty of
+    entirely non-interactive installs. Only a live shell object counts, and only the two
+    classes that mean Jupyter/Colab/Kaggle or a REPL. Anything else stays off."""
+    ipython = sys.modules.get("IPython")
+    if ipython is None:
+        return False
+    try:
+        shell = ipython.get_ipython()
+    except Exception:
+        return False
+    return type(shell).__name__ in ("ZMQInteractiveShell", "TerminalInteractiveShell")
+
+
 def _auto_install_enabled() -> bool:
-    # Read at the attempt, not at import: the user sets this after seeing the _run_install warning.
-    return _env_is_true("UNSLOTH_AUTO_INSTALL", "1")
+    # Read at the attempt, not at import: the user sets this after seeing the _run_install
+    # warning, and a notebook can enter an interactive shell after unsloth was imported.
+    value = os.environ.get("UNSLOTH_AUTO_INSTALL", "").strip()
+    if value:
+        return value.upper() in _TRUE_VALUES
+    # Unset means interactive-only. Running pip as a side effect of `import unsloth` is
+    # defensible when a person is watching a notebook cell and can read the warning; it is
+    # not defensible in CI, an inference server, or a scheduled script, where the process
+    # would silently gain a package nobody asked for. Those all fail the check above.
+    return _in_interactive_session()
 
 
 def _no_network() -> bool:
@@ -94,6 +118,10 @@ _attempt_lock = threading.Lock()
 # Slightly over the 300s subprocess timeout plus the uv-then-pip fallback, so a waiter
 # outlives the worst-case attempt instead of giving up early on a healthy install.
 _ATTEMPT_WAIT_SECONDS = 620
+# Serialises the installer subprocesses themselves, across package names. Distinct from
+# _attempt_lock, which only guards the tiny check-then-claim on _attempted and is never
+# held across a subprocess.
+_install_lock = threading.Lock()
 
 # Distributions whose REPLACEMENT would corrupt the running process: compiled
 # extensions already loaded by torch, and torch itself. Nothing in _ALLOW_LIST is
@@ -279,13 +307,21 @@ def _pip_install(pkg: str) -> bool:
         finished.wait(timeout = _ATTEMPT_WAIT_SECONDS)
         return False
     try:
-        if shutil.which("uv") and _in_venv():
-            ok, retry_with_pip = _run_install(pkg, _uv_command(pkg))
-            if ok:
-                return True
-            if not retry_with_pip:
-                return False
-        return _run_install(pkg, _pip_command(pkg))[0]
+        # Per-package events stop a second thread duplicating or mis-reporting THIS
+        # package. They do nothing for two threads installing DIFFERENT packages, which
+        # is the common shape here: requires_backends can want several backends at once.
+        # Two installers against one prefix can both rewrite a shared dependency and its
+        # .dist-info, so the executions themselves are serialised. Held only around the
+        # subprocesses, and never while waiting on _attempt_lock or on another package's
+        # event, so there is no lock cycle.
+        with _install_lock:
+            if shutil.which("uv") and _in_venv():
+                ok, retry_with_pip = _run_install(pkg, _uv_command(pkg))
+                if ok:
+                    return True
+                if not retry_with_pip:
+                    return False
+            return _run_install(pkg, _pip_command(pkg))[0]
     finally:
         finished.set()
 

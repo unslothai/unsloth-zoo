@@ -25,6 +25,7 @@ import importlib.util
 import subprocess
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -341,3 +342,109 @@ def test_the_waiter_is_bounded(monkeypatch):
     assert nd._ATTEMPT_WAIT_SECONDS > 300, (
         "the wait has to outlive the 300s subprocess timeout plus the pip fallback"
     )
+
+
+# ------------------------------------------------- the default is interactive-only
+
+class ZMQInteractiveShell:
+    pass
+
+
+class TerminalInteractiveShell:
+    pass
+
+
+class _EmbeddedShell:
+    pass
+
+
+def _fake_ipython(shell):
+    return types.SimpleNamespace(get_ipython = lambda: shell)
+
+
+def test_an_unset_flag_does_not_run_pip_in_a_plain_script(monkeypatch):
+    """Running pip as a side effect of `import unsloth` is defensible when a person is
+    watching a notebook cell. In CI, an inference server or a scheduled script nobody
+    reads the warning, so the default there is off."""
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+    monkeypatch.delitem(sys.modules, "IPython", raising = False)
+    assert nd._auto_install_enabled() is False
+
+
+def test_an_unset_flag_installs_inside_a_live_kernel(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+    for shell in (ZMQInteractiveShell(), TerminalInteractiveShell()):
+        monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(shell))
+        assert nd._auto_install_enabled() is True, type(shell).__name__
+
+
+def test_importable_ipython_without_a_running_shell_is_not_interactive(monkeypatch):
+    """IPython is a transitive dependency of plenty of non-interactive installs, so its
+    mere presence must not turn the feature on."""
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(None))
+    assert nd._auto_install_enabled() is False
+    # An unrecognised embedded shell is not a person at a prompt either.
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(_EmbeddedShell()))
+    assert nd._auto_install_enabled() is False
+    # A get_ipython that raises must not propagate out of an import.
+    def _boom():
+        raise RuntimeError("no shell")
+    monkeypatch.setitem(sys.modules, "IPython", types.SimpleNamespace(get_ipython = _boom))
+    assert nd._auto_install_enabled() is False
+
+
+def test_an_explicit_flag_beats_the_context_in_both_directions(monkeypatch):
+    """The env var stays authoritative: a server that wants this can opt in, and a
+    notebook that does not want it can opt out."""
+    monkeypatch.delitem(sys.modules, "IPython", raising = False)
+    for value in ("1", "ON", "true", " yes "):
+        monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", value)
+        assert nd._auto_install_enabled() is True, value
+
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(ZMQInteractiveShell()))
+    for value in ("0", "off", "no", "anything-else"):
+        monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", value)
+        assert nd._auto_install_enabled() is False, value
+
+
+def test_an_empty_flag_falls_back_to_the_context(monkeypatch):
+    """`UNSLOTH_AUTO_INSTALL=` exported by a wrapper script must not read as a refusal
+    any more than it reads as consent."""
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "   ")
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(ZMQInteractiveShell()))
+    assert nd._auto_install_enabled() is True
+    monkeypatch.delitem(sys.modules, "IPython", raising = False)
+    assert nd._auto_install_enabled() is False
+
+
+def test_two_different_packages_do_not_install_concurrently(monkeypatch):
+    """Per-package events only deduplicate one package. requires_backends can want several
+    backends at once, and two pip processes against one prefix can both rewrite a shared
+    dependency and its .dist-info."""
+    overlap = []
+    live = []
+    live_lock = threading.Lock()
+
+    def _slow_run(cmd, *args, **kwargs):
+        with live_lock:
+            live.append(cmd)
+            overlap.append(len(live))
+        time.sleep(0.2)
+        with live_lock:
+            live.remove(cmd)
+        return types.SimpleNamespace(returncode = 0, stdout = "", stderr = "")
+
+    monkeypatch.setattr(subprocess, "run", _slow_run)
+    monkeypatch.setattr(nd.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(nd, "_auto_install_enabled", lambda: True)
+
+    threads = [
+        threading.Thread(target = nd._pip_install, args = (pkg,))
+        for pkg in ("einops", "timm", "av", "jieba")
+    ]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout = 30)
+
+    assert len(overlap) == 4, "not every package was attempted: %s" % overlap
+    assert max(overlap) == 1, "installers overlapped: %s concurrent" % max(overlap)
