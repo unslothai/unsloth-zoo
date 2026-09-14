@@ -1154,7 +1154,8 @@ def make_runtime_cce_loss_fused_finalize(
 
             if dlogits_kernel is not None:
                 total_threads = (logits.size + n_reads - 1) // n_reads
-                dlogits_out_dtype = mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype
+                dlogits_out_dtype = (mx.float32 if logits.dtype == mx.bfloat16
+                                     and not weight_is_frozen else logits.dtype)
                 d_logits = dlogits_kernel(
                     inputs=[
                         logits,
