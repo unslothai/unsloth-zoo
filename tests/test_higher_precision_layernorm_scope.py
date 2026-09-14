@@ -24,7 +24,11 @@ import os
 
 import pytest
 
-from unsloth_zoo.compiler import higher_precision_layernorms
+# Before the import: CI installs unsloth with `|| true`, and without it unsloth_zoo/__init__
+# raises "Please install Unsloth" at import, so collection of this file would error out.
+os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
+
+from unsloth_zoo.compiler import higher_precision_layernorms  # noqa: E402
 
 # Llama 4 shape: the norm multiplies in the input dtype, so this is a float16 norm.
 FLOAT16_NORM = """
