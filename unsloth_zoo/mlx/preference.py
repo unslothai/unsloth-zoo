@@ -1398,21 +1398,20 @@ def _make_compact_preference_projection(head, *, frozen):
     return projection
 
 
-def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
+def _make_dpo_cce_forward(model):
     from . import utils
 
-    baseline = make_dpo_loss_fn(objective, reference_policy=reference_policy)
     desc = utils.describe_output_head(model)
     tm = utils._get_text_model(model)
     if (utils._cce_head_ineligibility(desc) is not None
             or (getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model))):
-        return baseline
+        return None
     scale, problem = utils._detect_head_transform(model, desc.status)
     softcap, cap_problem = utils._detect_logit_softcap(model)
     if (problem or cap_problem or scale is not None or softcap
             or desc.module.weight.shape[0] < 8192
             or (desc.quantized and desc.module.trainable_parameters())):
-        return baseline
+        return None
 
     projection = _make_compact_preference_projection(
         desc.module, frozen=not utils._is_lm_head_trainable(model),
@@ -1436,7 +1435,14 @@ def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
         sums = mx.zeros((targets.size,), sums.dtype).at[safe].add(mx.where(valid, sums, mx.array(0, sums.dtype)))
         return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape)), mask
 
+    return forward
+
+
+def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
+    forward = _make_dpo_cce_forward(model)
     loss_fn = make_dpo_loss_fn(objective, reference_policy=reference_policy, _cce_forward=forward)
+    if forward is None:
+        return loss_fn
     loss_fn._unsloth_cce_backend = "compact-native-preference"
     loss_fn._unsloth_cce_compaction = True
     return loss_fn
@@ -1671,7 +1677,7 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
     return terms, stats
 
 
-def make_preference_eval_fn(objective, *, reference_policy=None):
+def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     """Score one preference batch as ``(loss, pairs, stats)``.
 
     ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
@@ -1681,12 +1687,23 @@ def make_preference_eval_fn(objective, *, reference_policy=None):
     _require_reference(objective, reference_policy)
     kind = objective.kind
     beta = objective.beta
+    forward = None
+    compact = False
+    if model is not None:
+        if kind == "dpo":
+            forward = _make_dpo_cce_forward(model)
+            compact = forward is not None
+        else:
+            from .utils import describe_output_head
+            weight = getattr(describe_output_head(model).module, "weight", None)
+            compact = weight is not None and weight.shape[0] >= 8192
 
-    def eval_fn(model, batch, lengths, _normalizers=None):
+    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None):
         pairs = batch.shape[0] // 2
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
                 model, batch, lengths, beta,
+                cce_indices=cce_indices if compact else None,
             )
             loss = (
                 nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
@@ -1696,6 +1713,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None):
             terms, stats = _dpo_scores(
                 model, batch, lengths, objective,
                 reference_policy=reference_policy,
+                cce_forward=forward, cce_indices=cce_indices,
             )
             loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
@@ -1703,6 +1721,8 @@ def make_preference_eval_fn(objective, *, reference_policy=None):
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
     eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
+    eval_fn._unsloth_cce_compaction = compact
+    eval_fn._unsloth_cce_kind = kind
     return eval_fn
 
 

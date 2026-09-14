@@ -1241,6 +1241,62 @@ def test_preference_compaction_preserves_pair_ownership(monkeypatch, quantized, 
 
 @metal_only
 @pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, kind):
+    from types import SimpleNamespace
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    from unsloth_zoo.mlx import preference as p
+
+    mx.random.seed(738)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    policy = None
+    if reference:
+        adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
+        adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * .02
+        model.model.embed_tokens = adapter
+        policy = p.LoRAReferencePolicy([adapter])
+    model.set_dtype(mx.bfloat16)
+    model.eval()
+    rows = []
+    for i in range(7):
+        chosen = tuple((j * 7 + i) % 2053 for j in range(513 if i % 4 == 0 else 45 + i))
+        rejected = tuple((j * 11 + i) % 2053 for j in range(507 if i % 4 == 0 else 43 + i))
+        rows.append(p.TokenizedPreferenceRow(chosen[:-13-i], chosen[-13-i:],
+                    rejected[:-14+i], rejected[-14+i:]))
+    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1, 2, 3), (4, 5, 6)],
+        normalizers=[(1234, 37, 9)] * 2, cycle_length=2, max_seq_length=513, pad_id=0)
+    objective = p.resolve_preference_objective(kind, beta=.2,
+        **({"reference_free": not reference} if kind == "dpo" else {}))
+    baseline = p.make_preference_eval_fn(objective, reference_policy=policy)
+    candidate = p.make_preference_eval_fn(objective, reference_policy=policy, model=model)
+    assert not baseline._unsloth_cce_compaction and candidate._unsloth_cce_compaction
+    calls = []
+    def fail(failed, _context, error):
+        if failed:
+            raise error
+    trainer = SimpleNamespace(model=model, stop_requested=False,
+        _distributed_eval_status=lambda failed=False: (False, failed),
+        _raise_distributed_failure_from_any=fail, _fire_prediction_step=lambda: calls.append(1))
+    expected = MLXTrainer._evaluate_batch_totals(trainer, plan, baseline)
+    original, shapes = nn.losses.cross_entropy, []
+    def ce(logits, *args, **kwargs):
+        shapes.append(logits.shape)
+        return original(logits, *args, **kwargs)
+    monkeypatch.setattr(nn.losses, "cross_entropy", ce)
+    actual = MLXTrainer._evaluate_batch_totals(trainer, plan, candidate)
+    mx.eval(expected, actual)
+    capacity = 256 if kind == "dpo" else 768
+    assert shapes == [(capacity, 8192)] * (4 if kind == "dpo" and reference else 2)
+    assert len(calls) == 4 and actual[1].item() == 7
+    for want, got in zip(expected, actual):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-5).item()
+    if reference:
+        assert adapter.scale == 2.0
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
 def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     mx.random.seed(735)
     model = _cce_text_model(2053, 64, quantized=quantized)
