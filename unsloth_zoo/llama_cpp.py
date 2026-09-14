@@ -368,7 +368,19 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         # `RuntimeError: Unsloth: GGUF conversion failed: EOF when reading a line`.
         try:
             acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
-        except (EOFError, RuntimeError) as exception:
+        except (EOFError, RuntimeError, ValueError, OSError) as exception:
+            # A stdin closed AFTER interpreter start raises neither EOFError nor
+            # RuntimeError. Measured on CPython 3.13:
+            #   sys.stdin.close()  -> ValueError: I/O operation on closed file.
+            #   os.close(0)        -> OSError: [Errno 9] Bad file descriptor
+            #   sys.stdin = None   -> RuntimeError: lost sys.stdin
+            #   stdin=/dev/null    -> EOFError
+            # Daemon and process wrappers close fd 0, so without the first two a headless
+            # export still dies on the input() call this whole branch exists to survive.
+            # All four mean the same thing: there is no one to ask. The terminal check
+            # below still distinguishes Ctrl-D, and it holds for these too, since a closed
+            # sys.stdin makes isatty() raise and a closed fd 0 makes it return False.
+            #
             # CPython raises RuntimeError for a lost stdout or stderr too, and an unrelated
             # failure must not read as consent. Accept it only when stdin itself is gone.
             if isinstance(exception, RuntimeError) and sys.stdin is not None:

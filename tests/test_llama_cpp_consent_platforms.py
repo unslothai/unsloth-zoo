@@ -177,3 +177,72 @@ def test_the_opt_out_covers_every_package_manager(monkeypatch, system_type):
     with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
         llama_cpp.install_package("cmake", system_type = system_type)
     assert rec.calls == []
+
+
+# ------------------------------------------------- stdin closed after startup
+
+@pytest.mark.parametrize(
+    "exc, why",
+    [
+        (ValueError("I/O operation on closed file."), "sys.stdin.close()"),
+        (OSError(9, "Bad file descriptor"), "os.close(0)"),
+    ],
+)
+def test_a_stdin_closed_after_startup_is_treated_as_no_one_there(
+    recorder, monkeypatch, exc, why,
+):
+    """input() raises neither EOFError nor RuntimeError when stdin is closed after the
+    interpreter started, which is what daemon and process wrappers do to fd 0.
+
+    Measured on CPython 3.13: sys.stdin.close() gives ValueError, os.close(0) gives
+    OSError(EBADF). Both used to propagate straight through install_package, so a
+    headless export still died on the prompt this branch exists to survive."""
+    monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
+    # A closed sys.stdin makes isatty() raise; a closed fd 0 makes it return False.
+    monkeypatch.setattr(
+        llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = lambda: False),
+    )
+    llama_cpp.install_package("cmake", system_type = "debian")
+    assert recorder.calls == ["apt-get install cmake -y"], why
+
+
+@pytest.mark.parametrize(
+    "exc", [ValueError("I/O operation on closed file."), OSError(9, "Bad file descriptor")],
+)
+def test_a_closed_stdin_still_respects_the_opt_out(recorder, monkeypatch, exc):
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
+    with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
+        llama_cpp.install_package("cmake", system_type = "debian")
+    assert recorder.calls == []
+
+
+@pytest.mark.parametrize(
+    "exc", [ValueError("I/O operation on closed file."), OSError(9, "Bad file descriptor")],
+)
+def test_a_closed_stdin_on_a_terminal_still_cancels(recorder, monkeypatch, exc):
+    """The control that keeps Ctrl-D meaningful. If something claims to be a terminal,
+    a failed read is not evidence that nobody was asked."""
+    monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(
+        llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = lambda: True),
+    )
+    with pytest.raises(RuntimeError, match = "was cancelled"):
+        llama_cpp.install_package("cmake", system_type = "debian")
+    assert recorder.calls == []
+
+
+def test_the_real_builtin_raises_ValueError_on_a_closed_stdin():
+    """Pin the CPython behaviour the handler now depends on, rather than trusting it."""
+    import subprocess as _sp
+    # input() writes its prompt to stdout before failing, so mark the answer.
+    probe = (
+        "import sys\n"
+        "sys.stdin.close()\n"
+        "try:\n"
+        "    input('')\n"
+        "except BaseException as e:\n"
+        "    print('RESULT=' + type(e).__name__)\n"
+    )
+    r = _sp.run([sys.executable, "-c", probe], capture_output = True, text = True, timeout = 120)
+    assert "RESULT=ValueError" in r.stdout, r.stdout + r.stderr
