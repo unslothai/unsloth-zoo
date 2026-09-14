@@ -4277,6 +4277,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
+    if use_quantized:
+        from .cce import runtime_cce
+        budget = runtime_cce._CHUNK_BUDGET or runtime_cce._get_memory_budget()
+        base_chunk = max(2048, (lm_layer.weight.shape[0] + 15) // 16)
+        # Keep half-capacity and 256-row projections on the same vocabulary chunks.
+        loss_fn._unsloth_cce_small_capacity_limit = budget // (base_chunk * 4)
     return loss_fn
 
 
@@ -10505,6 +10511,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_cycle_length",
         "_cce_compaction",
         "_cce_dense_batches",
+        "_cce_small_capacity_limit",
     )
 
     def __init__(
@@ -10557,6 +10564,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._planned_widths = None
         self._cce_compaction = False
         self._cce_dense_batches = set()
+        self._cce_small_capacity_limit = 0
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -10637,20 +10645,30 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._planned_widths = planned_widths
         self._mru = None
 
-    def configure_cce_compaction(self, enabled=True, *, max_variants=None):
+    def configure_cce_compaction(self, enabled=True, *, max_variants=None, small_capacity_limit=0):
         self._cce_compaction = bool(enabled)
         self._cce_dense_batches.clear()
+        self._cce_small_capacity_limit = small_capacity_limit if enabled else 0
         plan = self._shape_plan
         if plan is None:
             return None
-        raw = frozenset(key for key in plan.raw_catalog if not key[1].endswith(":cce"))
-        planned = frozenset(key for key in plan.planned_catalog if not key[1].endswith(":cce"))
+        raw = frozenset(key for key in plan.raw_catalog if not key[1].endswith((":cce", ":cce256")))
+        planned = frozenset(key for key in plan.planned_catalog if not key[1].endswith((":cce", ":cce256")))
         max_variants = plan.report.cap if max_variants is None else max_variants
         self._cce_compaction &= 2 * len(planned) <= max_variants
+        if not self._cce_compaction or 3 * len(planned) > max_variants:
+            self._cce_small_capacity_limit = 0
         if self._cce_compaction:
-            # Budget both pytrees: changed processor labels can require the dense fallback.
+            if self._cce_small_capacity_limit:
+                small_raw = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in raw)
+                small_planned = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in planned)
+            else:
+                small_raw = small_planned = frozenset()
+            # Processor labels can require the dense fallback on later visits.
             raw |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in raw)
             planned |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in planned)
+            raw |= small_raw
+            planned |= small_planned
         cap = max(plan.report.cap, len(planned))
         report = replace(plan.report, raw_signatures=len(raw), planned_signatures=len(planned),
                          cap=cap, effective_cap=cap)
@@ -10670,6 +10688,8 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
             # Keep dense slots off the fast path, including later stochastic rebuilds.
             self._cce_dense_batches.add(index)
             return batch
+        if 256 < capacity <= self._cce_small_capacity_limit and len(selected) <= 256:
+            capacity = 256
         indices = np.full((capacity, 2), -1, dtype=np.int32)
         indices[:len(selected)] = selected
         return {**batch, "_unsloth_cce_indices": mx.array(indices)}
