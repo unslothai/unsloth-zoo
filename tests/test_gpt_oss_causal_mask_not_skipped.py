@@ -77,23 +77,60 @@ def wrapper(monkeypatch):
         })
         return "DENSE_MASK"
 
-    # Re-patching is gated on this sentinel, so clear it and restore every binding
-    # the patch touches; conftest fails any test that leaks module state.
+    import transformers.generation.utils as generation_utils
+    import transformers.models.gpt_oss.modeling_gpt_oss as modeling
+
+    # The patch writes to three modules and to GptOssModel itself, and creates names
+    # that were not there before, so snapshot every one of them rather than only the
+    # ones this fixture fakes: leaving any behind points a later in-process forward at
+    # `factory`. Re-patching is gated on `__patched_causal_mask__`, so it also has to go.
+    touched = [
+        (masking_utils, "create_causal_mask"),
+        (masking_utils, "create_sliding_window_causal_mask"),
+        (masking_utils, "create_masks_for_generate"),
+        (masking_utils, "_old_create_causal_mask"),
+        (masking_utils, "_old_create_sliding_window_causal_mask"),
+        (masking_utils, "__patched_causal_mask__"),
+        (generation_utils, "create_masks_for_generate"),
+        (modeling, "create_causal_mask"),
+        (modeling, "create_sliding_window_causal_mask"),
+    ]
+    _MISSING = object()
+    snapshot = [(obj, name, getattr(obj, name, _MISSING)) for obj, name in touched]
+    # A class, so read __dict__: getattr would hand back an inherited forward and
+    # restoring it would define one where the class had none.
+    forward_before = modeling.GptOssModel.__dict__.get("forward", _MISSING)
+
+    def restore():
+        for obj, name, value in snapshot:
+            if value is _MISSING:
+                if hasattr(obj, name):
+                    delattr(obj, name)
+            else:
+                setattr(obj, name, value)
+        if forward_before is _MISSING:
+            if "forward" in modeling.GptOssModel.__dict__:
+                delattr(modeling.GptOssModel, "forward")
+        else:
+            modeling.GptOssModel.forward = forward_before
+
     for name in ("__patched_causal_mask__", "_old_create_causal_mask",
                  "_old_create_sliding_window_causal_mask"):
         if hasattr(masking_utils, name):
-            monkeypatch.delattr(masking_utils, name, raising = False)
-    monkeypatch.setattr(masking_utils, "create_causal_mask", factory, raising = False)
-    monkeypatch.setattr(masking_utils, "create_sliding_window_causal_mask", factory, raising = False)
-    monkeypatch.setattr(masking_utils, "create_masks_for_generate", factory, raising = False)
-    import transformers.generation.utils as generation_utils
-    monkeypatch.setattr(generation_utils, "create_masks_for_generate", factory, raising = False)
+            delattr(masking_utils, name)
+    masking_utils.create_causal_mask = factory
+    masking_utils.create_sliding_window_causal_mask = factory
+    masking_utils.create_masks_for_generate = factory
+    generation_utils.create_masks_for_generate = factory
 
-    gpt_oss.patch_GptOssModel()
-    live = masking_utils.create_causal_mask
-    if live is factory:
-        pytest.skip("patch_GptOssModel declined to install (model gate or import)")
-    return types.SimpleNamespace(fn = live, calls = calls)
+    try:
+        gpt_oss.patch_GptOssModel()
+        live = masking_utils.create_causal_mask
+        if live is factory:
+            pytest.skip("patch_GptOssModel declined to install (model gate or import)")
+        yield types.SimpleNamespace(fn = live, calls = calls)
+    finally:
+        restore()
 
 
 def _config(attn_implementation, training = None):
