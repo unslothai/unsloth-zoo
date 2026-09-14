@@ -234,7 +234,7 @@ def install_spy(monkeypatch):
     monkeypatch.setattr(notebook_deps, "subprocess", types.SimpleNamespace(run=_run))
     monkeypatch.setattr(notebook_deps.shutil, "which", lambda exe: "/usr/bin/uv")
     monkeypatch.setattr(notebook_deps, "_in_venv", lambda: True)
-    monkeypatch.setattr(notebook_deps, "_attempted", set())
+    monkeypatch.setattr(notebook_deps, "_attempted", {})
     return types.SimpleNamespace(commands=commands, results=results)
 
 
@@ -534,7 +534,7 @@ def test_pip_install_does_not_hand_a_mismatched_kernel_to_uv(
 
     monkeypatch.setattr(notebook_deps, "subprocess", types.SimpleNamespace(run = _run))
     monkeypatch.setattr(notebook_deps.shutil, "which", lambda exe: "/usr/bin/uv")
-    monkeypatch.setattr(notebook_deps, "_attempted", set())
+    monkeypatch.setattr(notebook_deps, "_attempted", {})
     monkeypatch.setenv("VIRTUAL_ENV", str(two_environments.b))
 
     assert notebook_deps._pip_install("addict") is True
@@ -553,7 +553,7 @@ def package_manager_spy(monkeypatch):
         return types.SimpleNamespace(returncode = 0, stdout = "", stderr = "")
 
     monkeypatch.setattr(notebook_deps, "subprocess", types.SimpleNamespace(run = _run))
-    monkeypatch.setattr(notebook_deps, "_attempted", set())
+    monkeypatch.setattr(notebook_deps, "_attempted", {})
     for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(_off, raising = False)
     return commands

@@ -21,6 +21,7 @@ All CPU only, no real installs: `subprocess.run` is stubbed throughout.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import subprocess
 import sys
 import threading
@@ -286,3 +287,57 @@ def test_module_source_falls_back_to_reading_the_file(tmp_path, monkeypatch):
     module.__file__ = str(path)
     module.__loader__ = object()          # no get_source attribute
     assert nd._module_source(module) == "VALUE = 1\n"
+
+
+def test_a_waiting_thread_sees_the_other_thread_s_success(monkeypatch):
+    """The lock alone made the loser fail fast, which is its own wrong answer.
+
+    Thread B used to find the package already claimed, return False immediately, and let
+    its caller re-raise the original ImportError for a package thread A was about to
+    install successfully. B now waits for A's attempt and then re-probes."""
+    started = threading.Event()
+    release = threading.Event()
+    installed = {"done": False}
+
+    def _slow_run(cmd, *args, **kwargs):
+        started.set()
+        release.wait(timeout = 10)
+        installed["done"] = True
+        return types.SimpleNamespace(returncode = 0, stdout = "", stderr = "")
+
+    monkeypatch.setattr(subprocess, "run", _slow_run)
+    monkeypatch.setattr(nd.shutil, "which", lambda _name: None)
+    # Importability follows the install, so a premature answer is visible as False.
+    monkeypatch.setattr(nd, "_importable", lambda _name: installed["done"])
+    monkeypatch.setattr(nd, "_auto_install_enabled", lambda: True)
+    monkeypatch.setattr(nd, "_no_network", lambda: False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda _name: None)
+
+    results = {}
+
+    def _owner():
+        results["a"] = nd._try_install_and_import("einops")
+
+    def _waiter():
+        started.wait(timeout = 10)      # make sure A owns the attempt first
+        results["b"] = nd._try_install_and_import("einops")
+
+    a = threading.Thread(target = _owner)
+    b = threading.Thread(target = _waiter)
+    a.start(); b.start()
+    started.wait(timeout = 10)
+    release.set()
+    a.join(timeout = 20); b.join(timeout = 20)
+
+    assert results.get("a") is True, "the owning thread should have installed it"
+    assert results.get("b") is True, (
+        "the waiting thread reported failure for a package the other thread installed"
+    )
+
+
+def test_the_waiter_is_bounded(monkeypatch):
+    """A hung installer must not hang every other thread forever."""
+    assert isinstance(nd._ATTEMPT_WAIT_SECONDS, (int, float))
+    assert nd._ATTEMPT_WAIT_SECONDS > 300, (
+        "the wait has to outlive the 300s subprocess timeout plus the pip fallback"
+    )

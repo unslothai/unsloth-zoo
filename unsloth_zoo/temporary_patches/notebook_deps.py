@@ -82,12 +82,18 @@ def _no_network() -> bool:
         or _env_is_true("TRANSFORMERS_OFFLINE")
         or _env_is_true("HF_DATASETS_OFFLINE")
     )
-_attempted: set = set()
-# Guards the check-then-act on _attempted. Two threads hitting the same missing
-# backend could otherwise both pass the membership test and launch two pip
-# processes against one prefix, which is a known way to leave a half-unpacked
-# dist-info behind.
+# pkg -> Event, set once that package's one attempt has finished. An Event rather than
+# a set so a second thread can WAIT for the first instead of reporting failure while the
+# install is still running, which would re-raise the original ImportError for a package
+# that is about to exist.
+_attempted: dict = {}
+# Guards the check-then-claim on _attempted. Two threads hitting the same missing backend
+# could otherwise both pass the membership test and launch two pip processes against one
+# prefix, which is a known way to leave a half-unpacked dist-info behind.
 _attempt_lock = threading.Lock()
+# Slightly over the 300s subprocess timeout plus the uv-then-pip fallback, so a waiter
+# outlives the worst-case attempt instead of giving up early on a healthy install.
+_ATTEMPT_WAIT_SECONDS = 620
 
 # Distributions whose REPLACEMENT would corrupt the running process: compiled
 # extensions already loaded by torch, and torch itself. Nothing in _ALLOW_LIST is
@@ -260,16 +266,28 @@ def _pip_install(pkg: str) -> bool:
     if pkg not in _ALLOW_LIST:
         return False
     with _attempt_lock:
-        if pkg in _attempted:
-            return False
-        _attempted.add(pkg)
-    if shutil.which("uv") and _in_venv():
-        ok, retry_with_pip = _run_install(pkg, _uv_command(pkg))
-        if ok:
-            return True
-        if not retry_with_pip:
-            return False
-    return _run_install(pkg, _pip_command(pkg))[0]
+        finished = _attempted.get(pkg)
+        if finished is None:
+            finished = _attempted[pkg] = threading.Event()
+            ours = True
+        else:
+            ours = False
+    if not ours:
+        # Someone else owns this package's single attempt. Wait for it to finish and let
+        # the caller re-probe importability, rather than returning a failure for a package
+        # that another thread is in the middle of installing successfully.
+        finished.wait(timeout = _ATTEMPT_WAIT_SECONDS)
+        return False
+    try:
+        if shutil.which("uv") and _in_venv():
+            ok, retry_with_pip = _run_install(pkg, _uv_command(pkg))
+            if ok:
+                return True
+            if not retry_with_pip:
+                return False
+        return _run_install(pkg, _pip_command(pkg))[0]
+    finally:
+        finished.set()
 
 
 def _importable(import_name: str) -> bool:
@@ -291,7 +309,9 @@ def _try_install_and_import(pkg: str) -> bool:
     if importlib.util.find_spec(import_name) is not None and _importable(import_name):
         return True
     if not _pip_install(pkg):
-        return False
+        # Not necessarily a failure: another thread may have owned the attempt and
+        # completed it while we waited, so ask the interpreter rather than assuming.
+        return _importable(import_name)
     return _importable(import_name)
 
 
