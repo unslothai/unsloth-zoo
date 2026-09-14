@@ -1370,10 +1370,13 @@ def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     model.get_input_embeddings = lambda *args, **kwargs: None
     ids = mx.arange(1026).reshape(2, 513)
     batch = {"input_ids": ids, "labels": mx.where((ids % 11) == 5, ids, -100)}
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    small_limit = getattr(loss, "_unsloth_cce_small_capacity_limit", 0)
+    assert bool(small_limit) == quantized
     plan = mlx_utils.FiniteVLMBatchPlan([], [], None, processor=None, config={}, max_seq_length=1024, image_size=None)
-    plan.configure_cce_compaction()
+    plan.configure_cce_compaction(small_capacity_limit=small_limit)
     compact = plan.prepare_cce_batch(0, batch)
-    assert compact["_unsloth_cce_indices"].shape == (512, 2) and "_unsloth_cce_indices" not in batch
+    assert compact["_unsloth_cce_indices"].shape == (256 if quantized else 512, 2) and "_unsloth_cce_indices" not in batch
     def forward(m, b, **kwargs):
         target = b["labels"][:, 1:-4]
         return m.model.embed_tokens(b["input_ids"])[:, :-5], target, (target != -100).sum()
@@ -1387,6 +1390,38 @@ def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=2e-5)
     for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
         assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+
+
+@metal_only
+def test_vlm_cce_small_capacity_admission_and_rebuilds():
+    import numpy as np
+    from unsloth_zoo.mlx.shape_guard import TextShapeGuardReport, TextShapePlan
+
+    plan = mlx_utils.FiniteVLMBatchPlan([], [], None, processor=None, config={}, max_seq_length=2048, image_size=None)
+    catalog = frozenset({("full_step", "update", ("vlm",), 1025)})
+    report = TextShapeGuardReport("exact", "test", 3, "full_step", 1, 1, 1)
+    plan._shape_plan = TextShapePlan(report, catalog, catalog)
+    ids = mx.arange(2050).reshape(2, 1025)
+    sparse = {"labels": mx.where(ids % 17 == 5, ids, -100)}
+    for cap, count, expected in ((2, 2, 1024), (3, 3, 256), (3, 3, 256)):
+        result = plan.configure_cce_compaction(max_variants=cap, small_capacity_limit=1024)
+        assert result.planned_signatures == count
+        prepared = plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"]
+        assert prepared.shape == (expected, 2)
+        selected = np.argwhere(np.asarray(sparse["labels"])[:, 1:] != -100)
+        assert mx.array_equal(prepared[:selected.shape[0]], mx.array(selected)).item()
+        assert mx.all(prepared[selected.shape[0]:] == -1).item()
+    medium = {"labels": mx.where(ids % 5 == 0, ids, -100)}
+    assert plan.prepare_cce_batch(0, medium)["_unsloth_cce_indices"].shape == (1024, 2)
+    assert plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"].shape == (256, 2)
+    dense = {"labels": ids}
+    assert plan.prepare_cce_batch(0, dense) is dense
+    assert plan.prepare_cce_batch(0, sparse) is sparse
+    plan.configure_cce_compaction(max_variants=3, small_capacity_limit=512)
+    assert plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"].shape == (1024, 2)
+    result = plan.configure_cce_compaction(max_variants=3)
+    assert result.planned_signatures == 2
+    assert plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"].shape == (1024, 2)
 
 
 @metal_only

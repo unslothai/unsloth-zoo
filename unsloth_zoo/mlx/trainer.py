@@ -5223,6 +5223,7 @@ class MLXTrainer:
             compaction_report = batches.configure_cce_compaction(
                 getattr(loss_fn, "_unsloth_cce_compaction", False) and distributed_world_size == 1,
                 max_variants=resolve_compile_max_variants(getattr(args, "compile_max_variants", None)),
+                small_capacity_limit=getattr(loss_fn, "_unsloth_cce_small_capacity_limit", 0),
             )
             if compaction_report is not None:
                 _compile_shape_guard_report = compaction_report
