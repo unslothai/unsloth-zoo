@@ -156,8 +156,37 @@ _PINNED_DISTRIBUTIONS = (
     "numpy", "pillow", "transformers",
     "bitsandbytes", "xformers", "flash-attn", "vllm",
 )
+# dist-name -> import-name, for the ones that differ. Used to tell "not installed, so
+# nothing to protect" apart from "installed but unpinnable", which are opposite answers.
+_PINNED_IMPORT_NAMES = {
+    "pillow": "PIL", "flash-attn": "flash_attn",
+}
 _constraints_path = None
 _constraints_lock = threading.Lock()
+
+
+def _unpinnable_critical():
+    """Critical distributions that are importable but carry no readable version.
+
+    A vendor build, a system package or a source tree torch has no dist-info, so
+    importlib.metadata raises and the pin is silently dropped. Treating that as "not
+    installed" is backwards: it is the case where an unconstrained resolver is most
+    likely to replace a torch that is already loaded into a live CUDA process."""
+    unpinnable = []
+    for dist in _PINNED_DISTRIBUTIONS:
+        try:
+            importlib.metadata.version(dist)
+            continue
+        except Exception:
+            pass
+        import_name = _PINNED_IMPORT_NAMES.get(dist, dist.replace("-", "_"))
+        try:
+            if importlib.util.find_spec(import_name) is not None:
+                unpinnable.append(dist)
+        except Exception:
+            # A parent package that refuses to import is not evidence either way.
+            continue
+    return unpinnable
 
 
 def _constraints_file():
@@ -314,6 +343,20 @@ def _pip_install(pkg: str) -> bool:
     # point before a package name reaches a command line, and the name can come
     # from a downloaded trust_remote_code modeling file.
     if pkg not in _ALLOW_LIST:
+        return False
+    # Fail closed. The constraints file is the only thing standing between an allowed
+    # package and a resolver that replaces torch under a live CUDA process, and a
+    # distribution we cannot read a version for is one we cannot pin. Refusing leaves the
+    # original ImportError in place, which is the honest outcome: we could not repair this
+    # without risking something worse.
+    unpinnable = _unpinnable_critical()
+    if unpinnable:
+        logger.warning(
+            f"Unsloth: not auto-installing `{pkg}`: {', '.join(unpinnable)} "
+            f"{'is' if len(unpinnable) == 1 else 'are'} installed without readable "
+            f"version metadata, so it cannot be protected from being replaced. "
+            f"Install `{pkg}` manually if you need it."
+        )
         return False
     with _attempt_lock:
         finished = _attempted.get(pkg)

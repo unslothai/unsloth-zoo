@@ -535,3 +535,53 @@ def test_transformers_placeholder_modules_are_still_skipped(monkeypatch):
     nd._replay_skipped_guarded_imports(iu, "timm")
 
     assert placeholder not in seen, "a synthetic placeholder was reported as uninspectable"
+
+
+# ------------------------------------------------- the constraints file must fail closed
+
+def test_an_unpinnable_critical_distribution_blocks_the_install(monkeypatch):
+    """A vendor build, a system package or a source tree torch has no dist-info, so
+    importlib.metadata raises and the pin was silently dropped. That is backwards: it is
+    exactly the case where an unconstrained resolver is most likely to replace a torch
+    already loaded into a live CUDA process."""
+    def _no_metadata(name):
+        if name == "torch":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return "1.0.0"
+
+    monkeypatch.setattr(importlib.metadata, "version", _no_metadata)
+    # torch is importable: it is installed, just not readable.
+    monkeypatch.setattr(nd, "_auto_install_enabled", lambda: True)
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: ran.append(a))
+
+    assert nd._unpinnable_critical() == ["torch"]
+    assert nd._pip_install("timm") is False
+    assert ran == [], "pip ran unconstrained against an unpinnable torch"
+
+
+def test_a_critical_package_that_is_simply_absent_does_not_block(monkeypatch):
+    """Not installed and installed-but-unreadable are opposite answers. Only the second
+    is dangerous, and treating the first as dangerous would disable the feature on every
+    machine without, say, vllm."""
+    def _no_metadata(name):
+        if name == "vllm":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return "1.0.0"
+
+    monkeypatch.setattr(importlib.metadata, "version", _no_metadata)
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        importlib.util, "find_spec",
+        lambda name, *a, **k: None if name == "vllm" else real_find_spec(name, *a, **k),
+    )
+    assert nd._unpinnable_critical() == []
+
+
+def test_the_import_names_that_differ_from_the_dist_names_are_mapped():
+    """`pillow` imports as PIL and `flash-attn` as flash_attn. Probing the dist name would
+    report them absent and quietly drop their pins."""
+    assert nd._PINNED_IMPORT_NAMES["pillow"] == "PIL"
+    assert nd._PINNED_IMPORT_NAMES["flash-attn"] == "flash_attn"
+    for dist in nd._PINNED_DISTRIBUTIONS:
+        assert dist in nd._PINNED_IMPORT_NAMES or "-" not in dist, dist
