@@ -608,43 +608,60 @@ jobs:
           print("declared ceiling", max(declared), "at or below the policy ceiling", CEILING)
           PY
 
+      # The five "Fail if ... skipped" gates below used to re-run their pytest
+      # file a second time and grep the output, which cost 51-62s of a ~290s job
+      # to learn what the first run already knew. Each gated run now writes a
+      # JUnit XML report and the gate reads it. Same policies, one execution:
+      # scripts/pytest_junit_gate.py documents which policy is which and fails
+      # loudly if the report is missing, empty, truncated or records no tests.
+      # The pytest step itself still decides on its own exit status, and the
+      # files still run one process each -- tests/mlx_simulation/ replaces
+      # sys.modules["mlx.core"] process-wide.
       - name: pytest tests/test_mlx_quantized_optimizer_state.py (HARD GATE)
-        # -rs surfaces skips; the next step fails the job if the file skipped,
-        # because a skipped numeric suite is not a gate.
-        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+        # -rs surfaces skips in the log; the next step fails the job if the file
+        # skipped, because a skipped numeric suite is not a gate.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml"
 
       - name: Fail if the numeric tests skipped
         run: |
-          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -q -rs | tee out.txt
-          if grep -qiE '[0-9]+ skipped' out.txt; then
-            echo "real mlx is installed but the numeric tests skipped"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the numeric tests skipped"
 
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are
         # pure logic over a synthetic module tree: real mlx, no Metal, no
         # downloads. The metal_only half skips here and runs on the mlx job.
-        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/neftune_quant_map.xml"
 
       - name: Fail if the NEFTune logic tests all skipped
+        # one-passed, not no-skips: the metal_only half of this file is expected
+        # to skip here.
         run: |
-          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -q -rs | tee neftune.txt
-          if ! grep -qiE '[1-9][0-9]* passed' neftune.txt; then
-            echo "real mlx is installed but no NEFTune logic test ran"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/neftune_quant_map.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no NEFTune logic test ran"
 
       - name: tests/test_mlx_rng_rewind.py (HARD GATE)
         # PRNG capture/rewind across the compile fallbacks. Needs mlx core, not
         # Metal, so it gates here; the Apple Silicon lane is opt-in and usually
         # skipped, which guards nothing on a pull request.
-        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/rng_rewind.xml"
 
       - name: Fail if the RNG rewind tests skipped
         run: |
-          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -q -rs | tee rng.txt
-          if grep -qiE '[0-9]+ skipped' rng.txt; then
-            echo "real mlx is installed but the RNG rewind tests skipped"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/rng_rewind.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the RNG rewind tests skipped"
 
       # One pytest process per file: tests/mlx_simulation/ replaces
       # sys.modules["mlx.core"] process-wide, disarming whatever runs after it.
@@ -670,16 +687,20 @@ jobs:
       # gated on every PR here rather than only in the label-gated Apple Silicon
       # lane; the Metal-only half is that lane's job.
       - name: tests/test_mlx_quantized_merge_save.py
-        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/quantized_merge_save.xml"
 
       - name: Fail if the merged_4bit quantize tests skipped
         # The file skips wholesale on anything that stops mlx_lm.tuner.lora
         # importing, so without this the gate can go green having run nothing.
+        # That whole-module skip is one <skipped> testcase in the report, so
+        # one-passed catches it; "no failures" would not.
         run: |
-          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -q -rs | tee qms.txt
-          if ! grep -qiE '[1-9][0-9]* passed' qms.txt; then
-            echo "real mlx is installed but no merged_4bit quantize test ran"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/quantized_merge_save.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no merged_4bit quantize test ran"
 
       # The three gated-delta files ran in no workflow at all: this lane's list
       # omitted them and the Apple Silicon lane, which is opt-in behind the `mlx`
@@ -697,14 +718,16 @@ jobs:
         # Gradient parity vs plain autodiff at B >= 2. Every test here needs the
         # real runtime, so under the torch shim the file skips wholesale -- which
         # is exactly what the gate below refuses to accept as a pass.
-        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -v -rs
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/gated_delta_batch_grad.xml"
 
       - name: Fail if the gated-delta gradient tests skipped
         run: |
-          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -q -rs | tee gd.txt
-          if ! grep -qiE '[1-9][0-9]* passed' gd.txt; then
-            echo "real mlx is installed but no gated-delta gradient test ran"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/gated_delta_batch_grad.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no gated-delta gradient test ran"
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
