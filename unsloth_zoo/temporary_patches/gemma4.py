@@ -1199,7 +1199,10 @@ def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Te
     output = self._norm(x.float())
     if getattr(self, "with_scale", True) and hasattr(self, "weight"):
         output = output * self.weight.float()
-    return output.type_as(x)
+    # Stay in float32: the only caller casts to the projection's own dtype next,
+    # and a bfloat16 hop here would throw away the precision this patch exists
+    # to keep (measured 1.9e-3 relative on an fp32 projector).
+    return output
 
 def patch_Gemma4MultimodalEmbedder_forward():
     """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
