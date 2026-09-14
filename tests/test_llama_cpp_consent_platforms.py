@@ -320,3 +320,46 @@ def test_an_existing_install_is_unaffected_by_the_opt_out(monkeypatch, tmp_path)
     import inspect as _inspect
     src = _inspect.getsource(llama_cpp.install_llama_cpp)
     assert "(needs_build or needs_clone) and not _auto_install_enabled()" in src
+
+
+def test_a_refusal_does_not_wipe_a_corrupted_folder(monkeypatch, tmp_path):
+    """The corrupted-checkout branch used to rmtree before the opt-out was consulted, so
+    an explicit refusal still destroyed the folder and only then reported the refusal.
+    llama_cpp_folder can be a custom path holding the user's own files."""
+    folder = tmp_path / "llama.cpp"
+    folder.mkdir()
+    # No src/ggml/common and no prebuilt marker, so it reads as corrupted.
+    keep = folder / "my_own_notes.txt"
+    keep.write_text("do not delete me")
+
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
+        llama_cpp.install_llama_cpp(llama_cpp_folder = str(folder))
+
+    assert folder.is_dir(), "the folder was deleted despite the refusal"
+    assert keep.read_text() == "do not delete me", "user files were destroyed"
+
+
+def test_a_corrupted_folder_is_still_wiped_when_installing_is_allowed(monkeypatch, tmp_path):
+    """Deferring the deletion must not stop it happening on the normal path."""
+    folder = tmp_path / "llama.cpp"
+    folder.mkdir()
+    (folder / "junk.txt").write_text("stale")
+
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
+    seen = {}
+
+    def _stop_here(*args, **kwargs):
+        seen["reached_install"] = True
+        raise RuntimeError("stop after the wipe")
+
+    monkeypatch.setattr(llama_cpp, "_maybe_install_llama_cpp_prebuilt", _stop_here)
+    # tmp_path is neither under ~/.unsloth nor ./llama.cpp, so the real guard would
+    # refuse. That guard is unrelated to this test and is covered on its own.
+    monkeypatch.setattr(llama_cpp, "_is_safe_to_delete", lambda _path: True)
+
+    with pytest.raises(RuntimeError, match = "stop after the wipe"):
+        llama_cpp.install_llama_cpp(llama_cpp_folder = str(folder))
+
+    assert seen.get("reached_install"), "never got past the wipe"
+    assert not folder.exists(), "the corrupted folder was not re-cloned from scratch"

@@ -1275,6 +1275,7 @@ def install_llama_cpp(
 
     needs_clone = False
     needs_build = False
+    needs_wipe  = False
 
     # Ensure ~/.unsloth/ exists before we try to use it
     os.makedirs(UNSLOTH_HOME, exist_ok=True)
@@ -1304,14 +1305,11 @@ def install_llama_cpp(
         is_prebuilt_install = os.path.isfile(os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME))
         if not (is_source_checkout or is_prebuilt_install):
             print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
-            # C4: Only delete if the path is safe
-            if _is_safe_to_delete(llama_cpp_folder):
-                shutil.rmtree(llama_cpp_folder)
-            else:
-                raise RuntimeError(
-                    f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
-                    f"Please manually remove or fix it."
-                )
+            # Deleting is part of installing, so it waits for the opt-out check below.
+            # `llama_cpp_folder` can be a custom path holding the user's own files, and
+            # wiping it only to then report that installation was declined would be the
+            # worst of both outcomes.
+            needs_wipe = True
             needs_clone = True
             needs_build = True
         else:
@@ -1341,6 +1339,16 @@ def install_llama_cpp(
             "(UNSLOTH_AUTO_INSTALL=0)!\n"\
             "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
         )
+
+    if needs_wipe:
+        # C4: Only delete if the path is safe
+        if _is_safe_to_delete(llama_cpp_folder):
+            shutil.rmtree(llama_cpp_folder)
+        else:
+            raise RuntimeError(
+                f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
+                f"Please manually remove or fix it."
+            )
 
     # Prefer official prebuilt binaries before any source-build work
     # (no system package installs, no clone, no compile).
