@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
+import functools
 import inspect
 from .common import (
     TEMPORARY_PATCHES,
@@ -51,6 +52,11 @@ torch_cuda_device = torch.cuda.device
 
 # UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels); else dequantized to bf16 for LoRA.
 UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
+
+# Set when patch_GptOssAttention installs the forward that routes training through
+# flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
+_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
+_TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
 
 
 def _check_triton_kernels_available():
@@ -2531,6 +2537,13 @@ def patch_GptOssAttention():
 
     functions.append(forward)
     patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
+    # forward_function picks flex_attention_with_sink from self.training alone, so
+    # once it is live, training ignores whatever mask the factories build.
+    global _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
+    _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = (
+        getattr(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention.forward, "__module__", "")
+        == forward_function.__module__
+    )
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
@@ -2559,6 +2572,35 @@ def patch_GptOssModel():
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
     import transformers.generation.utils
+    def _find_config(args, kwargs):
+        config = kwargs.get("config", None)
+        if config is None:
+            for arg in args:
+                if hasattr(arg, "_attn_implementation"):
+                    config = arg
+                    break
+        return config
+
+    # Records self.training on the config so the mask wrapper can key on the state
+    # that selects the attention backend instead of guessing from requires_grad.
+    def _record_training_state(GptOssModel):
+        original = getattr(GptOssModel, "forward", None)
+        if original is None or getattr(original, _TRAINING_FLAG_ATTR, False):
+            return
+        @functools.wraps(original)
+        def forward(self, *args, **kwargs):
+            config = getattr(self, "config", None)
+            previous = getattr(config, _TRAINING_FLAG_ATTR, None)
+            if config is not None:
+                setattr(config, _TRAINING_FLAG_ATTR, bool(self.training))
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                if config is not None:
+                    setattr(config, _TRAINING_FLAG_ATTR, previous)
+        setattr(forward, _TRAINING_FLAG_ATTR, True)
+        GptOssModel.forward = forward
+
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
             input_embeds = kwargs.get("input_embeds", None)
@@ -2570,7 +2612,25 @@ def patch_GptOssModel():
                         input_embeds = arg
                         break
 
-            if input_embeds is not None and input_embeds.requires_grad:
+            # Skipping is only safe when flex_attention_with_sink takes over and
+            # ignores this mask, which it picks on self.training, not on
+            # _attn_implementation. `requires_grad` is not a training signal:
+            # enable_input_require_grads() fires on every LoRA-capable load, so
+            # skipping there hands eager attention no causal mask at all.
+            _config = _find_config(args, kwargs)
+            _is_flex = getattr(_config, "_attn_implementation", None) == "flex_attention"
+            _training = getattr(_config, _TRAINING_FLAG_ATTR, None)
+            if _training is None:
+                # Unusual caller, no model forward recorded it: at least exclude
+                # no_grad inference.
+                _training = bool(
+                    torch.is_grad_enabled()
+                    and input_embeds is not None
+                    and input_embeds.requires_grad
+                )
+            # Only zoo's patched forward builds its own BlockMask; stock flex takes
+            # causality from whatever this returns, so a flex config is not enough.
+            if _training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:
@@ -2591,21 +2651,13 @@ def patch_GptOssModel():
                 #       'Tensor' and 'BlockMask'
                 # Temporarily swap to eager so the factory returns a dense
                 # 4D float mask (0 / -inf) the eager path can consume.
-                config = kwargs.get("config", None)
-                if config is None:
-                    for arg in args:
-                        if hasattr(arg, "_attn_implementation"):
-                            config = arg
-                            break
-                if config is not None and getattr(
-                    config, "_attn_implementation", None
-                ) == "flex_attention":
-                    original_impl = config._attn_implementation
-                    config._attn_implementation = "eager"
+                if _is_flex:
+                    original_impl = _config._attn_implementation
+                    _config._attn_implementation = "eager"
                     try:
                         return f(*args, **kwargs)
                     finally:
-                        config._attn_implementation = original_impl
+                        _config._attn_implementation = original_impl
                 return f(*args, **kwargs)
             pass
         return return_attention_mask
@@ -2958,11 +3010,10 @@ def patch_GptOssModel():
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
-            # During training, flex_attention_with_sink creates its own sparse
-            # BlockMask and ignores the attention_mask argument entirely.
-            # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
-            # which causes OOM at long context lengths (e.g. 500K tokens).
-            if self.training:
+            # flex_attention_with_sink builds its own BlockMask, so dropping the dense
+            # one avoids an O(seq_len^2) allocation that OOMs at long context. Only that
+            # forward ignores it: without it, stock attention loses causality entirely.
+            if self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 attention_mask = None
 
             # Accumulate hidden states if requested
@@ -3005,6 +3056,9 @@ def patch_GptOssModel():
             })
 
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
+    # After the replacement, so the recorder wraps whichever forward ended up live:
+    # zoo's own, or stock when the signature did not match.
+    _record_training_state(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel)
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
 
