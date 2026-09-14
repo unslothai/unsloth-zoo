@@ -15,7 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import ast
-import contextlib
 import inspect
 import linecache
 import sys
@@ -1204,6 +1203,11 @@ def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Te
     # to keep (measured 1.9e-3 relative on an fp32 projector).
     return output
 
+# Devices whose autocast accepts float32. ROCm reports "cuda", so AMD is covered;
+# CPU and MPS reject it and take the weight-dtype path.
+_FLOAT32_AUTOCAST_DEVICES = ("cuda", "xpu")
+
+
 def patch_Gemma4MultimodalEmbedder_forward():
     """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
     try:
@@ -1219,21 +1223,18 @@ def patch_Gemma4MultimodalEmbedder_forward():
         # lives only in `forward`, so reading `.weight` trains the adapter that
         # finetune_vision_layers attaches here to exactly zero effect.
         projection = self.embedding_projection
-        # The projection's own dtype: fp32 when SKIP_QUANTIZATION_MODULES kept it
-        # there, and feeding fp32 to a half Linear would raise rather than upcast.
-        weight = getattr(projection, "weight", None)
-        compute_dtype = torch.float32 if weight is None else weight.dtype
-        emb_norm = emb_norm.to(compute_dtype)
-        # torch autocasts nn.Linear by the context, not by the dtypes passed in,
-        # so under the usual bf16 autocast this GEMM would run in bf16 anyway and
-        # the float32 above would buy nothing (measured 2.5e-1 max). Disabling
-        # beats autocast(dtype=float32): it is accepted on every backend.
-        try:
-            autocast_off = torch.autocast(device_type = emb_norm.device.type, enabled = False)
-        except (RuntimeError, ValueError):
-            autocast_off = contextlib.nullcontext()
-        with autocast_off:
-            emb_norm_proj = projection(emb_norm)
+        # autocast(dtype=float32) is the only form that delivers a float32 GEMM
+        # here: it promotes the weight too, so a plain bfloat16 load is covered.
+        # enabled=False leaves a half weight half, and the float32 input then
+        # raises. CPU autocast rejects float32, so there match the weight instead.
+        device_type = emb_norm.device.type
+        if device_type in _FLOAT32_AUTOCAST_DEVICES:
+            with torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True):
+                emb_norm_proj = projection(emb_norm.float())
+        else:
+            weight = getattr(projection, "weight", None)
+            compute_dtype = torch.float32 if weight is None else weight.dtype
+            emb_norm_proj = projection(emb_norm.to(compute_dtype))
         return emb_norm_proj.to(old_dtype)
     try:
         patch_function(

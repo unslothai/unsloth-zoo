@@ -167,6 +167,7 @@ def test_projection_stays_float32_inside_an_autocast_context():
     import torch
 
     from unsloth_zoo.temporary_patches.gemma4 import (
+        _FLOAT32_AUTOCAST_DEVICES,
         _Gemma4MultimodalEmbedder_RMSNorm_forward,
     )
 
@@ -197,16 +198,19 @@ def test_projection_stays_float32_inside_an_autocast_context():
             projection = self.embedding_projection
             weight = getattr(projection, "weight", None)
             compute_dtype = torch.float32 if weight is None else weight.dtype
-            emb_norm = emb_norm.to(compute_dtype)
-            with torch.autocast(device_type = emb_norm.device.type, enabled = False):
-                out = projection(emb_norm)
-            assert out.dtype == torch.float32, (
-                f"projection ran in {out.dtype}, autocast was not disabled"
-            )
+            device_type = emb_norm.device.type
+            if device_type in _FLOAT32_AUTOCAST_DEVICES:
+                with torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True):
+                    out = projection(emb_norm.float())
+                assert out.dtype == torch.float32, (
+                    f"projection ran in {out.dtype}, float32 autocast did not hold"
+                )
+            else:
+                out = projection(emb_norm.to(compute_dtype))
             return out.to(old_dtype)
 
     torch.manual_seed(0)
-    model = Embedder().to(device, torch.float32)
+    model = Embedder().to(device, torch.bfloat16)      # a plain bf16 load
     x = (torch.randn(2, 16, device = device) * 10.0).to(torch.bfloat16)
 
     with torch.autocast(device_type = device, dtype = torch.bfloat16):
