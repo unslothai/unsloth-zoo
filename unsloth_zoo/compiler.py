@@ -4468,8 +4468,7 @@ DISABLE_COMPILE_MODULES = [
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
     "Qwen3_5MoeGatedDeltaNet",
-    # Vision components - prevent torch.compile on vision encoders and embedders
-    # to avoid numerical precision issues in spatial localization (Issue #6028)
+    # Vision encoders and embedders: spatial precision (#6028).
     "Gemma4VisionPatchEmbedder",
     "Gemma4VisionModel",
     "Gemma4VisionEncoder",
@@ -5498,12 +5497,9 @@ def unsloth_compile_transformers(
             pass
         pass
     pass
-    # Add back to functions since failed compiling.
-    # `functions` is the import allow-list for the generated cache (see
-    # `create_new_function`), not a compile list: compilation is gated by the
-    # `bad_torch_modules` checks further down. Modules that failed to compile
-    # are still *referenced* by the emitted classes, so they must stay
-    # importable or the cache raises NameError when it constructs them.
+    # `functions` is the generated cache's import allow-list, not a compile list.
+    # Uncompiled modules are still referenced by the emitted classes, so dropping
+    # them here makes the cache raise NameError when it constructs them.
     functions += list(bad_torch_modules)
 
     if len(pretrained_modules) > 0:

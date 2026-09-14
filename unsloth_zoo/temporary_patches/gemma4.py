@@ -1189,9 +1189,8 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4VisionPoolerFP16)
 
 
-# Gemma4MultimodalEmbedder patch - force float32 for projection stability
-# The projection (embedding_projection) loses spatial precision in bf16/fp16.
-# Mirror of patch_Gemma3nMultimodalEmbedder_forward.
+# Force float32 through embedding_projection, which loses spatial precision in
+# bf16/fp16. Mirror of patch_Gemma3nMultimodalEmbedder_forward.
 # ============================================================================
 
 @torch_compile
@@ -1214,21 +1213,13 @@ def patch_Gemma4MultimodalEmbedder_forward():
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         old_dtype = inputs_embeds.dtype
-        # Compute norm in float32
         emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
-        # Call the module rather than reading `.weight`: PEFT replaces
-        # `embedding_projection` with a `lora.Linear` whose delta is applied only
-        # inside its `forward`, and `.weight` on the wrapper resolves to the
-        # frozen base weight. Reading it drops the LoRA contribution entirely,
-        # so an adapter on this projector would train to zero effect
-        # (`finetune_vision_layers` / `finetune_audio_layers` attach one here).
-        # The projector is in SKIP_QUANTIZATION_MODULES, so in a real load both
-        # the base GEMM and the LoRA delta still run in fp32. Matches gemma3n.
+        # Call the module, never `.weight`: on a PEFT `lora.Linear` the delta
+        # lives only in `forward`, so reading `.weight` trains the adapter that
+        # finetune_vision_layers attaches here to exactly zero effect.
         projection = self.embedding_projection
-        # Feed the projection the dtype its weights actually hold. When the
-        # projector is kept in fp32 (the SKIP_QUANTIZATION_MODULES case) this is
-        # fp32 and the spatial precision is preserved; when it is not, passing
-        # fp32 into a half-precision Linear would raise rather than upcast.
+        # The projection's own dtype: fp32 when SKIP_QUANTIZATION_MODULES kept it
+        # there, and feeding fp32 to a half Linear would raise rather than upcast.
         weight = getattr(projection, "weight", None)
         compute_dtype = torch.float32 if weight is None else weight.dtype
         emb_norm_proj = projection(emb_norm.to(compute_dtype))
@@ -1254,16 +1245,15 @@ def patch_Gemma4_static_cache_backport(phase = "post_compile"):
     hence the guard below: it runs only when unsloth has no gate of its own.
     """
     if phase != "post_compile": return
-    # unsloth_zoo must not import unsloth, so look in sys.modules only. Absent
-    # means it is too early to tell, and doing nothing is the safe answer.
+    # unsloth_zoo must not import unsloth: sys.modules only, and absent means
+    # too early to tell, so do nothing.
     vision = sys.modules.get("unsloth.models.vision")
     if vision is None or hasattr(vision, "_needs_bidirectional_multimodal_mask"): return
     for name in ("gemma4", "gemma4_unified"):
         module = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
         if module is None: continue
         for obj in vars(module).values():
-            # Only the classes that build the overlay, i.e. those that override
-            # create_masks_for_generate. Causal VLMs keep the static path.
+            # Only overlay builders; causal VLMs keep the static path.
             if isinstance(obj, type) and "create_masks_for_generate" in vars(obj):
                 obj._supports_static_cache = False
 pass
