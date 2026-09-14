@@ -256,9 +256,8 @@ def test_positional_embeds_are_recognised(wrapper, flex_installed):
 
 
 def test_model_forward_drops_the_mask_only_when_the_flex_forward_is_installed():
-    """zoo's own GptOssModel.forward drops attention_mask during training for the same
-    reason the wrapper skips it, so it has to be gated on the same flag. Read as AST:
-    a bare `if self.training: attention_mask = None` is the defect."""
+    """The same drop happens inside zoo's GptOssModel.forward, so it needs the same
+    flag: a bare `if self.training: attention_mask = None` is the defect."""
     import ast
     import inspect
     import textwrap

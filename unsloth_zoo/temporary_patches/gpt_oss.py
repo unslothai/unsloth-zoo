@@ -2628,9 +2628,8 @@ def patch_GptOssModel():
                     and input_embeds is not None
                     and input_embeds.requires_grad
                 )
-            # Only zoo's patched forward builds its own BlockMask. Stock transformers
-            # flex attention takes causality from whatever this factory returns, so a
-            # flex _attn_implementation on its own is not a reason to skip.
+            # Only zoo's patched forward builds its own BlockMask; stock flex takes
+            # causality from whatever this returns, so a flex config is not enough.
             if _training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
@@ -3011,12 +3010,9 @@ def patch_GptOssModel():
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
-            # During training, flex_attention_with_sink creates its own sparse
-            # BlockMask and ignores the attention_mask argument entirely, so dropping
-            # the dense 4D mask avoids an O(seq_len^2) allocation that OOMs at long
-            # context (e.g. 500K tokens). Only that forward ignores it: if the
-            # attention patch did not install, stock attention runs and a dropped mask
-            # would mean no causal masking at all.
+            # flex_attention_with_sink builds its own BlockMask, so dropping the dense
+            # one avoids an O(seq_len^2) allocation that OOMs at long context. Only that
+            # forward ignores it: without it, stock attention loses causality entirely.
             if self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 attention_mask = None
 
