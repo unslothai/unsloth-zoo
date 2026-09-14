@@ -182,14 +182,26 @@ def test_the_unblock_is_conditional_on_the_opt_out_being_clear():
     import inspect
     import textwrap
 
+    def _tests_the_opt_out_is_clear(test):
+        """`not _no_flashinfer`, on its own or as one conjunct of an `and` chain.
+
+        The re-probe unblock is additionally gated on there being no live owner of the
+        block (see test_the_reprobe_unblock_also_respects_owners), so insisting on a bare
+        `not _no_flashinfer` here would just forbid that second, narrowing condition.
+        """
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            return any(_tests_the_opt_out_is_clear(v) for v in test.values)
+        return (
+            isinstance(test, ast.UnaryOp)
+            and isinstance(test.op, ast.Not)
+            and getattr(test.operand, "id", "") == "_no_flashinfer"
+        )
+
     tree = ast.parse(textwrap.dedent(inspect.getsource(vllm_utils.load_vllm)))
     guards = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.UnaryOp)
-        and isinstance(node.test.op, ast.Not)
-        and getattr(node.test.operand, "id", "") == "_no_flashinfer"
+        if isinstance(node, ast.If) and _tests_the_opt_out_is_clear(node.test)
     ]
     assert len(guards) == 1, "the unblock is not guarded on the opt-out being clear"
     calls = [
