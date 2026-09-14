@@ -75,3 +75,31 @@ def test_patch_gpt_oss_scopes_tensor_parallel_to_load_and_swizzle():
     assert "load_and_swizzle_ready" in src
     assert "shard_and_distribute_module = None" in src
     assert "skip_patch(" in src
+
+
+def test_patch_gpt_oss_does_not_nest_expert_classes_under_matmul_ogs_guard():
+    """Keep class bodies at function indent; gate only patch_function calls."""
+    src = _patch_gpt_oss_source()
+    tree = ast.parse(src)
+    fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef)
+
+    class_names = {
+        node.name
+        for node in fn.body
+        if isinstance(node, ast.ClassDef)
+    }
+    assert "Mxfp4GptOssExperts_Training" in class_names
+    assert "Mxfp4GptOssExperts" in class_names
+
+    nested = []
+    for node in fn.body:
+        if not isinstance(node, ast.If):
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.ClassDef) and child.name in {
+                "Mxfp4GptOssExperts_Training",
+                "Mxfp4GptOssExperts",
+            }:
+                nested.append(child.name)
+    assert nested == []
