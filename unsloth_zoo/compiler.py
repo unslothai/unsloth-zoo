@@ -135,7 +135,11 @@ DISABLED_KEYWORDS = [
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
     "causal_mask[start:end, start:end] = 0",  # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING",  # Gemma3 create_masks_for_generate
-    "create_causal_mask(**mask_kwargs)",  # Gemma3 create_masks_for_generate
+    # A `create_causal_mask(**mask_kwargs)` literal used to live here. Do not put one
+    # back: transformers added `block_sequence_ids=` to that exact call in Gemma3, the
+    # substring stopped matching, and `create_masks_for_vision_model` was compiled with
+    # fullgraph = True until it died on the tensor branch inside `flex_attention_mask`.
+    # `calls_mask_creation_function` now recognises the call whatever its arguments.
     "create_causal_mask_mapping",        # Gemma3 5.x (raises ValueError, can't be compiled)
     "return inner_mask",  # Gemma3 token_type_ids_mask_function returns closure, can't trace generator
     "compute_mup_vector",  # used in falcon h1 init and not needed to compile + inductor complains
@@ -185,6 +189,25 @@ def calls_disable_compile_function(source, disable_compile_functions):
         for name in disable_compile_functions
         if re.search(r"[^\w.]" + re.escape(name) + r"[\s]{0,}\(", source)
     )
+
+
+def calls_mask_creation_function(source):
+    """`transformers.masking_utils` `create*` factories that `source` CALLS.
+
+    Those builders branch on tensor VALUES rather than on shapes -- on 5.x
+    `flex_attention_mask` does `if attention_mask is not None and not
+    fast_all(attention_mask)`, and `fast_all` returns a 0-dim tensor -- so a
+    caller compiled with fullgraph = True dies with `Unsupported: Data-dependent
+    branching`. A standalone function that builds masks is emitted uncompiled.
+
+    Matched by CALL, not by an exact source substring. `DISABLED_KEYWORDS` used to
+    carry the literal `create_causal_mask(**mask_kwargs)`; transformers added
+    `block_sequence_ids=` to that call in Gemma3, the `)` moved, the literal
+    stopped matching, and Gemma3 vision inference began crashing while gemma4,
+    whose spelling was untouched, kept working. Reading the names off the
+    installed `transformers.masking_utils` also means no version gate is needed:
+    a release that renames or drops a factory is tracked automatically."""
+    return calls_disable_compile_function(source, get_mask_functions())
 
 
 # Re-exported from .model_lists so callers can keep using
@@ -5962,10 +5985,17 @@ def unsloth_compile_transformers(
                 parameters = sig + ":\n" + code_section
             print(f"Unsloth: Fixed up function {module}.")
 
+            _mask_builders = calls_mask_creation_function(parameters)
             if module in disable_compile_functions:
                 parameters = (
                     "@torch.compiler.disable(recursive = False)\n"
                     + parameters
+                )
+            elif len(_mask_builders) != 0:
+                # Emitted uncompiled, like the DISABLED_KEYWORDS path below.
+                print(
+                    f"Unsloth: Cannot compile function {module} since it builds "
+                    f"attention masks via {', '.join(_mask_builders)}."
                 )
             elif not disable:
                 _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
@@ -6015,10 +6045,23 @@ def unsloth_compile_transformers(
 
             # Check erroring out
             bad = False
+            bad_reason = ""
             for keyword in DISABLED_KEYWORDS:
                 if keyword in source:
                     bad = True
+                    bad_reason = "disabled keyword is in it"
                     break
+            pass
+            # A mask builder branches on tensor values, so it cannot be captured
+            # whole. Checked by call rather than by source substring, which is how
+            # Gemma3 escaped DISABLED_KEYWORDS when transformers added a kwarg.
+            if not bad:
+                mask_builders = calls_mask_creation_function(source)
+                if len(mask_builders) != 0:
+                    bad = True
+                    bad_reason = (
+                        f"it builds attention masks via {', '.join(mask_builders)}"
+                    )
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented
@@ -6042,7 +6085,7 @@ def unsloth_compile_transformers(
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
-                    f"Unsloth: Cannot compile function {module} since disabled keyword is in it."
+                    f"Unsloth: Cannot compile function {module} since {bad_reason}."
                 )
             # Skip mask creation functions
             bad = False
