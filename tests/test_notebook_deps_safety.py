@@ -692,3 +692,37 @@ def test_a_failed_install_keeps_the_snapshot(monkeypatch):
     )
     nd._run_install("timm", ["false"])
     assert nd._constraints_file() == before
+
+
+class GoogleColabShell(ZMQInteractiveShell):
+    """google.colab._shell.Shell is declared `class Shell(zmqshell.ZMQInteractiveShell)`,
+    so its own class name is `Shell` and an exact-name test misses it."""
+
+
+def test_colab_counts_as_interactive(monkeypatch):
+    """Colab is the single most important platform this feature targets. An exact class
+    name check reported it as non-interactive and disabled every repair there."""
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(GoogleColabShell()))
+    assert nd._auto_install_enabled() is True
+
+
+def test_a_subclass_of_the_terminal_shell_also_counts(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+
+    class CustomRepl(TerminalInteractiveShell):
+        pass
+
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(CustomRepl()))
+    assert nd._auto_install_enabled() is True
+
+
+def test_an_unrelated_shell_class_still_does_not_count(monkeypatch):
+    """Walking the MRO must not turn into accepting anything with a get_ipython()."""
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+
+    class SomeEmbeddedThing:
+        pass
+
+    monkeypatch.setitem(sys.modules, "IPython", _fake_ipython(SomeEmbeddedThing()))
+    assert nd._auto_install_enabled() is False

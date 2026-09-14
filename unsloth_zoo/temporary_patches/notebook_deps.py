@@ -71,16 +71,23 @@ def _in_interactive_session() -> bool:
     """Whether a person is driving this interpreter through an IPython kernel.
 
     IPython being importable proves nothing: it is a transitive dependency of plenty of
-    entirely non-interactive installs. Only a live shell object counts, and only the two
-    classes that mean Jupyter/Colab/Kaggle or a REPL. Anything else stays off."""
+    entirely non-interactive installs. Only a live shell object counts, and only one
+    deriving from the two classes that mean Jupyter/Colab/Kaggle or a REPL."""
     ipython = sys.modules.get("IPython")
     if ipython is None:
         return False
     try:
         shell = ipython.get_ipython()
+        # The whole MRO, not the exact class name. Colab's get_ipython() returns
+        # google.colab._shell.Shell, declared as `class Shell(zmqshell.ZMQInteractiveShell)`,
+        # so an exact-name test reports the single most important notebook platform as
+        # non-interactive. Kaggle subclasses too.
+        return any(
+            klass.__name__ in ("ZMQInteractiveShell", "TerminalInteractiveShell")
+            for klass in type(shell).__mro__
+        )
     except Exception:
         return False
-    return type(shell).__name__ in ("ZMQInteractiveShell", "TerminalInteractiveShell")
 
 
 def _auto_install_enabled() -> bool:
