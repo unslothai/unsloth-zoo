@@ -357,8 +357,11 @@ def test_extract_gdn_layers_emits_bnb_quant_state_for_all_shards():
 def test_assert_same_state_dict_tied_embed_fallback_has_tolerances():
     # Pre-fix: tied-embeddings fallback used strict tolerances vs the outer atol=1e-4, rtol=1e-3.
     from unsloth_zoo import vllm_utils
+    # The candidate embedding names live in TIED_EMBED_KEYS; the fallback that reads them
+    # still has to compare loosely.
+    assert "model.embed_tokens.weight" in vllm_utils.TIED_EMBED_KEYS
     src = inspect.getsource(vllm_utils.assert_same_state_dict)
-    tied_idx = src.index("model.embed_tokens.weight")
+    tied_idx = src.index("TIED_EMBED_KEYS")
     tail = src[tied_idx:]
     assert "atol = 1e-4" in tail
     assert "rtol = 1e-3" in tail
