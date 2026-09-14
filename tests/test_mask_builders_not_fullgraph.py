@@ -39,7 +39,6 @@ _VISION_MASK_MODELS = ("gemma3", "gemma4", "gemma4_unified")
 
 
 def _vision_mask_builder(model):
-    """`create_masks_for_vision_model` from an installed modeling file, or None."""
     try:
         module = __import__(
             f"transformers.models.{model}.modeling_{model}", fromlist=["_"]
@@ -238,7 +237,6 @@ def test_disable_compile_functions_outranks_the_mask_rule():
         "compiled caller"
     )
 
-    # Loop A: membership is tested before the mask branch.
     fixup = source.index("_mask_builders = calls_mask_creation_function(")
     window = source[fixup:fixup + 400]
     assert window.index("if module in disable_compile_functions:") < window.index(
