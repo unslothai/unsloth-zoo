@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import subprocess
 import sys
 import threading
@@ -658,3 +659,36 @@ def test_an_unwritable_constraints_file_blocks_the_install(monkeypatch):
 
     assert nd._pip_install("timm") is False
     assert ran == [], "pip ran unconstrained after the constraints file failed"
+
+
+def test_the_constraints_snapshot_is_rebuilt_after_an_install(monkeypatch):
+    """One install can introduce a critical distribution that did not exist when the
+    snapshot was written: timm pulls in torchvision. Reusing the stale file would leave
+    that new torchvision unpinned for the next install."""
+    first = nd._constraints_file()
+    assert first and os.path.isfile(first)
+    assert nd._constraints_file() == first, "the snapshot should be cached between installs"
+
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode = 0, stdout = "", stderr = ""),
+    )
+    ok, _retry = nd._run_install("timm", ["true"])
+    assert ok
+
+    second = nd._constraints_file()
+    assert second != first, "the stale snapshot survived an install"
+    assert not os.path.isfile(first), "the stale constraints file was left behind"
+    assert os.path.isfile(second)
+
+
+def test_a_failed_install_keeps_the_snapshot(monkeypatch):
+    """Nothing changed, so there is nothing to re-read, and churning the file would just
+    litter the temp directory."""
+    before = nd._constraints_file()
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode = 1, stdout = "", stderr = "boom"),
+    )
+    nd._run_install("timm", ["false"])
+    assert nd._constraints_file() == before

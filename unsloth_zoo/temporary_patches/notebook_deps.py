@@ -165,6 +165,24 @@ _constraints_path = None
 _constraints_lock = threading.Lock()
 
 
+def _invalidate_constraints():
+    """Drop the cached snapshot so the next install re-reads the environment.
+
+    One install can introduce a critical distribution that did not exist when the file
+    was written: `timm` pulls in `torchvision`. Reusing the old snapshot would leave that
+    new torchvision unpinned, so the next allow-listed install could replace it or resolve
+    an incompatible build against the running torch, which is the whole failure this file
+    exists to prevent."""
+    global _constraints_path
+    with _constraints_lock:
+        stale, _constraints_path = _constraints_path, None
+    if stale:
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
+
 def _is_unsloth_stub(obj) -> bool:
     """Whether this module or spec is one of our own MLX shims rather than a real install.
 
@@ -337,6 +355,8 @@ def _run_install(pkg: str, cmd: list) -> tuple:
         logger.warning(f"Unsloth: auto-install of `{pkg}` failed to launch: {e}")
         return False, False
     if r.returncode == 0:
+        # The environment just changed, so the pinned snapshot is out of date.
+        _invalidate_constraints()
         importlib.invalidate_caches()
         # Unconditionally, not just when we passed --user. pip decides on its own:
         # decide_user_install (pip/_internal/commands/install.py) returns True whenever
