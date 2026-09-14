@@ -2796,7 +2796,8 @@ def load_vllm(
                     f"      Install cuda-compat / the CUDA toolkit's stubs, or point LIBRARY_PATH\n"
                     f"      at a directory containing libcuda.so (a symlink to libcuda.so.1 or to\n"
                     f"      /usr/local/cuda/compat/libcuda.so is enough).\n"
-                    f"  Then set UNSLOTH_VLLM_NO_FLASHINFER=0 to use FlashInfer again in this session.\n"
+                    f"  Installing the missing tools and calling again in the same session is\n"
+                    f"  enough: this probe re-runs on every load_vllm call.\n"
                     f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
                 )
                 # Clearing the env vars alone does not steer vLLM: VLLM_ATTENTION_BACKEND
@@ -2806,8 +2807,12 @@ def load_vllm(
                 # the probe above just said cannot run. Blocking the import is what makes
                 # vLLM's own has_flashinfer() (a find_spec call) report it absent, so
                 # get_attn_backend_cls falls through to FLASH_ATTN.
+                # Deliberately NOT os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1". That is a
+                # user facing knob, and writing to it would leak into vLLM's worker
+                # subprocesses and into the two diagnostics further down that read it back,
+                # making them report a choice the user never made. The re-probe on the next
+                # call is idempotent anyway, so stickiness buys nothing.
                 os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
-                os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1"
                 if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                     del os.environ["VLLM_ATTENTION_BACKEND"]
                 # Deliberately not lifted after backend selection: vLLM also imports
