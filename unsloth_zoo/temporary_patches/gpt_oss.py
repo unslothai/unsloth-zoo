@@ -74,10 +74,8 @@ def is_triton_kernels_available():
     return _TRITON_KERNELS_AVAILABLE
 
 
-# triton_kernels changed the return contract of make_default_matmul_mxfp4_w_layout:
-# older builds hand back (layout_class, ctor_kwargs) and convert_layout instantiates,
-# newer ones hand back a layout INSTANCE and convert_layout takes it as is. Unpacking
-# blind raises TypeError on the newer shape, so ask which one arrived.
+# Newer triton_kernels returns a layout instance, not (class, kwargs): unpacking blind
+# raises TypeError there.
 def _mxfp4_layout_selection_is_class_contract(selection):
     return (
         isinstance(selection, tuple)
@@ -94,7 +92,6 @@ def _normalize_mxfp4_value_layout(selection):
     return selection, {}
 
 
-# Matches tl.static_assert(SWIZZLE_MX_VALUE == "HOPPER_VALUE" or SWIZZLE_MX_VALUE is None, ...)
 _HOPPER_ONLY_VALUE_ASSERT = ast.dump(
     ast.parse(
         'SWIZZLE_MX_VALUE == "HOPPER_VALUE" or SWIZZLE_MX_VALUE is None',
@@ -108,15 +105,8 @@ _HOPPER_ONLY_VALUE_ASSERT = ast.dump(
 def _source_rejects_blackwell_value_swizzle(source):
     """Does this kernel source refuse any value swizzle other than Hopper's?
 
-    Positive detection of the defect, not a version comparison: the same
-    triton_kernels that ships BlackwellMXValueLayout can still carry a matmul
-    kernel that only accepts HOPPER_VALUE or no swizzle at all, which is exactly
-    the combination that raises "Only Hopper swizzling is supported for values"
-    on sm_100. Matched as an AST node under a tl.static_assert call, so the same
-    words in a comment, a docstring or an error string do not count.
-
-    Absence is NOT proof that Blackwell swizzling works -- it only means this
-    narrow patch has nothing it recognises, so it leaves the build alone.
+    Matched as an AST node, so the same words in a comment or an error string do not
+    count. Absence is not proof Blackwell works, only that there is nothing to fix.
     """
     try:
         tree = ast.parse(dedent(source))
@@ -145,8 +135,7 @@ def _blackwell_value_swizzle_unsupported():
     except Exception:
         return False
     found = False
-    # Every kernel in the module: older builds have only _matmul_ogs, newer ones add
-    # a persistent variant, and the dispatcher picks between them per call.
+    # Every kernel: newer builds add a persistent variant the dispatcher may pick.
     for name in dir(_kernel_module):
         kernel = getattr(_kernel_module, name, None)
         source = getattr(kernel, "src", None)
@@ -169,12 +158,8 @@ _MXFP4_STRIDED_VALUES_WARNED = False
 
 
 def _mxfp4_layout_arguments(layout_module, w):
-    """Pick the value layout for this weight: (layout_arg, ctor_kwargs, strided_arg).
-
-    `strided_arg` is StridedLayout in whichever form the installed convert_layout
-    wants -- the class under the older contract, an instance under the newer one --
-    and is reused for the scales, which zoo has always kept unswizzled.
-    """
+    """(layout_arg, ctor_kwargs, strided_arg) for this weight. strided_arg is a class or
+    an instance to match the installed convert_layout, and is reused for the scales."""
     selection = layout_module.make_default_matmul_mxfp4_w_layout(mx_axis = 1)
     class_contract = _mxfp4_layout_selection_is_class_contract(selection)
     value_layout, value_layout_opts = _normalize_mxfp4_value_layout(selection)
@@ -182,10 +167,8 @@ def _mxfp4_layout_arguments(layout_module, w):
     strided_argument = StridedLayout if class_contract else StridedLayout()
 
     if _force_strided_mxfp4_values(value_layout, layout_module, w):
-        # sm_100 chose Blackwell value swizzling from a build whose matmul kernel takes
-        # only HOPPER_VALUE or no swizzle, so the first generate would die inside
-        # matmul_ogs with "Only Hopper swizzling is supported for values". Unswizzled
-        # values pair with the strided scales and keep the weights in MXFP4.
+        # Otherwise generate() dies in matmul_ogs: "Only Hopper swizzling is supported
+        # for values". Unswizzled values pair with the strided scales, still MXFP4.
         global _MXFP4_STRIDED_VALUES_WARNED
         value_layout, value_layout_opts = strided_argument, {}
         if not _MXFP4_STRIDED_VALUES_WARNED:
@@ -199,17 +182,13 @@ def _mxfp4_layout_arguments(layout_module, w):
 
 
 def _force_strided_mxfp4_values(value_layout, layout_module, w):
-    """Should this weight skip Blackwell value swizzling?
-
-    UNSLOTH_MXFP4_VALUE_LAYOUT = auto (default) | strided | default, read here
-    rather than at import so a user can set it after `import unsloth`.
-    """
+    """Should this weight skip Blackwell value swizzling? UNSLOTH_MXFP4_VALUE_LAYOUT
+    = auto | strided | default, read per call so it can be set after import."""
     override = os.environ.get("UNSLOTH_MXFP4_VALUE_LAYOUT", "auto").strip().lower()
     if override == "default":
         return False
     try:
-        # The weight's own device, not device 0: a mixed-GPU process can hold
-        # Blackwell and non-Blackwell cards at once.
+        # The weight's own device: a process can hold Blackwell and non-Blackwell cards.
         if not (hasattr(w, "is_cuda") and w.is_cuda):
             return False
         if override == "strided":
