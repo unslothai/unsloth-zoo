@@ -368,18 +368,12 @@ class UnslothFusedLoss(torch.autograd.Function):
         global _FUSED_CE_COMPILE_SUPPORTED
         uncompiled_accumulate_chunk = accumulate_chunk
 
-        # A chunk whose labels are all ignored contributes 0 to the loss and 0
-        # to every gradient, so projecting it and running CE on it is pure
-        # waste. It also has to be skipped for correctness when the WHOLE batch
-        # is ignored: the divisor is then 0 and the loss comes back NaN.
-        #
-        # Work out which chunks those are in a fixed number of kernels and ONE
-        # host sync, independent of n_chunks. Reducing per chunk instead costs
-        # n_chunks launches, and syncing per chunk costs n_chunks stalls; with
-        # the chunk counts this function actually picks (hundreds) either one
-        # is far more expensive than the work being saved.
-        # torch.chunk emits equal-sized chunks except possibly the last, so
-        # padding up to that size and folding gives exactly one flag per chunk.
+        # A fully ignored chunk contributes nothing, and when the WHOLE batch is
+        # ignored the divisor is 0 and the loss is NaN, so skipping is required,
+        # not just faster. Fold the mask instead of reducing per chunk: that is a
+        # fixed number of kernels and one sync at any n_chunks, and get_chunk_size
+        # routinely picks hundreds. torch.chunk is equal-sized bar the last, so
+        # padding to that size gives exactly one flag per chunk.
         _chunk_size = __shift_labels[0].numel()
         _valid = (labels != ignore_index)
         _pad = (-_valid.numel()) % _chunk_size
@@ -387,8 +381,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             _valid = torch.cat((_valid, _valid.new_zeros(_pad),))
         _keep = _valid.view(-1, _chunk_size).any(dim = 1).tolist()
         if len(_keep) != len(__shift_labels):
-            # Should not happen, but zip() would silently drop chunks if it did,
-            # so fall back to the unambiguous per chunk reduction. Still one sync.
+            # zip() below would silently drop chunks on a mismatch.
             _keep = torch.stack([
                 (labels_j != ignore_index).any() for labels_j in __shift_labels
             ]).tolist()
@@ -398,8 +391,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             if keep:
                 chunks.append((grad_inputs_j, hidden_states_j, labels_j,))
             else:
-                # grad_inputs is torch.empty_like, so a skipped slice must still
-                # be written or the caller reads uninitialised memory.
+                # grad_inputs is empty_like: an unwritten slice leaks memory.
                 grad_inputs_j.zero_()
         pass
         if len(chunks) == 0:

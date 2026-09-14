@@ -16,28 +16,9 @@
 
 """Chunks whose labels are entirely ignored in the fused cross entropy.
 
-`UnslothFusedLoss.forward` splits the sequence into chunks and accumulates each
-one. A chunk can end up with every label set to `ignore_index`, which happens
-constantly with a last-assistant-turn-only mask, and always for a sample that
-was truncated before its assistant turn. Those chunks contribute nothing, so
-skipping them is free speed. The cases that must hold:
-
-  1. skipping does not move the answer - loss and every gradient stay equal to
-     the unchunked reference, for a mask sparse enough that most chunks are
-     empty
-  2. `grad_inputs` is allocated with `torch.empty_like`, so every skipped chunk
-     must still be written. If a skip forgets to zero its slice the caller gets
-     whatever was in that memory
-  3. a batch where EVERY label is ignored and `n_items` is not supplied used to
-     divide by a zero divisor and hand back NaN, which poisons the optimizer
-     state for the rest of the run. It must be a finite zero with zero grads
-  4. the skip predicate has to use the configured `ignore_index`, not a
-     hardcoded -100, or it silently stops skipping anything
-  5. skipping must not disturb the compile probe: a fully ignored batch has no
-     chunk to probe with, and the next real batch still has to work
-
-CPU only, no model downloads. `target_gb` is passed explicitly so chunk sizing
-never calls `torch.cuda.mem_get_info`.
+A last-assistant-turn-only mask empties most chunks, and a sample truncated
+before its assistant turn empties all of them. CPU only; `target_gb` is passed
+explicitly so chunk sizing never calls `torch.cuda.mem_get_info`.
 """
 import inspect
 
@@ -124,15 +105,13 @@ def test_sparse_mask_matches_unchunked_reference():
 
     torch.testing.assert_close(got_loss, ref_loss, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(got_grad, ref_grad, rtol=1e-4, atol=1e-6)
-    # A mask this sparse must still move the tokens it does keep, otherwise
-    # "matches the reference" would pass on two all-zero tensors.
+    # Else "matches the reference" would pass on two all-zero tensors.
     assert torch.count_nonzero(got_grad) > 0
 
 
 def test_skipped_chunks_are_zeroed_not_left_uninitialised():
     """grad_inputs comes from torch.empty_like; an unwritten slice leaks memory."""
-    # Poison the allocator so a forgotten slice reads back as a huge value
-    # rather than as an accidental zero.
+    # Poison the allocator so a forgotten slice is not an accidental zero.
     poison = [torch.full((BSZ * QLEN, HD), 1e30) for _ in range(8)]
     del poison
 
@@ -148,12 +127,11 @@ def test_skipped_chunks_are_zeroed_not_left_uninitialised():
 
 @pytest.mark.parametrize("n_items_given", [False, True])
 def test_fully_ignored_batch_is_finite_zero(n_items_given):
-    """Every label ignored: finite zero loss and zero grads, never NaN.
+    """Every label ignored: finite zero, never NaN.
 
-    With no `n_items` the divisor is the count of kept labels, which is zero
-    here. `_unsloth_get_batch_samples` legitimately leaves `n_items` unset (see
-    test_loss_normalization_contract), and a sample truncated before its
-    assistant turn is fully ignored, so this pair really does co-occur.
+    Without `n_items` the divisor is 0. Both halves co-occur:
+    `_unsloth_get_batch_samples` leaves it unset (test_loss_normalization_contract)
+    and a truncated sample is fully ignored.
     """
     x, w = _inputs(seed=4)
     labels = torch.full((BSZ, QLEN), -100, dtype=torch.long)
@@ -181,11 +159,8 @@ def test_skip_uses_configured_ignore_index():
     torch.testing.assert_close(got_loss, ref_loss, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(got_grad, ref_grad, rtol=1e-4, atol=1e-6)
 
-    # There ARE chunks to skip here, but a predicate written against a
-    # hardcoded -100 finds none of them, so the skip silently stops firing for
-    # any caller that configures a different sentinel. Answers stay correct
-    # either way, which is exactly why this needs pinning: nothing else in the
-    # suite would notice the optimisation had turned itself off.
+    # A hardcoded -100 finds none of these chunks, so the skip silently stops
+    # firing. Answers stay correct either way, so nothing else would notice.
     shifted = _shift(labels, ignore).reshape(-1)
     n = ce.get_chunk_size(BSZ, QLEN, VOCAB, target_gb=TINY_GB)
     by_hardcoded = sum(1 for c in torch.chunk(shifted, n) if not bool((c != -100).any()))
