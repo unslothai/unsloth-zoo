@@ -330,15 +330,14 @@ def _is_passthrough(func) -> bool:
     )
 
 
-def _unwrap_kernel_hub_func(obj):
+def _unwrap_kernel_hub_func(obj, expected_name = None):
     """Recover the Python function behind a kernels-hub replacement.
 
-    With the `kernels` package installed (transformers needs it for the gpt-oss
-    MXFP4 path), transformers swaps module-level functions for a
-    `kernels.layer.layer.Func` nn.Module whose forward is `(*args, **kwargs)`
-    closing over the original. Arity probes see the wrapper, not the function
-    they are actually protecting.
+    transformers swaps module functions for a `kernels.layer.layer.Func` nn.Module
+    whose forward is `(*args, **kwargs)` closing over the original. A closure can
+    hold several functions, so take a name match, else a single candidate.
     """
+    found = []
     for candidate in (obj, getattr(type(obj), "forward", None)):
         if candidate is None:
             continue
@@ -347,18 +346,19 @@ def _unwrap_kernel_hub_func(obj):
                 inner = cell.cell_contents
             except ValueError:
                 continue
-            if inspect.isfunction(inner) or inspect.isbuiltin(inner):
+            if not (inspect.isfunction(inner) or inspect.isbuiltin(inner)):
+                continue
+            if expected_name is not None and getattr(inner, "__name__", None) == expected_name:
                 return inner
+            found.append(inner)
+    if len(found) == 1 and expected_name is None:
+        return found[0]
     return obj
 
 
 def _positional_arity_from_source(module, name):
-    """Count positionals on ``name`` as the module's own source defines it.
-
-    Last resort when the live attribute is an opaque passthrough: the module still
-    carries the original ``def``, so drift is visible there even when the object
-    bound to the name is not inspectable.
-    """
+    """Count positionals on ``name`` as the module's own source defines it: a last
+    resort when the live attribute is an opaque passthrough."""
     import ast
 
     try:
@@ -372,14 +372,14 @@ def _positional_arity_from_source(module, name):
     return None
 
 
-def _resolve_for_arity(func):
+def _resolve_for_arity(func, expected_name = None):
     """Strip functools.wraps chains and kernels-hub wrappers before an arity probe."""
     seen = set()
     while hasattr(func, "__wrapped__") and id(func) not in seen:
         seen.add(id(func))
         func = func.__wrapped__
     if _is_passthrough(func):
-        func = _unwrap_kernel_hub_func(func)
+        func = _unwrap_kernel_hub_func(func, expected_name)
     return func
 
 
@@ -2490,11 +2490,10 @@ def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
             "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:1875 expects "
             "modeling_gpt_oss.apply_rotary_pos_emb but it is missing"
         )
-    # With `kernels` installed (transformers needs it for the gpt-oss MXFP4 path)
-    # this name is a kernels.layer Func nn.Module, `(*args, **kwargs)` forwarding to
-    # the real function. Probing the wrapper reports 0 positionals and looks like
-    # drift that is not there, so resolve the function the call actually reaches.
-    resolved = _resolve_for_arity(apply)
+    # With `kernels` installed (transformers needs it for gpt-oss MXFP4) this name is
+    # a Func nn.Module forwarding `(*args, **kwargs)`: probing the wrapper reports 0
+    # positionals and looks like drift that is not there.
+    resolved = _resolve_for_arity(apply, "apply_rotary_pos_emb")
     if _is_passthrough(resolved):
         count = _positional_arity_from_source(mod, "apply_rotary_pos_emb")
         if count is None:
