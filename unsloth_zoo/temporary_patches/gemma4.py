@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import ast
+import contextlib
 import inspect
 import linecache
 import sys
@@ -1220,9 +1221,13 @@ def patch_Gemma4MultimodalEmbedder_forward():
         # only a float32 projector (SKIP_QUANTIZATION_MODULES) gets float32.
         weight = getattr(projection, "weight", None)
         compute_dtype = torch.float32 if weight is None else weight.dtype
-        # An enclosing bf16 autocast downcasts even float32 operands; enabled=False
-        # is accepted on every backend and torch version.
-        with torch.autocast(device_type = emb_norm.device.type, enabled = False):
+        # An enclosing bf16 autocast downcasts even float32 operands. Guarded
+        # because autocast rejects meta and unregistered custom backends.
+        try:
+            autocast_off = torch.autocast(device_type = emb_norm.device.type, enabled = False)
+        except (RuntimeError, AssertionError):
+            autocast_off = contextlib.nullcontext()
+        with autocast_off:
             emb_norm_proj = projection(emb_norm.to(compute_dtype))
         return emb_norm_proj.to(old_dtype)
     try:

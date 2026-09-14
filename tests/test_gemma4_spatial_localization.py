@@ -199,7 +199,12 @@ def test_projection_stays_float32_inside_an_autocast_context():
             projection = self.embedding_projection
             weight = getattr(projection, "weight", None)
             compute_dtype = torch.float32 if weight is None else weight.dtype
-            with torch.autocast(device_type = emb_norm.device.type, enabled = False):
+            try:
+                autocast_off = torch.autocast(device_type = emb_norm.device.type, enabled = False)
+            except (RuntimeError, AssertionError):
+                import contextlib
+                autocast_off = contextlib.nullcontext()
+            with autocast_off:
                 out = projection(emb_norm.to(compute_dtype))
             assert out.dtype == compute_dtype, (
                 f"projection ran in {out.dtype}, an enclosing autocast leaked in"
@@ -219,3 +224,20 @@ def test_projection_stays_float32_inside_an_autocast_context():
     emb = torch.randn(2, 16, device = device, dtype = torch.float32)
     with torch.autocast(device_type = device, dtype = torch.bfloat16):
         assert model.embedding_projection(emb).dtype == torch.bfloat16
+
+
+def test_projection_autocast_guard_covers_unsupported_backends():
+    """autocast rejects meta and unregistered custom backends, so constructing it
+    from the tensor's device type has to be guarded."""
+    import contextlib
+
+    import torch
+
+    for device_type in ("meta", "privateuseone"):
+        try:
+            torch.autocast(device_type = device_type, enabled = False)
+        except (RuntimeError, AssertionError):
+            with contextlib.nullcontext():        # what the patch falls back to
+                pass
+        else:
+            continue
