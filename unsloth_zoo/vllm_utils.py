@@ -785,9 +785,8 @@ def patch_vllm_graph_capture():
     import time
     from functools import wraps
 
-    # `vllm` is only bound at module import time inside the find_spec guard, so on an
-    # image without vLLM the `vllm.__version__` read below is a bare NameError rather
-    # than something a caller can act on. patch_vllm() calls this unconditionally.
+    # patch_vllm() calls this unconditionally, and `vllm` is only bound inside the
+    # module-level find_spec guard, so without vLLM the version read below is a NameError.
     try:
         import vllm
     except ImportError:
@@ -2278,23 +2277,18 @@ def _clear_flashinfer_env_on_hip():
     return True
 
 
-# Marks a name that was NOT in sys.modules before the block, so the unblock leaves it
-# absent instead of resurrecting it. A real `None` entry (some other library's own
-# import block) is a distinct state that has to be restored as-is.
+# "was not in sys.modules", distinct from a real None entry (another library's own
+# import block), which the unblock has to restore rather than delete.
 _UNSLOTH_FLASHINFER_ABSENT = object()
 
 # What `_block_flashinfer_import` evicted from sys.modules, keyed by module name.
 _UNSLOTH_BLOCKED_FLASHINFER_MODULES = {}
 
-# Set by the pre-flight when it has decided FlashInfer cannot run here. Read when
-# the engine args are built, because the sys.modules block alone does NOT reach
-# the worker: vLLM re-resolves the attention backend inside the EngineCore child
-# (platforms/cuda.py get_attn_backend_cls), and forces the `spawn` start method
-# whenever CUDA is already initialised (utils/system_utils.py _maybe_force_spawn).
-# Unsloth always has CUDA initialised by then, so under spawn the child is a fresh
-# interpreter with an empty sys.modules and FlashInfer visible again. os.environ
-# is inherited but VLLM_ATTENTION_BACKEND was removed in vLLM 0.13.0, so the
-# durable channel is the engine arg, which is pickled into the child with the config.
+# Set by the pre-flight, read when the engine args are built, because the sys.modules
+# block does NOT reach the worker. vLLM re-resolves the backend in the EngineCore child
+# and forces `spawn` once CUDA is initialised (utils/system_utils.py _maybe_force_spawn),
+# which Unsloth always has by then, so the child starts with an empty sys.modules.
+# VLLM_ATTENTION_BACKEND was removed in 0.13.0, leaving the pickled engine arg.
 _UNSLOTH_FLASHINFER_UNUSABLE = False
 
 
@@ -2546,9 +2540,8 @@ def load_vllm(
     assert(type(use_bitsandbytes) is bool)
     assert(conservativeness >= 0.0 and conservativeness <= 1.0)
 
-    # `vllm_version` is only bound inside the find_spec guard at import time, so without
-    # vLLM the first `Version(vllm_version)` below is a bare NameError. Raise something
-    # a caller can act on instead.
+    # `vllm_version` is only bound inside the module-level find_spec guard, so without
+    # vLLM the first Version() read below is a bare NameError.
     if "vllm_version" not in globals():
         raise ImportError(
             "Unsloth: vLLM is required for `load_vllm` / `fast_inference = True` but it "
@@ -2760,25 +2753,20 @@ def load_vllm(
         # See https://docs.vllm.ai/en/latest/serving/env_vars.html
         # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
         # On AMD, vLLM uses its built-in paged attention instead.
-        # Lift a previous call's import block when the opt-out is clear: the block hides
-        # the package from find_spec too, so nvcc/ninja installed since would never count.
-        # ROCm never blocks, so there is nothing for the AMD branch below to lift.
+        # Lift a previous call's block first: it hides the package from find_spec too, so
+        # nvcc/ninja installed since would otherwise never be re-probed.
         _no_flashinfer = os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") != "0"
         if not _no_flashinfer:
             _unblock_flashinfer_import()
         if _clear_flashinfer_env_on_hip():
             pass
         elif _no_flashinfer:
-            # Clear a FORCED selection whether or not the package is here: an inherited
-            # VLLM_USE_FLASHINFER_SAMPLER=1 sends vLLM's TopKTopPSampler into an unguarded
-            # `from flashinfer import ...`, so an absent FlashInfer raises instead of
-            # falling back.
+            # Clear a forced selection even when the package is absent: vLLM's
+            # TopKTopPSampler imports flashinfer unguarded, so it would raise, not fall back.
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                 del os.environ["VLLM_ATTENTION_BACKEND"]
-            # Skipping our own setup is not enough: an installed FlashInfer stays
-            # importable, so vLLM selects it itself (the Blackwell default) and hits the
-            # JIT failure the opt-out exists to avoid.
+            # Skipping our own setup is not enough: vLLM would still select it itself.
             if importlib.util.find_spec("flashinfer") is not None:
                 _block_flashinfer_import()
             _UNSLOTH_FLASHINFER_UNUSABLE = True
@@ -2815,18 +2803,12 @@ def load_vllm(
                     f"  enough: this probe re-runs on every load_vllm call.\n"
                     f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
                 )
-                # Clearing the env vars alone does not steer vLLM: VLLM_ATTENTION_BACKEND
-                # was deprecated in vLLM 0.13.0 for --attention-backend and is gone from
-                # envs.py by 0.29, so the del below is a no-op there while FLASHINFER is
-                # still first in the sm_100 default backend list, dying in the JIT build
-                # the probe above just said cannot run. Blocking the import is what makes
-                # vLLM's own has_flashinfer() (a find_spec call) report it absent, so
-                # get_attn_backend_cls falls through to FLASH_ATTN.
-                # Deliberately NOT os.environ["UNSLOTH_VLLM_NO_FLASHINFER"] = "1". That is a
-                # user facing knob, and writing to it would leak into vLLM's worker
-                # subprocesses and into the two diagnostics further down that read it back,
-                # making them report a choice the user never made. The re-probe on the next
-                # call is idempotent anyway, so stickiness buys nothing.
+                # Clearing the env vars does not steer vLLM: VLLM_ATTENTION_BACKEND is gone
+                # from envs.py by 0.29, and FLASHINFER is still first in the sm_100 default
+                # list. Hiding the import is what makes has_flashinfer() report it absent.
+                # Deliberately NOT setting UNSLOTH_VLLM_NO_FLASHINFER: it is a user facing
+                # knob, it leaks into worker subprocesses and the diagnostics below, and the
+                # next call re-probes anyway.
                 os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
                 if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                     del os.environ["VLLM_ATTENTION_BACKEND"]
@@ -2863,8 +2845,7 @@ def load_vllm(
                     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
                 # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
         else:
-            # FlashInfer is simply not installed, but an inherited forced selection still
-            # has to go: vLLM's TopKTopPSampler imports flashinfer unguarded.
+            # Not installed, but an inherited forced selection still has to go.
             os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
             if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
                 del os.environ["VLLM_ATTENTION_BACKEND"]
@@ -3186,22 +3167,15 @@ def load_vllm(
             engine_args["quantization"] = "torchao"
             engine_args["hf_overrides"] = hf_overrides
 
-        # Pin the backend for the worker process. The sys.modules block only reaches
-        # a FORKED child; vLLM forces spawn once CUDA is initialised, which is always
-        # true by the time Unsloth gets here, and a spawned child re-resolves the
-        # backend from scratch. This arg travels inside VllmConfig, which IS pickled
-        # into the child, so it survives either start method.
-        #
-        # Only set when the pre-flight actually rejected FlashInfer: an explicit
-        # backend is a hard pin that makes vLLM RAISE on an unsupported value rather
-        # than falling through, so setting it unconditionally would break hosts where
-        # FlashInfer is fine, and AMD/ROCm which never reaches the blocker at all.
+        # Pin the backend for the worker, which the sys.modules block only reaches under
+        # fork. Set ONLY when the pre-flight rejected FlashInfer: an explicit backend is a
+        # hard pin that makes vLLM raise on an unsupported value instead of falling
+        # through, so doing it unconditionally would break healthy hosts and ROCm.
         if _UNSLOTH_FLASHINFER_UNUSABLE:
             engine_args["attention_backend"] = "FLASH_ATTN"
 
-        # Older vLLM has no `attention_backend` arg. The filter below deletes any key
-        # the installed EngineArgs does not accept, so this is a no-op there rather
-        # than a TypeError, which is what keeps it safe across versions both ways.
+        # Older vLLM has no such arg; the filter below drops unknown keys, so this is a
+        # no-op there rather than a TypeError.
         good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
         old_keys = list(engine_args.keys())
         for key in old_keys:
