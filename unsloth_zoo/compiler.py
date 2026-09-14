@@ -135,11 +135,9 @@ DISABLED_KEYWORDS = [
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
     "causal_mask[start:end, start:end] = 0",  # Pixtral Dynamic slicing on data-dependent value is not supported
     "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING",  # Gemma3 create_masks_for_generate
-    # A `create_causal_mask(**mask_kwargs)` literal used to live here. Do not put one
-    # back: transformers added `block_sequence_ids=` to that exact call in Gemma3, the
-    # substring stopped matching, and `create_masks_for_vision_model` was compiled with
-    # fullgraph = True until it died on the tensor branch inside `flex_attention_mask`.
-    # `calls_mask_creation_function` now recognises the call whatever its arguments.
+    # No `create_causal_mask(**mask_kwargs)` literal here: transformers added a kwarg
+    # inside those parens and Gemma3 silently started compiling. Use
+    # `calls_mask_creation_function`, which matches the call at any arity.
     "create_causal_mask_mapping",        # Gemma3 5.x (raises ValueError, can't be compiled)
     "return inner_mask",  # Gemma3 token_type_ids_mask_function returns closure, can't trace generator
     "compute_mup_vector",  # used in falcon h1 init and not needed to compile + inductor complains
@@ -194,19 +192,11 @@ def calls_disable_compile_function(source, disable_compile_functions):
 def calls_mask_creation_function(source):
     """`transformers.masking_utils` `create*` factories that `source` CALLS.
 
-    Those builders branch on tensor VALUES rather than on shapes -- on 5.x
-    `flex_attention_mask` does `if attention_mask is not None and not
-    fast_all(attention_mask)`, and `fast_all` returns a 0-dim tensor -- so a
-    caller compiled with fullgraph = True dies with `Unsupported: Data-dependent
-    branching`. A standalone function that builds masks is emitted uncompiled.
-
-    Matched by CALL, not by an exact source substring. `DISABLED_KEYWORDS` used to
-    carry the literal `create_causal_mask(**mask_kwargs)`; transformers added
-    `block_sequence_ids=` to that call in Gemma3, the `)` moved, the literal
-    stopped matching, and Gemma3 vision inference began crashing while gemma4,
-    whose spelling was untouched, kept working. Reading the names off the
-    installed `transformers.masking_utils` also means no version gate is needed:
-    a release that renames or drops a factory is tracked automatically."""
+    Mask builders branch on tensor VALUES (`flex_attention_mask` does `if not
+    fast_all(attention_mask)`), so fullgraph = True cannot capture a caller; they
+    are emitted uncompiled. Matched by call rather than by source substring: the
+    literal this replaced stopped matching the moment transformers added a kwarg.
+    Names come from the installed transformers, so no version gate is needed."""
     return calls_disable_compile_function(source, get_mask_functions())
 
 
@@ -5992,7 +5982,6 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif len(_mask_builders) != 0:
-                # Emitted uncompiled, like the DISABLED_KEYWORDS path below.
                 print(
                     f"Unsloth: Cannot compile function {module} since it builds "
                     f"attention masks via {', '.join(_mask_builders)}."
@@ -6052,14 +6041,9 @@ def unsloth_compile_transformers(
                     bad_reason = "disabled keyword is in it"
                     break
             pass
-            # A mask builder branches on tensor values, so it cannot be captured
-            # whole. Checked by call rather than by source substring, which is how
-            # Gemma3 escaped DISABLED_KEYWORDS when transformers added a kwarg.
-            # Not applied to a name in DISABLE_COMPILE_FUNCTIONS: that list is an
-            # explicit instruction to emit `@torch.compiler.disable`, which is a
-            # stronger guarantee than no decorator (it also stops Dynamo inlining
-            # the function into a compiled caller), so it must not be downgraded.
-            # Nothing on that list builds masks today; this keeps it true if one does.
+            # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
+            # also stops Dynamo inlining it into a compiled caller, so downgrading it
+            # to "emit bare" would be weaker. Nothing on that list builds masks today.
             if not bad and module not in disable_compile_functions:
                 mask_builders = calls_mask_creation_function(source)
                 if len(mask_builders) != 0:

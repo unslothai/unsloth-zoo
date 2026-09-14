@@ -16,16 +16,10 @@
 
 """A standalone function that builds attention masks must never be compiled fullgraph.
 
-`transformers.masking_utils` branches on tensor VALUES -- `flex_attention_mask` does
-`if attention_mask is not None and not fast_all(attention_mask)`, and `fast_all` returns
-a 0-dim tensor -- so a caller captured whole dies with `Unsupported: Data-dependent
-branching`.
-
-`DISABLED_KEYWORDS` used to hold the literal `create_causal_mask(**mask_kwargs)` for
-this. transformers then added `block_sequence_ids=` to that call in Gemma3, the `)`
-moved, the literal stopped matching, and Gemma3 vision inference crashed on the first
-generate while gemma4, whose spelling was untouched, kept working. These tests pin the
-call-shaped detector that replaced it, so the same drift cannot land twice.
+`flex_attention_mask` does `if not fast_all(attention_mask)` on a 0-dim tensor, so a
+caller captured whole dies with `Unsupported: Data-dependent branching`. The literal
+`create_causal_mask(**mask_kwargs)` used to catch this until transformers added a kwarg
+inside the parens, which is why these pin a call-shaped detector instead.
 """
 
 import inspect
@@ -97,12 +91,10 @@ def test_vision_mask_builders_are_not_compiled(model):
 
 
 def test_a_defined_vision_mask_builder_is_always_resolved():
-    """Skipping everything is only legitimate when no modeling file defines one.
+    """Skipping everything is legitimate only when no modeling file defines one.
 
-    transformers 4.57.6 has no create_masks_for_vision_model at all, so the cases
-    above skip and the rule is correctly a no-op. A release that DEFINES one but
-    exposes it under another name would also skip, silently guarding nothing, so
-    the modeling source is asked directly rather than trusting the skips."""
+    A release that defines the builder under another name would also skip and guard
+    nothing, so the modeling source is asked directly rather than trusting the skips."""
     defines = []
     for model in _VISION_MASK_MODELS:
         try:
@@ -128,13 +120,11 @@ def test_a_defined_vision_mask_builder_is_always_resolved():
 
 
 def test_a_mask_builder_really_is_uncapturable_fullgraph():
-    """Why the rule exists, rather than only that it fires.
+    """Why the rule exists, not just that it fires.
 
-    Builds the real Gemma3 flex-attention mask eagerly first -- so a harness that
-    drifted out of shape fails loudly instead of passing through the `except` -- then
-    asserts that compiling the same call fullgraph either raises, in which case the
-    compiler must be excluding it, or succeeds, which is allowed and means upstream
-    became traceable."""
+    Eager first, so a drifted harness fails loudly instead of passing through the
+    `except`. A raise then demands the compiler exclude it; success is allowed and
+    means upstream became traceable."""
     torch = pytest.importorskip("torch")
     gemma3 = pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
     builder = getattr(gemma3, "create_masks_for_vision_model", None)
@@ -241,13 +231,9 @@ def test_ordinary_lifted_functions_still_compile(name):
 
 
 def test_disable_compile_functions_outranks_the_mask_rule():
-    """`@torch.compiler.disable` is a stronger guarantee than no decorator.
-
-    No decorator only stops us compiling the function; the disable decorator also
-    stops Dynamo inlining it into a compiled caller. A name on
-    DISABLE_COMPILE_FUNCTIONS is an explicit instruction to emit that decorator, so
-    a mask call inside it must not silently downgrade to 'emit bare'. Nothing on
-    the list builds masks today, which is exactly why this needs pinning."""
+    """`@torch.compiler.disable` also blocks inlining into a compiled caller, so a
+    mask call inside a DISABLE_COMPILE_FUNCTIONS name must not downgrade it to 'emit
+    bare'. Nothing on the list builds masks today, which is why this needs pinning."""
     source = inspect.getsource(compiler_module)
 
     # Loop B: the mask rule is skipped for a listed name, so the branch below that
