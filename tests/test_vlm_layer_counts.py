@@ -1,13 +1,21 @@
-"""get_model_layer_counts must match the model_type get_model_type actually returns.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-get_model_type prefers `vision_config.model_type`, so a branch written against the
-top level name ("mllama", "gemma3", "gemma4") never runs. The counts then fall through
-to the causal-LM default of 32, and extract_vision_layers iterates to 32 instead of the
-real layer count, silently skipping every weight above index 31. On Llama-3.2-11B-Vision
-that drops the cross-attention gates on text layers 33 and 38.
-
-transformers also renames these strings between majors (qwen3_vl -> qwen3_vl_vision in
-transformers 5), so both spellings have to be accepted.
+"""get_model_type returns the vision name, so a branch on the top level one is dead: the
+bound falls back to 32 and Mllama loses its cross-attn gates on text layers 33 and 38.
 """
 import pytest
 import torch
@@ -21,8 +29,6 @@ from unsloth_zoo.empty_model import (
 
 
 class Cfg:
-    """Minimal stand-in for a transformers config (attribute access only)."""
-
     def __init__(self, **kw):
         for k, v in kw.items():
             setattr(self, k, v)
@@ -49,8 +55,6 @@ def iterate_to(config):
     return max(counts.values()) if isinstance(counts, dict) else counts
 
 
-# ---------------------------------------------------------------- model_type
-
 @pytest.mark.parametrize("top, vision, expected", [
     ("mllama",         "mllama_vision_model",   "mllama_vision_model"),
     ("gemma3",         "siglip_vision_model",   "siglip_vision_model"),
@@ -63,8 +67,6 @@ def test_get_model_type_prefers_the_vision_name(top, vision, expected):
     cfg = Cfg(model_type = top, vision_config = Cfg(model_type = vision))
     assert get_model_type(cfg) == expected
 
-
-# ---------------------------------------------------------------- layer counts
 
 @pytest.mark.parametrize("vision_name", ["mllama", "mllama_vision_model"])
 def test_mllama_counts_under_both_spellings(vision_name):
@@ -110,8 +112,7 @@ def test_qwen3_vl_counts_under_both_spellings(vision_name):
 
 
 def test_qwen3_vl_vision_still_takes_the_merged_qkv_path():
-    # transformers 5 renamed this; dropping out of the tuple would split a qkv that
-    # HF keeps merged, producing q/k/v keys vLLM never emits.
+    # renamed in transformers 5; dropping out splits a qkv HF keeps merged.
     assert "qwen3_vl" in QWEN_VL_MERGED_QKV_TYPES
     assert "qwen3_vl_vision" in QWEN_VL_MERGED_QKV_TYPES
     assert "qwen2_5_vl" in QWEN_VL_MERGED_QKV_TYPES
@@ -136,10 +137,7 @@ def test_unknown_vision_model_is_untouched():
     assert get_model_layer_counts(cfg) == 24
 
 
-# ---------------------------------------------------------------- end to end
-
 def test_cross_attention_gates_above_layer_31_are_extracted():
-    """The regression this all exists for: gates on text layers 33 and 38."""
     cross = [3, 8, 13, 18, 23, 28, 33, 38]
     cfg = mllama(text_layers = 40, cross = cross)
 

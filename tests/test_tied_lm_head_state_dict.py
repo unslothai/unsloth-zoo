@@ -1,12 +1,21 @@
-"""lm_head is tied to the embeddings, so it may be absent from either state dict.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-The symmetric-difference check excuses the tied lm_head names, but the per-key compare
-that follows then looked them up in the other dict unconditionally, so a key excused on
-one line raised KeyError two lines later. Idefics3 hits this with
-`model.text_model.lm_head.weight`.
-
-Being excused must not weaken the check: when both sides do carry the weight and the
-values disagree, that still has to be reported.
+"""A tied lm_head is excused from the difference check, but the per-key compare then
+KeyError-ed on it anyway (Idefics3). Excused must not mean values can disagree unseen.
 """
 import pytest
 import torch
@@ -40,8 +49,8 @@ def test_every_tied_name_is_covered_by_both_sets():
 @pytest.mark.parametrize("head, embed", PAIRS)
 def test_tied_lm_head_may_be_missing_from_either_side(head, embed):
     base = {embed: w()}
-    assert_same_state_dict(dict(base), {**base, head: w()})   # only in vllm
-    assert_same_state_dict({**base, head: w()}, dict(base))   # only in hf
+    assert_same_state_dict(dict(base), {**base, head: w()})
+    assert_same_state_dict({**base, head: w()}, dict(base))
     assert_same_state_dict({**base, head: w()}, {**base, head: w()})
 
 

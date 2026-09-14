@@ -1384,9 +1384,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
                 torch.testing.assert_close(old_val, new_val, check_stride = False)
         except Exception as error:
             if key in TIED_LM_HEAD_KEYS:
-                # Try tied embeddings fallback. The key is excused from the difference
-                # check above, so compare it against whichever embedding it is tied to
-                # rather than KeyError-ing when it is absent from one side.
+                # excused above: compare against the embedding it is tied to
                 key1 = next((k for k in (key,) + TIED_EMBED_KEYS if k in old_state_dict), None)
                 key2 = next((k for k in (key,) + TIED_EMBED_KEYS if k in new_state_dict), None)
 

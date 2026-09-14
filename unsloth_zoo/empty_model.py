@@ -36,9 +36,7 @@ from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
-# get_model_type prefers vision_config.model_type, and transformers 5 renamed the
-# Qwen3-VL vision config from "qwen3_vl" to "qwen3_vl_vision". Accept both spellings
-# so these stay matched on every supported transformers version.
+# get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
 QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5")
 
 
@@ -1225,8 +1223,7 @@ def get_model_type(config):
 def get_model_layer_counts(config):
     """Layer counts per model type (int for causal_lm, dict for VL models)."""
     model_type = get_model_type(config)
-    # get_model_type prefers vision_config.model_type, so match the vision names too,
-    # and fall back to config itself when a sub-config is absent.
+    # get_model_type returns the vision name, so each branch matches both spellings.
     text_config = getattr(config, "text_config", config)
     vision_config = getattr(config, "vision_config", config)
 
