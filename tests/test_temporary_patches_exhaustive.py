@@ -352,8 +352,8 @@ def _unwrap_kernel_hub_func(obj, expected_name = None):
                 return inner
             found.append(inner)
     if len(found) == 1:
-        # A name miss happens when upstream renames or decorates the target; a lone
-        # closed-over function is still what the wrapper forwards to.
+        # Name miss (an upstream rename or decorator): a lone closed-over function
+        # is still what the wrapper forwards to.
         return found[0]
     return obj
 
