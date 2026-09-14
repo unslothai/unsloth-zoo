@@ -27,6 +27,7 @@ import site
 import subprocess
 import tempfile
 import threading
+import time
 import sys
 
 # Absolute on purpose: `from ..log` makes transformers' custom_object_save write
@@ -116,8 +117,29 @@ _attempted: dict = {}
 # prefix, which is a known way to leave a half-unpacked dist-info behind.
 _attempt_lock = threading.Lock()
 # Slightly over the 300s subprocess timeout plus the uv-then-pip fallback, so a waiter
-# outlives the worst-case attempt instead of giving up early on a healthy install.
+# outlives the worst-case attempt instead of giving up early on a healthy install. It
+# bounds IDLE time, not total time: see _note_install_activity.
 _ATTEMPT_WAIT_SECONDS = 620
+# monotonic() of the last time any attempt claimed the package or started an installer.
+# The waiter's budget is measured against this rather than against its own start, because
+# _install_lock serialises across packages: an owner queued behind two 300s installs would
+# otherwise have only ~20s of the waiter's 620s left for its own command, and the waiter
+# would give up and re-raise ImportError for a package about to be installed. Bounding
+# idle time instead means the waiter only gives up when nothing is happening at all.
+_last_install_activity = 0.0
+
+
+def _note_install_activity():
+    global _last_install_activity
+    with _attempt_lock:
+        _last_install_activity = time.monotonic()
+
+
+def _install_is_idle() -> bool:
+    with _attempt_lock:
+        return (time.monotonic() - _last_install_activity) > _ATTEMPT_WAIT_SECONDS
+
+
 # Serialises the installer subprocesses themselves, across package names. Distinct from
 # _attempt_lock, which only guards the tiny check-then-claim on _attempted and is never
 # held across a subprocess.
@@ -304,8 +326,11 @@ def _pip_install(pkg: str) -> bool:
         # Someone else owns this package's single attempt. Wait for it to finish and let
         # the caller re-probe importability, rather than returning a failure for a package
         # that another thread is in the middle of installing successfully.
-        finished.wait(timeout = _ATTEMPT_WAIT_SECONDS)
+        while not finished.wait(timeout = 5):
+            if _install_is_idle():
+                break
         return False
+    _note_install_activity()
     try:
         # Per-package events stop a second thread duplicating or mis-reporting THIS
         # package. They do nothing for two threads installing DIFFERENT packages, which
@@ -315,6 +340,7 @@ def _pip_install(pkg: str) -> bool:
         # subprocesses, and never while waiting on _attempt_lock or on another package's
         # event, so there is no lock cycle.
         with _install_lock:
+            _note_install_activity()
             if shutil.which("uv") and _in_venv():
                 ok, retry_with_pip = _run_install(pkg, _uv_command(pkg))
                 if ok:
@@ -521,6 +547,19 @@ def _replay_skipped_guarded_imports(iu, backend) -> bool:
             continue
         source = _module_source(module)
         if source is None:
+            # A module the import system really executed, whose source we cannot read, may
+            # hold the guarded import we need to replay, and skipping it silently is what
+            # produces the bare NameError this replay exists to prevent. So report it.
+            #
+            # Gated on having a spec or a loader, which is what separates that case from a
+            # synthetic placeholder. transformers seeds sys.modules with bare module
+            # objects carrying no __spec__, no __loader__ and no __file__; they never ran
+            # any code, so they cannot hold a skipped import. Measured on a stock install:
+            # 221 of 373 loaded transformers modules are placeholders and 0 are genuinely
+            # sourceless, so failing closed on source alone would break every user.
+            if getattr(module, "__spec__", None) is not None or \
+               getattr(module, "__loader__", None) is not None:
+                ok = _uninspectable(module, "its source is unavailable")
             continue
         if guard not in source and import_name not in source:
             continue

@@ -448,3 +448,90 @@ def test_two_different_packages_do_not_install_concurrently(monkeypatch):
 
     assert len(overlap) == 4, "not every package was attempted: %s" % overlap
     assert max(overlap) == 1, "installers overlapped: %s concurrent" % max(overlap)
+
+
+def test_a_waiter_is_not_starved_by_other_packages_queueing(monkeypatch):
+    """_install_lock serialises across packages, so an owner can sit in that queue for
+    longer than one install. Measuring the waiter's budget from its own start would let it
+    give up while its owner had not even begun. The budget measures IDLE time instead."""
+    monkeypatch.setattr(nd, "_ATTEMPT_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(nd.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(nd, "_auto_install_enabled", lambda: True)
+
+    def _slow_run(cmd, *args, **kwargs):
+        # Three times the whole idle budget, so a start-anchored deadline would expire.
+        time.sleep(3.0)
+        return types.SimpleNamespace(returncode = 0, stdout = "", stderr = "")
+
+    monkeypatch.setattr(subprocess, "run", _slow_run)
+
+    # Occupy _install_lock with a different package first, so `timm`'s owner queues.
+    blocker = threading.Thread(target = nd._pip_install, args = ("einops",))
+    blocker.start()
+    time.sleep(0.3)
+
+    results = {}
+    owner = threading.Thread(target = lambda: results.__setitem__("owner", nd._pip_install("timm")))
+    owner.start()
+    time.sleep(0.3)
+    waiter = threading.Thread(target = lambda: results.__setitem__("waiter", nd._pip_install("timm")))
+    waiter.start()
+
+    for t in (blocker, owner, waiter):
+        t.join(timeout = 40)
+    assert not any(t.is_alive() for t in (blocker, owner, waiter)), "a thread hung"
+    assert results.get("owner") is True, "the owner did not finish its install"
+    # The waiter returns False by contract (the caller re-probes), but it must not have
+    # returned before the owner finished.
+    assert "waiter" in results
+
+
+def test_an_idle_installer_still_releases_the_waiter(monkeypatch):
+    """Bounding idle time rather than total time must not turn into an unbounded wait if
+    the owning thread dies without setting its event."""
+    monkeypatch.setattr(nd, "_ATTEMPT_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(nd, "_attempted", {"timm": threading.Event()})
+    nd._note_install_activity()
+
+    started = time.monotonic()
+    assert nd._pip_install("timm") is False
+    waited = time.monotonic() - started
+    assert waited < 20, "the waiter never gave up (%.1fs)" % waited
+
+
+def test_a_sourceless_but_real_transformers_module_is_reported(monkeypatch):
+    """A module the import system really executed, whose source cannot be read, may hold
+    the guarded import. Skipping it silently produces the bare NameError the replay
+    exists to prevent."""
+    module = types.ModuleType("transformers.mystery_model")
+    module.__spec__ = types.SimpleNamespace(name = "transformers.mystery_model", loader = object())
+    monkeypatch.setitem(sys.modules, "transformers.mystery_model", module)
+    monkeypatch.setattr(nd, "_module_source", lambda _m: None)
+
+    seen = []
+    monkeypatch.setattr(nd, "_uninspectable", lambda mod, why: seen.append((mod, why)) or False)
+    iu = types.SimpleNamespace(is_timm_available = lambda: True)
+    ok = nd._replay_skipped_guarded_imports(iu, "timm")
+
+    assert seen, "a genuinely sourceless transformers module was skipped silently"
+    assert ok is False, "the caller was told the replay succeeded"
+
+
+def test_transformers_placeholder_modules_are_still_skipped(monkeypatch):
+    """transformers seeds sys.modules with bare module objects that have no __spec__, no
+    __loader__ and no __file__. They never ran any code, so they cannot hold a skipped
+    import. On a stock install 221 of 373 loaded transformers modules are these, so
+    reporting them would break every user."""
+    placeholder = types.ModuleType("transformers.models.fake.image_processing_fake_fast")
+    placeholder.__spec__ = None
+    placeholder.__loader__ = None
+    monkeypatch.setitem(sys.modules, placeholder.__name__, placeholder)
+    monkeypatch.setattr(nd, "_module_source",
+                        lambda m: None if m is placeholder else "")
+
+    seen = []
+    monkeypatch.setattr(nd, "_uninspectable", lambda mod, why: seen.append(mod) or False)
+    iu = types.SimpleNamespace(is_timm_available = lambda: True)
+    nd._replay_skipped_guarded_imports(iu, "timm")
+
+    assert placeholder not in seen, "a synthetic placeholder was reported as uninspectable"
