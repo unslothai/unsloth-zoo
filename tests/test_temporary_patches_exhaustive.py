@@ -351,7 +351,9 @@ def _unwrap_kernel_hub_func(obj, expected_name = None):
             if expected_name is not None and getattr(inner, "__name__", None) == expected_name:
                 return inner
             found.append(inner)
-    if len(found) == 1 and expected_name is None:
+    if len(found) == 1:
+        # A name miss happens when upstream renames or decorates the target; a lone
+        # closed-over function is still what the wrapper forwards to.
         return found[0]
     return obj
 
