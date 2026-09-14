@@ -15,6 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import ast
+import functools
 import os
 import torch
 import torch.nn as nn
@@ -70,6 +72,142 @@ def is_triton_kernels_available():
     if _TRITON_KERNELS_AVAILABLE is None:
         _TRITON_KERNELS_AVAILABLE = _check_triton_kernels_available()
     return _TRITON_KERNELS_AVAILABLE
+
+
+# Newer triton_kernels returns a layout instance, not (class, kwargs): unpacking blind
+# raises TypeError there.
+def _mxfp4_layout_selection_is_class_contract(selection):
+    return (
+        isinstance(selection, tuple)
+        and len(selection) == 2
+        and isinstance(selection[1], dict)
+        and isinstance(selection[0], type)
+    )
+
+
+def _normalize_mxfp4_value_layout(selection):
+    """(layout_arg, ctor_kwargs) for either contract, ready for convert_layout."""
+    if _mxfp4_layout_selection_is_class_contract(selection):
+        return selection[0], selection[1]
+    return selection, {}
+
+
+_HOPPER_ONLY_VALUE_ASSERT = ast.dump(
+    ast.parse(
+        'SWIZZLE_MX_VALUE == "HOPPER_VALUE" or SWIZZLE_MX_VALUE is None',
+        mode = "eval",
+    ).body,
+    include_attributes = False,
+)
+
+
+@functools.lru_cache(maxsize = 8)
+def _source_rejects_blackwell_value_swizzle(source):
+    """Does this kernel source refuse any value swizzle other than Hopper's?
+
+    Matched as an AST node, so the same words in a comment or an error string do not
+    count. Absence is not proof Blackwell works, only that there is nothing to fix.
+    """
+    try:
+        tree = ast.parse(dedent(source))
+    except Exception:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == "static_assert"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "tl"
+        ):
+            continue
+        if ast.dump(node.args[0], include_attributes = False) == _HOPPER_ONLY_VALUE_ASSERT:
+            return True
+    return False
+
+
+def _blackwell_value_swizzle_unsupported():
+    """Read the matmul kernel this process would actually launch."""
+    try:
+        from triton_kernels.matmul_ogs_details import _matmul_ogs as _kernel_module
+    except Exception:
+        return False
+    found = False
+    # Every kernel: newer builds add a persistent variant the dispatcher may pick.
+    for name in dir(_kernel_module):
+        kernel = getattr(_kernel_module, name, None)
+        source = getattr(kernel, "src", None)
+        if not isinstance(source, str):
+            fn = getattr(kernel, "fn", None)
+            if fn is None:
+                continue
+            try:
+                source = inspect.getsource(fn)
+            except Exception:
+                continue
+        if not isinstance(source, str):
+            continue
+        if _source_rejects_blackwell_value_swizzle(source):
+            found = True
+    return found
+
+
+_MXFP4_STRIDED_VALUES_WARNED = False
+
+
+def _mxfp4_layout_arguments(layout_module, w):
+    """(layout_arg, ctor_kwargs, strided_arg) for this weight. strided_arg is a class or
+    an instance to match the installed convert_layout, and is reused for the scales."""
+    selection = layout_module.make_default_matmul_mxfp4_w_layout(mx_axis = 1)
+    class_contract = _mxfp4_layout_selection_is_class_contract(selection)
+    value_layout, value_layout_opts = _normalize_mxfp4_value_layout(selection)
+    StridedLayout = layout_module.StridedLayout
+    strided_argument = StridedLayout if class_contract else StridedLayout()
+
+    if _force_strided_mxfp4_values(value_layout, layout_module, w):
+        # Otherwise generate() dies in matmul_ogs: "Only Hopper swizzling is supported
+        # for values". Unswizzled values pair with the strided scales, still MXFP4.
+        global _MXFP4_STRIDED_VALUES_WARNED
+        value_layout, value_layout_opts = strided_argument, {}
+        if not _MXFP4_STRIDED_VALUES_WARNED:
+            _MXFP4_STRIDED_VALUES_WARNED = True
+            logger.info(
+                "Unsloth: This triton_kernels build cannot run Blackwell MXFP4 value "
+                "swizzling, so gpt-oss weights stay unswizzled (still MXFP4). Set "
+                "UNSLOTH_MXFP4_VALUE_LAYOUT=default to opt out."
+            )
+    return value_layout, value_layout_opts, strided_argument
+
+
+def _force_strided_mxfp4_values(value_layout, layout_module, w):
+    """Should this weight skip Blackwell value swizzling? UNSLOTH_MXFP4_VALUE_LAYOUT
+    = auto | strided | default, read per call so it can be set after import."""
+    override = os.environ.get("UNSLOTH_MXFP4_VALUE_LAYOUT", "auto").strip().lower()
+    if override == "default":
+        return False
+    try:
+        # The weight's own device: a process can hold Blackwell and non-Blackwell cards.
+        if not (hasattr(w, "is_cuda") and w.is_cuda):
+            return False
+        if override == "strided":
+            return True
+        if torch.cuda.get_device_capability(w.device)[0] < 10:
+            return False
+        blackwell = getattr(layout_module, "BlackwellMXValueLayout", None)
+        if blackwell is None:
+            return False
+        selected_is_blackwell = (
+            value_layout is blackwell
+            or (isinstance(value_layout, type) and issubclass(value_layout, blackwell))
+            or isinstance(value_layout, blackwell)
+        )
+        if not selected_is_blackwell:
+            return False
+        return _blackwell_value_swizzle_unsupported()
+    except Exception:
+        return False
 
 
 @torch_compile(dynamic = True, fullgraph = True)
@@ -168,9 +306,8 @@ def patch_gpt_oss():
             tensor.wrap_torch_tensor,
         )
         layout = tensor_details.layout
-        StridedLayout = tensor_details.layout.StridedLayout
 
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+        value_layout, value_layout_opts, strided_argument = _mxfp4_layout_arguments(layout, w)
         w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
         # TODO : add that when we are actually sure that it works on B200
         # if torch.cuda.get_device_capability()[0] == 10:
@@ -184,7 +321,7 @@ def patch_gpt_oss():
         # TODO: there is still an issue with the scales on hopper
         # scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=8)
         # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
-        w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), strided_argument)
         return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
 

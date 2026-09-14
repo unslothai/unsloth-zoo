@@ -364,6 +364,7 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
