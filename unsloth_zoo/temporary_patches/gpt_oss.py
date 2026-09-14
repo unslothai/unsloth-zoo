@@ -54,9 +54,7 @@ torch_cuda_device = torch.cuda.device
 UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
 
 # Set when patch_GptOssAttention installs the forward that routes training through
-# flex_attention_with_sink, which builds its own BlockMask and ignores whatever the
-# mask factories produce. Attribute name for the training flag GptOssModel.forward
-# hands to those factories.
+# flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
 _TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
 
@@ -2539,9 +2537,8 @@ def patch_GptOssAttention():
 
     functions.append(forward)
     patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
-    # forward_function above picks flex_attention_with_sink from self.training alone,
-    # so once this forward is live, training ignores whatever mask the factories build.
-    # The mask wrapper reads this to decide whether skipping the dense mask is safe.
+    # forward_function picks flex_attention_with_sink from self.training alone, so
+    # once it is live, training ignores whatever mask the factories build.
     global _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
     _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = (
         getattr(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention.forward, "__module__", "")
@@ -2584,11 +2581,8 @@ def patch_GptOssModel():
                     break
         return config
 
-    # GptOssModel.forward records its own training flag here, so the mask wrapper
-    # can key on the state that actually selects the attention backend instead of
-    # guessing from requires_grad. Wrapped rather than replaced: zoo's full
-    # GptOssModel.forward replacement fails the signature match on some releases
-    # ("Unsloth: Skipped GptOssModel.forward"), and this must hold either way.
+    # Records self.training on the config so the mask wrapper can key on the state
+    # that selects the attention backend instead of guessing from requires_grad.
     def _record_training_state(GptOssModel):
         original = getattr(GptOssModel, "forward", None)
         if original is None or getattr(original, _TRAINING_FLAG_ATTR, False):
@@ -2618,21 +2612,17 @@ def patch_GptOssModel():
                         input_embeds = arg
                         break
 
-            # Skipping the dense mask is only safe when the attention that runs
-            # will ignore it, which is exactly when flex_attention_with_sink takes
-            # over -- and forward_function picks that on self.training alone, not
-            # on _attn_implementation. Key on the same thing it does.
-            #
-            # `requires_grad` is NOT a training signal here: unsloth calls
-            # enable_input_require_grads() on every LoRA-capable load, so
-            # embeddings require grad during inference too, and skipping there
-            # hands eager attention a None mask, i.e. no causal masking at all.
+            # Skipping is only safe when flex_attention_with_sink takes over and
+            # ignores this mask, which it picks on self.training, not on
+            # _attn_implementation. `requires_grad` is not a training signal:
+            # enable_input_require_grads() fires on every LoRA-capable load, so
+            # skipping there hands eager attention no causal mask at all.
             _config = _find_config(args, kwargs)
             _is_flex = getattr(_config, "_attn_implementation", None) == "flex_attention"
             _training = getattr(_config, _TRAINING_FLAG_ATTR, None)
             if _training is None:
-                # No model forward recorded it (an unusual caller): fall back to a
-                # grad-shaped guess, which at least excludes no_grad inference.
+                # Unusual caller, no model forward recorded it: at least exclude
+                # no_grad inference.
                 _training = bool(
                     torch.is_grad_enabled()
                     and input_embeds is not None
@@ -3067,9 +3057,8 @@ def patch_GptOssModel():
             })
 
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
-    # After the replacement above, so the recorder wraps whichever forward ended up
-    # live: zoo's own when the signature matched, stock transformers when it did not
-    # ("Unsloth: Skipped GptOssModel.forward").
+    # After the replacement, so the recorder wraps whichever forward ended up live:
+    # zoo's own, or stock when the signature did not match.
     _record_training_state(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel)
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
