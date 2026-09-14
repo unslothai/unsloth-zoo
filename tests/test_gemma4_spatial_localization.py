@@ -31,6 +31,17 @@ shape/dtype-only versions did not:
 import pytest
 import torch
 
+# Gemma-4 arrived in transformers 5.x, and every test below builds a real
+# Gemma4MultimodalEmbedder. The patch these tests cover says the same thing about the other
+# side of that pin: each of its entry points catches ImportError on the gemma4 module with
+# "transformers < 5.x has no Gemma-4 -> nothing to patch". So on an older transformers there
+# is no patch installed and nothing here to assert, and the seven collected tests were
+# failing with ModuleNotFoundError on the pinned HF=4.57.6 lane rather than skipping.
+pytest.importorskip(
+    "transformers.models.gemma4",
+    reason = "Gemma-4 needs transformers 5.x; the patch under test no-ops without it",
+)
+
 # Imported at module scope, not from a fixture: applying TEMPORARY_PATCHES
 # installs entries in sys.modules (bitsandbytes.nn among them), and conftest's
 # hygiene guard attributes any sys.modules mutation made during a test to that
