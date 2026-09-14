@@ -1329,6 +1329,20 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 pass
 
 
+# lm_head is tied to the embeddings, so it may legitimately be absent from either side
+TIED_LM_HEAD_KEYS = frozenset((
+    "lm_head.weight",
+    "model.lm_head.weight",
+    "model.language_model.lm_head.weight",
+    "model.text_model.lm_head.weight",
+))
+TIED_EMBED_KEYS = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "model.text_model.embed_tokens.weight",
+)
+
+
 @torch.inference_mode
 def assert_same_state_dict(old_state_dict, new_state_dict):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1344,13 +1358,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         return value.contiguous()
 
     difference = new_state_dict.keys() ^ old_state_dict.keys()
-    # lm_head is tied to the embeddings, so it is allowed to be missing on either side
-    difference -= {
-        "lm_head.weight",
-        "model.lm_head.weight",
-        "model.language_model.lm_head.weight",
-        "model.text_model.lm_head.weight",
-    }
+    difference -= TIED_LM_HEAD_KEYS
     if len(difference) != 0:
         missing_from_hf = new_state_dict.keys() - old_state_dict.keys()
         missing_from_vllm = old_state_dict.keys() - new_state_dict.keys()
@@ -1375,10 +1383,12 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             else:
                 torch.testing.assert_close(old_val, new_val, check_stride = False)
         except Exception as error:
-            if key == "lm_head.weight":
-                # Try tied embeddings fallback
-                key1 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in old_state_dict), None)
-                key2 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in new_state_dict), None)
+            if key in TIED_LM_HEAD_KEYS:
+                # Try tied embeddings fallback. The key is excused from the difference
+                # check above, so compare it against whichever embedding it is tied to
+                # rather than KeyError-ing when it is absent from one side.
+                key1 = next((k for k in (key,) + TIED_EMBED_KEYS if k in old_state_dict), None)
+                key2 = next((k for k in (key,) + TIED_EMBED_KEYS if k in new_state_dict), None)
 
                 if key1 is not None and key2 is not None:
                     try:

@@ -36,6 +36,12 @@ from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
+# get_model_type prefers vision_config.model_type, and transformers 5 renamed the
+# Qwen3-VL vision config from "qwen3_vl" to "qwen3_vl_vision". Accept both spellings
+# so these stay matched on every supported transformers version.
+QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5")
+
+
 def _is_gemma4_config(config):
     if config is None:
         return False
@@ -576,7 +582,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
-    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+    if model_type in QWEN_VL_MERGED_QKV_TYPES:
         new_config.vision_config.out_hidden_size = 1
 
     num_layers = max(text_layers, vision_layers)
@@ -1235,7 +1241,7 @@ def get_model_layer_counts(config):
             "text_layers": getattr(config, "num_hidden_layers", 32),
             "vision_layers": getattr(vision_config, "depth", 32),
         }
-    elif model_type == "qwen3_vl":
+    elif model_type in ("qwen3_vl", "qwen3_vl_vision"):
         return {
             "text_layers": getattr(config, "num_hidden_layers", 36),
             "vision_layers": getattr(vision_config, "depth", 27),
@@ -1471,7 +1477,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+                    if model_type in QWEN_VL_MERGED_QKV_TYPES:
                         # HF keeps merged qkv for these (qwen-2.5-vl, qwen-3-vl)
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:
