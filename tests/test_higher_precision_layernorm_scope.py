@@ -16,10 +16,8 @@
 
 """higher_precision_layernorms must read only the norm class it found.
 
-It decides UNSLOTH_HIGH_PRECISION_LAYERNORM from markers like `self.weight.float()`
-in the RMSNorm source. The slice it matches those against used to run to the end of
-the class after the norm one, so a marker anywhere in that neighbour upcast the
-layernorm weights of a model that never asked for it.
+It picks UNSLOTH_HIGH_PRECISION_LAYERNORM from markers like `self.weight.float()` in the
+RMSNorm source. That slice used to run one class too far, so a neighbour's markers decided.
 """
 
 import os
@@ -85,11 +83,8 @@ def test_marker_in_the_norm_itself_still_upcasts(precision_flag):
 
 
 def test_a_marker_in_the_next_class_can_also_suppress_a_real_upcast(precision_flag):
-    # The leak runs both ways. The marker ladder is priority ordered, so a higher priority
-    # float16 marker next door hides a norm that really does want float32. Qwen4Exp is the
-    # live case: its own forward is `output * (1.0 + self.weight.float())`, but
-    # Qwen4ExpTextRMSNormGated next to it contains `self.weight * hidden_states.to(`,
-    # which is checked first. Before the fix this model silently lost its upcast.
+    # The ladder is priority ordered, so a float16 marker next door also hides a real float32
+    # norm. Qwen4Exp is the live case, and it was silently losing its upcast.
     float32_norm = FLOAT16_NORM.replace(
         "return output * self.weight", "return output * (1.0 + self.weight.float())"
     )
@@ -105,8 +100,8 @@ class Llama4TextRMSNormGated(nn.Module):
 
 
 def test_decorated_next_class_does_not_leak_either(precision_flag):
-    # The next class is usually introduced by a decorator, so the slice has to stop at the
-    # "\nclass" and not at the decorator. Kimi Linear and Cohere2 MoE both look like this.
+    # The next class usually has a decorator, so stop at its "\nclass", not the decorator.
+    # Kimi Linear and Cohere2 MoE both look like this.
     decorated_neighbour = '''
 
 @use_kernel_forward_from_hub("RMSNormGated")
@@ -120,8 +115,7 @@ class Llama4TextRMSNormGated(nn.Module):
 
 
 def test_the_norm_class_is_read_in_full(precision_flag):
-    # The narrower slice must still cover the whole norm class, including anything after
-    # forward(). A marker in the last method of the norm class still has to count.
+    # The narrower slice must still reach past forward() to the end of the norm class.
     norm_with_trailing_method = FLOAT16_NORM + """
     def extra_repr(self):
         scale = self.weight.float()
@@ -133,8 +127,7 @@ def test_the_norm_class_is_read_in_full(precision_flag):
 
 
 def test_the_flag_is_never_downgraded(precision_flag, monkeypatch):
-    # unsloth/models/loader.py hardcodes "1" for Gemma 3/3n/4 and Granite-4 before the
-    # compiler ever runs. Narrowing the slice must not be able to turn those back off.
+    # loader.py hardcodes "1" for Gemma 3/3n/4 and Granite-4 before this runs; never undo it.
     monkeypatch.setitem(os.environ, "UNSLOTH_HIGH_PRECISION_LAYERNORM", "1")
     higher_precision_layernorms(FLOAT16_NORM + FLOAT32_MARKER_NEIGHBOUR + TRAILING_CLASS)
 
@@ -144,15 +137,15 @@ def test_the_flag_is_never_downgraded(precision_flag, monkeypatch):
 @pytest.mark.parametrize(
     "model, expected",
     [
-        # Regressions caught by the old slice, pinned against the real transformers source.
-        ("cohere2_moe", "0"),  # Cohere2MoeLayerNorm next door leaked self.weight.to(torch.float32)
-        ("kimi_linear", "0"),  # KimiLinearRMSNormGated next door leaked the same marker
-        ("qwen4_exp", "1"),  # its own float32 norm was masked by the gated norm next door
-        # Controls that the old slice already got right.
+        # Real sources the old slice got wrong: a neighbour leaked its marker in.
+        ("cohere2_moe", "0"),  # Cohere2MoeLayerNorm
+        ("kimi_linear", "0"),  # KimiLinearRMSNormGated
+        ("qwen4_exp", "1"),  # Qwen4ExpTextRMSNormGated masked a real float32 norm
+        # Controls it already got right.
         ("llama4", "0"),
         ("llama", "0"),
         ("gemma3", "1"),
-        ("olmo2", "1"),  # (self.weight * hidden_states).to(input_dtype): weight used in float32
+        ("olmo2", "1"),  # (self.weight * hidden_states).to(...): weight used in float32
     ],
 )
 def test_real_transformers_sources(precision_flag, model, expected):

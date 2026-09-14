@@ -944,12 +944,9 @@ def higher_precision_layernorms(modeling_file):
         return modeling_file
     norm_module = norm_modules[0]
     start, end = norm_module.span(0)
-    # The match already runs into the next class's name, so searching forward from its end
-    # skips that class and stops at the one after, putting a whole unrelated class inside the
-    # text the markers below are matched against. Search from just past this class's own
-    # "\nclass" instead. The regex above only matches when a later "\nclass" exists, so the
-    # -1 branch is unreachable today; it is kept so a future regex change degrades to reading
-    # to the end of the file rather than to modeling_file[start:-1].
+    # The match already runs into the next class's name, so searching from its end skips that
+    # class and slices in the one after, letting a neighbour's markers decide. Anchor on this
+    # class's own "\nclass". The regex guarantees a later one, so -1 is only future proofing.
     end = modeling_file.find("\nclass", start + 1)
     if end == -1: end = len(modeling_file)
     norm_module = modeling_file[start:end]
