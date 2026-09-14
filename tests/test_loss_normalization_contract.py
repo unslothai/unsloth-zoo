@@ -254,6 +254,44 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
     )
 
 
+def test_custom_loss_counts_tokens_without_model_forward_kwargs():
+    torch = pytest.importorskip("torch")
+    import torch.nn.functional as F
+
+    class ExplicitForCausalLM(type(_tiny_model())):
+        def forward(self, input_ids):
+            return self.lm_head(self.embed(input_ids))
+
+    def compute_loss(logits, labels, num_items_in_batch = None):
+        total = F.cross_entropy(
+            logits[..., :-1, :].reshape(-1, logits.size(-1)),
+            labels[..., 1:].reshape(-1),
+            reduction = "sum",
+        )
+        count = (labels[..., 1:] != -100).sum() if num_items_in_batch is None else num_items_in_batch
+        return total / count
+
+    model = ExplicitForCausalLM()
+    batches = _microbatches(2, 5)
+    batches[1]["labels"][:, 1:4] = -100
+    full_input = torch.cat([batch["input_ids"] for batch in batches])
+    full_labels = torch.cat([batch["labels"] for batch in batches])
+    compute_loss(model(full_input), full_labels).backward()
+    reference_grad = model.lm_head.weight.grad.clone()
+    model.zero_grad(set_to_none = True)
+
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, count = mod._unsloth_get_batch_samples(
+        _fake_trainer(model, False, compute_loss), iter(batches), len(batches),
+    )
+    for batch in batches:
+        compute_loss(model(batch["input_ids"]), batch["labels"], count).backward()
+
+    torch.testing.assert_close(model.lm_head.weight.grad, reference_grad)
+    assert count == 14
+
+
 # The N-1 internal boundaries of a packed row are not training positions, but
 # subtracting N-1 double counts every boundary a collator already masked with
 # -100 (TRL >= 0.23.1 labels[position_ids == 0] = -100, completion_only_loss /
