@@ -25,9 +25,7 @@ pytest.importorskip("mlx.core")
 
 @pytest.fixture(autouse=True)
 def _require_real_mlx():
-    # Selection reads module trees, never a kernel, so the CPU backend answers
-    # it as well as Metal does. The torch shim cannot: its module classes are
-    # not the ones the selection isinstance-checks against.
+    # The torch shim lacks the module types checked by selection.
     import mlx.core as _mx   # re-import: the shim may have swapped it
     if "mlx_simulation" in str(getattr(_mx, "__file__", "")):
         pytest.skip("requires the real MLX runtime; shim active")
@@ -201,8 +199,8 @@ _EMPTY_GROUP_CASES = {
         {"finetune_vision_layers": True, "train_projector": True,
          "target_modules": ["q_proj"]},
         ["finetune_vision_layers", "'vision_tower'", "q_proj", "'wqkv'"]),
-    "a tower whose linears read as neither role": (
-        lambda: _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, HIDDEN)})),
+    "a tower with only normalization and scalar gates": (
+        lambda: _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, 1)})),
         {"finetune_vision_layers": True},
         ["finetune_vision_layers", "'patch_dense'"]),
 }
@@ -278,7 +276,7 @@ def test_a_nested_connector_is_adapted_whichever_pass_owns_it(
 def test_a_refusal_on_the_defaulted_path_names_no_target_modules():
     # The canonical list is substituted internally, so quoting it back sends
     # the caller to change an argument they never passed.
-    model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, HIDDEN)}))
+    model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, 1)}))
     with pytest.raises(ValueError) as excinfo:
         _peft(model, finetune_vision_layers=True)
     # Suggesting one is fine; quoting back a list they never passed is not.
@@ -349,13 +347,157 @@ def test_a_fused_expert_stack_reports_output_width_not_expert_count():
     assert _semantic_dims(nn.Linear(HIDDEN, 7)) == (7, HIDDEN)
 
 
-def test_a_tower_of_roleless_linears_says_so_rather_than_claiming_none_exist():
+@pytest.mark.parametrize("module_name", ["mlx_lm.models.bitlinear_layers",
+                                         "mlx_vlm.models.bitnet.bitlinear"])
+@pytest.mark.parametrize("targets", [None, "q_proj", ["q_proj"], {"q_proj"},
+                                     frozenset({"q_proj"}), "all-linear", ["all-linear"]])
+def test_bitlinear_refuses_before_mutating_other_targets(module_name, targets):
+    BitLinear = pytest.importorskip(module_name).BitLinear
+    model = _text_model([_TEXT_BLOCK, {"self_attn": {
+        "q_proj": BitLinear(HIDDEN, HIDDEN, bias=False)}}])
+    with pytest.raises(ValueError, match="BitLinear.*CustomKernel.*VJP"):
+        _peft(model, target_modules=targets)
+    assert not _adapters(model)
+
+
+def test_vlm_bitlinear_refusal_preserves_trainability():
+    from mlx_lm.models.bitlinear_layers import BitLinear
+    from mlx.utils import tree_flatten
+    model = _vlm(decoder=[_TEXT_BLOCK, {"self_attn": {
+        "q_proj": BitLinear(HIDDEN, HIDDEN, bias=False)}}])
+    before = [name for name, _ in tree_flatten(model.trainable_parameters())]
+    with pytest.raises(ValueError, match="BitLinear.*CustomKernel.*VJP"):
+        _peft(model)
+    assert [name for name, _ in tree_flatten(model.trainable_parameters())] == before
+    assert not _adapters(model)
+
+
+@pytest.mark.parametrize("targets,attention", [(["lm_head"], True),
+                                               (["q_proj", "lm_head"], False)])
+def test_bitlinear_head_selection_leaves_packed_layers_frozen(targets, attention):
+    from mlx_lm.models.bitlinear_layers import BitLinear
+    model = _text_model([{"self_attn": {"q_proj": BitLinear(HIDDEN, HIDDEN)}}])
+    _peft(model, target_modules=targets, finetune_attention_modules=attention)
+    assert _adapters(model) == ["lm_head"]
+
+
+def test_unselected_bitlinear_groups_are_left_alone():
+    from mlx_lm.models.bitlinear_layers import BitLinear
+    tower = _build({"q_proj": BitLinear(VISION, VISION, bias=False)})
+    vlm = _vlm(tower=tower)
+    _peft(vlm)
+    assert not _adapters(vlm, "vision_tower")
+    model = _text_model([{"self_attn": {"q_proj": BitLinear(HIDDEN, HIDDEN)}},
+                         _TEXT_BLOCK])
+    _peft(model, finetune_last_n_layers=1)
+    assert not _adapters(model, "model.layers.0")
+    assert _adapters(model, "model.layers.1")
+
+
+def test_roleless_vision_projections_follow_default_group_flags():
     model = _vlm(tower=_build({"patch_ln1": {}, "patch_dense": (VISION, HIDDEN)}))
-    with pytest.raises(ValueError) as excinfo:
-        _peft(model, finetune_vision_layers=True)
-    said = str(excinfo.value)
-    assert "holds no linear layer" not in said
-    assert "read as attention or MLP" in said and "'patch_dense'" in said
+    _peft(model, finetune_vision_layers=True)
+    assert _adapters(model, "vision_tower") == ["patch_dense"]
+    for flag in ("finetune_attention_modules", "finetune_mlp_modules"):
+        model = _vlm(tower=_build({"patch_dense": (VISION, HIDDEN)}))
+        with pytest.raises(ValueError, match="read as attention or MLP"):
+            _peft(model, finetune_vision_layers=True, **{flag: False})
+
+
+def test_pointwise_vision_adapters_train_reload_and_fuse(tmp_path):
+    import copy
+    import json
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx.optimizers as optim
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.loader import _apply_lora_at_paths
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+
+    tower = _build({"project": nn.Conv2d(4, 8, 1, stride=(2, 1), padding=(1, 0)),
+                    "depthwise": nn.Conv2d(4, 4, 1, groups=4),
+                    "spatial": nn.Conv2d(4, 8, 3)})
+    model = _vlm(tower=tower)
+    restored = copy.deepcopy(model)
+    x = mx.random.normal((2, 7, 8, 4))
+    before = tower.project(x)
+    _peft(model, finetune_vision_layers=True)
+    assert _adapters(model, "vision_tower") == ["project"]
+    assert mx.array_equal(tower.project(x), before).item()
+    loss = lambda m: mx.square(m.vision_tower.project(x)).mean()
+    _, grads = nn.value_and_grad(model, loss)(model)
+    optim.SGD(0.1).update(model, grads)
+    mx.eval(model.parameters())
+    assert mx.abs(tower.project.lora_b).max().item() > 0
+    assert all("lora_" in name for name, _ in tree_flatten(model.trainable_parameters()))
+    expected = tower.project(x)
+    fused = tower.project.fuse()
+    assert type(fused) is nn.Conv2d
+    assert (fused.stride, fused.padding, fused.dilation) == ((2, 1), (1, 0), 1)
+    assert mx.allclose(fused(x), expected, atol=1e-5).item()
+    save_lora_adapters(model, tmp_path)
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    _apply_lora_at_paths(restored, _adapters(model), config)
+    restored.load_weights(str(tmp_path / "adapters.safetensors"), strict=False)
+    assert mx.array_equal(restored.vision_tower.project(x), expected).item()
+
+
+@pytest.mark.parametrize("pixel_key", ["images", "pixel_values"])
+def test_vision_lora_b_moves_through_the_processed_image_merge(pixel_key):
+    from types import SimpleNamespace
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx.optimizers as optim
+    from unsloth_zoo.mlx.compile import _merge_special_token_features_only
+    from unsloth_zoo.mlx.utils import _to_mx_vlm_batch, make_vlm_baseline_loss_fn
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(hidden_size=HIDDEN, image_token_index=7)
+            self.language_model = _text_model([{"q_proj": (HIDDEN, HIDDEN)}])
+            self.vision_tower = _build({"q_proj": (VISION, HIDDEN)})
+            self._is_vlm_model = True
+
+        def get_input_embeddings(self, ids, pixel_values=None):
+            text = self.language_model.model.embed_tokens(ids)
+            if pixel_values is not None:
+                features = self.vision_tower.q_proj(pixel_values)
+                text = _merge_special_token_features_only(7, None, features, text, ids)
+            return SimpleNamespace(inputs_embeds=text)
+
+        def __call__(self, ids, pixel_values=None, **kwargs):
+            embeds = self.get_input_embeddings(ids, pixel_values).inputs_embeds
+            hidden = self.language_model.model.layers[0].q_proj(mx.cumsum(embeds, axis=1))
+            return self.language_model.lm_head(nn.tanh(hidden))
+
+    model = _peft(Wrapper(), finetune_vision_layers=True)
+    loss_fn = make_vlm_baseline_loss_fn(model)
+    optimizer = optim.SGD(0.1)
+    for ids, sign in (([[1, 7, 2, 3]], 1), ([[1, 2, 7, 3]], -1)):
+        before = mx.array(model.vision_tower.q_proj.lora_b)
+        batch = _to_mx_vlm_batch({"input_ids": mx.array(ids),
+                                  pixel_key: sign * mx.ones((1, 1, VISION))})
+        _, grads = nn.value_and_grad(model, lambda m: loss_fn(m, batch)[0])(model)
+        optimizer.update(model, grads)
+        mx.eval(model.parameters())
+        assert mx.abs(model.vision_tower.q_proj.lora_b - before).max().item() > 0
+
+
+def test_native_string_message_format_keeps_numbered_images():
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _vlm_token_messages
+    processor = SimpleNamespace(_unsloth_model_type="phi3_v")
+    messages = [{"role": "user", "content": [{"type": "image"}, {"type": "image"},
+                 {"type": "text", "text": "Compare these."}]}]
+    output = _vlm_token_messages(processor, messages)
+    assert output[0]["content"] == "<|image_1|><|image_2|>Compare these."
+    assert isinstance(messages[0]["content"], list)
+    messages += [{"role": "assistant", "content": "Two images."},
+                 {"role": "user", "content": [{"type": "image"},
+                  {"type": "text", "text": "Compare with <|image_1|>."}]}]
+    output = _vlm_token_messages(processor, messages)
+    assert output[2]["content"] == "<|image_3|>Compare with <|image_1|>."
 
 
 # An all-caps prefix runs into the next word, so a tower found only by its class
@@ -419,3 +561,33 @@ def test_every_container_discovery_yields_can_be_written_back_into():
         parent = _navigate(holder, parent_path)
         _set_child(parent, leaf, nn.Linear(4, 4))       # must not raise
         assert _navigate(holder, path) is not None
+
+
+@pytest.mark.parametrize("pixel_key", ["images", "pixel_values"])
+def test_generated_image_labels_ignore_negative_placeholders_only(pixel_key):
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.utils import (_stage_vlm_label_mask_np,
+        _apply_vlm_label_masks, _to_mx_vlm_batch)
+    ids = np.array([[1, -1, 2, -2], [-2, 3, -1, 4]], dtype=np.int32)
+    inputs = {"input_ids": ids, pixel_key: np.ones((2, 1, VISION))}
+    mask = _stage_vlm_label_mask_np(inputs)
+    assert np.array_equal(mask, ids < 0)
+    batch = _to_mx_vlm_batch(inputs)
+    labels = _apply_vlm_label_masks(batch)
+    assert np.array_equal(np.asarray(labels), np.where(ids < 0, -100, ids))
+    assert not _stage_vlm_label_mask_np(inputs, labels=ids).any()
+    assert mx.array_equal(_apply_vlm_label_masks(batch, labels=mx.array(ids)), mx.array(ids))
+    assert not _stage_vlm_label_mask_np({"input_ids": ids}).any()
+    assert mx.array_equal(_apply_vlm_label_masks({"input_ids": mx.array(ids)}), mx.array(ids))
+
+
+@pytest.mark.parametrize("row", [0, 1])
+def test_legacy_image_validation_checks_each_row(row):
+    from unsloth_zoo.mlx.utils import validate_legacy_image_batch
+    batch = {"input_ids": [[1, -200, -200, 2], [-200, -200, 3, 4]],
+             "_unsloth_legacy_image_spec": (-200, 2)}
+    validate_legacy_image_batch(batch)
+    batch["input_ids"][row][1] = 5
+    with pytest.raises(ValueError, match="split or removed"):
+        validate_legacy_image_batch(batch)

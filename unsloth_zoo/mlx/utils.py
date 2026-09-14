@@ -51,6 +51,7 @@ import tempfile
 import queue as _queue_module
 import threading
 import time
+import types
 import unicodedata
 import warnings
 import weakref
@@ -2413,6 +2414,7 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
     coercion parity holds by construction. Float comparisons mirror MLX's
     effective float32 narrowing so placement matches the finalized tensors.
     """
+    generated = labels is None
     if labels is None:
         labels = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
         if labels is None:
@@ -2434,6 +2436,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         # Same normalization finalize uses (wide unsigned ids -> int64 sentinels)
         values = _normalize_numpy_cce_labels(values)
     mask = values == -100
+    if generated and any(inputs.get(key) is not None for key in ("pixel_values", "images")):
+        mask = mask | (values < 0)
     if ignore_token_ids:
         compare = np.asarray(list(ignore_token_ids))
         if np.issubdtype(values.dtype, np.floating):
@@ -2624,9 +2628,13 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     # its own narrow, so wide/unsigned invalid ids (e.g. uint32(2**32-100))
     # must survive as out-of-vocab sentinels instead of wrapping to -100.
     # Prefer the pre-narrow raw carrier when deriving labels from input_ids.
+    generated = labels is None
     if labels is None:
         labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
     labels = _normalize_cce_label_dtype(labels)
+    if generated and batch_dict.get("pixel_values") is not None:
+        # Processor-generated negative image placeholders are not vocabulary targets.
+        labels = mx.where(labels < 0, mx.array(ignore_index, dtype=labels.dtype), labels)
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
     spans = _audio_span_positions_np(batch_dict, labels.shape)
     if spans is not None:
@@ -3808,6 +3816,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         return _vlm_positions_for_compile(batch_dict, config)
     if phase != "content":
         raise ValueError(f"unknown VLM prepare phase: {phase!r}")
+    validate_legacy_image_batch(batch_dict)
     # The provenance marker is pipeline-private: processor output carrying it is a
     # forgery that would misclassify foreign position ids as regenerated.
     batch_dict.pop("_unsloth_collated_position_ids", None)
@@ -4746,6 +4755,49 @@ def _processor_accepts_assistant_list_content(processor):
             return True
 
 
+def _vlm_token_messages(processor, messages):
+    model_type = getattr(processor, "_unsloth_model_type", None)
+    if not model_type:
+        return messages
+    from mlx_vlm.prompt_utils import get_message_json
+
+    rendered = []
+    image_offset = 0
+    for message in messages:
+        count = _count_vlm_image_parts([message])
+        offset = image_offset
+        image_offset += count
+        parts = message.get("content")
+        if not isinstance(parts, list) or any(
+            not isinstance(part, dict) or part.get("type") not in ("text", "image")
+            for part in parts
+        ):
+            rendered.append(message)
+            continue
+        text = "".join(str(part.get("text", "")) for part in parts
+                       if part.get("type") == "text")
+        if hasattr(processor, "_unsloth_legacy_image_spec"):
+            rendered.append({**message, "content": "".join(
+                "<image>\n" if part["type"] == "image" else str(part.get("text", "")) for part in parts)})
+            continue
+        try:
+            native = get_message_json(
+                model_type, text, role=message.get("role", "user"), num_images=count,
+            )
+        except ValueError:
+            native = None
+        content = native.get("content") if isinstance(native, dict) else None
+        if isinstance(content, str) and (not count or content != text):
+            if count and offset and content.endswith(text):
+                prefix = content[:-len(text)] if text else content
+                prefix = re.sub(r"<\|image_(\d+)\|>",
+                                lambda match: f"<|image_{int(match[1]) + offset}|>", prefix)
+                content = prefix + text
+            message = {**message, "content": content}
+        rendered.append(message)
+    return rendered
+
+
 def _mark_vlm_image_parts(messages, image_token):
     """Replace image parts with a literal image token, sharing everything else.
 
@@ -4786,7 +4838,7 @@ def _render_vlm_messages(
             for message in _flatten_vlm_content_for_text_template(messages, image_token)
         )
 
-    render_messages = messages
+    render_messages = _vlm_token_messages(processor, messages)
     if not _processor_accepts_assistant_list_content(renderer):
         render_messages = _collapse_vlm_assistant_content(render_messages)
     image_count = _count_vlm_image_parts(messages)
@@ -7872,6 +7924,9 @@ _VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
 
 
 def _to_mx_vlm_batch(inputs):
+    if inputs.get("pixel_values") is None and inputs.get("images") is not None:
+        inputs = dict(inputs)
+        inputs["pixel_values"] = inputs.pop("images")
     batch = {}
     for key, value in inputs.items():
         if key == "sound_clips" and isinstance(value, (list, tuple)):
@@ -8172,6 +8227,95 @@ def _drop_unsupported_processor_kwargs(processor, kwargs):
     return {k: v for k, v in kwargs.items() if k in params}
 
 
+_LEGACY_IMAGE_SPEC = "_unsloth_legacy_image_spec"
+
+
+def bind_legacy_image_processor(model, processor):
+    from mlx_vlm.models.base import BaseImageProcessor
+    image_processor = getattr(processor, "image_processor", None)
+    if hasattr(processor, "tokenizer") or not isinstance(image_processor, BaseImageProcessor):
+        return
+    from PIL import Image
+
+    merge_name = "_prepare_inputs_for_multimodal"
+    merge = getattr(model, merge_name, None)
+    token_id = _config_get(getattr(model, "config", None), "image_token_index")
+    if (not callable(merge) or token_id is None
+            or tuple(inspect.signature(merge).parameters) !=
+            ("image_features", "inputs_embeds", "input_ids")):
+        return
+    shapes = []
+
+    def capture(self, image_features, inputs_embeds, input_ids):
+        shapes.append(image_features.shape)
+        return inputs_embeds
+
+    namespace = vars(model)
+    existed, previous = merge_name in namespace, namespace.get(merge_name)
+    try:
+        object.__setattr__(model, merge_name, types.MethodType(capture, model))
+        with _preserved_preprocessing_rng():
+            pixels = np.stack(image_processor.preprocess([Image.new("RGB", (32, 32))]))
+            model.get_input_embeddings(mx.array([[0, token_id, 0]]), mx.array(pixels))
+    finally:
+        if existed:
+            object.__setattr__(model, merge_name, previous)
+        else:
+            object.__delattr__(model, merge_name)
+    if len(shapes) != 1 or len(shapes[0]) not in (2, 3) or math.prod(shapes[0][:-1]) < 1:
+        raise ValueError("Unsloth MLX: legacy image preprocessing requires one nonempty projected feature sequence.")
+    count = math.prod(shapes[0][:-1])
+    setattr(processor, _LEGACY_IMAGE_SPEC, (int(token_id), count, tuple(pixels.shape[1:])))
+    model._unsloth_legacy_image_token_count = count
+
+
+def legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation=True):
+    from mlx_vlm.models.base import BaseImageProcessor
+    if hasattr(processor, "tokenizer") or not isinstance(getattr(processor, "image_processor", None), BaseImageProcessor) or not any(all_images):
+        return None
+    from mlx_vlm.utils import prepare_inputs
+
+    spec = getattr(processor, _LEGACY_IMAGE_SPEC, None)
+    if spec is None:
+        raise ValueError("Unsloth MLX: legacy image training requires an expanded-image merge; load with patch_mode='patched'.")
+    token_id, count, pixel_shape = spec
+    if (not all(len(images) == 1 for images in all_images)
+            or not all(text.count("<image>") == 1 for text in texts)):
+        raise ValueError("Unsloth MLX: legacy image rows require exactly one image and <image> placeholder.")
+    inputs = prepare_inputs(
+        processor, images=[images[0] for images in all_images],
+        prompts=texts, image_token_index=token_id,
+    )
+    if tuple(inputs["pixel_values"].shape[1:]) != pixel_shape:
+        raise ValueError("Unsloth MLX: variable image shapes require a processor that expands its own image tokens.")
+    ids, mask = _expand_image_token_sequences(
+        inputs["input_ids"], inputs["attention_mask"], token_id, count,
+    )
+    if truncation and max_seq_length and ids.shape[1] > max_seq_length:
+        side = getattr(processor, "truncation_side", "right")
+        columns = slice(-max_seq_length, None) if side == "left" else slice(0, max_seq_length)
+        ids, mask = ids[:, columns], mask[:, columns]
+    inputs["input_ids"], inputs["attention_mask"] = ids, mask
+    inputs[_LEGACY_IMAGE_SPEC] = (token_id, count)
+    validate_legacy_image_batch(inputs)
+    return inputs
+
+
+def validate_legacy_image_batch(batch):
+    spec = batch.get(_LEGACY_IMAGE_SPEC)
+    if spec is None:
+        return
+    token_id, count = spec
+    ids = np.asarray(batch["input_ids"])
+    retained = (ids == token_id).sum(axis=1)
+    if np.any(retained != count):
+        raise ValueError(
+            f"Unsloth MLX: truncation split or removed an image span "
+            f"({count} visual tokens required per row, retained {retained.tolist()}). "
+            "Increase max_seq_length."
+        )
+
+
 def _ensure_vlm_pad_token(processor):
     tokenizer = _get_processor_tokenizer(processor)
     if getattr(tokenizer, "pad_token_id", None) is None:
@@ -8191,6 +8335,9 @@ def _processor_vlm_inputs(
     padding_side=None,
     all_audio=None,
 ):
+    legacy = legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation)
+    if legacy is not None:
+        return legacy
     tokenizer = _ensure_vlm_pad_token(processor)
     images = _format_vlm_images_for_processor(all_images, processor=processor)
     audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
@@ -13806,6 +13953,44 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     if adapter_config:
         with open(path / "adapter_config.json", "w", encoding="utf-8") as f:
             json.dump(adapter_config, f, indent=2)
+
+
+class LoRAPointwiseConv2d(nn.Module):
+    """LoRA for plain, ungrouped 1x1 convolutions in channel-last layout."""
+
+    @staticmethod
+    def supports(module):
+        return (type(module) is nn.Conv2d and module.groups == 1
+                and module.weight.shape[1:3] == (1, 1))
+
+    @staticmethod
+    def from_base(base, r=8, scale=1.0, dropout=0.0):
+        if not LoRAPointwiseConv2d.supports(base):
+            raise ValueError("LoRA requires a plain, ungrouped 1x1 Conv2d.")
+        module = LoRAPointwiseConv2d()
+        module.conv = base
+        module.scale = scale
+        module.dropout = nn.Dropout(dropout)
+        width = base.weight.shape[-1]
+        bound = 1 / math.sqrt(width)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(width, r))
+        module.lora_b = mx.zeros((r, base.weight.shape[0]))
+        return module
+
+    def __call__(self, x):
+        y = self.conv(x)
+        weight = (self.lora_a @ self.lora_b).T[:, None, None, :].astype(x.dtype)
+        delta = mx.conv2d(
+            self.dropout(x), weight, self.conv.stride, self.conv.padding,
+            self.conv.dilation, self.conv.groups,
+        )
+        return y + (self.scale * delta).astype(y.dtype)
+
+    def fuse(self):
+        conv = copy.deepcopy(self.conv)
+        delta = (self.lora_a @ self.lora_b).T[:, None, None, :]
+        conv.weight = conv.weight + (self.scale * delta).astype(conv.weight.dtype)
+        return conv
 
 
 def _extract_mlx_lora_parameters(model):
