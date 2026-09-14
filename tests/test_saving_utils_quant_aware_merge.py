@@ -53,23 +53,21 @@ class _FakeFile:
 
 
 class _FakeMM:
-    """Stand-in for the mmap-backed safetensors output. Collects writes so
-    we can assert on them."""
+    """Stand-in for the mmap-backed safetensors output; collects writes to assert on."""
 
     def __init__(self):
         self.writes = []  # list of (key, tensor, dtype) tuples
 
 
 def _identity_merge(W, lora_stats, expert_idx, num_experts, output_dtype):
-    """Stand-in 'merge' that returns the input unchanged. Lets us pin the
-    quant-aware wrapper without depending on the real LoRA math."""
+    """Stand-in 'merge' returning input unchanged; pins the wrapper without real LoRA math."""
     return W.to(output_dtype)
 
 
 @pytest.fixture(autouse=True)
 def _stub_write_tensor_direct_torch(monkeypatch):
-    """`_write_tensor_direct_torch` does real safetensors header arithmetic on
-    a torch storage; for these tests we just capture (key, tensor, dtype)."""
+    """`_write_tensor_direct_torch` does real safetensors header arithmetic;
+    here we just capture (key, tensor, dtype)."""
     from unsloth_zoo import saving_utils
 
     def _capture(mm, header_metadata, length_of_header, key, tensor, dtype):
@@ -146,7 +144,6 @@ def test_fp8_weight_missing_scale_records_fallback_and_skips_write():
     from unsloth_zoo import saving_utils
     from unsloth_zoo.saving_utils import _merge_moe_expert_quant_aware
 
-    # Sentinel-trigger: FP8 weight in header but NO companion scale key.
     fp8 = torch.zeros(64, 128, dtype=torch.float8_e4m3fn)
     file = _FakeFile({"layer.0.experts.0.down_proj.weight": fp8})
     hdr = _make_header_for({"layer.0.experts.0.down_proj.weight": "F8_E4M3"})
@@ -157,7 +154,6 @@ def test_fp8_weight_missing_scale_records_fallback_and_skips_write():
     def _capture_fallback(*args, **kwargs):
         fallback_log.append((args, kwargs))
 
-    # Patch in-place on the module to observe.
     original = saving_utils._record_moe_merge_fallback
     saving_utils._record_moe_merge_fallback = _capture_fallback
     try:
@@ -177,7 +173,7 @@ def test_key_missing_is_a_silent_no_op():
     from unsloth_zoo.saving_utils import _merge_moe_expert_quant_aware
 
     file = _FakeFile({})
-    hdr = {}  # key not present
+    hdr = {}
     mm = _FakeMM()
     assert _merge_moe_expert_quant_aware(
         "gate", "not_in_header.gate_proj.weight", file, hdr, _FakeLoraStats(),

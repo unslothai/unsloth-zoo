@@ -14,10 +14,11 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+# merge_and_overwrite_lora and merge_and_dequantize_lora were listed here after they had
+# already moved to saving_utils, which made `from unsloth_zoo.peft_utils import *` raise
+# AttributeError rather than import anything.
 __all__ = [
     "get_peft_regex",
-    "merge_and_overwrite_lora",
-    "merge_and_dequantize_lora",
     "SKIP_QUANTIZATION_MODULES",
     "get_lora_layer_modules",
     "requires_grad_for_gradient_checkpointing",
@@ -30,6 +31,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVa
 from collections import OrderedDict
 import re
 from .log import logger
+from .empty_model import _get_module_attribute
 
 # Skip some modules sensitive to quantization
 SKIP_QUANTIZATION_MODULES = [
@@ -60,16 +62,17 @@ def get_peft_regex(
     target_modules             : List[str] = None,
     vision_tags                : List[str] = ["vision", "image", "visual", "patch",],
     language_tags              : List[str] = ["language", "text",],
-    attention_tags             : List[str] = ["self_attn", "attention", "attn",],
-    mlp_tags                   : List[str] = ["mlp", "feed_forward", "ffn", "dense",],
+    attention_tags             : List[str] = ["self_attn", "attention", "attn", "mixer",],
+    mlp_tags                   : List[str] = ["mlp", "feed_forward", "ffn", "dense", "mixer",],
+    finetune_audio_layers      : bool = False,
 ) -> str:
     """
     Create a regex pattern to apply LoRA to only select layers of a model.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    if not finetune_vision_layers and not finetune_language_layers:
+    if not finetune_vision_layers and not finetune_language_layers and not finetune_audio_layers:
         raise RuntimeError(
-            "Unsloth: No layers to finetune - please select to finetune the vision and/or the language layers!"
+            "Unsloth: No layers to finetune - please select to finetune the vision, language and/or audio layers!"
         )
     if not finetune_attention_modules and not finetune_mlp_modules:
         raise RuntimeError(
@@ -78,7 +81,6 @@ def get_peft_regex(
     pass
 
     from collections import Counter
-    # Get only linear layers
     modules = model.named_modules()
     linear_modules = [name for name, module in modules if isinstance(module, torch.nn.Linear)]
 
@@ -93,7 +95,7 @@ def get_peft_regex(
 
     all_linear_modules = Counter(x.rsplit(".")[-1] for x in linear_modules)
 
-    # Isolate lm_head / projection matrices if count == 1
+    # Isolate lm_head / projection matrices (count == 1)
     if target_modules is None:
         only_linear_modules = []
         projection_modules  = {}
@@ -108,7 +110,6 @@ def get_peft_regex(
         only_linear_modules = list(target_modules)
     pass
 
-    # Create regex matcher
     regex_model_parts = []
     if finetune_vision_layers:     regex_model_parts += vision_tags
     if finetune_language_layers:   regex_model_parts += language_tags
@@ -120,24 +121,129 @@ def get_peft_regex(
     regex_components  = "|".join(regex_components)
 
     match_linear_modules = r"(?:" + "|".join(re.escape(x) for x in only_linear_modules) + r")"
-    regex_matcher = \
-        r".*?(?:"  + regex_model_parts + \
-        r").*?(?:" + regex_components + \
-        r").*?"    + match_linear_modules + ".*?"
+    # No trailing ".*?" after the linear-module group: PEFT uses re.fullmatch, so ".*?" would let
+    # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
+    # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
+    # so ending at the group keeps every real target and drops same-prefix non-linear modules.
+    if regex_model_parts == "":
+        # No vision/language model-part selected (e.g. audio-only finetuning):
+        # the standard matcher would degenerate into matching every attention/mlp
+        # leaf in the model, so make the base inert and rely solely on the
+        # dedicated audio branches added below.
+        regex_matcher = r"(?!x)x"  # never matches
+    else:
+        regex_matcher = \
+            r".*?(?:"  + regex_model_parts + \
+            r").*?(?:" + regex_components + \
+            r").*?"    + match_linear_modules
 
-    # Also account for model.layers.0.self_attn/mlp type modules like Qwen
-    if finetune_language_layers:
-        regex_matcher = r"(?:" + regex_matcher + \
-        r")|(?:\bmodel\.layers\.[\d]{1,}\.(?:" + regex_components + \
-        r")\.(?:" + match_linear_modules + r"))"
+        # Also account for model.layers.0.self_attn/mlp type modules like Qwen
+        if finetune_language_layers:
+            regex_matcher = r"(?:" + regex_matcher + \
+            r")|(?:\bmodel\.layers\.[\d]{1,}\.(?:" + regex_components + \
+            r")\.(?:" + match_linear_modules + r"))"
+        pass
     pass
 
-    # Check if regex is wrong since model does not have vision parts
-    check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
-    if not check:
-        regex_matcher = \
-            r".*?(?:" + regex_components + \
-            r").*?"   + match_linear_modules + ".*?"
+    # Gemma 4 / Gemma 3N keep the visual/audio path in flat embedder Linears
+    # (embed_vision.embedding_projection, embed_audio.embedding_projection,
+    # vision_embedder.patch_dense, vision_tower.patch_embedder.input_proj) and a
+    # conformer audio_tower whose ffw_layer_* / lconv1d.linear_* / attention.post
+    # leaves carry no attn/mlp component token, so the standard matcher above can
+    # never select them. Add dedicated name-anchored branches, gated on the
+    # vision/audio flags, scoped to the attention/mlp flags, and -- when an explicit
+    # target_modules list is given -- intersected with it. Each branch is appended
+    # only if it re.fullmatch-es a Linear in THIS model (matching PEFT's own matcher).
+    # Some of these leaf names are NOT Gemma-exclusive: empty_model.py also lists
+    # embed_vision.embedding_projection / vision_tower.patch_embedder.input_proj as
+    # Mistral3 components, so a name-only match could change a non-Gemma target set.
+    # Gate the whole block on the Gemma 4 / Gemma 3N model families (via model_type /
+    # architectures) so every other architecture's regex stays byte-identical.
+    # Leading ".*?"; no trailing ".*?" (a real Linear leaf terminates the match);
+    # "(?:\.linear)?" also covers Gemma4ClippableLinear ".linear" children.
+    def _scoped(leaves):
+        # Honour an explicit target_modules list when one was provided.
+        if target_modules is not None:
+            return [x for x in leaves if x in only_linear_modules]
+        return leaves
+
+    _config        = getattr(model, "config", None)
+    _model_type    = str(getattr(_config, "model_type", "") or "").lower()
+    _architectures = " ".join(getattr(_config, "architectures", None) or []).lower()
+    _is_gemma_mm   = (
+        "gemma4"  in _model_type or "gemma4"  in _architectures or
+        "gemma3n" in _model_type or "gemma3n" in _architectures
+    )
+
+    def _linear_aware_branches(cores):
+        # For each "core" (a regex that, after a leading ".*?", should fullmatch a
+        # real Linear's dotted module name), emit a branch matching ONLY the actual
+        # nn.Linear -- the bare module and/or the ".linear" child of a
+        # Gemma4ClippableLinear wrapper, whichever genuinely exists in this model.
+        # On Gemma 4 a projection appears in named_modules() as BOTH the wrapper
+        # ("...q_proj", not an nn.Linear) and its inner Linear ("...q_proj.linear").
+        # A blanket optional "(?:\.linear)?" would fullmatch the wrapper too, so PEFT
+        # would try to adapt the unsupported wrapper / double-process the inner
+        # Linear. Deciding per-core against linear_modules (which holds the real
+        # Linear names, including the appended ".linear" children) keeps Gemma 3N's
+        # bare leaves and Gemma 4's ".linear" children both correct.
+        out = []
+        for core in cores:
+            if any(re.fullmatch(r".*?" + core + r"\.linear", name, flags = re.DOTALL) for name in linear_modules):
+                out.append(r"(?:.*?" + core + r"\.linear)")
+            if any(re.fullmatch(r".*?" + core, name, flags = re.DOTALL) for name in linear_modules):
+                out.append(r"(?:.*?" + core + r")")
+        return out
+
+    candidate_branches = []
+    if finetune_audio_layers and _is_gemma_mm:
+        # conv / *norm leaves are not nn.Linear so they are never candidates. The
+        # conformer attention leaves are gated by finetune_attention_modules; the
+        # feed-forward / lightweight-conv / subsample / output projections (and the
+        # audio projector) are gated by finetune_mlp_modules. A "." is required
+        # before each leaf (the "(?:.*\.)?" segment) so e.g. target_modules=["k_proj"]
+        # does not also match "...relative_k_proj".
+        audio_leaves = []
+        if finetune_attention_modules:
+            audio_leaves += ["q_proj", "k_proj", "v_proj", "relative_k_proj", "pos_proj", "post"]
+        if finetune_mlp_modules:
+            audio_leaves += ["ffw_layer_1", "ffw_layer_2", "linear_start", "linear_end",
+                             "input_proj_linear", "output_proj"]
+        audio_leaves = _scoped(audio_leaves)
+        audio_cores = [r"\baudio_tower\.(?:.*\.)?" + re.escape(x) for x in audio_leaves]
+        # The audio projector is a feed-forward projection -> gate under the mlp flag.
+        if finetune_mlp_modules and _scoped(["embedding_projection"]):
+            audio_cores.append(r"\bembed_audio\.embedding_projection")
+        candidate_branches += _linear_aware_branches(audio_cores)
+    if finetune_vision_layers and finetune_mlp_modules and _is_gemma_mm:
+        # The Gemma vision embedders are flat projection / dense Linears -> like the
+        # audio projector, gate them under the mlp flag (attention-only stays clean).
+        vision_cores = []
+        if _scoped(["embedding_projection"]): vision_cores.append(r"\bembed_vision\.embedding_projection")
+        if _scoped(["patch_dense"]):          vision_cores.append(r"\bvision_embedder\.patch_dense")
+        if _scoped(["input_proj"]):           vision_cores.append(r"\bvision_tower\.patch_embedder\.input_proj")
+        candidate_branches += _linear_aware_branches(vision_cores)
+    # _linear_aware_branches already only emits branches that fullmatch a real Linear;
+    # re-filter for safety / to mirror PEFT's own re.fullmatch matcher exactly.
+    extra_branches = [
+        branch for branch in candidate_branches
+        if any(re.fullmatch(branch, name, flags = re.DOTALL) for name in linear_modules)
+    ]
+    if extra_branches:
+        regex_matcher = r"(?:" + regex_matcher + r")|" + "|".join(extra_branches)
+    pass
+
+    # Fallback only when a vision/language model-part was requested but neither the
+    # base matcher nor the branches above matched anything (e.g. a VLM whose vision
+    # modules are not tagged with vision keywords): drop the model-part requirement.
+    # Never broaden for audio-only (regex_model_parts == ""), which would otherwise
+    # pull in the whole language stack.
+    if regex_model_parts != "":
+        check = any(re.search(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
+        if not check:
+            regex_matcher = \
+                r".*?(?:" + regex_components + \
+                r").*?"   + match_linear_modules
     pass
 
     # Final check to confirm if matches exist
@@ -165,7 +271,16 @@ def get_lora_layer_modules():
     for file in files:
         if file == "__init__.py" or not file.endswith(".py"): continue
         item = f"peft.tuners.lora.{file[:-len('.py')]}"
-        exec(f"import {item}", locals(), globals())
+        # Skip submodules whose optional backend (bnb/eetq/awq/...) is missing
+        # instead of crashing LoRA-layer discovery.
+        try:
+            exec(f"import {item}", locals(), globals())
+        except (ImportError, OSError, ValueError, AttributeError, TypeError) as exception:
+            logger.debug(
+                f"Unsloth: Skipping LoRA layers from `{item}` "
+                f"(optional backend unavailable): {exception}"
+            )
+            continue
         modules = dir(eval(item))
         modules = [x for x in modules if x.startswith("Linear") or x.endswith("Linear")]
         if len(modules) == 0: continue
@@ -216,26 +331,37 @@ def requires_grad_for_gradient_checkpointing(model):
     def requires_grad_post_hook(module, input, output):
         type_output = type(output)
         if type_output is torch.Tensor:
-            output.requires_grad_(True)
+            target = output
         else:
-            try: # For dataclass from HF, try on loss or logits
+            try: # For HF dataclass, try loss or logits
                 if hasattr(output, "loss") and output.loss is not None:
-                    output.loss.requires_grad_(True)
-                elif hasattr(output, "logits") and output.logits is not None: #with RL like GRPO there are no loss as you don't provide labels
-                    output.logits.requires_grad_(True)
+                    target = output.loss
+                elif hasattr(output, "logits") and output.logits is not None: # RL like GRPO has no loss (no labels)
+                    target = output.logits
                 elif hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
                     # Encoder / decoder-style embedding backbones (e.g. Qwen3-Embedding) return a
                     # BaseModelOutputWithPast with only last_hidden_state (no loss/logits) when called
                     # for sentence embeddings. Make it require grad so gradient checkpointing works.
                     # See https://github.com/unslothai/unsloth/issues/5360
-                    output.last_hidden_state.requires_grad_(True)
+                    target = output.last_hidden_state
                 else:
+                    # Raise while tracing too: is_compiling() is constant folded, so a skip
+                    # here is permanent and the region trains with no adapter gradients.
                     raise ValueError("Neither loss, logits, nor last_hidden_state are available for grad post hook.")
             except Exception as e:
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
+        # Dynamo rejects requires_grad_() only when it would flip the flag, so skipping the
+        # no-op keeps fullgraph = True working. Skipping a real flip would break the frozen
+        # input embedding this also lands on, losing every checkpointing gradient.
+        if torch.compiler.is_compiling() and target.requires_grad: return
+        target.requires_grad_(True)
     pass
 
     def requires_grad_pre_hook(module, args, kwargs):
+        # Dynamo cannot trace requires_grad_(), and Gemma 3N compiles a LoRA target
+        # (embed_audio.embedding_projection) with fullgraph = True, so it is a hard error.
+        # Safe to skip: anything traced here is already downstream of trainable LoRA weights.
+        if torch.compiler.is_compiling(): return
         # Try positional args first (normal text models)
         if args:
             first = args[0]
@@ -245,9 +371,9 @@ def requires_grad_for_gradient_checkpointing(model):
                 return
             pass
         pass
-        # Kwargs-only path (VLMs like Idefics3, SmolVLM2, Llava, Qwen2VL, etc.)
-        # Look for the float tensor by name. inputs_embeds is universal across VLMs;
-        # hidden_states covers vision encoders; pixel_values covers image inputs.
+        # Kwargs-only path (VLMs like Idefics3, SmolVLM2, Llava, Qwen2VL, etc.):
+        # inputs_embeds is universal; hidden_states covers vision encoders;
+        # pixel_values covers image inputs.
         for key in ("inputs_embeds", "hidden_states", "pixel_values"):
             tensor = kwargs.get(key)
             if tensor is not None and type(tensor) is torch.Tensor:
@@ -288,7 +414,7 @@ def requires_grad_for_gradient_checkpointing(model):
                 name_pre  = "model." + ".".join(name_components[:j])
                 # Disable [\d] since it fails in gradient checkpointing
                 if re.search(r"\[[\d]{1,}\]", name_pre): continue
-                module = eval(name_pre, globals(), {"model" : model})
+                module = _get_module_attribute(model, ".".join(name_components[:j]))
                 fallback_name   = name_pre
                 fallback_module = module
                 if hasattr(module, "forward"):
@@ -320,7 +446,7 @@ def requires_grad_for_gradient_checkpointing(model):
             pass
 
             module_name = "model." + ".".join(name_components[:final_where])
-            module = eval(module_name, globals(), {"model" : model})
+            module = _get_module_attribute(model, ".".join(name_components[:final_where]))
             hook_targets[module_name] = module
         pass
         return hook_targets, fallback_targets

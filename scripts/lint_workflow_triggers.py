@@ -4,34 +4,22 @@
 
 """Refuse dangerous GitHub Actions trigger patterns at PR time.
 
-Two patterns are banned outright, both of which powered the TanStack
-GHSA-g7cv-rxg3-hmpx supply-chain compromise:
+Flags three patterns from the TanStack GHSA-g7cv-rxg3-hmpx compromise:
 
-1.  `pull_request_target` -- runs a fork's workflow YAML against the
-    BASE repository's secrets and permissions. The fork can inject
-    arbitrary code into the base context. The TanStack worm used this
-    to land base-context execution from a fork PR. There is essentially
-    no safe use of this trigger for a public open-source project;
-    `pull_request` is the safe alternative.
+1.  `pull_request_target` -- runs a fork's workflow YAML against the BASE
+    repo's secrets/permissions, letting the fork inject code into the base
+    context. No safe use for public projects; use `pull_request` instead.
 
-2.  `workflow_run` chained to a PR-triggered workflow -- carries the
-    same trust boundary problem one hop later. If a PR-triggered
-    workflow can poison artifacts/caches and a `workflow_run` trigger
-    fires off the result with elevated permissions, the attacker still
-    reaches the trusted context.
+2.  `workflow_run` chained to a PR-triggered workflow -- same trust-boundary
+    problem one hop later: a PR can poison artifacts/caches that the
+    elevated-permission run then consumes.
 
-3.  Shared cache keys between PR-triggered workflows and publish /
-    release / push-triggered workflows. The TanStack worm poisoned the
-    Actions cache from a fork PR and the legitimate release workflow
-    then restored the poisoned cache. Cache keys must be partitioned
-    so that nothing a PR can write is ever read by a workflow that
-    holds secrets.
+3.  Shared cache keys between PR-triggered and publish/release/push
+    workflows -- a fork PR can poison the cache the release run restores.
+    Keys must be partitioned so secrets-holding workflows never read what a
+    PR can write.
 
-Exit codes
-==========
-
-  0   no findings
-  1   one or more findings; stderr lists each with file path
+Exit codes: 0 = no findings; 1 = findings (stderr lists each with file path).
 
 Run from repo root:
     python3 scripts/lint_workflow_triggers.py

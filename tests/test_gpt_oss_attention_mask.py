@@ -16,26 +16,15 @@
 
 """Runtime regression check for the gpt-oss BlockMask leak (PR #690).
 
-The behavioural sibling tests (static AST guards over wrap and the
-patched GptOssModel.forward, plus the PR #691 _align_kv_to_mask static
-check, plus the inspect-driven mask-kwargs filter check) live in
-tests/test_zoo_history_regressions.py so they auto-run under the
-consolidated Tests CI workflow.
+The static AST guards live in tests/test_zoo_history_regressions.py. This file
+is the runtime invariant: call the wrapped create_causal_mask with a tiny
+GptOssConfig (_attn_implementation="flex_attention") and assert the return is
+not a BlockMask. Runs in a clean subprocess so torch.compile can be replaced
+with identity BEFORE any unsloth_zoo import (the wrap captures torch.compile at
+load time, and on CPU the compiled wrapper drops kwarg names, masking the real
+invariant with a misleading "missing positional argument" error).
 
-This file is the *runtime* invariant: actually call the wrapped
-transformers.masking_utils.create_causal_mask with a tiny GptOssConfig
-that has _attn_implementation="flex_attention" and assert the return is
-not a BlockMask. The check runs in a clean subprocess so torch.compile
-can be replaced with identity BEFORE any unsloth_zoo import -- the wrap
-captures _torch_compile = functools.partial(torch.compile, ...) at
-module load time and on CPU torch the compiled wrapper drops kwarg
-names, which would otherwise mask the real BlockMask invariant with a
-misleading "missing positional argument" error.
-
-CPU-only; no GPU required. The repo's existing tests/conftest.py GPU-free
-harness (device_type preload, mem_get_info / get_device_capability
-stubs, UNSLOTH_ALLOW_CPU=1) handles the inner subprocess via env
-inheritance.
+CPU-only; tests/conftest.py's GPU-free harness covers the inner subprocess.
 """
 from __future__ import annotations
 
@@ -108,12 +97,10 @@ except Exception:
 
 
 def test_pr690_runtime_blockmask_does_not_reach_eager_inference_path():
-    """Runtime invariant: with _attn_implementation='flex_attention' and
-    a non-grad inputs_embeds, the patched create_causal_mask must return
-    a tensor (or None), never a BlockMask. Without PR #690 this returns
-    a BlockMask and gpt-oss generate() crashes with
-        TypeError: unsupported operand type(s) for +=:
-            'Tensor' and 'BlockMask'
+    """Runtime invariant: with _attn_implementation='flex_attention' and a
+    non-grad inputs_embeds, the patched create_causal_mask returns a tensor (or
+    None), never a BlockMask. Without PR #690 it returns a BlockMask and
+    gpt-oss generate() crashes (Tensor += BlockMask TypeError).
     """
     import subprocess
     import sys as _sys

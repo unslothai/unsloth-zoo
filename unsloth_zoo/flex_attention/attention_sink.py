@@ -51,7 +51,7 @@ def causal_mask_with_sink(batch, head, q_idx, kv_idx):
     1 X X X     2   X X
     2 X X X X   3   X X X
     """
-    # We add (q_idx + 1) since first column is sink token
+    # +1 on q_idx since the first column is the sink token
     causal_mask = (q_idx + 1) >= kv_idx
     sink_first_column = kv_idx == 0
     return causal_mask | sink_first_column
@@ -95,12 +95,9 @@ def old_flex_attention_with_sink(
     compile = True,
 ):
     """
-    Allows one sink token to be attended to for full/sliding window attention
-    Similar to Efficient Streaming Language Models with Attention Sinks
-    Primarily for GPT-OSS 2025
-
-    [WARNING] This only works for training. Inference fails since KV cache's
-    absolute positioning will fail.
+    One sink token attended to for full/sliding window attention (cf. Efficient
+    Streaming Language Models with Attention Sinks). Primarily for GPT-OSS 2025.
+    [WARNING] Training only; inference fails since KV cache absolute positioning breaks.
     """
     if not self_attn.training:
         raise NotImplementedError("Unsloth: This version of flex attention only works for training")
@@ -116,14 +113,13 @@ def old_flex_attention_with_sink(
     key_padded   = torch.cat([key  .new_zeros(bsz, heads_KV, 1, dim), key],   dim = 2)
     value_padded = torch.cat([value.new_zeros(bsz, heads_KV, 1, dim), value], dim = 2)
 
-    # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
     mask_mod = \
         generate_sliding_window_with_sink(sliding_window) \
         if type(sliding_window) is int and sliding_window != 0 else \
         causal_mask_with_sink
     score_mod = generate_sink_score_mod(sink_weights)
-    block_mask = compiled_create_block_mask(mask_mod, qlen_Q, qlen_KV+1, device = key.device) # Add 1 since we padded
+    block_mask = compiled_create_block_mask(mask_mod, qlen_Q, qlen_KV+1, device = key.device) # +1 for padding
     attn_output = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key_padded,
@@ -165,11 +161,9 @@ def flex_attention_with_sink(
     has_static_cache = True,
 ):
     """
-    Allows one sink token to be attended to for full/sliding window attention
-    Similar to Efficient Streaming Language Models with Attention Sinks
-    Primarily for GPT-OSS 2025
-
-    [WARNING] has higher error than old_flex_attention_with_sink, but works for inference
+    One sink token attended to for full/sliding window attention (cf. Efficient
+    Streaming Language Models with Attention Sinks). Primarily for GPT-OSS 2025.
+    [WARNING] higher error than old_flex_attention_with_sink, but works for inference.
     """
     assert getattr(self_attn, "sinks", None) is not None, "Unsloth: self_attn must have sinks"
     sink_weights = self_attn.sinks
@@ -179,13 +173,11 @@ def flex_attention_with_sink(
     bsz, heads_Q, qlen_Q, dim = query.shape
     _, heads_KV, qlen_KV, _ = key.shape
 
-    # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
     is_training = self_attn.training
     mask_mod = None
     block_mask = None
     has_flex_cache = hasattr(self_attn, "_flex_attention_cache")
-    # Handle inference and training
     if attention_mask is not None and has_static_cache:
         if is_training or (
             not is_training and (not has_flex_cache or qlen_Q != 1)
@@ -200,13 +192,11 @@ def flex_attention_with_sink(
                 # We must account for left padding
                 padding_start_idx = attention_mask.argmax(1).to(query.device)
                 do_padding = torch.arange(max(qlen_Q, qlen_KV), device = query.device).repeat((bsz, 1)) < padding_start_idx.unsqueeze(0).T
-                # We also make all padded tokens Q=1, K=-inf
-                # Note if Q=0, K=0, Q*K = 0, but exp(0) = 1, so that's wrong
-                # Only exp(-inf) = 0. So Q=1, K=-inf, Q*K = -inf
+                # Padded tokens: Q=1, K=-inf so Q*K=-inf (exp=0). Q=K=0 would
+                # give Q*K=0 with exp(0)=1, which is wrong.
                 query.transpose(2, 1)[do_padding[:, :qlen_Q ]] = 1
                 key  .transpose(2, 1)[do_padding[:, :qlen_KV]] = -torch.inf
                 value.transpose(2, 1)[do_padding[:, :qlen_KV]] = 0
-                # Use special padded mask creators
                 mask_mod = prefill_mask_mod = \
                     generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
                     if type(sliding_window) is int and sliding_window != 0 else \
@@ -220,7 +210,7 @@ def flex_attention_with_sink(
             block_mask = self_attn._flex_attention_cache(key)
         pass
     pass
-    # Create mask_mod on training and decoding steps
+    # mask_mod for training and decoding steps
     if mask_mod is None:
         mask_mod = \
             generate_sliding_window_mask(sliding_window) \

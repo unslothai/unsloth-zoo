@@ -30,6 +30,7 @@ __all__ = [
 import torch
 import re
 import os
+import functools
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
@@ -45,7 +46,7 @@ def _is_gemma4_config(config):
 pass
 
 def is_comparable(val):
-    # Don't treat tensors as comparable, only basic types
+    # Only basic types, not tensors
     from enum import Enum
     return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype, Enum))
 
@@ -75,7 +76,6 @@ def compare_attributes(original_model, new_model):
     type_mismatches = []
     value_mismatches = []
 
-    # Extract all config keys at any level
     config_keys = _extract_all_config_keys(original_model.config) if hasattr(original_model, 'config') else set()
     config_keys = config_keys | {'config'}
 
@@ -88,19 +88,17 @@ def compare_attributes(original_model, new_model):
         buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
 
 
-        # Find missing attributes (in original but not in new)
+        # Missing: in original but not in new
         missing_in_new = orig_attrs - new_attrs
         missing_in_new = missing_in_new - {'hf_device_map', 'source_cls'}
         if missing_in_new:
             for attr in sorted(missing_in_new):
                 missing_attrs.append(f"{name}.{attr}")
 
-        # Find extra attributes (in new but not in original)
+        # Extra: in new but not in original
         extra_in_new = new_attrs - orig_attrs
         if extra_in_new:
             print(f'Found some extra attributes like: {list(extra_in_new)[:5]}...')
-            # for attr in sorted(extra_in_new):
-            #     print(f"EXTRA ATTRIBUTE: {name}.{attr} (exists in new model but not original)")
 
         # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
@@ -117,7 +115,6 @@ def compare_attributes(original_model, new_model):
             original_comparable = is_comparable(original_val)
             new_comparable = is_comparable(new_val)
 
-            # Check type mismatches first
             if type(original_val) != type(new_val):
                 if original_comparable or new_comparable:
                     type_mismatches.append(f"{name}.{attr}: original {type(original_val).__name__} != new {type(new_val).__name__}")
@@ -126,7 +123,6 @@ def compare_attributes(original_model, new_model):
             try:
                 if isinstance(original_val, dict) and isinstance(new_val, dict):
                     if attr in config_keys:
-                        # only compare those attributes that are relevant
                         compare_dicts(original_val, new_val, prefix=f"{name}.{attr}")
                 elif original_comparable and new_comparable:
                     if original_val != new_val:
@@ -140,7 +136,6 @@ def compare_attributes(original_model, new_model):
             except Exception as e:
                 type_mismatches.append(f"{name}.{attr}: comparison failed - {str(e)}")
 
-    # Print summary
     if missing_attrs:
         print(f"\n🚨 MISSING ATTRIBUTES ({len(missing_attrs)}):")
         for attr in missing_attrs:
@@ -160,7 +155,7 @@ def compare_attributes(original_model, new_model):
         print("\n✅ No missing attributes or type mismatches found!")
 
 def _extract_all_config_keys(config):
-    """Extract all keys from config at any nesting level"""
+    """Extract config keys at any nesting level."""
     keys = set()
 
     def _extract_keys(obj, prefix=""):
@@ -184,7 +179,6 @@ def copy_attributes(original_model, new_model):
         print("Cannot copy attributes: one of the models is None")
         return
 
-    # Extract all config keys at any level
     config_keys = _extract_all_config_keys(original_model.config) if hasattr(original_model, 'config') else set()
     config_keys = config_keys | {'config'}
     extra_attrs = {'hf_quantizer', }
@@ -205,14 +199,14 @@ def copy_attributes(original_model, new_model):
                 original_val = getattr(original_module, attr)
 
                 if attr in buffer_names and attr != "layer_scalar":
-                    # Some models like gemma3 have embed_scale and position_ids as buffers
-                    # Lets copy them over to avoid inconsistencies
+                    # gemma3 etc. keep embed_scale / position_ids as buffers; copy
+                    # them to avoid inconsistencies.
                     setattr(module, attr, original_val.to(new_model.device))
                 elif is_comparable(original_val):
                     setattr(module, attr, original_val)
                     copied_count += 1
                 elif isinstance(original_val, dict):
-                    # Only copy dictionaries whose attribute name exists in config keys
+                    # Only copy dicts whose attribute name exists in config keys
                     if attr in config_keys:
                         setattr(module, attr, deepcopy(original_val))
                         copied_count += 1
@@ -222,7 +216,7 @@ def copy_attributes(original_model, new_model):
                         skipped_attrs.append(f"{attr} (dict not in config)")
                         dict_skipped_count += 1
                 elif isinstance(original_val, PretrainedConfig):
-                    # Sometimes the .config in original model is of config class and not a dict. Copy it as is.
+                    # Sometimes .config is a config class, not a dict; copy as is.
                     setattr(module, attr, deepcopy(original_val))
                     copied_count += 1
                 elif attr in extra_attrs:
@@ -272,29 +266,25 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     kwargs = {"torch_dtype" if HAS_TORCH_DTYPE else "dtype" : dtype}
     original_meta_model = None
     error = None
-    # [NOTE] init_empty_weights(include_buffers = True) is wrong
-    # include_buffers=False is required because buffers (non-trainable tensors like
-    # embed_scale, position_ids) must be initialized with actual values, not on meta
-    # device. Models like Gemma 3 use embed_scale as a buffer in their embedding layer.
-    # With include_buffers=True, buffers become empty meta tensors with no data,
-    # causing attribute access failures during inference.
+    # include_buffers=False is required: buffers (e.g. Gemma 3's embed_scale,
+    # position_ids) need real values, not empty meta tensors, or attribute
+    # access fails during inference.
     with init_empty_weights(include_buffers = False):
         if model_name is not None and not using_text_subconfig:
             try:
-                # This would persist quantization information for FP8 weights
+                # Persists quantization information for FP8 weights
                 original_meta_model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
             except Exception as e:
                 error = str(e)
                 original_meta_model = None
         if original_meta_model is None:
             try:
-                # We must do this for 4.57.0 and above
+                # Required for transformers 4.57.0 and above
                 original_meta_model = AutoModelForCausalLM.from_config(causal_config)
             except Exception as e:
                 error = str(e)
                 original_meta_model = None
     pass
-    # Suppress warning on uninited weights
     os.environ["UNSLOTH_WARN_UNINITIALIZED"] = old_warn
     if error is not None and original_meta_model is None:
         print(f"Failed to create original_meta_model for AutoModelForCausalLM. Error {error}")
@@ -322,6 +312,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
+    # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
+    # for the 43+ architectures that set it False (GptOss, Mamba, Bloom, GPT-J...).
     new_model = AutoModelForCausalLM.from_config(
         new_config,
         attn_implementation = "eager",
@@ -352,7 +344,6 @@ def patch_gemma4_vllm_lora_support():
         from vllm.v1.worker import lora_model_runner_mixin
     except ImportError:
         lora_model_runner_mixin = None
-    from unsloth_zoo import vllm_lora_worker_manager
 
     gemma4_lora_classes = []
     classes_to_patch = []
@@ -370,6 +361,10 @@ def patch_gemma4_vllm_lora_support():
         pass
     if not classes_to_patch:
         return
+    # Deferred: this module imports vllm.config and friends, which only
+    # resolve on a real vllm install. Import once gemma4 classes exist.
+    from unsloth_zoo import vllm_lora_worker_manager
+
     gemma4_lora_classes = set(gemma4_lora_classes)
 
     for cls in classes_to_patch:
@@ -463,7 +458,7 @@ def patch_gemma4_vllm_k_eq_v_support():
             if quant_states is None:
                 continue
 
-            # k_eq_v reuses K as V: the raw-weight loader already duplicates
+            # k_eq_v reuses K as V; the raw-weight loader already duplicates
             # k_proj -> v_proj, so prequant BnB needs the matching QuantState.
             if kind == "packed":
                 if isinstance(quant_states, dict) and 2 not in quant_states and 1 in quant_states:
@@ -486,40 +481,62 @@ def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = get_model_type(config)
 
+    import transformers
+    # `architectures[0]` is a raw string off the downloaded config.json, and `getattr`
+    # on the transformers namespace followed by a call is an unbounded gadget: nothing
+    # here requires it to name a model class. Restrict it to the architectures the auto
+    # mappings actually register.
+    #
+    # Checked BEFORE the SiglipVisionModel patch below, not after. That patch replaces
+    # `_init_weights` on a class shared by the whole process and undoes it at the end of
+    # this function, so raising in between would leave every later SigLIP model skipping
+    # weight init. Validate first, then touch global state.
+    architecture = config.architectures[0]
+    if not _is_known_architecture(architecture):
+        raise ValueError(
+            f"Unsloth: config.json declares architecture `{architecture}`, which is not "
+            f"a model architecture transformers registers."
+        )
+    model_cls = getattr(transformers, architecture)
+
     from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 
     # Patch SiglipVisionModel to skip weight init on meta device.
-    if not hasattr(SiglipVisionModel, "_original_initialize_weights"):
+    #
+    # `_init_weights` lives on a class shared by the whole process, so the restore has to
+    # be in a `finally`. `except Exception` does not cover KeyboardInterrupt, and
+    # cancelling a cell mid-load is an ordinary thing to do in a notebook: without this,
+    # one cancel leaves weight init disabled for every SigLIP model built afterwards,
+    # silently and far from the cause.
+    #
+    # `patched_here` rather than the sentinel alone, so a nested or re-entrant call that
+    # found the patch already installed does not restore it out from under the outer call
+    # that owns it.
+    patched_here = not hasattr(SiglipVisionModel, "_original_initialize_weights")
+    if patched_here:
         SiglipVisionModel._original_initialize_weights = SiglipVisionModel._init_weights
-        # Patch _init_weights to a no-op with correct signature
         def _init_weights(self, module):
             return
         SiglipVisionModel._init_weights = _init_weights
 
-    import transformers
-    model_cls = getattr(transformers, config.architectures[0])
-
     try:
-        # Use accelerate's init_empty_weights, not transformers.modeling_utils
-        from accelerate import init_empty_weights
-        # [NOTE] init_empty_weights(include_buffers = True) is wrong
-        # include_buffers=False is required because buffers (non-trainable tensors like
-        # embed_scale, position_ids) must be initialized with actual values, not on meta
-        # device. Models like Gemma 3 use embed_scale as a buffer in their embedding layer.
-        # With include_buffers=True, buffers become empty meta tensors with no data,
-        # causing attribute access failures during inference.
-        with init_empty_weights():
-            original_meta_model = model_cls(config)
-    except Exception as e:
-        print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
-        import traceback
-        traceback.print_exc()
-        original_meta_model = None
-
-    # Restore original SiglipVisionModel weight init
-    if hasattr(SiglipVisionModel, "_original_initialize_weights"):
-        SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
-        del SiglipVisionModel._original_initialize_weights
+        try:
+            # accelerate's init_empty_weights, not transformers.modeling_utils.
+            # Default include_buffers=False keeps buffers (e.g. Gemma 3's embed_scale)
+            # as real tensors so inference-time attribute access works.
+            from accelerate import init_empty_weights
+            with init_empty_weights():
+                original_meta_model = model_cls(config)
+        except Exception as e:
+            print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
+            import traceback
+            traceback.print_exc()
+            original_meta_model = None
+    finally:
+        # Restore original SiglipVisionModel weight init
+        if patched_here and hasattr(SiglipVisionModel, "_original_initialize_weights"):
+            SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
+            del SiglipVisionModel._original_initialize_weights
 
 
     new_config = deepcopy(config)
@@ -550,7 +567,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
         "patch_size": 1,
         "image_size": 1,
         "vision_output_dim": 1,
-        # The following are different names for the same concept
+        # Different names for the same concept
         "num_heads": 1,
         "attention_heads": 1,
         "num_attention_heads": 1,
@@ -584,6 +601,110 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     return new_model, original_meta_model, num_layers, layer_names
 
 
+@functools.lru_cache(maxsize = 1)
+def _registered_architectures():
+    """Every model class name the transformers auto mappings register.
+
+    `MODEL_*_MAPPING_NAMES` maps a model_type to a *model* class name, which is what
+    `config.architectures` holds. `CONFIG_MAPPING_NAMES` lives in the same module and
+    maps to config classes, so it is excluded by the `MODEL_` prefix.
+    """
+    from transformers.models.auto import modeling_auto
+
+    names = set()
+    for attribute in dir(modeling_auto):
+        if not (attribute.startswith("MODEL_") and attribute.endswith("_MAPPING_NAMES")):
+            continue
+        mapping = getattr(modeling_auto, attribute, None)
+        if not isinstance(mapping, dict): continue
+        for value in mapping.values():
+            if isinstance(value, str): names.add(value)
+            elif isinstance(value, (list, tuple)):
+                names.update(v for v in value if isinstance(v, str))
+    return frozenset(names)
+pass
+
+
+def _is_known_architecture(architecture):
+    """Is `architecture` a name we are willing to resolve on the transformers namespace?
+
+    `config.architectures[0]` is a raw string off a downloaded config.json, and
+    `getattr(transformers, name)` followed by a call is an unbounded gadget - nothing
+    otherwise requires it to name a model. Two ways to qualify:
+
+      - the auto mappings register it. This is the primary check and it deliberately
+        admits the lazy `Placeholder` transformers substitutes when a model's optional
+        dependency is missing, so transformers' own "install X" error still surfaces
+        instead of being masked by ours.
+      - it is a PreTrainedModel subclass. Covers a class that exists but is not in the
+        mappings on this version.
+    """
+    import transformers
+
+    if not isinstance(architecture, str) or not architecture.isidentifier():
+        return False
+    if architecture in _registered_architectures():
+        return True
+    candidate = getattr(transformers, architecture, None)
+    return isinstance(candidate, type) and issubclass(candidate, transformers.PreTrainedModel)
+pass
+
+
+# `blocks[0]` or `blocks[0][1]`: a name followed by digit-only subscripts. The name part
+# is "anything without brackets" rather than an ASCII identifier, because Python
+# identifiers are not ASCII-only and PyTorch registers a submodule under a Unicode name
+# without complaint. Only the subscripts are constrained, which is what keeps this a
+# name-and-index walk; the name itself is handed straight to getattr, exactly as the
+# eval this replaces did.
+_INDEXED_COMPONENT = re.compile(r"([^\[\]]+)((?:\[\d+\])+)")
+_INDEX = re.compile(r"\[(\d+)\]")
+
+
+def _get_module_attribute(root, path):
+    """ Reads a dotted module path, e.g. `visual.blocks.0.norm.weight`
+
+    The read counterpart of `_set_module_attribute`. Replaces `eval(f"model.{path}")`:
+    same result for every path an attribute expression could express, plus numeric
+    segments, and no way for a path component to be Python rather than a name.
+    An empty `path` returns `root`, matching what `eval("model")` used to give.
+
+    Bracket components (`blocks[0]`) are resolved as well. `peft_utils` rewrites
+    `.0.` to `[0].` before splitting, and one of its two call sites can hand back a
+    path whose last component still carries the brackets, which `eval` indexed happily
+    and a bare `getattr` cannot. Indices are digits only, so this stays a name-and-index
+    walk rather than an expression.
+    """
+    if path == "": return root
+    obj = root
+    for part in path.split("."):
+        if part.isdigit():
+            obj = obj[int(part)]
+            continue
+        match = _INDEXED_COMPONENT.fullmatch(part)
+        if match is None:
+            obj = getattr(obj, part)
+            continue
+        obj = getattr(obj, match.group(1))
+        for index in _INDEX.findall(match.group(2)):
+            obj = obj[int(index)]
+    return obj
+pass
+
+
+def _set_module_attribute(root, path, value):
+    """ Assigns `value` at a dotted module path, e.g. `visual.blocks.0.norm.weight` """
+    parts = path.split(".")
+    obj = root
+    for part in parts[:-1]:
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    last = parts[-1]
+    if last.isdigit():
+        obj[int(last)] = value
+    else:
+        setattr(obj, last, value)
+pass
+
+
 @torch.inference_mode
 def set_additional_modules(new_model, quant_state_dict, config):
     def _unwrap_tensor(val):
@@ -600,7 +721,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
         language_model = new_model.model
 
     embed_tokens_key = f"{language_model_prefix}.embed_tokens.weight"
-    # Explicit None check since pad_token_id=0 is valid.
+    # Explicit None check: pad_token_id=0 is valid.
     pad_token_id = getattr(config, "pad_token_id", None)
     if pad_token_id is None:
         text_config = getattr(config, "text_config", None)
@@ -621,10 +742,10 @@ def set_additional_modules(new_model, quant_state_dict, config):
         module.num_embeddings = num_embeddings
         module.embedding_dim = embedding_dim
 
-    set_embedding(language_model.embed_tokens, embed_tokens_key, pad_token_id) # This sets the embedding that we generally find in language (sub)model
+    set_embedding(language_model.embed_tokens, embed_tokens_key, pad_token_id)
 
     if 'model.visual.pos_embed.weight' in quant_state_dict:
-        # This is to handle visual embeddings in Qwen 3 VL
+        # Qwen 3 VL visual embeddings
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
     norm_key = f"{language_model_prefix}.norm.weight"
@@ -633,9 +754,9 @@ def set_additional_modules(new_model, quant_state_dict, config):
     norm = torch.nn.Parameter(norm, requires_grad = False)
     language_model.norm.weight = norm
 
-    # LM Head. Do note that for some models, like Mistral3ForConditionalGeneration,
-    # there can be mismatch in the value of tie_word_embeddings between config and text_config
-    # we prefer picking the one in text_config. If you notice any issue later, please report it!
+    # LM Head. For some models (e.g. Mistral3ForConditionalGeneration)
+    # tie_word_embeddings can differ between config and text_config; prefer
+    # text_config.
     text_config = getattr(config, "text_config", config)
     if getattr(text_config, "tie_word_embeddings", False):
         lmhead_key = f"{language_model_prefix}.embed_tokens.weight"
@@ -678,17 +799,28 @@ def set_additional_modules(new_model, quant_state_dict, config):
     print(f'Performing substitution for {additional_keys=}')
 
     for key in additional_keys:
-        # sometimes it can be in new_model.model. instead of new_model.
-        for prefix in ['new_', 'new_model.']:
+        val = quant_state_dict[key]
+        val = _unwrap_tensor(val)
+        if isinstance(val, torch.Tensor):
+            val = torch.nn.Parameter(val, requires_grad = False)
+        # May live under new_model.model. instead of new_model. Walking the dotted
+        # path beats exec: exec cannot express blocks.0.weight, and a failure here
+        # is reported instead of swallowed.
+        candidates = []
+        if key.startswith("model."):
+            candidates.append(key[len("model."):])
+        candidates.append(key)
+        errors = []
+        for path in candidates:
             try:
-                val = quant_state_dict[key]
-                val = _unwrap_tensor(val)
-                if isinstance(val, torch.Tensor):
-                    val = torch.nn.Parameter(val,requires_grad=False)
-                exec(f"{prefix}{key} = val")
+                _set_module_attribute(new_model, path, val)
                 break
-            except:
-                continue
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exception:
+                errors.append(f"{path}: {exception}")
+        else:
+            logger.warning(
+                f"Unsloth: could not set `{key}` on the model - tried {', '.join(errors)}"
+            )
 
     pass
 pass
@@ -843,13 +975,7 @@ def finalize_huggingface_model(
 pass
 
 def get_model_layer_config(return_non_layered=True):
-    """
-    Returns a unified layer configuration containing the union of layer names
-    from all supported vision models. Serves as a fallback.
-
-    Returns:
-        dict: Dictionary containing layer templates for different components.
-    """
+    """Unified layer-name templates (union over supported vision models)."""
     layer_templates = {
         'standard_layers': {
             "model.language_model.layers.{kk}.layer_scalar",
@@ -1085,21 +1211,13 @@ def get_model_layer_config(return_non_layered=True):
 def get_model_type(config):
     model_type = getattr(config, "model_type", "causal_lm")
     if hasattr(config, "vision_config"):
-        # vllm curretly seems to be having qwen 2.5 vl model type as qwen2_5_vl_text for some reason
-        # aka vllm_config.model_type is qwen2_5_vl_text but config.vision_config.model_type is qwen2_5_vl
+        # vLLM reports qwen2_5_vl as qwen2_5_vl_text, but vision_config.model_type
+        # keeps the real qwen2_5_vl; prefer the vision_config value.
         model_type = getattr(config.vision_config, "model_type", model_type)
     return model_type
 
 def get_model_layer_counts(config):
-    """
-    Returns layer counts for different model types.
-
-    Args:
-        config: Model configuration
-
-    Returns:
-        int or dict: Number of layers (int for causal_lm, dict for VL models)
-    """
+    """Layer counts per model type (int for causal_lm, dict for VL models)."""
     model_type = get_model_type(config)
 
     if model_type == "mllama":
@@ -1323,11 +1441,7 @@ pass
 
 
 def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict):
-    """
-    Extracts vision layers for any supported vision model by dynamically using
-    a model-specific configuration. This approach is more robust and avoids
-    failures by correctly identifying layer paths and parameters.
-    """
+    """Extract vision layers via the model-specific layer config."""
     model_type = get_model_type(vllm_internals.config)
     layer_config = get_model_layer_config()
 
@@ -1347,22 +1461,21 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
             layer_module = _get_nested_attr(vllm_internals, layer_path)
 
             if 'language_model.model' in layer_path:
-                # vLLM uses vllm_internals.language_model.model.layers while HF uses model.language_model.layers
+                # vLLM uses language_model.model.layers; HF uses language_model.layers
                 layer_path = layer_path.replace('language_model.model', 'language_model')
 
 
             if layer_module is not None:
                 if "qkv" in layer_path:
                     if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
-                        # If the HF model too prefers having merged qkv, we do this
-                        # This is evident in qwen-2.5-vl and qwen-3-vl so far.
+                        # HF keeps merged qkv for these (qwen-2.5-vl, qwen-3-vl)
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'q_proj')}", 0, state_dict, layer_module)
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'k_proj')}", 1, state_dict, layer_module)
                          get_state_dict(f"{layer_path.replace('qkv_proj', 'v_proj')}", 2, state_dict, layer_module)
                 elif "gate_up_proj" in layer_path:
-                    # vLLM seems to have merged gate and up proj recently for qwen vl. This is to handle new variant
+                    # vLLM merged gate and up proj for qwen vl; split them back.
                     # https://github.com/jeejeelee/vllm/commit/a71e4765cc0c1534f2a8891aaf628e1751f6df07
                     get_state_dict(f"{layer_path.replace('gate_up_proj','gate_proj')}", 0, state_dict, layer_module)
                     get_state_dict(f"{layer_path.replace('gate_up_proj','up_proj')}", 1, state_dict, layer_module)
@@ -1378,21 +1491,20 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
                     else:
                         print(f"Unsloth: Skipping layer '{layer_path}' of unexpected type: {type(layer_module)}")
 
-    # Extract non-layered vision components using a more robust method
+    # Extract non-layered vision components
     non_layered_components = layer_config.get('non_layered_components', [])
     for component_path in non_layered_components:
         component = _get_nested_attr(vllm_internals, component_path)
 
         if component is not None:
             if hasattr(component, 'weight'):
-                # Prefer using get_state_dict when possible
                 get_state_dict(component_path, 0, state_dict, component)
             elif isinstance(component, torch.Tensor):
                 state_dict[component_path] = component.data
                 quant_state_dict[component_path] = component.data
             elif isinstance(component, torch.nn.Module):
                 for param_name, param in component.named_parameters():
-                    # if the parameter is to be extracted separately, skip it
+                    # Skip params extracted separately
                     if param_name.replace('.weight', '') in non_layered_components: continue
                     full_param_path = f"{component_path}.{param_name}"
                     if hasattr(param, 'weight'):

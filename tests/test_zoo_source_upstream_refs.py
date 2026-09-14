@@ -6,13 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or (at
 # your option) any later version.
 
-"""Importable-symbol pins for upstream references in ``unsloth_zoo`` source.
-
-Flat enumeration of every ``from <upstream> import <symbol>`` /
-``<upstream>.X.Y`` reference visible in ``unsloth_zoo/**.py``, exercised
-against the INSTALLED versions of transformers / trl / peft / datasets
-/ accelerate / vllm. Each test cites the zoo file:line it pins.
-"""
+"""Importable-symbol pins for every upstream reference in unsloth_zoo source,
+exercised against the INSTALLED transformers / trl / peft / datasets /
+accelerate / vllm. Each test cites the zoo file:line it pins."""
 
 from __future__ import annotations
 
@@ -23,19 +19,11 @@ from typing import Iterable
 import pytest
 
 
-# ---------------------------------------------------------------------------
 # Helpers.
-# ---------------------------------------------------------------------------
 
 def _resolve(dotted: str) -> object:
-    """``importlib.import_module`` + ``getattr`` chain.
-
-    DRIFT-DETECTED policy: any failure to resolve is reported as an
-    AssertionError -- never a SKIP. Three failure modes all surface as
-    DRIFT: module-file missing, module-file present but import raises
-    (transitively-broken optional dep), or attribute missing on a
-    successfully-imported module.
-    """
+    """import_module + getattr chain. Any resolution failure (missing module,
+    import raises, or missing attribute) surfaces as DRIFT, never a SKIP."""
     parts = dotted.split(".")
     obj: object = None
     consumed: list[str] = []
@@ -100,9 +88,7 @@ def _skip_if_missing(module_name: str) -> None:
     pytest.importorskip(module_name)
 
 
-# ===========================================================================
 # unsloth_zoo/compiler.py
-# ===========================================================================
 
 def test_compiler_modeling_flash_attention_utils_top_level():
     """unsloth_zoo/compiler.py:218 -- TOP-LEVEL unguarded
@@ -139,9 +125,7 @@ def test_compiler_trainer_module_and_class():
     ])
 
 
-# ===========================================================================
 # unsloth_zoo/loss_utils.py
-# ===========================================================================
 
 def test_loss_utils_training_args_parallel_mode():
     """unsloth_zoo/loss_utils.py:232 -- TOP-LEVEL unguarded ``from
@@ -165,9 +149,7 @@ def test_loss_utils_loss_module():
     _resolve("transformers.loss.loss_utils")
 
 
-# ===========================================================================
 # unsloth_zoo/training_utils.py
-# ===========================================================================
 
 def test_training_utils_top_level_transformers_surface():
     """unsloth_zoo/training_utils.py:20-23 -- four top-level imports; any
@@ -194,9 +176,7 @@ def test_training_utils_peft_modules_to_save_wrapper():
     _resolve("peft.utils.ModulesToSaveWrapper")
 
 
-# ===========================================================================
 # unsloth_zoo/dataset_utils.py
-# ===========================================================================
 
 def test_dataset_utils_datasets_top_level():
     """unsloth_zoo/dataset_utils.py:594 -- ``from datasets import (Dataset,
@@ -210,9 +190,7 @@ def test_dataset_utils_data_collator_for_seq2seq():
     _resolve("transformers.DataCollatorForSeq2Seq")
 
 
-# ===========================================================================
 # unsloth_zoo/saving_utils.py
-# ===========================================================================
 
 def test_saving_utils_pushtohubmixin():
     """unsloth_zoo/saving_utils.py:76 -- TOP-LEVEL unguarded ``from
@@ -238,9 +216,7 @@ def test_saving_utils_autoconfig():
     _resolve("transformers.AutoConfig")
 
 
-# ===========================================================================
 # unsloth_zoo/patching_utils.py
-# ===========================================================================
 
 def test_patching_utils_pretrainedconfig_either_name():
     """unsloth_zoo/patching_utils.py:247-251 -- try ``PreTrainedConfig``
@@ -281,9 +257,7 @@ def test_patching_utils_quantizers_utils_module():
     _resolve("transformers.quantizers.quantizers_utils")
 
 
-# ===========================================================================
 # unsloth_zoo/hf_utils.py
-# ===========================================================================
 
 def test_hf_utils_pretrainedconfig_either_name():
     """unsloth_zoo/hf_utils.py:25-28 -- try ``PreTrainedConfig`` (5.x),
@@ -328,9 +302,7 @@ def test_hf_utils_peft_config_top_level():
     _resolve("peft.PeftConfig")
 
 
-# ===========================================================================
 # unsloth_zoo/utils.py
-# ===========================================================================
 
 def test_utils_auto_quantization_config():
     """unsloth_zoo/utils.py:197 -- ``from transformers.quantizers import
@@ -338,9 +310,7 @@ def test_utils_auto_quantization_config():
     _resolve("transformers.quantizers.AutoQuantizationConfig")
 
 
-# ===========================================================================
 # unsloth_zoo/empty_model.py
-# ===========================================================================
 
 def test_empty_model_accelerate_init_empty_weights():
     """unsloth_zoo/empty_model.py:238, 322 -- ``from accelerate import
@@ -361,9 +331,7 @@ def test_empty_model_auto_model_for_causal_lm():
     _resolve("transformers.AutoModelForCausalLM")
 
 
-# ===========================================================================
 # unsloth_zoo/tokenizer_utils.py + unsloth_zoo/training_utils.py
-# ===========================================================================
 
 def test_top_level_datasets_module():
     """unsloth_zoo/tokenizer_utils.py:21, training_utils.py:19 --
@@ -371,9 +339,7 @@ def test_top_level_datasets_module():
     _resolve("datasets")
 
 
-# ===========================================================================
 # unsloth_zoo/peft_utils.py
-# ===========================================================================
 
 def test_peft_utils_peft_tuners_lora_module():
     """unsloth_zoo/peft_utils.py:157 -- ``import peft.tuners.lora``.
@@ -381,9 +347,7 @@ def test_peft_utils_peft_tuners_lora_module():
     _resolve("peft.tuners.lora")
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/utils.py
-# ===========================================================================
 
 def test_temporary_patches_utils_kwargs_typing():
     """unsloth_zoo/temporary_patches/utils.py:146, 211, 231, 244 --
@@ -415,9 +379,7 @@ def test_temporary_patches_utils_transformers_version():
     _resolve("transformers.__version__")
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/misc.py
-# ===========================================================================
 
 def test_temp_patches_misc_config_mapping():
     """unsloth_zoo/temporary_patches/misc.py:47 -- ``from
@@ -516,9 +478,7 @@ def test_temp_patches_misc_pretrained_tokenizer_base_top_level():
     _resolve("transformers.PreTrainedTokenizerBase")
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/gemma.py
-# ===========================================================================
 
 def test_temp_patches_gemma_processing_surface():
     """unsloth_zoo/temporary_patches/gemma.py:93-97 -- five module-level
@@ -531,9 +491,7 @@ def test_temp_patches_gemma_processing_surface():
     ])
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/gpt_oss.py
-# ===========================================================================
 
 def test_temp_patches_gpt_oss_modeling_rope_utils():
     """unsloth_zoo/temporary_patches/gpt_oss.py:2602 -- ``from
@@ -552,9 +510,7 @@ def test_temp_patches_gpt_oss_layer_type_validation():
     )
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/qwen3_vl_moe.py
-# ===========================================================================
 
 def test_temp_patches_qwen3_vl_moe_act2fn():
     """unsloth_zoo/temporary_patches/qwen3_vl_moe.py:201 -- ``from
@@ -563,9 +519,7 @@ def test_temp_patches_qwen3_vl_moe_act2fn():
     _resolve("transformers.activations.ACT2FN")
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/gemma4.py
-# ===========================================================================
 
 def test_temp_patches_gemma4_cache_utils():
     """unsloth_zoo/temporary_patches/gemma4.py:308, 334, 460 -- ``from
@@ -577,9 +531,7 @@ def test_temp_patches_gemma4_cache_utils():
     ])
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/moe_utils.py
-# ===========================================================================
 
 def test_temp_patches_moe_utils_param_wrapper():
     """unsloth_zoo/temporary_patches/moe_utils.py:897 -- ``from
@@ -588,9 +540,7 @@ def test_temp_patches_moe_utils_param_wrapper():
     _resolve("peft.tuners.lora.layer.ParamWrapper")
 
 
-# ===========================================================================
 # unsloth_zoo/logging_utils.py
-# ===========================================================================
 
 def test_logging_utils_utils_notebook():
     """unsloth_zoo/logging_utils.py:50 -- ``from
@@ -615,9 +565,7 @@ def test_logging_utils_trl_trainer_module():
     _resolve("trl.trainer")
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/pixtral.py
-# ===========================================================================
 
 def test_temp_patches_pixtral_rotary_emb():
     """unsloth_zoo/temporary_patches/pixtral.py:30 -- ``from
@@ -628,9 +576,7 @@ def test_temp_patches_pixtral_rotary_emb():
     )
 
 
-# ===========================================================================
 # unsloth_zoo/vllm_lora_worker_manager.py
-# ===========================================================================
 
 def test_vllm_lora_worker_manager_top_level():
     """unsloth_zoo/vllm_lora_worker_manager.py:22, 23, 32-34 -- five
@@ -655,9 +601,7 @@ def test_vllm_lora_worker_manager_vllm_config_top_level():
     _resolve("vllm.config.VllmConfig")
 
 
-# ===========================================================================
 # unsloth_zoo/vllm_utils.py
-# ===========================================================================
 
 def test_vllm_utils_top_level_peft_type():
     """unsloth_zoo/vllm_utils.py:2520 -- ``from peft import PeftType`` at
@@ -678,9 +622,7 @@ def test_vllm_utils_models_registry():
     _resolve("vllm.model_executor.models.registry.ModelRegistry")
 
 
-# ===========================================================================
 # unsloth_zoo/temporary_patches/mxfp4.py
-# ===========================================================================
 
 def test_temp_patches_mxfp4_module_path():
     """unsloth_zoo/temporary_patches/mxfp4.py -- three sites import
@@ -698,9 +640,7 @@ def test_temp_patches_mxfp4_tensor_parallel_helper():
     )
 
 
-# ===========================================================================
 # qwen2_vl + qwen2_5_vl image-processing surface
-# ===========================================================================
 
 def test_qwen2_vl_image_processor_class():
     """unsloth_zoo/temporary_patches/misc.py:1485 -- Qwen2VLImageProcessor.
@@ -714,23 +654,11 @@ def test_qwen2_vl_image_processor_class():
 
 
 def test_qwen2_5_vl_image_processor_class_gated_on_v5():
-    """unsloth_zoo/temporary_patches/misc.py:1501 --
-    Qwen2_5_VLImageProcessor.
+    """misc.py:1501 -- Qwen2_5_VLImageProcessor.
 
-    Originally added because zoo's patch site at misc.py:1501 references
-    this exact path; the version gate skipped on 4.x where the patch is
-    inert. transformers 5.x then DROPPED the slow image processors
-    entirely (no image_processing_qwen2_5_vl.py, no
-    image_processing_qwen2_5_vl_fast.py either): Qwen2.5-VL now reuses
-    ``Qwen2VLImageProcessor`` directly. zoo's misc.py:1500-1506 is
-    try/except ImportError-wrapped, so the no-longer-resolvable import
-    silently no-ops on 5.x and the runtime shim still fires via the
-    Qwen2VLImageProcessor patch at misc.py:1485-1498 (which is the
-    same class Qwen2.5-VL inherits at runtime).
-
-    On 4.57.6 the path still exists -- keep the strict drift check.
-    On 5.x the path is gone but the runtime is covered elsewhere --
-    skip.
+    On 4.57.6 the path exists -- keep the strict drift check. On 5.x the slow
+    image processors are gone (Qwen2.5-VL reuses Qwen2VLImageProcessor, covered
+    by the misc.py:1485-1498 patch); zoo's try/except import no-ops, so skip.
     """
     import transformers
     from packaging.version import Version
