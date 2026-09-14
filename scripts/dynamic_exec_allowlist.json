@@ -1,0 +1,461 @@
+{
+  "_comment": "Reviewed exec/eval/compile calls whose first argument is a built string. Keyed on a hash of the call's own source, so editing the call requires re-reviewing it. Regenerate with scripts/lint_dynamic_exec.py --update, then replace every REVIEW ME with why the interpolated value cannot be attacker controlled.",
+  "allowed": [
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "_install_patched_forward",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "16b803be263a7d1b",
+      "reason": "`module` iterates the hardcoded `_patch_functions` list at the top of this file; `model_location` is re-validated against [a-z0-9_]+ in unsloth_compile_transformers."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "_install_patched_forward",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "2a08ef7bf87aa806",
+      "reason": "`module` iterates the hardcoded `_patch_functions` list at the top of this file; `model_location` is re-validated against [a-z0-9_]+ in unsloth_compile_transformers."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "_install_patched_forward",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "6db61d41d15041a9",
+      "reason": "`module` iterates the hardcoded `_patch_functions` list at the top of this file; `model_location` is re-validated against [a-z0-9_]+ in unsloth_compile_transformers."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "_install_patched_forward",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "d6252fea6de677cd",
+      "reason": "`module` iterates the hardcoded `_patch_functions` list at the top of this file; `model_location` is re-validated against [a-z0-9_]+ in unsloth_compile_transformers."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "_patch_torch_dtype_modules",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "c88f4b2a2dfece41",
+      "reason": "`module` iterates the same hardcoded `_patch_functions` list; `model_location` is validated."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "_patch_torch_dtype_modules",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "e50edcd7f45039da",
+      "reason": "`module` iterates the same hardcoded `_patch_functions` list; `model_location` is validated."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "compile_timm_models",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "125ef0dee8697ab8",
+      "reason": "`norm` / `block` come from dir(timm.layers.norm_act) and a class regex over inspect.getsource(timm.models._efficientnet_blocks), i.e. names in the installed timm."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "compile_timm_models",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "477178a6b990eb09",
+      "reason": "`norm` / `block` come from dir(timm.layers.norm_act) and a class regex over inspect.getsource(timm.models._efficientnet_blocks), i.e. names in the installed timm."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "compile_timm_models",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "65cae25d9d007c86",
+      "reason": "`norm` / `block` come from dir(timm.layers.norm_act) and a class regex over inspect.getsource(timm.models._efficientnet_blocks), i.e. names in the installed timm."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "compile_timm_models",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "d9650e96220991c3",
+      "reason": "`norm` / `block` come from dir(timm.layers.norm_act) and a class regex over inspect.getsource(timm.models._efficientnet_blocks), i.e. names in the installed timm."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "create_standalone_class",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`module` comes from names scraped out of the installed modeling file. `model_location` is a parameter, but this function is NOT exported: it is absent from compiler.__all__ (5 names), and all 5 call sites are in this file and pass f\"transformers.models.{model_type}.modeling_{model_type}\" built from a model_type that get_transformers_model_type already validated. So the interpolated value is internal on every reachable path. Noting explicitly that this justification covers model_location as well as module, since a caller outside this file would invalidate it."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "patch_gradient_accumulation",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "582a2ff284d76dd9",
+      "reason": "Resolves names in transformers.trainer, filtered by `x in inner_training_loop` where the loop body is inspect.getsource(Trainer._inner_training_loop)."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "patch_gradient_accumulation",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "ae0dc524263f37f6",
+      "reason": "Resolves names in transformers.trainer, filtered by `x in inner_training_loop` where the loop body is inspect.getsource(Trainer._inner_training_loop)."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "patch_lora_forwards",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "60ec2e1e4c46a9ed",
+      "reason": "`parent` / `child` come from os.listdir(peft.tuners.lora.__path__) plus dir() filtered to names starting or ending with 'Linear', i.e. the installed peft package."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "patch_lora_forwards",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "9e394cdc35663c6e",
+      "reason": "`parent` / `child` come from os.listdir(peft.tuners.lora.__path__) plus dir() filtered to names starting or ending with 'Linear', i.e. the installed peft package."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "002343bd43161592",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "03e6d133b778a53e",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "07325163fcae29ba",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "41335056252b5222",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "ae0dc524263f37f6",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "ae0dc524263f37f6",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "ae0dc524263f37f6",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "aec8dc650544d15a",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "b4ffe1845a490edc",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/compiler.py",
+      "qualname": "unsloth_compile_transformers",
+      "sink": "exec",
+      "kind": "string concatenation",
+      "hash": "ffa18102ffbe15dd",
+      "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
+    },
+    {
+      "path": "unsloth_zoo/llama_cpp.py",
+      "qualname": "_assert_correct_gguf",
+      "sink": "exec",
+      "kind": "f-string via `source`",
+      "hash": "3725bba562bb6fff",
+      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
+    },
+    {
+      "path": "unsloth_zoo/llama_cpp.py",
+      "qualname": "_assert_correct_gguf",
+      "sink": "exec",
+      "kind": "f-string via `functions`",
+      "hash": "7330700d494b9249",
+      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
+    },
+    {
+      "path": "unsloth_zoo/patching_utils.py",
+      "qualname": "<module>",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "70146d03d161750a",
+      "reason": "Imports names selected by `x in source` from dir(transformers.integrations.bitsandbytes), i.e. attributes of the installed transformers."
+    },
+    {
+      "path": "unsloth_zoo/patching_utils.py",
+      "qualname": "patch_compiled_autograd",
+      "sink": "exec",
+      "kind": "string concatenation",
+      "hash": "12f4a6d20e7de470",
+      "reason": "Imports names selected by `x in source` from dir() of the installed torch._dynamo modules being patched."
+    },
+    {
+      "path": "unsloth_zoo/patching_utils.py",
+      "qualname": "patch_compiled_autograd",
+      "sink": "exec",
+      "kind": "string concatenation",
+      "hash": "d5c91cdf1f94e789",
+      "reason": "Imports names selected by `x in source` from dir() of the installed torch._dynamo modules being patched."
+    },
+    {
+      "path": "unsloth_zoo/peft_utils.py",
+      "qualname": "get_lora_layer_modules",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "45bbd24d7d803e73",
+      "reason": "`item` is 'peft.tuners.lora.' plus a filename stem from os.listdir of the installed peft package; `modules` is dir() filtered to Linear-ish names."
+    },
+    {
+      "path": "unsloth_zoo/peft_utils.py",
+      "qualname": "get_lora_layer_modules",
+      "sink": "eval",
+      "kind": "f-string via `item`",
+      "hash": "81cdac2f6f8a2c32",
+      "reason": "`item` is `peft.tuners.lora.<file>` where <file> is a .py filename listed from the INSTALLED peft package directory, and `modules` is dir() of that module filtered to Linear* names. Both are properties of the installed dependency."
+    },
+    {
+      "path": "unsloth_zoo/peft_utils.py",
+      "qualname": "get_lora_layer_modules",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "d467bcd0b437db95",
+      "reason": "`item` is 'peft.tuners.lora.' plus a filename stem from os.listdir of the installed peft package; `modules` is dir() filtered to Linear-ish names."
+    },
+    {
+      "path": "unsloth_zoo/peft_utils.py",
+      "qualname": "requires_grad_for_gradient_checkpointing.register_other_hooks",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "582f1edab6ecc7d8",
+      "reason": "`_hooks` is one of the two literals '_forward_hooks' / '_forward_pre_hooks' passed at the call sites in this function."
+    },
+    {
+      "path": "unsloth_zoo/peft_utils.py",
+      "qualname": "requires_grad_for_gradient_checkpointing.register_other_hooks",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "73be47696e5e4b6b",
+      "reason": "`_hooks` is one of the two literals '_forward_hooks' / '_forward_pre_hooks' passed at the call sites in this function."
+    },
+    {
+      "path": "unsloth_zoo/peft_utils.py",
+      "qualname": "requires_grad_for_gradient_checkpointing.register_other_hooks",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "9c8c2a17a2a67b45",
+      "reason": "`_hooks` is one of the two literals '_forward_hooks' / '_forward_pre_hooks' passed at the call sites in this function."
+    },
+    {
+      "path": "unsloth_zoo/saving_utils.py",
+      "qualname": "merge_and_dequantize_lora",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "691766359b82b093",
+      "reason": "Imports names from dir(transformers.modeling_utils); the generated save_pretrained interpolates only output_dtype (checked against four torch dtypes above) and two ints."
+    },
+    {
+      "path": "unsloth_zoo/temporary_patches/misc.py",
+      "qualname": "patch_merge_quantization_configs",
+      "sink": "exec",
+      "kind": "string concatenation",
+      "hash": "13fce184fe981cb2",
+      "reason": "Imports names selected by `x in source` from dir(transformers.quantizers.auto)."
+    },
+    {
+      "path": "unsloth_zoo/temporary_patches/misc.py",
+      "qualname": "patch_merge_quantization_configs",
+      "sink": "exec",
+      "kind": "string concatenation via `source`",
+      "hash": "7a5e305efb369e7f",
+      "reason": "`source` is inspect.getsource of the installed transformers quantizer method, reindented and with the classmethod `cls` parameter stripped. Self-generated source, same category as the compiler sites."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "_get_vllm_state_dict",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "e1c0e6e5e72d3992",
+      "reason": "The layernorm name templates come from get_model_layer_config() in empty_model.py, a hardcoded table; the index is an int from range()."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_lora_modules",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "158d0cb952b9ad6c",
+      "reason": "Formats a dtype whose textual form comes from _get_dtype(), which only ever returns a torch.dtype or None."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_vllm_to_huggingface",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "07970955945be5d2",
+      "reason": "`layer_name` is a hardcoded template from get_model_layer_config() with an int index substituted; it is not a checkpoint weight name. `vllm_text_model_prefix` is one of two string literals."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_vllm_to_huggingface",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "3100e23cb9cda992",
+      "reason": "`layer_name` is a hardcoded template from get_model_layer_config() with an int index substituted; it is not a checkpoint weight name. `vllm_text_model_prefix` is one of two string literals."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_vllm_to_huggingface",
+      "sink": "eval",
+      "kind": "f-string",
+      "hash": "6e5ae3bd4483e267",
+      "reason": "`layer_name` is a hardcoded template from get_model_layer_config() with an int index substituted; it is not a checkpoint weight name. `vllm_text_model_prefix` is one of two string literals."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_vllm_to_huggingface",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "9ba49a34b5d3f94d",
+      "reason": "`layer_name` is a hardcoded template from get_model_layer_config() with an int index substituted; it is not a checkpoint weight name. `vllm_text_model_prefix` is one of two string literals."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_vllm_to_huggingface",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "a32b902c145cbbb3",
+      "reason": "`layer_name` is a hardcoded template from get_model_layer_config() with an int index substituted; it is not a checkpoint weight name. `vllm_text_model_prefix` is one of two string literals."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_vllm_to_huggingface",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "da7d2cbca432c8bf",
+      "reason": "`layer_name` is a hardcoded template from get_model_layer_config() with an int index substituted; it is not a checkpoint weight name. `vllm_text_model_prefix` is one of two string literals."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "convert_vllm_to_huggingface",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "e1ac0cbebe50a698",
+      "reason": "`layer_name` is a hardcoded template from get_model_layer_config() with an int index substituted; it is not a checkpoint weight name. `vllm_text_model_prefix` is one of two string literals."
+    },
+    {
+      "path": "unsloth_zoo/vllm_utils.py",
+      "qualname": "return_lora_modules",
+      "sink": "exec",
+      "kind": "f-string",
+      "hash": "158d0cb952b9ad6c",
+      "reason": "Formats a dtype whose textual form comes from _get_dtype(), which only ever returns a torch.dtype or None."
+    }
+  ]
+}

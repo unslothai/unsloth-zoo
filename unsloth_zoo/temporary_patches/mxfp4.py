@@ -21,12 +21,15 @@ import torch
 import torch.nn as nn
 import os
 import math
+from importlib.metadata import version as importlib_version
+from unsloth_zoo.utils import Version
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 
-# MXFP4 configuration
-# Set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 to keep MXFP4 weights quantized (requires triton_kernels)
-# Otherwise, MXFP4 weights will be dequantized to bf16 for LoRA training
+transformers_version = Version(importlib_version("transformers"))
+
+# UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels);
+# otherwise weights dequantize to bf16 for LoRA training.
 UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
 
 
@@ -49,15 +52,9 @@ def is_triton_kernels_available():
 
 
 def should_dequantize_mxfp4():
-    """
-    Check if MXFP4 should be dequantized to bf16 for training.
+    """Whether MXFP4 should be dequantized to bf16 for training.
 
-    Returns True if:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE is not set or "0", OR
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" but triton_kernels is not available
-
-    Returns False if:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available
+    True unless UNSLOTH_MXFP4_NO_DEQUANTIZE="1" and triton_kernels is available.
     """
     if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
         return True  # Default: dequantize for compatibility
@@ -74,16 +71,10 @@ def should_dequantize_mxfp4():
 
 
 def get_mxfp4_config_for_training():
-    """
-    Get the appropriate Mxfp4Config for training.
-
-    Returns Mxfp4Config with dequantize=True unless:
-    - UNSLOTH_MXFP4_NO_DEQUANTIZE=1 AND triton_kernels is available
+    """Return the Mxfp4Config for training (dequantize=True unless
+    UNSLOTH_MXFP4_NO_DEQUANTIZE=1 and triton_kernels is available).
 
     Usage:
-        from unsloth_zoo.temporary_patches.mxfp4 import get_mxfp4_config_for_training
-        from transformers import AutoModelForCausalLM
-
         model = AutoModelForCausalLM.from_pretrained(
             "unsloth/gpt-oss-20b",
             quantization_config=get_mxfp4_config_for_training(),
@@ -105,9 +96,7 @@ def get_mxfp4_config_for_training():
     return Mxfp4Config(dequantize=dequantize)
 
 def patch_convert_moe_packed_tensors():
-    """
-    Pin the original GPU-optimized version of convert_moe_packed_tensors with smaller default chunk size.
-    """
+    """Pin the GPU convert_moe_packed_tensors with a smaller default chunk."""
     try:
         import transformers.integrations.mxfp4
         from transformers.integrations.mxfp4 import FP4_VALUES
@@ -121,17 +110,8 @@ def patch_convert_moe_packed_tensors():
         dtype: torch.dtype = torch.bfloat16,
         rows_per_chunk: int = 32768 * 1024,
     ) -> torch.Tensor:
-        """
-        Convert the mxfp4 weights again, dequantizing and makes them compatible with the forward
-        pass of GPT_OSS.
-
-        Args:
-            blocks: Packed quantized weights
-            scales: Quantization scales
-            dtype: Output data type
-            rows_per_chunk: Number of rows to process per chunk. .
-        """
-        # Check if blocks and scales are on CPU, and move to GPU if so
+        """Dequantize mxfp4 weights into GPT_OSS-compatible form (GPU path)."""
+        # Move CPU tensors to GPU if available.
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
@@ -176,48 +156,102 @@ def patch_convert_moe_packed_tensors():
     Transformers 4.55.4 did dequantized.transpose(1, 2).contiguous().to(target_device)
     but new versions > 4.56.0 removed the transpose(1, 2) and moved it into patch_convert_moe_packed_tensors
     """
-    try:
-        import transformers.integrations.mxfp4
-        from transformers.integrations.tensor_parallel import shard_and_distribute_module
-    except Exception as e:
-        return raise_error("transformers.integrations.mxfp4.dequantize", e)
+    # convert_moe_packed_tensors above returns the UN-transposed [E, D, G*B*2] layout
+    # on purpose (saving_utils._mxfp4_base_returns_transposed keys the export path off
+    # that convention), so the live loader hook must restore GPT-OSS's [E, G*B*2, D].
+    # Which hook is live:
+    #   4.x             -> module level mxfp4.dequantize, called by quantizer_mxfp4
+    #   5.0.0 and newer -> Mxfp4Dequantize (a ConversionOps) -> dequantize_convertops
+    # mxfp4.dequantize survives unreferenced from 5.0.0 until 5.16.0 (upstream PR
+    # #47579, the DTensor TP rewrite) deletes it, so patching only dequantize dropped
+    # the transpose from 5.0.0 on and loaded GPT-OSS with dims 1 and 2 silently
+    # swapped.
+    #
+    # 5.0.0 alone declares dequantize_convertops(blocks, scales, target_device); every
+    # release from 5.1.0 on declares (blocks, scales). A 2-arg replacement against the
+    # 3-arg original is refused by can_safely_patch ("Parameter count mismatch: 3 vs
+    # 2"), which left 5.0.0 with the un-transposed convert_moe_packed_tensors above and
+    # nothing restoring the transpose. So pick the arm that matches what is actually
+    # installed.
+    #
+    # Dispatch on the observed parameter names rather than on transformers_version:
+    # arity is the exact property can_safely_patch enforces, so reading it directly
+    # cannot disagree with it, whereas a version gate is a proxy that a backport or a
+    # fork can falsify. An unrecognised signature falls through to the 2-arg arm and is
+    # rejected loudly by can_safely_patch, which is the correct failure mode.
+    _convertops = getattr(transformers.integrations.mxfp4, "dequantize_convertops", None)
+    if _convertops is not None:
+        # 5.x path, called only by Mxfp4Dequantize.convert. Both arms close over the
+        # local un-transposed convert_moe_packed_tensors rather than re-reading the
+        # module attribute, so the transpose stays correct even if patch_function above
+        # did not take and upstream's self-transposing version is still installed.
+        try:
+            _convertops_params = tuple(inspect.signature(_convertops).parameters)
+        except (TypeError, ValueError):
+            _convertops_params = ()
 
-    def dequantize(module, param_name, param_value, target_device, dq_param_name, **kwargs):
-        model = kwargs.get("model", None)
-        empty_param = kwargs.get("empty_param", None)
-        casting_dtype = kwargs.get("casting_dtype", None)
-        to_contiguous = kwargs.get("to_contiguous", None)
-        rank = kwargs.get("rank", None)
-        device_mesh = kwargs.get("device_mesh", None)
+        if _convertops_params == ("blocks", "scales", "target_device"):
+            # 5.0.0. Mirrors upstream's own body (empty_cache before the move, and the
+            # result placed on target_device) with the transpose added back.
+            def dequantize_convertops(blocks, scales, target_device):
+                dequantized = convert_moe_packed_tensors(blocks, scales)
+                dequantized = dequantized.transpose(1, 2).contiguous()
+                if target_device == "cpu" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return torch.nn.Parameter(dequantized.to(target_device))
+        else:
+            # 5.1.0 and newer. Upstream leaves placement to its caller here.
+            def dequantize_convertops(blocks, scales):
+                dequantized = convert_moe_packed_tensors(blocks, scales)
+                return torch.nn.Parameter(dequantized.transpose(1, 2).contiguous())
+        patch_function(transformers.integrations.mxfp4, "dequantize_convertops", dequantize_convertops)
 
-        for proj in ["gate_up_proj", "down_proj"]:
-            if proj in param_name:
-                if device_mesh is not None:
-                    param_value = shard_and_distribute_module(
-                        model,
-                        param_value,
-                        empty_param,
-                        dq_param_name,
-                        casting_dtype,
-                        to_contiguous,
-                        rank,
-                        device_mesh,
-                        set_param=False,
-                    )
-                blocks_attr = f"{proj}_blocks"
-                scales_attr = f"{proj}_scales"
-                setattr(module, param_name.rsplit(".", 1)[1], param_value)
-                if hasattr(module, blocks_attr) and hasattr(module, scales_attr):
-                    dequantized = convert_moe_packed_tensors(getattr(module, blocks_attr), getattr(module, scales_attr))
-                    # [HERE] we must do transpose(1, 2)
-                    dequantized = dequantized.transpose(1, 2).contiguous().to(target_device)
-                    # TODO: this is perhaps necessary since if target_device is cpu, and the param was on gpu
-                    if target_device == "cpu" and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    setattr(module, proj, torch.nn.Parameter(dequantized))
-                    delattr(module, blocks_attr)
-                    delattr(module, scales_attr)
-    patch_function(transformers.integrations.mxfp4, "dequantize", dequantize)
+    if transformers_version < Version("5.0.0"):
+        # 4.x path. shard_and_distribute_module is imported inside the gate because on
+        # 5.16.0+ it still imports fine but is a tombstone that raises when called.
+        try:
+            import transformers.integrations.mxfp4
+            from transformers.integrations.tensor_parallel import shard_and_distribute_module
+        except Exception as e:
+            return raise_error("transformers.integrations.mxfp4.dequantize", e)
+
+        def dequantize(module, param_name, param_value, target_device, dq_param_name, **kwargs):
+            model = kwargs.get("model", None)
+            empty_param = kwargs.get("empty_param", None)
+            casting_dtype = kwargs.get("casting_dtype", None)
+            to_contiguous = kwargs.get("to_contiguous", None)
+            rank = kwargs.get("rank", None)
+            device_mesh = kwargs.get("device_mesh", None)
+
+            for proj in ["gate_up_proj", "down_proj"]:
+                if proj in param_name:
+                    if device_mesh is not None:
+                        # 8 positionals, no set_param: that kwarg was removed in 4.57.0
+                        # (and is absent from 5.x), so passing it TypeErrors there.
+                        param_value = shard_and_distribute_module(
+                            model,
+                            param_value,
+                            empty_param,
+                            dq_param_name,
+                            casting_dtype,
+                            to_contiguous,
+                            rank,
+                            device_mesh,
+                        )
+                    blocks_attr = f"{proj}_blocks"
+                    scales_attr = f"{proj}_scales"
+                    setattr(module, param_name.rsplit(".", 1)[1], param_value)
+                    if hasattr(module, blocks_attr) and hasattr(module, scales_attr):
+                        dequantized = convert_moe_packed_tensors(getattr(module, blocks_attr), getattr(module, scales_attr))
+                        # [HERE] we must do transpose(1, 2)
+                        dequantized = dequantized.transpose(1, 2).contiguous().to(target_device)
+                        # TODO: this is perhaps necessary since if target_device is cpu, and the param was on gpu
+                        if target_device == "cpu" and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        setattr(module, proj, torch.nn.Parameter(dequantized))
+                        delattr(module, blocks_attr)
+                        delattr(module, scales_attr)
+        patch_function(transformers.integrations.mxfp4, "dequantize", dequantize)
 
     """
     Add a new CPU-optimized version of convert_moe_packed_tensors with smaller default chunk size.
@@ -235,21 +269,13 @@ def patch_convert_moe_packed_tensors():
         dtype: torch.dtype = torch.bfloat16,
         rows_per_chunk: int = 1024 * 1024,  # CPU-optimized default (~2.6GB temp memory)
     ) -> torch.Tensor:
-        """
-        Convert the mxfp4 weights again, dequantizing and makes them compatible with the forward
-        pass of GPT_OSS. CPU-optimized version with smaller default chunk size.
+        """Dequantize mxfp4 weights into GPT_OSS-compatible form (CPU path,
+        smaller default chunk).
 
-        Args:
-            blocks: Packed quantized weights
-            scales: Quantization scales
-            dtype: Output data type
-            rows_per_chunk: Number of rows to process per chunk. CPU-optimized default: 1M rows.
-                           Memory usage per chunk (assuming B=128):
-                           - 8192: ~22 MB
-                           - 1048576 (1M): ~2.6 GB
-                           - 33554432 (32M): ~90 GB
+        rows_per_chunk default 1M rows; per-chunk memory at B=128: 8192 ~22 MB,
+        1M ~2.6 GB, 32M ~90 GB.
         """
-        # Ensure tensors are on CPU
+        # Force tensors onto CPU.
         if blocks.is_cuda:
             blocks = blocks.cpu()
         if scales.is_cuda:
@@ -259,7 +285,6 @@ def patch_convert_moe_packed_tensors():
 
         assert blocks.shape[:-1] == scales.shape, f"{blocks.shape[:-1]=} does not match {scales.shape=}"
 
-        # Create LUT on CPU
         lut = torch.tensor(FP4_VALUES, dtype=dtype, device='cpu')
 
         *prefix_shape, G, B = blocks.shape
@@ -268,7 +293,6 @@ def patch_convert_moe_packed_tensors():
         blocks = blocks.reshape(rows_total, B)
         scales = scales.reshape(rows_total, 1)
 
-        # Create output tensor on CPU
         out = torch.empty(rows_total, B * 2, dtype=dtype, device='cpu')
 
         for r0 in range(0, rows_total, rows_per_chunk):
@@ -292,7 +316,6 @@ def patch_convert_moe_packed_tensors():
         del blocks, scales, lut
         return out
 
-    # Add the new CPU function to the mxfp4 module
     if hasattr(transformers.integrations.mxfp4, 'convert_moe_packed_tensors'):
         transformers.integrations.mxfp4.convert_moe_packed_tensors_cpu = convert_moe_packed_tensors_cpu
         if UNSLOTH_ENABLE_LOGGING:

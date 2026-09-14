@@ -22,12 +22,8 @@ __all__ = [
 
 def stateless_init_process_group(master_address, master_port, rank, world_size,
                                  device):
-    """
-    vLLM provides `StatelessProcessGroup` to create a process group
-    without considering the global process group in torch.distributed.
-    It is recommended to create `StatelessProcessGroup`, and then initialize
-    the data-plane communication (NCCL) between external (train processes) 
-    and vLLM workers.
+    """Init NCCL data-plane comms between train processes and vLLM workers via
+    vLLM's `StatelessProcessGroup` (avoids the global torch.distributed group).
     """
     from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.utils import StatelessProcessGroup
@@ -40,13 +36,10 @@ def stateless_init_process_group(master_address, master_port, rank, world_size,
 
 
 class WorkerExtension:
-    """
-    The class for vLLM's worker to inherit from.
-    By defining an extension class, the code can work no matter what is
-    the underlying worker class. This way, the code can be compatible
-    with both vLLM V0 and V1.
-    NOTE: we define this class in a separate module, and the main module
-    should pass the full qualified name as `worker_extension_cls` argument.
+    """Mixin for vLLM's worker (compatible with V0 and V1).
+
+    Lives in a separate module; pass its fully qualified name as the
+    `worker_extension_cls` argument.
     """
 
     def init_weight_update_group(self, master_address, master_port,
@@ -72,9 +65,7 @@ class WorkerExtension:
         del weight
 
     def check_weights_changed(self):
-        """
-        Check if the weights are updated to 0.
-        """
+        """Check if the weights are updated to 0."""
         weights_updated = True
         for name, p in self.model_runner.model.named_parameters():
             weights_updated = weights_updated and torch.allclose(
@@ -83,13 +74,10 @@ class WorkerExtension:
 
 
 class ColocateWorkerExtension:
-    """
-    The class for vLLM's worker to inherit from, in the colocate setting.
-    By defining an extension class, the code can work no matter what is
-    the underlying worker class. This way, the code can be compatible
-    with both vLLM V0 and V1.
-    NOTE: we define this class in a separate module, and the main module
-    should pass the full qualified name as `worker_extension_cls` argument.
+    """Mixin for vLLM's worker in the colocate setting (compatible with V0 and V1).
+
+    Lives in a separate module; pass its fully qualified name as the
+    `worker_extension_cls` argument.
     """
 
     def report_device_id(self) -> str:
@@ -104,8 +92,8 @@ class ColocateWorkerExtension:
         for name, handle in handles.items():
             func, args = handle
             list_args = list(args)
-            # the key is to change device id to the current device id
-            # in case two processes have different CUDA_VISIBLE_DEVICES
+            # Remap to the current device id in case two processes have
+            # different CUDA_VISIBLE_DEVICES.
             list_args[6] = device_id
             tensor = func(*list_args)
             weights.append((name, tensor))
@@ -128,9 +116,7 @@ class ColocateWorkerExtension:
         return vllm_loras_A
 
     def check_weights_changed(self):
-        """
-        Check if the weights are updated to 0.
-        """
+        """Check if the weights are updated to 0."""
         weights_updated = True
         for name, p in self.model_runner.model.named_parameters():
             weights_updated = weights_updated and torch.allclose(
@@ -142,9 +128,7 @@ class ColocateWorkerExtension:
         data = {}
         vllm_model = self.model_runner.model
         for name, p in vllm_model.named_parameters():
-            # the training actor might only have a subset of the weights
-            # and need to all-gather the weights from all the actors.
-            # for demonstration, here we assume all training actors have
-            # the full weights.
+            # Assumes all training actors hold the full weights (a real setup
+            # may hold a subset and need to all-gather across actors).
             data[name] = reduce_tensor(p.detach())
         return {self.device_uuid: data}

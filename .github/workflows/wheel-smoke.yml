@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Build PyPI wheel + sdist, verify content sanity, import-smoke in a clean venv.
+# Adapted from unsloth's wheel-smoke.yml; zoo's content checks: package present,
+# no tests/ shipped, no stray .pyc, real version string, import smoke succeeds.
+
+name: Wheel CI
+
+on:
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'unsloth_zoo/**'
+      - 'tests/**'
+      - '.github/workflows/wheel-smoke.yml'
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Latest-only on branches, never on main. Pushes to main land in bursts, so
+  # cancelling superseded runs there throws away the run that would have
+  # reported a regression, and the run that writes the shared caches.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: Wheel build + content sanity + import smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Build wheel + sdist
+        run: |
+          python -m pip install --upgrade pip build
+          rm -rf dist build ./*.egg-info
+          python -m build
+
+      - name: Wheel content sanity
+        run: |
+          python - <<'PY'
+          import zipfile, glob, sys, re
+          wheels = glob.glob("dist/unsloth_zoo-*.whl")
+          if not wheels:
+              print("FAIL: no wheel produced"); sys.exit(2)
+          w = wheels[0]
+          print(f"wheel: {w}")
+          # Version sanity: dynamic metadata pulls from unsloth_zoo.__init__.__version__.
+          m = re.match(r"dist/unsloth_zoo-([^-]+)-py3-none-any\.whl", w)
+          version = m.group(1) if m else None
+          print(f"wheel version: {version}")
+          with zipfile.ZipFile(w) as z:
+              n = z.namelist()
+              # Anything outside these two is a stray tree the wheel must not carry.
+              tops = sorted({s.split("/")[0] for s in n if "/" in s})
+              strays = [t for t in tops if t not in ("unsloth_zoo", f"unsloth_zoo-{version}.dist-info")]
+              # Hard checks: must hold for any zoo release wheel.
+              hard_checks = {
+                "unsloth_zoo/__init__.py shipped":      any(s == "unsloth_zoo/__init__.py" for s in n),
+                "unsloth_zoo/rl_replacements.py shipped": any(s == "unsloth_zoo/rl_replacements.py" for s in n),
+                "unsloth_zoo/temporary_patches/__init__.py shipped": any(s == "unsloth_zoo/temporary_patches/__init__.py" for s in n),
+                "no .pyc files":                        not any(s.endswith(".pyc") for s in n),
+                "no .git tree":                         not any(s.startswith(".git/") for s in n),
+                "version is not 0.0.0":                 version is not None and version != "0.0.0",
+                "METADATA present":                     any(s.endswith(".dist-info/METADATA") for s in n),
+                # Hard since the packaging config excludes them. A top-level tests/
+                # or scripts/ in site-packages is shared with every other wheel
+                # using that name, so the last install wins and any uninstall
+                # deletes the survivor's files.
+                "no tests/ shipped":                    not any(s.startswith("tests/") for s in n),
+                "no scripts/ shipped":                  not any(s.startswith("scripts/") for s in n),
+                "no other top-level trees":             not strays,
+              }
+              print(f"top-level: {tops}")
+              if strays:
+                  print(f"strays: {strays}")
+              print("Hard checks:")
+              for k, v in hard_checks.items():
+                  print(f"  [{'PASS' if v else 'FAIL'}] {k}")
+              sys.exit(0 if all(hard_checks.values()) else 1)
+          PY
+
+      - name: Import smoke (clean venv)
+        # unsloth_zoo/__init__.py raises ImportError when parent `unsloth` is
+        # absent (deliberate guardrail). A bare `import unsloth_zoo` in a wheel-only
+        # venv will fail by design, so the smoke pivots to reading the version
+        # string from dist-info METADATA via importlib.metadata.
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --upgrade pip
+          /tmp/v/bin/pip install dist/unsloth_zoo-*.whl
+          # Read version from dist-info METADATA via importlib.metadata.
+          WHEEL_VERSION=$(/tmp/v/bin/python -c "
+          from importlib.metadata import version
+          print(version('unsloth_zoo'))
+          ")
+          echo "installed unsloth_zoo version: $WHEEL_VERSION"
+          test -n "$WHEEL_VERSION" && test "$WHEEL_VERSION" != "0.0.0"
+
+      - name: Upload wheel on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: unsloth-zoo-wheel
+          path: dist/
+          retention-days: 7

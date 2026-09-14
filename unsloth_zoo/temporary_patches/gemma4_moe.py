@@ -17,20 +17,67 @@
 import os
 import torch
 import torch.nn as nn
-from .common import TEMPORARY_PATCHES
+from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
 from .utils import patch_function, process_return, raise_error, logger
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    extract_moe_lora_weights_for_grouped_mm,
 )
+# Reuse the Qwen-MoE standard-layout LoRA extractor: Gemma4TextExperts shares
+# the (E, out, in) layout and attribute names, and per_expert_scale is folded
+# into top_k_weights upstream by Gemma4TextRouter.forward, so no Gemma-4
+# specific scale handling is needed inside the extractor.
+from .qwen3_moe import _make_qwen_moe_lora_extractor
+
+
+def _register_gemma4_lora_extractor(experts_cls):
+    """Attach _unsloth_lora_extractor_fn to a Gemma-4 experts class.
+
+    Idempotent and safe if experts_cls is None. Without it,
+    _extract_lora_from_wrapper falls through to the default canonical-permutation
+    branch, which on PEFT 0.19+ swapped layouts yields mismatched contraction
+    dims for torch._grouped_mm (RuntimeError: contraction dimension of mat_a
+    and mat_b must match) on the first step. The Qwen extractor handles both
+    PEFT 0.18 and 0.19 cleanly.
+    """
+    if experts_cls is None:
+        return False
+    if getattr(experts_cls, "_unsloth_lora_extractor_registered", False):
+        return True
+    try:
+        extractor = _make_qwen_moe_lora_extractor()
+        experts_cls._unsloth_lora_extractor_fn = staticmethod(extractor)
+        experts_cls._unsloth_model_type = "gemma4_moe"
+        experts_cls._unsloth_lora_extractor_registered = True
+        return True
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(
+                f"Unsloth: Could not register Gemma-4 MoE LoRA extractor on "
+                f"{getattr(experts_cls, '__name__', experts_cls)}: {e}"
+            )
+        return False
+
+
+def _gemma4_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+    return extract_moe_lora_weights_for_grouped_mm(
+        wrapper,
+        weight_A,
+        weight_B,
+        scaling,
+        num_experts,
+        model_name="Gemma4 MoE",
+        enable_logging=UNSLOTH_ENABLE_LOGGING,
+        logger_obj=logger,
+    )
 
 
 def patch_gemma4_grpo_hidden_states():
     """Patch Gemma4ForConditionalGeneration.forward for GRPO hidden states.
 
-    Independent from any MoE layout changes so that a MoE-patching failure
-    (e.g. when Transformers renames expert classes across versions) does not
-    silently disable the GRPO memory optimization.
+    Independent of MoE layout changes so a MoE-patching failure (e.g. renamed
+    expert classes) doesn't silently disable the GRPO memory optimization.
     """
     try:
         from transformers.models.gemma4.modeling_gemma4 import (
@@ -122,11 +169,8 @@ def patch_gemma4_grpo_hidden_states():
         )
 
         sliced_hidden_states = outputs.last_hidden_state
-        # Match the qwen3_moe.py idiom: only slice when the caller explicitly
-        # asked for a suffix. With logits_to_keep=0, slice(-0, None) is
-        # slice(0, None) which is a no-op; guarding avoids the accidental
-        # dependency on Python's -0 == 0 and avoids misbehavior if a caller
-        # ever passes a negative int.
+        # Only slice when a suffix is requested. logits_to_keep=0 would make
+        # slice(-0, None) a no-op anyway; guarding avoids relying on -0 == 0.
         if logits_to_keep != 0:
             slice_indices = (
                 slice(-logits_to_keep, None)
@@ -171,19 +215,24 @@ def _patch_gemma4_moe_current():
         return False
 
     if getattr(Gemma4TextExperts, "_unsloth_already_patched", False):
+        # Re-register the extractor even if forward is patched, guarding
+        # against an older unsloth-zoo that patched forward without it.
+        _register_gemma4_lora_extractor(Gemma4TextExperts)
         return True
 
     _moe_backend = get_forward_moe_backend()
 
     def _gemma4_experts_forward(self, hidden_states, top_k_index, top_k_weights):
-        # Current Transformers Gemma4 already folds per_expert_scale into
-        # top_k_weights inside Gemma4TextRouter.forward, so we can just
-        # dispatch to the generic grouped-GEMM backend.
+        # Gemma4TextRouter.forward already folds per_expert_scale into
+        # top_k_weights, so dispatch straight to the grouped-GEMM backend.
         return _moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     ok = patch_function(Gemma4TextExperts, "forward", _gemma4_experts_forward, force=True)
     if ok:
+        Gemma4TextExperts._unsloth_lora_extractor_fn = staticmethod(_gemma4_moe_lora_extractor)
         Gemma4TextExperts._unsloth_already_patched = True
+        # Register the standard-layout extractor for correct grouped-mm dims.
+        _register_gemma4_lora_extractor(Gemma4TextExperts)
     return ok
 
 
@@ -198,6 +247,7 @@ def _patch_gemma4_moe_legacy():
         return False
 
     if getattr(Gemma4TextMoEBlock, "_unsloth_already_patched", False):
+        _register_gemma4_lora_extractor(Gemma4TextMoEBlock)
         return True
 
     # Remap decoder layer module names to match checkpoint key layout:
@@ -243,19 +293,20 @@ def _patch_gemma4_moe_legacy():
     if not forward_ok:
         return False
 
+    Gemma4TextMoEBlock._unsloth_lora_extractor_fn = staticmethod(_gemma4_moe_lora_extractor)
     Gemma4TextMoEBlock._unsloth_already_patched = True
+    # Legacy block shares the (E, out, in) layout; use the same extractor.
+    _register_gemma4_lora_extractor(Gemma4TextMoEBlock)
     return True
 
 
 def patch_gemma4_moe():
-    """Patch Gemma4 MoE to support Split LoRA using grouped GEMM.
+    """Patch Gemma4 MoE for Split LoRA via grouped GEMM.
 
     Tries the current Transformers >= 5 layout (Gemma4TextExperts +
     Gemma4TextRouter) first, then falls back to the legacy Gemma4TextMoEBlock
-    layout. Each path returns a boolean so that a missing-class or signature
-    mismatch is surfaced via logging rather than silently disabling the patch
-    (and the GRPO hidden-states patch which previously lived in the same
-    function).
+    layout. Each path returns a boolean so a missing-class / signature mismatch
+    is surfaced via logging rather than silently disabling the patch.
     """
     patch_param_wrapper_for_moe()
 
@@ -277,11 +328,10 @@ def patch_gemma4_moe():
         )
         return
 
-    # Neither layout matched. Warn loudly via logger.warning_once so the
-    # message is visible without UNSLOTH_ENABLE_LOGGING and doesn't spam on
-    # repeated invocations. Note: this affects split-LoRA grouped-GEMM only.
-    # The GRPO hidden-states patch is a separate TEMPORARY_PATCHES entry and
-    # may still be active (checked below so the user knows the real state).
+    # Neither layout matched. warning_once is visible without
+    # UNSLOTH_ENABLE_LOGGING and doesn't spam. This affects split-LoRA
+    # grouped-GEMM only; the GRPO hidden-states patch is separate and may
+    # still be active (checked below so the user knows the real state).
     grpo_active = False
     try:
         from transformers.models.gemma4.modeling_gemma4 import (

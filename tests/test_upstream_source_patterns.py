@@ -1,0 +1,1711 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+
+"""Drift detectors for ``unsloth_zoo`` source-string / regex rewriters.
+
+Patches in ``unsloth_zoo/compiler.py`` and ``temporary_patches/*.py`` rewrite
+upstream source via ``inspect.getsource`` + ``str.replace`` / ``re.sub`` on
+literal strings; if upstream reflows the target, the rewriter silently no-ops.
+Each test pins the zoo file:line and fails with a "DRIFT DETECTED" message when
+its pinned pattern is gone.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import re
+import textwrap
+
+import pytest
+
+try:
+    import transformers as _transformers
+    from packaging.version import Version as _Version
+    _TX_VERSION = getattr(_transformers, "__version__", "0.0.0")
+    _TX_IS_5X = _Version(_TX_VERSION) >= _Version("5.0.0")
+except Exception:
+    _TX_VERSION = "unknown"
+    _TX_IS_5X = False
+
+
+def _skip_if_transformers_5x(reason: str) -> None:
+    """Skip when transformers 5.x removed the literal string the
+    rewriter probe anchors on. The companion zoo rewriter uses
+    ``str.replace`` / ``re.sub`` / hasattr -- all silently no-op when
+    the anchor is absent (see compiler.py inline comments at lines 362,
+    2535, 4246). Keep the drift detector active on 4.57.6."""
+    if _TX_IS_5X:
+        pytest.skip(
+            f"transformers {_TX_VERSION}: {reason} (zoo rewriter silently "
+            "no-ops -- str.replace / re.sub return source unchanged)"
+        )
+
+
+def _zoo_site(symbol: str) -> str:
+    """``unsloth_zoo/compiler.py:LINE (symbol)``, resolved now rather than typed
+    in. The hand-written pins in this file have gone stale twice -- the three
+    cross_entropy finders were still cited at :1508 / :1599 / :1683 long after
+    they moved past :2500 -- and a drift report that names the wrong line sends
+    the next reader to unrelated code."""
+    import pathlib
+
+    import unsloth_zoo.compiler as _compiler
+
+    path = pathlib.Path(_compiler.__file__)
+    for number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if line.startswith(f"{symbol} = "):
+            return f"unsloth_zoo/compiler.py:{number} ({symbol})"
+    return f"unsloth_zoo/compiler.py ({symbol}, definition not found)"
+
+
+def _drift(zoo_site: str, pattern: str, upstream_path: str,
+           extra: str = "") -> None:
+    msg = (
+        f"DRIFT DETECTED: zoo source-rewriter at {zoo_site} expects "
+        f"{pattern!r} in {upstream_path}, not found."
+    )
+    if extra:
+        msg += " " + extra
+    pytest.fail(msg)
+
+
+def _assert_in_source(needle: str, source: str, zoo_site: str,
+                      upstream_path: str) -> None:
+    if needle not in source:
+        _drift(zoo_site, needle, upstream_path)
+
+
+def _assert_regex_in_source(regex: str, source: str, zoo_site: str,
+                            upstream_path: str,
+                            flags: int = 0) -> None:
+    if re.search(regex, source, flags=flags) is None:
+        _drift(zoo_site, regex, upstream_path)
+
+
+def _get_source_of(dotted: str):
+    """Import dotted parent module and return ``inspect.getsource`` on
+    the leaf. Missing leaf/parent -> ``importorskip`` (not drift)."""
+    parts = dotted.split(".")
+    import importlib
+    obj = None
+    mod_name = None
+    for i in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:i])
+        try:
+            obj = importlib.import_module(candidate)
+            mod_name = candidate
+            consumed = i
+            break
+        except ImportError:
+            continue
+    if obj is None:
+        pytest.importorskip(parts[0])
+        return None  # pragma: no cover
+    for attr in parts[consumed:]:
+        try:
+            obj = getattr(obj, attr)
+        except AttributeError:
+            pytest.skip(
+                f"upstream attribute {dotted!r} missing in this "
+                f"transformers build (last good prefix: {mod_name})"
+            )
+    return inspect.getsource(obj)
+
+
+def test_compiler_gqa_enable_gqa_dropout_pinned_string_self_dropout():
+    """``unsloth_zoo/compiler.py:304-307`` pins
+    ``"dropout_p=self.dropout if self.training else 0.0,"`` -- the
+    rewriter inserts ``enable_gqa=...`` after this substring.
+
+    Known active drift on transformers >=4.50: upstream switched to
+    ``dropout=self.attention_dropout if self.training else 0.0,``
+    (no ``_p`` suffix). Pass if any old-or-new form is present
+    anywhere; fail only if the idiom is entirely gone."""
+    pytest.importorskip("transformers")
+    candidate_modules = [
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.qwen3.modeling_qwen3",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
+        "transformers.models.gemma3.modeling_gemma3",
+    ]
+    import importlib
+    needles = (
+        "dropout_p=self.dropout if self.training else 0.0,",
+        "dropout_p=self.attention_dropout if self.training else 0.0,",
+        "dropout=self.attention_dropout if self.training else 0.0,",
+        "dropout=0.0 if not self.training else self.attention_dropout",
+    )
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        for needle in needles:
+            if needle in src:
+                return
+    _drift(
+        "unsloth_zoo/compiler.py:304-311",
+        "any of dropout_p=... / dropout=... if self.training else 0.0",
+        "any of " + ", ".join(candidate_modules),
+        "Upstream re-architected the SDPA call site; zoo's str.replace "
+        "for enable_gqa= cannot find a target anywhere.",
+    )
+
+
+def test_compiler_replace_gqa_finder_regex():
+    """``unsloth_zoo/compiler.py:262-282`` -- the
+    ``grouped_query_attention_finder`` regex targets ``key_states =
+    repeat_kv(...) / value_states = repeat_kv(...) / ... contiguous()``.
+    transformers >=4.50 inlined repeat_kv into eager_attention_forward,
+    so the finder may match 0 times -> rewrite dormant."""
+    pytest.importorskip("transformers")
+    import importlib
+    head = re.compile(r"key_states\s*=\s*repeat_kv\(")
+    candidate_modules = [
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.qwen3.modeling_qwen3",
+        "transformers.models.qwen2_vl.modeling_qwen2_vl",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
+        "transformers.models.gemma3.modeling_gemma3",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if head.search(src):
+            return
+    _drift(
+        "unsloth_zoo/compiler.py:262-282",
+        r"key_states = repeat_kv(...)",
+        "any of " + ", ".join(candidate_modules),
+        "If 4.50+ inlined repeat_kv into eager_attention_forward, "
+        "the GQA finder regex matches 0 times everywhere and the "
+        "GQA rewrite is invisible.",
+    )
+
+
+def test_compiler_output_attentions_super_forward_regex_targetable():
+    """``unsloth_zoo/compiler.py:316-321`` runs re.sub for
+    ``if output_attentions: ... return super().forward(...)``. 4.57
+    removed the immediate ``return super().forward`` follow-up; pass if
+    ``if output_attentions`` marker is still discoverable so a
+    maintainer can re-anchor."""
+    _skip_if_transformers_5x(
+        "`if output_attentions` branching removed -- transformers 5.x "
+        "routes through attention_interface() instead. compiler.py:362 "
+        "explicitly documents that the rewriter no-ops when neither "
+        "shape matches"
+    )
+    pytest.importorskip("transformers")
+    import importlib
+    marker = "if output_attentions"
+    candidate_modules = [
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.qwen3.modeling_qwen3",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
+        "transformers.models.gemma3.modeling_gemma3",
+        "transformers.models.qwen2_vl.modeling_qwen2_vl",
+        "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if marker in src:
+            return
+    _drift(
+        "unsloth_zoo/compiler.py:316-321",
+        marker,
+        "any of " + ", ".join(candidate_modules),
+        "Modern transformers removed the `output_attentions` "
+        "branching entirely; zoo's `if output_attentions: ... return "
+        "super().forward(...)` rewriter regex has no anchor.",
+    )
+
+
+def test_compiler_self_config_ignore_index_replacement():
+    """``unsloth_zoo/compiler.py:1379`` runs
+    ``source.replace("self.config.ignore_index", "-100")``. By 4.57
+    only qwen2_audio still references it; pass if any upstream model
+    still has the exact string."""
+    pytest.importorskip("transformers")
+    import importlib
+    candidate_modules = [
+        "transformers.models.gemma3.modeling_gemma3",
+        "transformers.models.llava.modeling_llava",
+        "transformers.models.paligemma.modeling_paligemma",
+        "transformers.models.llava_next.modeling_llava_next",
+        "transformers.models.qwen2_audio.modeling_qwen2_audio",
+        "transformers.models.idefics3.modeling_idefics3",
+        "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
+        "transformers.models.qwen2_vl.modeling_qwen2_vl",
+        "transformers.models.mllama.modeling_mllama",
+    ]
+    found = False
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if "self.config.ignore_index" in src:
+            found = True
+            break
+    if not found:
+        _drift(
+            "unsloth_zoo/compiler.py:1379",
+            "self.config.ignore_index",
+            "any of " + ", ".join(candidate_modules),
+            "If upstream renamed the attribute, the `-100` patch is a "
+            "no-op and ignore_index reverts to the model default.",
+        )
+
+
+def test_compiler_per_layer_projection_inplace_regex():
+    """``unsloth_zoo/compiler.py:1404-1407`` rewrites Gemma 3N's
+    ``per_layer_projection *= self.per_layer_projection_scale.to(...)``
+    to a non-inplace form."""
+    pytest.importorskip("transformers")
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n as g3n
+    except ImportError:
+        pytest.skip("transformers.models.gemma3n not shipped in this build")
+    src = inspect.getsource(g3n)
+    pattern = re.compile(
+        r"(per_layer_projection) \*= (self\.per_layer_projection_scale\.to\()"
+    )
+    if not pattern.search(src):
+        _drift(
+            "unsloth_zoo/compiler.py:1404-1407",
+            r"per_layer_projection *= self.per_layer_projection_scale.to(",
+            "transformers.models.gemma3n.modeling_gemma3n",
+        )
+
+
+def test_compiler_cross_entropy_lm_head_pattern_present():
+    """``unsloth_zoo/compiler.py:1508-1525`` (cross_entropy_find_1)
+    expects ``logits = self.lm_head(hidden_states`` at the head of the
+    loss block in every ForCausalLM forward.
+
+    Read on-disk modeling source: the fused-forward installer rewrites
+    ``cls.forward`` at import time, but the upstream pattern compiler.py
+    pins still lives in the source file."""
+    pytest.importorskip("transformers")
+    import importlib
+    import pathlib
+    candidate_classes = [
+        "transformers.models.llama.modeling_llama.LlamaForCausalLM",
+        "transformers.models.llama4.modeling_llama4.Llama4ForCausalLM",
+        "transformers.models.mistral.modeling_mistral.MistralForCausalLM",
+        "transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM",
+        "transformers.models.qwen3.modeling_qwen3.Qwen3ForCausalLM",
+    ]
+    needle = "logits = self.lm_head(hidden_states"
+    found = False
+    for dotted in candidate_classes:
+        mod_path, _, cls_name = dotted.rpartition(".")
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        src_file = getattr(mod, "__file__", None)
+        if not src_file:
+            continue
+        try:
+            src = pathlib.Path(src_file).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if needle in src:
+            found = True
+            break
+    if not found:
+        _drift(
+            _zoo_site("cross_entropy_find_1"),
+            needle,
+            "any ForCausalLM among " + ", ".join(candidate_classes),
+            "The fused linear cross-entropy rewriter pins this line; "
+            "if upstream switches to e.g. `logits = compute_logits(...)`, "
+            "the entire CE replacement no-ops.",
+        )
+
+
+def test_compiler_cross_entropy_find_2_loss_function_signature():
+    """``unsloth_zoo/compiler.py:1593-1600`` (cross_entropy_find_2) pins
+    ``loss = self.loss_function(...$LOGITS$, $LABELS$, $VOCABSIZE$...)``.
+
+    Read the modeling module's on-disk source directly. The fused-forward
+    installer (forward_install.py) replaces ``*ForCausalLM.forward`` at
+    import time, so ``inspect.getsource(cls.forward)`` would return the
+    rewritten body; the upstream pattern this test pins still lives on
+    disk untouched."""
+    pytest.importorskip("transformers")
+    import importlib
+    import pathlib
+    candidate_classes = [
+        "transformers.models.llama.modeling_llama.LlamaForCausalLM",
+        "transformers.models.mistral.modeling_mistral.MistralForCausalLM",
+        "transformers.models.qwen2.modeling_qwen2.Qwen2ForCausalLM",
+        "transformers.models.qwen3.modeling_qwen3.Qwen3ForCausalLM",
+        "transformers.models.llama4.modeling_llama4.Llama4ForCausalLM",
+    ]
+    needle = "self.loss_function("
+    for dotted in candidate_classes:
+        mod_path, _, cls_name = dotted.rpartition(".")
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        src_file = getattr(mod, "__file__", None)
+        if not src_file:
+            continue
+        try:
+            src = pathlib.Path(src_file).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if needle in src:
+            return
+    _drift(
+        _zoo_site("cross_entropy_find_2"),
+        "self.loss_function(...)",
+        "any ForCausalLM among " + ", ".join(candidate_classes),
+    )
+
+
+# The gemma3 VLM forward as transformers 4.57.6 wrote it, reduced to the block
+# cross_entropy_find_3 matches. Frozen on purpose: upstream moved gemma3 to
+# `self.loss_function` in 5.17, and without a fixture the shift-logits branch
+# would stop being exercised the moment no shipped model used it -- which is
+# exactly when a change to the pattern would go unnoticed.
+_LEGACY_VLM_SHIFT_FORWARD = '''
+def forward(self, input_ids = None, labels = None, **loss_kwargs):
+    outputs = self.model(input_ids = input_ids)
+    logits = outputs.logits
+    loss = None
+    if labels is not None:
+        logits = logits.float()
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+        if attention_mask is not None:
+            shift_attention_mask = attention_mask[:, -shift_logits.shape[1]:]
+            shift_logits = shift_logits[shift_attention_mask.to(logits.device) != 0].contiguous()
+            shift_labels = shift_labels[shift_attention_mask.to(shift_labels.device) != 0].contiguous()
+        else:
+            shift_logits = shift_logits.contiguous()
+            shift_labels = shift_labels.contiguous()
+        loss_fct = nn.CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+    return loss
+'''
+
+
+def test_compiler_cross_entropy_find_3_still_matches_its_own_shape():
+    """cross_entropy_find_3 pins ``shift_logits = logits[..., :-1, :]`` /
+    ``shift_labels = labels[..., 1:]`` in VLM ForConditionalGeneration forwards.
+
+    Against a frozen fixture, so this fails when the *pattern* breaks rather than
+    when upstream stops using the shape."""
+    apply_fused_lm_head = pytest.importorskip(
+        "unsloth_zoo.compiler"
+    ).apply_fused_lm_head
+    _, applied = apply_fused_lm_head(_LEGACY_VLM_SHIFT_FORWARD)
+    if not applied:
+        _drift(
+            _zoo_site("cross_entropy_find_3"),
+            "shift_logits = logits[..., :-1, :] / shift_labels = labels[..., 1:]",
+            "the frozen transformers 4.57.6 gemma3 VLM forward in this file",
+            "The pattern no longer matches the shape it was written for, so the "
+            "fused cross-entropy rewrite is a no-op for every VLM still using it.",
+        )
+
+
+def test_the_fused_cross_entropy_rewrite_still_reaches_gemma3():
+    """The contract that actually matters: whatever shape upstream's gemma3
+    forward has this week, one of the cross_entropy finders matches it.
+
+    Asserting a literal string instead is what broke here. transformers 5.17
+    replaced gemma3's hand-written shift with ``self.loss_function(...,
+    **lm_kwargs)`` -- a shape cross_entropy_find_2 was written for, except its
+    ``$KWARGS$`` only accepted ``loss_kwargs`` / ``kwargs``. A no-match is a
+    silent no-op (compiler.py returns the forward untouched), so the only symptom
+    was Gemma 3 quietly losing fused linear cross entropy."""
+    pytest.importorskip("transformers")
+    apply_fused_lm_head = pytest.importorskip(
+        "unsloth_zoo.compiler"
+    ).apply_fused_lm_head
+    try:
+        from transformers.models.gemma3.modeling_gemma3 import (
+            Gemma3ForConditionalGeneration,
+        )
+    except ImportError:
+        pytest.skip("Gemma3ForConditionalGeneration not in this build")
+    try:
+        src = inspect.getsource(Gemma3ForConditionalGeneration.forward)
+    except OSError:
+        pytest.skip("Gemma3ForConditionalGeneration.forward source unavailable")
+
+    new_source, applied = apply_fused_lm_head(src)
+    if not applied:
+        _drift(
+            _zoo_site("cross_entropy_find_2")
+            + " / "
+            + _zoo_site("cross_entropy_find_3"),
+            "any cross_entropy finder",
+            "transformers.models.gemma3.modeling_gemma3."
+            "Gemma3ForConditionalGeneration.forward",
+            f"transformers {_TX_VERSION} writes the loss in a shape no finder "
+            "matches, and a finder that does not match is a silent no-op: the "
+            "model trains, using the memory the fused path exists to save.",
+        )
+    assert new_source != src, "reported applied but returned the source unchanged"
+    # A rewrite that does not parse is worse than one that does not fire.
+    ast.parse(textwrap.dedent(new_source))
+
+
+_QWEN2_VL_NEEDLE_4X = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+# 4.53.1 - 4.53.3 pass attention_mask at the call site. compiler.py carries
+# its own entry for that spelling; leaving it out here failed the guard on a
+# supported version while the rewriter was working fine.
+_QWEN2_VL_NEEDLE_4X_ATTENTION_MASK = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                attention_mask=attention_mask,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+_QWEN2_VL_NEEDLE_5X = (
+    "hidden_states = blk(\n"
+    "                hidden_states,\n"
+    "                cu_seqlens=cu_seqlens,\n"
+    "                max_seqlen=max_seqlen,\n"
+    "                position_embeddings=position_embeddings,\n"
+    "                **kwargs,\n"
+    "            )"
+)
+
+_QWEN2_VL_SIG_ROTARY = [
+    "self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+    "position_embeddings", "kwargs",
+]
+_QWEN2_VL_SIG_ROTARY_ATTENTION_MASK = [
+    "self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+    "position_embeddings", "attention_mask", "kwargs",
+]
+_QWEN2_VL_SIG_NO_ROTARY = [
+    "self", "hidden_states", "cu_seqlens", "position_embeddings", "kwargs",
+]
+
+# (label, call-site spelling, block signature) triples the rewriter handles.
+# The call spelling ALONE does not determine the rewrite: transformers
+# 4.53.0 / 4.54 - 5.9 and 5.10 - 5.14 write the call identically and need
+# different treatment, because 5.10 dropped rotary_pos_emb from the block.
+_QWEN2_VL_VARIANTS = (
+    ("4.53.0 / 4.54 - 5.9  (rotary re-injected)",
+     _QWEN2_VL_NEEDLE_4X, _QWEN2_VL_SIG_ROTARY),
+    ("4.53.1 - 4.53.3  (rotary re-injected, attention_mask at the call site)",
+     _QWEN2_VL_NEEDLE_4X_ATTENTION_MASK, _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK),
+    ("5.10 - 5.14  (no entry fires; the arg=arg demotion already fits)",
+     _QWEN2_VL_NEEDLE_4X, _QWEN2_VL_SIG_NO_ROTARY),
+    ("5.15+  (max_seqlen bound into the checkpointed callable)",
+     _QWEN2_VL_NEEDLE_5X, _QWEN2_VL_SIG_NO_ROTARY),
+)
+
+
+def test_compiler_custom_gradient_checkpointing_qwen2_vl_blk():
+    """``unsloth_zoo/compiler.py:2779-2848`` pins the Qwen2-VL multiline
+    raw strings ``hidden_states = blk(\\n hidden_states,\\n
+    cu_seqlens=cu_seqlens,\\n [max_seqlen=max_seqlen,\\n]
+    position_embeddings=position_embeddings,\\n **kwargs,\\n )``.
+    A re-indent silently no-ops.
+
+    transformers 4.x and 5.x spell the call differently: 5.x added
+    ``max_seqlen=max_seqlen`` (cu_seqlens/max_seqlen moved into
+    ``get_vision_attention_seqlens``) and dropped ``rotary_pos_emb`` from
+    ``Qwen2VLVisionBlock.forward``. The rewriter carries one entry per
+    spelling; pass if either is still present, fail if neither is.
+
+    The 5.x replacement drops ``max_seqlen`` (see
+    ``test_..._max_seqlen_is_recomputed`` below for why that is lossless)."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VisionTransformerPretrainedModel,
+        )
+    except ImportError:
+        pytest.skip("Qwen2VisionTransformerPretrainedModel not in this build")
+    src = inspect.getsource(Qwen2VisionTransformerPretrainedModel.forward)
+    needle_4x = _QWEN2_VL_NEEDLE_4X
+    needle_4x_attention_mask = _QWEN2_VL_NEEDLE_4X_ATTENTION_MASK
+    needle_5x = _QWEN2_VL_NEEDLE_5X
+    # 4.51.3 - 4.52.x spell the whole call on one line, and the same forward
+    # already calls ``self._gradient_checkpointing_func`` itself. That is the
+    # first thing patch_gradient_checkpointing() tests
+    # (``if "_gradient_checkpointing_func" in forward: return None``), so on
+    # those versions it returns None before the replacement list, before the
+    # ``for blk in ...`` regex and before the generic ``arg=arg`` demotion -
+    # nothing is rewritten and there is no pinned string that could have
+    # drifted. Skip on the early-return condition itself rather than on the
+    # one-line spelling, so this stays tied to the code path and not to a
+    # guess about how upstream formats the call.
+    if "_gradient_checkpointing_func" in src:
+        pytest.skip(
+            "upstream forward already implements gradient checkpointing "
+            "(transformers <= 4.52); patch_gradient_checkpointing() returns "
+            "None before touching this call site"
+        )
+    if not any(n in src for n in (needle_4x, needle_4x_attention_mask, needle_5x)):
+        _drift(
+            "unsloth_zoo/compiler.py:2779-2848 "
+            "(custom_gradient_checkpointing_replacements)",
+            " OR ".join((needle_4x, needle_4x_attention_mask, needle_5x)),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl."
+            "Qwen2VisionTransformerPretrainedModel.forward",
+        )
+
+
+def test_compiler_custom_gradient_checkpointing_qwen2_vl_block_signature():
+    """The rewriter in ``unsloth_zoo/compiler.py:2779-2848`` demotes every
+    ``arg=arg`` keyword to a positional, so the rewritten ``blk(...)`` call
+    only works if ``Qwen2VLVisionBlock.forward`` still takes
+    ``(hidden_states, cu_seqlens, [rotary_pos_emb,] position_embeddings)``
+    in that order. A reorder / rename binds arguments to the wrong
+    parameters instead of no-op'ing, so guard it separately from the
+    call-site string.
+
+    Names and order alone are not enough. Upstream can make
+    ``position_embeddings`` keyword-only without touching either: the name
+    list and its order are unchanged, so a name-only allowlist still passes
+    while the rewritten call keeps passing the tensor positionally and the
+    block raises ``TypeError``. So check ``Parameter.kind`` too - every named
+    parameter has to stay bindable positionally and ``kwargs`` has to stay a
+    real ``**kwargs``. Positional-only is accepted alongside
+    positional-or-keyword because the rewritten call site passes everything
+    positionally; only kinds that cannot take a positional argument
+    (keyword-only, ``*args``) break it."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VLVisionBlock,
+        )
+    except ImportError:
+        pytest.skip("Qwen2VLVisionBlock not in this build")
+    parameters = inspect.signature(Qwen2VLVisionBlock.forward).parameters
+    params = list(parameters)
+    accepted = (
+        # transformers 4.51.3 - 4.52.x -- no **kwargs on the block yet
+        ["self", "hidden_states", "cu_seqlens", "rotary_pos_emb",
+         "position_embeddings"],
+        # transformers 4.53.0 / 4.54 - 4.57 / 5.0 - 5.9
+        _QWEN2_VL_SIG_ROTARY,
+        # transformers 4.53.1 - 4.53.3 -- attention_mask added as the fifth
+        # positional parameter (and passed by the call site); this is the
+        # variant the 4.x + attention_mask replacement entry in compiler.py
+        # targets. Gone again by 4.54.
+        _QWEN2_VL_SIG_ROTARY_ATTENTION_MASK,
+        # transformers 5.10+ -- rotary_pos_emb dropped; from 5.15 max_seqlen
+        # rides in kwargs
+        _QWEN2_VL_SIG_NO_ROTARY,
+    )
+    if params not in accepted:
+        _drift(
+            "unsloth_zoo/compiler.py:2779-2848 "
+            "(custom_gradient_checkpointing_replacements)",
+            " OR ".join(str(a) for a in accepted),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl."
+            f"Qwen2VLVisionBlock.forward signature (got {params})",
+        )
+    positional_kinds = (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    )
+    for name, parameter in parameters.items():
+        expected = (
+            (inspect.Parameter.VAR_KEYWORD,) if name == "kwargs"
+            else positional_kinds
+        )
+        if parameter.kind not in expected:
+            _drift(
+                "unsloth_zoo/compiler.py:2779-2848 "
+                "(custom_gradient_checkpointing_replacements)",
+                f"{name} as " + " OR ".join(str(k) for k in expected),
+                "transformers.models.qwen2_vl.modeling_qwen2_vl."
+                f"Qwen2VLVisionBlock.forward signature (got {name} as "
+                f"{parameter.kind})",
+            )
+
+
+def test_compiler_qwen2_vl_call_site_and_block_signature_are_a_known_pair():
+    """The two guards above accept any known call spelling and any known block
+    signature INDEPENDENTLY, and that is not enough.
+
+    transformers 5.10.0 - 5.14.1 shipped the 4.x call spelling together with the
+    5.x no-rotary block signature. Both guards above pass on those releases,
+    while the rewriter re-injected ``rotary_pos_emb`` and the rewritten forward
+    died with ``TypeError: Qwen2VLVisionBlock.forward() takes from 3 to 4
+    positional arguments but 5 were given``. Only the PAIR is diagnostic, so
+    pin the pair."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+            Qwen2VisionTransformerPretrainedModel,
+            Qwen2VLVisionBlock,
+        )
+    except ImportError:
+        pytest.skip("Qwen2-VL vision classes not in this build")
+    src = inspect.getsource(Qwen2VisionTransformerPretrainedModel.forward)
+    if "_gradient_checkpointing_func" in src:
+        pytest.skip(
+            "upstream forward already implements gradient checkpointing "
+            "(transformers <= 4.52); patch_gradient_checkpointing() returns "
+            "None before touching this call site"
+        )
+    params = list(inspect.signature(Qwen2VLVisionBlock.forward).parameters)
+    matched = [
+        label for label, needle, signature in _QWEN2_VL_VARIANTS
+        if needle in src and params == signature
+    ]
+    if not matched:
+        present = [
+            label for label, needle, _sig in _QWEN2_VL_VARIANTS if needle in src
+        ] or ["<no known call spelling>"]
+        _drift(
+            "unsloth_zoo/compiler.py "
+            "(custom_gradient_checkpointing_replacements, call site paired "
+            "with Qwen2VLVisionBlock.forward)",
+            " OR ".join(label for label, _n, _s in _QWEN2_VL_VARIANTS),
+            "transformers.models.qwen2_vl.modeling_qwen2_vl: call site matches "
+            f"{present} but the block signature is {params}",
+        )
+
+
+def test_qwen2_vl_variant_table_is_the_pairing_the_rewriter_implements():
+    """Documents which pairs are supported, so the table above cannot silently
+    grow back into an "any call spelling with any signature" allowlist."""
+    pairs = {(needle, tuple(sig)) for _label, needle, sig in _QWEN2_VL_VARIANTS}
+    # 5.10 - 5.14: 4.x spelling, no rotary in the block. Supported because
+    # compiler.py now skips the rotary re-injection when the block dropped it.
+    assert (_QWEN2_VL_NEEDLE_4X, tuple(_QWEN2_VL_SIG_NO_ROTARY)) in pairs
+    # Never shipped and never handled: max_seqlen at the call site while the
+    # block still takes rotary_pos_emb. The 5.x entry removes max_seqlen and
+    # nothing re-adds rotary_pos_emb, so the block would lose a positional.
+    assert (_QWEN2_VL_NEEDLE_5X, tuple(_QWEN2_VL_SIG_ROTARY)) not in pairs
+
+
+_UNSET = object()
+
+_QWEN2_VL_MAX_SEQLEN_ZOO_SITE = (
+    "unsloth_zoo/compiler.py "
+    "(custom_gradient_checkpointing_replacements, 5.x entry)"
+)
+_QWEN2_VL_ATTN_PATH = (
+    "transformers.models.qwen2_vl.modeling_qwen2_vl.VisionAttention.forward"
+)
+
+
+def _qwen2_vl_max_seqlen_recompute_call(forward_src: str):
+    """Return the ``ast.Call`` for the ``max_seqlen = get_max_seqlen(...)``
+    recompute inside ``VisionAttention.forward``, or ``None``."""
+    tree = ast.parse(textwrap.dedent(forward_src))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (len(node.targets) == 1 and
+                isinstance(node.targets[0], ast.Name) and
+                node.targets[0].id == "max_seqlen"):
+            continue
+        call = node.value
+        if (isinstance(call, ast.Call) and
+                isinstance(call.func, ast.Name) and
+                call.func.id == "get_max_seqlen"):
+            return call
+    return None
+
+
+def _qwen2_vl_run_vision_attention(attn, hidden_states, cu_seqlens,
+                                   position_embeddings,
+                                   max_seqlen = _UNSET):
+    """Execute the real ``VisionAttention.forward`` on CPU and report the
+    packed-sequence lengths it handed to the attention backend.
+
+    The backend is swapped for a recorder by rebinding
+    ``ALL_ATTENTION_FUNCTIONS`` in the globals of the forward under test, so
+    this needs no flash-attn build and no GPU, and leaves the global attention
+    registry untouched. Passing ``max_seqlen`` reproduces the upstream call
+    site; omitting it reproduces the call the zoo rewriter emits.
+
+    Returns ``(max_length_q, max_length_k, attn_output)``."""
+    seen = {}
+
+    class _Recorder:
+        def get_interface(self, attn_implementation, default):
+            def _record(module, query, key, value, attention_mask = None,
+                        **kwargs):
+                seen.update(kwargs)
+                seq_length = query.shape[2]
+                return query.transpose(1, 2).reshape(1, seq_length, -1), None
+            return _record
+
+    forward_globals = type(attn).forward.__globals__
+    old = forward_globals["ALL_ATTENTION_FUNCTIONS"]
+    forward_globals["ALL_ATTENTION_FUNCTIONS"] = _Recorder()
+    try:
+        if max_seqlen is _UNSET:
+            out = attn(hidden_states, cu_seqlens, position_embeddings)
+        else:
+            out = attn(hidden_states, cu_seqlens, position_embeddings,
+                       max_seqlen = max_seqlen)
+    finally:
+        forward_globals["ALL_ATTENTION_FUNCTIONS"] = old
+    return seen.get("max_length_q"), seen.get("max_length_k"), out
+
+
+def _assert_qwen2_vl_max_seqlen_recomputed(attn_cls, forward_src = None):
+    """The guard body, factored out so a mutated ``VisionAttention`` can be
+    pushed through exactly the checks that ship (see
+    ``tests/mutants/qwen2_vl_max_seqlen_mutants.py``)."""
+    import torch
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+        get_vision_attention_seqlens,
+    )
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import (
+        Qwen2VLVisionConfig,
+    )
+    if forward_src is None:
+        forward_src = inspect.getsource(attn_cls.forward)
+
+    # (1) Pin the call expression itself, not just the presence of the name.
+    call = _qwen2_vl_max_seqlen_recompute_call(forward_src)
+    if call is None:
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "max_seqlen = get_max_seqlen(...)",
+            _QWEN2_VL_ATTN_PATH,
+        )
+    receiver = ast.unparse(call.args[0]) if call.args else "<no arguments>"
+    if receiver != "cu_seqlens":
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "get_max_seqlen(cu_seqlens, ...) -- recomputed from the very "
+            "cu_seqlens the rewritten blk(...) call still passes positionally",
+            _QWEN2_VL_ATTN_PATH,
+            f"(got get_max_seqlen({receiver}, ...))",
+        )
+    keywords = {kw.arg: kw.value for kw in call.keywords}
+    precomputed = (
+        ast.unparse(keywords["kwargs"]) if "kwargs" in keywords
+        else "<no kwargs= argument>"
+    )
+    if precomputed != "{'max_seqlen': max_seqlen}":
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "get_max_seqlen(..., kwargs = {'max_seqlen': max_seqlen}) -- the "
+            "precomputed slot must be the block's own parameter, which is None "
+            "is the block's own parameter, which the rewriter now binds "
+                "into the checkpointed callable (and which is None whenever a "
+                "caller omits it)",
+            _QWEN2_VL_ATTN_PATH,
+            f"(got kwargs = {precomputed})",
+        )
+
+    # (2) Execute the path. Flash attention is the only branch that consumes
+    # max_seqlen, so request it; the backend itself is stubbed out.
+    config = Qwen2VLVisionConfig(embed_dim = 8, num_heads = 2, hidden_size = 8)
+    config._attn_implementation = "flash_attention_2"
+    torch.manual_seed(0)
+    attn = attn_cls(config)
+
+    # Two ragged images -> 4 and 5 tokens, so max_seqlen (5) differs from both
+    # the token count (9) and the first segment (4): a recompute off the wrong
+    # tensor cannot coincidentally match.
+    grid_thw = torch.tensor([[1, 2, 2], [1, 1, 5]], dtype = torch.long)
+    cu_seqlens, caller_max_seqlen = get_vision_attention_seqlens(
+        grid_thw, config, kwargs = {},
+    )
+    assert caller_max_seqlen == 5, (
+        "test fixture is stale: get_vision_attention_seqlens returned "
+        f"{caller_max_seqlen} for grid {grid_thw.tolist()}, expected 5"
+    )
+    seq_length = int(cu_seqlens[-1])
+    head_dim = config.embed_dim // config.num_heads
+    hidden_states = torch.randn(seq_length, config.embed_dim)
+    angles = torch.arange(seq_length, dtype = torch.float32).unsqueeze(1) * 0.1
+    position_embeddings = (
+        torch.cos(angles).expand(seq_length, head_dim).contiguous(),
+        torch.sin(angles).expand(seq_length, head_dim).contiguous(),
+    )
+
+    # Upstream's own call site: max_seqlen precomputed and forwarded.
+    kept = _qwen2_vl_run_vision_attention(
+        attn, hidden_states, cu_seqlens, position_embeddings,
+        max_seqlen = caller_max_seqlen,
+    )
+    # The fallback: keyword absent, value recomputed from cu_seqlens.
+    dropped = _qwen2_vl_run_vision_attention(
+        attn, hidden_states, cu_seqlens, position_embeddings,
+    )
+    for label, (got_q, got_k, _) in (("with max_seqlen", kept),
+                                     ("with max_seqlen dropped", dropped)):
+        if (got_q, got_k) != (caller_max_seqlen, caller_max_seqlen):
+            _drift(
+                _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+                f"max_length_q/max_length_k == {caller_max_seqlen} "
+                f"({label})",
+                _QWEN2_VL_ATTN_PATH,
+                f"(got max_length_q={got_q}, max_length_k={got_k}; dropping "
+                "max_seqlen from the rewritten blk(...) call would silently "
+                "change vision attention)",
+            )
+    if not torch.equal(kept[2], dropped[2]):
+        _drift(
+            _QWEN2_VL_MAX_SEQLEN_ZOO_SITE,
+            "identical VisionAttention output with and without max_seqlen",
+            _QWEN2_VL_ATTN_PATH,
+            "(outputs diverge -- dropping the keyword is no longer lossless)",
+        )
+
+
+def test_compiler_custom_gradient_checkpointing_qwen2_vl_max_seqlen_is_recomputed():
+    """Safety net behind the transformers 5.x entry in
+    ``unsloth_zoo/compiler.py:custom_gradient_checkpointing_replacements``.
+
+    The entry no longer drops ``max_seqlen=max_seqlen``: it removes it from the
+    positional argument list (where the ``arg=arg`` demotion would push it into
+    a slot the block does not have, and where it would bind to
+    ``self._gradient_checkpointing_func`` - which is often plain
+    ``torch.utils.checkpoint.checkpoint`` and raises ``Unexpected keyword
+    arguments``) and re-adds it bound into the callable with
+    ``functools.partial``. That the value now ARRIVES at the block is pinned by
+    ``tests/test_gc_rewriter_bound_keywords.py``.
+
+    This guard pins the fallback that made dropping it survivable in the first
+    place, and it is still load-bearing: it is what makes a mis-bound or lost
+    ``max_seqlen`` degrade into a recompute rather than into wrong attention.
+    ``VisionAttention.forward`` must keep recomputing the value off the same
+    ``cu_seqlens`` the rewritten call passes, with the precomputed slot honoured.
+    Merely finding a ``get_max_seqlen(`` call somewhere in the forward proves
+    nothing: upstream could keep the call and feed it a different tensor, a
+    config-derived cap, or ignore the precomputed value. So pin the call
+    expression AND execute the forward twice on CPU -- once with the keyword,
+    once without -- and require the packed-sequence lengths and the attention
+    output to be identical."""
+    pytest.importorskip("transformers")
+    pytest.importorskip("torch")
+    try:
+        # Imported for existence only -- 4.x has neither helper, and the
+        # rewriter entry these guard is 5.x-only.
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import (  # noqa: F401
+            get_max_seqlen, get_vision_attention_seqlens, VisionAttention,
+        )
+    except ImportError:
+        pytest.skip("get_max_seqlen / VisionAttention not in this build (4.x)")
+
+    _assert_qwen2_vl_max_seqlen_recomputed(VisionAttention)
+
+
+def test_compiler_moe_routing_weights_cast_pattern():
+    """``unsloth_zoo/compiler.py:2423-2425`` MOE_ROUTING_WEIGHTS_CAST_PATTERN
+    targets ``routing_weights = routing_weights.to(hidden_states.dtype)``;
+    needed for the bf16 router-logit dtype fix."""
+    _skip_if_transformers_5x(
+        "MoE forwards refactored -- the explicit "
+        "`routing_weights = routing_weights.to(hidden_states.dtype)` "
+        "line is gone (replaced by the new Experts class API). "
+        "compiler.py:2535 documents the two regexes silently no-op"
+    )
+    pytest.importorskip("transformers")
+    import importlib
+    pattern = re.compile(
+        r"(\brouting_weights\s*=\s*routing_weights\.to\(\s*)"
+        r"hidden_states(\.dtype\s*\))"
+    )
+    candidate_modules = [
+        "transformers.models.mixtral.modeling_mixtral",
+        "transformers.models.qwen2_moe.modeling_qwen2_moe",
+        "transformers.models.qwen3_moe.modeling_qwen3_moe",
+        "transformers.models.deepseek_v3.modeling_deepseek_v3",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if pattern.search(src):
+            return
+    _drift(
+        "unsloth_zoo/compiler.py:2423-2425",
+        r"routing_weights = routing_weights.to(hidden_states.dtype)",
+        "any of " + ", ".join(candidate_modules),
+    )
+
+
+def test_compiler_peft_lora_forward_pinned_strings():
+    """``unsloth_zoo/compiler.py:2542-2543`` pins:
+        old1: "output = lora_B(lora_A(dropout(x))) * scaling"
+        old2: "result = result + lora_B(lora_A(dropout(x))) * scaling"
+    If peft drops parens/names, the fast LoRA forward never installs."""
+    pytest.importorskip("peft")
+    try:
+        from peft.tuners.lora.layer import Linear as LoraLinear
+    except ImportError:
+        pytest.skip("peft.tuners.lora.layer.Linear missing in this build")
+    try:
+        src = inspect.getsource(LoraLinear.forward)
+    except (OSError, TypeError):
+        pytest.skip("peft Linear.forward source unavailable")
+    old1 = "output = lora_B(lora_A(dropout(x))) * scaling"
+    old2 = "result = result + lora_B(lora_A(dropout(x))) * scaling"
+    if (old1 not in src) and (old2 not in src):
+        _drift(
+            "unsloth_zoo/compiler.py:2542-2543",
+            f"{old1!r} OR {old2!r}",
+            "peft.tuners.lora.layer.Linear.forward",
+        )
+
+
+def test_compiler_peft_lora_base_layer_call_pinned_string():
+    """``unsloth_zoo/compiler.py:2615,2631`` pins
+    ``"result = self.base_layer(x, *args, **kwargs)"`` -- the 8-bit
+    base-layer call site, replaced with a dynamo-disabled helper."""
+    pytest.importorskip("peft")
+    try:
+        from peft.tuners.lora.layer import Linear as LoraLinear
+    except ImportError:
+        pytest.skip("peft.tuners.lora.layer.Linear missing in this build")
+    try:
+        src = inspect.getsource(LoraLinear.forward)
+    except (OSError, TypeError):
+        pytest.skip("peft Linear.forward source unavailable")
+    needle = "result = self.base_layer(x, *args, **kwargs)"
+    _assert_in_source(
+        needle, src,
+        "unsloth_zoo/compiler.py:2615",
+        "peft.tuners.lora.layer.Linear.forward",
+    )
+
+
+def test_compiler_gemma3n_final_logit_softcapping_walrus():
+    """``unsloth_zoo/compiler.py:2815-2825`` pins the walrus form
+    ``if (final_logit_softcapping := self.config.get_text_config()
+    .final_logit_softcapping) is not None:`` in Gemma 3N's
+    ForConditionalGeneration forward."""
+    pytest.importorskip("transformers")
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n as g3n
+    except ImportError:
+        pytest.skip("transformers.models.gemma3n not shipped")
+    src_module = inspect.getsource(g3n)
+    needle_walrus = (
+        "if (final_logit_softcapping := "
+        "self.config.get_text_config().final_logit_softcapping) is not None:"
+    )
+    if needle_walrus not in src_module:
+        _drift(
+            "unsloth_zoo/compiler.py:2815-2817",
+            needle_walrus,
+            "transformers.models.gemma3n.modeling_gemma3n",
+        )
+
+
+def test_compiler_gemma3n_softcapping_divide_multiply_pins():
+    """``unsloth_zoo/compiler.py:2820-2825`` also pins
+    ``logits = logits / final_logit_softcapping`` and
+    ``logits = logits * final_logit_softcapping``."""
+    pytest.importorskip("transformers")
+    try:
+        import transformers.models.gemma3n.modeling_gemma3n as g3n
+    except ImportError:
+        pytest.skip("transformers.models.gemma3n not shipped")
+    src = inspect.getsource(g3n)
+    for needle in (
+        "logits = logits / final_logit_softcapping",
+        "logits = logits * final_logit_softcapping",
+    ):
+        _assert_in_source(
+            needle, src,
+            "unsloth_zoo/compiler.py:2820-2825",
+            "transformers.models.gemma3n.modeling_gemma3n",
+        )
+
+
+def test_compiler_gemma4_flat_logits_flat_labels_pins():
+    """``unsloth_zoo/compiler.py:2831-2842`` pins Gemma 4 LM-head shape
+    strings; rewriter is forward-looking (Gemma 4 lands in >= 4.58).
+    Skip cleanly when pattern is absent."""
+    pytest.importorskip("transformers")
+    g4 = None
+    for candidate in (
+        "transformers.models.gemma3.modeling_gemma3",
+    ):
+        try:
+            g4 = __import__(candidate, fromlist=["*"])
+            break
+        except ImportError:
+            continue
+    try:
+        g4 = __import__(
+            "transformers.models.gemma3.modeling_gemma3", fromlist=["*"]
+        )
+    except ImportError:
+        pytest.skip("Neither gemma3 nor gemma4 modeling shipped")
+    src = inspect.getsource(g4)
+    needles = (
+        "flat_logits = shift_logits.view(-1,",
+        "loss = loss_fct(flat_logits, flat_labels)",
+    )
+    found_any = any(n in src for n in needles)
+    if not found_any:
+        pytest.skip(
+            "Gemma 4 flat_logits pattern absent; rewriter is "
+            "forward-looking (transformers >= 4.58 introduces Gemma 4)."
+        )
+
+
+def test_compiler_causal_mask_find_regex_pattern():
+    """``unsloth_zoo/compiler.py:3469-3473`` causal_mask_find regex
+    targets ``is_causal = True if (.+?_mask) is None and q_len > 1
+    else False`` + scaled_dot_product_attention. Pass as long as
+    dispatcher + is_causal markers exist."""
+    pytest.importorskip("transformers")
+    import importlib
+    candidate_modules = [
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.qwen3.modeling_qwen3",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
+        "transformers.models.gemma3.modeling_gemma3",
+        "transformers.models.qwen2_vl.modeling_qwen2_vl",
+        "transformers.models.qwen2_5_vl.modeling_qwen2_5_vl",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if (
+            ("scaled_dot_product_attention" in src
+                or "ALL_ATTENTION_FUNCTIONS" in src)
+            and "is_causal" in src
+        ):
+            return
+    _drift(
+        "unsloth_zoo/compiler.py:3469-3478",
+        "scaled_dot_product_attention / ALL_ATTENTION_FUNCTIONS + is_causal",
+        "any of " + ", ".join(candidate_modules),
+        "Without an attention dispatcher + is_causal in the "
+        "module-level source, the SDPA fix-up branch is unreachable.",
+    )
+
+
+def test_compiler_trainer_running_training_logger_regex():
+    """``unsloth_zoo/compiler.py:3988-3990`` re.searches
+    ``logger.info('***** Running training *****')`` in
+    ``Trainer._inner_training_loop``; rewriter splices the Unsloth
+    banner before this line."""
+    pytest.importorskip("transformers")
+    from transformers.trainer import Trainer
+    try:
+        src = inspect.getsource(Trainer._inner_training_loop)
+    except (OSError, TypeError):
+        pytest.skip("Trainer._inner_training_loop source unavailable")
+    pattern = re.compile(r"logger\.info\([\"\'].+?Running training")
+    if pattern.search(src) is None:
+        _drift(
+            "unsloth_zoo/compiler.py:3988-3990",
+            "logger.info('***** Running training *****')",
+            "transformers.trainer.Trainer._inner_training_loop",
+            "The Unsloth banner-injection site is gone.",
+        )
+
+
+def test_compiler_trainer_tpu_spmd_dataloader_pinned_string():
+    """``unsloth_zoo/compiler.py:4026-4029`` replaces
+    ``train_dataloader = tpu_spmd_dataloader(train_dataloader)`` with
+    a RuntimeError TPU stub."""
+    pytest.importorskip("transformers")
+    from transformers.trainer import Trainer
+    try:
+        src = inspect.getsource(Trainer._inner_training_loop)
+    except (OSError, TypeError):
+        pytest.skip("Trainer._inner_training_loop source unavailable")
+    needle = "train_dataloader = tpu_spmd_dataloader(train_dataloader)"
+    _assert_in_source(
+        needle, src,
+        "unsloth_zoo/compiler.py:4026-4029",
+        "transformers.trainer.Trainer._inner_training_loop",
+    )
+
+
+def test_compiler_trainer_is_torch_tpu_available_pinned_string():
+    """``unsloth_zoo/compiler.py:4035-4038`` replaces
+    ``is_torch_tpu_available()`` with ``False``. Modern transformers
+    renamed to ``is_torch_xla_available``; pass if EITHER name appears."""
+    _skip_if_transformers_5x(
+        "Trainer._inner_training_loop removed both is_torch_tpu_available "
+        "and is_torch_xla_available -- transformers 5.x rewrote the inner "
+        "loop and the TPU-disable shim is dead code. compiler.py:4246 "
+        "documents the replace is idempotent / no-op on missing anchor"
+    )
+    pytest.importorskip("transformers")
+    from transformers.trainer import Trainer
+    try:
+        src = inspect.getsource(Trainer._inner_training_loop)
+    except (OSError, TypeError):
+        pytest.skip("Trainer._inner_training_loop source unavailable")
+    tpu_old = "is_torch_tpu_available()"
+    xla_new = "is_torch_xla_available()"
+    if (tpu_old not in src) and (xla_new not in src):
+        _drift(
+            "unsloth_zoo/compiler.py:4035-4038",
+            f"{tpu_old} OR {xla_new}",
+            "transformers.trainer.Trainer._inner_training_loop",
+            "Upstream removed both names; zoo's str.replace for the "
+            "TPU-disable shim has no target -- the obsolete TPU "
+            "detection branch (or its replacement) is now dead code.",
+        )
+
+
+def test_compiler_trainer_inner_training_loop_rename_pinned_string():
+    """``unsloth_zoo/compiler.py:4030-4034`` renames
+    ``_inner_training_loop -> _fast_inner_training_loop``."""
+    pytest.importorskip("transformers")
+    from transformers.trainer import Trainer
+    try:
+        src = inspect.getsource(Trainer._inner_training_loop)
+    except (OSError, TypeError):
+        pytest.skip("Trainer._inner_training_loop source unavailable")
+    needle = "_inner_training_loop"
+    _assert_in_source(
+        needle, src,
+        "unsloth_zoo/compiler.py:4030-4034",
+        "transformers.trainer.Trainer._inner_training_loop",
+    )
+
+
+def test_misc_merge_quantization_configs_class_name_compare():
+    """``unsloth_zoo/temporary_patches/misc.py:133-136`` pins the single-line
+    ``if quantization_config.__class__.__name__ !=
+    quantization_config_from_args.__class__.__name__:``. Modern
+    transformers reflowed this; pass as long as BOTH class-name compares
+    are present somewhere."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.quantizers.auto import AutoHfQuantizer
+    except ImportError:
+        pytest.skip("AutoHfQuantizer not in this build")
+    try:
+        src = inspect.getsource(AutoHfQuantizer.merge_quantization_configs)
+    except (OSError, TypeError):
+        pytest.skip(
+            "AutoHfQuantizer.merge_quantization_configs source unavailable"
+        )
+    needle = (
+        "if quantization_config.__class__.__name__ != "
+        "quantization_config_from_args.__class__.__name__:"
+    )
+    class_name_check = "quantization_config.__class__.__name__"
+    args_class_name_check = "quantization_config_from_args.__class__.__name__"
+    if (class_name_check not in src) or (args_class_name_check not in src):
+        _drift(
+            "unsloth_zoo/temporary_patches/misc.py:133-136",
+            f"{class_name_check} AND {args_class_name_check}",
+            "transformers.quantizers.auto.AutoHfQuantizer.merge_quantization_configs",
+            "Upstream removed the class-name compare entirely; zoo's "
+            "str.replace cannot find any anchor -- the "
+            "`quantization_config_from_args is not None` guard never "
+            "installs, and Mxfp4Config-vs-NoneType errors return.",
+        )
+
+
+def test_misc_mllama_vision_encoder_gradient_checkpointing_probe():
+    """``unsloth_zoo/temporary_patches/misc.py:1170-1172`` probes
+    ``MllamaVisionEncoder.forward`` for ``"gradient_checkpointing"``.
+    Drift = encoder class removed -> patch unreachable."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.mllama.modeling_mllama import (
+            MllamaVisionEncoder,
+        )
+    except ImportError:
+        pytest.skip("MllamaVisionEncoder not in this build")
+    try:
+        src = inspect.getsource(MllamaVisionEncoder.forward)
+    except (OSError, TypeError):
+        _drift(
+            "unsloth_zoo/temporary_patches/misc.py:1170",
+            "inspect.getsource(MllamaVisionEncoder.forward)",
+            "transformers.models.mllama.modeling_mllama.MllamaVisionEncoder",
+            "Class exists but .forward source is unavailable; the "
+            "`'gradient_checkpointing' not in src` probe will raise "
+            "and the encoder-layer replacement won't install.",
+        )
+        return
+    assert isinstance(src, str) and "def forward" in src, (
+        "DRIFT DETECTED: MllamaVisionEncoder.forward source unrecognizable; "
+        "the zoo substring probe will misbehave."
+    )
+
+
+def test_gpt_oss_config_class_source_equality_probe():
+    """``unsloth_zoo/temporary_patches/gpt_oss.py:2808-2810`` runs a
+    source-equality probe between ``GptOssConfig`` and the bundled
+    ``Old_GptOssConfig``. Drift contract: GptOssConfig must exist AND
+    ``max_position_embeddings`` must appear; otherwise the regression
+    the Old_GptOssConfig patch was introduced to fix is ACTIVE."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.gpt_oss.configuration_gpt_oss import (
+            GptOssConfig,
+        )
+    except ImportError:
+        pytest.skip("transformers.models.gpt_oss not shipped")
+    try:
+        src = inspect.getsource(GptOssConfig)
+    except (OSError, TypeError):
+        pytest.skip("GptOssConfig source unavailable")
+    needle = "max_position_embeddings"
+    if needle not in src:
+        _drift(
+            "unsloth_zoo/temporary_patches/gpt_oss.py:2808-2813",
+            "max_position_embeddings (field within GptOssConfig)",
+            "transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig",
+            "If `max_position_embeddings` is missing from the upstream "
+            "config, the regression the Old_GptOssConfig patch was "
+            "introduced to fix is ACTIVE on this install.",
+        )
+
+
+def test_unsloth_import_fixes_enable_input_require_grads_modules_loop():
+    """``unsloth/import_fixes.py:609-670``'s
+    ``patch_enable_input_require_grads`` fires only when ``"for module
+    in self.modules()"`` is in
+    ``PreTrainedModel.enable_input_require_grads`` source. Old shape is
+    a one-liner ``self._require_grads_hook = self.get_input_embeddings()
+    .register_forward_hook(make_inputs_require_grads)``. Drift = neither
+    shape recognizable."""
+    pytest.importorskip("transformers")
+    from transformers import PreTrainedModel
+    try:
+        src = inspect.getsource(PreTrainedModel.enable_input_require_grads)
+    except (OSError, TypeError):
+        _drift(
+            "unsloth/import_fixes.py:609-670",
+            "inspect.getsource(PreTrainedModel.enable_input_require_grads)",
+            "transformers.PreTrainedModel",
+            "Cannot fetch source; unsloth patch and any zoo mirror "
+            "would silently skip and the vision-NotImplementedError "
+            "regression returns.",
+        )
+        return
+    old_one_liner = (
+        "self._require_grads_hook = self.get_input_embeddings()"
+        ".register_forward_hook(make_inputs_require_grads)"
+    )
+    new_modules_loop = "for module in self.modules()"
+    if new_modules_loop in src:
+        return
+    if old_one_liner in src:
+        return
+    _drift(
+        "unsloth/import_fixes.py:609-670",
+        f"either {old_one_liner!r} OR {new_modules_loop!r}",
+        "transformers.PreTrainedModel.enable_input_require_grads",
+        "Neither shape recognized; upstream refactored to a third "
+        "form. Both the unsloth patch AND any zoo mirror would silently "
+        "no-op and vision-model fine-tuning regresses with "
+        "NotImplementedError from get_input_embeddings().",
+    )
+
+
+def test_unsloth_import_fixes_make_inputs_require_grads_inner_fn():
+    """``unsloth/import_fixes.py:609-670``'s replacement also references
+    inner ``def make_inputs_require_grads(module, input, output)`` and
+    ``output.requires_grad_(True)``."""
+    pytest.importorskip("transformers")
+    from transformers import PreTrainedModel
+    try:
+        src = inspect.getsource(PreTrainedModel.enable_input_require_grads)
+    except (OSError, TypeError):
+        pytest.skip(
+            "PreTrainedModel.enable_input_require_grads source unavailable"
+        )
+    for needle in (
+        "def make_inputs_require_grads(module, input, output)",
+        "output.requires_grad_(True)",
+    ):
+        if needle not in src:
+            _drift(
+                "unsloth/import_fixes.py:609-670",
+                needle,
+                "transformers.PreTrainedModel.enable_input_require_grads",
+                "Inner-function shape changed; the patch's replacement "
+                "may install an API-incompatible hook.",
+            )
+
+
+def test_compiler_no_update_causal_mask_attribute_probe():
+    """``unsloth_zoo/compiler.py:3524, 3762`` ``hasattr(source,
+    "_update_causal_mask")`` probe. Modern Llama/Mistral/Qwen3 dropped
+    it; legacy models (Bamba, Falcon, etc.) still expose it. Pass if any
+    model still has it."""
+    _skip_if_transformers_5x(
+        "_update_causal_mask removed across all probed model classes -- "
+        "mask construction moved into the central masking-utils path. "
+        "compiler.py:3969 documents the hasattr probe just skips when "
+        "the attribute is absent"
+    )
+    pytest.importorskip("transformers")
+    import importlib
+    found_any = False
+    candidates = [
+        ("transformers.models.llama.modeling_llama", "LlamaModel"),
+        ("transformers.models.mistral.modeling_mistral", "MistralModel"),
+        ("transformers.models.qwen2.modeling_qwen2", "Qwen2Model"),
+        ("transformers.models.gemma.modeling_gemma", "GemmaModel"),
+        ("transformers.models.bamba.modeling_bamba", "BambaModel"),
+        ("transformers.models.falcon.modeling_falcon", "FalconModel"),
+        ("transformers.models.dbrx.modeling_dbrx", "DbrxModel"),
+        ("transformers.models.bloom.modeling_bloom", "BloomModel"),
+    ]
+    for mod_name, cls_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            continue
+        if hasattr(cls, "_update_causal_mask"):
+            found_any = True
+            break
+    if not found_any:
+        _drift(
+            "unsloth_zoo/compiler.py:3524,3762",
+            "_update_causal_mask method (probed via hasattr)",
+            "any of " + ", ".join(f"{m}.{c}" for m, c in candidates),
+            "Without `_update_causal_mask` anywhere in transformers, "
+            "zoo's `remove_causal_masks` optimization is dead code.",
+        )
+
+
+def test_compiler_attn_weights_attention_mask_dict_pattern():
+    """``unsloth_zoo/compiler.py:4148-4158`` rewrites ``attn_weights =
+    attn_weights + attention_mask`` (gpt_oss dict-mask v5 shape).
+    Upstream may rename ``attention_mask`` -> ``causal_mask``; pass on
+    either."""
+    pytest.importorskip("transformers")
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss as gpt_oss
+    except ImportError:
+        pytest.skip("transformers.models.gpt_oss not shipped")
+    src = inspect.getsource(gpt_oss)
+    candidates = (
+        "attn_weights = attn_weights + attention_mask",
+        "attn_weights = attn_weights + causal_mask",
+    )
+    if not any(n in src for n in candidates):
+        _drift(
+            "unsloth_zoo/compiler.py:4148-4158",
+            " OR ".join(candidates),
+            "transformers.models.gpt_oss.modeling_gpt_oss",
+            "Upstream removed the explicit mask-add line entirely; "
+            "zoo's dict-attention v5 re.sub has no target.",
+        )
+
+
+def test_compiler_gradient_checkpointing_layer_marker_in_full_source():
+    """``unsloth_zoo/compiler.py:3841`` branches on
+    ``"(GradientCheckpointingLayer)" in full_source``."""
+    pytest.importorskip("transformers")
+    import importlib
+    candidate_modules = [
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.qwen3.modeling_qwen3",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if "(GradientCheckpointingLayer)" in src:
+            return
+    _drift(
+        "unsloth_zoo/compiler.py:3841",
+        "(GradientCheckpointingLayer)",
+        "any of " + ", ".join(candidate_modules),
+        "Without this marker, zoo always falls back to "
+        "`patch_gradient_checkpointing` which has stricter "
+        "preconditions and may also no-op.",
+    )
+
+
+def test_compiler_lm_head_self_lm_head_attribute_present():
+    """``unsloth_zoo/compiler.py:1727,1736,1748-1758`` references
+    ``self.lm_head.weight`` in the fused CE replacement."""
+    pytest.importorskip("transformers")
+    import importlib
+    candidate_classes = [
+        ("transformers.models.llama.modeling_llama", "LlamaForCausalLM"),
+        ("transformers.models.mistral.modeling_mistral", "MistralForCausalLM"),
+        ("transformers.models.qwen2.modeling_qwen2", "Qwen2ForCausalLM"),
+        ("transformers.models.qwen3.modeling_qwen3", "Qwen3ForCausalLM"),
+    ]
+    found = False
+    for mod_name, cls_name in candidate_classes:
+        try:
+            mod = importlib.import_module(mod_name)
+        except ImportError:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            continue
+        try:
+            src = inspect.getsource(cls)
+        except (OSError, TypeError):
+            continue
+        if "self.lm_head" in src:
+            found = True
+            break
+    if not found:
+        _drift(
+            "unsloth_zoo/compiler.py:1727+ (fused CE replacement)",
+            "self.lm_head",
+            "any ForCausalLM among " + ", ".join(
+                f"{m}.{c}" for m, c in candidate_classes
+            ),
+            "If upstream renamed `lm_head` (e.g. to `output_projection`), "
+            "the fused linear cross-entropy replacement compiles but "
+            "AttributeErrors at first forward.",
+        )
+
+
+def test_compiler_loss_function_for_causal_lm_loss_suffix():
+    """``unsloth_zoo/compiler.py:1560,1639,1647`` keys the fused CE
+    fast-path on
+    ``self.loss_function.__name__.endswith("ForCausalLMLoss")``."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.loss.loss_utils import ForCausalLMLoss
+    except ImportError:
+        _drift(
+            "unsloth_zoo/compiler.py:1560,1639,1647",
+            "ForCausalLMLoss (loss-function name suffix)",
+            "transformers.loss.loss_utils",
+            "If `ForCausalLMLoss` is renamed, the fast-CE branch "
+            "never fires.",
+        )
+        return
+    name = getattr(ForCausalLMLoss, "__name__", "")
+    if not name.endswith("ForCausalLMLoss"):
+        _drift(
+            "unsloth_zoo/compiler.py:1560,1639,1647",
+            "<func>.__name__.endswith('ForCausalLMLoss')",
+            "transformers.loss.loss_utils.ForCausalLMLoss",
+            f"Found name={name!r}.",
+        )
+
+
+def test_compiler_softmax_higher_precision_finder_regex():
+    """``unsloth_zoo/compiler.py:391-397`` (higher_precision_softmax)
+    matches ``nn.functional.softmax(...)`` / ``F.softmax(...)``."""
+    pytest.importorskip("transformers")
+    import importlib
+    pattern = re.compile(
+        r"(nn\.functional\.softmax|F\.softmax)\("
+    )
+    candidate_modules = [
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.qwen3.modeling_qwen3",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.qwen2_moe.modeling_qwen2_moe",
+        "transformers.models.mixtral.modeling_mixtral",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if pattern.search(src):
+            return
+    _drift(
+        "unsloth_zoo/compiler.py:391-397",
+        r"nn.functional.softmax(...) or F.softmax(...)",
+        "any of " + ", ".join(candidate_modules),
+        "If softmax calls now go through torch.softmax / tensor.softmax(), "
+        "the float32-upcast rewrite no-ops everywhere.",
+    )
+
+
+def test_compiler_sqrt_mean_higher_precision_finder_regex():
+    """``unsloth_zoo/compiler.py:428-438`` (higher_precision_sqrt_mean)
+    targets ``torch.mean(X ** 2, dim=-1, keepdim=True) ** 0.5``.
+    Currently dormant on modern models."""
+    pytest.importorskip("transformers")
+    import importlib
+    pattern = re.compile(
+        r"(torch\.mean|torch\.sum)\([a-zA-Z0-9_\[\]]+\s*\*\*\s*\d"
+    )
+    candidate_modules = [
+        "transformers.models.gemma3n.modeling_gemma3n",
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
+        "transformers.models.gemma3.modeling_gemma3",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if pattern.search(src):
+            return
+    pytest.skip(
+        "No probed model currently uses torch.mean(X**2)**0.5; rewrite "
+        "is dormant. Test will surface this if/when zoo adds Gemma 3N-"
+        "style RMSNorm rewriting to a model that lacks it."
+    )
+
+
+def test_compiler_apply_rotary_pos_emb_attention_dtype_fix_target():
+    """``unsloth_zoo/compiler.py:533-535`` (fix_attention_dtype_consistency)
+    matches ``query_states, key_states = apply_rotary_pos_emb(...)``."""
+    pytest.importorskip("transformers")
+    import importlib
+    pattern = re.compile(
+        r"query_states\s*,\s*key_states\s*=\s*apply_rotary_pos_emb\("
+    )
+    candidate_modules = [
+        "transformers.models.llama.modeling_llama",
+        "transformers.models.mistral.modeling_mistral",
+        "transformers.models.qwen2.modeling_qwen2",
+        "transformers.models.qwen3.modeling_qwen3",
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
+    ]
+    for mod in candidate_modules:
+        try:
+            m = importlib.import_module(mod)
+        except ImportError:
+            continue
+        try:
+            src = inspect.getsource(m)
+        except OSError:
+            continue
+        if pattern.search(src):
+            return
+    _drift(
+        "unsloth_zoo/compiler.py:533-535",
+        r"query_states, key_states = apply_rotary_pos_emb(...)",
+        "any of " + ", ".join(candidate_modules),
+        "The 4-bit BNB dtype consistency fix no longer has a target.",
+    )
+
+
+def test_compiler_residual_stream_finder_regex():
+    """``unsloth_zoo/compiler.py:2686-2705`` (patch_residual_stream)
+    matches ``if self.<gate>: hidden_states = <expr> * hidden_states ...
+    hidden_states = residual + hidden_states`` in VLM cross-attention.
+    Pin ``if self.is_gated`` head in mllama."""
+    pytest.importorskip("transformers")
+    try:
+        from transformers.models.mllama.modeling_mllama import (
+            MllamaVisionEncoder,
+        )
+    except ImportError:
+        pytest.skip("MllamaVisionEncoder not in this build")
+    try:
+        src = inspect.getsource(MllamaVisionEncoder)
+    except (OSError, TypeError):
+        pytest.skip("MllamaVisionEncoder source unavailable")
+    needle = "if self.is_gated"
+    if needle not in src:
+        try:
+            import transformers.models.mllama.modeling_mllama as mll
+            src_module = inspect.getsource(mll)
+            if needle in src_module:
+                return
+        except (OSError, TypeError, ImportError):
+            pass
+        _drift(
+            "unsloth_zoo/compiler.py:2686-2705",
+            "if self.is_gated: ... hidden_state = ... * hidden_state",
+            "transformers.models.mllama.modeling_mllama",
+            "`patch_residual_stream` no longer has a target; "
+            "torch.add / torch.addcmul fast-path is unreachable.",
+        )

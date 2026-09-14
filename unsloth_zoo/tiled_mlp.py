@@ -63,27 +63,48 @@ def get_max_flat_qlen(
     return max_flat_qlen
 pass
 
+
+def _default_target_gb():
+    # Size the tile memory budget from the free memory actually available on the
+    # current backend, so a device with little memory left does not pick chunks
+    # that immediately OOM. Mirror the CUDA path: query free memory and keep half.
+    if DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
+        # torch.cuda.mem_get_info also covers ROCm (PyTorch aliases the cuda API).
+        return torch.cuda.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+    if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+        # Present from torch 2.6, but raises on some Intel GPUs (e.g. Arc B580,
+        # Lunar Lake). When the accelerator cannot report free memory, use a small
+        # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
+        try:
+            return torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+        except Exception:
+            return 4.0
+    # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
+    try:
+        import psutil
+        return psutil.virtual_memory().available / 1024 / 1024 / 1024 * 0.5
+    except Exception:
+        return 4.0
+pass
+
 class TiledMLP(torch.autograd.Function):
     @staticmethod
     def handle_output(output, extra_lists):
-        """Extract main output and append extras to their lists"""
+        """Extract main output, append extras to their lists."""
         if isinstance(output, tuple):
-            # Initialize lists on first tuple
             if not extra_lists:
                 for _ in output[1:]:
                     extra_lists.append([])
-            # Append extras
             for i, extra in enumerate(output[1:]):
                 extra_lists[i].append(extra)
-            return output[0]  # Return main output
-        return output  # Single tensor
+            return output[0]
+        return output
 
     @staticmethod
     def structure_output(main_output, extra_lists):
-        """Reconstruct original structure"""
+        """Reconstruct original structure: cat extras along seq dim."""
         if not extra_lists:
             return main_output
-        # Cat extras along seq dim and return tuple
         extras = [torch.cat(extra_list, dim=-2) for extra_list in extra_lists]
         return (main_output, *extras)
 
@@ -119,10 +140,8 @@ class TiledMLP(torch.autograd.Function):
             preserve_rng_state = True
         ctx.preserve_rng_state = bool(preserve_rng_state)
 
-        # Save tensors needed in backward
         ctx.save_for_backward(x)
 
-        # RNG state capture if requested
         if ctx.preserve_rng_state:
             ctx.fwd_cpu_state = torch.get_rng_state()
             ctx.had_device_in_fwd = False
@@ -226,10 +245,7 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
             intermediate_size = hd * 4
 
         if target_gb is None:
-            free, total = torch.cuda.mem_get_info(0)
-            free_gb = free / 1024 / 1024 / 1024
-            free_gb = free_gb * 0.5
-            target_gb = free_gb
+            target_gb = _default_target_gb()
 
         max_flat_qlen = get_max_flat_qlen(
             hd = hd,

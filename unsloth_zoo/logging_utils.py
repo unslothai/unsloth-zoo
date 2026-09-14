@@ -68,10 +68,8 @@ def NotebookProgressCallback_on_train_begin(Trainer_metrics):
         self.first_column = "Epoch" if args.eval_strategy == IntervalStrategy.EPOCH else "Step"
         self.training_loss = 0
         self.last_log = 0
-        # Don't pre-create metric columns. Start with just the essentials;
-        # columns are added dynamically by write_line as metrics actually appear.
-        # This prevents empty "0 then blank" columns for conditional metrics
-        # (kl when beta=0, sampling/* without importance sampling, etc.)
+        # Don't pre-create metric columns; write_line adds them dynamically as
+        # metrics appear, avoiding empty columns for conditional metrics.
         column_names = [self.first_column] + ["Training Loss"]
         if args.eval_strategy != IntervalStrategy.NO:
             column_names.append("Validation Loss")
@@ -82,9 +80,8 @@ pass
 
 
 def NotebookProgressCallback_on_log(Trainer_metrics):
-    # Build an allowlist of known metrics (pre-extracted from TRL source).
-    # Only these + dynamic rewards/* metrics pass through. This blocks
-    # spurious keys injected at runtime (e.g. "train", "tools/*").
+    # Allowlist of known metrics (pre-extracted from TRL source); only these +
+    # dynamic rewards/* pass through, blocking runtime-injected keys.
     set_Trainer_metrics = frozenset(Trainer_metrics)
 
     def _NotebookProgressCallback_on_log(self, args, state, control, logs = None, **kwargs):
@@ -92,15 +89,14 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
         if args.eval_strategy == IntervalStrategy.NO and "loss" in logs:
             values = {}
 
-            # 1) Pre-extracted metrics — only if actually present in logs
+            # 1) Pre-extracted metrics, only if present in logs
             for metric in Trainer_metrics:
                 if metric in logs:
                     values[metric.replace("/", " / ")] = logs[metric]
             pass
 
-            # 2) Dynamic per-reward-function metrics (rewards/*)
-            #    These have user-defined names so can't be pre-extracted.
-            #    Sort for stable column ordering across steps.
+            # 2) Dynamic per-reward-function metrics (rewards/*): user-defined
+            #    names, so sort for stable column ordering across steps.
             dynamic_reward_keys = sorted(
                 k for k in logs
                 if k.startswith("rewards/") and k not in set_Trainer_metrics
@@ -111,7 +107,7 @@ def NotebookProgressCallback_on_log(Trainer_metrics):
                     values[display_key] = logs[key]
             pass
 
-            # 3) Prepend Training Loss + Step (always first columns)
+            # 3) Prepend Training Loss + Step as first columns
             values = {"Training Loss": logs["loss"], **values}
             values[self.first_column] = state.global_step
             self.training_tracker.write_line(values)
@@ -134,12 +130,11 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
         else:
             columns = self.inner_table[0]
 
-            # Dynamically add new columns that appear in values
-            # (e.g. per-reward-func metrics discovered at step > 1)
+            # Add new columns appearing in values (e.g. per-reward-func metrics
+            # discovered at step > 1), back-filling previous rows.
             for key in values:
                 if key not in columns:
                     columns.append(key)
-                    # Back-fill previous rows with empty string
                     for row in self.inner_table[1:]:
                         row.append("")
             pass
@@ -152,7 +147,7 @@ def NotebookTrainingTracker_write_line(Trainer_metrics):
                     # write new line
                     self.inner_table.append([values[c] if c in values else "" for c in columns])
                 else:
-                    # update last line — preserve existing values for missing keys
+                    # update last line, preserving existing values for missing keys
                     new_values = values
                     for c in columns:
                         if c not in new_values:
@@ -193,20 +188,19 @@ def get_trl_metrics():
     filepath = inspect.getfile(trl.trainer)
     filepath = os.path.split(filepath)[0]
 
-    # TRL >= 0.26.0 moved many trainers to trl/experimental/*/
-    # The old trl/trainer/ files become thin shims that re-export.
-    # Build a map of trainer_name -> source file path, preferring the
-    # experimental (real) file when both exist.
+    # TRL >= 0.26.0 moved many trainers to trl/experimental/*/, leaving thin
+    # re-export shims in trl/trainer/. Map trainer -> source path, preferring
+    # the experimental (real) file when both exist.
     trl_root = os.path.split(filepath)[0]
     exp_dir = os.path.join(trl_root, "experimental")
     trainer_files = dict()
     for trainer in trainers:
         candidates = []
-        # 1) trl/trainer/{trainer}.py (original or shim)
+        # trl/trainer/{trainer}.py (original or shim)
         c1 = os.path.join(filepath, f"{trainer}.py")
         if os.path.exists(c1):
             candidates.append(c1)
-        # 2) trl/experimental/{name}/{trainer}.py (real code in >= 0.26.0)
+        # trl/experimental/{name}/{trainer}.py (real code in >= 0.26.0)
         if os.path.isdir(exp_dir):
             name = trainer.replace("_trainer", "")
             c2 = os.path.join(exp_dir, name, f"{trainer}.py")

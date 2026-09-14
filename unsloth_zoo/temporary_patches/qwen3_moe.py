@@ -32,38 +32,44 @@ from .utils import (
 )
 
 
-# ============================================================================
 # Grouped GEMM kernel integration for MoE training acceleration
-# ============================================================================
-
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
+    extract_moe_lora_weights_for_grouped_mm,
 )
 
 
 def _make_qwen_moe_lora_extractor():
+    def _get_qwen_moe_lora_dims(wrapper):
+        if wrapper is None or not hasattr(wrapper, "get_base_layer"):
+            return None, None
+
+        base = wrapper.get_base_layer()
+        param_name = getattr(wrapper, "parameter_name", None)
+        if param_name == "gate_up_proj":
+            input_dim = getattr(base, "hidden_dim", None)
+            output_dim = getattr(base, "intermediate_dim", None)
+            return input_dim, None if output_dim is None else 2 * output_dim
+        if param_name == "down_proj":
+            return getattr(base, "intermediate_dim", None), getattr(base, "hidden_dim", None)
+
+        return None, None
+
     def _qwen_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
-        """
-        LoRA extractor for Qwen-family MoE (Qwen3-MoE, Qwen3.5/3.6, Qwen3-Next).
-
-        PEFT LoRA shapes are fixed by the linear's in/out dims, independent of
-        raw base-weight storage order, so no model-specific dispatch is needed:
-          weight_A: (E*R, in_dim)  -> (E, in_dim, R)
-          weight_B: (out_dim, E*R) -> (E, R, out_dim)
-        """
-        total_rank = weight_A.shape[0]
-        rank_per_expert = total_rank // num_experts
-        dim_A = weight_A.shape[1]   # in_dim
-        dim_B = weight_B.shape[0]   # out_dim
-
-        first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
-        first_weight = first_weight.permute(0, 2, 1).contiguous()
-
-        second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-        second_weight = second_weight.permute(1, 2, 0).contiguous()
-
-        return first_weight, second_weight, scaling, num_experts
+        input_dim, output_dim = _get_qwen_moe_lora_dims(wrapper)
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper,
+            weight_A,
+            weight_B,
+            scaling,
+            num_experts,
+            input_dim=input_dim,
+            output_dim=output_dim,
+            model_name="Qwen MoE",
+            enable_logging=UNSLOTH_ENABLE_LOGGING,
+            logger_obj=logger,
+        )
 
     return _qwen_moe_lora_extractor
 
@@ -199,7 +205,11 @@ def patch_qwen3_moe():
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
 
-    # Patch ParamWrapper.forward for MoE separated LoRA
+    # Patch ParamWrapper.forward for MoE separated LoRA.
+    # Ordering is load-bearing: this unconditional call installs the
+    # peft.get_peft_model wrapper during the import-time patch pass, before
+    # unsloth.models.llama/vision capture their get_peft_model alias. Do not
+    # gate it by model name or move it below the qwen3 import check.
     patch_param_wrapper_for_moe()
 
     try:
@@ -307,11 +317,8 @@ def patch_qwen3_moe():
                 final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
-    # ====================================================================
-        # New transformers (5.0+) with stacked expert weights
-        # Uses Triton grouped GEMM kernels for high performance
-        # ====================================================================
-
+        # New transformers (5.0+) with stacked expert weights; uses Triton
+        # grouped GEMM kernels.
         _qwen3_lora_extractor = _make_qwen_moe_lora_extractor()
 
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_lora_extractor)
@@ -322,18 +329,16 @@ def patch_qwen3_moe():
             module_name=__name__,
         )
 
-    # For old transformers, patch Qwen3MoeSparseMoeBlock
-    # For new transformers, patch Qwen3MoeExperts (which has the expert loop)
+    # Old transformers: patch Qwen3MoeSparseMoeBlock.
+    # New transformers: patch Qwen3MoeExperts (which has the expert loop).
     if old_transformers:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", forward)
     else:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts, "forward", forward)
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", sparse_moe_block_forward)
 
-    # ====================================================================
-    # Patch Qwen3MoeForCausalLM.forward for GRPO training
-    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
-    # ====================================================================
+    # Patch Qwen3MoeForCausalLM.forward for GRPO: return hidden_states instead
+    # of logits when UNSLOTH_RETURN_HIDDEN_STATES=1.
     try:
         from transformers.models.qwen3_moe.modeling_qwen3_moe import (
             Qwen3MoeForCausalLM,
