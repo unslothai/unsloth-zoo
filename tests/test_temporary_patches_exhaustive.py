@@ -307,6 +307,84 @@ def _has_var_keyword(func) -> bool:
     )
 
 
+def _is_passthrough(func) -> bool:
+    """Is this signature a bare (*args, **kwargs) that forwards everything?
+
+    Such a signature carries no arity information, so an arity probe can neither
+    confirm nor deny drift against it.
+    """
+    try:
+        sig = inspect.signature(func)
+    except Exception:
+        return False
+    kinds = [p.kind for p in sig.parameters.values()]
+    return (
+        inspect.Parameter.VAR_POSITIONAL in kinds
+        and inspect.Parameter.VAR_KEYWORD in kinds
+        and not any(
+            k in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                  inspect.Parameter.POSITIONAL_ONLY,
+                  inspect.Parameter.KEYWORD_ONLY)
+            for k in kinds
+        )
+    )
+
+
+def _unwrap_kernel_hub_func(obj, expected_name = None):
+    """Recover the Python function behind a kernels-hub replacement.
+
+    transformers swaps module functions for a `kernels.layer.layer.Func` nn.Module
+    whose forward is `(*args, **kwargs)` closing over the original. A closure can
+    hold several functions, so take a name match, else a single candidate.
+    """
+    found = []
+    for candidate in (obj, getattr(type(obj), "forward", None)):
+        if candidate is None:
+            continue
+        for cell in getattr(candidate, "__closure__", None) or ():
+            try:
+                inner = cell.cell_contents
+            except ValueError:
+                continue
+            if not (inspect.isfunction(inner) or inspect.isbuiltin(inner)):
+                continue
+            if expected_name is not None and getattr(inner, "__name__", None) == expected_name:
+                return inner
+            found.append(inner)
+    if len(found) == 1:
+        # Name miss (an upstream rename or decorator): a lone closed-over function
+        # is still what the wrapper forwards to.
+        return found[0]
+    return obj
+
+
+def _positional_arity_from_source(module, name):
+    """Count positionals on ``name`` as the module's own source defines it: a last
+    resort when the live attribute is an opaque passthrough."""
+    import ast
+
+    try:
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+    except Exception:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return len(node.args.posonlyargs) + len(node.args.args)
+    return None
+
+
+def _resolve_for_arity(func, expected_name = None):
+    """Strip functools.wraps chains and kernels-hub wrappers before an arity probe."""
+    seen = set()
+    while hasattr(func, "__wrapped__") and id(func) not in seen:
+        seen.add(id(func))
+        func = func.__wrapped__
+    if _is_passthrough(func):
+        func = _unwrap_kernel_hub_func(func, expected_name)
+    return func
+
+
 # bitsandbytes.py: patches bitsandbytes.nn.modules.Linear4bit.forward
 # (covered elsewhere) + bitsandbytes.nn.Linear4bit.forward top-level
 # re-export alias.
@@ -2414,8 +2492,28 @@ def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
             "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:1875 expects "
             "modeling_gpt_oss.apply_rotary_pos_emb but it is missing"
         )
+    # With `kernels` installed (transformers needs it for gpt-oss MXFP4) this name is
+    # a Func nn.Module forwarding `(*args, **kwargs)`: probing the wrapper reports 0
+    # positionals and looks like drift that is not there.
+    resolved = _resolve_for_arity(apply, "apply_rotary_pos_emb")
+    if _is_passthrough(resolved):
+        count = _positional_arity_from_source(mod, "apply_rotary_pos_emb")
+        if count is None:
+            pytest.skip(
+                f"installed apply_rotary_pos_emb is a {type(apply).__name__} "
+                f"passthrough {inspect.signature(resolved)} whose target could "
+                "not be resolved, and the module source carries no def to read, "
+                "so positional arity says nothing about drift"
+            )
+        if count < 4:
+            pytest.fail(
+                f"DRIFT DETECTED: zoo temporary_patches/gpt_oss.py calls "
+                f"apply_rotary_pos_emb(q, k, cos, sin) -- 4 positionals -- but "
+                f"{mod.__name__} defines it with {count}"
+            )
+        return
     params = [
-        p for p in inspect.signature(apply).parameters.values()
+        p for p in inspect.signature(resolved).parameters.values()
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
                       inspect.Parameter.POSITIONAL_ONLY)
     ]
@@ -2424,7 +2522,7 @@ def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
             f"DRIFT DETECTED: zoo temporary_patches/gpt_oss.py calls "
             f"apply_rotary_pos_emb(q, k, cos, sin) -- 4 positionals -- but "
             f"installed signature accepts only {len(params)}: "
-            f"{inspect.signature(apply)}"
+            f"{inspect.signature(resolved)}"
         )
 
 
