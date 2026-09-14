@@ -108,6 +108,38 @@ def test_switch_linear_experts_are_detected():
     assert _model_has_quantized_module(_Stack(experts))
 
 
+def test_qqlinear_is_detected():
+    """QQLinear subclasses no quantized type and is not Quantized*-named, so
+    both a class list and a name prefix miss it, and merged_4bit would pack an
+    already-packed model a second time. It holds uint32 weights only in eval
+    mode, which is the mode save_merged_model puts the model in.
+    """
+    quantized = pytest.importorskip("mlx.nn.layers.quantized")
+    qq_linear = getattr(quantized, "QQLinear", None)
+    if qq_linear is None:
+        pytest.skip("this mlx has no QQLinear")
+    module = qq_linear.from_linear(
+        nn.Linear(DIMS, DIMS, bias=False), group_size=16, bits=4, mode="nvfp4")
+    module.eval()
+    assert not type(module).__name__.startswith("Quantized")
+    assert _model_has_quantized_module(_Stack(module))
+
+
+def test_unpacked_bits_attributes_do_not_count_as_quantized():
+    """The flip side: bits/group_size alone must not mark a dense module
+    quantized, or the merge is skipped and merged_4bit silently writes full
+    precision again -- the very bug this path exists to prevent.
+    """
+    class _CarriesTheAttributes(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bits = 4
+            self.group_size = 64
+            self.linear = _linear()
+
+    assert not _model_has_quantized_module(_Stack(_CarriesTheAttributes()))
+
+
 def _tiny_llama(dtype, hidden_size=128, intermediate_size=256, vocab_size=512):
     """A real mlx-lm llama, small enough to build in-process."""
     llama = pytest.importorskip("mlx_lm.models.llama")
