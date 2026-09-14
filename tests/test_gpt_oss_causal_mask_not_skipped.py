@@ -86,10 +86,26 @@ def wrapper(monkeypatch):
     return types.SimpleNamespace(fn = live, calls = calls)
 
 
-def _config(attn_implementation):
+def _config(attn_implementation, training = None):
     cfg = types.SimpleNamespace()
     cfg._attn_implementation = attn_implementation
+    if training is not None:
+        from unsloth_zoo.temporary_patches.gpt_oss import _TRAINING_FLAG_ATTR
+        setattr(cfg, _TRAINING_FLAG_ATTR, training)
     return cfg
+
+
+@pytest.fixture
+def flex_installed(monkeypatch):
+    """Pretend patch_GptOssAttention installed the flex-routing forward."""
+    from unsloth_zoo.temporary_patches import gpt_oss
+    monkeypatch.setattr(gpt_oss, "_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED", True)
+
+
+@pytest.fixture
+def flex_absent(monkeypatch):
+    from unsloth_zoo.temporary_patches import gpt_oss
+    monkeypatch.setattr(gpt_oss, "_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED", False)
 
 
 def _embeds(requires_grad):
@@ -98,11 +114,11 @@ def _embeds(requires_grad):
     return x
 
 
-def test_eager_inference_gets_a_real_mask(wrapper):
+def test_eager_inference_gets_a_real_mask(wrapper, flex_installed):
     """The regression: requires_grad is set by unsloth, not by training."""
     with torch.enable_grad():
         got = wrapper.fn(
-            config = _config("eager"),
+            config = _config("eager", training = False),
             input_embeds = _embeds(True),
             attention_mask = None,
         )
@@ -110,22 +126,22 @@ def test_eager_inference_gets_a_real_mask(wrapper):
     assert wrapper.calls, "the factory must actually be called"
 
 
-def test_eager_inference_without_grad_gets_a_real_mask(wrapper):
+def test_eager_inference_without_grad_gets_a_real_mask(wrapper, flex_installed):
     with torch.no_grad():
         got = wrapper.fn(
-            config = _config("eager"),
+            config = _config("eager", training = False),
             input_embeds = _embeds(False),
             attention_mask = None,
         )
     assert got == "DENSE_MASK"
 
 
-def test_flex_training_still_skips_the_dense_mask(wrapper):
+def test_flex_training_still_skips_the_dense_mask(wrapper, flex_installed):
     """Preserved: flex builds its own BlockMask, and a dense mask at long
     context is the O(seq_len^2) allocation this skip exists to avoid."""
     with torch.enable_grad():
         got = wrapper.fn(
-            config = _config("flex_attention"),
+            config = _config("flex_attention", training = True),
             input_embeds = _embeds(True),
             attention_mask = "RAW_2D_MASK",
         )
@@ -133,11 +149,48 @@ def test_flex_training_still_skips_the_dense_mask(wrapper):
     assert not wrapper.calls
 
 
-def test_flex_inference_under_no_grad_builds_the_mask(wrapper):
+def test_eager_config_training_still_skips_when_flex_will_run(wrapper, flex_installed):
+    """forward_function picks flex_attention_with_sink from self.training alone,
+    so an eager _attn_implementation during training still gets flex, and a dense
+    mask would be built and thrown away (unsloth-zoo#1212 review, P1)."""
+    with torch.enable_grad():
+        got = wrapper.fn(
+            config = _config("eager", training = True),
+            input_embeds = _embeds(True),
+            attention_mask = "RAW_2D_MASK",
+        )
+    assert got == "RAW_2D_MASK"
+    assert not wrapper.calls
+
+
+def test_training_builds_the_mask_when_the_flex_forward_is_absent(wrapper, flex_absent):
+    """No patched attention means stock eager runs and genuinely needs the mask."""
+    with torch.enable_grad():
+        got = wrapper.fn(
+            config = _config("eager", training = True),
+            input_embeds = _embeds(True),
+            attention_mask = None,
+        )
+    assert got == "DENSE_MASK"
+
+
+def test_grad_enabled_inference_gets_a_mask(wrapper, flex_installed):
+    """A plain forward outside no_grad is still inference: the recorded training
+    flag settles it, where the old requires_grad guess could not."""
+    with torch.enable_grad():
+        got = wrapper.fn(
+            config = _config("eager", training = False),
+            input_embeds = _embeds(True),
+            attention_mask = None,
+        )
+    assert got == "DENSE_MASK"
+
+
+def test_flex_inference_under_no_grad_builds_the_mask(wrapper, flex_installed):
     """generate() runs under no_grad, where flex-with-KV-cache is not used."""
     with torch.no_grad():
         got = wrapper.fn(
-            config = _config("flex_attention"),
+            config = _config("flex_attention", training = False),
             input_embeds = _embeds(True),
             attention_mask = None,
         )
@@ -147,22 +200,34 @@ def test_flex_inference_under_no_grad_builds_the_mask(wrapper):
 def test_flex_config_is_swapped_to_eager_while_building(wrapper):
     """A BlockMask cannot be consumed by the eager forward, so the factory must
     be called with _attn_implementation temporarily set to eager, and restored."""
-    cfg = _config("flex_attention")
+    cfg = _config("flex_attention", training = False)
     with torch.no_grad():
         wrapper.fn(config = cfg, input_embeds = _embeds(False), attention_mask = None)
     assert wrapper.calls[-1]["attn_implementation"] == "eager", "swapped for the call"
     assert cfg._attn_implementation == "flex_attention", "and restored afterwards"
 
 
-def test_no_config_still_builds_a_mask(wrapper):
+def test_no_config_still_builds_a_mask(wrapper, flex_absent):
     """Unknown shape of call: prefer a correct mask over a skipped one."""
     with torch.enable_grad():
         got = wrapper.fn(input_embeds = _embeds(True), attention_mask = None)
     assert got == "DENSE_MASK"
 
 
-def test_positional_embeds_are_recognised(wrapper):
+def test_fallback_guess_applies_only_without_a_recorded_flag(wrapper, flex_installed):
+    """No flag (no model forward ran): the grad-shaped guess takes over, so a
+    no_grad call still builds and a grad+requires_grad call still skips."""
+    with torch.no_grad():
+        assert wrapper.fn(config = _config("flex_attention"),
+                          input_embeds = _embeds(True), attention_mask = None) == "DENSE_MASK"
+    with torch.enable_grad():
+        assert wrapper.fn(config = _config("flex_attention"),
+                          input_embeds = _embeds(True),
+                          attention_mask = "RAW_2D_MASK") == "RAW_2D_MASK"
+
+
+def test_positional_embeds_are_recognised(wrapper, flex_installed):
     """4.x passes some of these positionally; the skip must not misfire."""
     with torch.enable_grad():
-        got = wrapper.fn(_config("eager"), _embeds(True))
+        got = wrapper.fn(_config("eager", training = False), _embeds(True))
     assert got == "DENSE_MASK"
