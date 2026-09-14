@@ -45,6 +45,10 @@ SUFFIXES = (".py", ".ipynb")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_PATH = Path(__file__).resolve().parent / "exec_literals_baseline.json"
+# Relative to the repo root, which is where the printed commands are meant to be run
+# from. The bare filename sent a contributor looking for a root-level file that does
+# not exist.
+_BASELINE_REL = BASELINE_PATH.relative_to(REPO_ROOT).as_posix()
 
 # The gate has three distinct red outcomes with three different remedies, and the pytest
 # wrapper used to report all of them as one nameless "the baseline does not match the
@@ -226,7 +230,7 @@ def main() -> int:
             "record it, in two steps:\n"
             "  1. python scripts/lint_exec_literals.py --update\n"
             f"  2. replace the new entr(y/ies)' \"REVIEW ME\" reason in\n"
-            f"     {BASELINE_PATH.name} with why the value is trusted.\n"
+            f"     {_BASELINE_REL} with why the value is trusted.\n"
             "Step 2 is not optional: `--update` writes \"REVIEW ME\", and this gate "
             "stays red on it (see the next check below)."
         )
@@ -243,7 +247,7 @@ def main() -> int:
             print(f"  {f}  {s}")
         print(
             f"\nSay why the value is trusted in the entry's `reason` field in "
-            f"{BASELINE_PATH.name}. This is step 2 after `--update`."
+            f"{_BASELINE_REL}. This is step 2 after `--update`."
         )
         print(f"\n{_VERDICT}unreviewed-entry")
         return 1
