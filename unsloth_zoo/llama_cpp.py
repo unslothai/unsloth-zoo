@@ -294,6 +294,16 @@ def _auto_install_enabled() -> bool:
         in _AUTO_INSTALL_TRUE_VALUES
 
 
+def _stdin_is_usable() -> bool:
+    """Whether sys.stdin still refers to a live descriptor we could have read from."""
+    try:
+        os.fstat(sys.stdin.fileno())
+    except Exception:
+        # None, closed, detached, or a wrapper with no real fd. All mean no one to ask.
+        return False
+    return True
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
 
@@ -388,7 +398,14 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
             # CPython raises RuntimeError for a lost stdout or stderr too.
             if isinstance(exception, RuntimeError) and sys.stdin is not None:
                 raise
-            if isinstance(exception, OSError) and exception.errno != errno.EBADF:
+            # EBADF on its own is not enough. input() writes the prompt to stdout before
+            # it reads, so a closed fd 1 raises EBADF while fd 0 is open, non-tty and
+            # holding an unread answer. Reproduced on CPython: `python -u` with fd 1
+            # closed gives OSError(9) with sys.stdin.closed and isatty() both False.
+            # So ask stdin itself, not the errno.
+            if isinstance(exception, OSError) and (
+                exception.errno != errno.EBADF or _stdin_is_usable()
+            ):
                 raise
             if isinstance(exception, ValueError) and not getattr(sys.stdin, "closed", False):
                 raise

@@ -386,3 +386,51 @@ def test_the_repair_still_runs_when_installing_is_allowed(monkeypatch):
     assert llama_cpp._auto_install_enabled() is True
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
     assert llama_cpp._auto_install_enabled() is False
+
+
+# ------------------------------------------- EBADF must belong to stdin, not to stdout
+
+def test_ebadf_from_a_closed_stdout_is_not_consent(recorder, monkeypatch):
+    """input() writes the prompt before it reads, so a closed fd 1 raises EBADF while fd 0
+    is open, non-tty and holding an unread answer. Reproduced on CPython: `python -u` with
+    fd 1 closed gives OSError(9) with sys.stdin.closed and isatty() both False. Accepting
+    that as an implicit ENTER installs packages while the real answer went unread."""
+    monkeypatch.setattr(
+        builtins, "input",
+        lambda prompt = "": (_ for _ in ()).throw(OSError(errno.EBADF, "Bad file descriptor")),
+    )
+    # A live stdin: not closed, not a tty, and with a real descriptor behind it.
+    monkeypatch.setattr(
+        llama_cpp.sys, "stdin",
+        types.SimpleNamespace(isatty = lambda: False, closed = False, fileno = lambda: 0),
+    )
+    with pytest.raises(OSError):
+        llama_cpp.install_package("cmake", system_type = "debian")
+    assert recorder.calls == [], "consented while stdin still had an answer waiting"
+
+
+def test_ebadf_from_a_genuinely_dead_stdin_is_still_consent(recorder, monkeypatch):
+    """The case the branch exists for must keep working: fd 0 really is gone."""
+    monkeypatch.setattr(
+        builtins, "input",
+        lambda prompt = "": (_ for _ in ()).throw(OSError(errno.EBADF, "Bad file descriptor")),
+    )
+    def _dead_fileno():
+        raise OSError(errno.EBADF, "Bad file descriptor")
+    monkeypatch.setattr(
+        llama_cpp.sys, "stdin",
+        types.SimpleNamespace(isatty = lambda: False, closed = True, fileno = _dead_fileno),
+    )
+    llama_cpp.install_package("cmake", system_type = "debian")
+    assert recorder.calls == ["apt-get install cmake -y"]
+
+
+def test_stdin_is_usable_handles_every_broken_shape(monkeypatch):
+    for stdin in (
+        None,
+        types.SimpleNamespace(),                                  # no fileno at all
+        types.SimpleNamespace(fileno = lambda: (_ for _ in ()).throw(ValueError("closed"))),
+        types.SimpleNamespace(fileno = lambda: -1),
+    ):
+        monkeypatch.setattr(llama_cpp.sys, "stdin", stdin)
+        assert llama_cpp._stdin_is_usable() is False, stdin
