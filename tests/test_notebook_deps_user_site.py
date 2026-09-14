@@ -67,14 +67,25 @@ def test_a_user_install_puts_the_new_directory_on_sys_path(fresh_user_site):
     )
 
 
-def test_an_install_without_user_leaves_sys_path_alone(fresh_user_site):
-    """Non-vacuity, and the blast radius: only a --user install may touch sys.path."""
-    before = list(sys.path)
+def test_an_install_without_user_still_refreshes_the_user_site(fresh_user_site):
+    """This used to assert the opposite, that only a --user install may touch sys.path.
+
+    That premise is wrong, because the flag is not what decides where pip installs.
+    decide_user_install (pip/_internal/commands/install.py) returns True whenever
+    site_packages_writable() is False, logging "Defaulting to user installation because
+    normal site-packages is not writeable". And we never pass --user on Windows at all:
+    the writability probe in _pip_command is gated on os.geteuid, which does not exist
+    there. So a non-admin Windows install into Program Files takes pip's silent
+    fallback, lands in %APPDATA%\\Python, and stays off sys.path, which made a
+    successful install read as a failed one."""
+    assert str(fresh_user_site) not in sys.path, "precondition: it is not there yet"
 
     ok, _ = notebook_deps._run_install("snac", ["pip", "install", "snac"])
 
     assert ok
-    assert sys.path == before
+    assert str(fresh_user_site) in sys.path, (
+        "pip chose a user install on its own and we never exposed the directory"
+    )
 
 
 def test_a_disabled_user_site_is_not_overridden(fresh_user_site, monkeypatch):
@@ -115,3 +126,47 @@ def test_the_stdlib_really_gates_on_the_directory_existing():
     body = src[src.index("def addusersitepackages"):]
     body = body[: body.index("\ndef ", 1)]
     assert "os.path.isdir(user_site)" in body, body
+
+
+def test_user_site_is_refreshed_even_without_an_explicit_user_flag(monkeypatch):
+    """pip can choose a user install by itself, and we would never notice.
+
+    decide_user_install (pip/_internal/commands/install.py) returns True whenever
+    site_packages_writable() is False, logging "Defaulting to user installation
+    because normal site-packages is not writeable". We never pass --user on Windows,
+    because the writability probe is gated on os.geteuid, which does not exist there.
+    So a non-admin Windows install into Program Files takes pip's silent fallback and
+    the package lands somewhere that is not on sys.path, making a successful install
+    look like a failed one."""
+    import subprocess
+    import types
+
+    import unsloth_zoo.temporary_patches.notebook_deps as nd
+
+    called = []
+    monkeypatch.setattr(nd, "_add_user_site", lambda: called.append(True))
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, *a, **k: types.SimpleNamespace(returncode = 0, stdout = "", stderr = ""),
+    )
+    # No --user anywhere in the command, exactly as on Windows.
+    ok, retry = nd._run_install("einops", ["python", "-m", "pip", "install", "einops"])
+    assert ok is True and retry is False
+    assert called, "a successful install did not refresh the user site directory"
+
+
+def test_user_site_is_not_refreshed_after_a_failed_install(monkeypatch):
+    """The control. Nothing was installed, so there is nothing new to expose."""
+    import subprocess
+    import types
+
+    import unsloth_zoo.temporary_patches.notebook_deps as nd
+
+    called = []
+    monkeypatch.setattr(nd, "_add_user_site", lambda: called.append(True))
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda cmd, *a, **k: types.SimpleNamespace(returncode = 1, stdout = "", stderr = "boom"),
+    )
+    nd._run_install("einops", ["python", "-m", "pip", "install", "einops"])
+    assert not called

@@ -225,8 +225,16 @@ def _run_install(pkg: str, cmd: list) -> tuple:
         return False, False
     if r.returncode == 0:
         importlib.invalidate_caches()
-        if "--user" in cmd:
-            _add_user_site()
+        # Unconditionally, not just when we passed --user. pip decides on its own:
+        # decide_user_install (pip/_internal/commands/install.py) returns True whenever
+        # site_packages_writable() is False, logging "Defaulting to user installation
+        # because normal site-packages is not writeable". We never pass --user on
+        # Windows at all, because the probe above is gated on os.geteuid, which does not
+        # exist there. So a non-admin Windows install into Program Files takes pip's
+        # silent fallback, lands in %APPDATA%\Python, and stays off sys.path if the
+        # directory did not exist at interpreter start, leaving the install "successful"
+        # and the import still broken.
+        _add_user_site()
         try:
             list(importlib.metadata.distributions())
         except Exception:
