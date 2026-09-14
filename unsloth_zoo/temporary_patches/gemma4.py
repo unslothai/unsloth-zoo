@@ -1238,3 +1238,30 @@ def patch_Gemma4MultimodalEmbedder_forward():
         return raise_error("Gemma4MultimodalEmbedder.forward", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4MultimodalEmbedder_forward)
+
+
+def patch_Gemma4_static_cache_backport(phase = "post_compile"):
+    """#6028 backport for installs whose unsloth still forces a static cache.
+
+    A static cache makes transformers skip mask materialisation at prefill, which
+    drops Gemma's bidirectional image block overlay, so image tokens attend
+    causally. Current unsloth gates this per request; older ones consult only
+    `_supports_static_cache` (models/vision.py), so clear it on the Gemma 4
+    generation classes. That costs text-only generation the static cache too,
+    hence the guard below: it runs only when unsloth has no gate of its own.
+    """
+    if phase != "post_compile": return
+    # unsloth_zoo must not import unsloth, so look in sys.modules only. Absent
+    # means it is too early to tell, and doing nothing is the safe answer.
+    vision = sys.modules.get("unsloth.models.vision")
+    if vision is None or hasattr(vision, "_needs_bidirectional_multimodal_mask"): return
+    for name in ("gemma4", "gemma4_unified"):
+        module = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
+        if module is None: continue
+        for obj in vars(module).values():
+            # Only the classes that build the overlay, i.e. those that override
+            # create_masks_for_generate. Causal VLMs keep the static path.
+            if isinstance(obj, type) and "create_masks_for_generate" in vars(obj):
+                obj._supports_static_cache = False
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4_static_cache_backport)
