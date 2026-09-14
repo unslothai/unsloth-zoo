@@ -108,8 +108,8 @@ def test_engine_arg_is_set_only_when_flashinfer_was_rejected():
     instead of falling through. Setting it unconditionally would break hosts
     where FlashInfer works, and ROCm, which never reaches the blocker."""
     source = inspect.getsource(vllm_utils.load_vllm)
-    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():" in source
-    guard = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():")
+    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable()" in source
+    guard = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable()")
     assign = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
     assert guard < assign, "the assignment is not behind the guard"
 
@@ -216,9 +216,10 @@ def test_an_unknown_device_does_not_get_a_hard_pin(monkeypatch):
 
 
 def test_the_engine_arg_is_gated_on_the_capability_check():
-    """Both conditions, not just the pre-flight verdict."""
+    """Both conditions, not just the pre-flight verdict. The MLA arm is asserted
+    separately below; this one pins the device check."""
     source = inspect.getsource(vllm_utils.load_vllm)
-    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():" in source
+    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable()" in source
 
 
 def test_installed_vllm_still_requires_sm80_for_flash_attn():
@@ -288,3 +289,53 @@ def test_return_args_does_not_leave_flashinfer_blocked():
     assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in window
     unblock = window.index("_unblock_flashinfer_import()")
     assert unblock < window.index("return engine_args"), "restore must precede the return"
+
+
+# ------------------------------------------------- MLA models need an MLA backend
+
+def test_an_mla_config_is_not_pinned_to_flash_attn(monkeypatch):
+    """Under MLA the priority list in platforms/cuda.py holds only MLA backends, and the
+    base validate_configuration rejects any backend whose is_mla() disagrees with use_mla.
+    An explicit backend is a hard requirement, so pinning the non-MLA FLASH_ATTN on
+    DeepSeek-V2/V3 turns a working run into a startup error."""
+    monkeypatch.delenv("VLLM_MLA_DISABLE", raising = False)
+    deepseek = types.SimpleNamespace(kv_lora_rank = 512)
+    assert vllm_utils._config_uses_mla(deepseek) is True
+
+    # Also when it sits on a nested text_config, which is how the multimodal ones carry it.
+    nested = types.SimpleNamespace(text_config = types.SimpleNamespace(kv_lora_rank = 512))
+    assert vllm_utils._config_uses_mla(nested) is True
+
+
+def test_an_ordinary_config_is_still_eligible_for_the_pin(monkeypatch):
+    monkeypatch.delenv("VLLM_MLA_DISABLE", raising = False)
+    llama = types.SimpleNamespace(hidden_size = 4096, num_attention_heads = 32)
+    assert vllm_utils._config_uses_mla(llama) is False
+    nested = types.SimpleNamespace(text_config = types.SimpleNamespace(hidden_size = 4096))
+    assert vllm_utils._config_uses_mla(nested) is False
+
+
+def test_vllm_mla_disable_turns_the_path_off(monkeypatch):
+    """With MLA disabled vLLM takes the ordinary path, so the pin is valid again."""
+    monkeypatch.setenv("VLLM_MLA_DISABLE", "1")
+    assert vllm_utils._config_uses_mla(types.SimpleNamespace(kv_lora_rank = 512)) is False
+
+
+def test_an_unreadable_config_is_assumed_to_be_mla(monkeypatch):
+    """The only cost of a false positive is that vLLM picks its own backend, which is
+    what it would do without the pin anyway. A false negative is a startup error."""
+    monkeypatch.delenv("VLLM_MLA_DISABLE", raising = False)
+
+    class _Hostile:
+        def __getattr__(self, name):
+            raise RuntimeError("config is not readable")
+
+    assert vllm_utils._config_uses_mla(_Hostile()) is True
+
+
+def test_the_pin_is_gated_on_both_the_device_and_the_config():
+    source = inspect.getsource(vllm_utils.load_vllm)
+    marker = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
+    guard = source[source.rindex("if ", 0, marker):marker]
+    assert "_flash_attn_is_selectable()" in guard
+    assert "_config_uses_mla(config)" in guard, "the MLA check is not on the pin's guard"

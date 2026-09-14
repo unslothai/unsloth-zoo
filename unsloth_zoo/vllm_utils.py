@@ -2313,6 +2313,29 @@ def _block_flashinfer_import():
         pass
 
 
+def _config_uses_mla(config) -> bool:
+    """Whether vLLM will take its MLA attention path for this model.
+
+    Under MLA the backend priority list in platforms/cuda.py contains only MLA backends
+    (FLASHMLA, FLASHINFER_MLA, TRITON_MLA, CUTLASS_MLA, ...), and the base
+    validate_configuration rejects any backend whose is_mla() disagrees with use_mla with
+    "MLA not supported". Since an explicit backend is a hard requirement, pinning the
+    non-MLA FLASH_ATTN on DeepSeek-V2/V3 would turn a working run into a startup error.
+
+    `kv_lora_rank` is the signal vLLM itself keys on, and VLLM_MLA_DISABLE turns the whole
+    path off. Anything unreadable is treated as MLA, because the only cost of a false
+    positive is that vLLM picks its own backend, which is what it would do anyway."""
+    try:
+        if os.environ.get("VLLM_MLA_DISABLE", "0") not in ("0", ""):
+            return False
+        text_config = getattr(config, "text_config", None) or config
+        if getattr(text_config, "kv_lora_rank", None) is not None:
+            return True
+        return getattr(config, "kv_lora_rank", None) is not None
+    except Exception:
+        return True
+
+
 def _flash_attn_is_selectable() -> bool:
     """Whether pinning FLASH_ATTN is safe on this device.
 
@@ -3195,7 +3218,8 @@ def load_vllm(
         # it is not an XPU backend at all. Restrict the pin to CUDA sm_80+, which covers
         # the Blackwell case this exists for; everywhere else the sys.modules block still
         # applies and vLLM picks its own compatible fallback.
-        if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():
+        if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable() \
+                and not _config_uses_mla(config):
             engine_args["attention_backend"] = "FLASH_ATTN"
 
         # Older vLLM has no such arg; the filter below drops unknown keys, so this is a
