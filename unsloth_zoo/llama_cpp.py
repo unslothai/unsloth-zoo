@@ -2857,7 +2857,13 @@ def convert_to_gguf(
 
                 # Self-heal: reinstall the converter deps (command[0] = its
                 # interpreter) and retry once instead of failing.
-                if not attempted_repair and _looks_like_converter_dep_error(captured):
+                # `_auto_install_enabled` gates this too: the repair runs pip with
+                # --upgrade --force-reinstall, so it mutates the environment just as much
+                # as the installer does. An existing checkout returns out of
+                # install_llama_cpp before its gate, so this is the one remaining way a
+                # refusal could still reach pip.
+                if (not attempted_repair and _auto_install_enabled()
+                        and _looks_like_converter_dep_error(captured)):
                     attempted_repair = True
                     try:
                         repair = _reinstall_converter_deps(command[0], print_output = print_output)

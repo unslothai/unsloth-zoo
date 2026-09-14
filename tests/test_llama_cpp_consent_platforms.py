@@ -363,3 +363,26 @@ def test_a_corrupted_folder_is_still_wiped_when_installing_is_allowed(monkeypatc
 
     assert seen.get("reached_install"), "never got past the wipe"
     assert not folder.exists(), "the corrupted folder was not re-cloned from scratch"
+
+
+def test_the_converter_repair_honours_the_opt_out(monkeypatch):
+    """An existing working checkout returns out of install_llama_cpp before its gate, so
+    the converter self-heal was the one remaining way a refusal still reached pip. It runs
+    `pip install --upgrade --force-reinstall`, which mutates the environment as much as
+    any install does."""
+    import inspect as _inspect
+    src = _inspect.getsource(llama_cpp)
+    call = src.index("_reinstall_converter_deps(command[0]")
+    guard = src.rindex("_auto_install_enabled()", 0, call)
+    between = src[guard:call]
+    assert "_looks_like_converter_dep_error" in between, (
+        "the opt-out is not checked on the path that reaches the repair"
+    )
+
+
+def test_the_repair_still_runs_when_installing_is_allowed(monkeypatch):
+    """The gate must not disable the self-heal for everyone else."""
+    monkeypatch.delenv("UNSLOTH_AUTO_INSTALL", raising = False)
+    assert llama_cpp._auto_install_enabled() is True
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    assert llama_cpp._auto_install_enabled() is False
