@@ -2559,6 +2559,15 @@ def patch_GptOssModel():
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
     import transformers.generation.utils
+    def _find_config(args, kwargs):
+        config = kwargs.get("config", None)
+        if config is None:
+            for arg in args:
+                if hasattr(arg, "_attn_implementation"):
+                    config = arg
+                    break
+        return config
+
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
             input_embeds = kwargs.get("input_embeds", None)
@@ -2570,7 +2579,21 @@ def patch_GptOssModel():
                         input_embeds = arg
                         break
 
-            if input_embeds is not None and input_embeds.requires_grad:
+            # Skipping the dense mask is only safe when flex attention is about to
+            # build its own BlockMask and ignore this one. `requires_grad` alone
+            # does NOT mean training: unsloth calls enable_input_require_grads()
+            # on every LoRA-capable load, so embeddings require grad during
+            # inference too, and skipping there hands eager attention a None mask,
+            # i.e. no causal masking at all -- fluent but wrong output.
+            _config = _find_config(args, kwargs)
+            _is_flex = getattr(_config, "_attn_implementation", None) == "flex_attention"
+
+            if (
+                _is_flex
+                and torch.is_grad_enabled()
+                and input_embeds is not None
+                and input_embeds.requires_grad
+            ):
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:
@@ -2591,21 +2614,13 @@ def patch_GptOssModel():
                 #       'Tensor' and 'BlockMask'
                 # Temporarily swap to eager so the factory returns a dense
                 # 4D float mask (0 / -inf) the eager path can consume.
-                config = kwargs.get("config", None)
-                if config is None:
-                    for arg in args:
-                        if hasattr(arg, "_attn_implementation"):
-                            config = arg
-                            break
-                if config is not None and getattr(
-                    config, "_attn_implementation", None
-                ) == "flex_attention":
-                    original_impl = config._attn_implementation
-                    config._attn_implementation = "eager"
+                if _is_flex:
+                    original_impl = _config._attn_implementation
+                    _config._attn_implementation = "eager"
                     try:
                         return f(*args, **kwargs)
                     finally:
-                        config._attn_implementation = original_impl
+                        _config._attn_implementation = original_impl
                 return f(*args, **kwargs)
             pass
         return return_attention_mask
