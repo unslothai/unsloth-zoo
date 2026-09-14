@@ -42,9 +42,9 @@ from unsloth_zoo.temporary_patches.gpt_oss import (
 )
 
 
-# The assert as the affected build actually writes it (triton_kernels @ 0add6826,
-# matmul_ogs_details/_matmul_ogs.py:107-114), kept verbatim so a rewrite upstream
-# shows up here as a failing fixture rather than as silent under-detection.
+# Verbatim from the affected build (triton_kernels @ 0add6826,
+# matmul_ogs_details/_matmul_ogs.py:107-114), so an upstream rewrite fails here
+# rather than silently under-detecting.
 HOPPER_ONLY_SOURCE = '''
 @triton.jit
 def _matmul_ogs(Y, X, W, stride_w_k, WMxScale, SWIZZLE_MX_VALUE: tl.constexpr,
