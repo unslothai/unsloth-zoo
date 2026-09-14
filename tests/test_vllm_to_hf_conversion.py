@@ -1361,3 +1361,20 @@ def test_patch_gemma4_vllm_k_eq_v_support_noop_when_private_attr_missing():
                 _sys.modules.pop(name, None)
             else:
                 _sys.modules[name] = prev
+
+
+def test_rotary_pos_emb_reinit_handles_both_signatures():
+    """Qwen2.5-VL / Qwen3-VL's VisionRotaryEmbedding takes a positional dim, Qwen3.5's
+    Qwen3_5VisionRotaryEmbedding takes the vision config. Calling the config form with a
+    dim raised `'int' object has no attribute 'rope_parameters'` and killed every
+    Qwen3.5 fast_inference load, so both shapes have to be tried and an unknown one has
+    to warn rather than abort."""
+    from unsloth_zoo import empty_model
+    src = inspect.getsource(empty_model.finalize_huggingface_model)
+    start = src.index("rotary_class = module.rotary_pos_emb.__class__")
+    block = src[start : start + 900]
+    assert "head_dim//2" in block, "the positional-dim call the VL models need is gone"
+    assert "config = vision_config" in block, "no config fallback for Qwen3.5"
+    assert "skipped rotary_pos_emb reinit" in block, "an unknown signature still aborts the load"
+    # the dim form must be attempted first, so the VL models keep their exact call
+    assert block.index("head_dim//2") < block.index("config = vision_config")

@@ -894,8 +894,23 @@ def finalize_huggingface_model(
                         f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
                     )
             if hasattr(module, "rotary_pos_emb") and vision_config is not None:
-                head_dim = vision_config.hidden_size // vision_config.num_heads
-                module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+                # Qwen2.5-VL / Qwen3-VL take a positional dim; Qwen3.5's
+                # Qwen3_5VisionRotaryEmbedding takes the vision config instead. Try the
+                # dim first so the VL models keep the exact call they had, and warn
+                # rather than abort the load on a signature we do not know.
+                rotary_class = module.rotary_pos_emb.__class__
+                try:
+                    head_dim = vision_config.hidden_size // vision_config.num_heads
+                    module.rotary_pos_emb = rotary_class(head_dim//2).to(target_device)
+                except Exception:
+                    try:
+                        module.rotary_pos_emb = rotary_class(
+                            config = vision_config, device = target_device,
+                        )
+                    except Exception as rotary_reinit_error:
+                        logger.warning(
+                            f"Unsloth: skipped rotary_pos_emb reinit for {module_name}: {rotary_reinit_error}"
+                        )
             if hasattr(module, "rotary_emb_local"):
                 if local_rope_config is None:
                     local_rope_config = deepcopy(text_config)
