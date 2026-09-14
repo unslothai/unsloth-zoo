@@ -116,10 +116,8 @@ _REMEDIES = {
 def test_the_baseline_matches_the_tree_it_was_recorded_against():
     """A stale entry silently re-permits whatever lands on that digest next.
 
-    This runs the whole gate, which has three different red outcomes with three
-    different remedies. Reporting them as one nameless failure sent a contributor who
-    had merely deleted an `exec` looking for a security review they did not need, so
-    read the verdict back and say which one it was.
+    Runs the whole gate, so read its verdict back: reported as one nameless failure, a
+    deleted `exec` sends the contributor looking for a review they do not need.
     """
     proc = subprocess.run(
         [sys.executable, str(SCRIPT)], capture_output = True, text = True, cwd = SCRIPT.parents[1]

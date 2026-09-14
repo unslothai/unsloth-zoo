@@ -45,15 +45,10 @@ SUFFIXES = (".py", ".ipynb")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_PATH = Path(__file__).resolve().parent / "exec_literals_baseline.json"
-# Relative to the repo root, which is where the printed commands are meant to be run
-# from. The bare filename sent a contributor looking for a root-level file that does
-# not exist.
+# Repo-relative: the printed commands run from the root, where the bare filename is not a file.
 _BASELINE_REL = BASELINE_PATH.relative_to(REPO_ROOT).as_posix()
 
-# The gate has three distinct red outcomes with three different remedies, and the pytest
-# wrapper used to report all of them as one nameless "the baseline does not match the
-# tree". Printed on the last line so a caller can say which one fired without parsing
-# the prose above it.
+# Last line, so a caller names which of the three red outcomes fired without parsing the prose.
 _VERDICT = "verdict: "
 
 # Not part of any commit, or not ours to fail on. `tests` is excluded because a test
