@@ -230,6 +230,33 @@ def test_ordinary_lifted_functions_still_compile(name):
     assert calls_mask_creation_function(inspect.getsource(function)) == []
 
 
+def test_disable_compile_functions_outranks_the_mask_rule():
+    """`@torch.compiler.disable` is a stronger guarantee than no decorator.
+
+    No decorator only stops us compiling the function; the disable decorator also
+    stops Dynamo inlining it into a compiled caller. A name on
+    DISABLE_COMPILE_FUNCTIONS is an explicit instruction to emit that decorator, so
+    a mask call inside it must not silently downgrade to 'emit bare'. Nothing on
+    the list builds masks today, which is exactly why this needs pinning."""
+    source = inspect.getsource(compiler_module)
+
+    # Loop B: the mask rule is skipped for a listed name, so the branch below that
+    # emits @torch.compiler.disable is still reached.
+    assert "if not bad and module not in disable_compile_functions:" in source, (
+        "the copy loop applies the mask rule to names in DISABLE_COMPILE_FUNCTIONS, "
+        "so such a function is emitted bare instead of with "
+        "@torch.compiler.disable(recursive = False) and can be inlined into a "
+        "compiled caller"
+    )
+
+    # Loop A: membership is tested before the mask branch.
+    fixup = source.index("_mask_builders = calls_mask_creation_function(")
+    window = source[fixup:fixup + 400]
+    assert window.index("if module in disable_compile_functions:") < window.index(
+        "elif len(_mask_builders) != 0:"
+    ), "the signature-fixup loop tests the mask rule before DISABLE_COMPILE_FUNCTIONS"
+
+
 def test_both_standalone_emit_sites_consult_the_detector():
     """Miss one and a mask builder is stamped fullgraph again from the other path."""
     source = inspect.getsource(compiler_module)

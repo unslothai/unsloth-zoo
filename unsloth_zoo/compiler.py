@@ -6055,7 +6055,12 @@ def unsloth_compile_transformers(
             # A mask builder branches on tensor values, so it cannot be captured
             # whole. Checked by call rather than by source substring, which is how
             # Gemma3 escaped DISABLED_KEYWORDS when transformers added a kwarg.
-            if not bad:
+            # Not applied to a name in DISABLE_COMPILE_FUNCTIONS: that list is an
+            # explicit instruction to emit `@torch.compiler.disable`, which is a
+            # stronger guarantee than no decorator (it also stops Dynamo inlining
+            # the function into a compiled caller), so it must not be downgraded.
+            # Nothing on that list builds masks today; this keeps it true if one does.
+            if not bad and module not in disable_compile_functions:
                 mask_builders = calls_mask_creation_function(source)
                 if len(mask_builders) != 0:
                     bad = True
