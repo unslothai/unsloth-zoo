@@ -33,7 +33,9 @@ from __future__ import annotations
 import importlib
 import inspect
 import multiprocessing as mp
+import contextlib
 import sys
+import types
 
 import pytest
 
@@ -233,3 +235,43 @@ def test_installed_vllm_still_requires_sm80_for_flash_attn():
     text = fa.read_text()
     assert "supports_compute_capability" in text
     assert "DeviceCapability(8, 0)" in text
+
+
+# ------------------------------------------------- the block follows the engine lifecycle
+
+def test_delete_vllm_hands_flashinfer_back(monkeypatch):
+    """The block protects an engine. Once the engine is deleted there is nothing left to
+    protect, and an unrelated `import flashinfer` in the same session should work again."""
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    vllm_utils._block_flashinfer_import()
+    assert sys.modules.get("flashinfer") is None, "precondition: the block is on"
+    monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_UNUSABLE", True, raising = False)
+
+    # delete_vllm's real teardown needs a live distributed environment, which this host
+    # does not have. The unblock runs first precisely so a failing teardown cannot skip it.
+    with contextlib.suppress(Exception):
+        vllm_utils.delete_vllm()
+
+    assert sys.modules.get("flashinfer") is not None, "flashinfer is still hidden"
+    assert vllm_utils._UNSLOTH_FLASHINFER_UNUSABLE is False
+
+
+def test_the_unblock_is_the_first_thing_delete_vllm_does():
+    """Ordering is the whole point: the teardown below it can raise."""
+    source = inspect.getsource(vllm_utils.delete_vllm)
+    body = [line.strip() for line in source.splitlines() if line.strip()
+            and not line.strip().startswith("#")]
+    # body[0] is the def line.
+    assert "_unblock_flashinfer_import()" in body[:4], body[:5]
+
+
+def test_a_failed_load_vllm_restores_flashinfer():
+    """A startup error leaves no engine, so keeping the module hidden for the rest of the
+    session buys nothing and breaks unrelated code."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    assert "except BaseException:" in source, "no restore arm on the failure path"
+    restore = source.index("except BaseException:")
+    tail = source[restore:restore + 600]
+    assert "_unblock_flashinfer_import()" in tail
+    assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in tail
+    assert "raise" in tail, "the original error must still propagate"

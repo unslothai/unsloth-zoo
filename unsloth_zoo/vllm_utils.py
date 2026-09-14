@@ -3316,6 +3316,14 @@ def load_vllm(
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
 
+    except BaseException:
+        # The block exists to protect an engine. If we never got one, there is nothing to
+        # protect, and leaving flashinfer hidden would break an unrelated later import in
+        # the same session for no reason. A successful load keeps the block, because vLLM
+        # imports FlashInfer lazily at run time, long after the engine is built.
+        _unblock_flashinfer_import()
+        _UNSLOTH_FLASHINFER_UNUSABLE = False
+        raise
     finally:
         unpatch_vllm_compute_dtype(BitsAndBytesConfig)
 
@@ -3627,6 +3635,12 @@ pass
 
 
 def delete_vllm(llm = None):
+    # The engine the block was protecting is going away, so hand flashinfer back to the
+    # session. Done first: the teardown below can raise, and the caller who asked for the
+    # engine to be deleted should not be left with a hidden module either way.
+    global _UNSLOTH_FLASHINFER_UNUSABLE
+    _unblock_flashinfer_import()
+    _UNSLOTH_FLASHINFER_UNUSABLE = False
     # From https://github.com/vllm-project/vllm/issues/1908
     from vllm.distributed.parallel_state import (
         destroy_model_parallel,
