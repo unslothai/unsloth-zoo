@@ -37,7 +37,8 @@ def _module_source_text() -> str:
 
 
 def _load_vllm_node() -> ast.FunctionDef:
-    for node in ast.walk(ast.parse(_module_source_text())):
+    tree = ast.parse(_module_source_text())
+    for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "load_vllm":
             return node
     raise AssertionError("load_vllm is gone from unsloth_zoo/vllm_utils.py")
@@ -61,8 +62,8 @@ def _engine_args_value(load_vllm : ast.FunctionDef, keyword : str) -> str:
     """The variable passed as `keyword` in `engine_args = dict(...)`."""
     for node in ast.walk(load_vllm):
         if not isinstance(node, ast.Assign): continue
-        if not any(isinstance(t, ast.Name) and t.id == "engine_args" for t in node.targets):
-            continue
+        if not any(isinstance(t, ast.Name) and t.id == "engine_args"
+                   for t in node.targets): continue
         assert isinstance(node.value, ast.Call), "engine_args is no longer a dict(...) call"
         for kw in node.value.keywords:
             if kw.arg != keyword: continue
@@ -97,6 +98,6 @@ def test_no_second_chunked_prefill_variable_is_computed_and_dropped():
         if isinstance(target, ast.Name)
     }
     assert "chunked_prefill_tokens" not in assigned, (
-        "chunked_prefill_tokens is back; if it is used again it must reach vLLM, "
-        "not just the log line"
+        "chunked_prefill_tokens is back; if it is ever used again it must reach "
+        "vLLM, not just the log line"
     )
