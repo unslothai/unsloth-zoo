@@ -84,12 +84,86 @@ def test_marker_in_the_norm_itself_still_upcasts(precision_flag):
     assert precision_flag() == "1"
 
 
-def test_a_norm_class_with_nothing_after_it_is_still_read(precision_flag):
-    # find() returns -1 when the norm class ends the file, which used to slice off the last
-    # character instead of reading to the end.
-    upcasting_norm = FLOAT16_NORM.replace(
-        "return output * self.weight", "return output * self.weight.float()"
+def test_a_marker_in_the_next_class_can_also_suppress_a_real_upcast(precision_flag):
+    # The leak runs both ways. The marker ladder is priority ordered, so a higher priority
+    # float16 marker next door hides a norm that really does want float32. Qwen4Exp is the
+    # live case: its own forward is `output * (1.0 + self.weight.float())`, but
+    # Qwen4ExpTextRMSNormGated next to it contains `self.weight * hidden_states.to(`,
+    # which is checked first. Before the fix this model silently lost its upcast.
+    float32_norm = FLOAT16_NORM.replace(
+        "return output * self.weight", "return output * (1.0 + self.weight.float())"
     )
-    higher_precision_layernorms(upcasting_norm + TRAILING_CLASS)
+    float16_marker_neighbour = """
+
+class Llama4TextRMSNormGated(nn.Module):
+    def forward(self, hidden_states, gate):
+        return self.weight * hidden_states.to(input_dtype)
+"""
+    higher_precision_layernorms(float32_norm + float16_marker_neighbour + TRAILING_CLASS)
 
     assert precision_flag() == "1"
+
+
+def test_decorated_next_class_does_not_leak_either(precision_flag):
+    # The next class is usually introduced by a decorator, so the slice has to stop at the
+    # "\nclass" and not at the decorator. Kimi Linear and Cohere2 MoE both look like this.
+    decorated_neighbour = '''
+
+@use_kernel_forward_from_hub("RMSNormGated")
+class Llama4TextRMSNormGated(nn.Module):
+    def forward(self, hidden_states):
+        return self.weight.to(torch.float32) * hidden_states
+'''
+    higher_precision_layernorms(FLOAT16_NORM + decorated_neighbour + TRAILING_CLASS)
+
+    assert precision_flag() == "0"
+
+
+def test_the_norm_class_is_read_in_full(precision_flag):
+    # The narrower slice must still cover the whole norm class, including anything after
+    # forward(). A marker in the last method of the norm class still has to count.
+    norm_with_trailing_method = FLOAT16_NORM + """
+    def extra_repr(self):
+        scale = self.weight.float()
+        return f"{tuple(self.weight.shape)}"
+"""
+    higher_precision_layernorms(norm_with_trailing_method + TRAILING_CLASS)
+
+    assert precision_flag() == "1"
+
+
+def test_the_flag_is_never_downgraded(precision_flag, monkeypatch):
+    # unsloth/models/loader.py hardcodes "1" for Gemma 3/3n/4 and Granite-4 before the
+    # compiler ever runs. Narrowing the slice must not be able to turn those back off.
+    monkeypatch.setitem(os.environ, "UNSLOTH_HIGH_PRECISION_LAYERNORM", "1")
+    higher_precision_layernorms(FLOAT16_NORM + FLOAT32_MARKER_NEIGHBOUR + TRAILING_CLASS)
+
+    assert precision_flag() == "1"
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        # Regressions caught by the old slice, pinned against the real transformers source.
+        ("cohere2_moe", "0"),  # Cohere2MoeLayerNorm next door leaked self.weight.to(torch.float32)
+        ("kimi_linear", "0"),  # KimiLinearRMSNormGated next door leaked the same marker
+        ("qwen4_exp", "1"),  # its own float32 norm was masked by the gated norm next door
+        # Controls that the old slice already got right.
+        ("llama4", "0"),
+        ("llama", "0"),
+        ("gemma3", "1"),
+        ("olmo2", "1"),  # (self.weight * hidden_states).to(input_dtype): weight used in float32
+    ],
+)
+def test_real_transformers_sources(precision_flag, model, expected):
+    import importlib
+    import inspect
+
+    try:
+        module = importlib.import_module(f"transformers.models.{model}.modeling_{model}")
+    except ImportError:
+        pytest.skip(f"transformers has no {model}")
+
+    higher_precision_layernorms(inspect.getsource(module))
+
+    assert precision_flag() == expected
