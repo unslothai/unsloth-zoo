@@ -46,6 +46,12 @@ SUFFIXES = (".py", ".ipynb")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BASELINE_PATH = Path(__file__).resolve().parent / "exec_literals_baseline.json"
 
+# The gate has three distinct red outcomes with three different remedies, and the pytest
+# wrapper used to report all of them as one nameless "the baseline does not match the
+# tree". Printed on the last line so a caller can say which one fired without parsing
+# the prose above it.
+_VERDICT = "verdict: "
+
 # Not part of any commit, or not ours to fail on. `tests` is excluded because a test
 # legitimately keeps a real `exec` around as the thing it is asserting about.
 EXCLUDED_PARTS = frozenset({
@@ -217,8 +223,14 @@ def main() -> int:
             print(f"  {f}:{lines[(f, s, d)]}  {s}(...) is handed a value that is not written out")
         print(
             "\nEither pass a written-out string, or - if the value really is trusted - "
-            "record it with `--update` and say why in the pull request."
+            "record it, in two steps:\n"
+            "  1. python scripts/lint_exec_literals.py --update\n"
+            f"  2. replace the new entr(y/ies)' \"REVIEW ME\" reason in\n"
+            f"     {BASELINE_PATH.name} with why the value is trusted.\n"
+            "Step 2 is not optional: `--update` writes \"REVIEW ME\", and this gate "
+            "stays red on it (see the next check below)."
         )
+        print(f"\n{_VERDICT}new-call-site")
         return 1
 
     unreviewed = sorted(
@@ -229,19 +241,30 @@ def main() -> int:
         print(f"{len(unreviewed)} baseline entr(y/ies) carry no justification:\n")
         for f, s in unreviewed:
             print(f"  {f}  {s}")
-        print("\nSay why the value is trusted in the entry's `reason` field.")
+        print(
+            f"\nSay why the value is trusted in the entry's `reason` field in "
+            f"{BASELINE_PATH.name}. This is step 2 after `--update`."
+        )
+        print(f"\n{_VERDICT}unreviewed-entry")
         return 1
 
     stale = sorted(k for k in allowed if k not in observed)
     if stale:
         # A baseline that outlives its call site quietly re-permits whatever lands on
         # that digest next, so it is an error rather than a note.
-        print(f"{len(stale)} baseline entr(y/ies) no longer match any call. Run --update:\n")
+        print(f"{len(stale)} baseline entr(y/ies) no longer match any call:\n")
         for f, s, d in stale:
             print(f"  {f}  {s}  {d}")
+        print(
+            "\nYou removed or rewrote a dynamic-execution call, which is a good thing and "
+            "needs no review. Just run `python scripts/lint_exec_literals.py --update` to "
+            "drop the entries; nothing here asks you to justify anything."
+        )
+        print(f"\n{_VERDICT}stale-entry")
         return 1
 
     print(f"ok: {len(found)} dynamic-execution call site(s), all recorded")
+    print(f"\n{_VERDICT}ok")
     return 0
 
 
