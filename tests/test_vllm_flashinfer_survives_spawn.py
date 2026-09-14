@@ -286,7 +286,7 @@ def test_return_args_does_not_leave_flashinfer_blocked():
     still travels in engine_args, so the caller keeps the decision."""
     source = inspect.getsource(vllm_utils.load_vllm)
     marker = source.index("if return_args:")
-    window = source[marker:marker + 700]
+    window = source[marker:marker + 1400]
     assert "_unblock_flashinfer_import()" in window, "the dry-run exit leaks the block"
     assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in window
     unblock = window.index("_unblock_flashinfer_import()")
@@ -378,3 +378,24 @@ def test_triton_mla_is_a_real_backend_with_no_nvcc_requirement():
         assert "return True" in text[capability:capability + 200], (
             "TRITON_MLA now restricts compute capability, so the pin needs re-checking"
         )
+
+
+def test_the_dry_run_unblock_is_skipped_when_the_arg_was_filtered():
+    """On an older vLLM whose EngineArgs has no attention_backend, the compatibility
+    filter drops the key, so unblocking would leave the caller with no exclusion at all
+    and vLLM free to select FlashInfer again. A hidden module is the lesser harm."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    marker = source.index("if return_args:")
+    window = source[marker:marker + 900]
+    guard = window.index('"attention_backend" in engine_args')
+    unblock = window.index("_unblock_flashinfer_import()")
+    assert guard < unblock, "the unblock is not gated on the argument surviving"
+    assert "not _UNSLOTH_FLASHINFER_UNUSABLE or" in window, (
+        "a run that never blocked anything should still unblock harmlessly"
+    )
+
+
+def test_the_filter_runs_before_the_dry_run_exit():
+    """The gate reads engine_args AFTER filtering, so the order matters."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    assert source.index("good_keys = inspect.signature") < source.index("if return_args:")
