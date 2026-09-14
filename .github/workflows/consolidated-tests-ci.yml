@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -59,29 +59,48 @@ jobs:
       # Four interpreters on one runner. Each `id` exposes python-path, which is how
       # a lane addresses an interpreter that is no longer the one on PATH -- only the
       # last of these wins PATH, and that is fine because no lane uses it.
+      #
+      # None of them carries `cache: 'pip'`, and none should. All four interpreters
+      # share one `~/.cache/pip` on the runner, so four cache-enabled steps do not
+      # cache four things: they save the identical directory four times under four
+      # python-version keys. Observed on main 2026-08-23, where the 3.10 and 3.11
+      # entries were byte-identical at 2011216266 and 3.13 differed by 1524 bytes
+      # -- 3.7 GiB of exact duplicates, against a 20 GiB repo ceiling. (3.12 looked
+      # small only because repo-tests-cpu had already written that key four minutes
+      # earlier and the duplicate save was skipped; same-key saves are
+      # first-writer-wins.)
+      #
+      # One restore for the whole job, from the pip-cache pair below, which also
+      # keeps the save on main. It lands in the shared directory ahead of the
+      # install step, so every lane reads the wheels of every interpreter from it.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py310
         with:
           python-version: '3.10'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py311
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py312
         with:
           python-version: '3.12'
-          cache: 'pip'
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: py313
         with:
           python-version: '3.13'
-          cache: 'pip'
+
+      # After all four interpreters, before the one step that installs. The lanes
+      # install `.[core]`, so pyproject.toml is what describes their downloads.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: collect
+          key-files: |
+            pyproject.toml
 
       - name: Install and collect on every interpreter (concurrently)
         env:
@@ -92,23 +111,45 @@ jobs:
         run: |
           mkdir -p .lanes
 
+          # `&&`-chained, not newline-separated: a brace group reports only its LAST
+          # command, and `set -e` would be ignored here because the group sits on
+          # the left of `|| rc=$?`. Chaining makes the first failure the lane's rc.
+          #
+          # retry(): pip's --retries only covers ESTABLISHING a connection, so a
+          # body truncated mid-download (IncompleteRead) is never retried.
+          retry() {
+            attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "retry: giving up after $attempt attempts: $*"
+                return 1
+              fi
+              echo "retry: attempt $attempt failed, retrying in 15s: $*"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+
           # CPU index avoids the multi-GB CUDA wheel set. `--no-deps unsloth`
-          # satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+          # satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
           lane() {
             version="$1"; interpreter="$2"
             venv=".lanes/venv-$version"
             log=".lanes/$version.log"
             (
+              # Per-lane generated-source dir: else 3.10 imports a cache 3.13 wrote.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$version"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
-                "$interpreter" -m venv "$venv"
-                "$venv/bin/python" -m pip install --upgrade pip
-                "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
-                  "torch>=2.4.0,<2.11.0"
-                "$venv/bin/pip" install -e .[core]
-                "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-                "$venv/bin/pip" install pytest==9.0.3
+                "$interpreter" -m venv "$venv" &&
+                retry "$venv/bin/python" -m pip install --upgrade pip &&
+                retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
+                  "torch>=2.4.0,<2.11.0" &&
+                retry "$venv/bin/pip" install -e .[core] &&
+                { "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install pytest==9.0.3
               } > "$log" 2>&1 || rc=$?
               echo "$rc" > ".lanes/$version.install"
 
@@ -130,6 +171,17 @@ jobs:
           lane 3.13 "$PY313"
           wait
           echo "all four lanes finished"
+
+      # Immediately after the install, not at the end of the job. A composite step
+      # with no `if:` is SKIPPED once an earlier step has failed, so the action's
+      # own always() only covers steps between the restore and here. Placed after
+      # the lanes, the wheels are saved whenever they were actually downloaded --
+      # including when the next step exits 1 because one interpreter failed.
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: What each interpreter said
         if: always()
@@ -165,7 +217,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -176,10 +228,16 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: repo-tests
+          key-files: |
+            pyproject.toml
 
       - name: Install runtime + test deps
-        # --no-deps unsloth satisfies the find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
@@ -187,6 +245,12 @@ jobs:
           pip install -e .[core]
           pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3 pyyaml==6.0.2
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: pytest tests/security (HARD GATE)
         run: python -m pytest tests/security -v
@@ -213,6 +277,11 @@ jobs:
         # mapping (no GPU, no vLLM needed). test_sft_prepare_dataset_double_bos
         # pins add_special_tokens for text that already carries BOS.
         #
+        # The two MoE registry files pin preprocess_weight's layout resolution (#849)
+        # and that the weight-preprocessor registry is one dict across the package
+        # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
+        # neither was executed by any job before.
+        #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
         # model, which is what stops save_pretrained_merged from writing nothing
@@ -230,6 +299,10 @@ jobs:
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
         #
+        # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
+        # eager fallback: still falls back on a first-call refusal, ends the step
+        # when a compiled pack is outstanding, latches only its own label. CPU-pure.
+        #
         # test_loss_normalization_contract pins num_items_in_batch: the grad-accum
         # guard, and the packed / padding-free boundary count. The second one
         # shipped broken for the same reason this comment keeps repeating -- the
@@ -243,6 +316,21 @@ jobs:
         # backend and its preprocessor registration (#850): stub OlmoeConfig, CPU-pure,
         # sub-second. The zoo-specific step below is continue-on-error, so a
         # regression there would only ever be yellow.
+        # test_hip_bf16_offload_dtype pins that the HIP branch ASKS whether bf16 is
+        # supported rather than hardcoding True, which is what kills an RDNA 1/2 card
+        # at step 0. No job here has an AMD runner, so it stubs device_count to 0 and
+        # runs the dtype decision alone on CPU; left to --collect-only it would prove
+        # only that it imports, which is the failure this comment already lists twice.
+        #
+        # The two compiled-cache files cover create_new_function's distributed
+        # protocol: the rank-local guard that let one rank skip a broadcast and
+        # hang the group under torchrun, and the digest agreement that stops two
+        # ranks importing different generated implementations. They are CPU-pure
+        # (the gloo file spawns two local ranks over a file:// rendezvous, no
+        # ports and no GPU) and take about 15 seconds together. Listing them here
+        # is the whole point of this block: 42 of the 44 fail against the code
+        # they fix, so left to --collect-only they would prove only that they
+        # import, which is the failure every paragraph above already describes.
         #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
@@ -264,7 +352,10 @@ jobs:
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference.py \
+            tests/test_mlx_trainer_internals.py \
+            tests/test_mlx_arrays_cache_advance.py \
             tests/test_mlx_quantized_optimizer_routing.py \
+            tests/test_fp16_emulation.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
             tests/test_quant_status_transport_errors.py \
@@ -275,6 +366,10 @@ jobs:
             tests/test_find_common_token_ids_no_match.py \
             tests/test_vllm_direct_lora_loading.py \
             tests/test_sft_prepare_dataset_double_bos.py \
+            tests/test_moe_preprocess_weight_transpose.py \
+            tests/test_moe_weight_preprocessor_registry_shared.py \
+            tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
@@ -285,12 +380,34 @@ jobs:
             tests/test_disabled_hook_graph_break.py \
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
+            tests/test_hip_bf16_offload_dtype.py \
+            tests/test_disabled_hook_checkpoint_guard.py \
+            tests/test_conftest_module_leak_gate.py \
+            tests/test_compiled_cache_collective.py \
+            tests/test_compiled_cache_collective_gloo.py \
+            tests/test_undefined_name_gate.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
         # Run in a fresh process so its module-scoped MLX simulation does not
         # inherit module state from another MLX test file.
         run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
+
+      - name: pytest MLX GGUF export gates (HARD GATE)
+        # One invocation each, for the reason above: tests/mlx_simulation/ replaces
+        # sys.modules["mlx.core"] process-wide, so a file collected after another
+        # inherits its shim.
+        #
+        # These are here because they were in NO job, which is the failure the
+        # comment above already lists four times. The MoE name-restoration work
+        # changed the arguments _prepare_mlx_gguf_export_directory is called with and
+        # took 13 tests in test_mlx_save_export_edge_cases.py down; every check on
+        # that pull request stayed green, because `pytest tests/ --collect-only`
+        # proves only that a file imports.
+        run: |
+          python -m pytest tests/test_mlx_save_export_regressions.py -v
+          python -m pytest tests/test_mlx_save_export_edge_cases.py -v
+          python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
@@ -324,7 +441,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -335,24 +452,49 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      # One restore for both venvs: they share the runner's pip cache even though
+      # they must not share an environment.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: mlx-lanes
+          key-files: |
+            pyproject.toml
 
       - name: Build both environments (concurrently)
         run: |
           mkdir -p .lanes
 
+          # See the interpreter lane for why these are `&&`-chained and what retry()
+          # is for: a brace group reports only its last command, `set -e` is
+          # ignored on the left of `|| rc=$?`, and pip's --retries does not cover a
+          # download truncated mid-body.
+          retry() {
+            attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "retry: giving up after $attempt attempts: $*"
+                return 1
+              fi
+              echo "retry: attempt $attempt failed, retrying in 15s: $*"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+
           # numerics: minimal on purpose -- mlx core only, no mlx-lm / mlx-vlm.
           (
             rc=0
             {
-              python -m venv .lanes/venv-numerics
-              .lanes/venv-numerics/bin/python -m pip install --upgrade pip
-              .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
-                "torch>=2.4.0,<2.11.0"
-              .lanes/venv-numerics/bin/pip install -e .[core]
-              .lanes/venv-numerics/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-              .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
+              python -m venv .lanes/venv-numerics &&
+              retry .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
+                "torch>=2.4.0,<2.11.0" &&
+              retry .lanes/venv-numerics/bin/pip install -e .[core] &&
+              { .lanes/venv-numerics/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
             } > .lanes/numerics-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/numerics.install
           ) < /dev/null > /dev/null 2>&1 &
@@ -363,18 +505,23 @@ jobs:
           # pins: measured 5.5.0 -> 5.14.1. Together, pip honours the cap and lands
           # on the newest mlx-vlm that fits, which is the 0.6.4 ceiling the audio
           # gate records.
+          #
+          # The <0.7.0 bound is repeated here because pyproject's copy is marker-gated
+          # to darwin + arm64 and so constrains nothing on this Linux lane. Without it
+          # the lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
+          # gating a combination pyproject forbids.
           (
             rc=0
             {
-              python -m venv .lanes/venv-suites
-              .lanes/venv-suites/bin/python -m pip install --upgrade pip
-              .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
-                "torch>=2.4.0,<2.11.0"
-              .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4"
-              .lanes/venv-suites/bin/pip install --no-deps \
-                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-              .lanes/venv-suites/bin/pip install pytest==9.0.3
+              python -m venv .lanes/venv-suites &&
+              retry .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
+                "torch>=2.4.0,<2.11.0" &&
+              retry .lanes/venv-suites/bin/pip install -e .[core] \
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<0.7.0" &&
+              { .lanes/venv-suites/bin/pip install --no-deps \
+                "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+              retry .lanes/venv-suites/bin/pip install pytest==9.0.3
             } > .lanes/suites-install.log 2>&1 || rc=$?
             echo "$rc" > .lanes/suites.install
           ) < /dev/null > /dev/null 2>&1 &
@@ -385,6 +532,12 @@ jobs:
             rc="$(cat ".lanes/$id.install" 2>/dev/null || echo missing)"
             [ "$rc" = "0" ] || { echo "::error::$id environment could not be built (status $rc)"; exit 1; }
           done
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: Assert the real MLX runtime is what got installed
         # All the MLX files importorskip mlx.core, and a module that skips
@@ -404,15 +557,61 @@ jobs:
           .lanes/venv-suites/bin/python -c "import mlx_vlm, mlx_lm; print('mlx-vlm', mlx_vlm.__version__)"
           # If the joint resolution missed the transformers cap, this job is
           # gating an environment the package forbids.
+          #
+          # Read the cap off our own installed metadata rather than repeating it
+          # as a literal. A literal here says "<=5.5.0" and means "whatever
+          # pyproject pins": the moment pyproject legitimately moves the cap the
+          # gate reports drift that does not exist, which is exactly how #1144
+          # went red. It also only ever checked the ceiling, so a resolution
+          # landing on one of the excluded releases (4.57.4, 5.0.0, ...) passed.
+          # The whole specifier set is the contract, so assert the whole thing.
           .lanes/venv-suites/bin/python - <<'PY'
-          from importlib.metadata import version
+          from importlib.metadata import requires, version
+          from packaging.requirements import Requirement
           from packaging.version import Version
-          transformers = Version(version("transformers"))
-          assert transformers <= Version("5.5.0"), (
-              f"transformers {transformers} exceeds the cap this package pins; "
-              "the MLX packages were resolved without it"
+
+          specifiers = {
+              str(req.specifier)
+              for raw in (requires("unsloth_zoo") or [])
+              for req in [Requirement(raw)]
+              if req.name.lower().replace("_", "-") == "transformers"
+          }
+          assert specifiers, (
+              "unsloth_zoo declares no transformers requirement, so this gate is "
+              "checking nothing. Did the dependency move out of pyproject.toml?"
           )
-          print("transformers", transformers, "within the pinned cap")
+          assert len(specifiers) == 1, (
+              f"unsloth_zoo pins transformers inconsistently across extras: "
+              f"{sorted(specifiers)}. Pick one before this gate can mean anything."
+          )
+          pinned = Requirement(f"transformers{specifiers.pop()}").specifier
+          transformers = Version(version("transformers"))
+          assert transformers in pinned, (
+              f"transformers {transformers} is outside the range this package "
+              f"pins ({pinned}); the MLX packages were resolved without it"
+          )
+          print("transformers", transformers, "within the pinned range", pinned)
+
+          # The ceiling is a deliberate policy choice, not an incidental number,
+          # so state it here as well and on purpose. mlx-vlm >= 0.6.9 requires
+          # transformers >= 5.14, and we are not taking that jump yet; the cap is
+          # what keeps the joint MLX resolution off it. Checking only "matches
+          # pyproject" above would let an automated dependency bump raise the cap
+          # and quietly opt the whole project in -- which is exactly what #1144
+          # did. Raising this is a decision: change CEILING in the same commit
+          # that changes pyproject.toml, deliberately.
+          CEILING = Version("5.5.0")
+          declared = [
+              Version(str(s.version)) for s in pinned if s.operator == "<="
+          ]
+          assert declared and max(declared) <= CEILING, (
+              f"pyproject.toml pins transformers <= {max(declared) if declared else None}, "
+              f"above the {CEILING} ceiling this project holds on purpose. "
+              "mlx-vlm >= 0.6.9 needs transformers >= 5.14 and we are not "
+              "following it yet. If raising it is intended, raise CEILING here "
+              "in the same commit and say why."
+          )
+          print("declared ceiling", max(declared), "at or below the policy ceiling", CEILING)
           PY
 
       - name: pytest tests/test_mlx_quantized_optimizer_state.py (HARD GATE)
@@ -427,8 +626,42 @@ jobs:
             echo "real mlx is installed but the numeric tests skipped"; exit 1
           fi
 
+      - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
+        # Embedding identification, embed-scale resolution and probe cleanup are
+        # pure logic over a synthetic module tree: real mlx, no Metal, no
+        # downloads. The metal_only half skips here and runs on the mlx job.
+        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+
+      - name: Fail if the NEFTune logic tests all skipped
+        run: |
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -q -rs | tee neftune.txt
+          if ! grep -qiE '[1-9][0-9]* passed' neftune.txt; then
+            echo "real mlx is installed but no NEFTune logic test ran"; exit 1
+          fi
+
+      - name: tests/test_mlx_rng_rewind.py (HARD GATE)
+        # PRNG capture/rewind across the compile fallbacks. Needs mlx core, not
+        # Metal, so it gates here; the Apple Silicon lane is opt-in and usually
+        # skipped, which guards nothing on a pull request.
+        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+
+      - name: Fail if the RNG rewind tests skipped
+        run: |
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -q -rs | tee rng.txt
+          if grep -qiE '[0-9]+ skipped' rng.txt; then
+            echo "real mlx is installed but the RNG rewind tests skipped"; exit 1
+          fi
+
       # One pytest process per file: tests/mlx_simulation/ replaces
       # sys.modules["mlx.core"] process-wide, disarming whatever runs after it.
+      - name: tests/test_mlx_lora_group_selection.py
+        # Group-flag selection is structural, so real Metal adds nothing to it
+        # and the CPU backend is a full gate.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_lora_group_selection.py -v -rs
+
+      - name: tests/test_mlx_resume_adapter_mismatch.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_resume_adapter_mismatch.py -v -rs
+
       - name: tests/test_mlx_shape_guard.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_shape_guard.py -v -rs
 
@@ -438,6 +671,46 @@ jobs:
 
       - name: tests/test_mlx_batching_and_decay.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
+
+      # Needs the real mlx runtime but not Metal, so the merged_4bit quantize is
+      # gated on every PR here rather than only in the label-gated Apple Silicon
+      # lane; the Metal-only half is that lane's job.
+      - name: tests/test_mlx_quantized_merge_save.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
+
+      - name: Fail if the merged_4bit quantize tests skipped
+        # The file skips wholesale on anything that stops mlx_lm.tuner.lora
+        # importing, so without this the gate can go green having run nothing.
+        run: |
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -q -rs | tee qms.txt
+          if ! grep -qiE '[1-9][0-9]* passed' qms.txt; then
+            echo "real mlx is installed but no merged_4bit quantize test ran"; exit 1
+          fi
+
+      # The three gated-delta files ran in no workflow at all: this lane's list
+      # omitted them and the Apple Silicon lane, which is opt-in behind the `mlx`
+      # label, names only test_qwen35_vjp_metal.py. So the ops VJP, the batched
+      # gradient regression from #776 and the consumer-binding sweep shipped
+      # ungated. They need mlx core plus mlx-lm, not Metal, so they belong here;
+      # the Metal-only halves skip and stay the macOS lane's job.
+      - name: tests/test_mlx_gated_delta.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta.py -v -rs
+
+      - name: tests/test_mlx_gated_delta_vjp.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_vjp.py -v -rs
+
+      - name: tests/test_mlx_gated_delta_batch_grad.py
+        # Gradient parity vs plain autodiff at B >= 2. Every test here needs the
+        # real runtime, so under the torch shim the file skips wholesale -- which
+        # is exactly what the gate below refuses to accept as a pass.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -v -rs
+
+      - name: Fail if the gated-delta gradient tests skipped
+        run: |
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -q -rs | tee gd.txt
+          if ! grep -qiE '[1-9][0-9]* passed' gd.txt; then
+            echo "real mlx is installed but no gated-delta gradient test ran"; exit 1
+          fi
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
@@ -460,12 +733,12 @@ jobs:
       # Pure-Python protobuf parser; transformers' bundled *_pb2.py is rejected by C++ protobuf 4+/5+.
       PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
       UNSLOTH_COMPILE_DISABLE: '1'
-      # Secondary handshake after find_spec("unsloth") guard at unsloth_zoo/__init__.py:128.
+      # Secondary handshake after the find_spec("unsloth") guard in unsloth_zoo/__init__.py.
       UNSLOTH_IS_PRESENT: '1'
     steps:
       - name: Harden runner (audit)
         # audit (not block): the cells pull arbitrary transformers/TRL/peft pins.
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -476,7 +749,22 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      # pyproject.toml only, even though the transformers/trl/peft specs for two
+      # of the three lanes are written inline below. Adding this workflow file to
+      # the key would roll the cache on every edit to it, including edits to the
+      # other three jobs and to comments -- and buy nothing, because a pip HTTP
+      # cache is addressed by URL and content hash and cannot serve the wrong
+      # wheel. Changing an inline spec just misses on the wheels that actually
+      # changed and still hits on the rest. The hash exists to roll the entry
+      # forward occasionally so stale wheels do not accumulate, not to protect
+      # correctness.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: core-drift
+          key-files: |
+            pyproject.toml
 
       - name: Run all three upstream pins (concurrently)
         run: |
@@ -522,6 +810,21 @@ jobs:
           PY
           }
 
+          # See the interpreter lane for why these are `&&`-chained and what retry()
+          # is for.
+          retry() {
+            attempt=1
+            until "$@"; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "retry: giving up after $attempt attempts: $*"
+                return 1
+              fi
+              echo "retry: attempt $attempt failed, retrying in 15s: $*"
+              attempt=$((attempt + 1))
+              sleep 15
+            done
+          }
+
           # Two-phase install, exactly as the matrix job did it: `-e .[core]` for the
           # pyproject defaults, then `-U <resolved>` to override. The -U is what lets
           # pip DOWNGRADE transformers for the 4.57.6 cell.
@@ -529,39 +832,54 @@ jobs:
             id="$1"; shift
             venv=".lanes/venv-$id"; log=".lanes/$id.log"
             (
+              # Per-lane generated-source dir, absolute (compiler.py puts it on sys.path):
+              # concurrent lanes sharing one checkout rewrite the default cache under a reader.
+              export UNSLOTH_COMPILE_LOCATION="$PWD/.lanes/compiled-$id"
+              mkdir -p "$UNSLOTH_COMPILE_LOCATION"
               rc=0
               {
-                set -x
-                specs="$(resolve "$@")"
-                spec_t="$(echo "$specs" | sed -n 1p)"
-                spec_r="$(echo "$specs" | sed -n 2p)"
-                spec_p="$(echo "$specs" | sed -n 3p)"
-                echo "resolved: $spec_t | $spec_r | $spec_p"
-
-                python -m venv "$venv"
-                "$venv/bin/python" -m pip install --upgrade pip
+                set -x &&
+                specs="$(resolve "$@")" &&
+                spec_t="$(echo "$specs" | sed -n 1p)" &&
+                spec_r="$(echo "$specs" | sed -n 2p)" &&
+                spec_p="$(echo "$specs" | sed -n 3p)" &&
+                echo "resolved: $spec_t | $spec_r | $spec_p" &&
+                python -m venv "$venv" &&
+                retry "$venv/bin/python" -m pip install --upgrade pip &&
                 # torchvision: transformers' qwen2_vl / qwen2_5_vl image processors
                 # import it at module top, so without it the existence probes go red
                 # on ModuleNotFoundError rather than on drift. CPU build is plenty.
-                "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
-                  "torch>=2.4.0,<2.11.0" "torchvision<0.26"
-                "$venv/bin/pip" install -e .[core]
-                "$venv/bin/pip" install --no-deps \
-                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
-                "$venv/bin/pip" install -U "$spec_t" "$spec_r" "$spec_p"
+                retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
+                  "torch>=2.4.0,<2.11.0" "torchvision<0.26" &&
+                retry "$venv/bin/pip" install -e .[core] &&
+                { "$venv/bin/pip" install --no-deps \
+                  "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
+                retry "$venv/bin/pip" install -U "$spec_t" "$spec_r" "$spec_p" &&
                 # bitsandbytes: imported at module scope in saving_utils.py.
                 # IPython + ipywidgets: logging_utils.py:50 imports
                 # transformers.utils.notebook. Both so the drift detector fires on
                 # real drift and not on a missing CI dep.
-                "$venv/bin/pip" install 'bitsandbytes>=0.45' 'ipython>=8' 'ipywidgets>=8'
-                "$venv/bin/pip" install pytest==9.0.3 packaging
-                set +x
+                retry "$venv/bin/pip" install 'bitsandbytes>=0.45' 'ipython>=8' 'ipywidgets>=8' &&
+                retry "$venv/bin/pip" install pytest==9.0.3 packaging &&
+                set +x &&
                 "$venv/bin/pip" show transformers trl peft torch
               } > "$log" 2>&1 || rc=$?
               echo "$rc" > ".lanes/$id.install"
 
               if [ "$rc" -eq 0 ]; then
                 trc=0
+                # test_mxfp4_load_path_layout runs here, not in repo-tests-cpu, for
+                # two reasons. It is version-aware by construction -- red on 5.5.0
+                # and 5.16.x, skipped on 4.57.6 -- so it only means anything across
+                # more than one pin, and these lanes are the only ones that provide
+                # them. And its probe runs in a subprocess, which conftest does not
+                # reach, so it sets its own environment rather than relying on this
+                # job's `env`. The binding constraint there is find_spec("unsloth"),
+                # not the UNSLOTH_IS_PRESENT set below: unsloth is installed with
+                # `|| true` above, and unsloth_zoo raises on the missing spec before
+                # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
+                # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
+                # cannot turn these lanes red.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -575,7 +893,11 @@ jobs:
                   tests/test_upstream_source_patterns.py \
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
+                  tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_vision_utils_grid_helpers_eager.py \
+                  tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_temporary_patches_exhaustive.py \
+                  tests/test_mxfp4_load_path_layout.py \
                   tests/test_missing_parent_package_is_drift.py \
                   tests/test_unsloth_zoo_lora_merge.py \
                   tests/test_peft_paramwrapper_layout_drift.py \
@@ -596,6 +918,12 @@ jobs:
           wait
           echo "all three lanes finished"
           df -h / | tail -1
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: What each pin said
         if: always()

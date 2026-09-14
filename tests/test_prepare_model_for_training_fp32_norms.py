@@ -139,8 +139,6 @@ def _run(full_finetuning, with_bias=False, env=None,
     return m, _params(m)
 
 
-# ---------------- full-FT: norm.weights become fp32 ----------------
-
 def test_full_ft_norm_weights_become_fp32():
     m, p = _run(full_finetuning=True)
     for n in (
@@ -171,8 +169,6 @@ def test_full_ft_norm_biases_follow_module_cast():
             f"{n} should follow its norm module's dtype cast, got {p[n].dtype}"
 
 
-# ---------------- deferral to external _pre_set_compute_dtype ----------------
-
 def test_full_ft_defers_to_pre_set_compute_dtype_on_norm():
     # A norm module owned by an external policy keeps its loaded dtype; the
     # fix MUST NOT overwrite it. Other norms still upcast.
@@ -193,8 +189,6 @@ def test_full_ft_defers_per_module_not_globally():
     assert p["model.layers.0.input_layernorm.weight"].dtype == torch.float32
 
 
-# ---------------- LoRA / QLoRA path: zero behaviour change ----------------
-
 def test_lora_norms_stay_bf16_frozen():
     m, p = _run(full_finetuning=False)
     for n in (
@@ -205,8 +199,6 @@ def test_lora_norms_stay_bf16_frozen():
         assert p[n].dtype == torch.bfloat16
         assert p[n].requires_grad is False
 
-
-# ---------------- rollback env switch ----------------
 
 def test_disable_float32_upcast_reproduces_pre_fix_bf16():
     m, p = _run(full_finetuning=True,
@@ -240,9 +232,6 @@ def test_matcher_catches_vit_style_norm1_norm2():
     assert p["model.visual.blocks.0.norm1.bias"].dtype == torch.float32
     assert p["model.visual.blocks.0.norm2.weight"].dtype == torch.float32
     assert p["model.visual.blocks.0.norm2.bias"].dtype == torch.float32
-
-
-# ---------------- autocast wrapper: signature / meta-device / deepcopy ------
 
 
 class _TinyForSig(nn.Module):
@@ -325,7 +314,6 @@ def test_wrapper_survives_deepcopy_and_uses_copy_weights():
     with torch.no_grad():
         m2.lin.weight.fill_(2.0)
 
-    # Distinct parameter storage after deepcopy.
     assert m.lin.weight.data_ptr() != m2.lin.weight.data_ptr()
 
     x = torch.zeros(1, 4, dtype=torch.bfloat16)
@@ -494,7 +482,6 @@ def test_matcher_catches_norm_by_module_class_when_name_unmatched():
     assert m.audio_tower.norm_pre_attn.weight.dtype == torch.float32
     assert m.audio_tower.norm_post_attn.weight.dtype == torch.float32
     assert m.audio_tower.norm_out.weight.dtype == torch.float32
-    # non-norm linear stays bf16
     assert m.audio_tower.proj.weight.dtype == torch.bfloat16
 
 
@@ -522,7 +509,7 @@ def test_wrapper_intercepts_instance_level_forward():
             return self._impl(x)
 
     m = _M()
-    m.forward = m._impl  # instance-level forward shadows the class method
+    m.forward = m._impl
     _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
     # Must not raise a dtype mismatch: autocast downcasts fp32 norm out to bf16.
     out = m(torch.randn(2, 8))
@@ -746,7 +733,7 @@ def test_instance_forward_wrapper_rebinds_on_deepcopy():
     m = _M()
     with torch.no_grad():
         m.lin.weight.fill_(1.0)
-    m.forward = m._impl  # instance-level forward
+    m.forward = m._impl
     _wrap_forward_in_bf16_autocast(m, torch.bfloat16)
 
     m2 = copy.deepcopy(m)

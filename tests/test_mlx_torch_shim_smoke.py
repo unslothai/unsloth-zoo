@@ -41,10 +41,6 @@ def _install_mlx_shim():
     simulate_mlx_on_torch()
 
 
-# ---------------------------------------------------------------------------
-# 1. All named imports succeed.
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("module_path", [
     "mlx",
     "mlx.core",
@@ -98,10 +94,6 @@ def test_vlm_subarch_auto_resolve(submodule):
     assert mod is not None
 
 
-# ---------------------------------------------------------------------------
-# 2. Tier 1: Unsloth backend fresh symbols.
-# ---------------------------------------------------------------------------
-
 def test_metal_is_available_returns_false():
     import mlx.core as mx
     assert mx.metal.is_available() is False
@@ -131,10 +123,6 @@ def test_synchronize_no_op():
     import mlx.core as mx
     mx.synchronize()
 
-
-# ---------------------------------------------------------------------------
-# 3. Tier 2: trivial passthroughs.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test_elementwise_math(dtype):
@@ -269,10 +257,6 @@ def test_module_children_preserves_direct_child_tree():
     ]
 
 
-# ---------------------------------------------------------------------------
-# 4. Tree utils round-trip.
-# ---------------------------------------------------------------------------
-
 def test_tree_flatten_unflatten():
     import mlx.utils as mlxu
     tree = {"a": {"b": 1, "c": [2, 3]}, "d": 4}
@@ -291,10 +275,6 @@ def test_tree_map():
     assert doubled == {"a": 2, "b": [4, 6]}
 
 
-# ---------------------------------------------------------------------------
-# 5. RNG keys are deterministic.
-# ---------------------------------------------------------------------------
-
 def test_random_seed_reproducible():
     import mlx.core as mx
     mx.random.seed(123)
@@ -304,14 +284,10 @@ def test_random_seed_reproducible():
     torch.testing.assert_close(a, b)
 
 
-# ---------------------------------------------------------------------------
 # 6. _Noop raises loudly on call (regression guard against silent masking).
-# ---------------------------------------------------------------------------
 
 def test_noop_raises_on_call():
     import mlx.core as mx
-    # An unknown attribute returns _Noop; calling raises NotImplementedError
-    # with the symbol name.
     noop = mx.this_is_a_definitely_unknown_symbol_xyz
     with pytest.raises(NotImplementedError, match="this_is_a_definitely_unknown_symbol_xyz"):
         noop()

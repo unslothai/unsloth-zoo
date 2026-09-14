@@ -28,7 +28,6 @@ import pytest
 
 def _tokenizer():
     from transformers import AutoTokenizer
-    # Small, ungated tokenizers commonly cached in CI; first that loads wins.
     # local_files_only keeps this hermetic: an uncached tokenizer raises immediately
     # (no download / network timeout) and we fall through to the next / to a skip.
     for repo in ("hf-internal-testing/llama-tokenizer", "Qwen/Qwen2.5-0.5B-Instruct"):

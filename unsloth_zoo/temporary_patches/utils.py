@@ -1185,6 +1185,35 @@ _DISABLED_HOOK_SIGNATURES = (
 )
 
 
+_DYNAMO_CONFIG = None
+
+
+def dynamo_tracing_disabled():
+    """Has the user switched Dynamo off process-wide?
+
+    `TORCH_COMPILE_DISABLE=1` is the switch torch reads into `config.disable`
+    at import; `torch._dynamo.config.disable = True` is the same thing set by
+    hand. Reads the live value, so a caller that wants a snapshot takes one:
+    `_fall_back_to_eager_on_recompile_limit` asks once, at its first call.
+
+    `TORCHDYNAMO_DISABLE=1` is NOT this flag. `torch._dynamo.optimize` checks
+    that env var itself and hands back the undecorated function, so it never
+    reaches a compiled callable and needs nothing from us.
+    """
+    global _DYNAMO_CONFIG
+    config = _DYNAMO_CONFIG
+    if config is None:
+        try:
+            import torch._dynamo
+            config = _DYNAMO_CONFIG = torch._dynamo.config
+        except Exception:
+            return False
+    # The module object is cached, the flag is not: this runs on every call
+    # into a compiled region, where the `import` statement alone cost about as
+    # much as a small torch op.
+    return bool(config.disable)
+
+
 def _is_our_own_disabled_hook(exc):
     """Did we break our own graph with our own `torch.compiler.disable`?
 
@@ -1470,6 +1499,18 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
 
     That leaves one mixed step, the one during which the latch flips. See
     `force_eager_fallback` below, which unsloth uses to close it.
+
+    The same reasoning decides the disabled-compiler branch, which asks
+    `dynamo_tracing_disabled()` once, on the first call, and keeps the answer.
+    `TORCH_COMPILE_DISABLE=1` is a process-level switch, and per-call reads of
+    it collide with checkpointing in every direction: a wrapper's pack and its
+    recompute must agree, and by the time a recompute runs, the forward that
+    packed it is long gone -- so the flag cannot be honoured mid-flight without
+    tracking a mode per outstanding pack, which torch exposes no handle for.
+    Deciding once removes the question. A flip made after the first call is
+    ignored, exactly as it is on a plain `torch.compile` region whose code is
+    already cached, and `apply_pending_eager_fallbacks` remains the supported
+    way to move a live wrapper to eager at a step boundary.
     """
     errors = _recompile_limit_errors()
     graph_break_errors = _disabled_hook_graph_break_error()
@@ -1488,7 +1529,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # every step boundary. See that set for why the answer has to be per step
     # rather than per wrapper.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
-             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0}
+             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0,
+             # Was the compiler switched off when this wrapper was FIRST called?
+             # None until then. Decided once, deliberately: see the wrapper.
+             "compiler_off": None}
 
     def _warn(message):
         if not state["warned"]:
@@ -1660,18 +1704,17 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             raise e
         return eager_func(*args, **kwargs)
 
-    def _give_up_on_backend(e, args, kwargs, marker_before):
-        """Inductor refused to generate code. Run eager, and stay there.
+    def _give_up_at_compile_time(e, args, kwargs, marker_before, warning):
+        """The compiler refused this region while TRACING it. Run eager, and stay.
 
-        No budget retry: cache exhaustion is a resource problem that more
-        budget can genuinely fix, but a codegen refusal is deterministic. The
-        same graph regenerates the same failure, so retrying only pays the
-        compile twice before landing here anyway.
+        Shared by the two refusals decided before any compiled code runs:
+        Inductor declining codegen, and Dynamo declining to inline one of
+        Unsloth's own `torch.compiler.disable`d hooks under `fullgraph = True`.
+        Neither gets a budget retry: the same graph regenerates the same refusal.
 
         Only THIS label latches, unlike `_give_up`. Exhaustion is process-wide
-        and takes the other borrowers with it; a codegen refusal is a property
-        of one region's graph, so knocking unrelated regions eager would cost
-        their compilation for nothing.
+        and takes the other borrowers with it; a compile-time refusal belongs to
+        one region, so latching others would cost their compilation for nothing.
 
         The checkpoint rule from `_give_up` applies, but only when THIS wrapper
         has actually run compiled at some point in this step. That extra
@@ -1680,14 +1723,19 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         `_give_up` has to assume the worst because it latches every borrower,
         including regions that did pack activations compiled. This path latches
         one label, so the only pack/recompute pair that can desynchronise is
-        this function's own. Inductor refuses at compile time, so a first-call
-        refusal means this region has packed nothing compiled: the eager call
-        below packs eagerly and the backward recomputes eagerly, which agree.
+        this function's own. Both refuse at compile time, so a first-call
+        refusal means this region packed nothing compiled: eager pack and eager
+        recompute agree.
 
-        The case that does need the raise is a later compile for a new dynamic
-        shape, after an earlier shape already compiled and packed. Then the pack
-        was compiled and the recompute would be eager, which either aborts or
-        returns wrong gradients, so end the step instead.
+        The raise is needed on a LATER compile -- new shape, new branch -- after
+        an earlier one already compiled and packed: a compiled pack against an
+        eager recompute aborts or corrupts gradients, so end the step instead.
+
+        That later compile can be the RECOMPUTE ITSELF: Dynamo only discovers a
+        disabled hook while tracing, and a `dynamic = True` region can first
+        trace a recompute-only path after the forward packed compiled. RMSNorm
+        packs 3 tensors compiled and 6 eager, but `early_stop` truncates to the
+        forward's count, so torch reports differing metadata, not a count.
         """
         global _PACKED_COMPILED_IN_CHECKPOINT
         packed = (
@@ -1714,17 +1762,35 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         # compile-mode flip happened" and re-raises the very failure it was
         # asked to retry past.
         _RECENT_EAGER_LABELS.add(label)
-        _warn(
-            f"Unsloth: torch.compile could not generate code for {label}; "
-            f"running it eagerly from here. Training is unaffected apart from "
-            f"speed. ({type(e).__name__})"
-        )
+        _warn(warning)
         if packed:
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
             raise e
         return eager_func(*args, **kwargs)
+
+    def _give_up_on_backend(e, args, kwargs, marker_before):
+        """Inductor refused to generate code for this region."""
+        return _give_up_at_compile_time(
+            e, args, kwargs, marker_before,
+            f"Unsloth: torch.compile could not generate code for {label}; "
+            f"running it eagerly from here. Training is unaffected apart from "
+            f"speed. ({type(e).__name__})",
+        )
+
+    def _give_up_on_disabled_hook(e, args, kwargs, marker_before):
+        """Dynamo refused to inline one of our own `torch.compiler.disable`d hooks.
+
+        Was a bare eager flip: no checkpoint question, no deferral, no record.
+        """
+        return _give_up_at_compile_time(
+            e, args, kwargs, marker_before,
+            f"Unsloth: torch.compile hit one of Unsloth's own "
+            f"`torch.compiler.disable`d gradient-checkpointing hooks inside "
+            f"{label}; running it eagerly from here. Training is unaffected "
+            f"apart from speed.",
+        )
 
     def _is_backend_refusal_we_handle(e):
         """The gate the wrapper's own backend arm applies, in one place."""
@@ -1839,6 +1905,15 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
+        if state["compiler_off"] is None:
+            state["compiler_off"] = dynamo_tracing_disabled()
+        if state["compiler_off"]:
+            # Checked BEFORE the call, not recovered from afterwards. Torch runs
+            # the body and only then raises "found no compiled frames" from its
+            # post-call bookkeeping (torch/_dynamo/eval_frame.py), so catching
+            # that and re-running eager executes the body twice, consuming RNG
+            # twice and repeating any mutation it made.
+            return eager_func(*args, **kwargs)
         marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
             _note_packed_under_checkpoint()
@@ -1893,14 +1968,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 return _give_up(e, args, kwargs)
             if not _is_our_own_disabled_hook(e):
                 raise
-            state["eager"] = True
-            _warn(
-                f"Unsloth: torch.compile hit one of Unsloth's own "
-                f"`torch.compiler.disable`d gradient-checkpointing hooks "
-                f"inside {label}; running it eagerly from here. Training is "
-                f"unaffected apart from speed."
-            )
-            return eager_func(*args, **kwargs)
+            return _give_up_on_disabled_hook(e, args, kwargs, marker_before)
         else:
             # The compiled callable returned, so anything it packed under a
             # checkpoint is packed compiled. Only `_give_up_on_backend` reads

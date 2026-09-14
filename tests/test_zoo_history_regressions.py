@@ -17,13 +17,11 @@ import importlib
 import pytest
 
 
-# ---------------------------------------------------------------------------
 # Regression: a missing comma in temporary_patches/utils.py `__all__` silently
 # concatenates adjacent string literals ("raise_errorUnpack"), making the
 # public names un-importable under `from ... import *`. No syntax error fires.
 # Source: 2e36f32 fix(temporary_patches/utils): add missing comma in __all__
 # between 'raise_error' and 'Unpack' (#617)
-# ---------------------------------------------------------------------------
 
 
 def test_temporary_patches_utils_all_entries_are_valid_attributes():
@@ -52,7 +50,6 @@ def test_temporary_patches_utils_no_concatenated_all_entries():
     from unsloth_zoo.temporary_patches import utils
     import re
 
-    # lowercase->uppercase = a snake_case + CamelCase concatenation.
     camel_boundary = re.compile(r"[a-z][A-Z]")
     suspicious = []
     for name in utils.__all__:
@@ -83,14 +80,12 @@ def test_temporary_patches_utils_known_public_names_present():
         )
 
 
-# ---------------------------------------------------------------------------
 # Regression: `compiler.higher_precision_softmax` wasn't idempotent -- running
 # it twice appended a duplicate `.to(x.dtype).to(x.dtype)` (the
 # already-rewritten lookahead was missing). The compiler runs on user source
 # mid-training and may re-run (e.g. checkpoint reload), so emitted source must
 # not drift.
 # Source: f98dbbc fix(compiler): make higher_precision_softmax idempotent (#631)
-# ---------------------------------------------------------------------------
 
 
 def test_higher_precision_softmax_idempotent():
@@ -125,7 +120,6 @@ def test_higher_precision_softmax_does_not_double_cast():
         "dtype = torch.float32).to(attn_weights.dtype)\n"
     )
     out = higher_precision_softmax(already_rewritten)
-    # No double `.to(...)` chain produced.
     assert ".dtype).to(" not in out.replace(
         # Tolerate ONE `.to(<var>.dtype)` per call -- bug emits TWO.
         ").to(attn_weights.dtype)", "", 1,
@@ -134,12 +128,10 @@ def test_higher_precision_softmax_does_not_double_cast():
     )
 
 
-# ---------------------------------------------------------------------------
 # Regression: backend device helpers must guard against partial torch builds
 # (e.g. `torch.xpu` exists but `torch.xpu.synchronize` raises). Calling
 # device_synchronize / device_empty_cache must not raise on a partial backend.
 # Source: e08c1df (Guard XPU synchronize), 35dc451 (Guard XPU empty_cache).
-# ---------------------------------------------------------------------------
 
 
 def test_device_synchronize_tolerates_partial_backend():
@@ -166,12 +158,10 @@ def test_device_type_module_has_expected_helpers():
     )
 
 
-# ---------------------------------------------------------------------------
 # Regression: RL_REPLACEMENTS dict integrity vs the GRPO refactor wave
 # (commits 466334c, 9829ade, 035f...). The dict is rebuilt per definition; a
 # missing `RL_REPLACEMENTS[name] = fn` after a refactor fails silently. Pins
 # the public-API keys (test_rl_replacements_cpu.py covers the IO contract).
-# ---------------------------------------------------------------------------
 
 
 def test_rl_replacements_registration_survived_grpo_refactor():
@@ -191,7 +181,6 @@ def test_rl_replacements_registration_survived_grpo_refactor():
     )
 
 
-# ---------------------------------------------------------------------------
 # Regression: gpt-oss inference leaks a flex BlockMask into the eager attention
 # forward. When config._attn_implementation == "flex_attention" the inference
 # path receives a BlockMask and inplace_eager_attention_forward crashes with
@@ -199,7 +188,6 @@ def test_rl_replacements_registration_survived_grpo_refactor():
 # Two AST guards (one over wrap.return_attention_mask, one over
 # patch_GptOssModel) catch silent deletion of the flex_attention literal.
 # Source: PR #690; latent since commit ef819214 ("Fix Flex").
-# ---------------------------------------------------------------------------
 
 
 def test_gpt_oss_wrap_has_flex_attention_inference_guard():
@@ -268,7 +256,6 @@ def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
     )
 
 
-# ---------------------------------------------------------------------------
 # Regression: eager attention shape mismatch when the KV cache is longer than
 # the attention mask's kv dim. transformers 5.x cache pre-allocation hands a
 # full-attention layer more positions than the causal mask covers (e.g. k=161
@@ -276,7 +263,6 @@ def test_gpt_oss_patched_model_forward_has_flex_attention_guard():
 # RuntimeError on dim 3. The _align_kv_to_mask helper trims to the shorter
 # length; static check: it exists AND runs in BOTH eager forwards.
 # Source: PR #691.
-# ---------------------------------------------------------------------------
 
 
 def test_gpt_oss_eager_attention_aligns_kv_to_mask():
@@ -321,12 +307,10 @@ def test_gpt_oss_eager_attention_aligns_kv_to_mask():
     )
 
 
-# ---------------------------------------------------------------------------
 # Regression: patched GptOssModel.forward hard-coded the 4.x mask kwargs
 # ("input_embeds", "cache_position") and blew up on 5.x (renamed to
 # "inputs_embeds", dropped "cache_position"). PR #690 added inspect-driven
 # kwarg filtering to support both; static check that the helper is present.
-# ---------------------------------------------------------------------------
 
 
 def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
@@ -334,7 +318,6 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
     from unsloth_zoo.temporary_patches import gpt_oss as _M
 
     src = inspect.getsource(_M.patch_GptOssModel)
-    # The inspect-driven helper, or a guard testing inputs_embeds availability.
     has_inspect_filter = (
         "_build_mask_kwargs" in src
         or "_ccm_params" in src
@@ -348,7 +331,6 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
     )
 
 
-# ---------------------------------------------------------------------------
 # Regression: patch_compiling_bitsandbytes used exec(f"import {x}",
 # globals(), locals()) + eval(x) inside a function. Under PEP 667
 # (Python 3.13+) the locals() snapshot does not persist, so eval raised
@@ -357,7 +339,6 @@ def test_gpt_oss_model_forward_uses_inspect_filtered_mask_kwargs():
 # getattr. Source: #710 (issue #311).
 # These tests stub bitsandbytes/peft in sys.modules so they are hermetic:
 # no GPU, no real bitsandbytes install needed.
-# ---------------------------------------------------------------------------
 
 
 def _install_fake_bnb_and_peft(monkeypatch, bnb_version, with_peft_leaf=True):
@@ -475,10 +456,8 @@ def test_patch_compiling_bitsandbytes_missing_peft_helpful_error(monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
 # Gemma-4 E-series KV sharing under use_cache=False / gradient checkpointing
 # (transformers#45242). These lock the zoo fix in and check its invariants on CPU.
-# ---------------------------------------------------------------------------
 def test_gemma4_kv_shared_patches_registered():
     """Both patch functions stay registered AND wire the carrier (not bare return stubs)."""
     import inspect
@@ -521,7 +500,6 @@ def test_gemma4_capability_gate(monkeypatch):
     class _Fixed:
         def forward(self, hidden_states, position_embeddings, attention_mask, shared_kv_states, past_key_values=None, **kw):
             return None
-    # The discriminator is the `shared_kv_states` parameter on the attention forward.
     assert "shared_kv_states" not in inspect.signature(_Buggy.forward).parameters
     assert "shared_kv_states" in inspect.signature(_Fixed.forward).parameters
 
@@ -559,7 +537,7 @@ def test_gemma4_attention_carrier_substitution():
     real = object()
     wrapped(m, "h", "pe", "am", past_key_values=real)
     assert seen["pkv"] is real, "a real cache must NOT be replaced"
-    m2 = M()  # no carrier attached
+    m2 = M()
     wrapped(m2, "h", "pe", "am", past_key_values=None)
     assert seen["pkv"] is None, "without a carrier, pass through unchanged"
 
@@ -591,7 +569,6 @@ def test_gemma4_clear_shared_kv_carrier_releases_kv():
     assert not hasattr(a0, "_unsloth_shared_kv_carrier"), "carrier attr must be removed"
     assert not hasattr(a1, "_unsloth_shared_kv_carrier")
 
-    # Idempotent / no-op when nothing is attached.
     model2 = _Model()
     _gemma4_clear_shared_kv_carrier(model2)  # no _unsloth_gemma4_attns -> no error
     model3 = _Model(); model3._unsloth_gemma4_attns = []
@@ -649,7 +626,7 @@ def test_gemma4_force_nonreentrant_checkpointing(monkeypatch):
     _gemma4_force_nonreentrant_checkpointing(m)
 
     # Non-E-series gemma-4 (no shared layer) must be a strict no-op.
-    plain = _Layer(Gemma4TextAttention, True)  # gemma-4 but NOT a shared layer
+    plain = _Layer(Gemma4TextAttention, True)
     class _ModelNoShare:
         def modules(self):
             return [self, plain, plain.self_attn]
@@ -750,13 +727,11 @@ def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
     wrapped = _make_kv_shared_use_cache_false_safe_forward(_orig, attach_carrier=True)
     x = torch.randn(2, 4, requires_grad=True)
 
-    # Unsafe: KV sharing + checkpointing -> arm + reject the overlapping forward.
     m = _make_gemma4_fake_model(torch, kv_shared=True, checkpointed=True)
     out1 = wrapped(m, x)
     assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is True
     with pytest.raises(RuntimeError, match="two forward passes before a single backward"):
         wrapped(m, x)
-    # after the first graph's backward the marker clears and a new forward is allowed
     out1.sum().backward()
     assert getattr(m, "_unsloth_gemma4_carrier_outstanding", False) is False
     wrapped(m, x)
@@ -782,13 +757,11 @@ def test_gemma4_carrier_rejects_two_forwards_only_when_unsafe():
     assert getattr(m_eval, "_unsloth_gemma4_carrier_outstanding", False) is False
 
 
-# ---------------------------------------------------------------------------
 # Regression: gpt-oss bnb-4bit <-> 16bit compiled-cache mode switch.
 # The compiled gpt_oss module hardcodes the BnB or stock router/experts layout. Reusing a
 # stale BnB-built module for a later 16bit load re-installs the BnB router -> "weights not
 # initialized". patch_gpt_oss_bnb4bit_auto must restore stock classes + invalidate the module
 # when the load is not bnb-4bit, and drop a stale stock module when switching into bnb.
-# ---------------------------------------------------------------------------
 
 
 def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path, monkeypatch):
@@ -798,7 +771,6 @@ def test_invalidate_gpt_oss_compiled_module_drops_sys_modules_and_file(tmp_path,
     import types
     from unsloth_zoo.temporary_patches import gpt_oss as _M
 
-    # fake an already-imported compiled module + its on-disk cache file
     sys.modules["unsloth_compiled_module_gpt_oss"] = types.ModuleType(
         "unsloth_compiled_module_gpt_oss"
     )
@@ -894,7 +866,6 @@ def test_patch_gpt_oss_auto_does_not_touch_cache_for_non_gpt_loads(tmp_path, mon
     marker.write_text("bnb4bit")
     before = module.read_text()
 
-    # Loading some other model (name has no "gpt_oss") must leave the cache intact.
     monkeypatch.setenv("UNSLOTH_MODEL_NAME", "meta-llama/Llama-3.2-1B")
     monkeypatch.setenv("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0")
     _M.patch_gpt_oss_bnb4bit_auto()

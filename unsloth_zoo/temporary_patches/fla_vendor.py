@@ -971,11 +971,182 @@ def _warn_hopper_optout_degraded():
     )
 
 
+# Names Transformers resolves out of fla that fla does not actually export.
+#
+# Since huggingface/transformers#47630 the gated-delta kernels come from
+# ``use_kernel_func_from_hub_with_fallback(func, "fla")``, which resolves
+# ``fla.ops.gated_delta_rule.<func>`` at decoration time and silently keeps the
+# pure-PyTorch fallback when the lookup returns None. For decode it asks for
+# ``recurrent_gated_delta_rule``, which no fla has ever exported -- upstream
+# calls it ``fused_recurrent_gated_delta_rule``.
+#
+# So every cached decode step of every gated-deltanet model runs a float32 Python
+# loop instead of Triton, and nothing reports it: availability still answers True
+# and prefill/training are unaffected, so it only looks like slow generation.
+# Measured on Qwen3.8-27B (48 layers, greedy, 64 new tokens): fla is entered 48
+# times without the alias (prefill only), 48 + 3024 with it.
+_MISSING_GATED_DELTA_ALIASES = {
+    "recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
+}
+
+
+def _alias_missing_gated_delta_names():
+    """Additively supply the gated-delta names Transformers looks up.
+
+    Applied to whichever fla is live, vendored or a user install we deferred to,
+    since the decode path is equally dead on both. A name that already resolves is
+    never replaced, so a future fla that exports it upstream wins. Returns the
+    names added, for logging and tests.
+    """
+    module = sys.modules.get("fla.ops.gated_delta_rule")
+    if module is None:
+        try:
+            module = importlib.import_module("fla.ops.gated_delta_rule")
+        except Exception:
+            return ()
+
+    added = []
+    for wanted, source in _MISSING_GATED_DELTA_ALIASES.items():
+        if getattr(module, wanted, None) is not None:
+            continue
+        implementation = getattr(module, source, None)
+        if implementation is None:
+            # A pruned or partial fla; leave the pure-torch fallback alone rather
+            # than binding a name to nothing.
+            continue
+        setattr(module, wanted, implementation)
+        exported = getattr(module, "__all__", None)
+        if isinstance(exported, list) and wanted not in exported:
+            exported.append(wanted)
+        added.append(wanted)
+
+    if added and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: aliased {', '.join(added)} onto fla.ops.gated_delta_rule "
+            f"so the Triton decode kernel is reachable."
+        )
+    return tuple(added)
+
+
+# The fla kernels Transformers pulls in through the kernel-hub decorator, keyed by
+# the module attribute holding the decorated wrapper. Identical across every model in
+# _REPAIR_MODELING. The causal_conv1d decorators in the same modules are deliberately
+# absent: we do not vendor that package, so there is nothing to re-resolve them to.
+_KERNEL_HUB_DECORATED = {
+    "torch_chunk_gated_delta_rule": "chunk_gated_delta_rule",
+    "torch_recurrent_gated_delta_rule": "recurrent_gated_delta_rule",
+}
+
+
+def _resolved_implementation(wrapper):
+    """The callable a kernel-hub wrapper will actually dispatch to, or None."""
+    for cell in getattr(wrapper, "__closure__", None) or ():
+        try:
+            value = cell.cell_contents
+        except ValueError:      # empty cell
+            continue
+        if callable(value):
+            return value
+    return None
+
+
+def _live_gated_delta_kernel(name):
+    """The kernel ``name`` currently resolves to on the live fla, or None."""
+    module = sys.modules.get("fla.ops.gated_delta_rule")
+    return getattr(module, name, None) if module is not None else None
+
+
+def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
+    """Re-resolve the kernel-hub decorators on modeling modules imported before us.
+
+    Since huggingface/transformers#47630 the gated-delta kernels are bound by
+    ``use_kernel_func_from_hub_with_fallback``, which resolves the implementation at
+    *decoration time* and closes over it. A modeling module imported before we ran
+    therefore froze whatever was live then, and no amount of fixing ``fla`` afterwards
+    can reach it: ``_repair_already_imported_modeling`` only rebinds module globals,
+    which these modules no longer have.
+
+    Two things get frozen. The pure-PyTorch fallback, when no fla was importable yet.
+    Or a real user install's kernel, when one was live and ``UNSLOTH_FORCE_VENDORED_FLA``
+    (or the Hopper #640 switch) has since purged it -- the case ``replaced_real``
+    exists for, and the one that matters most, since that kernel is exactly the
+    miscompiled backward we replaced it to avoid. So the test is against the fla that
+    is live *now*, not against the fallback: anything else is stale.
+
+    Re-applying the decorator rather than poking ``cell_contents`` is what makes this
+    correct. The wrapper also closes over the implementation's parameter names, and
+    those differ between the fallback and the kernel (10 against 16 for chunk), so
+    patching the implementation alone would filter out arguments the kernel needs.
+
+    Scoped to ``_REPAIR_MODELING``: olmo_hybrid is deliberately not vendor-covered,
+    and ``_disable_already_imported_gated_delta`` handles it instead.
+    """
+    try:
+        from transformers.integrations.hub_kernels import (
+            use_kernel_func_from_hub_with_fallback,
+        )
+    except Exception:
+        return ()               # transformers predates the decorator
+
+    repaired = []
+    for package in packages:
+        module = sys.modules.get(f"transformers.models.{package}.modeling_{package}")
+        if module is None:
+            continue
+        for attribute, kernel in _KERNEL_HUB_DECORATED.items():
+            wrapper = getattr(module, attribute, None)
+            original = getattr(wrapper, "__wrapped__", None)
+            if original is None:
+                continue        # not decorated on this transformers
+            current = _resolved_implementation(wrapper)
+            live = _live_gated_delta_kernel(kernel)
+            if live is not None and current is live:
+                continue        # already dispatching to the fla that is live now
+            try:
+                rebuilt = use_kernel_func_from_hub_with_fallback(kernel, "fla")(original)
+            except Exception:
+                continue
+            if _resolved_implementation(rebuilt) is current:
+                continue        # nothing would change
+            # Reached with a stale kernel and no live replacement too, where the
+            # rebuild resolves to the fallback. Taking it is the point: pure torch
+            # beats calling into an install that has been purged.
+            setattr(module, attribute, rebuilt)
+            repaired.append(f"{package}.{attribute}")
+
+    if repaired and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: re-resolved the fla kernels on {', '.join(repaired)}, which "
+            f"were bound before the live fla was in place."
+        )
+    return tuple(repaired)
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
     Idempotent; safe to call at import time and again from TEMPORARY_PATCHES.
     """
+    try:
+        return _patch_vendor_fla(phase)
+    finally:
+        # Every early return in _patch_vendor_fla leaves some fla live, and all of
+        # them are missing the decode name, so the alias goes on the way out rather
+        # than at each return, where the next one added would quietly skip it.
+        # The closure repair follows the alias, since it resolves through it.
+        try:
+            _alias_missing_gated_delta_names()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+        try:
+            _repair_kernel_hub_closures()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
+
+
+def _patch_vendor_fla(phase=None):
     # Correctness switch, checked before the source-preference flags below. On
     # Hopper + Triton [3.4.0, 3.7.1) *every* fla on the host has the #640 backward
     # miscompile except our vendored copy, which steps around it. A user who does

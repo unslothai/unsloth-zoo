@@ -51,8 +51,6 @@ def _trainable_bias_count(model):
         p.requires_grad for n, p in model.named_parameters() if n.endswith(".bias"))
 
 
-# ---------------- PEFT bias decision is preserved ----------------------------
-
 def test_peft_bias_all_stays_trainable():
     """bias='all': every bias PEFT enabled stays trainable after prepare."""
     pytest.importorskip("peft")
@@ -68,7 +66,6 @@ def test_peft_bias_all_stays_trainable():
     )
     after = _trainable_bias_count(model)
     assert after == before, f"bias='all' lost trainable biases: {before} -> {after}"
-    # Base weights stay frozen.
     params = dict(model.named_parameters())
     base_w = next(n for n in params
                   if n.endswith("q_proj.base_layer.weight"))
@@ -133,13 +130,10 @@ def test_peft_bias_gradient_flows_after_backward():
     a_grad = params[a_bias].grad
     assert a_grad is not None, "trainable bias must receive a grad"
     assert torch.isfinite(a_grad).all(), "bias grad must be finite"
-    # > 0 proves a gradient actually flowed, not just that grad exists.
     assert a_grad.abs().sum() > 0, "bias grad must be non-zero (gradient flowed)"
     base_w = next(n for n in params if n.endswith("q_proj.base_layer.weight"))
     assert params[base_w].grad is None, "frozen base weight must not accumulate grad"
 
-
-# ---------------- non-PEFT models are left frozen ----------------------------
 
 def test_non_peft_model_biases_stay_frozen():
     """A non-PEFT model's biases default to requires_grad=True but must still be
@@ -157,8 +151,6 @@ def test_non_peft_model_biases_stay_frozen():
     assert _trainable_bias_count(model) == 0, \
         "non-PEFT biases must be frozen on the LoRA path"
 
-
-# ---------------- modules_to_save biases are not a bias decision -------------
 
 def test_modules_to_save_bias_not_preserved_on_bias_none():
     """bias='none' + modules_to_save: a saved module is trainable because the whole

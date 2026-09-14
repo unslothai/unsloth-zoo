@@ -462,7 +462,6 @@ def test_restoring_the_marker_cannot_erase_an_earlier_compiled_pack(monkeypatch)
     """
     monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
                         lambda **_: True)
-    # An earlier region in this same checkpoint already packed compiled.
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
     monkeypatch.setattr(
         patch_utils, "_note_packed_under_checkpoint",
@@ -930,7 +929,6 @@ def test_releasing_borrowed_budget_keeps_compiled_pack_history(monkeypatch):
         "handing back the recompile budget mid-step erased a wrapper's record "
         "of having packed compiled activations"
     )
-    # The genuine step boundary still clears it.
     patch_utils.apply_pending_eager_fallbacks()
     assert "test-packed-earlier" not in patch_utils._COMPILED_OK_LABELS, \
         "the step boundary must still reset the history"

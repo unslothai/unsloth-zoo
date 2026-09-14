@@ -105,7 +105,6 @@ def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
     count = result[0] if isinstance(result, tuple) else result
     merged = load_file(path)
 
-    # Every per-expert tensor changed; nothing fell back.
     n_expert = sum(1 for k in base if ".experts." in k)
     n_changed = sum(
         1 for k in base
@@ -117,10 +116,8 @@ def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
     # gate_up + down per layer.
     assert count == num_layers * 2
 
-    # Disk layout stays unfused.
     assert not any("gate_up_proj" in k for k in merged)
 
-    # Numeric check against the analytic LoRA delta per expert.
     max_err = 0.0
     for L in range(num_layers):
         prefix = f"model.layers.{L}.mlp.experts"
@@ -158,7 +155,6 @@ def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
         B_gu = torch.randn(2 * intermediate, TR, dtype=torch.float32) * 0.05
         A_dn = torch.randn(TR, intermediate, dtype=torch.float32) * 0.05
         B_dn = torch.randn(hidden, TR, dtype=torch.float32) * 0.05
-        # gate_up keyed on .gate_up_proj instead of .base_layer.
         lw[prefix + ".gate_up_proj"] = LoraStats(_InnerMoE(num_experts), A_gu, B_gu, alpha)
         lw[prefix] = LoraStats(_InnerMoE(num_experts), A_dn, B_dn, alpha)
 
@@ -221,7 +217,6 @@ def test_legacy_mixtral_down_proj_keyed_adapter_is_merged(tmp_path):
         A_dn = torch.randn(TR, intermediate, dtype=torch.float32) * 0.05
         B_dn = torch.randn(hidden, TR, dtype=torch.float32) * 0.05
         lw[prefix + ".base_layer"] = LoraStats(_InnerMoE(num_experts), A_gu, B_gu, alpha)
-        # down keyed on .down_proj instead of the experts module.
         lw[prefix + ".down_proj"] = LoraStats(_InnerMoE(num_experts), A_dn, B_dn, alpha)
 
     _reset_moe_merge_state()
@@ -382,7 +377,6 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
     count = result[0] if isinstance(result, tuple) else result
     merged = load_file(path)
 
-    # Data stays float8 and scales were rewritten.
     for k, v in merged.items():
         if k.endswith(".weight"):
             assert v.dtype == torch.float8_e4m3fn, f"{k} should stay FP8, got {v.dtype}"
@@ -453,7 +447,6 @@ def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
                 hp[f"{p}.{w_name}.weight"] = _fp8_dequant_blockwise(W_fp8, scale)
     save_file(tensors, path)
 
-    # Phase 1: dequantize to 16bit (no LoRA), then drop the now-resolved scales.
     prerewrite_fp8 = _collect_fp8_weight_keys(str(tmp_path), ["model.safetensors"])
     _merge_and_overwrite_lora_fp8(
         str(tmp_path), "model.safetensors",
@@ -464,7 +457,6 @@ def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
     assert not any(k.endswith(("weight_scale", "weight_scale_inv")) for k in dq), "scales not dropped"
     assert all(v.dtype == torch.bfloat16 for k, v in dq.items() if k.endswith(".weight")), "not 16bit"
 
-    # Phase 2: standard (non-quantized) 16bit MoE merge of the expert LoRA.
     TR = num_experts * rank_per
     lw = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
     for L in range(num_layers):
@@ -485,7 +477,6 @@ def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
     )
     merged = load_file(path)
     assert _MOE_MERGE_STATE["fallback"] == 0
-    # Genuine 16bit output (no FP8, no scales) with the LoRA delta applied.
     assert all(v.dtype == torch.bfloat16 for k, v in merged.items() if k.endswith(".weight"))
     assert not any(k.endswith(("weight_scale", "weight_scale_inv")) for k in merged)
 

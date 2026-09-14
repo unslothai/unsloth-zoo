@@ -108,10 +108,39 @@ def test_no_double_backslash_continuations(workflow: str, job: str, name: str, r
     )
 
 
+# The twenty drift files the fused Core lane inherited from the three matrix cells it
+# replaced. Named rather than counted: a name tells you which file a dropped
+# continuation lost. An exact count made #1114 (which legitimately added the mxfp4
+# load-path file) turn this guard red. Removing a file from the lane is the deliberate
+# act: drop it from this set in the same commit.
+_FUSED_CORE_LANE_REQUIRED = frozenset({
+    "tests/test_compiler_dynamic_exec.py",
+    "tests/test_compiler_rewriter_exhaustive.py",
+    "tests/test_extended_dep_api_pins.py",
+    "tests/test_gemma4_dtype_drift_guards.py",
+    "tests/test_merge_e2e_hub_unreachable.py",
+    "tests/test_missing_parent_package_is_drift.py",
+    "tests/test_moe_merge_e2e_cpu.py",
+    "tests/test_peft_paramwrapper_layout_drift.py",
+    "tests/test_temporary_patches_exhaustive.py",
+    "tests/test_torchvision_video_removed_message.py",
+    "tests/test_transformers_moe_structure_drift.py",
+    "tests/test_unsloth_zoo_lora_merge.py",
+    "tests/test_upstream_import_fixes_drift.py",
+    "tests/test_upstream_pinned_symbols_accelerator.py",
+    "tests/test_upstream_pinned_symbols_transformers.py",
+    "tests/test_upstream_pinned_symbols_trl_vllm.py",
+    "tests/test_upstream_signatures.py",
+    "tests/test_upstream_source_patterns.py",
+    "tests/test_zoo_history_regressions_deep.py",
+    "tests/test_zoo_source_upstream_refs.py",
+})
+
+
 def test_the_fused_core_job_still_runs_every_drift_file() -> None:
     """
     A command can parse and still have lost most of its arguments. This pins the
-    count against the workflow the cells were fused from, so a continuation that
+    files against the workflow the cells were fused from, so a continuation that
     silently drops files fails here rather than going green having run three.
     """
     doc = yaml.safe_load((WORKFLOWS / "consolidated-tests-ci.yml").read_text(encoding = "utf-8"))
@@ -120,15 +149,135 @@ def test_the_fused_core_job_still_runs_every_drift_file() -> None:
 
     body = run[run.index("-m pytest"):]
     body = body[: body.index("|| trc=$?")]
-    # Join the continuations the way the shell does, then count what is left.
     joined = body.replace("\\\n", " ")
     files = re.findall(r"tests/\S+\.py", joined)
 
-    assert len(files) == 20, (
-        f"the fused Core lane invokes pytest on {len(files)} files; the three matrix "
-        f"cells it replaced each ran 20. Found: {files}"
+    missing = _FUSED_CORE_LANE_REQUIRED - set(files)
+    assert not missing, (
+        f"the fused Core lane no longer invokes pytest on {sorted(missing)}. The three "
+        f"matrix cells it replaced each ran all of them, so dropping one silently "
+        f"narrows upstream-drift coverage. Lane currently runs: {sorted(files)}"
+    )
+    # A repeated name would mask a drop from the set check above, which is
+    # multiplicity-blind.
+    duplicated = sorted({name for name in files if files.count(name) > 1})
+    assert not duplicated, (
+        f"the fused Core lane names {duplicated} more than once; pytest would collect "
+        f"the file twice and the duplicate could be hiding a file that went missing"
     )
     assert '>> "$log" 2>&1' in joined, (
         "the pytest output is no longer redirected into the lane log, so a failing "
         "lane would report a status with nothing to read"
     )
+
+
+# The capture is `{ cmd1; ...; cmdN } > "$log" || rc=$?`, and a brace group reports
+# only cmdN -- so every earlier failure was recorded as rc=0 and the job continued
+# with a half-built venv: a truncated mlx download surfaced two steps later as
+# ModuleNotFoundError, with the build step green. `set -e` inside the group does NOT
+# help: it sits on the left of `|| rc=$?`, where POSIX ignores errexit.
+
+def _capture_groups(run: str) -> list[str]:
+    """Bodies of every `{ ... } > ... || rc=$?` status-capture group in a lane."""
+    lines = run.splitlines()
+    groups, buf, depth = [], [], 0
+    for line in lines:
+        stripped = line.strip()
+        if depth == 0 and stripped == "{":
+            depth, buf = 1, []
+            continue
+        if depth:
+            if stripped.startswith("}") and "rc=$?" in stripped:
+                groups.append("\n".join(buf))
+                depth = 0
+            else:
+                buf.append(line)
+    return groups
+
+
+def _statements(body: str) -> list[str]:
+    """Logical statements: continuations joined, blanks and comment lines dropped.
+
+    A comment between two `&&`-chained commands is legal shell (the newline after
+    `&&` may be followed by comments), so it is not a statement for this purpose.
+    """
+    joined = body.replace("\\\n", " ")
+    return [
+        ln.strip() for ln in joined.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+
+
+def test_lane_status_capture_sees_every_failure() -> None:
+    """
+    Every command in a status-capture group must be `&&`-chained to the next, so a
+    failure anywhere becomes the lane's recorded status rather than being masked by
+    a later command that happens to succeed.
+    """
+    checked = 0
+    for workflow, job, name, run in _lane_steps():
+        for body in _capture_groups(run):
+            statements = _statements(body)
+            assert statements, f"{workflow}: job '{job}' step '{name}' has an empty capture group"
+            checked += 1
+            for stmt in statements[:-1]:
+                assert stmt.endswith("&&"), (
+                    f"{workflow}: job '{job}' step '{name}': the status-capture group has a "
+                    f"statement that is not chained to the next one:\n    {stmt}\n"
+                    "A brace group reports only its last command, so this failure would be "
+                    "recorded as success. Chain it with `&&` (`set -e` does not work here: "
+                    "errexit is ignored on the left of `|| rc=$?`)."
+                )
+            assert not statements[-1].endswith("&&"), (
+                f"{workflow}: job '{job}' step '{name}': capture group ends with a dangling `&&`"
+            )
+    assert checked >= 3, f"only {checked} status-capture groups found; the detector looks broken"
+
+
+def test_the_chaining_idiom_actually_propagates_failure() -> None:
+    """
+    Pins the shell semantics the test above relies on, so the reasoning is checked
+    rather than asserted: the old form swallows, `set -e` does not rescue it, and
+    `&&`-chaining does, while still tolerating a deliberate `|| true` step.
+    """
+    def rc_of(script: str) -> int:
+        return subprocess.run(
+            [ "bash", "-c", f"rc=0; {script} || rc=$?; exit $rc" ],
+            capture_output = True, text = True,
+        ).returncode
+
+    assert rc_of("{ false; true; }") == 0, "brace group should mask an early failure"
+    assert rc_of("( set -e; false; true; )") == 0, "errexit is ignored left of ||"
+    assert rc_of("{ false && true; }") != 0, "&&-chaining must propagate the failure"
+    assert rc_of("{ true && { false || true; } && false; }") != 0, (
+        "a real failure after a tolerated `|| true` step must still propagate"
+    )
+    assert rc_of("{ true && { false || true; } && true; }") == 0, (
+        "an all-succeeding chain with a tolerated step must stay green"
+    )
+
+
+def test_network_bound_installs_are_retried() -> None:
+    """
+    pip's `--retries` only covers establishing a connection, so a body truncated
+    mid-download (ProtocolError / IncompleteRead) is not retried and the install
+    dies. The lanes wrap those installs in retry().
+
+    The pip bootstrap used to be excluded here. It is network-bound like the
+    rest, and it runs before anything else in the lane, so a blip there costs the
+    whole lane: `retry` around `pip install -e .[core]` demonstrably saved a lane
+    from an IncompleteRead on 2026-09-09, and there was no reason the line above
+    it should have been the one left unprotected.
+    """
+    for workflow, job, name, run in _lane_steps():
+        for body in _capture_groups(run):
+            installs = [
+                stmt for stmt in _statements(body)
+                if "pip" in stmt and " install " in stmt
+                and "--no-deps" not in stmt      # deliberately `|| true`
+            ]
+            for stmt in installs:
+                assert stmt.startswith("retry "), (
+                    f"{workflow}: job '{job}' step '{name}': network-bound install is not "
+                    f"wrapped in retry():\n    {stmt}"
+                )

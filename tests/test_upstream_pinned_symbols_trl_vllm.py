@@ -270,8 +270,6 @@ def test_trl_dpo_vision_mapping_attr_installed():
     # populates it FROM transformers when empty). We only require the
     # *attribute name* to be a thing the module looks up via getattr,
     # which it is -- so the patch site stays valid.
-    # Direct assertion: the symbol the patch writes to MUST be the
-    # exact string the patch uses (no upstream rename).
     assert "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES" in dir(dpo_mod) or hasattr(
         dpo_mod, "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES"
     ) or True, (
@@ -323,8 +321,6 @@ def test_trl_constant_length_dataset_soft():
         from trl.trainer.utils import ConstantLengthDataset
     except ImportError:
         pytest.skip("ConstantLengthDataset removed on this TRL (OK -- soft import)")
-    # When present, it MUST be importable as a class object (not a
-    # module). Our isinstance check in dataset_utils:613 relies on this.
     assert inspect.isclass(ConstantLengthDataset), (
         "trl.trainer.utils.ConstantLengthDataset is not a class -- "
         "unsloth_zoo dataset_utils:613 isinstance() check breaks"

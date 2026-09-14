@@ -417,6 +417,21 @@ def patch_model_and_tokenizer(
                 module.to(setted_dtype)
             if "bias" in name:
                 module.to(setted_dtype)
+        pass
+        # empty_cache() used to run here once per module, and that corrupted memory on a
+        # model split across GPUs: the casts above are async, and empty_cache() cudaFrees
+        # cached blocks on EVERY device with no device guard, while cudaFree only
+        # synchronises the current one. Blocks on the other card went back to the driver
+        # mid-write, surfacing as an illegal memory access at a later, unrelated sync.
+        # Only FORCE_FLOAT32 architectures reach this pass, which is why llama never
+        # showed it. Sync the devices this model occupies, then release once -- taking the
+        # set from the model rather than device_count() keeps a DDP rank from creating a
+        # CUDA context on a card it never uses.
+        _model_devices  = {p.device for p in model.parameters() if p.device.type == "cuda"}
+        _model_devices |= {b.device for b in model.buffers()    if b.device.type == "cuda"}
+        for _device in _model_devices:
+            torch.cuda.synchronize(_device)
+        if _model_devices:
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters
@@ -449,7 +464,23 @@ def patch_model_and_tokenizer(
             if key == "torch_dtype" or key == "dtype":
                 setattr(config, key, correct_dtype)
             else:
-                __fix_dtype(getattr(config, key, None))
+                # getattr's default only covers AttributeError, and transformers
+                # >= 5.15 raises AmbiguousGlobalPerLayerAttributeError straight
+                # out of PretrainedConfig.__getattribute__ for any attribute
+                # that varies per layer on a heterogeneous config. So reading a
+                # key that to_dict() itself just listed can raise, and it kills
+                # the whole load: unsloth/gemma-4-E2B-it on transformers 5.15.1
+                # dies here on 'head_dim' before a single weight is touched.
+                #
+                # Not fatal, because of what this walk is FOR. It descends
+                # looking for nested config objects that might carry a dtype
+                # key; a per-layer scalar like head_dim is never one, so an
+                # unreadable key has nothing to contribute either way.
+                try:
+                    child = getattr(config, key, None)
+                except Exception:
+                    continue
+                __fix_dtype(child)
     m = model
     while hasattr(m, "model"):
         if hasattr(m, "dtype"):
@@ -626,7 +657,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.compiled_autograd import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture  # noqa: F821
 
     # From https://github.com/pytorch/pytorch/pull/135795/files
     try:
@@ -652,7 +684,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.variables.misc import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method  # noqa: F821
     return
 pass
 
@@ -810,7 +843,8 @@ if _transformers_bnb is not None and \
     source = re.sub(pattern, add_score_code, source, flags=re.MULTILINE)
 
     exec(source, globals())
-    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
+    # Defined by the exec(source, globals()) directly above.
+    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear  # noqa: F821
 pass
 
 # Patch for transformers 5.x: should_convert_module uses re.match + endswith

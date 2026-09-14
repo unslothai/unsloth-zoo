@@ -156,8 +156,6 @@ def _check(repo):
     try:
         ins, res = get_chat_template_parts(tok)
     except ValueError as e:
-        # A model shipped in a notebook is expected to auto-detect. Only allowlisted
-        # non-atomic templates may safe-raise; anything else is a real regression.
         if any(k in repo.lower() for k in KNOWN_NON_ATOMIC):
             return "SKIP", "known non-atomic template (allowlisted)"
         return "FAIL", f"auto-detect raised ValueError for a supported model: {str(e)[:80]}"

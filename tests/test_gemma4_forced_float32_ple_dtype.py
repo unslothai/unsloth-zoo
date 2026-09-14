@@ -387,7 +387,6 @@ def test_gemma4_ple_dry_run_classifies_without_mutating(tmp_path, monkeypatch):
     ) is False
     assert drift_cls.project_per_layer_inputs.__code__ is drift_code
 
-    # Dry run on the already-marked good class reports ALREADY.
     assert _patch_gemma4_ple_dtype_on_method(ok_cls, "project_per_layer_inputs", targets) is True
     assert _patch_gemma4_ple_dtype_on_method(
         ok_cls, "project_per_layer_inputs", targets, dry_run=True,
@@ -422,7 +421,7 @@ def test_gemma4_ple_compiler_appends_helper_only_when_call_present(tmp_path, mon
     module = _make_fake_decoder_module(tmp_path, monkeypatch, "fake_gemma4_ple_append")
     monkeypatch.setattr(compiler, "fake_gemma4_ple_append", module, raising=False)
 
-    # Flag off: no PLE rewrite, so no helper call and no appended helper def.
+    # Flag off: no PLE rewrite, so no appended helper def.
     monkeypatch.delenv("UNSLOTH_FORCE_FLOAT32", raising=False)
     off = compiler.create_standalone_class(
         "Gemma4TextDecoderLayer", "fake_gemma4_ple_append", dir(module), disable=True,
@@ -430,7 +429,7 @@ def test_gemma4_ple_compiler_appends_helper_only_when_call_present(tmp_path, mon
     assert "_unsloth_gemma4_ple_cast_input(" not in off
     assert "def _unsloth_gemma4_ple_cast_input" not in off
 
-    # Flag on: the rewrite inserts the call, so the helper def is appended exactly once.
+    # Flag on: the helper def is appended exactly once.
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     on = compiler.create_standalone_class(
         "Gemma4TextDecoderLayer", "fake_gemma4_ple_append", dir(module), disable=True,
@@ -454,11 +453,9 @@ def test_gemma4_ple_eager_then_compile_share_one_helper_name(tmp_path, monkeypat
         decoder_cls, "forward",
         (("per_layer_input_gate", "hidden_states"), ("per_layer_projection", "hidden_states")),
     ) is True
-    # inspect.getsource (which the compiler uses) now returns the eager-patched source.
     assert "_unsloth_gemma4_ple_cast_input(" in inspect.getsource(decoder_cls.forward)
 
-    # The compiler reads that poisoned source; the generated module must DEFINE the
-    # same helper name it CALLS.
+    # The generated module must DEFINE the same helper name it CALLS.
     monkeypatch.setattr(compiler, "fake_gemma4_ple_crosspath", module, raising=False)
     generated = compiler.create_standalone_class(
         "Gemma4TextDecoderLayer", "fake_gemma4_ple_crosspath", dir(module), disable=True,

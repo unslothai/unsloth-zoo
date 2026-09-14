@@ -252,7 +252,6 @@ def assert_merge_correct_model_space(*, family, base_dir, out_dir,
         f"-{sorted(set(base_p) - set(merged_p))[:4]})"
     )
 
-    # map each adapted key onto its parameter name (usually identical)
     resolved: dict[str, _Adapted] = {}
     for ak, a in adapted.items():
         if ak in base_p:
@@ -301,7 +300,6 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
     assert merged, f"[{family}] no safetensors written to {out_dir}"
     base_keys = set(base_tensors.keys())
 
-    # no adapter remnants leaked
     leaked = [k for k in merged if any(m in k for m in _LORA_REMNANT_MARKERS)]
     assert not leaked, f"[{family}] adapter remnants in merged output: {leaked[:5]}"
 
@@ -320,7 +318,6 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
             adapted=adapted, save_dtype=save_dtype,
         )
 
-    # resolve adapted keys against real base keys (VLM prefix tolerance)
     resolved: dict[str, _Adapted] = {}
     for ak, a in adapted.items():
         rk = _resolve_key(ak, base_keys)
@@ -351,18 +348,15 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
             _assert_equal(family, key, mt, base_tensors[key])
             n_passthru += 1
 
-    # every adapted target appeared and was checked
     if not allow_missing_adapted:
         missing = [k for k in resolved if k not in merged]
         assert not missing, f"[{family}] adapted targets missing from merged output: {missing}"
     assert n_adapted >= 1, f"[{family}] no adapted tensors were checked (LoRA not attached?)"
 
-    # MoE merge must not have fallen back
     assert _MOE_MERGE_STATE.get("fallback", 0) == 0, (
         f"[{family}] MoE merge fell back: {_MOE_MERGE_STATE}"
     )
 
-    # index consistency
     idx = read_index(out_dir)
     if idx is not None:
         wm = idx.get("weight_map", {})
@@ -412,7 +406,6 @@ class FamilySpec:
     fused_params: tuple = ()        # fused-expert target_parameters
 
 
-# distinct dims so fused-expert orientation is unambiguous (transpose bugs show)
 _H = 32
 _I = 64
 _MOE_I = 48      # distinct from _H and 2*_MOE_I

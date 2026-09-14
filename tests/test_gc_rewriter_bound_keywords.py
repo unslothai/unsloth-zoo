@@ -56,9 +56,7 @@ from unsloth_zoo.gradient_checkpointing import (
 )
 
 
-# ---------------------------------------------------------------------------
 # A miniature model whose forward has the exact shape the rewriter looks for.
-# ---------------------------------------------------------------------------
 
 _TOY_SOURCE = '''
 class _ToyBlocks(torch.nn.Module):
@@ -80,8 +78,7 @@ class _ToyBlocks(torch.nn.Module):
 '''
 
 
-# Same shape, but with a named layer class so the rewriter can resolve the
-# ModuleList's element type and check a replacement against its signature.
+# Same shape, but with a named layer class the rewriter can resolve.
 _TOY_NAMED_SOURCE = '''
 class _ToyLayer(torch.nn.Module):
     def forward(self, hidden_states, extra, **kwargs):
@@ -118,8 +115,7 @@ _TOY_NAMED_REPLACE = """hidden_states = layer(
 
 @functools.lru_cache(maxsize = None)
 def _build_toy():
-    # patch_gradient_checkpointing() reads the class through inspect.getsource(),
-    # so the toy has to live in a real file on disk.
+    # patch_gradient_checkpointing() reads the class through inspect.getsource().
     import importlib.util
     import tempfile
 
@@ -234,10 +230,8 @@ def test_rewriter_binds_declared_keyword_into_the_callable(monkeypatch, declarat
     checkpointed = branch.body[0].value
     assert isinstance(checkpointed, ast.Call)
     assert ast.unparse(checkpointed.func) == "self._gradient_checkpointing_func"
-    # NOTHING may be left as a keyword on the checkpoint function itself - not
-    # the declared keyword and not the layer's own **kwargs expansion, which is
-    # empty often enough to look harmless and then raises `Unexpected keyword
-    # arguments` the first time a caller passes anything.
+    # No keyword may be left on the checkpoint function, not even the layer's own
+    # **kwargs: `Unexpected keyword arguments` the first time a caller passes one.
     assert [kw.arg for kw in checkpointed.keywords] == [], (
         "no keyword may reach _gradient_checkpointing_func; "
         f"got {[kw.arg for kw in checkpointed.keywords]}"
@@ -277,8 +271,6 @@ def test_rewriter_both_branches_call_the_layer_identically(monkeypatch):
 
     positional = [ast.unparse(a) for a in checkpointed.args[1:]]
     assert positional == [ast.unparse(a) for a in direct.args]
-    # Every keyword the direct branch passes - named or expanded - has to be on
-    # the partial instead, and none of them on the checkpoint function.
     assert sorted(
         (str(kw.arg), ast.unparse(kw.value)) for kw in checkpointed.args[0].keywords
     ) == sorted(
@@ -418,8 +410,7 @@ def test_qwen2_vl_5x_entry_declares_max_seqlen():
         "max_seqlen must leave the argument list; it comes back bound into the "
         "callable"
     )
-    # And the 5.x entry has to stay last, after both 4.x entries, because its
-    # replacement text is literally the 4.x call site.
+    # The 5.x entry must stay last: its replacement text is the 4.x call site.
     assert entries.index(entry) == len(entries) - 1
 
 
@@ -432,16 +423,13 @@ def test_generated_module_imports_functools():
     assert '"import functools\\n"' in source
 
 
-# ---------------------------------------------------------------------------
 # Checkpoint shims
-# ---------------------------------------------------------------------------
 
 def test_bind_checkpoint_kwargs_is_identity_without_kwargs():
     def fn(x):
         return x
     assert _bind_checkpoint_kwargs(fn, {}) == (fn, ())
-    # torch's own checkpoint keywords are consumed by the checkpoint machinery
-    # and must never be bound into the wrapped function.
+    # torch's own checkpoint keywords must never be bound into the function.
     only_torch = {k: object() for k in _TORCH_CHECKPOINT_KEYWORDS}
     assert _bind_checkpoint_kwargs(fn, only_torch) == (fn, ())
 
@@ -484,8 +472,7 @@ def test_bind_checkpoint_kwargs_binds_the_rest():
     def fn(x, flag = None):
         return (x, flag)
     bound, extra = _bind_checkpoint_kwargs(fn, {"flag": 7, "preserve_rng_state": False})
-    # Nothing differentiable here, so the cheap partial is kept and no extra
-    # positional input is handed to the checkpoint Function.
+    # Nothing differentiable here, so the cheap partial is kept.
     assert isinstance(bound, functools.partial)
     assert extra == ()
     assert bound(1) == (1, 7)
@@ -551,16 +538,9 @@ def test_unsloth_gradient_checkpointer_still_accepts_a_one_tuple_return():
     assert torch.allclose(x.grad, torch.full_like(x, 3.0))
 
 
-# ---------------------------------------------------------------------------
-# Tensor keywords stay visible to autograd
-# ---------------------------------------------------------------------------
-# A keyword whose value is a non-leaf tensor that requires grad cannot be closed
-# over by functools.partial: the checkpoint autograd.Function would never see it
-# as an input, so its gradient could only arrive as a side effect of the nested
-# torch.autograd.backward() the reentrant recompute performs. When that tensor is
-# shared - handed to more than one checkpointed layer, or also feeding the loss -
-# the first nested backward frees the shared history and the next traversal dies
-# with "Trying to backward through the graph a second time".
+# Tensor keywords stay visible to autograd. A non-leaf tensor keyword closed over
+# by functools.partial is never an input of the checkpoint autograd.Function, so
+# a shared one dies with "Trying to backward through the graph a second time".
 
 
 @pytest.fixture
@@ -676,16 +656,11 @@ def test_reentrant_checkpointer_returns_gradients_for_tensor_args():
     assert torch.allclose(leaf.grad, torch.full_like(leaf, 6.0))
 
 
-# ---------------------------------------------------------------------------
-# A frozen first activation next to a differentiable later input
-# ---------------------------------------------------------------------------
-# UnslothCheckpointFunction decided "this Function has a gradient to produce"
-# from positional input zero alone. Autograd calls backward whenever ANY input
-# requires grad, so a frozen activation zero next to a differentiable later
-# input reached the early return and the engine got a single None where it
-# wanted one gradient per input. torch's own reentrant CheckpointFunction has no
-# such gate - it saves unconditionally - so this was a divergence from the
-# function these shims stand in for.
+# A frozen first activation next to a differentiable later input.
+# UnslothCheckpointFunction decided "this Function has a gradient to produce" from
+# positional input zero alone, so a frozen input zero reached the early return and
+# the engine got one None where it wanted a gradient per input. torch's own reentrant
+# CheckpointFunction has no such gate: it saves every tensor input unconditionally.
 
 
 def _frozen_first_input(checkpoint_fn, as_keyword):

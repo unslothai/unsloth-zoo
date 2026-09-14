@@ -92,8 +92,6 @@ def _pair(compiled_raises = None, calls = None):
     return compiled, eager, calls
 
 
-# ---- the failure that must stop being fatal -------------------------------
-
 def test_recompile_limit_falls_back_instead_of_raising():
     c, e, calls = _pair(_LIMIT_ERROR("recompile_limit reached"))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
@@ -149,8 +147,6 @@ def test_recompile_limit_exceeded_is_also_caught():
     assert _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")(4) == 8
 
 
-# ---- what must still raise ------------------------------------------------
-
 def test_a_real_graph_break_still_raises():
     from torch._dynamo.exc import Unsupported
     c, e, calls = _pair(Unsupported("call_function BuiltinVariable"))
@@ -168,16 +164,12 @@ def test_an_ordinary_error_still_raises():
     assert calls["e"] == 0
 
 
-# ---- the happy path is untouched ------------------------------------------
-
 def test_compiled_path_is_used_when_nothing_goes_wrong():
     c, e, calls = _pair()
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
     assert w(5) == 10
     assert calls == {"c": 1, "e": 0}
 
-
-# ---- introspection other code depends on ----------------------------------
 
 def test_signature_and_metadata_survive():
     c, e, _ = _pair()
@@ -280,8 +272,6 @@ def test_error_tuple_is_non_empty_on_this_torch():
     assert all(issubclass(x, BaseException) for x in errs)
 
 
-# ---- wiring into patch_function -------------------------------------------
-
 def test_only_fullgraph_patches_get_the_wrapper():
     src = Path(
         sys.modules["unsloth_zoo.temporary_patches.utils"].__file__
@@ -336,8 +326,6 @@ def test_end_to_end_through_patch_function():
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
-
-# ---- the one case where falling back is the wrong answer ------------------
 
 @contextlib.contextmanager
 def _hard_failure(enabled):
@@ -765,8 +753,6 @@ def test_a_successful_retry_keeps_its_bump():
         assert u._GLOBAL_BUMPS == 1
 
 
-# ---- round 3: four Codex items ------------------------------------------
-
 def _utils():
     """The module itself, so module-level bookkeeping can be reset."""
     import unsloth_zoo.temporary_patches.utils as U
@@ -983,8 +969,6 @@ def test_early_stop_counts_as_a_finished_retry():
         "the retry finished; the wrapper must still be latched for next step"
     _reset_bump_state(U)
 
-
-# ---- round 4: three Codex items -----------------------------------------
 
 def test_a_hidden_branch_survives_restoring_a_visible_one():
     """Restoring one branch used to drop every branch recorded for the name.
@@ -1291,8 +1275,6 @@ def test_a_real_compiled_region_traces_through_the_wrapper():
         _reset_bump_state(U)
         torch._dynamo.reset()
 
-
-# --- what the sixth review round found -------------------------------------
 
 def test_a_pre_2_8_torch_does_not_mark_every_call_as_packed():
     """The accessor arrived in 2.8, so on 2.4-2.7 it is always absent, and

@@ -105,6 +105,53 @@ def test_vlm_detection_requires_a_real_modality(monkeypatch, tmp_path):
     assert not loader._is_vlm({"vision_config": {}, "model_type": "text_only"})
 
 
+class _VLMOnlyClass:
+    """Stands in for a class only mlx-vlm ships; routing never calls it."""
+
+
+def test_text_only_vlm_load_stays_on_vlm_path_when_mlx_lm_has_no_model(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    monkeypatch.setattr(loader, "_get_mlx_lm_model_class", lambda _: None)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: _VLMOnlyClass)
+
+    config = {"model_type": "gemma4_unified", "vision_config": {"hidden_size": 32}}
+    assert loader._prefer_vlm_loader_for_text(config, "gemma4_unified")
+
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _: None)
+    assert not loader._prefer_vlm_loader_for_text(config, "unsupported_vlm")
+
+
+def test_a_model_module_that_exits_at_import_is_a_verdict_not_a_dead_process(monkeypatch):
+    """mlx_lm and mlx-vlm both ship modules that call `exit(1)` at import when an
+    optional dependency is missing -- `mlx_lm/models/olmo.py` does it without
+    ai2-olmo, which no install pulls in. `SystemExit` is not an `Exception`, so
+    catching only that let a routing question take the process down with no
+    traceback. Every one of these imports asks a question whose answer, when the
+    module will not import, is simply "this backend cannot build it".
+    """
+    import importlib
+
+    import unsloth_zoo.mlx.loader as loader
+
+    real_import = importlib.import_module
+
+    def exiting_import(name, *args, **kwargs):
+        if name.startswith(("mlx_lm.models.", "mlx_vlm.models.")):
+            print("To run olmo install ai2-olmo: pip install ai2-olmo")
+            raise SystemExit(1)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(loader.importlib, "import_module", exiting_import)
+
+    assert loader._get_mlx_lm_model_class("olmo") is None
+    assert loader._resolve_mlx_vlm_model_class("olmo") is None
+    # Reached on the mlx_lm branch of every text load, for any model_type.
+    loader._ensure_safe_text_wrapper_sanitize("olmo")
+    config = {"model_type": "olmo", "vision_config": {"hidden_size": 32}}
+    assert loader._prefer_vlm_loader_for_text(config, "olmo") is False
+
+
 def test_apply_mlx_distributed_sharding_modes_and_guards():
     from unsloth_zoo.mlx.loader import (
         _apply_mlx_distributed_sharding,
@@ -127,7 +174,9 @@ def test_apply_mlx_distributed_sharding_modes_and_guards():
         _apply_mlx_distributed_sharding(object(), tensor_group=tensor_group, model_name="fake")
 
 
-def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_path):
+@pytest.mark.parametrize("trust", [False, True])
+def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_path, trust):
+    from transformers import AutoTokenizer
     import mlx_lm.utils as mlx_lm_utils
     from unsloth_zoo.mlx.loader import _load_mlx_lm_distributed
 
@@ -180,12 +229,23 @@ def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_
 
     monkeypatch.setattr(mlx_lm_utils, "_download", _download)
     monkeypatch.setattr(mlx_lm_utils, "load_model", _load_model)
-    monkeypatch.setattr(mlx_lm_utils, "load_tokenizer", lambda *_a, **_k: types.SimpleNamespace(name="tok"))
+    (model_path / "tokenizer_config.json").write_text('{"tokenizer_class":"RemoteTokenizer"}')
+    tokenizer_calls = []
+
+    def tokenizer(path, **kwargs):
+        tokenizer_calls.append(kwargs)
+        return types.SimpleNamespace(name="tok")
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(tokenizer))
+    monkeypatch.setattr(
+        mlx_lm_utils, "load_tokenizer",
+        lambda path, *_a, **_k: AutoTokenizer.from_pretrained(path),
+    )
 
     model, tokenizer, config = _load_mlx_lm_distributed(
         "fake/repo",
         "llama",
-        {"return_config": True},
+        {"return_config": True, "tokenizer_config": {"trust_remote_code": trust}},
         pipeline_group=_FakeGroup(name="pipeline"),
     )
 
@@ -198,6 +258,7 @@ def test_load_mlx_lm_distributed_pipeline_filters_quant_shards(monkeypatch, tmp_
     assert ("download", local_shards) in events
     assert ("load", list(local_shards)) in events
     assert all(not path.exists() for path in load_paths)
+    assert tokenizer_calls[0]["trust_remote_code"] is trust
     assert config["eos_token_id"] == 3
     assert config["model_type"] == "llama"
     assert model._unsloth_mlx_distributed_parallel_mode == "pipeline"

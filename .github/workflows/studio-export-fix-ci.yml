@@ -56,7 +56,15 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-          cache: pip
+
+      # This file is its own key-file: the deps are named on the install line
+      # below and nowhere else. Small entry, so rolling it on any edit is cheap.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: studio-export-fix
+          key-files: |
+            .github/workflows/studio-export-fix-ci.yml
 
       - name: Install minimal test deps
         run: |
@@ -64,6 +72,12 @@ jobs:
           # Pure-Python tests: monkeypatch subprocess + AST-parse upstream files.
           # No torch / transformers needed. Keep slim so Windows cold start stays under a minute.
           python -m pip install pytest psutil requests tqdm
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: Run patcher + q2_k_l unit tests
         shell: bash

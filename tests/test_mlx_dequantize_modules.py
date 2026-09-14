@@ -82,7 +82,6 @@ def test_dequantize_selected_mlx_modules_swap():
     scales = torch.cat([scales0, scales1], dim=0)          # (2, 1)
     biases = torch.cat([biases0, biases1], dim=0)          # (2, 1)
 
-    # Build a wrapper Module with a QuantizedLinear submodule.
     class TinyModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -96,21 +95,17 @@ def test_dequantize_selected_mlx_modules_swap():
 
     model = TinyModel()
 
-    # Sanity: named_modules walks self + the QuantizedLinear child.
     names = [n for n, _ in model.named_modules()]
     assert "" in names and "layer" in names, f"unexpected names: {names!r}"
 
-    # Run the dequant-replace helper.
     n_replaced = _dequantize_selected_mlx_modules(
         model, predicate=lambda path, mod: isinstance(mod, nn.QuantizedLinear)
     )
     assert n_replaced == 1, f"expected 1 replacement, got {n_replaced}"
 
-    # The QuantizedLinear has been swapped for an nn.Linear.
     assert isinstance(model.layer, nn.Linear), f"got {type(model.layer)!r}"
     assert not isinstance(model.layer, nn.QuantizedLinear)
 
-    # Weight values: row 0 = [0..7], row 1 = [7..0]
     expected_row0 = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.float32)
     expected_row1 = torch.tensor([7, 6, 5, 4, 3, 2, 1, 0], dtype=torch.float32)
     torch.testing.assert_close(model.layer.weight[0].float(), expected_row0)
@@ -134,7 +129,6 @@ def test_dequantize_predicate_filters():
             self.swap.weight, self.swap.scales, self.swap.biases = packed, scales, biases
 
     m = TwoLayers()
-    # Only swap the .swap submodule
     n = _dequantize_selected_mlx_modules(m, predicate=lambda path, mod: path == "swap")
     assert n == 1
     assert isinstance(m.swap, nn.Linear)

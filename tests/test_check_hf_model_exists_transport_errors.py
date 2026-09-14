@@ -203,7 +203,6 @@ def test_a_plain_absent_repo_does_not_warn_about_gating(monkeypatch):
     assert [w for w in caught if "gated" in str(w.message)] == []
 
 
-# The success paths are unchanged.
 
 def test_repo_with_safetensors_returns_true(monkeypatch):
     _patch_ls(monkeypatch, [

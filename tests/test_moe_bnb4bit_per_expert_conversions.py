@@ -334,7 +334,6 @@ def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
         target_patterns=[conv.target_patterns[0]],
     )
     new_param = out[conv.target_patterns[0]]
-    # Reference: what the per-expert quantized segments actually dequantize to.
     seg_ref = torch.stack([
         torch.cat([
             bnb.functional.dequantize_4bit(
@@ -384,7 +383,6 @@ def test_plain_dequant_skips_bnb_embedding4bit():
 
     _dequantize_plain_param_slots(model)
 
-    # bnb module keeps its quantized weight; the genuinely plain slot converts.
     assert type(model.emb.weight).__name__ == "Params4bit"
     assert getattr(model.emb.weight, "quant_state", None) is not None
     assert type(model.plain.weight).__name__ == "Parameter"

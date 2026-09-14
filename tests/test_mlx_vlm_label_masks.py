@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import re
 
 import numpy as np
 import pytest
+from PIL import Image
 from pathlib import Path
+from unittest import mock
 
 
 mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 if "mlx_simulation" in str(getattr(mx, "__file__", "")):
     pytest.skip("requires real MLX runtime", allow_module_level=True)
 
@@ -479,11 +483,11 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
     processor = _ConversationalPromptCompletionProcessor()
     _finalized_collate(
         [{
-            "image": "top-level",
+            "image": Image.new("RGB", (8, 8), "red"),
             "prompt": [{
                 "role": "user",
                 "content": [
-                    {"type": "image", "image": "embedded"},
+                    {"type": "image", "image": Image.new("RGB", (8, 8), "blue")},
                     {"type": "text", "text": "Q"},
                 ],
             }],
@@ -494,7 +498,7 @@ def test_vlm_prompt_completion_prefers_embedded_images_like_cuda():
         image_size=16,
     )
 
-    assert processor.images_seen[0] == ["embedded"]
+    assert processor.images_seen[0] == [Image.new("RGB", (8, 8), "blue")]
 
 
 def test_vlm_prompt_completion_uses_top_level_image_for_bare_placeholder():
@@ -502,8 +506,8 @@ def test_vlm_prompt_completion_uses_top_level_image_for_bare_placeholder():
 
     messages = [{"role": "user", "content": [{"type": "image"}]}]
     assert _extract_vlm_pc_images(
-        {"image": "top-level"}, messages, [], image_size=16,
-    ) == ["top-level"]
+        {"image": Image.new("RGB", (8, 8), "red")}, messages, [], image_size=16,
+    ) == [Image.new("RGB", (8, 8), "red")]
 
 
 def test_vlm_collate_passes_studio_top_level_image_to_processor():
@@ -519,24 +523,24 @@ def test_vlm_collate_passes_studio_top_level_image_to_processor():
                     {"type": "text", "text": "Q"},
                 ],
             }],
-            "image": "top-level",
+            "image": Image.new("RGB", (8, 8), "red"),
         }],
         processor,
         max_seq_length=8,
         image_size=16,
     )
 
-    assert processor.images_seen == [["top-level"]]
+    assert processor.images_seen == [[Image.new("RGB", (8, 8), "red")]]
 
 
 def test_vlm_top_level_images_key_still_wins_over_image_key():
     from unsloth_zoo.mlx.utils import _extract_vlm_images
 
     assert _extract_vlm_images(
-        {"images": ["plural"], "image": "singular"},
+        {"images": [Image.new("RGB", (8, 8), "red")], "image": Image.new("RGB", (8, 8), "blue")},
         [],
         image_size=16,
-    ) == ["plural"]
+    ) == [Image.new("RGB", (8, 8), "red")]
 
 
 def test_vlm_top_level_image_key_requires_bare_image_placeholder():
@@ -607,7 +611,7 @@ def test_vlm_prompt_completion_top_level_images_use_cuda_process_shape(monkeypat
     def fake_process_vision_info(conversations, **kwargs):
         seen["conversations"] = conversations
         seen["kwargs"] = kwargs
-        return ["processed"], None, {"fps": []}
+        return [Image.new("RGB", (8, 8), "blue")], None, {"fps": []}
 
     monkeypatch.setattr(
         vision_utils,
@@ -615,9 +619,9 @@ def test_vlm_prompt_completion_top_level_images_use_cuda_process_shape(monkeypat
         fake_process_vision_info,
     )
 
-    assert _extract_vlm_pc_images({"images": ["raw"]}, [], [], image_size=16) == ["processed"]
+    assert _extract_vlm_pc_images({"images": [Image.new("RGB", (8, 8), "red")]}, [], [], image_size=16) == [Image.new("RGB", (8, 8), "blue")]
     assert seen == {
-        "conversations": [{"image": "raw"}],
+        "conversations": [{"image": Image.new("RGB", (8, 8), "red")}],
         "kwargs": {"return_video_kwargs": True},
     }
 
@@ -652,7 +656,7 @@ def test_vlm_render_falls_back_to_content_part_templates():
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
             assert tokenize is False
             if messages and all(isinstance(part, dict) and "type" in part for part in messages):
-                return "parts:" + ",".join(part["type"] for part in messages)
+                return "parts:" + ",".join(part["type"] for part in messages) + ":" + "".join(part.get("text", "") for part in messages)
             raise ValueError("expected content parts")
 
     rendered = _render_vlm_messages(
@@ -660,7 +664,7 @@ def test_vlm_render_falls_back_to_content_part_templates():
         [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Q"}]}],
     )
 
-    assert rendered == "parts:image,text"
+    assert rendered == "parts:image,text:Q"
 
 
 def test_vlm_render_falls_back_to_text_templates():
@@ -909,7 +913,7 @@ def test_deepseek_rendering_repairs_missing_image_token():
         chat_template = "deepseek"
 
         def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-            return "question"
+            return "".join(part.get("text", "") for m in messages for part in m["content"])
 
     text = _render_vlm_messages(
         DeepseekProcessor(),
@@ -960,6 +964,372 @@ def test_text_only_vlm_wrapper_uses_text_training_path():
         vision_tower = object()
 
     assert _is_vlm_model(TextOnlyVLMWrapper()) is False
+
+
+_VLM_CONFIG = {"model_type": "fake_vlm", "vision_config": {"hidden_size": 8}}
+
+
+def _skip_unless_mlx_vlm_ships(model_type):
+    """Asking the resolver would turn its own regressions into skips."""
+    import pkgutil
+
+    import mlx_vlm.models
+
+    shipped = {module.name for module in pkgutil.iter_modules(mlx_vlm.models.__path__)}
+    if model_type not in shipped:
+        pytest.skip(f"installed mlx-vlm does not ship {model_type}")
+
+
+class _VLMOnlyClass:
+    """Stands in for a class only mlx-vlm ships; routing never calls it."""
+
+
+def _route_text_only(monkeypatch, *, mlx_lm_class, vlm_class, config=_VLM_CONFIG):
+    from unsloth_zoo.mlx import loader
+
+    monkeypatch.setattr(loader, "_get_mlx_lm_model_class", lambda _t: mlx_lm_class)
+    monkeypatch.setattr(loader, "_resolve_mlx_vlm_model_class", lambda _t: vlm_class)
+    return loader._prefer_vlm_loader_for_text(config, config["model_type"])
+
+
+class _StripSanitizeModel:
+    def sanitize(self, weights):
+        return {k: v for k, v in weights.items() if not k.startswith("vision_tower")}
+
+
+class _PlainModel:
+    def sanitize(self, weights):
+        return weights
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["muse_glimmer", "qwen4_exp", "glm5_next", "lfm2_vl", "mage_vl", "kimi_k3"],
+)
+def test_vlm_only_families_reach_the_text_path_without_being_listed(model_type):
+    """Against the installed packages rather than a monkeypatched resolver."""
+    from unsloth_zoo.mlx import loader
+
+    _skip_unless_mlx_vlm_ships(model_type)
+    config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+    assert loader._get_mlx_lm_model_class(model_type) is None
+    assert loader._prefer_vlm_loader_for_text(config, model_type) is True
+
+
+def test_a_capitalised_model_type_routes_like_its_lowercase_spelling():
+    """mlx-vlm lower-cases before it remaps, so a `Muse_Glimmer` config loads."""
+    from unsloth_zoo.mlx import loader
+
+    _skip_unless_mlx_vlm_ships("muse_glimmer")
+
+    def route(model_type):
+        config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+        return loader._prefer_vlm_loader_for_text(config, model_type)
+
+    assert route("Muse_Glimmer") is route("muse_glimmer") is True
+
+
+@pytest.mark.parametrize("alias, target", [("qwen2_5_vl", "qwen2_vl"), ("llava", "mistral3")])
+def test_an_aliased_model_type_loads_like_the_architecture_it_aliases(alias, target):
+    """mlx_lm remaps before it imports, so both spellings must decide alike."""
+    from unsloth_zoo.mlx import loader
+
+    assert loader._get_mlx_lm_model_class(alias) is loader._get_mlx_lm_model_class(target)
+
+    def route(model_type):
+        config = {"model_type": model_type, "vision_config": {"hidden_size": 8}}
+        return loader._prefer_vlm_loader_for_text(config, model_type)
+
+    assert route(alias) == route(target)
+
+
+def _causal_logits(input_ids, vocab=7):
+    running = mx.cumsum(input_ids.astype(mx.float32), axis=1)
+    return mx.repeat(running[:, :, None], vocab, axis=2)
+
+
+def _sees_everything(values):
+    """What bidirectional attention looks like from outside."""
+    everything = values.astype(mx.float32).sum(axis=1, keepdims=True)
+    return mx.repeat(mx.broadcast_to(everything, values.shape)[:, :, None], 5, axis=2)
+
+
+class _PooledOutput:
+    """Shaped like mlx-vlm's pooled wrappers: no `logits` at all."""
+    text_embeds = "embeddings"
+
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        pytest.param(
+            lambda self, ids: (_ for _ in ()).throw(ValueError("You have to specify pixel_values")),
+            "cannot be fine-tuned on text alone",
+            id="demands pixels it was not given",
+        ),
+        pytest.param(
+            lambda self, ids: mx.zeros((1, ids.shape[1] + 3, 7)),
+            "not a causal language model",
+            id="answers a different sequence length",
+        ),
+        pytest.param(
+            lambda self, ids: _PooledOutput(),
+            "cannot be fine-tuned on text alone",
+            id="returns pooled embeddings",
+        ),
+        pytest.param(
+            lambda self, ids, a, b, c, d: _causal_logits(ids),
+            "cannot be fine-tuned on text alone",
+            id="demands more modalities than the path can invent",
+        ),
+        pytest.param(
+            lambda self, ids: _sees_everything(ids),
+            "attends bidirectionally",
+            id="sees the whole sequence",
+        ),
+        pytest.param(
+            lambda self, ids: _sees_everything(mx.maximum(ids, 4)),
+            "attends bidirectionally",
+            id="sees it only above the ids that share an embedding row",
+        ),
+        pytest.param(
+            lambda self, ids: mx.repeat(
+                mx.broadcast_to(1.0 + ids[:, -1:].astype(mx.float32) * 1e-6, ids.shape)[:, :, None], 5, axis=2),
+            "attends bidirectionally",
+            id="leaks far below any numerical tolerance",
+        ),
+        pytest.param(
+            lambda self, ids: mx.zeros((*ids.shape, 5)),
+            "answered every probe identically",
+            id="no probe can move it",
+        ),
+    ],
+)
+def test_a_wrapper_that_cannot_be_trained_on_text_is_refused_by_name(call, expected):
+    """Only running one tells these apart, and the refusal has to name it."""
+    from unsloth_zoo.mlx import loader
+
+    cls = type("Wrapper", (), {"__call__": call})
+    try:
+        with pytest.raises(ValueError, match=expected) as raised:
+            loader._verify_text_only_wrapper(cls(), "fake_vlm")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(cls)
+    assert "fake_vlm" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda self, ids: _causal_logits(ids), id="plain causal"),
+        pytest.param(
+            lambda self, ids: _causal_logits(mx.where(ids < 4, ids // 2, ids)),
+            id="two probe pairs cannot move it",
+        ),
+    ],
+)
+def test_a_causal_wrapper_is_accepted_and_left_unpatched(call):
+    """The second ties ids 0/1 and 2/3, so only the wider pairs settle it."""
+    from unsloth_zoo.mlx import loader
+
+    cls = type("Wrapper", (), {"__call__": call})
+    original, model = cls.__call__, cls()
+    loader._mark_text_only_vlm(model, "fake_vlm")
+    assert model._unsloth_text_only_vlm is True
+    assert cls.__call__ is original
+
+
+def test_the_text_only_path_flags_the_model_makes_it_callable_and_checks_it():
+    """Checked but not bound, or bound but not flagged, fails on the first step."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def __call__(self, input_ids, pixel_values, mask):
+            return _causal_logits(input_ids)
+
+    model = Wrapper()
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model._unsloth_text_only_vlm is True
+        assert model(mx.ones((1, 2), dtype=mx.int32)).shape == (1, 2, 7)
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_a_refused_wrapper_leaves_the_process_as_it_found_it():
+    """A class patch would outlive the refusal and reach the next load."""
+    from unsloth_zoo.mlx import loader
+
+    class Bidirectional:
+        def __call__(self, input_ids, pixel_values):
+            return _sees_everything(input_ids)
+
+    original, model = Bidirectional.__call__, Bidirectional()
+    try:
+        with pytest.raises(ValueError, match="attends bidirectionally"):
+            loader._mark_text_only_vlm(model, "fake_vlm")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Bidirectional)
+
+    assert Bidirectional.__call__ is original
+    assert not hasattr(model, "_unsloth_text_only_vlm")
+
+
+def test_a_wrapper_bound_for_text_still_takes_its_modalities_by_name():
+    """The image path names `pixel_values`; that must not become a duplicate."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def __call__(self, input_ids, pixel_values, mask=None):
+            if pixel_values is None:
+                return _causal_logits(input_ids)
+            return pixel_values, mask
+
+    model = Wrapper()
+    ids = mx.ones((1, 2), dtype=mx.int32)
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model(ids).shape == (1, 2, 7)
+        assert model(ids, pixel_values="pixels", mask="mask") == ("pixels", "mask")
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_a_wrapper_whose_signature_hides_what_it_demands_is_still_called():
+    """`_install_paligemma_causal_mask` rewrites `__call__` as `(*args, **kwargs)`."""
+    from unsloth_zoo.mlx import loader
+
+    class Wrapper:
+        def _forward(self, input_ids, pixel_values, mask=None):
+            return _causal_logits(input_ids)
+
+        def __call__(self, *args, **kwargs):
+            return self._forward(*args, **kwargs)
+
+    assert str(inspect.signature(Wrapper.__call__)) == "(self, *args, **kwargs)"
+
+    model = Wrapper()
+    try:
+        loader._mark_text_only_vlm(model, "fake_vlm")
+        assert model(mx.ones((1, 2), dtype=mx.int32)).shape == (1, 2, 7)
+    finally:
+        loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
+
+
+def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
+    """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
+    from unsloth_zoo.mlx import loader
+
+    class Cacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.ones((4, 5))
+            self._position_ids = None
+
+        def __call__(self, input_ids):
+            self._position_ids = mx.arange(input_ids.shape[1])
+            return _causal_logits(input_ids, vocab=5)
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = Cacher()
+
+        def __call__(self, input_ids):
+            return self.language_model(input_ids)
+
+    model = Wrapper()
+    weight = model.language_model.weight
+    loader._verify_text_only_wrapper(model, "fake_vlm")
+
+    assert model.language_model._position_ids is None
+    assert model.language_model.weight is weight
+
+
+@pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
+def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
+    """mlx_lm names these modules after the raw config spelling.
+
+    Asserted on the resolved module name, which is what this change decides.
+    Reaching the class as well needs mlx_lm to import, and it does not everywhere:
+    `mlx_lm/utils.py` imports `resource`, a Unix-only stdlib module, so on Windows
+    -- where mlx now does ship a wheel -- every one of these resolves to None for
+    a reason that has nothing to do with hyphens.
+    """
+    from unsloth_zoo.mlx import loader
+
+    assert loader._mlx_lm_module_name(model_type) == model_type
+
+    try:
+        import mlx_lm  # noqa: F401
+    except Exception as error:
+        pytest.skip(f"installed mlx_lm does not import here ({error})")
+    assert loader._get_mlx_lm_model_class(model_type) is not None
+
+
+def test_vlm_generate_prefers_the_processor_over_the_published_tokenizer():
+    """A text-only multimodal load stays on the vision path but publishes its
+    inner tokenizer, which cannot drive mlx-vlm preprocessing."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx import loader
+
+    seen = {}
+
+    def fake_stream_generate(model, processor, *args, **kwargs):
+        seen["processor"] = processor
+        raise _StopProbe
+
+    class _StopProbe(Exception):
+        pass
+
+    model = SimpleNamespace(
+        _processor = "the-processor",
+        _tokenizer = "the-inner-tokenizer",
+        _is_vlm_model = True,
+    )
+    with mock.patch.dict(
+        "sys.modules",
+        {"mlx_vlm": SimpleNamespace(stream_generate = fake_stream_generate)},
+    ):
+        with pytest.raises(Exception):
+            loader._mlx_generate_vlm(model, input_ids = [[1, 2]])
+
+    assert seen.get("processor", "the-inner-tokenizer") == "the-processor"
+
+
+def test_text_capable_mlx_lm_architecture_still_decides_by_its_sanitize(monkeypatch):
+    """An mlx_lm class keeps deciding on whether its sanitize strips towers."""
+    assert _route_text_only(
+        monkeypatch, mlx_lm_class=_StripSanitizeModel, vlm_class=_VLMOnlyClass
+    ) is True
+    assert _route_text_only(
+        monkeypatch, mlx_lm_class=_PlainModel, vlm_class=_VLMOnlyClass
+    ) is False
+
+
+def test_text_only_config_is_never_routed_to_the_vlm_loader(monkeypatch):
+    assert _route_text_only(
+        monkeypatch,
+        mlx_lm_class=None,
+        vlm_class=_VLMOnlyClass,
+        config={"model_type": "fake_text"},
+    ) is False
+
+
+def test_text_path_fallback_resolves_mlx_vlm_model_type_aliases():
+    """mlx-vlm maps several config spellings onto one module."""
+    from unsloth_zoo.mlx import loader
+
+    _skip_unless_mlx_vlm_ships("fastvlm")
+    with mock.patch.dict(
+        "mlx_vlm.utils.MODEL_REMAPPING", {"llava_qwen2": "fastvlm"}, clear = False,
+    ):
+        # Only the remap reaches fastvlm, and only from the lower-cased spelling.
+        fastvlm = loader._resolve_mlx_vlm_model_class("fastvlm")
+        assert loader._resolve_mlx_vlm_model_class("llava_qwen2") is fastvlm
+        assert loader._resolve_mlx_vlm_model_class("LLaVA_Qwen2") is fastvlm
+        assert loader._resolve_mlx_vlm_model_class("not_a_real_arch") is None
 
 
 def test_gemma3_vlm_cce_does_not_forward_outer_product_attention_mask():
@@ -1302,7 +1672,6 @@ def test_vlm_host_label_authority_and_staged_finalize():
         completion_only_loss=False)
     assert off["labels"].dtype == off["input_ids"].dtype
 
-    # MLX-returning processors flag host_valued=False, nested too; reject raises first.
     assert _vlm_inputs_host_valued(
         {"input_ids": np.array([[1]])}) is True
     assert _vlm_inputs_host_valued(
@@ -1333,7 +1702,6 @@ def test_vlm_host_label_authority_and_staged_finalize():
             yield_host_staged=True))
     assert probe.pulls == 0 and probe.epochs == []
 
-    # Value-carrying closures finalize through the legacy pipeline unchanged.
     from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
     def _value_closure(mask_batch):
         width = len(mask_batch["input_ids"][0])
@@ -1412,7 +1780,6 @@ def test_vlm_prefetch_identity_laziness_and_masked_rejection():
     assert prefetched == sync  # bit-for-bit consumer-visible sequence
     assert control["prefetcher"].close()
 
-    # Trainer wiring: eligibility, control registration, and cleanup.
     shell_probe = _LifecycleVLMRows(6)
     trainer = _vlm_trainer_shell_for(shell_probe, prefetch=2)
     _b, shell_stream = trainer._prepare_data(is_vlm=True)
@@ -1768,11 +2135,9 @@ def test_a_natively_shared_backbone_gets_no_legacy_slots():
     # Native: no slots at all, so `cache` stays unset and every layer runs.
     assert _build_shared_kv_caches(_model(4, 2, native=True)) is None
 
-    # Legacy backbones still get exactly one slot per producer layer.
     legacy = _build_shared_kv_caches(_model(4, 2, native=False))
     assert legacy is not None and len(legacy) == 2
 
-    # And a stack that shares nothing is unaffected either way.
     assert _build_shared_kv_caches(_model(4, 0, native=False)) is None
     assert _build_shared_kv_caches(_model(4, 0, native=True)) is None
 
@@ -1971,11 +2336,13 @@ def test_paligemma_mask_is_left_alone_without_token_types():
     untouched = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=outer_product), None, padding)
     assert untouched.attention_mask_4d is outer_product
-    # Nor when upstream built no mask at all, e.g. a text-only batch.
-    assert _paligemma_replace_mask(
+    text_mask = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=None),
-        mx_.zeros((1, 4), dtype=mx_.int32), padding).attention_mask_4d is None
-    # But it is replaced once the token types are there.
+        mx_.array([[0, 0, 1, 1], [0, 0, 0, 1]]), mx_.ones((2, 4)),
+    ).attention_mask_4d
+    visible = np.asarray(text_mask).reshape(2, 4, 4)
+    assert visible[0, 0, 1] and visible[1, 0, 2]
+    assert not visible[0, 0, 2] and not visible[1, 2, 3]
     replaced = _paligemma_replace_mask(
         SimpleNamespace(attention_mask_4d=outer_product),
         mx_.array([[0, 0, 1, 1]], dtype=mx_.int32), padding)
@@ -1983,14 +2350,15 @@ def test_paligemma_mask_is_left_alone_without_token_types():
     assert not np.asarray(replaced.attention_mask_4d).reshape(4, 4)[2, 3]
 
 
-def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
+@pytest.mark.parametrize("has_native_mask", [False, True])
+def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped(has_native_mask):
     """The wrapper is what actually reaches a loaded model, so it has to hand the
     token types on rather than return upstream's mask untouched."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.loader import _paligemma_causal_mask_wrapper
 
     mx_ = _utils_mx()
-    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_) if has_native_mask else None
     seen = {}
 
     def original(_self, input_ids=None, pixel_values=None, mask=None, **kwargs):
@@ -2001,14 +2369,14 @@ def test_paligemma_embedder_wrapper_replaces_the_mask_it_wrapped():
     got = wrapped(object(), mx_.zeros((1, 4), dtype=mx_.int32), None,
                   mx_.ones((1, 4), dtype=mx_.int32),
                   token_type_ids=mx_.array([[0, 0, 1, 1]], dtype=mx_.int32))
-    # Upstream still runs and still sees its kwargs.
     assert "token_type_ids" in seen["kwargs"]
     # And its all-visible mask does not survive: the suffix cannot read ahead.
     assert got.attention_mask_4d is not outer_product
     assert not np.asarray(got.attention_mask_4d).reshape(4, 4)[2, 3]
 
 
-def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
+@pytest.mark.parametrize("has_native_mask", [False, True])
+def test_paligemma_plain_loss_path_also_gets_the_causal_suffix(has_native_mask):
     """Upstream's call embeds with a fixed three arguments, dropping the token
     types, so without threading them the `use_cce=False` path keeps leaking."""
     from types import SimpleNamespace
@@ -2018,7 +2386,7 @@ def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
     )
 
     mx_ = _utils_mx()
-    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_)
+    outer_product = mx_.ones((1, 1, 4, 4), dtype=mx_.bool_) if has_native_mask else None
     padding = mx_.ones((1, 4), dtype=mx_.int32)
     seen = {}
 
@@ -2041,7 +2409,6 @@ def test_paligemma_plain_loss_path_also_gets_the_causal_suffix():
 
     assert seen["mask"] is not outer_product
     assert not np.asarray(seen["mask"]).reshape(4, 4)[2, 3]
-    # And nothing is left pending once the call returns.
     assert _paligemma_pending_token_types() is None
 
 
@@ -2126,7 +2493,6 @@ def test_paligemma_token_types_do_not_cross_between_concurrent_callers():
     for thread in threads:
         thread.join(timeout=10)
 
-    # Each caller saw its own token types, not the other's.
     for name, mark in marks.items():
         assert _Model.seen[name] is mark, f"{name} saw another caller's batch"
     assert _paligemma_pending_token_types() is None
@@ -2233,7 +2599,6 @@ def test_gemma3n_altup_patch_declines_a_release_that_is_already_correct():
         model=SimpleNamespace(layers=[SimpleNamespace(altup=altup)])))
     assert not _fix_gemma3n_altup_batch(model)
     assert cls.correct is fixed, "an already-correct release must be left alone"
-# --- Audio input collation -------------------------------------------------
 
 
 class _FakeGemmaAudioProcessor(_ConversationalPromptCompletionProcessor):
@@ -2500,7 +2865,6 @@ def test_processors_taking_audio_pairs_are_accommodated(monkeypatch):
     batch, is_pc = _finalized_collate([pc_row], processor, 16, None,
                                       return_prompt_completion=True)
     assert is_pc and "input_features" in batch
-
 
 
 def test_placeholders_without_features_are_rejected(monkeypatch):
@@ -3127,8 +3491,6 @@ def test_the_corrected_count_rides_a_copy_and_only_for_its_family(monkeypatch):
 
     # Same family name, so the repair is reached, but not independently
     # copyable -- correcting either would correct the caller's own processor.
-    # A copy that is the original, and one that keeps its own attributes but
-    # writes just that hook through -- the narrowest sharing there is.
     for cls in (type("Gemma4Processor", (Gemma4Processor,),
                      {"__copy__": lambda self: self}),
                 type("Gemma4Processor", (_ForwardsTheHook,), {})):
@@ -3200,7 +3562,6 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
 
     model = _Model()
     original = model.get_input_embeddings
-    # Every caller taking a hold is told so, and releases exactly one.
     assert install_audio_merge_patch(model, 1) is True
     assert install_audio_merge_patch(model, 1) is True    # second holder
     assert remove_audio_merge_patch(model) is False       # first release
@@ -3214,7 +3575,6 @@ def test_audio_merge_patch_is_held_and_restored_exactly():
     install_audio_merge_patch(model, 1)
     remove_audio_merge_patch(model)
     assert model.get_input_embeddings() == "instance wrapper"
-
 
 
 def test_concurrent_installs_take_one_wrapper_and_one_hold_each():
@@ -3419,7 +3779,6 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
 
     # The real checkpoint's shape: model_type present, neither index declared.
     assert _phi4mm_token_ids({"model_type": "phi4mm"}) == expected
-    # A config that does declare them wins over the defaults.
     assert _phi4mm_token_ids(
         {"image_token_index": -7, "audio_token_index": 11}
     ) == (-7, 11)
@@ -3466,6 +3825,52 @@ def test_compile_preparation_finds_phi4mm_positions_without_token_indices():
     assert np.asarray(declared["input_ids"]).tolist() == [
         [7, image_id, 8, audio_id, 9]
     ]
+
+@pytest.mark.parametrize("array_factory", [mx.array, np.array, tuple])
+@pytest.mark.parametrize("key,rows", [
+    ("image_grid_thw", [[1, 16, 12], [2, 8, 4]]),
+    ("video_grid_thw", [[2, 12, 8], [3, 4, 2]]),
+    ("spatial_shapes", [[16, 12], [8, 4]]),
+    ("image_sizes", [[16, 12], [8, 4]]),
+    ("images_spatial_crop", [[2, 3], [4, 5]]),
+])
+def test_processor_grid_structure_survives_compile_preparation(array_factory, key, rows):
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    value = array_factory(rows)
+    batch = _prepare_vlm_batch_for_compile({"input_ids": mx.array([[1, 2, 3], [4, 5, 6]]), key: value},
+                                           {"model_type": "new_architecture"}, phase="content")
+    expected = tuple(tuple(row) for row in rows)
+    assert batch["_unsloth_static_vlm_metadata"][key] == expected
+    if array_factory is tuple:
+        assert batch[key] == expected
+    else:
+        assert batch[key] is value
+        assert batch[key].tolist() == rows
+
+
+def _prepared_positions(model_type):
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    return _prepare_vlm_batch_for_compile({
+        "input_ids": mx.array([[1, 5, 5, 5, 5, 2]], dtype=mx.int32),
+        "attention_mask": mx.array([[1] * 6], dtype=mx.int32),
+        "image_grid_thw": mx.array([[1, 4, 4]], dtype=mx.int32),
+    }, {"model_type": model_type, "image_token_id": 5, "video_token_id": 6,
+        "vision_config": {"spatial_merge_size": 2}})
+
+
+def test_qwen_mrope_families_get_pipeline_built_position_ids():
+    """Without them the decoder falls back to mlx-vlm's `get_rope_index`, which
+    calls `.item()` on grid entries the pipeline hands it as plain ints."""
+    for model_type in ("qwen2_vl", "qwen3_vl", "qwen3_5", "qwen4_exp"):
+        prepared = _prepared_positions(model_type)
+        assert prepared["_unsloth_collated_position_ids"] is True, model_type
+        assert np.asarray(prepared["position_ids"]).shape == (3, 1, 6), model_type
+
+    # GLM-5.x reaches its vision grid directly instead, so it must not be here.
+    assert "position_ids" not in _prepared_positions("glm5_next")
+
 
 # --- audio alignment from stated spans, for families whose run carries no id ---
 
@@ -3522,8 +3927,6 @@ def test_a_bare_message_list_row_is_scanned_for_audio(monkeypatch):
     assert _raw_row_has_audio({"messages": messages}) is True
     assert _raw_row_has_audio(messages) is True, "the same row, unwrapped"
 
-    # An unqualified family must still be refused when the formatter hides the
-    # clips, which is the whole point of scanning before formatting.
     from unsloth_zoo.mlx import utils as mlx_utils
 
     monkeypatch.setattr(
@@ -3554,11 +3957,9 @@ def test_a_row_that_is_one_message_dict_is_scanned_for_audio(monkeypatch):
     row = {"role": "user", "content": [{"type": "audio", "audio": clip},
                                        {"type": "text", "text": "transcribe"}]}
 
-    # Supported: collation turns this row into exactly one message.
     assert len(_normalize_vlm_messages(row)) == 1
     assert _raw_row_has_audio(row) is True
 
-    # A message dict carrying no audio must not be gated.
     assert _raw_row_has_audio(
         {"role": "user", "content": [{"type": "text", "text": "hi"}]}
     ) is False
@@ -3666,7 +4067,6 @@ def test_an_audio_part_canonicalizes_whichever_alias_it_uses(monkeypatch):
                     assert np.array_equal(
                         np.asarray(clip), ramp["array"]), (part, content)
 
-    # A type outside the audio spellings is never rewritten.
     kept = _normalize_vlm_messages(
         [{"role": "user", "content": [{"type": "video", "video": "v.mp4"}]}])
     assert kept[0]["content"][0]["type"] == "video"
@@ -5043,7 +5443,6 @@ def test_qwen3_omni_deficit_still_lands_only_on_the_anchor():
         prompt_utils, "qwen3_omni_moe", messages, num_images = 1, num_audios = 2, kwargs = {},
     )
 
-    # One audio is missing conversation-wide; it goes to the anchor only.
     assert [part.get("type") for part in template[0]["content"]] == ["image", "audio", "text"]
     assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]
 
@@ -5131,3 +5530,333 @@ def test_qwen3_omni_leaves_assistant_turns_alone_without_counts():
 
     assert [part.get("type") for part in template[0]["content"]] == ["text", "audio"]
     assert [part.get("type") for part in template[1]["content"]] == ["audio", "text"]
+
+
+@pytest.mark.parametrize("drops_padding", [False, True])
+def test_vlm_component_kwargs_preserve_expansion_and_modality_options(drops_padding):
+    from unsloth_zoo.mlx.utils import _call_vlm_processor
+    class Tokenizer:
+        def __call__(self, text, padding):
+            return {"input_ids": [[len(t)] for t in text], "padding": padding}
+
+    class Images:
+        def __call__(self, images, size):
+            return {"pixel_values": [i * size for i in images]}
+
+    class Processor:
+        tokenizer, image_processor = Tokenizer(), Images()
+        def __call__(self, text, images, **kwargs):
+            if drops_padding:
+                kwargs.pop("padding")
+            return {**self.image_processor(images, **kwargs),
+                    **self.tokenizer([t.replace("#", "##") for t in text], **kwargs)}
+
+    output = _call_vlm_processor(Processor(), (), dict(text=["a#", "bb#"], images=[2, 3], size=4, padding=True))
+    assert output == {"input_ids": [[3], [4]], "pixel_values": [8, 12], "padding": True}
+@pytest.mark.parametrize("existing_pad", [None, "[UNK]"])
+def test_image_free_vlm_calls_use_the_padded_tokenizer(existing_pad):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "[EOS]": 1, "a": 2, "b": 3}))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, eos_token="[EOS]",
+                                       unk_token="[UNK]", pad_token=existing_pad, model_input_names=["input_ids", "attention_mask"])
+    processor = mock.Mock(spec=["tokenizer", "image_processor"], tokenizer=tokenizer, image_processor=object())
+    processor.side_effect = AssertionError("image processor must not receive text-only calls")
+    inputs = _processor_vlm_inputs(processor, ["a b", "b"], [[], []], 8)
+    assert inputs["input_ids"].tolist() == [[2, 3], [3, 1 if existing_pad is None else 0]]
+    assert inputs["attention_mask"].tolist() == [[1, 1], [1, 0]]
+    processor.assert_not_called()
+    assert tokenizer.pad_token == (existing_pad or "[EOS]")
+
+
+@pytest.mark.parametrize("key", ["image_sizes", "images_spatial_crop"])
+def test_nested_size_metadata_preserves_image_and_slice_axes(key):
+    from unsloth_zoo.mlx.utils import _normalize_size_tuples, _prepare_vlm_batch_for_compile
+    assert _normalize_size_tuples([[[2, 3], [4, 5]], [[6, 7]]]) == (((2, 3), (4, 5)), ((6, 7),))
+    raw = mx.array([[[2, 3], [4, 5]], [[6, 7], [8, 9]]])
+    batch = _prepare_vlm_batch_for_compile({key: raw}, {}, phase="content")
+    assert batch[key] is raw and batch[key].shape == (2, 2, 2)
+    assert batch["_unsloth_static_vlm_metadata"][key] == (((2, 3), (4, 5)), ((6, 7), (8, 9)))
+
+
+@pytest.mark.parametrize("image_type", ["image", "image_url", "input_image"])
+@pytest.mark.parametrize("stringify", [False, True])
+def test_vlm_rendering_keeps_image_order_without_stringifying_parts(tmp_path, monkeypatch, image_type, stringify):
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(models.WordLevel({"x": 0})))
+    expression = "m['content']" if stringify else "'' + m['content']"
+    tokenizer.chat_template = "{% for m in messages %}{{ " + expression + " }}{% endfor %}"
+    processor = SimpleNamespace(tokenizer=tokenizer, image_token="<|picture|>")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "before"}, {"type": image_type},
+        {"type": "text", "text": "after"}]}]
+    assert _render_vlm_messages(processor, messages) == "before<|picture|>after"
+
+
+@pytest.mark.parametrize("layout", ["nested", "decoder", "view"])
+@pytest.mark.parametrize("count", [1, 2])
+@pytest.mark.parametrize("use_dora", [False, True])
+def test_decoder_containers_support_lora(layout, count, use_dora):
+    from types import SimpleNamespace as NS
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers, _fix_gemma3n_altup_batch
+    from unsloth_zoo.mlx.utils import _get_transformer_layers
+    stack = nn.Module()
+    stack.layers = [nn.Module(), nn.Module()]
+    for layer in stack.layers:
+        layer.proj = nn.Linear(4, 4)
+    root = {"nested": NS(model=NS(layers=stack)), "decoder": NS(layers=range(2), model=NS(decoder=stack)),
+            "view": NS(model=stack)}[layout]
+    assert _get_transformer_layers(root) is stack.layers
+    assert not _fix_gemma3n_altup_batch(NS(language_model=root))
+    assert linear_to_lora_layers(root, count, dict(keys=["proj"], rank=2, scale=2, dropout=0, use_dora=use_dora)) == count
+    assert [hasattr(layer.proj, "lora_a") for layer in stack.layers] == [count == 2, True]
+
+
+def test_crop_arrays_reach_the_image_tower_without_boolean_conversion(monkeypatch):
+    from collections import defaultdict
+    from types import SimpleNamespace as NS
+    from unsloth_zoo.mlx import compile as patches
+    modules = defaultdict(lambda: NS(**{name: type(name, (), {}) for name in (
+        "Model", "MlpProjector", "VisionEmbeddings", "VisionModel", "InputEmbeddingsFeatures")}))
+    monkeypatch.setattr(patches, "importlib", NS(import_module=lambda name: modules[name]))
+    monkeypatch.setattr(patches, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(patches, "_patch_method", setattr)
+    patches._install_deepseek_ocr_compile_patches()
+    model = NS(language_model=NS(model=NS(embed_tokens=lambda ids: mx.zeros((1, 2, 4)))),
+               sam_model=mock.Mock(side_effect=RuntimeError("image tower reached")))
+    with pytest.raises(RuntimeError, match="image tower reached"):
+        modules["mlx_vlm.models.deepseekocr.deepseekocr"].Model.get_input_embeddings(
+            model, mx.array([[1, 2]]), (mx.zeros((0, 3, 1, 1)), mx.zeros((2, 3, 1, 1))),
+            images_spatial_crop=mx.array([[1, 1], [2, 1]]))
+
+
+class _PairTokenizer:
+    """Tokenizer with real `text_pair` semantics: 1 marks the second segment."""
+    eos_token = "<eos>"
+    pad_token_id = None
+    pad_token = None
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __call__(self, text=None, text_pair=None, return_token_type_ids=None, **kwargs):
+        self.seen = dict(kwargs, text=text, text_pair=text_pair)
+        pairs = text_pair if text_pair is not None else [None] * len(text)
+        rows = [([1] * len(a), [2] * len(b or "")) for a, b in zip(text, pairs)]
+        width = max(len(a) + len(b) for a, b in rows)
+        pad = lambda values: np.array([v + [0] * (width - len(v)) for v in values])
+        out = {"input_ids": pad([a + b for a, b in rows]),
+               "attention_mask": pad([[1] * (len(a) + len(b)) for a, b in rows])}
+        if return_token_type_ids:
+            out["token_type_ids"] = pad([[0] * len(a) + [1] * len(b) for a, b in rows])
+        return out
+
+
+def _suffix_pair_batch(suffixes=("answer",)):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+    processor = SimpleNamespace(tokenizer=_PairTokenizer(), image_processor=None)
+    return _processor_vlm_inputs(
+        processor, ["prompt"] * len(suffixes), [[] for _ in suffixes], 64,
+        suffixes=list(suffixes),
+    )
+
+
+def test_suffix_pair_markers_never_reach_the_text_stack():
+    """A text-only row is encoded as a tokenizer pair, so its `token_type_ids`
+    mean "1 = suffix". Gemma3's stack reads that key as "1 = image" and turns
+    every marked span bidirectional, which would let the answer attend to its
+    own future tokens. The model-level kwargs still carry it, because
+    PaliGemma's prefix-LM wrapper is the consumer that wants that meaning."""
+    from unsloth_zoo.mlx.utils import _drop_pair_token_type_ids
+
+    batch = _suffix_pair_batch()
+    assert batch["_unsloth_suffix_only_loss"] is True
+    forwarded = {"token_type_ids": batch["token_type_ids"], "position_ids": None}
+    assert "token_type_ids" not in _drop_pair_token_type_ids(batch, forwarded)
+    assert "position_ids" in _drop_pair_token_type_ids(batch, forwarded)
+
+    # Real image markers, from a processor rather than a pair, still go through.
+    image_batch = {k: v for k, v in batch.items() if k != "_unsloth_suffix_only_loss"}
+    assert "token_type_ids" in _drop_pair_token_type_ids(image_batch, forwarded)
+
+
+def test_gemma_image_mask_is_bidirectional_over_a_marked_span():
+    """Pins why the test above matters, independently of the collator."""
+    from unsloth_zoo.mlx.utils import _build_gemma_image_attention_mask
+
+    token_type_ids = mx.array([[0, 0, 0, 1, 1, 1, 1]], dtype=mx.int32)
+    built = _build_gemma_image_attention_mask(
+        token_type_ids, attention_mask=mx.ones((1, 7), dtype=mx.int32))
+    visible = np.asarray(built).reshape(7, 7)
+    assert visible[3, 6] and not visible[1, 2]
+
+
+@pytest.mark.parametrize("template,expected", [
+    # Qwen3 / QwQ / DeepSeek-R1 strip <think> from history.
+    ("{% for m in messages %}{{ m['content'].split('</think>')[-1] }}{% endfor %}",
+     "answer"),
+    # Templates that transform the case of what they render.
+    ("{% for m in messages %}{{ m['content']|upper }}{% endfor %}",
+     "<THINK>R</THINK>ANSWER"),
+])
+def test_a_template_that_transforms_content_still_renders(template, expected):
+    """The content-preservation checks choose between candidates; they do not
+    get to fail a render the template itself accepted."""
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class _Processor:
+        image_token = None
+        boi_token = None
+        chat_template = template
+
+        def apply_chat_template(self, messages, tokenize=False,
+                                add_generation_prompt=False):
+            import jinja2
+            return jinja2.Template(template).render(messages=messages)
+
+    messages = [{"role": "user", "content": "<think>r</think>answer"}]
+    assert _render_vlm_messages(_Processor(), messages) == expected
+
+
+def test_a_template_that_renders_nothing_is_still_an_error():
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    class _Empty:
+        image_token = None
+        boi_token = None
+        chat_template = "x"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "   "
+
+    with pytest.raises(RuntimeError):
+        _render_vlm_messages(_Empty(), [{"role": "user", "content": "hi"}])
+
+
+def test_rendering_does_not_copy_the_row_media():
+    """`_render_vlm_messages` runs per training sample, so deep-copying the
+    message list clones every image on every row."""
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    copied = []
+
+    class _CountingImage:
+        def __deepcopy__(self, memo):
+            copied.append(self)
+            return self
+
+    class _Processor:
+        image_token = "<image>"
+        boi_token = None
+        chat_template = "x"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "<image>Q"
+
+    messages = [{"role": "user",
+                 "content": [{"type": "image", "image": _CountingImage()},
+                             {"type": "text", "text": "Q"}]}]
+    assert _render_vlm_messages(_Processor(), messages) == "<image>Q"
+    assert copied == []
+
+
+def test_compile_preparation_adds_no_metadata_key_without_metadata():
+    """Every VLM batch goes through the compile preparation, so writing the
+    static-metadata dict unconditionally puts a new key in every text-only
+    batch's pytree."""
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    text_only = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "attention_mask": mx.array([[1, 1, 1]])},
+        {"model_type": "some_new_arch"}, phase="content")
+    assert "_unsloth_static_vlm_metadata" not in text_only
+
+    with_grid = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "image_grid_thw": mx.array([[1, 16, 12]])},
+        {"model_type": "some_new_arch"}, phase="content")
+    assert with_grid["_unsloth_static_vlm_metadata"] == {"image_grid_thw": ((1, 16, 12),)}
+
+
+@pytest.mark.parametrize("model_type,wants_array", [
+    ("glm4v", True), ("glm_ocr", True), ("muse_glimmer", True), ("glm5_next", True),
+    ("qwen2_vl", False), ("qwen2_5_vl", False), ("qwen3_vl", False), ("paddleocr_vl", False),
+])
+def test_grid_form_follows_the_family_when_the_processor_emits_a_list(model_type, wants_array):
+    """These vision towers open with `grid_thw.tolist()` and a tuple raises there,
+    while the Qwen/Paddle compile patches trace the grid as static metadata and an
+    array becomes a tracer. A processor that hands over a plain list has to be
+    coerced to whichever form its own family reads.
+
+    Also pinned by tests/test_mlx_text_path_contract.py, which no workflow runs.
+    """
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    out = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "image_grid_thw": [[1, 16, 16]]},
+        {"model_type": model_type, "vision_config": {"hidden_size": 8}},
+        phase="content")
+    if wants_array:
+        assert isinstance(out["image_grid_thw"], mx.array), model_type
+        assert out["image_grid_thw"].tolist() == [[1, 16, 16]], model_type
+    else:
+        assert out["image_grid_thw"] == ((1, 16, 16),), model_type
+
+
+def test_a_processor_emitted_grid_array_is_never_downgraded():
+    """The point of the change this pins: an array the processor built stays an
+    array even for a family whose default form is the tuple."""
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    out = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), "image_grid_thw": mx.array([[1, 16, 16]])},
+        {"model_type": "qwen2_vl", "vision_config": {"hidden_size": 8}},
+        phase="content")
+    assert isinstance(out["image_grid_thw"], mx.array)
+    assert out["_unsloth_static_vlm_metadata"]["image_grid_thw"] == ((1, 16, 16),)
+
+
+def test_a_sidecar_symlink_out_of_the_model_is_not_dereferenced(tmp_path):
+    """A writable model directory is otherwise enough to aim a sidecar at a
+    credential file and have the save copy it into a published adapter."""
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    secret = tmp_path / "credentials.json"
+    secret.write_text('{"token": "SECRET"}')
+    src = tmp_path / "model"; src.mkdir()
+    (src / "config.json").write_text('{"model_type": "x"}')
+    (src / "generation_config.json").symlink_to(secret)
+    out = tmp_path / "out"; out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(src),))
+    assert (out / "config.json").is_file()
+    assert not (out / "generation_config.json").exists()
+    assert "SECRET" not in "".join(p.read_text() for p in out.rglob("*.json"))
+
+
+def test_a_hugging_face_snapshot_symlink_is_still_followed(tmp_path):
+    """Every file in an HF snapshot is a symlink into a sibling blobs/ dir, so
+    the rule cannot be "must resolve inside the source"."""
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    repo = tmp_path / "models--org--name"
+    blobs = repo / "blobs"; blobs.mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"; snapshot.mkdir(parents=True)
+    (blobs / "deadbeef").write_text('{"model_type": "real"}')
+    (snapshot / "config.json").symlink_to(blobs / "deadbeef")
+    out = tmp_path / "out"; out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(snapshot),))
+    assert (out / "config.json").read_text() == '{"model_type": "real"}'

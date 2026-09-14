@@ -49,7 +49,6 @@ def test_top_level_bitsandbytes_is_found():
 
 
 def test_nested_text_config_is_found():
-    # VLMs keep it under a sub-config.
     cfg = {"text_config": {"quantization_config": {"quant_method": "bitsandbytes"}}}
     assert find(cfg) == "config.json['text_config']"
 
@@ -85,7 +84,7 @@ def test_non_dict_inputs_are_safe():
 def test_guard_is_wired_into_convert_to_gguf():
     body = _SRC[_SRC.index("def convert_to_gguf("):]
     assert "_find_bitsandbytes_quantization(config_file)" in body
-    # Failing fast: the guard must precede the converter subprocess.
+    # The guard must precede the converter subprocess.
     guard = body.index("_find_bitsandbytes_quantization(config_file)")
     launch = body.index("subprocess.run")
     assert guard < launch

@@ -45,7 +45,6 @@ def test_get_vllm_state_dict_sm_cap_guards_rocm_and_xpu():
     assert idx != -1, "sm_cap computation missing from vllm_utils.py"
     window = src[max(0, idx - 400): idx + 400]
 
-    # The CUDA capability query must be gated behind BOTH the ROCm and XPU checks
     guard = re.search(r"if\s+not\s+is_hip\(\)\s+and\s+DEVICE_TYPE\s*!=\s*[\"']xpu[\"']\s*:", window)
     assert guard is not None, (
         "sm_cap guard must exclude both ROCm and Intel XPU from the CUDA "

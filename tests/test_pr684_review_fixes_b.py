@@ -67,7 +67,6 @@ def test_run_hidden_stack_reads_sliding_window_from_config():
         layers=[layer_sliding, layer_global],
         norm=IdentityNorm(),
     )
-    # No sliding_window_pattern / window_size attributes on the stack itself.
     assert not hasattr(stack, "sliding_window_pattern")
     assert not hasattr(stack, "window_size")
 
@@ -197,7 +196,6 @@ def test_apply_vlm_label_masks_preserves_wide_unsigned_ids():
     labels = _apply_vlm_label_masks(batch, ignore_token_ids=None)
 
     values = labels[0].tolist()
-    # The wide id is preserved (not wrapped to -100 or a negative int32 value).
     assert values[1] == wide_id
     assert values[0] == 5
     assert values[2] == 7

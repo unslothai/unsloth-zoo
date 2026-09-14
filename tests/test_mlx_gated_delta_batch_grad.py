@@ -76,9 +76,6 @@ if not _HAS_MLX:
 mlx_only = pytest.mark.skipif(not _HAS_MLX, reason=_SKIP_REASON)
 
 
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
 def _make_inputs(B, T, Hk, Dk, Hv, Dv, vectorized_gating, with_mask, identical_rows=False, seed=0):
     mx.random.seed(seed)
 
@@ -158,7 +155,7 @@ def _rel_l2(a, b):
 _NAMES = ("q", "k", "v", "g", "beta")
 
 # B>1, both gating forms, GQA on/off, single- and multi-chunk (CHUNK_SIZE=min(64,T)),
-# and masked/unmasked. Small dims keep this well under a second per case.
+# and masked/unmasked.
 _PARITY_CASES = [
     (B, T, gqa, mask_on, vec)
     for B in (2, 3, 4)

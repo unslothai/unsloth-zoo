@@ -141,8 +141,6 @@ def _multimodal_rows():
     })
 
 
-# ---- images must not be dropped -------------------------------------------
-
 @pytest.mark.parametrize("extra_column", [
     "pixel_values", "pixel_values_videos", "image_grid_thw", "input_features",
 ])
@@ -169,8 +167,6 @@ def test_multimodal_iterable_rows_are_still_refused():
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
-
-# ---- the run has to survive the first batch --------------------------------
 
 def test_a_processor_backed_seq2seq_collator_is_rebuilt():
     """`DataCollatorForSeq2Seq(tokenizer = processor)` is what the bypass exists
@@ -206,8 +202,6 @@ def test_a_tokenizer_backed_seq2seq_collator_is_left_alone():
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 
-
-# ---- the follow-on cases the first round of this fix missed ---------------
 
 def _text_only_trainer():
     return StubTrainer(MyVisionCollator(StubProcessor()), _text_rows())
@@ -272,8 +266,6 @@ def test_the_rebuild_keeps_the_settings_the_caller_chose():
     assert hasattr(trainer.data_collator.tokenizer, "pad")
 
 
-# ---- raw text-only splits reach the text path too --------------------------
-
 def _raw_text_rows(n = 2):
     return Dataset.from_dict({
         "text": [f"{INSTRUCTION_PART}q{i}{RESPONSE_PART}a{i}" for i in range(n)],
@@ -324,8 +316,6 @@ def test_a_raw_split_with_no_text_column_is_still_refused():
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
-
-# ---- non-seq2seq collators that pad through a processor --------------------
 
 def test_a_processor_backed_padding_collator_under_packing_is_refused():
     """`DataCollatorWithPadding(tokenizer = processor)` pads through the same
@@ -447,8 +437,6 @@ def test_a_real_tokenizer_padding_collator_is_untouched_under_packing():
     assert out.data_collator is collator
 
 
-# ---- raw columns must not reach the collator -------------------------------
-
 class StrictPadTokenizer(StubTokenizer):
     """Pads like the real thing: it tensorizes every key it is handed, so a raw
     string column raises exactly as `tokenizer.pad(return_tensors = "pt")` does."""
@@ -538,8 +526,6 @@ def test_a_tokenized_eval_split_keeps_no_raw_text():
     assert "text" not in out.eval_dataset["raw"].column_names
     assert "labels" in out.eval_dataset["raw"].column_names
 
-
-# ---- only model inputs may reach the collator ------------------------------
 
 class TensorizingPadTokenizer(StrictPadTokenizer):
     """Pads the keys a real tokenizer knows about and tensorizes the rest, so a
@@ -642,8 +628,6 @@ def test_model_and_processor_declared_inputs_survive():
     assert "id" not in kept
 
 
-# ---- the multimodal set follows the installed processor --------------------
-
 class DerivedProcessor(StubProcessor):
     """A processor whose image half declares its own output names, the way every
     transformers image processor / feature extractor does."""
@@ -736,8 +720,6 @@ def test_deriving_never_denylists_the_text_columns():
     assert "labels" in out.train_dataset.column_names
 
 
-# ---- a DatasetDict eval is a dict of splits, not one dataset ---------------
-
 def test_a_datasetdict_eval_is_normalized_per_split():
     """`type(x) is dict` is False for a DatasetDict, so the eval branches used to
     treat the whole mapping as one dataset: `column_names` came back a dict, the
@@ -779,8 +761,6 @@ def test_an_iterable_datasetdict_eval_is_normalized_per_split():
     assert "labels" in next(iter(out.eval_dataset["a"]))
 
 
-# ---- a fresh streaming dataset carries no batch_size -----------------------
-
 def test_a_pretokenized_streaming_dataset_reaches_masking():
     """The bypass accepts an IterableDataset, so the map below must not read a
     `_ex_iterable.batch_size` a fresh ArrowExamplesIterable does not have."""
@@ -807,8 +787,6 @@ def test_a_columnless_streaming_dataset_reaches_masking():
     row = next(iter(out.train_dataset))     # used to raise AttributeError
     assert [l for l in row["labels"] if l != -100] == [20, 21]
 
-
-# ---- a text column is a column that actually holds text --------------------
 
 def _messages_with_an_image():
     return [[
@@ -949,8 +927,6 @@ def test_a_raw_iterable_eval_split_of_real_text_is_still_allowed():
     assert "labels" in next(iter(out.eval_dataset))
 
 
-# ---- one row is not the whole split ----------------------------------------
-
 def _rows_with_an_image_at(n, image_at):
     """`n` pretokenized rows; only row `image_at` carries an image, under a column
     name no static list mentions. Exactly what a partly-illustrated set looks like."""
@@ -1049,8 +1025,6 @@ def test_a_raw_eval_split_whose_null_is_past_the_sample_is_refused():
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
-# ---- what the whole-column scan is allowed to cost -------------------------
-
 @pytest.mark.parametrize("column", ["urls", "paths", "files"])
 def test_an_ambiguous_column_of_media_lists_is_refused(column):
     """A plural media column holds a list of URLs per row, and `List(string)` is
@@ -1101,8 +1075,6 @@ def test_an_ambiguous_image_column_is_never_decoded_by_the_scan(monkeypatch):
     assert len(decoded) < n / 4, "the sample is scaling with the dataset"
 
 
-# ---- the processor may live only on the collator ---------------------------
-
 def test_the_collators_processor_derives_the_multimodal_columns():
     """With the public `tokenizer =` override the multimodal processor is no
     longer `processing_class`, but the collator still holds it, so its derived
@@ -1130,8 +1102,6 @@ def test_the_tokenizer_override_still_allows_a_text_only_run():
                                   tokenizer = StrictPadTokenizer())
     assert "labels" in out.train_dataset.column_names
 
-
-# ---- a streaming split cannot be filtered, so sample its labels -------------
 
 def _unmatched_rows(n = 3):
     # No response marker anywhere: every label ends up -100.
@@ -1175,8 +1145,6 @@ def test_a_partly_masked_streaming_split_still_trains():
     assert len(list(out.train_dataset)) == 4
 
 
-# ---- a 16-row sample is not the whole split either --------------------------
-
 def test_an_image_on_an_unsampled_row_is_refused():
     """The bounded scan reads 16 fixed positions, so a 200-row split checks rows
     0, 13, 26, ... and an image on row 5 was never looked at. The column type is
@@ -1216,8 +1184,6 @@ def test_a_raw_eval_split_with_an_image_on_an_unsampled_row_is_refused():
     assert "media" in trainer.eval_dataset.column_names
 
 
-# ---- a masked prefix is not a masked stream --------------------------------
-
 def test_a_stream_whose_responses_start_later_still_trains():
     """A sorted or filtered stream can put every prompt-only row first. The
     bounded prefix cannot see past row 16, so it must not refuse the run."""
@@ -1242,8 +1208,6 @@ def test_a_stream_masked_past_the_prefix_warns_instead(capsys):
     assert "nothing to train on" in capsys.readouterr().out
 
 
-# ---- empty splits ----------------------------------------------------------
-
 def test_an_empty_raw_eval_split_is_handled():
     """`_maybe_tokenize_dataset` peeks one row, and an empty split has none."""
     trainer = StubTrainer(MyVisionCollator(StubProcessor()), _text_rows())
@@ -1261,8 +1225,6 @@ def test_an_empty_pretokenized_eval_split_is_handled():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert len(out.eval_dataset) == 0
 
-
-# ---- a trainer need not have a train split ---------------------------------
 
 def test_an_eval_only_trainer_is_not_a_crash():
     """`Trainer(eval_dataset = ...)` with no train split: the final all-masked
@@ -1283,8 +1245,6 @@ def test_an_eval_only_trainer_on_the_plain_text_path_is_not_a_crash():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "labels" in out.eval_dataset.column_names
 
-
-# ---- a media URL/path column is media, even as a plain string ---------------
 
 @pytest.mark.parametrize("column", [
     "image_url", "video_url", "audio_url", "input_image", "input_video",
@@ -1361,8 +1321,6 @@ def test_a_raw_eval_split_with_a_media_url_column_is_refused():
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
 
-# ---- an ambiguous media column is read to the end ---------------------------
-
 def test_an_ambiguous_media_column_is_scanned_past_the_sample():
     """`url`/`path` are `string` either way, so the schema cannot rule them out
     and the 16-row sample skips row 5. Read the column instead: it decodes no
@@ -1405,8 +1363,6 @@ def test_a_wholly_benign_ambiguous_column_still_passes_the_scan():
     assert "labels" in out.train_dataset.column_names, "the text path never ran"
 
 
-# ---- a collator holding an image processor directly -------------------------
-
 class DirectImageProcessorCollator:
     """`_is_vision_collator` accepts a bare `collator.image_processor`, so the
     column names that half declares have to be derived from it as well."""
@@ -1438,8 +1394,6 @@ def test_a_directly_held_image_processor_still_lets_text_only_rows_through():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "labels" in out.train_dataset.column_names, "the text path never ran"
 
-
-# ---- what the second review round found ------------------------------------
 
 @pytest.mark.parametrize("suffix", [".avif", ".jfif", ".jpe", ".apng", ".ogv", ".wma"])
 def test_less_common_media_suffixes_are_recognized(suffix):
@@ -1541,8 +1495,6 @@ def test_precomputed_labels_survive_the_raw_column_drop():
     assert out.train_dataset[0]["labels"] == old, "the caller's mask was lost"
 
 
-# ---- provenance structs are not media --------------------------------------
-
 def _meta_trainer(meta, n = 2, iterable = False):
     dataset = Dataset.from_dict({"input_ids": [list(ROW)] * n, "meta": meta})
     if iterable: dataset = dataset.to_iterable_dataset()
@@ -1608,8 +1560,6 @@ def test_an_undecoded_image_struct_is_still_refused():
     with pytest.raises(ValueError, match = "does not support response-only"):
         train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
 
-
-# ---- what the third review round found --------------------------------------
 
 @pytest.mark.parametrize("key, value", [
     ("image_path",     "images/cat.jpg"),
@@ -1767,8 +1717,6 @@ def test_a_seq2seq_collator_holding_a_processor_is_still_repaired_without_packin
     assert hasattr(out.data_collator.tokenizer, "pad")
 
 
-# --- what the fourth review round found -----------------------------------
-
 def test_a_model_input_column_survives_raw_text_tokenization():
     """A field the model is fed but the tokenizer does not recreate must survive.
 
@@ -1839,8 +1787,6 @@ def test_a_token_classification_collator_keeps_its_padding_settings():
     assert repaired.max_length == 128, repaired.max_length
     assert repaired.pad_to_multiple_of == 8, repaired.pad_to_multiple_of
 
-
-# --- what the fifth review round found ---------------------------------------
 
 def test_a_raw_eval_split_whose_full_scan_fails_is_refused():
     """A failed exhaustive scan proves nothing, so it must not read as proof.
@@ -1962,7 +1908,6 @@ def test_a_bypassed_self_packing_collator_is_untouched_without_packing():
     assert isinstance(_text_collator_of(out.data_collator), DataCollatorForSeq2Seq)
 
 
-
 def test_remove_unused_columns_false_survives_raw_text_tokenization():
     """The opt-out has to hold on the raw path too, not just the pretokenized one.
 
@@ -1995,8 +1940,6 @@ def test_remove_unused_columns_false_survives_a_raw_train_split():
     assert "sample_weight" in columns, sorted(columns)
     assert "text" not in columns, sorted(columns)
 
-
-# ---- round N: three more Codex items ---------------------------------------
 
 def test_the_packing_refusal_lands_before_the_dataset_is_touched():
     """It is a deterministic configuration error, so it must not cost a full
@@ -2091,8 +2034,6 @@ def test_the_default_label_pad_value_is_unchanged():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert out.data_collator.label_pad_token_id == -100
 
-
-# ---- round N+1: three more Codex items --------------------------------------
 
 def test_a_float_sequence_column_is_not_proven_text():
     """`Sequence(float32)` under a generic name is a waveform, and the leaf
@@ -2316,8 +2257,6 @@ def test_remove_unused_columns_false_without_a_text_column_is_untouched():
     out = train_on_responses_only(trainer, INSTRUCTION_PART, RESPONSE_PART)
     assert "sample_weight" in out.train_dataset.column_names
 
-
-# --- what the seventh review round found -----------------------------------
 
 class AudioOnlyProcessor:
     """Whisper and friends: a processor whose only half is audio."""
@@ -2742,7 +2681,6 @@ def test_a_repaired_padding_collator_is_not_kept_as_the_media_fallback():
     })
     out = train_on_responses_only(StubTrainer(broken, rows),
                                   INSTRUCTION_PART, RESPONSE_PART)
-    # A plain text collator, not a dispatcher holding the broken one.
     assert not hasattr(out.data_collator, "media"), \
         "the unusable collator was preserved as the media fallback"
 
@@ -2764,7 +2702,6 @@ def test_the_media_keys_survive_unused_column_removal():
     assert signature, "signature columns were never seeded"
     for key in ("images", "pixel_values", "input_features"):
         assert key in signature, f"{key} would be stripped before the collator"
-    # The columns the loss needs are still there.
     for key in ("input_ids", "labels"):
         assert key in signature, key
 
@@ -2783,7 +2720,6 @@ def test_a_raw_conversation_batch_reaches_the_media_collator():
 
     conversation = [{"role": "user", "content": [{"type": "image", "image": object()}]}]
     assert collator([{"messages": conversation}]) == {"mine": True}
-    # A text batch is unaffected.
     assert "mine" not in collator([{"input_ids": list(ROW), "labels": list(ROW)}])
 
 
@@ -2837,7 +2773,6 @@ def test_a_declared_forward_input_survives_the_seeded_signature():
     assert signature, "signature columns were never seeded"
     for key in ("position_ids", "sample_weight"):
         assert key in signature, f"{key} is declared by forward and would be stripped"
-    # And the media keys it was seeded for are still there.
     assert "pixel_values" in signature
 
 
@@ -2874,9 +2809,6 @@ def test_the_conversation_keys_are_still_not_dispatch_keys():
     assert "messages" not in dispatcher.media_keys
     assert not dispatcher._has_media([{"messages": "a plain string, not a conversation"}])
     assert dispatcher._has_media([{"messages": [{"role": "user"}]}])
-
-
-# ── round fifteen: what the deferred media collator actually needs ───────────
 
 
 def _r15_bypass(**args):
@@ -2941,9 +2873,6 @@ def test_a_list_of_media_paths_is_not_proven_text():
         "a string sequence is still not treated like a bare string"
     assert "_looks_like_media_value(value)" in src, \
         "the value scan still weighs only data URIs, not media suffixes"
-
-
-# ── round sixteen: what the TEXT path must not be handed ────────────────────
 
 
 def test_retained_metadata_is_stripped_before_the_text_collator():
@@ -3264,8 +3193,6 @@ def test_a_nullable_scalar_labels_column_is_still_dropped_on_a_null_first_row():
     assert len(out.eval_dataset["labels"][0]) == len(out.eval_dataset["input_ids"][0])
 
 
-# ---- the keep-lists, round 3 ----------------------------------------------
-
 def _raw_text_split(**extra):
     rows = {"text": ["<|user|>q0<|assistant|>a0", "<|user|>q1<|assistant|>a1"]}
     rows.update(extra)
@@ -3310,11 +3237,7 @@ def test_index_is_not_seeded_into_the_signature():
 
     seeded = getattr(out, "_signature_columns", None) or []
     assert "index" not in seeded, seeded
-    # The columns HF really does always keep are still there.
     assert {"label", "label_ids", "input_ids", "labels"} <= set(seeded)
-
-
-# ── round seventeen: the resolved label names, the text field, repeat calls ──
 
 
 def test_the_resolved_label_names_survive_unused_column_removal():

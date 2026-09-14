@@ -34,7 +34,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920  # v2.20.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -97,7 +97,7 @@ jobs:
           PY
 
       - name: Import smoke (clean venv)
-        # unsloth_zoo/__init__.py:128 raises ImportError when parent `unsloth` is
+        # unsloth_zoo/__init__.py raises ImportError when parent `unsloth` is
         # absent (deliberate guardrail). A bare `import unsloth_zoo` in a wheel-only
         # venv will fail by design, so the smoke pivots to reading the version
         # string from dist-info METADATA via importlib.metadata.

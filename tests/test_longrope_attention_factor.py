@@ -107,8 +107,6 @@ def _att(cfg):
 DERIVED = math.sqrt(1 + math.log(32) / math.log(4096))   # ~1.1902
 
 
-# ---- the published configs ------------------------------------------------
-
 def test_impossible_value_is_replaced_by_the_derivation():
     cfg = _cfg(attention_factor=32.0)
     assert _att(cfg) == pytest.approx(DERIVED, rel=1e-6)
@@ -138,8 +136,6 @@ def test_patching_twice_does_not_stack():
     patch_longrope_impossible_attention_factor()
     assert R.ROPE_INIT_FUNCTIONS["longrope"] is first
 
-
-# ---- configs that mean what they say --------------------------------------
 
 def test_a_real_attention_factor_is_preserved():
     assert _att(_cfg(attention_factor=1.19)) == pytest.approx(1.19)
@@ -189,8 +185,6 @@ def test_missing_original_max_still_strips_the_bad_value():
     _att(cfg)
     assert "attention_factor" not in cfg.rope_scaling
 
-
-# ---- every call shape transformers uses -----------------------------------
 
 def test_device_stays_optional_for_a_transformers_5_original():
     """transformers 5 gives every parameter but `config` a default, and

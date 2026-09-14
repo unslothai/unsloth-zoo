@@ -105,7 +105,6 @@ def test_no_gradient_checkpointing_leaves_use_cache():
     [pytest.param(None, marks = requires_none_use_cache), False],
 )
 def test_falsy_use_cache_preserved(initial):
-    # None means "defer to the model default": it must NOT be coerced to False.
     model = _tiny_llama(use_cache = initial)
     prepare_model_for_training(model, use_gradient_checkpointing = True)
     assert model.config.use_cache is initial

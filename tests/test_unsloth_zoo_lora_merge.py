@@ -52,9 +52,7 @@ def _ls(lora_A: torch.Tensor, lora_B: torch.Tensor, alpha: float) -> LoraStats:
     return LoraStats(module=None, lora_A=lora_A, lora_B=lora_B, alpha=alpha)
 
 
-# ---------------------------------------------------------------------------
 # 1. _active_merge_device — recent fix that replaced the W-based helper.
-# ---------------------------------------------------------------------------
 
 def test_active_merge_device_returns_string_on_gpu():
     if not gpu_available:
@@ -72,9 +70,7 @@ def test_active_merge_device_takes_no_args():
     )
 
 
-# ---------------------------------------------------------------------------
 # 2. _merge_lora — basic correctness against a numpy reference.
-# ---------------------------------------------------------------------------
 
 def _ref_merge_lora(W: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor,
                     alpha: float) -> torch.Tensor:
@@ -135,10 +131,8 @@ def test_merge_lora_vocab_resize():
 
     assert out.shape == (new_vocab, dim)
     assert out.dtype == torch.float32
-    # The first old_vocab rows: original W + alpha * lora_B[:old_vocab] @ lora_A
     expected_old = (W.to(torch.float32) +
                     alpha * (lora_B[:old_vocab].to(torch.float32) @ lora_A.to(torch.float32)))
-    # New rows: zero base + alpha * lora_B[old_vocab:] @ lora_A
     expected_new = alpha * (lora_B[old_vocab:].to(torch.float32) @ lora_A.to(torch.float32))
     torch.testing.assert_close(out[:old_vocab].cpu(), expected_old, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out[old_vocab:].cpu(), expected_new, atol=5e-2, rtol=5e-2)
@@ -159,9 +153,7 @@ def test_merge_lora_returns_W_when_lora_missing():
     assert out is W
 
 
-# ---------------------------------------------------------------------------
 # 3. _merge_moe_gate_expert — first half of A is gate_proj.
-# ---------------------------------------------------------------------------
 
 def test_merge_moe_gate_expert():
     """gate_W shape (inter_dim, hidden_dim).  delta = (B @ gate_a).T."""
@@ -179,7 +171,6 @@ def test_merge_moe_gate_expert():
                                  expert_idx=expert_idx, num_experts=num_experts,
                                  output_dtype=torch.bfloat16)
 
-    # Reference: a_slice = lora_A[r:r*2], gate_a = a_slice[:, :inter_dim]
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
     b_slice = lora_B[:, s:e].to(torch.float32)
@@ -192,9 +183,7 @@ def test_merge_moe_gate_expert():
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 4. _merge_moe_up_expert — second half of A is up_proj.
-# ---------------------------------------------------------------------------
 
 def test_merge_moe_up_expert():
     torch.manual_seed(SEED)
@@ -214,16 +203,14 @@ def test_merge_moe_up_expert():
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
     b_slice = lora_B[:, s:e].to(torch.float32)
-    up_a = a_slice[:, inter_dim:]  # second half
+    up_a = a_slice[:, inter_dim:]
     up_delta = b_slice @ up_a
     expected = up_W.to(torch.float32) + alpha * up_delta.T
 
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 5. _merge_moe_down_proj_expert — full A slice (no halving).
-# ---------------------------------------------------------------------------
 
 def test_merge_moe_down_proj_expert():
     """down_W shape (H, I).  A: (total_rank, H).  B: (I, total_rank).  delta = (B @ A).T = (H, I)."""
@@ -250,9 +237,7 @@ def test_merge_moe_down_proj_expert():
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 6. _merge_moe_fused_gate_up_expert — 3D fused tensor across all experts.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("is_transposed", [True, False])
 def test_merge_moe_fused_gate_up_expert(is_transposed):
@@ -288,9 +273,7 @@ def test_merge_moe_fused_gate_up_expert(is_transposed):
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
 
 
-# ---------------------------------------------------------------------------
 # 7. _merge_moe_fused_down_proj_expert — 3D fused tensor.
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("is_transposed", [True, False])
 def test_merge_moe_fused_down_proj_expert(is_transposed):

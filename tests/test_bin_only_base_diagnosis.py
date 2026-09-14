@@ -110,7 +110,6 @@ def test_caller_raises_the_specific_message():
     j = src.index("could not be read locally or on Hugging Face")
     assert i < j, "the bin-only check must run before the generic message"
 
-    # Render every f-string in the module, then find the one this branch raises.
     rendered = [
         re.sub(r"\s+", " ", "".join(v.value for v in n.values
                                     if isinstance(v, ast.Constant)))

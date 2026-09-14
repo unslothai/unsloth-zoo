@@ -58,7 +58,6 @@ def test_the_pattern_is_recognized():
         "from tests.a import ..."
     ]
     assert _imports_through_the_tests_package("import tests.a") == ["import tests.a"]
-    # A relative import and an unrelated one are both fine.
     assert _imports_through_the_tests_package("from .a import b") == []
     assert _imports_through_the_tests_package("from testsuite import b") == []
     assert _imports_through_the_tests_package("from a import tests") == []

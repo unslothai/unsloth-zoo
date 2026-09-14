@@ -35,29 +35,39 @@ import torch
 def _install_shim():
     import sys
     shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
-    real_mlx_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
-    }
-    from mlx_simulation import simulate_mlx_on_torch
+    def _owned(name):
+        return (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        )
+
+    # The unsloth_zoo.mlx.* entries are saved as well as the mlx* ones, because
+    # this fixture drops them and the next importer therefore builds a NEW module
+    # object. Anything that ran earlier in this process and did
+    # `from unsloth_zoo.mlx.utils import ...` at import time keeps the OLD one, so
+    # it and the code under test end up on two copies of the same module globals:
+    # the training window one opens is invisible to the other, and a gated-delta
+    # op quietly takes the cached path instead of the VJP. Serially that never
+    # happens (alphabetical order puts this file after the pair it would break);
+    # under `-n N --dist loadfile` it depends on which worker draws which file.
+    from mlx_simulation import (
+        restore_modules,
+        simulate_mlx_on_torch,
+        snapshot_modules,
+    )
     from mlx_simulation.mlx_stub import _MLXFinder
+
+    real_mlx_modules = snapshot_modules(_owned)
     simulate_mlx_on_torch()
     for name in list(sys.modules):
         if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
             sys.modules.pop(name, None)
     yield
-    for name in list(sys.modules):
-        if (
-            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
-            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
-        ):
-            sys.modules.pop(name, None)
     sys.meta_path[:] = [
         finder for finder in sys.meta_path
         if not isinstance(finder, _MLXFinder)
     ]
-    sys.modules.update(real_mlx_modules)
+    restore_modules(real_mlx_modules, _owned)
 
 
 def test_finite_text_batch_plan_materializes_cpu_rows_on_demand():
@@ -836,10 +846,6 @@ def test_response_masked_text_batches_can_remain_a_lazy_plan():
     assert eager[2].dtype == mx.int32
 
 
-# ---------------------------------------------------------------------------
-# 1. MLXTrainingConfig: full surface check.
-# ---------------------------------------------------------------------------
-
 def test_mlx_training_config_is_dataclass_with_all_fields():
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     assert dataclasses.is_dataclass(MLXTrainingConfig)
@@ -1108,7 +1114,6 @@ def test_distributed_text_batches_use_token_length_not_cache_itemlen(monkeypatch
         for batch in batches
         for row in batch[0].tolist()
     }
-    # Rows survived the >=2-token filter (token length, not itemlen).
     assert (5, 6) in content or (7, 8, 9) in content
 
 
@@ -2532,12 +2537,9 @@ def test_num_input_tokens_seen_persisted_and_restored_across_resume():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     ti = inspect.getsource(MLXTrainer._train_inner)
-    # Saved in the checkpoint state dict ...
     assert '"num_input_tokens_seen": int(' in ti
-    # ... and restored from it on resume into the resume attr.
     assert 'ts.get("num_input_tokens_seen"' in ti
     assert "_resume_num_input_tokens_seen = int(" in ti
-    # ... then seeded into the callback-visible TrainerState.
     ics = inspect.getsource(MLXTrainer._init_callback_state)
     assert "num_input_tokens_seen=int(" in ics
     assert "_resume_num_input_tokens_seen" in ics
@@ -2551,13 +2553,10 @@ def test_should_epoch_stop_field_reset_and_honored():
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
 
-    # (1) Field exists and defaults False.
     assert _MLXTrainerControl().should_epoch_stop is False
 
     src = inspect.getsource(MLXTrainer._train_inner)
-    # (2) Reset at epoch begin.
     assert "self.control.should_epoch_stop = False" in src
-    # (3) Rank-synced honoring: an all-reduced flag drives an epoch-boundary skip.
     assert "def _sync_epoch_stop" in src
     assert "_distributed_any_flag(self.control.should_epoch_stop)" in src
     assert "_sync_epoch_stop()" in src
@@ -2638,6 +2637,69 @@ def test_resolved_best_metric_name_mirrors_hf_lookup():
     ]:
         trainer.args.metric_for_best_model = value
         assert trainer._resolved_best_metric_name() == expected
+
+
+def test_best_metric_direction_is_inferred_when_it_is_not_set():
+    # A preference run selects on rewards/accuracies, where "better" is upward.
+    # An unset direction defaulting to False would keep the worst checkpoint.
+    from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
+
+    class Args:
+        greater_is_better = None
+
+    args = Args()
+    for metric, expected in [
+        ("eval_loss", False),
+        ("eval_nll_loss", False),
+        ("eval_rewards/accuracies", True),
+        (None, False),
+    ]:
+        args.metric_for_best_model = metric
+        assert _resolve_greater_is_better(args) is expected
+
+    args.metric_for_best_model = "eval_rewards/accuracies"
+    for explicit in (True, False):
+        args.greater_is_better = explicit
+        assert _resolve_greater_is_better(args) is explicit
+
+
+def test_perplexity_is_inferred_as_lower_is_better():
+    # HF's rule is a bare "loss" suffix, because HF never emits perplexity. This
+    # trainer emits it for every token objective, and the field defaulted to
+    # False before the direction was inferred at all -- so reading it upward
+    # would invert best-checkpoint selection for runs that predate inference.
+    from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
+
+    class Args:
+        greater_is_better = None
+
+    args = Args()
+    for metric in ("eval_perplexity", "eval_val_perplexity"):
+        args.metric_for_best_model = metric
+        assert _resolve_greater_is_better(args) is False
+
+
+def test_the_resolved_direction_is_not_written_to_the_callers_config():
+    # The direction has to be a real boolean on the arguments before any
+    # callback reads it, but `args` belongs to the caller: a config handed to
+    # two trainers, or inspected afterwards, must come back as it went in.
+    import dataclasses
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Model:
+        def trainable_parameters(self): return {}
+
+    args = MLXTrainingConfig(metric_for_best_model="eval_accuracy")
+    before = dataclasses.asdict(args)
+
+    first = MLXTrainer(Model(), None, [], args=args)
+    second = MLXTrainer(Model(), None, [], args=args)
+
+    assert dataclasses.asdict(args) == before
+    assert args.greater_is_better is None
+    assert first.args is not second.args
+    assert first.args.greater_is_better is True
+    assert second.args.greater_is_better is True
 
 
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
@@ -3067,19 +3129,15 @@ def test_qwen3_vl_vision_block_mlp_fp32_guard_for_fp16():
 
     source = inspect.getsource(mc._install_qwen3_family_compile_patches)
 
-    # Guard is present
     assert "linear_fc1 (up-projection) overflows fp16" in source, (
         "Missing comment documenting the fp16 overflow rationale"
     )
-    # Dtype-conditional branch keys on residual_dtype (the activation dtype)
     assert "if residual_dtype == mx.float16:" in source, (
         "MLP fp32 guard must be gated on residual_dtype == mx.float16"
     )
-    # fp16 path: upcast input to fp32 before calling self.mlp
     assert "self.mlp(mlp_norm_out.astype(mx.float32))" in source, (
         "fp16 branch must upcast mlp input to fp32"
     )
-    # non-fp16 path: original (cheaper) cast-only flow preserved
     assert "self.mlp(mlp_norm_out)" in source, (
         "bf16/fp32 path must keep the original self.mlp(...) call"
     )
@@ -3469,11 +3527,6 @@ def test_gemma3_training_compile_verified():
     assert "gemma3" in mc._VERIFIED_TRAINING_ARCHES
 
 
-# ---------------------------------------------------------------------------
-# 2. compile module-level discovery functions return sensible defaults
-#    on a host with no real MLX architectures.
-# ---------------------------------------------------------------------------
-
 def test_compile_discovers_no_archs_under_shim():
     """No real mlx_vlm.models.* installed -> empty discovery, not crash."""
     import unsloth_zoo.mlx.compile as mc
@@ -3544,10 +3597,6 @@ def test_compile_summarize_qualifications_returns_dict():
     assert "architectures" in s
 
 
-# ---------------------------------------------------------------------------
-# 3. CCE backward via the pure-Python fallback.
-# ---------------------------------------------------------------------------
-
 def test_cce_backward_via_torch_autograd():
     """Build a tiny CCE forward and verify torch.autograd traverses it."""
     from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
@@ -3570,10 +3619,6 @@ def test_cce_backward_via_torch_autograd():
     assert weight.grad is not None and torch.isfinite(weight.grad).all()
 
 
-# ---------------------------------------------------------------------------
-# 4. mx.dequantize cross-validation against the helper's output.
-# ---------------------------------------------------------------------------
-
 def test_mx_dequantize_with_nonzero_bias_and_scale():
     import mlx.core as mx
 
@@ -3595,10 +3640,6 @@ def test_mx_dequantize_with_nonzero_bias_and_scale():
     torch.testing.assert_close(out, expected)
 
 
-# ---------------------------------------------------------------------------
-# 5. mx.fast.scaled_dot_product_attention works for a small attention.
-# ---------------------------------------------------------------------------
-
 def test_mx_fast_sdpa_works():
     import mlx.core as mx
     B, H, T, D = 1, 2, 4, 8
@@ -3609,10 +3650,6 @@ def test_mx_fast_sdpa_works():
     assert out.shape == (B, H, T, D)
     assert torch.isfinite(out).all()
 
-
-# ---------------------------------------------------------------------------
-# 6. Tree utilities round-trip.
-# ---------------------------------------------------------------------------
 
 def test_tree_flatten_unflatten_roundtrip():
     from mlx.utils import tree_flatten, tree_unflatten
@@ -3627,10 +3664,6 @@ def test_tree_flatten_unflatten_roundtrip():
     assert set(rebuilt.keys()) == {"a", "d"}
     torch.testing.assert_close(rebuilt["d"], torch.tensor([3.0]))
 
-
-# ---------------------------------------------------------------------------
-# 7. Quantized layer __call__ works (forward through nn.QuantizedLinear).
-# ---------------------------------------------------------------------------
 
 def test_quantized_linear_forward():
     import mlx.nn as nn
@@ -5328,7 +5361,6 @@ def test_callback_num_train_epochs_mirrors_hf_arithmetic():
     # Streaming: no finite plan, no epoch events, field left alone.
     assert trainer._callback_num_train_epochs(50, None) == 0
 
-    # Epoch-count runs are unchanged.
     epochs = MLXTrainer.__new__(MLXTrainer)
     epochs.args = MLXTrainingConfig(num_train_epochs=3, max_steps=-1)
     epochs._prepared_batches_include_epochs = True
@@ -5920,8 +5952,6 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
     # the final totals still cover exactly the 4 applied steps.
     assert whole._train_loss_token_total == 2 * saved["train_loss_token_total"]
 
-    # End to end: stop right after the step-2 checkpoint, resume, and the final
-    # token-weighted train loss matches the uninterrupted run's.
     interrupted = build(stop_after=2)
     interrupted.train()
     resumed = build()
@@ -5973,7 +6003,6 @@ def test_integration_callback_args_cover_stock_trackio_and_swanlab():
         for field in sorted(set(reader.findall(inspect.getsource(callback)))):
             assert hasattr(args, field), f"{name} reads args.{field}"
 
-    # A caller that configures the run keeps their value across the next run.
     args.project = "my-project"
     args.hub_private_repo = True
     trainer._ensure_callback_args_compat()
@@ -6086,7 +6115,6 @@ def test_callback_events_dispatch_on_every_rank(monkeypatch):
     rank0_lr_cb, rank0_io_cb, rank0_seen = run(0)
     rank1_lr_cb, rank1_io_cb, rank1_seen = run(1)
 
-    # The callback runs on the peer too, so both ranks step with the same LR.
     assert rank0_lr_cb.calls == 4
     assert rank1_lr_cb.calls == 4
     assert rank0_seen == [override_lr] * 4
@@ -6124,12 +6152,10 @@ def test_training_config_exposes_sanitized_dict_for_integration_callbacks():
 
     assert sanitized["train_batch_size"] == 2
     assert sanitized["eval_batch_size"] == 3
-    # Every raw field survives; only the values are coerced.
     assert set(config.to_dict()) <= set(sanitized)
     assert all(type(value) in (bool, int, float, str) for value in sanitized.values())
     # A tracker must be able to serialize the whole payload.
     json.dumps(sanitized)
-    # Non-scalars are stringified rather than dropped, and bool stays bool.
     assert sanitized["compile_arch_overrides"] == str({"a": "b"})
     assert isinstance(sanitized["packing"], bool)
 
@@ -6821,7 +6847,6 @@ def test_callback_interrupt_joins_the_ddp_failure_consensus(monkeypatch, interru
     peer_contexts, peer_outcome, _ = run(raising=False)
     raiser_contexts, raiser_outcome, raiser_stop = run(raising=True)
 
-    # The peer runs to completion and reports no failure of its own.
     assert peer_outcome is None
     # The interrupt still reaches the caller unwrapped, exactly as HF's
     # callback_handler.call_event lets it propagate (transformers
@@ -7866,7 +7891,6 @@ def test_epoch_cadence_closes_a_callback_stopped_epoch(monkeypatch):
         # skip lands the loop on the next boundary.
         assert probe["saved"][0] == 2, (with_flow, probe["saved"])
         assert probe["checkpoints"][0] == 2, (with_flow, probe["checkpoints"])
-    # And the two configurations agree exactly, which is the whole point.
     runs = [
         _run_log_save_cadence_probe(
             monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
@@ -8022,7 +8046,6 @@ def test_dict_eval_rebuilds_the_prediction_bar_per_split(monkeypatch):
         (3, 1), (3, 2), (3, 3),
         (4, 1), (4, 2), (4, 3), (4, 4),
     ], bar.geometry
-    # No bar ever runs past its own total.
     assert all(seen <= total for total, seen in bar.geometry), bar.geometry
     # The last split's bar is still torn down by on_evaluate, exactly as in HF.
     assert bar.closing == (4, 4), bar.closing

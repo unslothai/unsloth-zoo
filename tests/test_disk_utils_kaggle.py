@@ -94,9 +94,7 @@ def _fake_free(disk_utils, monkeypatch, sizes):
     monkeypatch.setattr(disk_utils, "free_bytes", fake)
 
 
-# --------------------------------------------------------------------------
 # Detection
-# --------------------------------------------------------------------------
 
 
 class TestKaggleDetection:
@@ -172,9 +170,7 @@ class TestKaggleDetection:
         assert disk_utils.is_kaggle_environment() is False
 
 
-# --------------------------------------------------------------------------
 # Sizing
-# --------------------------------------------------------------------------
 
 
 class _FakeQuantState:
@@ -389,14 +385,11 @@ class TestGGUFEstimate:
         assert old_style < free, "the old estimate let this through, which is the bug"
         assert three < free, "three copies still let it through"
         assert four > free, "the full peak has to be caught"
-        # And the export does fit without the pre-warm, so refusing outright
-        # would have been the wrong answer.
+        # The export does fit without the pre-warm, so refusing outright is wrong.
         assert three < free
 
 
-# --------------------------------------------------------------------------
 # The /tmp redirect
-# --------------------------------------------------------------------------
 
 
 class TestKaggleTmpRedirect:

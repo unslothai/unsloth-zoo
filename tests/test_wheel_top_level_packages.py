@@ -93,7 +93,6 @@ def test_shared_names_are_never_discovered():
 
 
 def test_package_payload_is_untouched():
-    # The exclusion must not thin out unsloth_zoo itself.
     from setuptools.discovery import PEP420PackageFinder
 
     config = _find_config()

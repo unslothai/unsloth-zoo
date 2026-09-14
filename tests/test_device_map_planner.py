@@ -95,9 +95,8 @@ def test_headroom_grows_with_rows_and_vocab():
 
 
 def test_headroom_retained_term_scales_with_total_rows():
-    # The retained term is what makes the backward pass expensive: it depends on
-    # the total number of rows, not on the chunk size, so chunking alone cannot
-    # bound it.
+    # The retained term depends on the total rows, not the chunk size, so
+    # chunking alone cannot bound it.
     a = logit_headroom_bytes(200000, 128, retained_rows = 1024)
     b = logit_headroom_bytes(200000, 128, retained_rows = 4096)
     assert b > a
@@ -135,9 +134,6 @@ def test_refuses_instead_of_spilling_when_it_cannot_fit():
         )
 
 
-# --------------------------------------------------------------------------- #
-# quantised sizing
-# --------------------------------------------------------------------------- #
 def test_quantised_sizes_use_the_storage_dtype():
     """`preprocess_model` leaves a meta `Params4bit` at the full unpacked shape
     in float32, so measuring the modules directly reports a 4-bit checkpoint at
@@ -180,8 +176,7 @@ def test_quantised_sizes_use_the_storage_dtype():
     plain = _compute_module_sizes(model)[""]
     quant = _compute_module_sizes(model, Q())[""]
     assert quant < plain, (quant, plain)
-    # lm_head is not converted, so it keeps the load dtype rather than shrinking
-    # with everything else.
+    # lm_head is not converted, so it keeps the load dtype.
     assert _compute_module_sizes(model, Q())["lm_head"] == 512 * 64 * 2
 
 
@@ -190,9 +185,6 @@ def test_no_quantizer_leaves_sizes_untouched():
     assert _compute_module_sizes(model, None) == _compute_module_sizes(model)
 
 
-# --------------------------------------------------------------------------- #
-# placement units
-# --------------------------------------------------------------------------- #
 class _RootState(nn.Module):
     _no_split_modules = ["_Block"]
 
@@ -256,9 +248,6 @@ def test_a_composite_head_is_pinned_whole():
     assert plan.device_map["lm_head.proj"] == plan.head_device
 
 
-# --------------------------------------------------------------------------- #
-# packing
-# --------------------------------------------------------------------------- #
 class _Sized(nn.Module):
     def __init__(self, n):
         super().__init__()
@@ -305,9 +294,6 @@ def test_in_order_layout_is_kept_when_it_fits():
     assert layers == sorted(layers), layers
 
 
-# --------------------------------------------------------------------------- #
-# reserves
-# --------------------------------------------------------------------------- #
 def test_an_explicit_reserve_is_a_hard_constraint():
     """The relaxation loop walks the non-head reserve down to zero. Doing that
     to a reserve the caller measured is how a run OOMs on a card the plan still
@@ -338,9 +324,6 @@ def test_the_auto_reserve_is_still_relaxable():
     assert set(plan.device_map.values()) <= {0, 1}
 
 
-# --------------------------------------------------------------------------- #
-# remote code
-# --------------------------------------------------------------------------- #
 def test_remote_code_config_picks_the_auto_class_the_repo_registered():
     """A dynamic config is in no `_model_mapping`, so the mapping walk falls
     through to AutoModel and `from_config` then fails instead of honouring the
@@ -447,9 +430,6 @@ def test_each_backend_is_called_with_the_arguments_it_accepts(monkeypatch):
     assert seen["accelerate"][0] is torch.int8
 
 
-# --------------------------------------------------------------------------- #
-# budgets, packing and shared parameters
-# --------------------------------------------------------------------------- #
 _MiB = 1024 ** 2
 
 
@@ -624,8 +604,7 @@ def test_directly_owned_tensors_use_the_quantizer_aware_sizes():
     refuses a model that fits (or overcommits one that does not)."""
     with torch.device("meta"):
         model = _OwnState()
-    # A quantiser that halves every parameter, the shape of a 4-bit checkpoint
-    # whose meta tensors still report the unpacked float32 size.
+    # A 4-bit checkpoint whose meta tensors still report the unpacked float32 size.
     sizes = {k: v // 2 for k, v in _compute_module_sizes(model).items()}
     units = _split_units(model, [], sizes)
     assert sum(size for _, size in units) == sizes[""]
@@ -695,8 +674,7 @@ class _TiedDirectState(nn.Module):
         self.embed_tokens = nn.Embedding(vocab, hidden)
         self.trunk = _Composite(hidden)
         self.lm_head = nn.Linear(hidden, vocab, bias = False)
-        # Registered after `embed_tokens`, so sizing counts the tensor there and
-        # this module's own share of the size table is zero.
+        # Registered after `embed_tokens`, so sizing counts the tensor there.
         self.trunk.shadow = self.embed_tokens.weight
 
     def get_output_embeddings(self):
@@ -762,8 +740,7 @@ def test_keep_in_fp32_modules_mirror_the_loader():
         def update_dtype(self, dtype):
             return dtype
 
-    # bfloat16: the strict list always applies, the plain one only because the
-    # quantiser asks for it.
+    # bfloat16: the strict list always applies, the plain one only on request.
     assert _keep_in_fp32_modules(model, Bnb()) == ["norm", "lm_head"]
     assert _keep_in_fp32_modules(model, Other()) == ["lm_head"]
     assert _keep_in_fp32_modules(model, None) == ["lm_head"]
@@ -966,7 +943,6 @@ def test_fp32_loader_exceptions_apply_without_a_quantizer():
     plain = _compute_module_sizes(model)
     model._keep_in_fp32_modules = ["norm"]
     upcast = _compute_module_sizes(model)
-    # The norm doubles from float16 to float32; nothing else moves.
     assert upcast["norm"] == plain["norm"] * 2
     assert upcast["layers"] == plain["layers"]
     assert upcast[""] == plain[""] + plain["norm"]
@@ -1028,9 +1004,8 @@ def test_the_balanced_reserve_is_derived_per_head_candidate():
     )
     assert plan.head_device == 1
     kept = plan.activation_reserve_by_device
-    # cuda:0 does not hold the head, so its cap is its own 3 GiB less the weight
-    # share (about 2.98 GiB). The shared cap charged it the 2.5 GiB of headroom
-    # as well and left it under 0.5 GiB.
+    # cuda:0 holds no head, so its cap is 3 GiB less the weight share (2.98 GiB).
+    # The shared cap also charged it the 2.5 GiB headroom, leaving under 0.5 GiB.
     assert kept[0] > 1 * _GiB
     for device, reserve in kept.items():
         head_extra = plan.headroom_bytes if device == plan.head_device else 0
@@ -1052,7 +1027,6 @@ def test_runtime_quantization_options_build_a_quantizer(monkeypatch):
     assert _runtime_quantization_config({}) is None
     assert _runtime_quantization_config({"load_in_8bit": True}).load_in_8bit is True
 
-    # The loader consumes every BitsAndBytesConfig option from its kwargs, and
     # `llm_int8_skip_modules` becomes `modules_to_not_convert`: ignoring it sizes
     # whole modules at the quantised width that the loader keeps full precision.
     kwargs = {"load_in_8bit": True, "llm_int8_skip_modules": ["lm_head"],
@@ -1147,8 +1121,7 @@ def _muse_shaped_budgets(model):
     total = sum(sizes.values())
     head = sizes["lm_head.weight"]
     budget = 3 * total // 2
-    # Inside (budget - total/2, budget - head], which is non-empty exactly
-    # when head < total/2.
+    # Inside (budget - total/2, budget - head], non-empty iff head < total/2.
     assert head < total // 2, "fixture no longer has a head under half the weights"
     headroom = (budget - total // 2 + budget - head) // 2
     assert budget - total // 2 < headroom <= budget - head
@@ -1343,8 +1316,7 @@ def test_the_smaller_card_of_an_asymmetric_pair_is_not_packed_to_zero():
             f"reserve ({kept}); it is being charged the flat average weight again"
         )
 
-        # Reserving the small card's WHOLE budget would satisfy the line above
-        # by leaving it empty, which is not a two-GPU plan.
+        # Reserving the small card's WHOLE budget leaves it empty, not a plan.
         assert plan.weight_bytes[0] > 0, (
             f"{small}+{big} GiB: the smaller card was left holding nothing "
             f"({plan.weight_bytes})"
@@ -1358,7 +1330,6 @@ def test_the_smaller_card_of_an_asymmetric_pair_is_not_packed_to_zero():
             f"{small}+{big} GiB: kept {kept[0]} but only {free[0]} is free"
         )
 
-        # And it is not packed disproportionately tighter than the big card.
         small_frac = free[0] / max_memory[0]
         big_frac = free[1] / max_memory[1]
         assert small_frac >= big_frac / 2, (
@@ -1393,8 +1364,7 @@ def test_identical_cards_still_get_the_flat_average_share():
         plan = plan_device_map(model, max_memory = {d: budget for d in range(n)})
         assert plan is not None, f"{n} x 14.56 GiB was refused"
 
-        # The pre-proration formula: one flat average share for every device,
-        # with the pinned head as its floor.
+        # Pre-proration: one flat average share, pinned head as its floor.
         total = plan.total_weight_bytes
         headroom = plan.headroom_bytes
         value = max(0, (n * budget - total - headroom) // n)
@@ -1475,7 +1445,6 @@ def test_prorating_never_charges_the_head_card_more_than_the_flat_average():
             f"flat-average planner kept {flat[head]}; proration must only "
             f"loosen the cap, never tighten it"
         )
-        # And the small card still gets the reserve this whole change is about.
         assert all(v > 0 for v in kept.values()), kept
 
 
@@ -1573,9 +1542,6 @@ def test_a_small_card_is_not_charged_the_pinned_head_it_never_holds():
     assert free[0] >= kept[0], f"cuda:0 was packed below its own reserve: {free}"
 
 
-# --------------------------------------------------------------------------- #
-# logit transform detection
-# --------------------------------------------------------------------------- #
 class _Cfg:
     """A model config stands in as a plain attribute holder."""
 

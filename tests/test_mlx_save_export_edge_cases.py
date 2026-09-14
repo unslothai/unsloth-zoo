@@ -10,10 +10,17 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import sys
 import threading
 import types
 from pathlib import Path, PureWindowsPath
+
+# `os.geteuid` is POSIX-only and these decorators run at collection time, so a
+# bare call takes the whole module out on Windows (tests/test_llama_cpp_prebuilt.py:30
+# guards the same way).
+IS_POSIX = os.name == "posix"
+
 
 import pytest
 import torch
@@ -35,9 +42,6 @@ def _patch_mlx_tensor_helpers_for_torch(monkeypatch, mutils):
 
     monkeypatch.setattr(mutils.mx, "transpose", _transpose)
     monkeypatch.setattr(mutils.mx, "all", _all)
-
-
-# --- Group 1: _mlx_arrays_match ---
 
 
 def test_arrays_match_rank3_checks_values(monkeypatch):
@@ -117,9 +121,6 @@ def test_arrays_match_nan_tensors_do_not_match(monkeypatch):
     # NaN != NaN elementwise, so a clone never value-matches; identity does.
     assert mutils._mlx_arrays_match(nan, nan.clone()) is False
     assert mutils._mlx_arrays_match(nan, nan) is True
-
-
-# --- Group 2: _rewrite_mlx_vlm_tensor_for_gguf branches ---
 
 
 def test_rewrite_handles_5d_layout_transform(monkeypatch):
@@ -249,9 +250,6 @@ def test_rewrite_model_prefixed_alias_families(monkeypatch):
     assert new_name == "model.visual.embed.bias"
 
 
-# --- Group 3: _MlxVlmSanitizeProxy (2-param sanitize path) ---
-
-
 def test_two_param_sanitize_receives_config_proxy():
     import unsloth_zoo.mlx.utils as mutils
 
@@ -295,9 +293,6 @@ def test_sanitize_missing_method_returns_weights_unchanged():
 
     weights = {"w": torch.zeros(1)}
     assert mutils._call_mlx_vlm_sanitize(NoSanitize, {}, weights) is weights
-
-
-# --- Group 4: _prepare_vlm_gguf_export_directory end-to-end (real shards) ---
 
 
 class _ConvAndRenameSanitizer:
@@ -379,7 +374,7 @@ def test_prepare_export_rewrites_real_shards_and_index(monkeypatch, tmp_path):
         },
     )
 
-    rewritten = mutils._prepare_vlm_gguf_export_directory(out)
+    rewritten = mutils._prepare_mlx_gguf_export_directory(out)
     assert rewritten == 1
 
     shard1 = _read_shard(out / "model-00001-of-00002.safetensors")
@@ -435,7 +430,7 @@ def test_prepare_export_restores_stripped_multimodal_namespaces_and_index(
         index={"metadata": {"total_size": 123}, "weight_map": weight_map},
     )
 
-    assert mutils._prepare_vlm_gguf_export_directory(out) == len(tensors)
+    assert mutils._prepare_mlx_gguf_export_directory(out) == len(tensors)
 
     shard = _read_shard(out / shard_name)
     expected_names = {f"model.{name}" for name in tensors}
@@ -476,7 +471,7 @@ def test_prepare_export_duplicate_rewrite_name_raises(monkeypatch, tmp_path):
         },
     )
     with pytest.raises(RuntimeError, match="duplicate tensor name"):
-        mutils._prepare_vlm_gguf_export_directory(out)
+        mutils._prepare_mlx_gguf_export_directory(out)
 
 
 def test_prepare_export_missing_index_is_fine(monkeypatch, tmp_path):
@@ -497,7 +492,7 @@ def test_prepare_export_missing_index_is_fine(monkeypatch, tmp_path):
             },
         },
     )
-    assert mutils._prepare_vlm_gguf_export_directory(out) == 1
+    assert mutils._prepare_mlx_gguf_export_directory(out) == 1
     assert not (out / "model.safetensors.index.json").exists()
 
 
@@ -511,7 +506,7 @@ def test_prepare_export_no_shards_returns_zero(monkeypatch, tmp_path):
     out = _export_dir_with_shards(
         tmp_path, config={"model_type": "fake_vlm"}, shards={}
     )
-    assert mutils._prepare_vlm_gguf_export_directory(out) == 0
+    assert mutils._prepare_mlx_gguf_export_directory(out) == 0
 
 
 def test_prepare_export_unicode_shard_filename(monkeypatch, tmp_path):
@@ -532,7 +527,7 @@ def test_prepare_export_unicode_shard_filename(monkeypatch, tmp_path):
             },
         },
     )
-    assert mutils._prepare_vlm_gguf_export_directory(out) == 1
+    assert mutils._prepare_mlx_gguf_export_directory(out) == 1
     assert list(_read_shard(out / "模型-shard.safetensors")) == [
         "visual.embed.weight"
     ]
@@ -603,9 +598,6 @@ def test_nextn_handles_language_and_thinker_nested_configs():
     assert "nextn_predict_layers" not in config["thinker_config"]["text_config"]
 
 
-# --- Group 5: _copy_source_sidecars filesystem edges ---
-
-
 def test_sidecars_src_equals_dst_copies_nothing(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -657,7 +649,8 @@ def test_sidecars_unicode_names_and_spaces_in_paths(tmp_path):
     assert (dst / "tokenizer_配置.json").exists()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks no-op as root")
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0,
+                    reason="permission checks no-op as root / non-POSIX")
 def test_sidecars_unreadable_source_propagates_loudly(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -680,9 +673,6 @@ def test_sidecars_windows_style_path_object_does_not_crash():
 
     # On POSIX a PureWindowsPath coerces to a missing relative path: return 0.
     assert mutils._copy_source_sidecars(PureWindowsPath("C:/no/such"), "out") == 0
-
-
-# --- Group 6: _read_json_file non-dict payloads + processor repair robustness ---
 
 
 @pytest.mark.parametrize("payload", ["[]", '"just a string"', "null", "3.14"])
@@ -722,7 +712,8 @@ def test_read_json_file_directory_path_returns_empty(tmp_path):
     assert loader._read_json_file(tmp_path) == {}
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="permission checks no-op as root")
+@pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0,
+                    reason="permission checks no-op as root / non-POSIX")
 def test_read_json_file_permission_error_returns_empty(tmp_path):
     import unsloth_zoo.mlx.loader as loader
 
@@ -742,9 +733,6 @@ def test_read_json_file_accepts_str_and_path(tmp_path):
     sidecar.write_text('{"a": 1}', encoding="utf-8")
     assert loader._read_json_file(str(sidecar)) == {"a": 1}
     assert loader._read_json_file(sidecar) == {"a": 1}
-
-
-# --- Group 7: _get_model_config fallback ladder ---
 
 
 def test_get_model_config_to_dict_returning_non_dict_falls_through():
@@ -801,9 +789,6 @@ def test_get_model_config_non_dict_private_config_falls_through():
     assert mutils._get_model_config(model) == {"model_type": "qwen3"}
 
 
-# --- Group 8: _save_mlx_config routing and quantization key handling ---
-
-
 def _capture_save_config(monkeypatch, module_name):
     calls = {}
     fake = types.ModuleType(module_name)
@@ -854,9 +839,6 @@ def test_save_config_vlm_without_quantization_key_adds_nothing(monkeypatch, tmp_
     assert "quantization" not in calls["config"]
 
 
-# --- Group 9: _is_vlm_model real body ---
-
-
 def test_is_vlm_explicit_flag_overrides_structure():
     import unsloth_zoo.mlx.utils as mutils
 
@@ -894,9 +876,6 @@ def test_is_vlm_requires_language_model():
     assert mutils._is_vlm_model(types.SimpleNamespace(vision_tower=object())) is False
     assert mutils._is_vlm_model(types.SimpleNamespace(language_model=object())) is False
     assert mutils._is_vlm_model(object()) is False
-
-
-# --- Group 10: save_merged_model contracts ---
 
 
 def _install_fake_lm_save(monkeypatch):
@@ -1019,10 +998,15 @@ def test_merged_save_keeps_quantization_when_not_dequantizing(
     assert calls["saved_config"]["quantization"] == {"bits": 4}
 
 
-# --- Group 11: save_pretrained_gguf first_conversion derivation + quantize step ---
+def _gguf_export_scaffold(
+    monkeypatch, tmp_path, shards=1, mmproj=False, mmproj_shards=1
+):
+    """Fake out the GGUF toolchain around the real ``save_pretrained_gguf``.
 
-
-def _gguf_export_scaffold(monkeypatch, tmp_path):
+    ``shards`` > 1 makes the converter write llama.cpp's shard names instead of
+    the requested ``--outfile``, which is what it does past ``--split-max-size``.
+    ``mmproj_shards`` does the same for the vision projector's own ``--outfile``.
+    """
     import unsloth_zoo.llama_cpp as llama_cpp
     import unsloth_zoo.mlx.utils as mutils
 
@@ -1046,17 +1030,72 @@ def _gguf_export_scaffold(monkeypatch, tmp_path):
 
     def fake_convert_to_gguf(**kwargs):
         calls["convert_kwargs"] = kwargs
-        output = Path(
-            f"{kwargs['model_name']}.{kwargs['quantization_type'].upper()}.gguf"
-        )
-        output.write_bytes(b"GGUF-intermediate")
+        # Mirror convert_to_gguf's own naming: a model_name that already ends in
+        # .gguf is the --outfile verbatim, and the projector hangs off the name
+        # with that suffix stripped.
+        name = kwargs["model_name"]
+        if name.endswith(".gguf"):
+            stem = name[: -len(".gguf")]
+            mmproj_stem = f"{stem}.{kwargs['model_dtype'].upper()}"
+        else:
+            stem = f"{name}.{kwargs['quantization_type'].upper()}"
+            mmproj_stem = f"{name}.{kwargs['model_dtype'].upper()}"
+        if shards > 1:
+            produced = [
+                Path(f"{stem}-{i:05d}-of-{shards:05d}.gguf")
+                for i in range(1, shards + 1)
+            ]
+        else:
+            produced = [Path(f"{stem}.gguf")]
+        for part in produced:
+            part.write_bytes(b"GGUF-intermediate")
+        if mmproj:
+            # The projector is a second --outfile, so it shards on its own stem.
+            for i in range(1, mmproj_shards + 1):
+                part = Path(
+                    f"{mmproj_stem}-mmproj.gguf" if mmproj_shards == 1
+                    else f"{mmproj_stem}-mmproj-{i:05d}-of-{mmproj_shards:05d}.gguf"
+                )
+                part.write_bytes(b"GGUF-mmproj")
+                produced.append(part)
+        return [str(p) for p in produced], bool(mmproj)
 
     def fake_quantize_gguf(**kwargs):
         calls["quantize_kwargs"] = kwargs
+        # llama-quantize reads shard 1 and then every sibling its split.count names,
+        # so a missing sibling is as fatal as a missing input.
+        source = Path(kwargs["input_gguf"])
+        needed = [source]
+        split = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", source.name)
+        if split:
+            total = int(split.group(2))
+            needed = [
+                source.with_name(
+                    f"{source.name[:split.start()]}-{i:05d}-of-{total:05d}.gguf"
+                )
+                for i in range(1, total + 1)
+            ]
+        for part in needed:
+            if not part.exists():
+                raise RuntimeError(
+                    f"gguf_init_from_file: failed to open GGUF file '{part}'"
+                )
         Path(kwargs["output_gguf"]).write_bytes(b"GGUF-final")
 
     monkeypatch.setattr(mutils, "save_merged_model", fake_save_merged_model)
-    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: False)
+    monkeypatch.setattr(mutils, "_is_vlm_model", lambda model: mmproj)
+    monkeypatch.setattr(
+        mutils,
+        "_prepare_mlx_gguf_export_directory",
+        lambda path, model=None, replay_sanitizers=True, norm_offsets=None,
+               relaid_out=None: 0,
+    )
+    # The MoE pass also runs on every export, and this scaffold has no shards for it.
+    monkeypatch.setattr(
+        mutils,
+        "_prepare_moe_gguf_export_directory",
+        lambda path, model=None, source_norm_offsets=None, source_layouts=(): 0,
+    )
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unused"))
     monkeypatch.setattr(
         llama_cpp,
@@ -1112,7 +1151,138 @@ def test_gguf_default_first_conversion_not_quantized_skips_quantizer(
     assert (out / "EdgeModel.BF16.gguf").exists()
 
 
-# --- Group 12: concurrency over the patcher env mutation ---
+def test_gguf_quantizes_split_intermediate_from_first_shard(monkeypatch, tmp_path):
+    """A split intermediate has no --outfile-named file; quantize shard 1 instead."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path, shards=3, mmproj=True)
+    out = tmp_path / "out"
+    model = types.SimpleNamespace(_hf_repo="mlx-community/EdgeModel-30B-4bit")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    assert calls["quantize_kwargs"]["input_gguf"] == str(
+        out / "EdgeModel-30B-4bit.BF16-00001-of-00003.gguf"
+    )
+    # Every base shard is an intermediate; the projector and the quant are outputs.
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel-30B-4bit.BF16-mmproj.gguf",
+        "EdgeModel-30B-4bit.Q4_K_M.gguf",
+    ]
+
+
+def test_gguf_keeps_the_vision_projector_out_of_the_intermediates(
+    monkeypatch, tmp_path
+):
+    """The projector is an output of the export, not an intermediate to consume."""
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path, mmproj=True)
+    out = tmp_path / "out"
+    model = types.SimpleNamespace(_hf_repo="org/EdgeModel")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    assert calls["quantize_kwargs"]["input_gguf"] == str(out / "EdgeModel.BF16.gguf")
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel.BF16-mmproj.gguf",
+        "EdgeModel.Q4_K_M.gguf",
+    ]
+
+
+@pytest.mark.parametrize("shards", [1, 2])
+@pytest.mark.parametrize(
+    "repo, stem",
+    [
+        # The converter appends ".BF16.gguf" to these, so the model's own name is
+        # free to look like a projector's.
+        ("org/example-mmproj-model", "example-mmproj-model.BF16"),
+        # A name already ending in .gguf is used verbatim as the --outfile, so the
+        # model file itself is literally named like a projector.
+        ("org/example-mmproj.gguf", "example-mmproj"),
+    ],
+)
+def test_gguf_exports_a_model_whose_own_name_looks_like_a_projector(
+    monkeypatch, tmp_path, repo, stem, shards
+):
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path, shards=shards)
+    out = tmp_path / "out"
+    mutils.save_pretrained_gguf(
+        types.SimpleNamespace(_hf_repo=repo),
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    expected = f"{stem}.gguf" if shards == 1 else f"{stem}-00001-of-{shards:05d}.gguf"
+    assert calls["quantize_kwargs"]["input_gguf"] == str(out / expected)
+    assert [p.name for p in out.glob("*.gguf")] == [
+        f"{Path(repo).name}.Q4_K_M.gguf"
+    ]
+
+
+def test_gguf_keeps_a_projector_that_llama_cpp_sharded(monkeypatch, tmp_path):
+    """The projector shards on its own stem, so it is not part of the model."""
+    mutils, calls = _gguf_export_scaffold(
+        monkeypatch, tmp_path, shards=2, mmproj=True, mmproj_shards=2
+    )
+    out = tmp_path / "out"
+    mutils.save_pretrained_gguf(
+        types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+        tokenizer=object(),
+        save_directory=out,
+        quantization_method="q4_k_m",
+    )
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel.BF16-mmproj-00001-of-00002.gguf",
+        "EdgeModel.BF16-mmproj-00002-of-00002.gguf",
+        "EdgeModel.Q4_K_M.gguf",
+    ]
+
+
+def test_gguf_reports_a_conversion_that_reported_no_output(monkeypatch, tmp_path):
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, _calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    monkeypatch.setattr(llama_cpp, "convert_to_gguf", lambda **kwargs: ([], False))
+    monkeypatch.setattr(
+        llama_cpp,
+        "quantize_gguf",
+        lambda **kwargs: pytest.fail("nothing was produced to quantize"),
+    )
+    with pytest.raises(RuntimeError, match="no output file to quantize"):
+        mutils.save_pretrained_gguf(
+            types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+            tokenizer=object(),
+            save_directory=tmp_path / "out",
+            quantization_method="q4_k_m",
+        )
+
+
+def test_gguf_keeps_the_intermediates_when_quantization_fails(monkeypatch, tmp_path):
+    """A failed quantize must leave the shards it would have to be retried from."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, _calls = _gguf_export_scaffold(monkeypatch, tmp_path, shards=3)
+    out = tmp_path / "out"
+    monkeypatch.setattr(
+        llama_cpp,
+        "quantize_gguf",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("llama-quantize failed")),
+    )
+    with pytest.raises(RuntimeError, match="llama-quantize failed"):
+        mutils.save_pretrained_gguf(
+            types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+            tokenizer=object(),
+            save_directory=out,
+            quantization_method="q4_k_m",
+        )
+    assert sorted(p.name for p in out.glob("*.gguf")) == [
+        "EdgeModel.BF16-00001-of-00003.gguf",
+        "EdgeModel.BF16-00002-of-00003.gguf",
+        "EdgeModel.BF16-00003-of-00003.gguf",
+    ]
 
 
 def test_concurrent_gguf_exports_serialize_env_mutation(monkeypatch, tmp_path):
@@ -1201,8 +1371,6 @@ def test_gguf_export_respects_preexisting_scripts_dir_override(
     assert seen["env"] == custom
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == custom
 
-
-# --- Group 13: converter placement contract (monolith vs package layout) ---
 
 _PACKAGE_ENTRYPOINT = b"""\
 #!/usr/bin/env python3
@@ -1378,9 +1546,6 @@ def test_monolith_layout_patched_script_stays_in_default_dir(
     assert (root / "convert_hf_to_gguf.py").read_bytes() == _MONOLITH
 
 
-# --- Group 14: path-shape portability ---
-
-
 def test_save_config_accepts_str_and_path_targets(monkeypatch, tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -1398,7 +1563,7 @@ def test_prepare_export_accepts_string_path(monkeypatch, tmp_path):
         lambda config, model=None: [],
     )
     out = _export_dir_with_shards(tmp_path, config={"model_type": "t"}, shards={})
-    assert mutils._prepare_vlm_gguf_export_directory(str(out)) == 0
+    assert mutils._prepare_mlx_gguf_export_directory(str(out)) == 0
 
 
 def test_repair_with_backslash_path_string_returns_processor_unchanged():
@@ -1410,9 +1575,6 @@ def test_repair_with_backslash_path_string_returns_processor_unchanged():
         processor, "C:\\models\\fake", "fake_type"
     )
     assert repaired is processor
-
-
-# --- Group 15: review follow-ups ---
 
 
 def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):
@@ -1444,8 +1606,12 @@ def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):
         save_directory,
         quantization_method="fast_quantized",
         first_conversion=None,
+        token=None,
+        imatrix_file=None,
     ):
         calls["first_conversion"] = first_conversion
+        calls["imatrix_file"] = imatrix_file
+        calls["forwarded_token"] = token
         Path(save_directory).mkdir(parents=True, exist_ok=True)
         (Path(save_directory) / "model.F16.gguf").write_bytes(b"GGUF")
 
@@ -1460,7 +1626,9 @@ def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):
         "hf_secret_token",
     )
     assert calls["token"] == "hf_secret_token"
+    assert calls["forwarded_token"] == "hf_secret_token"
     assert calls["first_conversion"] is None
+    assert calls["imatrix_file"] is None
     assert calls["uploads"] == ["model.F16.gguf"]
 
 

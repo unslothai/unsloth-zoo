@@ -37,6 +37,7 @@ import mlx.core as mx
 import numpy as np
 import pkgutil
 import re
+import sys
 import textwrap
 from typing import Any, Callable, Iterable, Mapping
 
@@ -1397,18 +1398,19 @@ def get_backend_compile_qualifications(model_or_arch) -> tuple[MLXVLMCompileQual
     return tuple(qualifications)
 
 
-def _module_is_gated_delta(module) -> bool:
-    """Match gated-delta (GDN linear attention) layers structurally.
+def _defined_beside_gated_delta_update(module) -> bool:
+    """Mamba/SSM mixers carry the same gate-decay parameters but never bind it."""
+    return hasattr(sys.modules.get(type(module).__module__), "gated_delta_update")
 
-    Class-name + parameter check: GatedDeltaNet / Qwen3NextGatedDeltaNet /
-    Qwen3_5GatedDeltaNet / KimiDeltaAttention all contain "delta" and carry
-    the A_log + dt_bias pair. Mamba/SSM mixers carry the same parameters but
-    never the name, so they are deliberately not matched here.
-    """
+
+def _module_is_gated_delta(module) -> bool:
+    """Match gated-delta (GDN linear attention) layers structurally: most name
+    themselves after the recurrence, but GLM-5.x calls it `Glm5NextLinearAttention`."""
+    if not (hasattr(module, "A_log") and hasattr(module, "dt_bias")):
+        return False
     return (
         "delta" in type(module).__name__.lower()
-        and hasattr(module, "A_log")
-        and hasattr(module, "dt_bias")
+        or _defined_beside_gated_delta_update(module)
     )
 
 
@@ -1419,6 +1421,16 @@ def model_has_gated_delta_layers(model) -> bool:
     except Exception:
         return False
     return any(_module_is_gated_delta(module) for _, module in modules)
+
+
+def model_has_qwen35_attention_layers(model) -> bool:
+    """qwen4_exp reuses mlx-vlm's Qwen3.5 attention class under its own model_type."""
+    try:
+        modules = model.named_modules()
+    except Exception:
+        return False
+    return any(any(b.__name__ == "Qwen3_5Attention" for b in type(m).__mro__)
+               for _, m in modules)
 
 
 def _model_repo_training_compile_block_reason(model_or_arch) -> str | None:
@@ -1928,7 +1940,6 @@ def _install_safe_fused_sdpa_mask_patches():
 
         out = original_fast_sdpa(q, k, v, scale=scale, mask=mask, **kwargs)
         if row_all_masked is not None:
-            # Restore zero-output for fully masked query rows.
             out = mx.where(
                 mx.expand_dims(row_all_masked, axis=-1),
                 mx.zeros_like(out),
@@ -2173,6 +2184,8 @@ def _explicit_position_embedding_adapter(original, replacement):
             return original(self, input_ids, pixel_values, **kwargs)
         return replacement(self, input_ids, pixel_values, **kwargs)
 
+    patched._unsloth_static_vlm_metadata = ("image_grid_thw", "video_grid_thw")
+    patched._unsloth_static_metadata_with_positions = True
     return patched
 
 
@@ -2858,6 +2871,10 @@ def _qwen3_batch_embedding_adapter(
                 )
         return features
 
+    patched._unsloth_static_vlm_metadata = (
+        ("image_grid_thw", "video_grid_thw") if replacement is not None else ()
+    )
+    patched._unsloth_static_metadata_with_positions = True
     patched._unsloth_qwen3_batch_visual_state = True
     patched._unsloth_qwen3_replaces_visual_inference = bool(
         replacement is not None
@@ -4164,6 +4181,9 @@ def _install_paddleocr_vl_compile_patches():
     _patch_method(vision_module.Attention, "__call__", patched_paddle_attention)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_paddle_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "__call__", patched_paddle_vision_call)
+    patched_paddle_get_input_embeddings._unsloth_static_vlm_metadata = (
+        "image_grid_thw", "video_grid_thw",
+    )
     _patch_method(module.Model, "get_input_embeddings", patched_paddle_get_input_embeddings)
     _PATCHED_ARCHES.add("paddleocr_vl")
 
@@ -4353,6 +4373,9 @@ def _install_llama_pixtral_mistral_compile_patches():
         llama4_module = None
 
     def patched_single_image_prepare_inputs(self, image_features, inputs_embeds, input_ids):
+        count = getattr(self, "_unsloth_legacy_image_token_count", None)
+        if count is not None and image_features.size // image_features.shape[-1] != count * input_ids.shape[0]:
+            raise ValueError("Unsloth MLX: legacy image feature count changed after token expansion.")
         return _merge_special_token_features_only(
             self.config.image_token_index,
             None,
@@ -5066,7 +5089,7 @@ def _install_deepseek_ocr_compile_patches():
             seq_features = []
             patch_idx = 0
 
-            for image_idx, crop_shape in enumerate(images_spatial_crop or ()):
+            for image_idx, crop_shape in enumerate(() if images_spatial_crop is None else images_spatial_crop):
                 width_crop_num, height_crop_num = (int(crop_shape[0]), int(crop_shape[1]))
                 has_crops = width_crop_num > 1 or height_crop_num > 1
                 num_patches = width_crop_num * height_crop_num if has_crops else 0
@@ -5179,6 +5202,7 @@ def _install_deepseek_ocr_compile_patches():
 
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
+        patched_deepseekocr_get_input_embeddings._unsloth_static_vlm_metadata = ("images_spatial_crop",)
         _patch_method(
             deepseekocr_module.Model,
             "get_input_embeddings",
@@ -5288,6 +5312,7 @@ def _install_deepseek_ocr_compile_patches():
 
         return InputEmbeddingsFeatures2(inputs_embeds=input_embeds)
 
+    patched_deepseekocr2_get_input_embeddings._unsloth_static_vlm_metadata = ("images_spatial_crop",)
     _patch_method(
         deepseekocr2_module.Model,
         "get_input_embeddings",
@@ -5530,6 +5555,7 @@ def _install_negative_image_placeholder_patches():
 
         return txt_embeds
 
+    patched_phi3_get_input_embeddings._unsloth_static_vlm_metadata = ("image_sizes",)
     _patch_method(phi3_module.Model, "get_input_embeddings", patched_phi3_get_input_embeddings)
     _patch_method(phi3_vision_module.VisionModel, "__call__", patched_phi3_vision_call)
     _PATCHED_ARCHES.add("phi3_v")
@@ -5677,6 +5703,7 @@ def _install_phi4_multimodal_patches():
             )
             return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
+        patched_phi4_siglip_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
         _patch_method(
             phi4_siglip_module.Model,
             "get_input_embeddings",
@@ -5792,6 +5819,7 @@ def _install_phi4_multimodal_patches():
         return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
     _patch_method(phi4mm_vision_module.VisionTower, "__call__", patched_phi4mm_vision_tower_call)
+    patched_phi4mm_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
     _patch_method(phi4mm_module.Model, "get_input_embeddings", patched_phi4mm_get_input_embeddings)
     _PATCHED_ARCHES.add("phi4mm")
 

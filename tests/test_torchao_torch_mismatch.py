@@ -60,8 +60,6 @@ REAL = ("cannot import name 'ScalingType' from 'torch.nn.functional' "
         "(/usr/local/lib/python3.12/dist-packages/torch/nn/functional.py)")
 
 
-# ---- what it must catch ---------------------------------------------------
-
 def test_the_error_seen_in_the_wild():
     assert looks_like(REAL) is True
 
@@ -72,8 +70,6 @@ def test_the_other_torchao_symbols(sym):
     assert looks_like(
         f"cannot import name '{sym}' from 'torch.nn.functional'") is True
 
-
-# ---- what it must NOT catch ----------------------------------------------
 
 def test_the_unpack_move_is_left_alone():
     """It sits beside the Unpack branch; swallowing that hides a different bug."""
@@ -95,8 +91,6 @@ def test_an_unrelated_missing_name_from_torch():
         "cannot import name 'some_new_api' from 'torch.nn.functional'") is False
 
 
-# ---- the guard must never be what raises ---------------------------------
-
 @pytest.mark.parametrize("bad", [None, 123, object()])
 def test_non_string_input_does_not_raise(bad):
     assert looks_like(bad) in (True, False)
@@ -117,8 +111,6 @@ def test_the_message_survives_missing_metadata(monkeypatch):
     m = message_of(REAL)
     assert "unknown" in m
 
-
-# ---- the call site --------------------------------------------------------
 
 def test_the_branch_runs_before_the_generic_reraise():
     """Placed after `raise Exception(e)` it would never be reached."""

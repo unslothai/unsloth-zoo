@@ -203,7 +203,6 @@ def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
 
     assert len(plan_for(0.5)) == 3
     assert len(plan_for(1.5)) == 8
-    # Whole counts are unchanged.
     assert len(plan_for(2)) == 10
 
 
@@ -211,7 +210,7 @@ def test_ordered_text_fractional_epochs_match_transformers_step_budget():
     # Golden values measured by running a real transformers.Trainer on the same
     # shapes: HF quantizes a fractional num_train_epochs to whole accumulation
     # windows and re-iterates the dataloader, so 0.5 epochs of 5 rows at batch 2
-    # and accum 2 is one update over 4 rows, not a proportional 3 rows.
+    # and accum 2 is one update over 4 rows, not a proportional 3.
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
@@ -395,7 +394,6 @@ def _digest_vlm_batches(batches):
                         tuple(_tuplify(item) for item in x)
                         if isinstance(x, list) else x
                     )
-                # dtype-native values: float drift must fail the oracle.
                 entry.append((
                     key, str(value.dtype), tuple(value.shape),
                     _tuplify(value.tolist()),
@@ -489,7 +487,7 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
 
     def spy_all_sum(value, **kwargs):
         collective_calls.append(value.tolist())
-        return value  # identity: single fake rank stands in for the sum
+        return value
 
     monkeypatch.setattr(mx_core.distributed, "all_sum", spy_all_sum)
     try:
@@ -502,7 +500,6 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
     assert processor.calls == calls_before_check
 
 
-    # The fake-rank collective test covers no-materialization more strictly.
 
 
 def test_vlm_family_invariant_against_live_mx_compile_traces():
@@ -556,8 +553,8 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
         if kind == "merge":
             assert same_key and fam_left == fam_right and plannable(fam_left)
         elif kind == "split":
-            # Distinct values stay ELIGIBLE while splitting: making common
-            # constants unplannable would regress ordinary batches to eager.
+            # Both stay plannable while splitting: making common constants
+            # unplannable would regress ordinary batches to eager.
             assert not same_key and fam_left != fam_right
             assert plannable(fam_left) and plannable(fam_right)
         else:
@@ -590,7 +587,7 @@ def test_per_row_audio_spans_stay_plannable():
     )
 
     cases = [
-        ([np.zeros((0, 2), np.int32)] * 2, [[], []]),         # a text-only batch
+        ([np.zeros((0, 2), np.int32)] * 2, [[], []]),
         ([np.array([[1, 3]]), np.array([[1, 3], [4, 7]])],
          [[[1, 3]], [[1, 3], [4, 7]]]),
     ]
@@ -599,7 +596,7 @@ def test_per_row_audio_spans_stay_plannable():
             "input_ids": np.zeros((2, 8), dtype=np.int32),
             "audio_bounds": spans,
         })
-        # Both halves matter here: the generic conversion also yields something
+        # Both halves matter: the generic conversion also yields something
         # plannable, by stacking equal rows and keeping only the first of ragged
         # ones, so plannability alone would not show the rows survived.
         assert [np.asarray(row).tolist() for row in batch["audio_bounds"]] == expected
@@ -650,7 +647,6 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     cached_batch = plan.materialize(0)
     assert processor.calls == 1 and plan._mru is not None
     descriptors = plan.ensure_descriptors()
-    # The pre-populated cache is invalidated, not consulted.
     assert processor.calls == 1 + len(plan) == 4
     assert plan._mru is None
     assert plan.ensure_descriptors() is descriptors
@@ -665,7 +661,6 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
         assert descriptors[index] == _vlm_batch_family(
             rebuilt, symbolic_axes=axes,
         )
-    # Widths merge symbolically; the structural sidecar still splits.
     assert len(set(descriptors)) == 2
     assert plan.batch_family(1) == descriptors[1]
     assert len(descriptors) == 3
@@ -715,7 +710,6 @@ def test_vlm_plan_survey_does_not_consume_preprocessing_rng():
     unsurveyed, unsurveyed_tail = _stream(False)
     surveyed, surveyed_tail = _stream(True)
     assert surveyed == unsurveyed
-    # The survey also leaves no offset behind for anything drawing afterwards.
     assert surveyed_tail == unsurveyed_tail
 
 
@@ -839,7 +833,6 @@ def test_vlm_plan_does_not_pin_one_file_descriptor_per_row(tmp_path):
         f"row must not keep its image file open until materialization"
     )
 
-    # Releasing the descriptor has to leave a row that still materializes.
     batch = plan[0]
     assert batch["input_ids"].shape[0] == 2
 
@@ -894,7 +887,7 @@ def test_vlm_family_drift_check_fails_hard_with_location():
     reordered = dict(reversed(list(batch.items())))
     with pytest.raises(RuntimeError, match="drifted"):
         plan.check_family_drift(1, reordered)
-    # Families genuinely differ, so a checker pinned wrong cannot pass.
+    # Families genuinely differ, so the cross-index check cannot pass vacuously.
     assert plan.batch_family(0) != plan.batch_family(1)
     with pytest.raises(RuntimeError, match="batch 0 drifted"):
         plan.check_family_drift(0, batch)
@@ -988,8 +981,6 @@ def test_vlm_shape_planning_follows_the_resolved_override_mode():
         mode="best_effort", arch_overrides=((arch, "strict"),),
     )
     decision = resolve_training_compile(arch, policy=strict_override)
-    # Qualified arch: the decision is enabled, so planning runs past the
-    # should_raise and unqualified guards and reaches the failure branches.
     assert decision.enabled and decision.policy_mode == "strict"
     assert not decision.fallback_allowed and not decision.should_raise
     with pytest.raises(RuntimeError, match="not stable enough"):
@@ -1058,7 +1049,6 @@ def test_vlm_admission_covers_only_the_batches_the_loop_visits():
         _shape_plan, report, allowed, _frontier = _plan(poison_call)
         assert allowed and report.reason != "vlm_unplannable_family"
 
-    # Still enforced for a batch the loop does reach.
     with pytest.raises(RuntimeError, match="cannot plan VLM batch 3"):
         _plan(4)
 
@@ -1132,7 +1122,6 @@ def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
         dataset_order="sequential",
     )
 
-    # The processor is never handed a cap, so nothing is truncated.
     assert set(processor.seen_max_length) == {"<absent>"}
     assert len(batches) == 2
     assert all(batch["input_ids"].shape == (2, 12) for batch in batches)
@@ -1147,7 +1136,6 @@ def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
     )
     assert plan.max_seq_length is None
 
-    # A finite cap still coerces to int and still truncates.
     capped_processor = _ProcessorNativeLimitProcessor(native_width=12)
     capped = create_vlm_batches(
         dataset=[{"text": str(i)} for i in range(4)],
@@ -1431,7 +1419,6 @@ def test_vlm_eval_splits_each_draw_their_own_augmentation_stretch(
         processor_log=calls,
     )
 
-    # Evaluation never moves the training stream, whatever the split count.
     assert len(without_eval) == 4
     assert with_splits == without_eval
 
@@ -1443,7 +1430,6 @@ def test_vlm_eval_splits_each_draw_their_own_augmentation_stretch(
     assert sorted(per_split) == [1, 2, 3]
     assert [len(draws) for draws in per_split.values()] == [2, 2, 2]
 
-    # No split may replay a draw another split already consumed.
     eval_draws = [draw for draws in per_split.values() for draw in draws]
     assert len(set(eval_draws)) == len(eval_draws)
 
@@ -1697,12 +1683,10 @@ def test_vlm_plan_is_excluded_from_eager_fallback_refetch():
 def test_vlm_fallback_refetch_would_shift_the_augmentation_stream():
     """Why the exclusion exists: the refetch is a second processor call whose
     draws offset every later batch, and the reuse it replaces is loss-safe."""
-    # Reference: an eager-from-start run, which never surveys or materializes.
     plan = _make_plan()
     eager = [_pixels(plan[i]) for i in range(len(plan))]
     eager_tail = int(np.random.randint(0, 1 << 30))
 
-    # What the removed refetch did: materialize, then re-index the same visit.
     plan = _install_and_get()
     calls_before = plan._processor.calls
     plan.materialize(0, phase="full_step")
@@ -1717,7 +1701,6 @@ def test_vlm_fallback_refetch_would_shift_the_augmentation_stream():
     )
     assert refetch_tail != eager_tail
 
-    # What the fix does: reuse the materialized batch, drawing nothing extra.
     plan = _install_and_get()
     calls_before = plan._processor.calls
     reused = [_pixels(plan.materialize(0, phase="full_step"))]
@@ -1862,7 +1845,6 @@ def test_vlm_exact_plan_compiles_without_a_pad_token():
             for index, width in enumerate(plan.planned_event_widths())
         )
         assert endpoints == raw == (32,) * len(plan)
-        # The planned fetch the training loop makes must not need a pad id.
         batch = plan.materialize(0, phase=phase_for_microstep(
             FULL_STEP_SCOPE, 1, 0,
         ))
@@ -1954,8 +1936,6 @@ def test_vlm_planned_width_steps_above_the_surveyed_maximum_on_collision():
     assert surveyed_max == 32
     assert planned == (33,) * len(plan)
     assert all(width > surveyed_max for width in planned)
-    # One shared endpoint, and every batch reaches it: above its own prepared
-    # width and clear of every extent the pipeline does not pad.
     assert [
         int(
             plan.materialize(index, target_width=planned[index])
@@ -2027,7 +2007,7 @@ def test_vlm_drift_error_names_the_survey_for_privately_owned_draw_state():
         max_seq_length=8,
     )
     plan.ensure_descriptors()
-    assert processor.calls == 4      # one private advance per scheduled batch
+    assert processor.calls == 4
 
     rebuilt = plan._build_batch(0)
     # Training resumes the private stream past the survey, so batch 0 rebuilds
@@ -2100,11 +2080,9 @@ def test_vlm_plan_releases_the_previous_batch_before_building_the_next(
         batch_data = plan.materialize(index)
     del batch_data
 
-    # No build ever started while a previously built batch was still held.
     assert live_at_build_start == [0, 0, 0, 0]
     assert alive["peak"] == 1
 
-    # Releasing the cache early must not cost a rebuild for a repeated fetch.
     calls_before = processor.calls
     again = plan.materialize(len(plan) - 1)
     assert processor.calls == calls_before
@@ -2201,7 +2179,6 @@ def test_vlm_plan_rechecks_media_between_setup_and_the_batch_that_uses_it():
         num_batches=2,
         dataset_order="sequential",
     )
-    # Clean at setup: nothing aliases, so every batch builds.
     assert plan.materialize(0) is not None
 
     dataset.arrays[2][:] = 99
@@ -2230,7 +2207,7 @@ def test_vlm_plan_keeps_referencing_media_payloads_it_does_not_own():
         config={"image_size": 16, "image_token_id": 200},
         batch_size=1,
         max_seq_length=8,
-        num_batches=9,          # three full revisits of every row
+        num_batches=9,
         dataset_order="sequential",
     )
 
@@ -2388,8 +2365,6 @@ def test_vlm_plan_reports_an_in_place_augmentation_over_a_reused_buffer():
             num_batches=3,
             dataset_order="sequential",
         )
-    # Every read really did hand back a permutation of the previous one, so
-    # the sum and the xor were identical at every pin.
     sums = {int(np.asarray(image).sum()) for image in dataset.returned}
     assert len(dataset.returned) == 6 and len(sums) == 1
 
@@ -2427,7 +2402,6 @@ def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
     assert isinstance(restored["images"], tuple)
     assert int(np.asarray(restored["images"][0]).reshape(-1)[0]) == 6
 
-    # A namedtuple keeps its type rather than collapsing to a plain tuple.
     holder = collections.namedtuple("holder", "left right")
     row = {"media": holder(left=Image.open(paths[0]), right="caption")}
     out = _release_vlm_row_image_handles(row)
@@ -2436,7 +2410,6 @@ def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
     back = _restore_vlm_row_image_handles(out)
     assert int(np.asarray(back["media"].left).reshape(-1)[0]) == 1
 
-    # A tuple holding nothing releasable keeps its exact identity.
     plain = {"images": ("a", "b")}
     assert _release_vlm_row_image_handles(plain)["images"] is plain["images"]
 
@@ -2480,8 +2453,6 @@ def test_vlm_plan_reports_a_dataset_that_reuses_one_temporary_image_path(tmp_pat
             dataset_order="sequential",
         )
 
-    # Six distinct samples really did go through the one file, and the file now
-    # holds only the last of them -- which is what every row would have read.
     assert dataset.written == [1, 2, 3, 4, 5, 6]
     assert int(np.asarray(Image.open(str(shared))).reshape(-1)[0]) == 6
 

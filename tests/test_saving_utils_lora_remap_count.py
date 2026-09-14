@@ -340,7 +340,6 @@ def test_remap_short_suffix_does_not_cross_namespaces():
     out = _infer_prefix_and_remap(
         _lw(["model.vision_tower.embed_tokens", "model.language_model.layers.0.self_attn.q_proj"]),
         ["language_model.model.layers.0.self_attn.q_proj.weight"])  # no vision embed tensor
-    # The vision embed has no backing tensor; it must stay unmapped, not be pulled onto the language tensor.
     assert out.get("language_model.model.layers.0.self_attn.q_proj") == \
         "model.language_model.layers.0.self_attn.q_proj"
     assert "model.vision_tower.embed_tokens" not in out or \
@@ -422,7 +421,7 @@ class _FakeLoRALinear(nn.Module):
         self.lora_A = nn.ModuleDict({"default": nn.Linear(n, r, bias=False)})
         self.lora_B = nn.ModuleDict({"default": nn.Linear(r, n, bias=False)})
         self.scaling = {"default": alpha / r}
-        self.active_adapter = "default"  # singular only
+        self.active_adapter = "default"
 
 class _Inner(nn.Module):
     def __init__(self, n=3):
@@ -457,6 +456,5 @@ def test_non_lora_scaled_module_not_misclassified():
     model = _PeftLike(inner)
 
     lora_weights, _ = create_lora_statistics(model, merge_into_original=True, return_state_dict=False)
-    # Real LoRA layers captured; non-LoRA scaled module not (its weight is not dropped).
     assert sum(1 for v in lora_weights.values() if v.lora_A is not None) == 2
     assert not any(k.endswith("attn_like") for k in lora_weights)

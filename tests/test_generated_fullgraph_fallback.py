@@ -45,9 +45,8 @@ from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
 
 ZOO = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 COMPILER = ZOO / "compiler.py"
-# Every module that hands torch a fullgraph region, not just the compiler: the
-# first pass scanned compiler.py alone and passed while GRPO's own
-# `grpo_compute_loss_slow` and `accumulate_chunk` stayed bare, and so fatal.
+# Not just the compiler: the first pass scanned compiler.py alone and passed while
+# GRPO's own `grpo_compute_loss_slow` and `accumulate_chunk` stayed bare, and so fatal.
 FULLGRAPH_SITES = (COMPILER, ZOO / "rl_replacements.py",
                    ZOO / "temporary_patches" / "common.py")
 
@@ -98,7 +97,6 @@ def _run_with_compile_disabled(body):
     _run_in_fresh_interpreter(body, "1")
 
 
-# ---- what the compiler emits ---------------------------------------------
 
 def test_no_emitter_writes_a_bare_fullgraph_compile():
     """Every emitted `fullgraph` decorator has to carry the fallback.
@@ -141,9 +139,8 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
     # Without fullgraph Dynamo already falls back by itself, so leave it alone.
     assert 'if not kwargs.get("fullgraph"):' in body
 
-    # In process, unlike the alias below: `_maybe_compile` reads both switches
-    # in its own body on every call, so pinning the module attributes is exact
-    # and the assertion then holds in every configuration the suite runs under.
+    # `_maybe_compile` reads both switches on every call, so pinning the module
+    # attributes is exact.
     monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", False)
     monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE_PARTIAL", False)
 
@@ -152,14 +149,11 @@ def test_maybe_compile_routes_fullgraph_through_the_fallback(monkeypatch):
     wrapped = common._maybe_compile(fullgraph = True, dynamic = True)(f)
     assert hasattr(wrapped, "_unsloth_fallback_state")
 
-    # The other direction needs a second observable. `_unsloth_fallback_state`
-    # is stamped on only under fullgraph (utils.py returns the plain compiled
-    # object before it), so its absence cannot tell a non-fullgraph compile that
-    # wrongly went through the helper from one that did not. Record the call
-    # instead: `_maybe_compile` resolves the name off `utils` at call time, so
-    # rebinding the attribute is enough. Verified by replacing the guard's body
-    # with `pass`, which the `hasattr` form did not notice in any switch
-    # position and this does.
+    # `_unsloth_fallback_state` is stamped on only under fullgraph, so its absence
+    # cannot single out a non-fullgraph compile that went through the helper anyway.
+    # Record the call instead: `_maybe_compile` imports the name off `utils` at call
+    # time, so rebinding the attribute is enough. Verified by replacing the guard's
+    # body with `pass`, which the `hasattr` form did not notice and this does.
     import unsloth_zoo.temporary_patches.utils as U
     calls = []
 
@@ -228,7 +222,6 @@ def test_the_cross_entropy_template_carries_its_own_import():
     assert "import torch_compile_with_fallback" in block
 
 
-# ---- what the helper does -------------------------------------------------
 
 def test_fullgraph_false_is_returned_untouched():
     """Dynamo already falls back on its own there, so a wrapper could never
@@ -248,10 +241,8 @@ def test_fullgraph_true_is_wrapped():
     assert hasattr(wrapped, "_unsloth_fallback_state")
 
 
-# aot_eager, not inductor: inductor shells out to a host compiler, so this
-# raised `Compiler: cl is not found` on the Windows runner, a statement about
-# MSVC and not about the wrapper. Any backend answers what is under test, that
-# the wrapper returns what the eager function returns.
+# aot_eager, not inductor: inductor shells out to a host compiler, so this raised
+# `Compiler: cl is not found` on the Windows runner, a statement about MSVC.
 _BACKEND = "aot_eager"
 
 
@@ -297,7 +288,6 @@ def test_the_eager_path_is_the_original_function():
     assert wrapped.__wrapped__ is some_forward
 
 
-# --- what the seventh review round found ------------------------------------
 
 def _bare_fullgraph_alias_sites():
     """Every `@torch_compile(... fullgraph = True)` in the package.
@@ -334,8 +324,8 @@ def test_the_alias_sites_exist_and_are_covered_by_the_alias_itself():
     assert "torch_compile_with_fallback" in common
     # By line, not by substring: `_torch_compile = ...` is a substring of
     # `_raw_torch_compile = ...`, which deliberately DOES partial torch.compile
-    # (compile_with_eager_fallback applies the wrapper itself, and wrapping a
-    # wrapper leaves the inner one swallowing the exhaustion).
+    # (compile_with_eager_fallback applies the wrapper itself, and wrapping a wrapper
+    # leaves the inner one swallowing the exhaustion).
     lines = common.split("\n")
     for name in ("torch_compile", "_torch_compile"):
         starts = [i for i, ln in enumerate(lines)

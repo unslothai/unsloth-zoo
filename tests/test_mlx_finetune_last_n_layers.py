@@ -57,7 +57,6 @@ def test_get_peft_model_passes_finetune_last_n_layers_through(monkeypatch):
     """
     import unsloth_zoo.mlx.loader as loader_mod
 
-    # Build a minimal text-only fake model with .model.layers of len=8.
     class FakeLayer: pass
     class FakeInner:
         layers = [FakeLayer() for _ in range(8)]
@@ -72,14 +71,11 @@ def test_get_peft_model_passes_finetune_last_n_layers_through(monkeypatch):
         def parameters(self): return {}
         def trainable_parameters(self): return {}
 
-    # Capture num_layers values seen by linear_to_lora_layers.
     captured = {"calls": []}
     def fake_linear_to_lora_layers(model, num_layers, config):
         captured["calls"].append(num_layers)
         return 1
 
-    # Stub out the helpers get_peft_model uses internally so the test
-    # doesn't need to walk a real model tree.
     import unsloth_zoo.mlx.loader as L
     monkeypatch.setattr(L, "_fix_missing_no_grad", lambda m: None)
     monkeypatch.setattr(L, "_resolve_lora_keys", lambda m, t: [

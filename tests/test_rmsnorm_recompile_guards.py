@@ -330,7 +330,6 @@ def test_each_kernel_reports_its_own_fallback_state():
                _gemma3_rms_norm_float32, _gemma3_rms_norm_generic)]
     assert len(set(labels)) == len(labels), f"labels collide: {labels}"
 
-    # One latched, its neighbour not: the dict must show the latched one.
     saved = dict(_gemma4_rms_norm_scaled._unsloth_fallback_state)
     _gemma4_rms_norm_scaled._unsloth_fallback_state["eager"] = True
     try:

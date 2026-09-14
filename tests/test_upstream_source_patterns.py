@@ -52,9 +52,24 @@ def _skip_if_transformers_5x(reason: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# Helpers.
-# ---------------------------------------------------------------------------
+def _zoo_site(symbol: str) -> str:
+    """``unsloth_zoo/compiler.py:LINE (symbol)``, resolved now rather than typed
+    in. The hand-written pins in this file have gone stale twice -- the three
+    cross_entropy finders were still cited at :1508 / :1599 / :1683 long after
+    they moved past :2500 -- and a drift report that names the wrong line sends
+    the next reader to unrelated code."""
+    import pathlib
+
+    import unsloth_zoo.compiler as _compiler
+
+    path = pathlib.Path(_compiler.__file__)
+    for number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if line.startswith(f"{symbol} = "):
+            return f"unsloth_zoo/compiler.py:{number} ({symbol})"
+    return f"unsloth_zoo/compiler.py ({symbol}, definition not found)"
+
 
 def _drift(zoo_site: str, pattern: str, upstream_path: str,
            extra: str = "") -> None:
@@ -109,10 +124,6 @@ def _get_source_of(dotted: str):
             )
     return inspect.getsource(obj)
 
-
-# ===========================================================================
-# unsloth_zoo/compiler.py rewriters
-# ===========================================================================
 
 def test_compiler_gqa_enable_gqa_dropout_pinned_string_self_dropout():
     """``unsloth_zoo/compiler.py:304-307`` pins
@@ -348,7 +359,7 @@ def test_compiler_cross_entropy_lm_head_pattern_present():
             break
     if not found:
         _drift(
-            "unsloth_zoo/compiler.py:1508 (cross_entropy_find_1)",
+            _zoo_site("cross_entropy_find_1"),
             needle,
             "any ForCausalLM among " + ", ".join(candidate_classes),
             "The fused linear cross-entropy rewriter pins this line; "
@@ -393,17 +404,76 @@ def test_compiler_cross_entropy_find_2_loss_function_signature():
         if needle in src:
             return
     _drift(
-        "unsloth_zoo/compiler.py:1599 (cross_entropy_find_2)",
+        _zoo_site("cross_entropy_find_2"),
         "self.loss_function(...)",
         "any ForCausalLM among " + ", ".join(candidate_classes),
     )
 
 
-def test_compiler_cross_entropy_find_3_shift_logits_pattern():
-    """``unsloth_zoo/compiler.py:1683-1700`` (cross_entropy_find_3) pins
-    ``shift_logits = logits[..., :-1, :]`` / ``shift_labels = labels[..., 1:]``
-    in VLM ForConditionalGeneration forwards."""
+# The gemma3 VLM forward as transformers 4.57.6 wrote it, reduced to the block
+# cross_entropy_find_3 matches. Frozen on purpose: upstream moved gemma3 to
+# `self.loss_function` in 5.17, and without a fixture the shift-logits branch
+# would stop being exercised the moment no shipped model used it -- which is
+# exactly when a change to the pattern would go unnoticed.
+_LEGACY_VLM_SHIFT_FORWARD = '''
+def forward(self, input_ids = None, labels = None, **loss_kwargs):
+    outputs = self.model(input_ids = input_ids)
+    logits = outputs.logits
+    loss = None
+    if labels is not None:
+        logits = logits.float()
+        shift_logits = logits[..., :-1, :]
+        shift_labels = labels[..., 1:]
+        if attention_mask is not None:
+            shift_attention_mask = attention_mask[:, -shift_logits.shape[1]:]
+            shift_logits = shift_logits[shift_attention_mask.to(logits.device) != 0].contiguous()
+            shift_labels = shift_labels[shift_attention_mask.to(shift_labels.device) != 0].contiguous()
+        else:
+            shift_logits = shift_logits.contiguous()
+            shift_labels = shift_labels.contiguous()
+        loss_fct = nn.CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+    return loss
+'''
+
+
+def test_compiler_cross_entropy_find_3_still_matches_its_own_shape():
+    """cross_entropy_find_3 pins ``shift_logits = logits[..., :-1, :]`` /
+    ``shift_labels = labels[..., 1:]`` in VLM ForConditionalGeneration forwards.
+
+    Against a frozen fixture, so this fails when the *pattern* breaks rather than
+    when upstream stops using the shape."""
+    apply_fused_lm_head = pytest.importorskip(
+        "unsloth_zoo.compiler"
+    ).apply_fused_lm_head
+    _, applied = apply_fused_lm_head(_LEGACY_VLM_SHIFT_FORWARD)
+    if not applied:
+        _drift(
+            _zoo_site("cross_entropy_find_3"),
+            "shift_logits = logits[..., :-1, :] / shift_labels = labels[..., 1:]",
+            "the frozen transformers 4.57.6 gemma3 VLM forward in this file",
+            "The pattern no longer matches the shape it was written for, so the "
+            "fused cross-entropy rewrite is a no-op for every VLM still using it.",
+        )
+
+
+def test_the_fused_cross_entropy_rewrite_still_reaches_gemma3():
+    """The contract that actually matters: whatever shape upstream's gemma3
+    forward has this week, one of the cross_entropy finders matches it.
+
+    Asserting a literal string instead is what broke here. transformers 5.17
+    replaced gemma3's hand-written shift with ``self.loss_function(...,
+    **lm_kwargs)`` -- a shape cross_entropy_find_2 was written for, except its
+    ``$KWARGS$`` only accepted ``loss_kwargs`` / ``kwargs``. A no-match is a
+    silent no-op (compiler.py returns the forward untouched), so the only symptom
+    was Gemma 3 quietly losing fused linear cross entropy."""
     pytest.importorskip("transformers")
+    apply_fused_lm_head = pytest.importorskip(
+        "unsloth_zoo.compiler"
+    ).apply_fused_lm_head
     try:
         from transformers.models.gemma3.modeling_gemma3 import (
             Gemma3ForConditionalGeneration,
@@ -414,17 +484,23 @@ def test_compiler_cross_entropy_find_3_shift_logits_pattern():
         src = inspect.getsource(Gemma3ForConditionalGeneration.forward)
     except OSError:
         pytest.skip("Gemma3ForConditionalGeneration.forward source unavailable")
-    needles = (
-        "shift_logits = logits[..., :-1, :]",
-        "shift_labels = labels[..., 1:]",
-    )
-    for needle in needles:
-        if needle not in src:
-            _drift(
-                "unsloth_zoo/compiler.py:1683-1700 (cross_entropy_find_3)",
-                needle,
-                "transformers.models.gemma3.modeling_gemma3.Gemma3ForConditionalGeneration.forward",
-            )
+
+    new_source, applied = apply_fused_lm_head(src)
+    if not applied:
+        _drift(
+            _zoo_site("cross_entropy_find_2")
+            + " / "
+            + _zoo_site("cross_entropy_find_3"),
+            "any cross_entropy finder",
+            "transformers.models.gemma3.modeling_gemma3."
+            "Gemma3ForConditionalGeneration.forward",
+            f"transformers {_TX_VERSION} writes the loss in a shape no finder "
+            "matches, and a finder that does not match is a silent no-op: the "
+            "model trains, using the memory the fused path exists to save.",
+        )
+    assert new_source != src, "reported applied but returned the source unchanged"
+    # A rewrite that does not parse is worse than one that does not fire.
+    ast.parse(textwrap.dedent(new_source))
 
 
 _QWEN2_VL_NEEDLE_4X = (
@@ -1165,10 +1241,6 @@ def test_compiler_trainer_inner_training_loop_rename_pinned_string():
     )
 
 
-# ===========================================================================
-# unsloth_zoo/temporary_patches/misc.py rewriters
-# ===========================================================================
-
 def test_misc_merge_quantization_configs_class_name_compare():
     """``unsloth_zoo/temporary_patches/misc.py:133-136`` pins the single-line
     ``if quantization_config.__class__.__name__ !=
@@ -1233,10 +1305,6 @@ def test_misc_mllama_vision_encoder_gradient_checkpointing_probe():
     )
 
 
-# ===========================================================================
-# unsloth_zoo/temporary_patches/gpt_oss.py
-# ===========================================================================
-
 def test_gpt_oss_config_class_source_equality_probe():
     """``unsloth_zoo/temporary_patches/gpt_oss.py:2808-2810`` runs a
     source-equality probe between ``GptOssConfig`` and the bundled
@@ -1265,10 +1333,6 @@ def test_gpt_oss_config_class_source_equality_probe():
             "introduced to fix is ACTIVE on this install.",
         )
 
-
-# ===========================================================================
-# unsloth/import_fixes.py (mirrored for zoo benefit)
-# ===========================================================================
 
 def test_unsloth_import_fixes_enable_input_require_grads_modules_loop():
     """``unsloth/import_fixes.py:609-670``'s
@@ -1337,10 +1401,6 @@ def test_unsloth_import_fixes_make_inputs_require_grads_inner_fn():
                 "may install an API-incompatible hook.",
             )
 
-
-# ===========================================================================
-# Additional source-rewriter pins.
-# ===========================================================================
 
 def test_compiler_no_update_causal_mask_attribute_probe():
     """``unsloth_zoo/compiler.py:3524, 3762`` ``hasattr(source,

@@ -107,7 +107,28 @@ def get_mem_info():
     return free_memory, total_memory
 pass
 
+# Whichever bitsandbytes module we resolved below, if vLLM is installed at all.
+# Defined out here because load_vllm reads it and lives outside that branch.
+_vllm_bnb = None
+
+
+def _set_registered_quant_config(method, config_cls):
+    # A plugin registers the CLASS OBJECT, so a module attribute swap alone
+    # leaves vLLM ignoring UNSLOTH_bnb_4bit_compute_dtype. In-tree re-imports
+    # the attribute per call and registers nothing, hence the `in registry`.
+    try:
+        from vllm.model_executor.layers.quantization import (
+            _CUSTOMIZED_METHOD_TO_QUANT_CONFIG as registry,
+        )
+    except ImportError:
+        return
+    if method in registry: registry[method] = config_cls
+pass
+
 if importlib.util.find_spec("vllm") is not None:
+    # Every `vllm.<...>` below used to be bound as a side effect of the
+    # try-guarded submodule imports, which 0.28 removed, leaving it NameError.
+    import vllm
     try:
         from vllm import __version__ as vllm_version
     except ImportError:
@@ -157,27 +178,48 @@ if importlib.util.find_spec("vllm") is not None:
     def _dequantize_dq(self, quant_states):
         return quant_states
     try:
-        import vllm.model_executor.model_loader.bitsandbytes_loader
-        if hasattr(
-            vllm.model_executor.model_loader.bitsandbytes_loader,
-            "dequantize_dq",
+        # Same two homes as the quantization module: in tree, else the plugin.
+        _bnb_loader = None
+        for _loader_path in (
+            "vllm.model_executor.model_loader.bitsandbytes_loader",
+            "vllm_bnb_plugin.bitsandbytes_loader",
         ):
-            vllm.model_executor.model_loader.bitsandbytes_loader.dequantize_dq = dequantize_dq
-        elif hasattr(
-            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader,
-            "_dequantize_dq",
-        ):
-            vllm.model_executor.model_loader.bitsandbytes_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
+            try:
+                _bnb_loader = importlib.import_module(_loader_path)
+                break
+            except ImportError:
+                continue
+        if _bnb_loader is None:
+            raise ImportError("no bitsandbytes model loader")
+        if hasattr(_bnb_loader, "dequantize_dq"):
+            _bnb_loader.dequantize_dq = dequantize_dq
+        elif hasattr(_bnb_loader.BitsAndBytesModelLoader, "_dequantize_dq"):
+            _bnb_loader.BitsAndBytesModelLoader._dequantize_dq = _dequantize_dq
         pass
     except:
         pass
 
     # Patch apply_bnb_4bit
-    import vllm.model_executor.layers.quantization.bitsandbytes
-    if not hasattr(
-        vllm.model_executor.layers.quantization.bitsandbytes,
-        "apply_bnb_4bit"
+    # vLLM 0.28 (PR #43529) moved bitsandbytes out of tree into vllm-bnb-plugin,
+    # which re-exports the same names, so patch whichever is installed. Hard
+    # importing the in-tree path took out every fast_inference run, not just 4-bit.
+    _vllm_bnb = None
+    for _bnb_path in (
+        "vllm.model_executor.layers.quantization.bitsandbytes",  # vLLM <= 0.27.1
+        "vllm_bnb_plugin.bitsandbytes",                          # vLLM >= 0.28
     ):
+        try:
+            _vllm_bnb = importlib.import_module(_bnb_path)
+            break
+        except ImportError:
+            continue
+    if _vllm_bnb is None:
+        # No bnb to wrap. Only 4-bit needs it, and load_vllm raises there with
+        # the install instructions, so leave the rest of this module usable.
+        def _apply_4bit_weight(self, layer, x, bias = None):
+            raise RuntimeError("Unsloth: `pip install vllm-bnb-plugin` for load_in_4bit.")
+        pass
+    elif not hasattr(_vllm_bnb, "apply_bnb_4bit"):
         # Make the compute dtype dynamic instead of forcing torch.bfloat16
         def _apply_4bit_weight(
             self,
@@ -232,7 +274,7 @@ if importlib.util.find_spec("vllm") is not None:
         pass
     else:
         # Newer vLLM versions have _apply_bnb_4bit
-        apply_bnb_4bit = vllm.model_executor.layers.quantization.bitsandbytes.apply_bnb_4bit
+        apply_bnb_4bit = _vllm_bnb.apply_bnb_4bit
         def _apply_4bit_weight(
             self,
             layer: torch.nn.Module,
@@ -274,9 +316,9 @@ if importlib.util.find_spec("vllm") is not None:
 
     def patch_vllm_bitsandbytes():
         # All Unsloth Zoo code licensed under LGPLv3
-        import vllm.model_executor.layers.quantization.bitsandbytes
-        vllm.model_executor.layers.quantization.bitsandbytes.is_layer_skipped_bnb = is_layer_skipped_bnb
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
+        if _vllm_bnb is None: return
+        _vllm_bnb.is_layer_skipped_bnb = is_layer_skipped_bnb
+        _vllm_bnb.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
 
         # Disable all not supported messages
         try:
@@ -291,9 +333,12 @@ if importlib.util.find_spec("vllm") is not None:
         del vllm_config_logger
     pass
 
-    class BitsAndBytesConfig(
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
-    ):
+    # `object` keeps the class definition legal with no bnb; it is never installed then.
+    _BitsAndBytesConfigBase = (
+        _vllm_bnb.BitsAndBytesConfig if _vllm_bnb is not None else object
+    )
+
+    class BitsAndBytesConfig(_BitsAndBytesConfigBase):
         # All Unsloth Zoo code licensed under LGPLv3
         def __init__(self, *args, **kwargs):
             dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
@@ -306,21 +351,25 @@ if importlib.util.find_spec("vllm") is not None:
     def patch_vllm_compute_dtype(dtype = torch.float16):
         # All Unsloth Zoo code licensed under LGPLv3
         # vLLM uses the config file's compute_dtype; override it dynamically.
-        old_config = vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig
+        if _vllm_bnb is None: return None
+        old_config = _vllm_bnb.BitsAndBytesConfig
 
         dtype = str(dtype)
         if dtype.startswith("torch."): dtype = dtype[len("torch."):]
         os.environ["UNSLOTH_bnb_4bit_compute_dtype"] = dtype
 
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig = BitsAndBytesConfig
+        _vllm_bnb.BitsAndBytesConfig = BitsAndBytesConfig
+        _set_registered_quant_config("bitsandbytes", BitsAndBytesConfig)
         return old_config
     pass
 
     def unpatch_vllm_compute_dtype(old_config):
         # All Unsloth Zoo code licensed under LGPLv3
-        import vllm.model_executor.layers.quantization.bitsandbytes
-        vllm.model_executor.layers.quantization.bitsandbytes.BitsAndBytesConfig = old_config
-        del os.environ["UNSLOTH_bnb_4bit_compute_dtype"]
+        if _vllm_bnb is None: return
+        _vllm_bnb.BitsAndBytesConfig = old_config
+        _set_registered_quant_config("bitsandbytes", old_config)
+        # pop, not del: a finally can run after an exit that already restored.
+        os.environ.pop("UNSLOTH_bnb_4bit_compute_dtype", None)
     pass
 
     def patch_vllm_lora_tokenizer():
@@ -1280,6 +1329,20 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 pass
 
 
+# lm_head is tied to the embeddings, so it may legitimately be absent from either side
+TIED_LM_HEAD_KEYS = frozenset((
+    "lm_head.weight",
+    "model.lm_head.weight",
+    "model.language_model.lm_head.weight",
+    "model.text_model.lm_head.weight",
+))
+TIED_EMBED_KEYS = (
+    "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "model.text_model.embed_tokens.weight",
+)
+
+
 @torch.inference_mode
 def assert_same_state_dict(old_state_dict, new_state_dict):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1295,7 +1358,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
         return value.contiguous()
 
     difference = new_state_dict.keys() ^ old_state_dict.keys()
-    difference -= set(("model.lm_head.weight","model.language_model.lm_head.weight", "lm_head.weight"))
+    difference -= TIED_LM_HEAD_KEYS
     if len(difference) != 0:
         missing_from_hf = new_state_dict.keys() - old_state_dict.keys()
         missing_from_vllm = old_state_dict.keys() - new_state_dict.keys()
@@ -1320,10 +1383,10 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             else:
                 torch.testing.assert_close(old_val, new_val, check_stride = False)
         except Exception as error:
-            if key == "lm_head.weight":
-                # Try tied embeddings fallback
-                key1 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in old_state_dict), None)
-                key2 = next((k for k in (key, "model.embed_tokens.weight", "model.language_model.embed_tokens.weight") if k in new_state_dict), None)
+            if key in TIED_LM_HEAD_KEYS:
+                # excused above: compare against the embedding it is tied to
+                key1 = next((k for k in (key,) + TIED_EMBED_KEYS if k in old_state_dict), None)
+                key2 = next((k for k in (key,) + TIED_EMBED_KEYS if k in new_state_dict), None)
 
                 if key1 is not None and key2 is not None:
                     try:
@@ -1341,6 +1404,24 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             else:
                 failures[key] = error
         pass
+
+    # The loop above walks old_state_dict, so a new-only tied head met no comparison.
+    for key in sorted(TIED_LM_HEAD_KEYS & (new_state_dict.keys() - old_state_dict.keys())):
+        ref = next((k for k in (key.replace("lm_head", "embed_tokens"),) + TIED_EMBED_KEYS
+                    if k in old_state_dict), None)
+        if ref is None: continue
+        old_val = _normalize_state_dict_tensor(old_state_dict[ref])
+        new_val = _normalize_state_dict_tensor(new_state_dict[key])
+        if old_val is None or new_val is None: continue
+        try:
+            torch.testing.assert_close(
+                old_val.to(torch.float32), new_val.to(torch.float32),
+                check_stride = False, atol = 1e-4, rtol = 1e-3,
+            )
+        except Exception as error:
+            failures[key] = error
+    pass
+
     if len(failures) > 0:
         error_message = "\n".join([f"[{key}]\n{str(error)}" for key, error in failures.items()])
         raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(failures)}: {error_message}")
@@ -2031,6 +2112,178 @@ def _install_vllm_decompose_size_nodes_fix():
     return True
 
 
+# Where `-L` reaches on Linux. `/usr/local/cuda/compat` is deliberately NOT
+# among them upstream, which is what makes the check below necessary.
+_FLASHINFER_LINK_DIRS = (
+    "/usr/local/cuda/lib64",
+    "/usr/local/cuda/lib64/stubs",
+)
+
+# Windows links `cuda.lib` from the toolkit, not a driver stub, and searches
+# LIB rather than LIBRARY_PATH.
+_FLASHINFER_LINK_DIRS_WINDOWS_SUBDIRS = (
+    os.path.join("lib", "x64"),
+    os.path.join("lib", "Win32"),
+)
+
+# The only two `-L` dirs FlashInfer emits, verbatim from its generated
+# build.ninja: `-L$cuda_home/lib64 -L$cuda_home/lib64/stubs`.
+_CUDA_ROOT_LIB_SUBDIRS = (
+    "lib64",
+    os.path.join("lib64", "stubs"),
+)
+
+
+def _multiarch_linker_dirs() -> "Tuple[str, ...]":
+    """`<base>/<triplet>` for this machine, e.g. /usr/lib/x86_64-linux-gnu.
+
+    On Debian/Ubuntu the NVIDIA driver's unversioned `libcuda.so` lives in the
+    multiarch directory and nowhere else, and ld's built-in SEARCH_DIRs list
+    it, so `c++ ... -lcuda` links there with no -L at all. The fallback below
+    is what runs when ld cannot be consulted -- no binutils in the image, or an
+    `ld` that is really lld, which has no built-in linker script and so prints
+    no SEARCH_DIR at all -- and omitting the one directory that actually holds
+    the stub would answer False on a machine that links fine. That is the false
+    negative this whole check exists to avoid.
+
+    Both the interpreter's own MULTIARCH triplet (set on Debian/Ubuntu, absent
+    on manylinux and conda builds) and a triplet derived from the machine are
+    tried, so aarch64 hosts -- Jetson, GH200 -- are covered too.
+    """
+    if not sys.platform.startswith("linux"): return ()
+    import platform
+    import sysconfig
+    machine = platform.machine() or ""
+    triplets = []
+    for triplet in (sysconfig.get_config_var("MULTIARCH") or "",
+                    (machine + "-linux-gnu") if machine else ""):
+        if triplet and "/" not in triplet and triplet not in triplets:
+            triplets.append(triplet)
+    return tuple(
+        base + "/" + triplet
+        for base in ("/usr/lib", "/lib", "/usr/local/lib")
+        for triplet in triplets
+    )
+
+
+# Used only when `ld --verbose` cannot be run. Deliberately generous: a
+# directory that does not exist costs nothing, a missing one costs FlashInfer.
+# The multiarch entries come first because on the most common CUDA platform
+# they are the only place the driver's unversioned libcuda.so ever appears.
+_FALLBACK_LINKER_DIRS = _multiarch_linker_dirs() + (
+    "/usr/lib",
+    "/lib",
+    "/usr/lib64",
+    "/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
+)
+
+
+def _cuda_roots_from_nvcc() -> "Tuple[str, ...]":
+    """The CUDA root FlashInfer infers with neither CUDA_HOME nor CUDA_PATH set.
+
+    flashinfer/jit/cpp_ext.py get_cuda_path() resolves CUDA_HOME, CUDA_PATH,
+    `dirname(dirname(which nvcc))`, then /usr/local/cuda. Without that third
+    case a toolkit outside /usr/local/cuda (/opt/cuda, a conda prefix) has its
+    stubs directory missed and FlashInfer is disabled on a machine that links.
+
+    Both the literal and the symlink-resolved grandparent are returned:
+    FlashInfer does not resolve symlinks, but a /usr/bin/nvcc shim pointing
+    into the real toolkit would otherwise reintroduce the same false negative.
+    """
+    nvcc = shutil.which("nvcc")
+    if not nvcc: return ()
+    roots = []
+    for path in (nvcc, os.path.realpath(nvcc)):
+        root = os.path.dirname(os.path.dirname(path))
+        if root and root not in roots: roots.append(root)
+    return tuple(roots)
+
+
+@functools.cache
+def _linker_default_dirs() -> "Tuple[str, ...]":
+    """The directories `ld` searches with no -L at all.
+
+    The NVIDIA driver installer creates the unversioned `libcuda.so` symlink in
+    a default directory (/usr/lib/x86_64-linux-gnu on Debian/Ubuntu), so
+    `c++ ... -lcuda` often succeeds with no toolkit stubs directory in sight.
+    Ignoring these paths would make those machines false negatives.
+
+    `ld --verbose` prints the built-in linker script, whose SEARCH_DIR entries
+    are exactly that list; the leading `=` is the sysroot placeholder, empty
+    for a native link.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["ld", "--verbose"],
+            capture_output = True, text = True, timeout = 20,
+        ).stdout
+    except Exception:
+        out = ""
+    dirs = [d.replace("=", "", 1) if d.startswith("=") else d
+            for d in re.findall(r'SEARCH_DIR\("([^"]*)"\)', out)]
+    # On a parse failure fall back rather than silently narrowing the search.
+    return tuple(dirs) if dirs else _FALLBACK_LINKER_DIRS
+
+
+def _can_link_libcuda() -> bool:
+    """Can a FlashInfer JIT build actually LINK, not merely compile?
+
+    nvcc and ninja being present only covers the compile. The link passes
+    `-lcuda` on Linux and so needs the driver STUB `libcuda.so`, not the
+    runtime `libcuda.so.1` that every machine with a driver has.
+
+    Container images routinely ship the runtime and omit the stub. Observed on
+    Kaggle: every check above passes, each .cu file compiles cleanly, and the
+    final step dies on
+
+        /usr/bin/ld: cannot find -lcuda
+
+    surfacing as `RuntimeError: Ninja build failed` after minutes of nvcc work.
+    No env var avoids it: disabling the FlashInfer SAMPLER just moves the build
+    to the attention kernels, and vLLM has no prefill-specific opt-out.
+
+    Platform scope matters. The `-lcuda`/`libcuda.so` mechanism is Linux-only;
+    on Windows the link resolves `cuda.lib` and searches LIB, so probing for
+    `libcuda.so` there would disable FlashInfer on a platform where it works.
+    Where the link cannot be checked positively, return True rather than claim
+    it will fail, keeping behaviour as before this check existed.
+    """
+    if sys.platform.startswith("win"):
+        search = [d for d in os.environ.get("LIB", "").split(os.pathsep) if d]
+        for var in ("CUDA_PATH", "CUDA_HOME"):
+            root = os.environ.get(var, "")
+            if root:
+                search += [os.path.join(root, sub)
+                           for sub in _FLASHINFER_LINK_DIRS_WINDOWS_SUBDIRS]
+        if not search:
+            # Nothing to go on. Stay out of the way rather than guess.
+            return True
+        return any(os.path.exists(os.path.join(d, "cuda.lib")) for d in search)
+
+    if not sys.platform.startswith("linux"):
+        # macOS and anything else: CUDA is not in play, so a negative would be
+        # an invention rather than an observation.
+        return True
+
+    search = list(_FLASHINFER_LINK_DIRS)
+    roots = [os.environ.get(var, "") for var in ("CUDA_HOME", "CUDA_PATH")]
+    # Neither var set is the common case; FlashInfer then infers the root from
+    # nvcc rather than assuming /usr/local/cuda.
+    roots += list(_cuda_roots_from_nvcc())
+    for root in roots:
+        if not root: continue
+        search += [os.path.join(root, sub) for sub in _CUDA_ROOT_LIB_SUBDIRS]
+    # LIBRARY_PATH is what the linker consults beyond its defaults, so a stub
+    # already supplied there counts.
+    search += [d for d in os.environ.get("LIBRARY_PATH", "").split(os.pathsep) if d]
+    # The defaults themselves hold the driver's own unversioned libcuda.so on a
+    # normal bare-metal install.
+    search += list(_linker_default_dirs())
+    return any(os.path.exists(os.path.join(d, "libcuda.so")) for d in search)
+
 def _clear_flashinfer_env_on_hip():
     # AMD ROCm: FlashInfer requires the CUDA nvcc compiler and never applies here.
     # Remove any forced FlashInfer selection unconditionally, even when the package
@@ -2352,6 +2605,14 @@ def load_vllm(
     use_bitsandbytes = use_bitsandbytes or \
         model_name.lower().endswith("-bnb-4bit") or (quant_method == "bitsandbytes")
 
+    # vLLM absent is a different failure with its own message, so say nothing here.
+    if use_bitsandbytes and _vllm_bnb is None and importlib.util.find_spec("vllm"):
+        raise RuntimeError(
+            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
+            "Install it with `pip install vllm-bnb-plugin` to use "
+            "load_in_4bit with fast_inference."
+        )
+
     if _is_gemma4_config(config):
         if enable_lora:
             patch_gemma4_vllm_lora_support()
@@ -2438,506 +2699,518 @@ def load_vllm(
 
     # Fix up vLLM compute_dtype for bitsandbytes
     BitsAndBytesConfig = patch_vllm_compute_dtype(dtype)
+    # The patch is process wide, so every exit restores it, errors in setup
+    # included: a later load would otherwise build the Unsloth config
+    # subclass with a stale dtype.
+    try:
 
-    # Use Flashinfer if possible (not faster for BnB, and seems lower throughput;
-    # FP8 Flashinfer may be better).
-    # See https://docs.vllm.ai/en/latest/serving/env_vars.html
-    # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
-    # On AMD, vLLM uses its built-in paged attention instead.
-    if _clear_flashinfer_env_on_hip():
-        pass
-    elif importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
-        # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
-        # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
-        _has_nvcc = (
-            shutil.which("nvcc") is not None
-            or os.path.isfile(os.path.join(os.environ.get("CUDA_HOME", ""), "bin", "nvcc"))
-            or os.path.isfile(os.path.join(os.environ.get("CUDA_PATH", ""), "bin", "nvcc"))
-            or os.path.isfile("/usr/local/cuda/bin/nvcc")
-        )
-        _has_ninja = shutil.which("ninja") is not None
-
-        if not _has_nvcc or not _has_ninja:
-            _missing = []
-            if not _has_nvcc:  _missing.append("nvcc (CUDA compiler)")
-            if not _has_ninja: _missing.append("ninja (build tool)")
-            print(
-                f"Unsloth: FlashInfer requires JIT compilation but {' and '.join(_missing)} "
-                f"{'is' if len(_missing) == 1 else 'are'} not found.\n"
-                f"  vLLM will use FLASH_ATTN attention + PyTorch sampler instead (works fine).\n"
-                f"  To enable FlashInfer, install the missing tools:\n"
-                f"    nvcc  - install the CUDA toolkit or set CUDA_HOME to your CUDA installation\n"
-                f"    ninja - pip install ninja\n"
-                f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
+        # Use Flashinfer if possible (not faster for BnB, and seems lower throughput;
+        # FP8 Flashinfer may be better).
+        # See https://docs.vllm.ai/en/latest/serving/env_vars.html
+        # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
+        # On AMD, vLLM uses its built-in paged attention instead.
+        if _clear_flashinfer_env_on_hip():
+            pass
+        elif importlib.util.find_spec("flashinfer") and os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") == "0":
+            # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
+            # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
+            _has_nvcc = (
+                shutil.which("nvcc") is not None
+                or os.path.isfile(os.path.join(os.environ.get("CUDA_HOME", ""), "bin", "nvcc"))
+                or os.path.isfile(os.path.join(os.environ.get("CUDA_PATH", ""), "bin", "nvcc"))
+                or os.path.isfile("/usr/local/cuda/bin/nvcc")
             )
-            # Clear any externally-set FlashInfer env vars so vLLM uses defaults
-            if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "") == "1":
-                del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
-            if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
-                del os.environ["VLLM_ATTENTION_BACKEND"]
-        else:
-            # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
-            if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
-                del os.environ["VLLM_ATTENTION_BACKEND"]
-            elif not vllm_supports_flashinfer(config):
-                if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
-                    print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
-                if "VLLM_ATTENTION_BACKEND" in os.environ:
-                    del os.environ["VLLM_ATTENTION_BACKEND"]
-            elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
-                pass
-            elif not use_bitsandbytes and major_version >= 8:
-                # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
-                os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
-            elif Version(vllm_version) >= Version("0.11.0"):
-                # On 0.11.0, Flashinfer also works!
-                os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+            _has_ninja = shutil.which("ninja") is not None
+            # Compiling is not the same as linking; see _can_link_libcuda.
+            _can_link = _can_link_libcuda()
 
-            # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
-            # Tesla T4 is 280 tok/s vs 330 tok/s
-            if major_version >= 8:
-                os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
-            elif Version(vllm_version) >= Version("0.11.0"):
-                # On 0.11.0, Flashinfer also works!
-                os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
-            else:
-                os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
-            # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
-    pass
-
-    # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
-    # See https://github.com/huggingface/trl/issues/2798
-    if DEVICE_TYPE == "cuda":
-        major_version, minor_version = torch.cuda.get_device_capability()
-        if (major_version < 7) or (major_version == 7 and minor_version < 5):
-            print("Unsloth: Your GPU does not support prefix caching - will disable!")
-            enable_prefix_caching = False
-    elif DEVICE_TYPE == "hip":
-        enable_prefix_caching = True
-    elif DEVICE_TYPE == "xpu":
-        enable_prefix_caching = True
-    pass
-
-    # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
-    # [FAILS] for bitsandbytes - https://github.com/unslothai/unsloth/issues/2102
-    # if importlib.util.find_spec("vllm") and (major_version >= 8):
-    #     from importlib.metadata import version as importlib_version
-    #     from packaging.version import Version
-    #     if Version(importlib_version("vllm")) > Version("0.7.3"):
-    #         os.environ["VLLM_USE_V1"] = "1"
-    # pass
-
-    from vllm import LLM, LLMEngine, AsyncLLMEngine, EngineArgs, AsyncEngineArgs
-
-    # max_num_seqs = sequences processed in parallel (vLLM default 256; we use
-    # 64 on smaller GPUs). max_batched_tokens scales 4096 -> 8192 small -> large.
-    """
-    Benchmarks for max_batched_tokens, max_num_seqs
-    Around after max_num_seqs>=64, we see linear increase in memory usage.
-    | max_model_len | max_batched_tokens | max_num_seqs | Profiling Time | Non-KV Memory | Torch Peak | Non-Torch Forward | Weights |
-    |--------------:|-------------------:|-------------:|---------------:|--------------:|-----------:|------------------:|--------:|
-    | 2048          | 2048               | 8            | 11.18s         | 7.87GiB       | 0.18GiB    | 0.13GiB           | 7.56GiB |
-    | 4096          | 4096               | 8            | 10.87s         | 8.01GiB       | 0.32GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 8            | 11.24s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 16           | 11.48s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 32           | 11.09s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 64           | 11.09s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 128          | 11.38s         | 8.45GiB       | 0.76GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 256          | 11.84s         | 9.14GiB       | 1.45GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 512          | 11.50s         | 10.52GiB      | 2.83GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 1024         | 11.03s         | 13.28GiB      | 5.59GiB    | 0.13GiB           | 7.56GiB |
-    | 8192          | 8192               | 2048         | 11.63s         | 18.80GiB      | 11.11GiB   | 0.13GiB           | 7.56GiB |
-    | 16384         | 16384              | 8            | 11.21s         | 8.89GiB       | 1.20GiB    | 0.13GiB           | 7.56GiB |
-    | 32768         | 32768              | 8            | 11.27s         | 10.07GiB      | 2.38GiB    | 0.13GiB           | 7.56GiB |
-    """
-    approx_max_num_seqs = max_num_seqs # vLLM default is 256
-    max_num_batched_tokens = 2048 # vLLM default
-    if   memory_left_for_kv_cache_gb <=  2: max_num_batched_tokens, approx_max_num_seqs = 2048, 8   # - 8
-    elif memory_left_for_kv_cache_gb <=  4: max_num_batched_tokens, approx_max_num_seqs = 2048, 16  # - 16
-    elif memory_left_for_kv_cache_gb <=  8: max_num_batched_tokens, approx_max_num_seqs = 4096, 32  # - 16
-    elif memory_left_for_kv_cache_gb <= 12: max_num_batched_tokens, approx_max_num_seqs = 4096, 48  # - 16
-    elif memory_left_for_kv_cache_gb <= 16: max_num_batched_tokens, approx_max_num_seqs = 6144, 64  # Default
-    elif memory_left_for_kv_cache_gb <= 24: max_num_batched_tokens, approx_max_num_seqs = 6144, 80  # + 16
-    elif memory_left_for_kv_cache_gb <= 40: max_num_batched_tokens, approx_max_num_seqs = 8192, 96  # + 16
-    elif memory_left_for_kv_cache_gb <= 48: max_num_batched_tokens, approx_max_num_seqs = 8192, 112 # + 16
-    elif memory_left_for_kv_cache_gb <= 80: max_num_batched_tokens, approx_max_num_seqs = 8192, 128 # + 16
-    elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
-
-    if is_vision_model:
-        # Each sequence carries an image (~thousands of tokens) in vLLM
-        # profiling; cap seqs low for vision models.
-        # TODO: vLLM V1 profiling may cap max seqs by budget; check.
-        print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-        approx_max_num_seqs = 1
-        # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
-        max_num_batched_tokens = max(8192, max_seq_length)
-
-    # float8 KV cache fits more sequences -> more throughput
-    if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
-
-    # vLLM default max_num_batched_tokens is 2048
-    chunked_prefill_tokens = 2048
-    if not is_vision_model:
-        if   memory_left_for_kv_cache_gb <=  8: chunked_prefill_tokens = 1024 # + 0
-        elif memory_left_for_kv_cache_gb <= 12: chunked_prefill_tokens = 1536 # + 512
-        elif memory_left_for_kv_cache_gb <= 16: chunked_prefill_tokens = 2048 # + 512
-        elif memory_left_for_kv_cache_gb <= 24: chunked_prefill_tokens = 3072 # + 1024
-        elif memory_left_for_kv_cache_gb <= 40: chunked_prefill_tokens = 4096 # + 1024
-        elif memory_left_for_kv_cache_gb <= 48: chunked_prefill_tokens = 4608 # + 512
-        elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
-        else: chunked_prefill_tokens = 8192 # + 0
-
-        # vLLM errors if max_seq_length exceeds chunked_prefill_tokens
-        chunked_prefill_tokens = max_seq_length
-
-    # Scale num_seqs by conservativeness
-    approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
-    approx_max_num_seqs = max(approx_max_num_seqs, 1)
-
-    # Check max RAM usage for vLLM (swap space) default is 4GB
-    memory = psutil.virtual_memory()
-    RAM_GB = memory.available / 1024 / 1024 / 1024
-    swap_space = 4
-    if   RAM_GB <= 4:  swap_space = 0
-    elif RAM_GB <= 8:  swap_space = 0
-    elif RAM_GB <= 12: swap_space = 0
-    elif RAM_GB <= 16: swap_space = 0
-    elif RAM_GB <= 24: swap_space = 2
-    elif RAM_GB <= 48: swap_space = 4
-    else: swap_space = 6
-
-    if DEVICE_TYPE == "xpu":
-        platform = "Intel GPU"
-        gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
-        message = f"{platform} has eu:{gpu_eu_count}"
-    else:
-        platform = "CUDA"
-        major_version, minor_version = torch.cuda.get_device_capability()
-        message = f"{platform} compute capability {major_version}.{minor_version}"
-    pass
-
-    print(
-        f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
-        f"Unsloth: Your GPU has {message} with VRAM = {total_memory_gb} GB.\n"\
-        f"Unsloth: Using conservativeness = {conservativeness}. Chunked prefill tokens = {chunked_prefill_tokens}. Num Sequences = {approx_max_num_seqs}.\n"\
-        f"Unsloth: vLLM's KV Cache can use up to {round(memory_left_for_kv_cache_gb, 2)} GB. Also swap space = {swap_space} GB."
-    )
-
-    # Get device as well
-    device = get_target_device()
-
-    # vLLM >= 0.19.0 ships a piecewise graph-partition pass (`_decompose_size_nodes`,
-    # vllm-project/vllm#36038) that crashes on Unsloth's LoRA graph under
-    # compilation_config=3: "Tried to erase Node size_N but it still had N users".
-    # Root cause: the pass fails to rewire `size` nodes nested inside a `slice(...)`
-    # object (from the stock LoRA punica `token_lora_mapping[:x.size(0)]` slicing).
-    # `_install_vllm_decompose_size_nodes_fix` monkeypatches a corrected pass (matching
-    # upstream vllm-project/vllm#42543) so CUDA graphs (compilation_config=3) work with
-    # LoRA. If the pass is not present (older/newer vLLM), we fall back to
-    # compilation_config=2 (skips piecewise splitting; no CUDA graphs but no crash).
-    # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 without the fix
-    # (e.g. once vLLM ships the fix upstream), or UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX=0 to
-    # disable the Unsloth-side monkeypatch and take the compilation_config=2 fallback.
-    if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
-        install_fix = os.environ.get("UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX", "1") != "0"
-        fixed = False
-        if install_fix:
-            try:
-                fixed = _install_vllm_decompose_size_nodes_fix()
-            except Exception as e:
-                print(f"Unsloth: Failed installing piecewise-compile LoRA fix: {e}")
-                fixed = False
-        if fixed:
-            print(
-                "Unsloth: Patched vLLM's piecewise graph-partition pass so "
-                "compilation_config=3 (CUDA graphs) works with LoRA."
-            )
-        else:
-            try:
-                import vllm.compilation.backends as _vllm_backends
-                has_pass = hasattr(_vllm_backends, "_decompose_size_nodes")
-            except Exception:
-                has_pass = False
-            if has_pass:
+            if not _has_nvcc or not _has_ninja or not _can_link:
+                _missing = []
+                if not _has_nvcc:  _missing.append("nvcc (CUDA compiler)")
+                if not _has_ninja: _missing.append("ninja (build tool)")
+                if not _can_link:  _missing.append("libcuda.so (the CUDA driver stub that -lcuda needs)")
                 print(
-                    "Unsloth: This vLLM's piecewise compile is incompatible with LoRA "
-                    "(compilation_config=3); using compilation_config=2 instead. "
-                    "Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to override."
+                    f"Unsloth: FlashInfer requires JIT compilation but {' and '.join(_missing)} "
+                    f"{'is' if len(_missing) == 1 else 'are'} not found.\n"
+                    f"  vLLM will use FLASH_ATTN attention + PyTorch sampler instead (works fine).\n"
+                    f"  To enable FlashInfer, install the missing tools:\n"
+                    f"    nvcc  - install the CUDA toolkit or set CUDA_HOME to your CUDA installation\n"
+                    f"    ninja - pip install ninja\n"
+                    f"    libcuda.so - this image has the CUDA runtime but not the driver stub.\n"
+                    f"      Install cuda-compat / the CUDA toolkit's stubs, or point LIBRARY_PATH\n"
+                    f"      at a directory containing libcuda.so (a symlink to libcuda.so.1 or to\n"
+                    f"      /usr/local/cuda/compat/libcuda.so is enough).\n"
+                    f"  To silence this warning: set UNSLOTH_VLLM_NO_FLASHINFER=1"
                 )
-                compilation_config = 2
-
-    if compilation_config == 3:
-        try:
-            from vllm.config import CompilationConfig
-
-            # Torch versions >= 2.9.0 or vllm_version > 0.11.0
-            if Version(vllm_version) > Version("0.11.0") or Version(torch_version) > Version("2.9.0"):
-                cudagraphs = False # Weirdly if we set it to True, we get
-                # [rank0]: RuntimeError: These storage data ptrs are not allocated in pool (0, 2) but should be {612290048}
-                combo_kernels = True # Latest works now only on Llama it seems
-                if total_memory_gb <= 70:
-                    combo_kernels = False # Too slow on less than 80GB GPUs
-                # We still see
-                # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
-                # Try unsloth/gemma-3-4b-it
-                combo_kernels = False
+                # Clear any externally-set FlashInfer env vars so vLLM uses defaults
+                if os.environ.get("VLLM_USE_FLASHINFER_SAMPLER", "") == "1":
+                    del os.environ["VLLM_USE_FLASHINFER_SAMPLER"]
+                if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+                    del os.environ["VLLM_ATTENTION_BACKEND"]
             else:
-                cudagraphs = True
-                combo_kernels = False
+                # FLASHINFER unsupported by some models (e.g. Qwen3-VL, Qwen2-VL)
+                if "VLLM_ATTENTION_BACKEND" in os.environ and os.environ["VLLM_ATTENTION_BACKEND"] == "":
+                    del os.environ["VLLM_ATTENTION_BACKEND"]
+                elif not vllm_supports_flashinfer(config):
+                    if os.environ.get("VLLM_ATTENTION_BACKEND", "") == "FLASHINFER":
+                        print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
+                    if "VLLM_ATTENTION_BACKEND" in os.environ:
+                        del os.environ["VLLM_ATTENTION_BACKEND"]
+                elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
+                    pass
+                elif not use_bitsandbytes and major_version >= 8:
+                    # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
+                    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+                elif Version(vllm_version) >= Version("0.11.0"):
+                    # On 0.11.0, Flashinfer also works!
+                    os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
-            compile_flags = dict(
-                level = 3,
-                backend = "inductor",
-                # cache_dir = "unsloth_compiled_vllm_cache", # Pytorch fails to load from cache
-                # compile_sizes = [1, 2, 4, 8, 16],
-                # cudagraph_capture_sizes = [1, 2, 4, 8, 16],
-                # max_capture_size = 16,
-                cudagraph_num_of_warmups = 1,
-                full_cuda_graph = True,
-                use_cudagraph = True,
-                use_inductor = True,
-                inductor_compile_config = get_torch_compile_options(
-                    epilogue_fusion = True,
-                    max_autotune = False, # Too slow
-                    shape_padding = True,
-                    debug = False,
-                    cudagraphs = cudagraphs,
-                    coordinate_descent_tuning = False, # Too slow
-                    logging = True, # Enable compile logs
-                    combo_kernels = combo_kernels,
-                    group_fusion = True,
-                    memory_planning = True,
-                    use_block_ptr = True,
-
-                    multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
-                    # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
-                )
-            )
-            good_keys = inspect.signature(CompilationConfig).parameters.keys()
-            # Use new cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE mode for maximum performance
-            # See https://docs.vllm.ai/en/v0.10.2/api/vllm/config/compilation.html#vllm.config.compilation.CUDAGraphMode
-            if "cudagraph_mode" in good_keys:
-                try:
-                    from vllm.config import CUDAGraphMode
-                    compile_flags["cudagraph_mode"] = CUDAGraphMode.FULL_AND_PIECEWISE
-                    del compile_flags["full_cuda_graph"]
-                except Exception as e:
-                    print("Unsloth: Failed getting `from vllm.config import CUDAGraphMode` and `CUDAGraphMode.FULL_AND_PIECEWISE`")
-            else:
-                print("Unsloth: `cudagraph_mode` is not in `from vllm.config import CompilationConfig`")
-            old_keys = list(compile_flags.keys())
-            for key in old_keys:
-                if key not in good_keys:
-                    del compile_flags[key]
-                    print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM.config.CompilationConfig. Skipping.")
-                pass
-            pass
-            compilation_config = CompilationConfig(**compile_flags)
-        except Exception as e:
-            print(f"Unsloth: FAILED getting compilation_config with error = {str(e)}")
-    pass
-
-    engine_args = dict(
-        model                  = model_name,
-        gpu_memory_utilization = actual_gpu_memory_utilization,
-        max_model_len          = max_seq_length,
-        quantization           = "bitsandbytes" if use_bitsandbytes else None,
-        load_format            = "bitsandbytes" if use_bitsandbytes else "auto",
-        kv_cache_dtype         = "fp8" if float8_kv_cache else "auto",
-        dtype                  = dtype,
-
-        max_num_batched_tokens = max_num_batched_tokens,
-        max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
-        max_logprobs           = max_logprobs, # Disallow logprobs being returned
-        seed                   = random_state, # Default is 0
-
-        # lora_extra_vocab_size = 0, # Breaks vLLM so we leave it as 256
-        enable_lora            = enable_lora,
-        max_lora_rank          = max_lora_rank,
-        max_loras              = max_loras,
-
-        disable_log_stats      = disable_log_stats,
-        enable_prefix_caching  = enable_prefix_caching,
-        enable_chunked_prefill = enable_chunked_prefill, # LoRA fails with chunked prefill as at Feb 2025
-        # max_seq_len_to_capture fails for V1
-        # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
-        compilation_config     = compilation_config, # 0, 1, 2, 3
-        enforce_eager          = enforce_eager,
-        swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
-        device                 = device,
-        # New vLLM versions need to pass this in!
-        # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
-        enable_sleep_mode      = unsloth_vllm_standby,
-    )
-    if is_vision_model:
-        # Limit images/videos per prompt to save memory. TODO: make configurable.
-        engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
-    if _is_gemma4_config(config) and use_bitsandbytes:
-        gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
-            getattr(config, "quantization_config", None)
-        )
-        if gemma4_bnb_quantization_config is not None:
-            engine_args["hf_overrides"] = {
-                "quantization_config": gemma4_bnb_quantization_config,
-            }
-
-    # [[CRITICAL for RL on policy]]
-    # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
-    # Ada Lovelace 8.9 and Ampere 8.0
-    # See https://github.com/vllm-project/flash-attention/pull/87
-    # import vllm.vllm_flash_attn
-    # vllm.vllm_flash_attn.__version__ == 2.7.2.post1
-    if DEVICE_TYPE == "cuda":
-        major_version, minor_version = torch.cuda.get_device_capability()
-        if major_version < 9:
-            if Version(vllm_version) >= Version("0.11.0"):
-                disable_cascade_attn = False
-            else:
-                # Disable for A100, L40 etc
-                disable_cascade_attn = True
-                print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
-            engine_args["disable_cascade_attn"] = disable_cascade_attn
-
-        # FlashInfer has a bug with block_size=16 and head_dim>=256 on Blackwell (SM100+).
-        # https://github.com/flashinfer-ai/flashinfer/issues/1993
-        # vLLM defaults block_size to 16 on CUDA, which triggers an assertion.
-        # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
-        if major_version >= 10:
-            _text_config = getattr(config, "text_config", config)
-            _head_dim = getattr(_text_config, "head_dim", None)
-            if _head_dim is not None and _head_dim >= 256:
-                engine_args["block_size"] = 32
-                logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
-    pass
-
-    # On-the-fly quantization (vLLM >= 0.12.0); older versions quantize offline.
-    # https://github.com/vllm-project/vllm/pull/23014
-    if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
-        from torchao.core.config import config_to_dict
-        torchao_config = _get_torchao_fp8_config(fp8_mode)
-        hf_overrides = {
-            "quantization_config_dict_json": json.dumps(config_to_dict(torchao_config)),
-        }
-        engine_args["quantization"] = "torchao"
-        engine_args["hf_overrides"] = hf_overrides
-
-    good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
-    old_keys = list(engine_args.keys())
-    for key in old_keys:
-        if key not in good_keys:
-            del engine_args[key]
-            print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
+                # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
+                # Tesla T4 is 280 tok/s vs 330 tok/s
+                if major_version >= 8:
+                    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
+                elif Version(vllm_version) >= Version("0.11.0"):
+                    # On 0.11.0, Flashinfer also works!
+                    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
+                else:
+                    os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+                # os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
         pass
-    pass
 
-    # Quick exit
-    if return_args: return engine_args
+        # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
+        # See https://github.com/huggingface/trl/issues/2798
+        if DEVICE_TYPE == "cuda":
+            major_version, minor_version = torch.cuda.get_device_capability()
+            if (major_version < 7) or (major_version == 7 and minor_version < 5):
+                print("Unsloth: Your GPU does not support prefix caching - will disable!")
+                enable_prefix_caching = False
+        elif DEVICE_TYPE == "hip":
+            enable_prefix_caching = True
+        elif DEVICE_TYPE == "xpu":
+            enable_prefix_caching = True
+        pass
 
-    # Keep trying until success (2 times)
-    trials = 0
-    race_trials = 0
-    while True:
-        try:
-            if use_async:
-                llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
-            elif use_engine:
-                llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
+        # Use VLLM_USE_V1 for vllm >= 0.7.4 and CUDA >= 8.0
+        # [FAILS] for bitsandbytes - https://github.com/unslothai/unsloth/issues/2102
+        # if importlib.util.find_spec("vllm") and (major_version >= 8):
+        #     from importlib.metadata import version as importlib_version
+        #     from packaging.version import Version
+        #     if Version(importlib_version("vllm")) > Version("0.7.3"):
+        #         os.environ["VLLM_USE_V1"] = "1"
+        # pass
+
+        from vllm import LLM, LLMEngine, AsyncLLMEngine, EngineArgs, AsyncEngineArgs
+
+        # max_num_seqs = sequences processed in parallel (vLLM default 256; we use
+        # 64 on smaller GPUs). max_batched_tokens scales 4096 -> 8192 small -> large.
+        """
+        Benchmarks for max_batched_tokens, max_num_seqs
+        Around after max_num_seqs>=64, we see linear increase in memory usage.
+        | max_model_len | max_batched_tokens | max_num_seqs | Profiling Time | Non-KV Memory | Torch Peak | Non-Torch Forward | Weights |
+        |--------------:|-------------------:|-------------:|---------------:|--------------:|-----------:|------------------:|--------:|
+        | 2048          | 2048               | 8            | 11.18s         | 7.87GiB       | 0.18GiB    | 0.13GiB           | 7.56GiB |
+        | 4096          | 4096               | 8            | 10.87s         | 8.01GiB       | 0.32GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 8            | 11.24s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 16           | 11.48s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 32           | 11.09s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 64           | 11.09s         | 8.31GiB       | 0.62GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 128          | 11.38s         | 8.45GiB       | 0.76GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 256          | 11.84s         | 9.14GiB       | 1.45GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 512          | 11.50s         | 10.52GiB      | 2.83GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 1024         | 11.03s         | 13.28GiB      | 5.59GiB    | 0.13GiB           | 7.56GiB |
+        | 8192          | 8192               | 2048         | 11.63s         | 18.80GiB      | 11.11GiB   | 0.13GiB           | 7.56GiB |
+        | 16384         | 16384              | 8            | 11.21s         | 8.89GiB       | 1.20GiB    | 0.13GiB           | 7.56GiB |
+        | 32768         | 32768              | 8            | 11.27s         | 10.07GiB      | 2.38GiB    | 0.13GiB           | 7.56GiB |
+        """
+        approx_max_num_seqs = max_num_seqs # vLLM default is 256
+        max_num_batched_tokens = 2048 # vLLM default
+        if   memory_left_for_kv_cache_gb <=  2: max_num_batched_tokens, approx_max_num_seqs = 2048, 8   # - 8
+        elif memory_left_for_kv_cache_gb <=  4: max_num_batched_tokens, approx_max_num_seqs = 2048, 16  # - 16
+        elif memory_left_for_kv_cache_gb <=  8: max_num_batched_tokens, approx_max_num_seqs = 4096, 32  # - 16
+        elif memory_left_for_kv_cache_gb <= 12: max_num_batched_tokens, approx_max_num_seqs = 4096, 48  # - 16
+        elif memory_left_for_kv_cache_gb <= 16: max_num_batched_tokens, approx_max_num_seqs = 6144, 64  # Default
+        elif memory_left_for_kv_cache_gb <= 24: max_num_batched_tokens, approx_max_num_seqs = 6144, 80  # + 16
+        elif memory_left_for_kv_cache_gb <= 40: max_num_batched_tokens, approx_max_num_seqs = 8192, 96  # + 16
+        elif memory_left_for_kv_cache_gb <= 48: max_num_batched_tokens, approx_max_num_seqs = 8192, 112 # + 16
+        elif memory_left_for_kv_cache_gb <= 80: max_num_batched_tokens, approx_max_num_seqs = 8192, 128 # + 16
+        elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
+
+        if is_vision_model:
+            # Each sequence carries an image (~thousands of tokens) in vLLM
+            # profiling; cap seqs low for vision models.
+            # TODO: vLLM V1 profiling may cap max seqs by budget; check.
+            print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+            approx_max_num_seqs = 1
+            # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
+            max_num_batched_tokens = max(8192, max_seq_length)
+
+        # float8 KV cache fits more sequences -> more throughput
+        if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
+
+        # vLLM default max_num_batched_tokens is 2048
+        chunked_prefill_tokens = 2048
+        if not is_vision_model:
+            if   memory_left_for_kv_cache_gb <=  8: chunked_prefill_tokens = 1024 # + 0
+            elif memory_left_for_kv_cache_gb <= 12: chunked_prefill_tokens = 1536 # + 512
+            elif memory_left_for_kv_cache_gb <= 16: chunked_prefill_tokens = 2048 # + 512
+            elif memory_left_for_kv_cache_gb <= 24: chunked_prefill_tokens = 3072 # + 1024
+            elif memory_left_for_kv_cache_gb <= 40: chunked_prefill_tokens = 4096 # + 1024
+            elif memory_left_for_kv_cache_gb <= 48: chunked_prefill_tokens = 4608 # + 512
+            elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
+            else: chunked_prefill_tokens = 8192 # + 0
+
+            # vLLM errors if max_seq_length exceeds chunked_prefill_tokens
+            chunked_prefill_tokens = max_seq_length
+
+        # Scale num_seqs by conservativeness
+        approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
+        approx_max_num_seqs = max(approx_max_num_seqs, 1)
+
+        # Check max RAM usage for vLLM (swap space) default is 4GB
+        memory = psutil.virtual_memory()
+        RAM_GB = memory.available / 1024 / 1024 / 1024
+        swap_space = 4
+        if   RAM_GB <= 4:  swap_space = 0
+        elif RAM_GB <= 8:  swap_space = 0
+        elif RAM_GB <= 12: swap_space = 0
+        elif RAM_GB <= 16: swap_space = 0
+        elif RAM_GB <= 24: swap_space = 2
+        elif RAM_GB <= 48: swap_space = 4
+        else: swap_space = 6
+
+        if DEVICE_TYPE == "xpu":
+            platform = "Intel GPU"
+            gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
+            message = f"{platform} has eu:{gpu_eu_count}"
+        else:
+            platform = "CUDA"
+            major_version, minor_version = torch.cuda.get_device_capability()
+            message = f"{platform} compute capability {major_version}.{minor_version}"
+        pass
+
+        print(
+            f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
+            f"Unsloth: Your GPU has {message} with VRAM = {total_memory_gb} GB.\n"\
+            f"Unsloth: Using conservativeness = {conservativeness}. Chunked prefill tokens = {chunked_prefill_tokens}. Num Sequences = {approx_max_num_seqs}.\n"\
+            f"Unsloth: vLLM's KV Cache can use up to {round(memory_left_for_kv_cache_gb, 2)} GB. Also swap space = {swap_space} GB."
+        )
+
+        # Get device as well
+        device = get_target_device()
+
+        # vLLM >= 0.19.0 ships a piecewise graph-partition pass (`_decompose_size_nodes`,
+        # vllm-project/vllm#36038) that crashes on Unsloth's LoRA graph under
+        # compilation_config=3: "Tried to erase Node size_N but it still had N users".
+        # Root cause: the pass fails to rewire `size` nodes nested inside a `slice(...)`
+        # object (from the stock LoRA punica `token_lora_mapping[:x.size(0)]` slicing).
+        # `_install_vllm_decompose_size_nodes_fix` monkeypatches a corrected pass (matching
+        # upstream vllm-project/vllm#42543) so CUDA graphs (compilation_config=3) work with
+        # LoRA. If the pass is not present (older/newer vLLM), we fall back to
+        # compilation_config=2 (skips piecewise splitting; no CUDA graphs but no crash).
+        # Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to force compilation_config=3 without the fix
+        # (e.g. once vLLM ships the fix upstream), or UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX=0 to
+        # disable the Unsloth-side monkeypatch and take the compilation_config=2 fallback.
+        if compilation_config == 3 and os.environ.get("UNSLOTH_VLLM_PIECEWISE_COMPILE", "0") != "1":
+            install_fix = os.environ.get("UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX", "1") != "0"
+            fixed = False
+            if install_fix:
+                try:
+                    fixed = _install_vllm_decompose_size_nodes_fix()
+                except Exception as e:
+                    print(f"Unsloth: Failed installing piecewise-compile LoRA fix: {e}")
+                    fixed = False
+            if fixed:
+                print(
+                    "Unsloth: Patched vLLM's piecewise graph-partition pass so "
+                    "compilation_config=3 (CUDA graphs) works with LoRA."
+                )
             else:
-                llm = LLM(**engine_args)
-            pass
-            break
-        except Exception as error:
-            # Cleanup
-            for _ in range(3):
-                gc.collect()
-                torch.cuda.empty_cache()
-            pass
-            error = str(error)
-            # `expandable_segments:True` + sleep/standby mode is a deterministic
-            # config clash raised by CuMemAllocator.__init__, not an OOM, and
-            # retrying with a smaller gpu_memory_utilization can never clear it.
-            # Its text mentions PYTORCH_CUDA_ALLOC_CONF (ours) or "memory pool"
-            # (upstream vLLM), so a loose "alloc" / "memory" substring test
-            # reported it as an OOM and sent users to fixes that cannot work.
-            if _is_expandable_segments_error(error):
-                raise RuntimeError(_expandable_segments_standby_message(error))
-            # A transient race: retry the *identical* load rather than fall
-            # through to the generic "memory" branch below, which would shrink
-            # gpu_memory_utilization and max_num_seqs for the rest of the run
-            # over a failure neither caused. Standby is excluded because
-            # CuMemAllocator is a singleton in this process, so a second load
-            # would stack on the failed attempt's pool. Counted separately from
-            # `trials` so a race followed by a genuine OOM still gets its
-            # shrink-and-retry.
-            if _is_memory_profiling_race_error(error):
-                race_trials += 1
-                if race_trials < _MEMORY_PROFILING_RACE_MAX_TRIALS and not unsloth_vllm_standby:
+                try:
+                    import vllm.compilation.backends as _vllm_backends
+                    has_pass = hasattr(_vllm_backends, "_decompose_size_nodes")
+                except Exception:
+                    has_pass = False
+                if has_pass:
                     print(
-                        f"Unsloth: Another process on this GPU freed memory while vLLM was profiling. "
-                        f"Retrying the load unchanged ({race_trials} of {_MEMORY_PROFILING_RACE_MAX_TRIALS}).\n"
+                        "Unsloth: This vLLM's piecewise compile is incompatible with LoRA "
+                        "(compilation_config=3); using compilation_config=2 instead. "
+                        "Set UNSLOTH_VLLM_PIECEWISE_COMPILE=1 to override."
+                    )
+                    compilation_config = 2
+
+        if compilation_config == 3:
+            try:
+                from vllm.config import CompilationConfig
+
+                # Torch versions >= 2.9.0 or vllm_version > 0.11.0
+                if Version(vllm_version) > Version("0.11.0") or Version(torch_version) > Version("2.9.0"):
+                    cudagraphs = False # Weirdly if we set it to True, we get
+                    # [rank0]: RuntimeError: These storage data ptrs are not allocated in pool (0, 2) but should be {612290048}
+                    combo_kernels = True # Latest works now only on Llama it seems
+                    if total_memory_gb <= 70:
+                        combo_kernels = False # Too slow on less than 80GB GPUs
+                    # We still see
+                    # AttributeError: 'NullKernelHandler' object has no attribute 'index_to_str'
+                    # Try unsloth/gemma-3-4b-it
+                    combo_kernels = False
+                else:
+                    cudagraphs = True
+                    combo_kernels = False
+
+                compile_flags = dict(
+                    level = 3,
+                    backend = "inductor",
+                    # cache_dir = "unsloth_compiled_vllm_cache", # Pytorch fails to load from cache
+                    # compile_sizes = [1, 2, 4, 8, 16],
+                    # cudagraph_capture_sizes = [1, 2, 4, 8, 16],
+                    # max_capture_size = 16,
+                    cudagraph_num_of_warmups = 1,
+                    full_cuda_graph = True,
+                    use_cudagraph = True,
+                    use_inductor = True,
+                    inductor_compile_config = get_torch_compile_options(
+                        epilogue_fusion = True,
+                        max_autotune = False, # Too slow
+                        shape_padding = True,
+                        debug = False,
+                        cudagraphs = cudagraphs,
+                        coordinate_descent_tuning = False, # Too slow
+                        logging = True, # Enable compile logs
+                        combo_kernels = combo_kernels,
+                        group_fusion = True,
+                        memory_planning = True,
+                        use_block_ptr = True,
+
+                        multi_kernel = False, # RuntimeError: name 'multi_kernel_0' is not defined
+                        # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
+                    )
+                )
+                good_keys = inspect.signature(CompilationConfig).parameters.keys()
+                # Use new cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE mode for maximum performance
+                # See https://docs.vllm.ai/en/v0.10.2/api/vllm/config/compilation.html#vllm.config.compilation.CUDAGraphMode
+                if "cudagraph_mode" in good_keys:
+                    try:
+                        from vllm.config import CUDAGraphMode
+                        compile_flags["cudagraph_mode"] = CUDAGraphMode.FULL_AND_PIECEWISE
+                        del compile_flags["full_cuda_graph"]
+                    except Exception as e:
+                        print("Unsloth: Failed getting `from vllm.config import CUDAGraphMode` and `CUDAGraphMode.FULL_AND_PIECEWISE`")
+                else:
+                    print("Unsloth: `cudagraph_mode` is not in `from vllm.config import CompilationConfig`")
+                old_keys = list(compile_flags.keys())
+                for key in old_keys:
+                    if key not in good_keys:
+                        del compile_flags[key]
+                        print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM.config.CompilationConfig. Skipping.")
+                    pass
+                pass
+                compilation_config = CompilationConfig(**compile_flags)
+            except Exception as e:
+                print(f"Unsloth: FAILED getting compilation_config with error = {str(e)}")
+        pass
+
+        engine_args = dict(
+            model                  = model_name,
+            gpu_memory_utilization = actual_gpu_memory_utilization,
+            max_model_len          = max_seq_length,
+            quantization           = "bitsandbytes" if use_bitsandbytes else None,
+            load_format            = "bitsandbytes" if use_bitsandbytes else "auto",
+            kv_cache_dtype         = "fp8" if float8_kv_cache else "auto",
+            dtype                  = dtype,
+
+            max_num_batched_tokens = max_num_batched_tokens,
+            max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
+            max_logprobs           = max_logprobs, # Disallow logprobs being returned
+            seed                   = random_state, # Default is 0
+
+            # lora_extra_vocab_size = 0, # Breaks vLLM so we leave it as 256
+            enable_lora            = enable_lora,
+            max_lora_rank          = max_lora_rank,
+            max_loras              = max_loras,
+
+            disable_log_stats      = disable_log_stats,
+            enable_prefix_caching  = enable_prefix_caching,
+            enable_chunked_prefill = enable_chunked_prefill, # LoRA fails with chunked prefill as at Feb 2025
+            # max_seq_len_to_capture fails for V1
+            # max_seq_len_to_capture = min(8192, max_seq_length + 256), # Default is 8192 for CUDAGraphs
+            compilation_config     = compilation_config, # 0, 1, 2, 3
+            enforce_eager          = enforce_eager,
+            swap_space             = swap_space, # Low memory devices like Colab (13GB) default 4GB
+            device                 = device,
+            # New vLLM versions need to pass this in!
+            # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
+            enable_sleep_mode      = unsloth_vllm_standby,
+        )
+        if is_vision_model:
+            # Limit images/videos per prompt to save memory. TODO: make configurable.
+            engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+        if _is_gemma4_config(config) and use_bitsandbytes:
+            gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
+                getattr(config, "quantization_config", None)
+            )
+            if gemma4_bnb_quantization_config is not None:
+                engine_args["hf_overrides"] = {
+                    "quantization_config": gemma4_bnb_quantization_config,
+                }
+
+        # [[CRITICAL for RL on policy]]
+        # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
+        # Ada Lovelace 8.9 and Ampere 8.0
+        # See https://github.com/vllm-project/flash-attention/pull/87
+        # import vllm.vllm_flash_attn
+        # vllm.vllm_flash_attn.__version__ == 2.7.2.post1
+        if DEVICE_TYPE == "cuda":
+            major_version, minor_version = torch.cuda.get_device_capability()
+            if major_version < 9:
+                if Version(vllm_version) >= Version("0.11.0"):
+                    disable_cascade_attn = False
+                else:
+                    # Disable for A100, L40 etc
+                    disable_cascade_attn = True
+                    print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
+                engine_args["disable_cascade_attn"] = disable_cascade_attn
+
+            # FlashInfer has a bug with block_size=16 and head_dim>=256 on Blackwell (SM100+).
+            # https://github.com/flashinfer-ai/flashinfer/issues/1993
+            # vLLM defaults block_size to 16 on CUDA, which triggers an assertion.
+            # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
+            if major_version >= 10:
+                _text_config = getattr(config, "text_config", config)
+                _head_dim = getattr(_text_config, "head_dim", None)
+                if _head_dim is not None and _head_dim >= 256:
+                    engine_args["block_size"] = 32
+                    logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
+        pass
+
+        # On-the-fly quantization (vLLM >= 0.12.0); older versions quantize offline.
+        # https://github.com/vllm-project/vllm/pull/23014
+        if fp8_mode is not None and Version(vllm_version) >= Version("0.12.0"):
+            from torchao.core.config import config_to_dict
+            torchao_config = _get_torchao_fp8_config(fp8_mode)
+            hf_overrides = {
+                "quantization_config_dict_json": json.dumps(config_to_dict(torchao_config)),
+            }
+            engine_args["quantization"] = "torchao"
+            engine_args["hf_overrides"] = hf_overrides
+
+        good_keys = inspect.signature(AsyncEngineArgs if use_async else EngineArgs).parameters.keys()
+        old_keys = list(engine_args.keys())
+        for key in old_keys:
+            if key not in good_keys:
+                del engine_args[key]
+                print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
+            pass
+        pass
+
+        # Quick exit. The finally below restores the patch on the way out.
+        if return_args:
+            return engine_args
+
+        # Keep trying until success (2 times)
+        trials = 0
+        race_trials = 0
+        while True:
+            try:
+                if use_async:
+                    llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
+                elif use_engine:
+                    llm = LLMEngine.from_engine_args(EngineArgs(**engine_args))
+                else:
+                    llm = LLM(**engine_args)
+                pass
+                break
+            except Exception as error:
+                # Cleanup
+                for _ in range(3):
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                pass
+                error = str(error)
+                # `expandable_segments:True` + sleep/standby mode is a deterministic
+                # config clash raised by CuMemAllocator.__init__, not an OOM, and
+                # retrying with a smaller gpu_memory_utilization can never clear it.
+                # Its text mentions PYTORCH_CUDA_ALLOC_CONF (ours) or "memory pool"
+                # (upstream vLLM), so a loose "alloc" / "memory" substring test
+                # reported it as an OOM and sent users to fixes that cannot work.
+                if _is_expandable_segments_error(error):
+                    raise RuntimeError(_expandable_segments_standby_message(error))
+                # A transient race: retry the *identical* load rather than fall
+                # through to the generic "memory" branch below, which would shrink
+                # gpu_memory_utilization and max_num_seqs for the rest of the run
+                # over a failure neither caused. Standby is excluded because
+                # CuMemAllocator is a singleton in this process, so a second load
+                # would stack on the failed attempt's pool. Counted separately from
+                # `trials` so a race followed by a genuine OOM still gets its
+                # shrink-and-retry.
+                if _is_memory_profiling_race_error(error):
+                    race_trials += 1
+                    if race_trials < _MEMORY_PROFILING_RACE_MAX_TRIALS and not unsloth_vllm_standby:
+                        print(
+                            f"Unsloth: Another process on this GPU freed memory while vLLM was profiling. "
+                            f"Retrying the load unchanged ({race_trials} of {_MEMORY_PROFILING_RACE_MAX_TRIALS}).\n"
+                            f"Error:\n{error}"
+                        )
+                        continue
+                    raise RuntimeError(_memory_profiling_race_message(
+                        error,
+                        trials = race_trials,
+                        unsloth_vllm_standby = unsloth_vllm_standby,
+                    ))
+                trials += 1
+                if trials >= 2 or unsloth_vllm_standby:
+                    # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
+                    # We can't do retry because vLLM will fail to load with said error.
+                    if unsloth_vllm_standby and _is_out_of_memory_error(error):
+                        raise MemoryError(
+                            f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
+                            f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
+                            f"Try one of these fixes:\n"
+                            f"  1. Lower gpu_memory_utilization: model, tokenizer = FastLanguageModel.from_pretrained(..., gpu_memory_utilization=0.6)\n"
+                            f"  2. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
+                            f"  3. Use a smaller model or quantization (load_in_4bit=True)\n"
+                            f"Original error: {error}"
+                        )
+                    raise RuntimeError(error)
+
+                if "gpu_memory_utilization" in error or "memory" in error:
+                    approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)
+                    engine_args["max_num_seqs"] = approx_max_num_seqs
+                    engine_args["gpu_memory_utilization"] *= 0.85
+                    print(
+                        f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\
                         f"Error:\n{error}"
                     )
-                    continue
-                raise RuntimeError(_memory_profiling_race_message(
-                    error,
-                    trials = race_trials,
-                    unsloth_vllm_standby = unsloth_vllm_standby,
-                ))
-            trials += 1
-            if trials >= 2 or unsloth_vllm_standby:
-                # Sleep mode uses CuMemAllocator which can't run multiple instances in single process.
-                # We can't do retry because vLLM will fail to load with said error.
-                if unsloth_vllm_standby and _is_out_of_memory_error(error):
-                    raise MemoryError(
-                        f"Unsloth: Your GPU ran out of memory loading vLLM with standby mode enabled.\n"
-                        f"Your GPU has {total_gb:.1f} GB VRAM with gpu_memory_utilization={gpu_memory_utilization:.3f}.\n"
-                        f"Try one of these fixes:\n"
-                        f"  1. Lower gpu_memory_utilization: model, tokenizer = FastLanguageModel.from_pretrained(..., gpu_memory_utilization=0.6)\n"
-                        f"  2. Disable standby mode: remove os.environ['UNSLOTH_VLLM_STANDBY'] = '1'\n"
-                        f"  3. Use a smaller model or quantization (load_in_4bit=True)\n"
-                        f"Original error: {error}"
-                    )
-                raise RuntimeError(error)
-
-            if "gpu_memory_utilization" in error or "memory" in error:
-                approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)
-                engine_args["max_num_seqs"] = approx_max_num_seqs
-                engine_args["gpu_memory_utilization"] *= 0.85
-                print(
-                    f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\
-                    f"Error:\n{error}"
-                )
-            else:
-                # Detect FlashInfer JIT compilation failures due to missing nvcc/ninja
-                error_lower = error.lower()
-                if ("could not find nvcc" in error_lower) or \
-                   ("cuda_home" in error_lower and "does not exist" in error_lower):
-                    raise RuntimeError(
-                        f"FlashInfer failed to JIT-compile: nvcc (CUDA compiler) not found.\n"
-                        f"Fix options:\n"
-                        f"  1. Install the CUDA toolkit (nvcc) or set CUDA_HOME to your CUDA installation\n"
-                        f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
-                        f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
-                        f"Original error: {error}"
-                    )
-                elif ("ninja" in error_lower) and \
-                     ("no such file" in error_lower or "errno 2" in error_lower or "not found" in error_lower):
-                    raise RuntimeError(
-                        f"FlashInfer failed to JIT-compile: ninja (build tool) not found.\n"
-                        f"Fix options:\n"
-                        f"  1. Install ninja: pip install ninja\n"
-                        f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
-                        f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
-                        f"Original error: {error}"
-                    )
-                raise RuntimeError(error)
+                else:
+                    # Detect FlashInfer JIT compilation failures due to missing nvcc/ninja
+                    error_lower = error.lower()
+                    if ("could not find nvcc" in error_lower) or \
+                       ("cuda_home" in error_lower and "does not exist" in error_lower):
+                        raise RuntimeError(
+                            f"FlashInfer failed to JIT-compile: nvcc (CUDA compiler) not found.\n"
+                            f"Fix options:\n"
+                            f"  1. Install the CUDA toolkit (nvcc) or set CUDA_HOME to your CUDA installation\n"
+                            f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
+                            f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
+                            f"Original error: {error}"
+                        )
+                    elif ("ninja" in error_lower) and \
+                         ("no such file" in error_lower or "errno 2" in error_lower or "not found" in error_lower):
+                        raise RuntimeError(
+                            f"FlashInfer failed to JIT-compile: ninja (build tool) not found.\n"
+                            f"Fix options:\n"
+                            f"  1. Install ninja: pip install ninja\n"
+                            f"  2. Disable FlashInfer: set environment variable UNSLOTH_VLLM_NO_FLASHINFER=1\n"
+                            f"     e.g. import os; os.environ['UNSLOTH_VLLM_NO_FLASHINFER'] = '1'  # before importing unsloth\n"
+                            f"Original error: {error}"
+                        )
+                    raise RuntimeError(error)
+            pass
         pass
-    pass
-    # Save maximum requests length since llm.generate fails to partition inputs sometimes
-    llm.approx_max_num_seqs = approx_max_num_seqs
+        # Save maximum requests length since llm.generate fails to partition inputs sometimes
+        llm.approx_max_num_seqs = approx_max_num_seqs
 
-    # Unpatch vLLM compute_dtype for bitsandbytes
-    unpatch_vllm_compute_dtype(BitsAndBytesConfig)
+    finally:
+        unpatch_vllm_compute_dtype(BitsAndBytesConfig)
 
     # Check if sleep mode, and send the model to sleep
     # This is to counteract OOMs before GRPO is launched like pre-inference runs
@@ -3653,7 +3926,19 @@ def _test_get_vllm_state_dict(
         VLLM_SUPPORTED_VLM = get_vllm_supported_vlm()
         if model_type in VLLM_SUPPORTED_VLM:
             import transformers
-            model_class = getattr(transformers, config.architectures[0])
+            from .empty_model import _is_known_architecture
+            # `model_type` and `architectures` are independent fields of the same
+            # downloaded config.json, so the check above constrains neither this
+            # `getattr` nor the `from_pretrained` call below it: a config declaring a
+            # supported model_type and `architectures: ["AutoTokenizer"]` resolves and
+            # invokes an unrelated transformers class. Same gate as create_empty_vision_model.
+            architecture = config.architectures[0]
+            if not _is_known_architecture(architecture):
+                raise ValueError(
+                    f"Unsloth: config.json declares architecture `{architecture}`, which "
+                    f"is not a model architecture transformers registers."
+                )
+            model_class = getattr(transformers, architecture)
         else:
             raise ValueError(f"Unsloth: Model type {model_type} not supported for vision models")
 

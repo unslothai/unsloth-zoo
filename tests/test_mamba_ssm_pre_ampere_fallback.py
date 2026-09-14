@@ -506,8 +506,6 @@ def test_no_mamba_ssm_is_untouched(env):
     assert iu.is_mamba_ssm_available() is True
 
 
-# ---- transformers 5's Hub kernels ----------------------------------------
-#
 # lazy_load_kernel resolves mamba-ssm from kernels-community when the `kernels`
 # package is installed. It needs no local wheel and never calls
 # is_mamba_ssm_available, so the predicates above cannot reach it.
