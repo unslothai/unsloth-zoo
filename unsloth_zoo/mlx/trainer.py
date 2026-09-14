@@ -3911,6 +3911,12 @@ class MLXTrainer:
         Returns ``(all_losses, ntokens, stats)``; ``stats`` is None unless the
         loss function also reports per-batch metric sums.
         """
+        compact_preference = (
+            isinstance(eval_batches, FinitePreferenceBatchPlan)
+            and getattr(loss_fn, "_unsloth_cce_compaction", False)
+        )
+        if compact_preference:
+            eval_batches.configure_cce_compaction(kind=loss_fn._unsloth_cce_kind)
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
         metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
@@ -3925,6 +3931,7 @@ class MLXTrainer:
         if should_stop:
             return all_losses, ntokens, stats
         iterator = iter(eval_batches)
+        batch_index = 0
 
         while True:
             failed = False
@@ -3941,11 +3948,12 @@ class MLXTrainer:
 
             if not failed and not self.stop_requested:
                 try:
+                    if compact_preference:
+                        batch_data = eval_batches.prepare_cce_batch(batch_index, batch_data)
                     if is_vlm:
                         scored = loss_fn(self.model, batch_data)
                     else:
-                        batch, lengths, labels = batch_data
-                        scored = loss_fn(self.model, batch, lengths, labels)
+                        scored = loss_fn(self.model, *batch_data)
                     loss, ntoks = scored[0], scored[1]
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
@@ -3967,6 +3975,8 @@ class MLXTrainer:
                 except BaseException as exc:
                     failed = True
                     error = exc
+
+            batch_index += 1
 
             should_stop, failed_any = self._distributed_eval_status(failed)
             self._raise_distributed_failure_from_any(
@@ -5500,6 +5510,7 @@ class MLXTrainer:
             # Not the training loss: that one normalizes across a window.
             preference_eval_fn = make_preference_eval_fn(
                 objective, reference_policy=_sampling_reference,
+                model=model if args.use_cce else None,
             )
             if isinstance(batches, FinitePreferenceBatchPlan):
                 batches.configure_cce_compaction(
