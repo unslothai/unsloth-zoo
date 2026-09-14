@@ -2628,9 +2628,10 @@ def patch_GptOssModel():
                     and input_embeds is not None
                     and input_embeds.requires_grad
                 )
-            _flex_will_run = _is_flex or _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
-
-            if _training and _flex_will_run:
+            # Only zoo's patched forward builds its own BlockMask. Stock transformers
+            # flex attention takes causality from whatever this factory returns, so a
+            # flex _attn_implementation on its own is not a reason to skip.
+            if _training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:

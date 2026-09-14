@@ -184,6 +184,18 @@ def test_training_builds_the_mask_when_the_flex_forward_is_absent(wrapper, flex_
     assert got == "DENSE_MASK"
 
 
+def test_flex_training_builds_the_mask_when_the_flex_forward_is_absent(wrapper, flex_absent):
+    """Stock transformers flex attention takes causality from this factory rather than
+    building its own, so a flex config without the patched forward still needs a mask."""
+    with torch.enable_grad():
+        got = wrapper.fn(
+            config = _config("flex_attention", training = True),
+            input_embeds = _embeds(True),
+            attention_mask = torch.ones(2, 4, dtype = torch.int64),
+        )
+    assert got == "DENSE_MASK"
+
+
 def test_grad_enabled_inference_gets_a_mask(wrapper, flex_installed):
     """A plain forward outside no_grad is still inference: the recorded training
     flag settles it, where the old requires_grad guess could not."""
