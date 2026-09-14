@@ -3911,12 +3911,15 @@ class MLXTrainer:
         Returns ``(all_losses, ntokens, stats)``; ``stats`` is None unless the
         loss function also reports per-batch metric sums.
         """
-        compact_preference = (
-            isinstance(eval_batches, FinitePreferenceBatchPlan)
+        compact_batches = (
+            isinstance(eval_batches, (FiniteTextBatchPlan, FinitePreferenceBatchPlan))
             and getattr(loss_fn, "_unsloth_cce_compaction", False)
         )
-        if compact_preference:
-            eval_batches.configure_cce_compaction(kind=loss_fn._unsloth_cce_kind)
+        if compact_batches:
+            if isinstance(eval_batches, FinitePreferenceBatchPlan):
+                eval_batches.configure_cce_compaction(kind=loss_fn._unsloth_cce_kind)
+            else:
+                eval_batches.configure_cce_compaction()
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
         metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
@@ -3948,7 +3951,7 @@ class MLXTrainer:
 
             if not failed and not self.stop_requested:
                 try:
-                    if compact_preference:
+                    if compact_batches:
                         batch_data = eval_batches.prepare_cce_batch(batch_index, batch_data)
                     if is_vlm:
                         scored = loss_fn(self.model, batch_data)
@@ -4053,7 +4056,8 @@ class MLXTrainer:
                 max_batches=max_batches,
                 comm_group=self.distributed_world,
             )
-        return create_batches(
+        batch_factory = _create_text_batch_plan if args.use_cce else create_batches
+        return batch_factory(
             **common,
             comm_group=self.distributed_world,
             distributed_pad_mode="empty",
@@ -9068,6 +9072,7 @@ def _prepare_response_labeled_eval_batches(
             return_dataset=True,
             comm_group=comm_group,
             distributed_pad_mode="empty",
+            return_plan=True,
         )
         return batches, response_masked_dataset
 

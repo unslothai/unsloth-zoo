@@ -1893,6 +1893,31 @@ def test_sized_response_training_defers_lazy_eval_with_override_tokenizer():
     assert batch[2].tolist() == [[-100, -100, -100, 2]]
 
 
+def test_response_only_eval_batches_stay_a_finite_plan():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, train_on_responses_only,
+    )
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan
+
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _StreamingTextTokenizer(100),
+        [{"text": "10 1 20 2"}],
+        eval_dataset=[{"text": "10 1 20 2"}],
+        args=MLXTrainingConfig(
+            max_steps=1, completion_only_loss=False,
+            per_device_train_batch_size=1,
+        ),
+    )
+    train_on_responses_only(trainer, instruction_part="10", response_part="20")
+
+    # Evaluation compacts CCE supervision only for finite plans.
+    eval_batches = trainer._eval_batches_labeled
+    assert isinstance(eval_batches, FiniteTextBatchPlan)
+    batch = next(iter(eval_batches))
+    assert batch[0][0, :4].tolist() == [110, 101, 120, 102]
+    assert [label for label in batch[2][0].tolist() if label != -100] == [102]
+
+
 def test_length_declaring_text_stream_supports_epoch_replay():
     MLXTrainer, trainer = _streaming_text_trainer(
         max_steps=0, num_train_epochs=2,
