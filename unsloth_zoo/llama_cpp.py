@@ -29,6 +29,7 @@ __all__ = [
     "IS_WINDOWS",
 ]
 
+import errno
 import subprocess
 import sys
 import os
@@ -381,9 +382,15 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
             # below still distinguishes Ctrl-D, and it holds for these too, since a closed
             # sys.stdin makes isatty() raise and a closed fd 0 makes it return False.
             #
-            # CPython raises RuntimeError for a lost stdout or stderr too, and an unrelated
-            # failure must not read as consent. Accept it only when stdin itself is gone.
+            # Each type is accepted only in the exact state that means "stdin is gone".
+            # An unrelated I/O error on a live stdin is not consent: EIO from a serial
+            # console, or a ValueError out of a custom stdin wrapper, must still propagate.
+            # CPython raises RuntimeError for a lost stdout or stderr too.
             if isinstance(exception, RuntimeError) and sys.stdin is not None:
+                raise
+            if isinstance(exception, OSError) and exception.errno != errno.EBADF:
+                raise
+            if isinstance(exception, ValueError) and not getattr(sys.stdin, "closed", False):
                 raise
             # EOFError on a terminal is Ctrl-D and still cancels. EOFError with no terminal
             # means there was never anyone to ask, which is the same implicit ENTER the
@@ -1321,6 +1328,19 @@ def install_llama_cpp(
         needs_clone = True
         needs_build = True
     pass
+
+    # Everything below this point installs something: the prebuilt download, the clone, and
+    # do_we_need_sudo, which probes by RUNNING `apt-get update -y` / `pacman -Sy` / a yum
+    # check-update and then retrying under sudo. Checking the opt-out only inside
+    # install_package left all of that reachable, so UNSLOTH_AUTO_INSTALL=0 still fetched and
+    # activated a prebuilt llama.cpp, and still ran a package-manager update as root.
+    # An existing install is unaffected: that returns above without reaching here.
+    if (needs_build or needs_clone) and not _auto_install_enabled():
+        raise RuntimeError(
+            "Unsloth: llama.cpp is not installed and automatic installation was declined "
+            "(UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
 
     # Prefer official prebuilt binaries before any source-build work
     # (no system package installs, no clone, no compile).

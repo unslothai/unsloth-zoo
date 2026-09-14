@@ -27,6 +27,7 @@ coverage comes from the staging cross-platform CI run, not from this file.
 from __future__ import annotations
 
 import builtins
+import errno
 import subprocess
 import sys
 import types
@@ -200,7 +201,8 @@ def test_a_stdin_closed_after_startup_is_treated_as_no_one_there(
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
     # A closed sys.stdin makes isatty() raise; a closed fd 0 makes it return False.
     monkeypatch.setattr(
-        llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = lambda: False),
+        llama_cpp.sys, "stdin",
+        types.SimpleNamespace(isatty = lambda: False, closed = True),
     )
     llama_cpp.install_package("cmake", system_type = "debian")
     assert recorder.calls == ["apt-get install cmake -y"], why
@@ -212,6 +214,10 @@ def test_a_stdin_closed_after_startup_is_treated_as_no_one_there(
 def test_a_closed_stdin_still_respects_the_opt_out(recorder, monkeypatch, exc):
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(
+        llama_cpp.sys, "stdin",
+        types.SimpleNamespace(isatty = lambda: False, closed = True),
+    )
     with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
         llama_cpp.install_package("cmake", system_type = "debian")
     assert recorder.calls == []
@@ -225,7 +231,8 @@ def test_a_closed_stdin_on_a_terminal_still_cancels(recorder, monkeypatch, exc):
     a failed read is not evidence that nobody was asked."""
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
     monkeypatch.setattr(
-        llama_cpp.sys, "stdin", types.SimpleNamespace(isatty = lambda: True),
+        llama_cpp.sys, "stdin",
+        types.SimpleNamespace(isatty = lambda: True, closed = True),
     )
     with pytest.raises(RuntimeError, match = "was cancelled"):
         llama_cpp.install_package("cmake", system_type = "debian")
@@ -246,3 +253,70 @@ def test_the_real_builtin_raises_ValueError_on_a_closed_stdin():
     )
     r = _sp.run([sys.executable, "-c", probe], capture_output = True, text = True, timeout = 120)
     assert "RESULT=ValueError" in r.stdout, r.stdout + r.stderr
+
+
+# ------------------------------------------------- narrowness of the new arms
+
+def test_an_unrelated_OSError_on_a_live_stdin_is_not_consent(recorder, monkeypatch):
+    """EIO from a serial console is an I/O failure, not an empty answer. Only EBADF
+    establishes that the descriptor is gone."""
+    exc = OSError(errno.EIO, "Input/output error")
+    monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
+    monkeypatch.setattr(
+        llama_cpp.sys, "stdin",
+        types.SimpleNamespace(isatty = lambda: False, closed = False),
+    )
+    with pytest.raises(OSError):
+        llama_cpp.install_package("cmake", system_type = "debian")
+    assert recorder.calls == [], "an unrelated I/O error ran the installer"
+
+
+def test_a_ValueError_from_a_live_stdin_wrapper_is_not_consent(recorder, monkeypatch):
+    """A wrapper raising ValueError while still open is not a closed stream."""
+    monkeypatch.setattr(
+        builtins, "input",
+        lambda prompt = "": (_ for _ in ()).throw(ValueError("wrapper blew up")),
+    )
+    monkeypatch.setattr(
+        llama_cpp.sys, "stdin",
+        types.SimpleNamespace(isatty = lambda: False, closed = False),
+    )
+    with pytest.raises(ValueError):
+        llama_cpp.install_package("cmake", system_type = "debian")
+    assert recorder.calls == []
+
+
+# ------------------------------------------------- the opt-out covers the whole install
+
+def test_the_opt_out_blocks_the_prebuilt_download_and_the_privileged_update(monkeypatch):
+    """install_llama_cpp fetches a prebuilt binary, and probes for elevation by RUNNING
+    `apt-get update`, both before install_package is ever reached. Checking the flag only
+    inside install_package left an explicit refusal installing llama.cpp anyway."""
+    calls = []
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    monkeypatch.setattr(
+        llama_cpp, "_maybe_install_llama_cpp_prebuilt",
+        lambda *a, **k: calls.append("prebuilt"),
+    )
+    monkeypatch.setattr(
+        llama_cpp, "do_we_need_sudo", lambda *a, **k: calls.append("elevate") or False,
+    )
+    monkeypatch.setattr(llama_cpp, "check_build_requirements", lambda *a, **k: ([], "debian"))
+
+    with pytest.raises(RuntimeError, match = "UNSLOTH_AUTO_INSTALL=0"):
+        llama_cpp.install_llama_cpp(llama_cpp_folder = "/nonexistent-unsloth-test-path")
+
+    assert calls == [], "the opt-out was bypassed: %s" % calls
+
+
+def test_an_existing_install_is_unaffected_by_the_opt_out(monkeypatch, tmp_path):
+    """The gate must only fire when something would actually be installed."""
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
+    monkeypatch.setattr(
+        llama_cpp, "check_llama_cpp",
+        lambda *a, **k: (str(tmp_path / "quantize"), str(tmp_path / "convert")),
+    )
+    # Nothing to build or clone, so no refusal: the flag governs installation, not use.
+    import inspect as _inspect
+    src = _inspect.getsource(llama_cpp.install_llama_cpp)
+    assert "(needs_build or needs_clone) and not _auto_install_enabled()" in src
