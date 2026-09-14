@@ -275,3 +275,16 @@ def test_a_failed_load_vllm_restores_flashinfer():
     assert "_unblock_flashinfer_import()" in tail
     assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in tail
     assert "raise" in tail, "the original error must still propagate"
+
+
+def test_return_args_does_not_leave_flashinfer_blocked():
+    """`load_vllm(..., return_args=True)` builds no engine, so nothing will ever reach
+    delete_vllm to lift the block, and the failure arm is not reached either. The pin
+    still travels in engine_args, so the caller keeps the decision."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    marker = source.index("if return_args:")
+    window = source[marker:marker + 700]
+    assert "_unblock_flashinfer_import()" in window, "the dry-run exit leaks the block"
+    assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in window
+    unblock = window.index("_unblock_flashinfer_import()")
+    assert unblock < window.index("return engine_args"), "restore must precede the return"

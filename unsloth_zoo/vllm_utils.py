@@ -3211,6 +3211,12 @@ def load_vllm(
 
         # Quick exit. The finally below restores the patch on the way out.
         if return_args:
+            # No engine is built here, so nothing will ever reach delete_vllm to lift the
+            # block, and the failure arm below is not reached either. engine_args already
+            # carries the FLASH_ATTN pin where one applies, so the caller keeps the
+            # decision without the session keeping a hidden module.
+            _unblock_flashinfer_import()
+            _UNSLOTH_FLASHINFER_UNUSABLE = False
             return engine_args
 
         # Keep trying until success (2 times)
