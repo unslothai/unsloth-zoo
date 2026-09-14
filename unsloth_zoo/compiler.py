@@ -3639,7 +3639,6 @@ def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
         This lets the first autotune run find the best config normally,
         then reuses it for any unseen key (e.g. different NB from
         variable sequence lengths), preventing repeated benchmarking."""
-        _unsloth_reuse_best = True
 
         def __contains__(self, key):
             return len(self) > 0 or super().__contains__(key)

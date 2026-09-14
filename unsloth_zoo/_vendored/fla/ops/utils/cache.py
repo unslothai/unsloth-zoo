@@ -391,36 +391,7 @@ class CachedAutotuner(Autotuner):
             return True
         return key.autotune_key not in self.cache
 
-    def _run_with_stored_config(self, config, *args, **kwargs):
-        """Launch with a pinned config; same hooks as ``Autotuner._bench`` / ``Autotuner.run``."""
-        self.nargs = dict(zip(self.arg_names, args))
-        self.best_config = config
-        full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
-        if config.pre_hook is not None:
-            config.pre_hook(full_nargs)
-        self.pre_hook(full_nargs)
-        try:
-            try:
-                ret = self.fn.run(*args, **kwargs, **config.all_kwargs())
-            except Exception as exc:
-                self.post_hook(full_nargs, exc)
-                raise
-            self.post_hook(full_nargs, None)
-            return ret
-        finally:
-            self.nargs = None
-
     def run(self, *args, **kwargs):
-        # Steady state after ``compile_fla_no_autotune``'s ``_ReuseBestCache``: one tuned
-        # config is reused for every runtime key — skip per-launch key construction.
-        if (
-            len(self.configs) > 1
-            and getattr(self.cache, "_unsloth_reuse_best", False)
-            and len(self.cache) > 0
-            and FLA_CACHE_MODE is not FlaCacheMode.ALWAYS
-        ):
-            return self._run_with_stored_config(next(iter(self.cache.values())), *args, **kwargs)
-
         if FLA_CACHE_MODE is not FlaCacheMode.DISABLED:
             triton_key = triton_runtime_autotune_key(
                 self.arg_names, self.keys, args, kwargs,

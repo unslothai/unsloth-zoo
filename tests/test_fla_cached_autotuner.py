@@ -78,18 +78,6 @@ def cache_mod():
                 sys.modules[key] = previous
 
 
-class _ReuseBestCache(dict):
-    _unsloth_reuse_best = True
-
-    def __contains__(self, key):
-        return len(self) > 0 or super().__contains__(key)
-
-    def __getitem__(self, key):
-        if not super().__contains__(key) and len(self) > 0:
-            return next(iter(self.values()))
-        return super().__getitem__(key)
-
-
 def _make_autotuner(cache_mod, cache, configs=(MagicMock(), MagicMock())):
     CachedAutotuner = cache_mod.CachedAutotuner
     fn = MagicMock()
@@ -131,70 +119,21 @@ def test_run_skips_autotune_key_when_fla_cache_disabled(cache_mod, monkeypatch):
             parent_run.assert_called_once()
 
 
-def test_reuse_best_cache_fast_path_skips_parent_run(cache_mod):
+def test_run_delegates_to_parent_even_with_warm_autotune_cache(cache_mod):
+    """``compile_fla_no_autotune`` may pre-fill the cache; launches must still use ``Autotuner.run``."""
     cfg = MagicMock()
-    cfg.pre_hook = None
-    cfg.all_kwargs.return_value = {}
-    cache = _ReuseBestCache({(1,): cfg})
-    tuner, fn = _make_autotuner(cache_mod, cache)
-    with patch("triton.runtime.autotuner.Autotuner.run") as parent_run:
-        assert tuner.run(1) == "ok"
-        parent_run.assert_not_called()
-        fn.run.assert_called_once()
+    cache = {(1,): cfg}
+    tuner, _fn = _make_autotuner(cache_mod, cache)
+    with patch("triton.runtime.autotuner.Autotuner.run", return_value="parent") as parent_run:
+        assert tuner.run(1) == "parent"
+        parent_run.assert_called_once_with(1)
 
 
-def test_reuse_best_fast_path_disabled_for_fla_cache_always(cache_mod, monkeypatch):
+def test_fla_cache_always_still_loads_disk_config(cache_mod, monkeypatch):
     monkeypatch.setattr(cache_mod, "FLA_CACHE_MODE", cache_mod.FlaCacheMode.ALWAYS)
-    cfg = MagicMock()
-    cfg.pre_hook = None
-    cfg.all_kwargs.return_value = {}
-    cache = _ReuseBestCache({(1,): cfg})
-    tuner, fn = _make_autotuner(cache_mod, cache)
+    tuner, _fn = _make_autotuner(cache_mod, {})
     with patch.object(tuner, "maybe_load_cached_config") as load_cfg:
         with patch("triton.runtime.autotuner.Autotuner.run", return_value="parent") as parent_run:
             assert tuner.run(1) == "parent"
             parent_run.assert_called_once()
-            fn.run.assert_not_called()
             load_cfg.assert_called_once()
-
-
-def test_reuse_best_fast_path_runs_autotuner_pre_hook(cache_mod):
-    cfg = MagicMock()
-    cfg.pre_hook = None
-    cfg.all_kwargs.return_value = {}
-    cache = _ReuseBestCache({(1,): cfg})
-    buf = MagicMock()
-    tuner, fn = _make_autotuner(cache_mod, cache)
-    tuner.reset_to_zero = ["x"]
-    pre = MagicMock()
-    tuner.pre_hook = pre
-    tuner.post_hook = MagicMock()
-    with patch("triton.runtime.autotuner.Autotuner.run") as parent_run:
-        assert tuner.run(buf) == "ok"
-        parent_run.assert_not_called()
-        pre.assert_called_once()
-        fn.run.assert_called_once()
-
-
-def test_reuse_best_fast_path_zeros_reset_to_zero_from_init(cache_mod):
-    cfg = MagicMock()
-    cfg.pre_hook = None
-    cfg.all_kwargs.return_value = {}
-    cache = _ReuseBestCache({(1,): cfg})
-    fn = MagicMock()
-    fn.configure_mock(run=MagicMock(return_value="ok"), arg_names=["x"], __name__="test_kernel")
-    inner = SimpleNamespace(fn=fn, __name__="test_kernel")
-    buf = MagicMock()
-    tuner = cache_mod.CachedAutotuner(
-        inner,
-        ["x"],
-        [MagicMock(), MagicMock()],
-        ["x"],
-        ["x"],
-        [],
-    )
-    tuner.cache = cache
-    tuner.fn = fn
-    with patch("triton.runtime.autotuner.Autotuner.run"):
-        tuner.run(buf)
-    buf.zero_.assert_called_once()
