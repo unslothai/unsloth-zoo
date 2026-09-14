@@ -61,6 +61,21 @@ def test_a_tied_lm_head_that_disagrees_is_still_reported(head, embed):
         assert_same_state_dict({**base, head: w(1.0)}, dict(base))
 
 
+@pytest.mark.parametrize("head, embed", PAIRS)
+def test_a_new_only_tied_head_is_checked_against_its_embedding(head, embed):
+    # The per-key loop walks old_state_dict, so a head only vLLM emits reached no
+    # comparison at all and a wrong conversion validated clean.
+    base = {embed: w(0.0)}
+    with pytest.raises(RuntimeError):
+        assert_same_state_dict(dict(base), {**base, head: w(1.0)})
+
+
+def test_a_new_only_head_with_no_embedding_to_check_against_is_not_a_failure():
+    # Nothing to compare it to, so this must stay silent rather than invent a failure.
+    sd = {"model.layers.0.q_proj.weight": w()}
+    assert_same_state_dict(dict(sd), {**sd, "lm_head.weight": w(1.0)})
+
+
 def test_genuine_key_differences_still_raise():
     base = {"model.embed_tokens.weight": w()}
     with pytest.raises(RuntimeError):

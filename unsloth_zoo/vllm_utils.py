@@ -1404,6 +1404,25 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
             else:
                 failures[key] = error
         pass
+
+    # The loop above walks old_state_dict, so a tied head excused from the difference
+    # check but present only on the new side was never compared to anything.
+    for key in sorted(TIED_LM_HEAD_KEYS & (new_state_dict.keys() - old_state_dict.keys())):
+        ref = next((k for k in (key.replace("lm_head", "embed_tokens"),) + TIED_EMBED_KEYS
+                    if k in old_state_dict), None)
+        if ref is None: continue
+        old_val = _normalize_state_dict_tensor(old_state_dict[ref])
+        new_val = _normalize_state_dict_tensor(new_state_dict[key])
+        if old_val is None or new_val is None: continue
+        try:
+            torch.testing.assert_close(
+                old_val.to(torch.float32), new_val.to(torch.float32),
+                check_stride = False, atol = 1e-4, rtol = 1e-3,
+            )
+        except Exception as error:
+            failures[key] = error
+    pass
+
     if len(failures) > 0:
         error_message = "\n".join([f"[{key}]\n{str(error)}" for key, error in failures.items()])
         raise RuntimeError(f"Unsloth: Failed comparing state_dict with {len(failures)}: {error_message}")
