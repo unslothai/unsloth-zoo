@@ -4485,6 +4485,12 @@ DISABLE_COMPILE_MODULES = [
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
     "Qwen3_5MoeGatedDeltaNet",
+    # Vision encoders and embedders: spatial precision (#6028).
+    "Gemma4VisionPatchEmbedder",
+    "Gemma4VisionModel",
+    "Gemma4VisionEncoder",
+    "Gemma4VisionEncoderLayer",
+    "Gemma4MultimodalEmbedder",
     # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
     # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
     "DeepseekV4HyperConnection",
@@ -5508,7 +5514,8 @@ def unsloth_compile_transformers(
             pass
         pass
     pass
-    # Add back to functions since failed compiling
+    # Import allow-list for the generated cache, not a compile list: the emitted
+    # classes still reference uncompiled modules and NameError without them.
     functions += list(bad_torch_modules)
 
     if len(pretrained_modules) > 0:
