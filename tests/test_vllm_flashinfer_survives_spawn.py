@@ -106,8 +106,8 @@ def test_engine_arg_is_set_only_when_flashinfer_was_rejected():
     instead of falling through. Setting it unconditionally would break hosts
     where FlashInfer works, and ROCm, which never reaches the blocker."""
     source = inspect.getsource(vllm_utils.load_vllm)
-    assert 'if _UNSLOTH_FLASHINFER_UNUSABLE:' in source
-    guard = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE:")
+    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():" in source
+    guard = source.index("if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():")
     assign = source.index('engine_args["attention_backend"] = "FLASH_ATTN"')
     assert guard < assign, "the assignment is not behind the guard"
 
@@ -163,3 +163,73 @@ def test_installed_vllm_accepts_the_argument_or_the_filter_drops_it():
     if not accepted:
         source = inspect.getsource(vllm_utils.load_vllm)
         assert "del engine_args[key]" in source
+
+
+# ------------------------------------------------- the pin must not be a downgrade
+
+@pytest.mark.parametrize(
+    "capability, expected",
+    [((7, 0), False), ((7, 5), False), ((8, 0), True), ((9, 0), True), ((10, 0), True)],
+)
+def test_flash_attn_is_only_pinned_from_ampere_up(monkeypatch, capability, expected):
+    """FLASH_ATTN declares supports_compute_capability() >= (8, 0), and an explicitly
+    selected backend is a HARD requirement in vLLM: platforms/cuda.py raises "Selected
+    backend ... is not valid for this configuration" rather than falling through.
+
+    So pinning it on Volta (V100, 7.0) or Turing (T4, 7.5) converts a working XFORMERS
+    run into a startup error, every time the FlashInfer pre-flight rejects."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: capability)
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    assert vllm_utils._flash_attn_is_selectable() is expected
+
+
+def test_flash_attn_is_not_pinned_on_rocm(monkeypatch):
+    """FLASH_ATTN is a CUDA backend. ROCm already takes its own branch in the pre-flight
+    and must never be handed a CUDA-only hard pin."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    monkeypatch.setattr(torch.version, "hip", "6.2.0", raising = False)
+    assert vllm_utils._flash_attn_is_selectable() is False
+
+
+def test_flash_attn_is_not_pinned_without_cuda(monkeypatch):
+    """XPU and CPU: FLASH_ATTN is not a valid backend there at all."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert vllm_utils._flash_attn_is_selectable() is False
+
+
+def test_an_unknown_device_does_not_get_a_hard_pin(monkeypatch):
+    """Fail open. If we cannot establish the capability we have no basis for imposing a
+    requirement vLLM will treat as absolute."""
+    import torch
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    def _boom(*a, **k):
+        raise RuntimeError("no device")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", _boom)
+    assert vllm_utils._flash_attn_is_selectable() is False
+
+
+def test_the_engine_arg_is_gated_on_the_capability_check():
+    """Both conditions, not just the pre-flight verdict."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    assert "if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():" in source
+
+
+def test_installed_vllm_still_requires_sm80_for_flash_attn():
+    """Pin the premise against the installed vLLM rather than trusting it. If upstream
+    relaxes this, the guard is merely conservative, not wrong."""
+    import importlib.util
+    import pathlib
+    spec = importlib.util.find_spec("vllm")
+    if spec is None or not spec.origin:
+        pytest.skip("vLLM not installed")
+    fa = pathlib.Path(spec.origin).parent / "v1" / "attention" / "backends" / "flash_attn.py"
+    if not fa.exists():
+        pytest.skip("flash_attn backend not present in this vLLM")
+    text = fa.read_text()
+    assert "supports_compute_capability" in text
+    assert "DeviceCapability(8, 0)" in text

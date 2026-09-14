@@ -2313,6 +2313,26 @@ def _block_flashinfer_import():
         pass
 
 
+def _flash_attn_is_selectable() -> bool:
+    """Whether pinning FLASH_ATTN is safe on this device.
+
+    vLLM's FlashAttention backend declares supports_compute_capability() >= (8, 0), and an
+    explicitly selected backend is a hard requirement: platforms/cuda.py raises rather than
+    falling back. Pre-Ampere CUDA (T4 7.5, V100 7.0), ROCm and XPU must therefore be left to
+    choose for themselves."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        if getattr(torch.version, "hip", None):
+            return False
+        major, minor = torch.cuda.get_device_capability()
+        return (major, minor) >= (8, 0)
+    except Exception:
+        # Unknown device: do not impose a hard pin we cannot justify.
+        return False
+
+
 def _unblock_flashinfer_import():
     """Undo `_block_flashinfer_import`, restoring sys.modules to what it held before.
 
@@ -3168,10 +3188,14 @@ def load_vllm(
             engine_args["hf_overrides"] = hf_overrides
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
-        # fork. Set ONLY when the pre-flight rejected FlashInfer: an explicit backend is a
-        # hard pin that makes vLLM raise on an unsupported value instead of falling
-        # through, so doing it unconditionally would break healthy hosts and ROCm.
-        if _UNSLOTH_FLASHINFER_UNUSABLE:
+        # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
+        # not valid for this configuration" instead of falling through, and FLASH_ATTN
+        # declares supports_compute_capability() >= (8, 0). So pinning it on Turing (T4,
+        # 7.5) or Volta (V100, 7.0) turns a working XFORMERS run into a startup error, and
+        # it is not an XPU backend at all. Restrict the pin to CUDA sm_80+, which covers
+        # the Blackwell case this exists for; everywhere else the sys.modules block still
+        # applies and vLLM picks its own compatible fallback.
+        if _UNSLOTH_FLASHINFER_UNUSABLE and _flash_attn_is_selectable():
             engine_args["attention_backend"] = "FLASH_ATTN"
 
         # Older vLLM has no such arg; the filter below drops unknown keys, so this is a
