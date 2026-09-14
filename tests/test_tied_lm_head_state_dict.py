@@ -63,8 +63,6 @@ def test_a_tied_lm_head_that_disagrees_is_still_reported(head, embed):
 
 @pytest.mark.parametrize("head, embed", PAIRS)
 def test_a_new_only_tied_head_is_checked_against_its_embedding(head, embed):
-    # The per-key loop walks old_state_dict, so a head only vLLM emits reached no
-    # comparison at all and a wrong conversion validated clean.
     base = {embed: w(0.0)}
     with pytest.raises(RuntimeError):
         assert_same_state_dict(dict(base), {**base, head: w(1.0)})

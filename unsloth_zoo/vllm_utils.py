@@ -1405,8 +1405,7 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
                 failures[key] = error
         pass
 
-    # The loop above walks old_state_dict, so a tied head excused from the difference
-    # check but present only on the new side was never compared to anything.
+    # The loop above walks old_state_dict, so a new-only tied head met no comparison.
     for key in sorted(TIED_LM_HEAD_KEYS & (new_state_dict.keys() - old_state_dict.keys())):
         ref = next((k for k in (key.replace("lm_head", "embed_tokens"),) + TIED_EMBED_KEYS
                     if k in old_state_dict), None)
