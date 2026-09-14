@@ -368,12 +368,9 @@ class UnslothFusedLoss(torch.autograd.Function):
         global _FUSED_CE_COMPILE_SUPPORTED
         uncompiled_accumulate_chunk = accumulate_chunk
 
-        # A fully ignored chunk contributes nothing, and when the WHOLE batch is
-        # ignored the divisor is 0 and the loss is NaN, so skipping is required,
-        # not just faster. Fold the mask instead of reducing per chunk: that is a
-        # fixed number of kernels and one sync at any n_chunks, and get_chunk_size
-        # routinely picks hundreds. torch.chunk is equal-sized bar the last, so
-        # padding to that size gives exactly one flag per chunk.
+        # Required, not just faster: an all-ignored batch has divisor 0, so NaN.
+        # Fold the mask rather than reduce per chunk (get_chunk_size picks hundreds):
+        # fixed kernels, one sync. torch.chunk is equal-sized bar the last.
         _chunk_size = __shift_labels[0].numel()
         _valid = (labels != ignore_index)
         _pad = (-_valid.numel()) % _chunk_size

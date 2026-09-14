@@ -53,7 +53,6 @@ def _shift(labels, ignore=-100):
 
 
 def _reference(x, w, labels, n_items, ignore=-100):
-    """Unchunked: materialize every logit, one cross entropy, one backward."""
     xr = x.detach().clone().requires_grad_(True)
     shifted = _shift(labels, ignore).reshape(-1)
     logits = F.linear(xr, w).float().reshape(-1, VOCAB)
@@ -94,7 +93,6 @@ def _n_empty_chunks(labels, ignore=-100):
 
 
 def test_sparse_mask_matches_unchunked_reference():
-    """Most chunks fully ignored: the answer must not move."""
     x, w = _inputs()
     labels = _suffix_labels()
     assert _n_empty_chunks(labels) > 0, "test shape stopped producing empty chunks"
@@ -127,12 +125,7 @@ def test_skipped_chunks_are_zeroed_not_left_uninitialised():
 
 @pytest.mark.parametrize("n_items_given", [False, True])
 def test_fully_ignored_batch_is_finite_zero(n_items_given):
-    """Every label ignored: finite zero, never NaN.
-
-    Without `n_items` the divisor is 0. Both halves co-occur:
-    `_unsloth_get_batch_samples` leaves it unset (test_loss_normalization_contract)
-    and a truncated sample is fully ignored.
-    """
+    """Divisor is 0 without `n_items`; a truncated sample really is fully ignored."""
     x, w = _inputs(seed=4)
     labels = torch.full((BSZ, QLEN), -100, dtype=torch.long)
     n_items = torch.tensor(1) if n_items_given else None
@@ -146,7 +139,6 @@ def test_fully_ignored_batch_is_finite_zero(n_items_given):
 
 
 def test_skip_uses_configured_ignore_index():
-    """A non-default ignore_index must be honoured by the skip predicate."""
     ignore = -1
     x, w = _inputs(seed=5)
     labels = _suffix_labels(ignore=ignore, seed=6)
@@ -175,7 +167,6 @@ def test_skip_uses_configured_ignore_index():
 
 
 def test_fully_ignored_batch_does_not_strand_the_compile_probe():
-    """An all-ignored batch has no chunk to probe with; the next one must work."""
     previous = ce._FUSED_CE_COMPILE_SUPPORTED
     try:
         ce._FUSED_CE_COMPILE_SUPPORTED = None
@@ -196,7 +187,6 @@ def test_fully_ignored_batch_does_not_strand_the_compile_probe():
 
 
 def test_dense_mask_is_unchanged_by_the_skip():
-    """No chunk is empty: the skip must be a no-op on the common path."""
     x, w = _inputs(seed=9)
     g = torch.Generator().manual_seed(10)
     labels = torch.randint(0, VOCAB, (BSZ, QLEN), generator=g)
