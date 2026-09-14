@@ -25,9 +25,24 @@ import os
 import pytest
 
 # Before the import: CI installs unsloth with `|| true`, and zoo raises without this flag.
-os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
-
-from unsloth_zoo.compiler import higher_precision_layernorms  # noqa: E402
+#
+# Put back afterwards, which the plain setdefault did not do. This runs at COLLECTION, and
+# pytest imports every selected module before running any test, so leaving it set handed the
+# flag to the whole xdist worker: `__init__.py:179` reads it into _SKIP_GPU_INIT, which skips
+# the import-time allocator block and pins DEVICE_TYPE to "cpu". The suite then reported
+# test_alloc_conf_platform_matrix.py as "the product wrote no allocator vars" and
+# test_temporary_patches_imports.py as "device_memory is 0", neither of which was true of the
+# product. Only the import needs the flag, and _SKIP_GPU_INIT is read once at zoo import.
+_GPU_INIT_GATE = "UNSLOTH_ZOO_DISABLE_GPU_INIT"
+_previous_gate = os.environ.get(_GPU_INIT_GATE)
+try:
+    os.environ.setdefault(_GPU_INIT_GATE, "1")
+    from unsloth_zoo.compiler import higher_precision_layernorms  # noqa: E402
+finally:
+    if _previous_gate is None:
+        os.environ.pop(_GPU_INIT_GATE, None)
+    else:
+        os.environ[_GPU_INIT_GATE] = _previous_gate
 
 # Llama 4 shape: the weight multiplies in the input dtype.
 FLOAT16_NORM = """
