@@ -2844,23 +2844,13 @@ def load_vllm(
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
 
+        # vLLM only rejects a budget under max_model_len when it cannot chunk. A
+        # blanket floor instead would disable chunking for text models.
+        if not enable_chunked_prefill:
+            max_num_batched_tokens = max(max_num_batched_tokens, max_seq_length)
+
         # float8 KV cache fits more sequences -> more throughput
         if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
-
-        # vLLM default max_num_batched_tokens is 2048
-        chunked_prefill_tokens = 2048
-        if not is_vision_model:
-            if   memory_left_for_kv_cache_gb <=  8: chunked_prefill_tokens = 1024 # + 0
-            elif memory_left_for_kv_cache_gb <= 12: chunked_prefill_tokens = 1536 # + 512
-            elif memory_left_for_kv_cache_gb <= 16: chunked_prefill_tokens = 2048 # + 512
-            elif memory_left_for_kv_cache_gb <= 24: chunked_prefill_tokens = 3072 # + 1024
-            elif memory_left_for_kv_cache_gb <= 40: chunked_prefill_tokens = 4096 # + 1024
-            elif memory_left_for_kv_cache_gb <= 48: chunked_prefill_tokens = 4608 # + 512
-            elif memory_left_for_kv_cache_gb <= 80: chunked_prefill_tokens = 8192 # + 4096
-            else: chunked_prefill_tokens = 8192 # + 0
-
-            # vLLM errors if max_seq_length exceeds chunked_prefill_tokens
-            chunked_prefill_tokens = max_seq_length
 
         # Scale num_seqs by conservativeness
         approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
@@ -2887,13 +2877,6 @@ def load_vllm(
             major_version, minor_version = torch.cuda.get_device_capability()
             message = f"{platform} compute capability {major_version}.{minor_version}"
         pass
-
-        print(
-            f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
-            f"Unsloth: Your GPU has {message} with VRAM = {total_memory_gb} GB.\n"\
-            f"Unsloth: Using conservativeness = {conservativeness}. Chunked prefill tokens = {chunked_prefill_tokens}. Num Sequences = {approx_max_num_seqs}.\n"\
-            f"Unsloth: vLLM's KV Cache can use up to {round(memory_left_for_kv_cache_gb, 2)} GB. Also swap space = {swap_space} GB."
-        )
 
         # Get device as well
         device = get_target_device()
@@ -3101,6 +3084,17 @@ def load_vllm(
                 print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
             pass
         pass
+
+        # Read back from engine_args, after the filter above, so the banner can only
+        # report what vLLM was given: swap_space left EngineArgs in vLLM 0.18.0.
+        swap_msg = f"Also swap space = {engine_args['swap_space']} GB." \
+            if "swap_space" in engine_args else "Swap space is left to vLLM."
+        print(
+            f"Unsloth: vLLM loading {model_name} with actual GPU utilization = {round(actual_gpu_memory_utilization*100, 2)}%\n"\
+            f"Unsloth: Your GPU has {message} with VRAM = {total_memory_gb} GB.\n"\
+            f"Unsloth: Using conservativeness = {conservativeness}. Chunked prefill tokens = {engine_args.get('max_num_batched_tokens', 'vLLM default')}. Num Sequences = {engine_args.get('max_num_seqs', 'vLLM default')}.\n"\
+            f"Unsloth: vLLM's KV Cache can use up to {round(memory_left_for_kv_cache_gb, 2)} GB. {swap_msg}"
+        )
 
         # Quick exit. The finally below restores the patch on the way out.
         if return_args:
