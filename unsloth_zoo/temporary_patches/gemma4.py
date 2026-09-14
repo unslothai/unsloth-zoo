@@ -1203,13 +1203,6 @@ def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Te
     # to keep (measured 1.9e-3 relative on an fp32 projector).
     return output
 
-# Only CUDA autocast accepts float32 (ROCm reports "cuda", so AMD is covered).
-# CPU, MPS and XPU refuse it and merely warn, which would leave the weight in
-# half and make a float32 input raise, so those keep the weight-dtype path and
-# do not get the precision improvement.
-_FLOAT32_AUTOCAST_DEVICES = ("cuda",)
-
-
 def patch_Gemma4MultimodalEmbedder_forward():
     """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
     try:
@@ -1225,19 +1218,19 @@ def patch_Gemma4MultimodalEmbedder_forward():
         # lives only in `forward`, so reading `.weight` trains the adapter that
         # finetune_vision_layers attaches here to exactly zero effect.
         projection = self.embedding_projection
-        # float32 autocast promotes the weight too, so a plain bf16 load runs the
-        # GEMM in float32. Promoting the parameters directly would be better
-        # still, but this forward is compiled fullgraph and Dynamo cannot trace a
-        # Parameter being rebuilt. Elsewhere, match the weight so nothing raises.
-        device_type = emb_norm.device.type
-        if device_type in _FLOAT32_AUTOCAST_DEVICES:
-            with torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True):
-                emb_norm_proj = projection(emb_norm.float())
-        else:
-            weight = getattr(projection, "weight", None)
-            compute_dtype = torch.float32 if weight is None else weight.dtype
-            with torch.autocast(device_type = device_type, enabled = False):
-                emb_norm_proj = projection(emb_norm.to(compute_dtype))
+        # Match the projection's own dtype. Promoting a half weight would need
+        # either autocast(dtype=float32), which several backends and older torch
+        # refuse and then feed float32 into a half Linear, or rebuilding the
+        # Parameter, which Dynamo cannot trace in this fullgraph forward. So the
+        # float32 GEMM is delivered for a float32 projector, which is the
+        # SKIP_QUANTIZATION_MODULES configuration this patch is for, and a half
+        # projector keeps upstream behaviour rather than risking a crash.
+        weight = getattr(projection, "weight", None)
+        compute_dtype = torch.float32 if weight is None else weight.dtype
+        # An enclosing bf16 autocast would downcast the GEMM even with float32
+        # operands. enabled=False is accepted on every backend and torch version.
+        with torch.autocast(device_type = emb_norm.device.type, enabled = False):
+            emb_norm_proj = projection(emb_norm.to(compute_dtype))
         return emb_norm_proj.to(old_dtype)
     try:
         patch_function(

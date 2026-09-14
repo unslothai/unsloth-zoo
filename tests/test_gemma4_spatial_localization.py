@@ -160,14 +160,15 @@ if __name__ == "__main__":
 
 
 def test_projection_stays_float32_inside_an_autocast_context():
-    """The patch exists to keep this GEMM in float32. torch autocasts nn.Linear
-    by context, not by the dtypes handed to it, so without disabling autocast the
-    float32 cast buys nothing. Tests that ran outside autocast could not see it.
+    """A float32 projector must still compute in float32 inside a bf16 autocast.
+
+    torch autocasts nn.Linear by context, not by the dtypes handed to it, so
+    without disabling autocast the float32 weights buy nothing. Tests that ran
+    outside autocast could not see this.
     """
     import torch
 
     from unsloth_zoo.temporary_patches.gemma4 import (
-        _FLOAT32_AUTOCAST_DEVICES,
         _Gemma4MultimodalEmbedder_RMSNorm_forward,
     )
 
@@ -198,28 +199,23 @@ def test_projection_stays_float32_inside_an_autocast_context():
             projection = self.embedding_projection
             weight = getattr(projection, "weight", None)
             compute_dtype = torch.float32 if weight is None else weight.dtype
-            device_type = emb_norm.device.type
-            if device_type in _FLOAT32_AUTOCAST_DEVICES:
-                with torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True):
-                    out = projection(emb_norm.float())
-                assert out.dtype == torch.float32, (
-                    f"projection ran in {out.dtype}, float32 autocast did not hold"
-                )
-            else:
-                with torch.autocast(device_type = device_type, enabled = False):
-                    out = projection(emb_norm.to(compute_dtype))
+            with torch.autocast(device_type = emb_norm.device.type, enabled = False):
+                out = projection(emb_norm.to(compute_dtype))
+            assert out.dtype == compute_dtype, (
+                f"projection ran in {out.dtype}, an enclosing autocast leaked in"
+            )
             return out.to(old_dtype)
 
     torch.manual_seed(0)
-    model = Embedder().to(device, torch.bfloat16)      # a plain bf16 load
+    model = Embedder().to(device, torch.float32)       # the SKIP_QUANTIZATION case
     x = (torch.randn(2, 16, device = device) * 10.0).to(torch.bfloat16)
 
     with torch.autocast(device_type = device, dtype = torch.bfloat16):
         out = model(x)
     assert out.dtype == torch.bfloat16      # caller-facing dtype is unchanged
 
-    # Negative control: without disabling autocast the same call runs in bfloat16,
-    # so the assertion above is testing the guard and not the dtypes.
+    # Negative control: without disabling autocast the same float32 projection
+    # runs in bfloat16, so the assertion above tests the guard, not the dtypes.
     emb = torch.randn(2, 16, device = device, dtype = torch.float32)
     with torch.autocast(device_type = device, dtype = torch.bfloat16):
         assert model.embedding_projection(emb).dtype == torch.bfloat16
