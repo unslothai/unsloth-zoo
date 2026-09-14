@@ -447,3 +447,30 @@ def test_the_dry_run_exit_also_respects_ownership():
     assert "_UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0" in window, (
         "a dry run can still strip a live engine's block"
     )
+
+
+def test_the_reprobe_unblock_also_respects_owners():
+    """The top of load_vllm lifts a previous call's block so a newly installed nvcc can be
+    re-probed. With a live engine that was built under the block, that strips its
+    protection, and this path never reinstates the block on a healthy second load."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    marker = source.index("_no_flashinfer = os.environ.get")
+    window = source[marker:marker + 400]
+    unblock = window.index("_unblock_flashinfer_import()")
+    assert "_UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0" in window[:unblock], (
+        "the re-probe unblock ignores live owners"
+    )
+
+
+def test_every_unblock_site_is_owner_gated():
+    """Three exits reach _unblock_flashinfer_import inside load_vllm: the re-probe, the
+    dry run and the failure arm. All three must agree, or the weakest one wins."""
+    source = inspect.getsource(vllm_utils.load_vllm)
+    sites = [i for i in range(len(source))
+             if source.startswith("_unblock_flashinfer_import()", i)]
+    assert len(sites) == 3, "unexpected number of unblock sites: %d" % len(sites)
+    for i in sites:
+        preceding = source[max(0, i - 700):i]
+        assert "_UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0" in preceding, (
+            "an unblock site at offset %d is not owner-gated" % i
+        )

@@ -2801,9 +2801,12 @@ def load_vllm(
         # AMD ROCm: FlashInfer requires CUDA nvcc compiler which is not present on ROCm.
         # On AMD, vLLM uses its built-in paged attention instead.
         # Lift a previous call's block first: it hides the package from find_spec too, so
-        # nvcc/ninja installed since would otherwise never be re-probed.
+        # nvcc/ninja installed since would otherwise never be re-probed. Not while an
+        # engine built under the block is still alive, though: it keeps importing
+        # FlashInfer lazily at run time, and this path never reinstates the block on a
+        # healthy second load, so lifting it here would strand that engine for good.
         _no_flashinfer = os.environ.get("UNSLOTH_VLLM_NO_FLASHINFER", "0") != "0"
-        if not _no_flashinfer:
+        if not _no_flashinfer and _UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0:
             _unblock_flashinfer_import()
         if _clear_flashinfer_env_on_hip():
             pass
