@@ -1241,6 +1241,73 @@ def test_preference_compaction_preserves_pair_ownership(monkeypatch, quantized, 
 
 @metal_only
 @pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("labeled", [False, True])
+def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
+    from types import SimpleNamespace
+    import numpy as np
+
+    rows = []
+    for row, width in enumerate((513, 507, 769)):
+        ids = (np.arange(width) * (7 + row) + row) % 2053
+        offset = width - 55 - row * 3
+        labels = None
+        if labeled:
+            labels = np.full(width, -100, dtype=np.int32)
+            positions = np.arange(offset + row, width, row + 2)
+            labels[positions] = (positions * 19 + row) % 8192
+            labels[1] = 7
+            labels = tuple(labels)
+        rows.append(_FiniteTextRow(tuple(ids), offset=offset, labels=labels))
+    plan = FiniteTextBatchPlan(rows, [(0, None, 1), (2,), (None, None)],
+                              max_seq_length=769, pad_id=0, minimum_width=2)
+    mx.random.seed(927)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    model.set_dtype(mx.bfloat16)
+    original, projected = mlx_utils._get_runtime_cce, []
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+        def record(hidden, *args):
+            projected.append(hidden.shape[0])
+            return runtime(hidden, *args)
+        return record
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    candidate = mlx_utils.make_cce_loss_fn(model)
+    def baseline(model, *batch):
+        return candidate(model, *batch)
+    def fail(failed, _context, error):
+        if failed:
+            raise error
+    trainer = SimpleNamespace(model=model, stop_requested=False,
+        _distributed_eval_status=lambda failed=False: (False, failed),
+        _raise_distributed_failure_from_any=fail, _fire_prediction_step=lambda: None)
+    trainer.args = SimpleNamespace(use_cce=True, streaming=False, max_seq_length=769,
+                                  seed=42, dataset_text_field="text", append_eos=False)
+    trainer.tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=None)
+    trainer.formatting_func = None
+    trainer.distributed_world = None
+    dataset = [{"input_ids": list(row.input_ids), **({"labels": list(row.labels)} if labeled else {})}
+               for row in rows]
+    prepared = MLXTrainer._create_text_eval_batches(trainer, dataset, 2, False, False)
+    assert isinstance(prepared, FiniteTextBatchPlan)
+    expected = MLXTrainer._evaluate_batch_totals(trainer, plan, baseline)
+    dense_shapes = list(projected)
+    projected.clear()
+    actual = MLXTrainer._evaluate_batch_totals(trainer, plan, candidate)
+    mx.eval(expected[:2], actual[:2])
+    assert projected[:2] == [256, 256] and all(n > 256 for n in dense_shapes[:2])
+    assert len(projected) == 3 and projected[2] == dense_shapes[2]
+    assert expected[2] is None and actual[2] is None
+    expected_tokens = sum(
+        sum(label != -100 for label in row.labels[row.offset:]) if labeled else
+        len(row.input_ids) - row.offset for row in rows
+    )
+    assert actual[1].item() == expected_tokens
+    for want, got in zip(expected[:2], actual[:2]):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-6).item()
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("reference", [False, True])
 @pytest.mark.parametrize("kind", ["dpo", "orpo"])
 def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, kind):
