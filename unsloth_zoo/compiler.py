@@ -957,7 +957,11 @@ def higher_precision_layernorms(modeling_file):
         return modeling_file
     norm_module = norm_modules[0]
     start, end = norm_module.span(0)
-    end = modeling_file.find("\nclass", end)
+    # The match runs into the next class's name, so searching from its end lands one class too
+    # far and lets a neighbour's markers decide. The regex guarantees a later "\nclass", so -1
+    # is only future proofing.
+    end = modeling_file.find("\nclass", start + 1)
+    if end == -1: end = len(modeling_file)
     norm_module = modeling_file[start:end]
     dtype = torch.float16
     if "self.weight.to(torch.float32)" in norm_module:
