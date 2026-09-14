@@ -165,6 +165,14 @@ _installed_backends: set = set()
 # Those modules still have the guarded names unbound, so letting a later call through
 # hands the consumer the bare NameError this whole path exists to prevent.
 _replay_failed: set = set()
+# Backends already replayed successfully, and the lock that makes the refresh-and-replay
+# phase one-at-a-time. The per-package install event only serialises the pip subprocess:
+# once it is set, every waiter returns True together and would replay concurrently.
+# importlib.reload of a module another thread is already reloading returns immediately
+# with the guarded name still unbound, so the loser would record a permanent
+# _replay_failed for a backend that was in fact repaired, and demand a restart for nothing.
+_replay_done: set = set()
+_replay_lock = threading.Lock()
 
 # Distributions whose REPLACEMENT would corrupt the running process: compiled
 # extensions already loaded by torch, and torch itself. Nothing in _ALLOW_LIST is
@@ -846,14 +854,20 @@ def patch_requires_backends_autoinstall():
             if not installed:
                 raise
             _installed_backends.update(installed)
-            for b in installed:
-                _refresh_backend_availability(iu, b)
-                # On replay failure the consumer is still unbound; the original error names the package.
-                if not _replay_skipped_guarded_imports(iu, b):
-                    # Remembered, or the next call sails past _orig and hands the consumer
-                    # a module whose guarded name was never bound.
-                    _replay_failed.add(b)
-                    raise
+            with _replay_lock:
+                for b in installed:
+                    if b in _replay_done:
+                        # Another thread already did this one; redoing it would reload the
+                        # same modules underneath it for no gain.
+                        continue
+                    _refresh_backend_availability(iu, b)
+                    # On replay failure the consumer is still unbound; the original error names the package.
+                    if not _replay_skipped_guarded_imports(iu, b):
+                        # Remembered, or the next call sails past _orig and hands the
+                        # consumer a module whose guarded name was never bound.
+                        _replay_failed.add(b)
+                        raise
+                    _replay_done.add(b)
             try:
                 # A dummy can want backends this allow list does not carry, as
                 # `["timm", "torchvision"]` does; a restart cannot supply those.

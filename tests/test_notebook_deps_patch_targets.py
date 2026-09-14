@@ -25,6 +25,8 @@ from __future__ import annotations
 import functools
 import importlib
 import os
+import threading
+import time
 import sys
 import types
 
@@ -53,6 +55,16 @@ def _make_original():
 
 
 fake_transformers_state = {"available": {}}
+
+
+@pytest.fixture(autouse = True)
+def _clean_process_lifetime_state(monkeypatch):
+    """`_installed_backends`, `_replay_failed` and `_replay_done` live for the life of the
+    process on purpose: only a restart can clear what they record. That is right in a real
+    session and wrong in a test runner, where one test's install leaks into the next and
+    makes the suite order-dependent."""
+    for name in ("_installed_backends", "_replay_failed", "_replay_done"):
+        monkeypatch.setattr(notebook_deps, name, set())
 
 
 @pytest.fixture
@@ -866,3 +878,57 @@ def test_an_unrelated_backend_is_unaffected_by_a_failed_replay(
 
     patched = sys.modules["transformers.utils.import_utils"].requires_backends
     assert patched(object(), ["einops"]) is None
+
+
+def test_two_threads_do_not_replay_the_same_backend_twice(fake_transformers, monkeypatch):
+    """The per-package install event only serialises the pip subprocess. Once it is set
+    both callers return True together, and a concurrent importlib.reload returns
+    immediately to the loser with the guarded name still unbound, so it recorded a
+    permanent _replay_failed for a backend that was actually repaired."""
+    notebook_deps.patch_requires_backends_autoinstall()
+    monkeypatch.setattr(notebook_deps, "_try_install_and_import", lambda pkg: True)
+    monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "1")
+    for _off in ("UNSLOTH_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
+        monkeypatch.delenv(_off, raising = False)
+
+    concurrent = []
+    live = []
+    live_lock = threading.Lock()
+
+    def _slow_replay(iu, backend):
+        with live_lock:
+            live.append(backend)
+            concurrent.append(len(live))
+        time.sleep(0.2)
+        with live_lock:
+            live.remove(backend)
+        # The flag flips only after the replay completes, as it does in reality.
+        fake_transformers_state["available"][backend] = True
+        return True
+
+    monkeypatch.setattr(notebook_deps, "_replay_skipped_guarded_imports", _slow_replay)
+    monkeypatch.setattr(notebook_deps, "_refresh_backend_availability", lambda iu, b: None)
+
+    patched = sys.modules["transformers.utils.import_utils"].requires_backends
+    errors = []
+
+    def _call():
+        try:
+            patched(_Consumer, [_BACKEND])
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target = _call) for _ in range(4)]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout = 30)
+
+    assert not any(t.is_alive() for t in threads), "a thread hung on the replay lock"
+    assert concurrent and max(concurrent) == 1, (
+        "replays overlapped: %s concurrent" % max(concurrent)
+    )
+    assert len(concurrent) == 1, "the replay ran %d times, not once" % len(concurrent)
+    assert notebook_deps._replay_failed == set(), (
+        "a repaired backend was permanently marked as needing a restart: %s"
+        % notebook_deps._replay_failed
+    )
+    assert errors == [], "concurrent callers saw spurious failures: %r" % errors[:2]
