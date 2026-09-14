@@ -57,7 +57,7 @@ def test_tied_lm_head_may_be_missing_from_either_side(head, embed):
 @pytest.mark.parametrize("head, embed", PAIRS)
 def test_a_tied_lm_head_that_disagrees_is_still_reported(head, embed):
     base = {embed: w(0.0)}
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         assert_same_state_dict({**base, head: w(1.0)}, dict(base))
 
 
@@ -70,7 +70,7 @@ def test_genuine_key_differences_still_raise():
 
 
 def test_genuine_value_differences_still_raise():
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError):
         assert_same_state_dict({"a.weight": w(0.0)}, {"a.weight": w(1.0)})
 
 
