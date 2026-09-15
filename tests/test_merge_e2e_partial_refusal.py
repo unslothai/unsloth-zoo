@@ -606,3 +606,169 @@ def test_exact_merge_is_unchanged_by_the_accounting(family, tmp_path):
         pytest.skip(f"{family} unavailable in this transformers")
     n_adapted, n_passthrough = H.run_case(family, "full", str(tmp_path))
     assert n_adapted >= 1 and n_passthrough >= 1
+
+
+# --------------------------------------------------------------------------------------
+# Verification pass: shapes the guard must never refuse, and what the escape hatch takes
+
+
+def _tiny_llama(base_dir, *, tie_word_embeddings = False):
+    import transformers as T
+
+    cfg = T.AutoConfig.for_model(
+        "llama", hidden_size = _H, intermediate_size = _I, num_hidden_layers = 2,
+        num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 64,
+        max_position_embeddings = 64, tie_word_embeddings = tie_word_embeddings,
+    )
+    torch.manual_seed(H.SEED)
+    model = T.AutoModelForCausalLM.from_config(cfg).to(torch.float32)
+    model.save_pretrained(base_dir, safe_serialization = True)
+    model.config._name_or_path = base_dir
+    return model
+
+
+def _attach_text_lora(model, targets, **kwargs):
+    from peft import LoraConfig, get_peft_model
+
+    torch.manual_seed(H.SEED)
+    peft_model = get_peft_model(model, LoraConfig(
+        r = 8, lora_alpha = 16, lora_dropout = 0.0, bias = "none",
+        target_modules = list(targets), **kwargs,
+    ))
+    H.seed_lora(peft_model)
+    return peft_model
+
+
+_ATTENTION_AND_MLP = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+
+@pytest.mark.parametrize(
+    "tie, targets, kwargs",
+    [
+        (False, _ATTENTION_AND_MLP, {}),
+        (True,  _ATTENTION_AND_MLP, {}),
+        (True,  _ATTENTION_AND_MLP, {"modules_to_save": ["lm_head"]}),
+        (False, ("q_proj", "lm_head", "embed_tokens"), {}),
+    ],
+    ids = ["text_only", "tied_embeddings", "tied_plus_modules_to_save", "embedding_and_head"],
+)
+def test_a_text_only_merge_is_never_refused(tmp_path, tie, targets, kwargs):
+    """The refusal exists for a composite model whose towers live under another prefix.
+    A plain text model has no such prefix, so none of these shapes may raise, tied
+    embeddings and an adapted head included."""
+    H.set_offline_cpu_env()
+    base_dir = str(tmp_path / "base")
+    out_dir  = str(tmp_path / "merged")
+    model = _tiny_llama(base_dir, tie_word_embeddings = tie)
+    base_tensors = H.read_safetensors_dir(base_dir)
+    if tie:
+        assert "lm_head.weight" not in base_tensors, sorted(base_tensors)
+
+    peft_model = _attach_text_lora(model, targets, **kwargs)
+    H.run_merge(peft_model, base_dir, out_dir, save_dtype = torch.float32)
+
+    merged = H.read_safetensors_dir(out_dir)
+    assert merged
+    if tie:
+        assert "lm_head.weight" not in merged, sorted(merged)
+
+
+def _one_unplaced_lora(hidden = _H):
+    lora_weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+    lora_weights["model.language_model.layers.0.self_attn.q_proj"] = LoraStats(
+        module = torch.nn.Linear(hidden, hidden, bias = False),
+        lora_A = torch.zeros(8, hidden), lora_B = torch.zeros(hidden, 8), alpha = 1.0,
+    )
+    return lora_weights
+
+
+@pytest.mark.parametrize(
+    "value, refuses",
+    [("1", False), ("0", True), ("", True), ("true", True), ("yes", True)],
+)
+def test_only_an_exact_1_opens_the_escape_hatch(tmp_path, monkeypatch, value, refuses):
+    """The env var is an exact `1`, like the other UNSLOTH_ALLOW_* switches. Anything
+    else, including a truthy-looking word, must still refuse: a typo must not quietly
+    hand back a checkpoint that is not trained."""
+    from safetensors.torch import save_file
+
+    shard = tmp_path / "model.safetensors"
+    save_file({"model.layers.0.self_attn.q_proj.weight": torch.zeros(_H, _H)}, str(shard))
+
+    monkeypatch.setenv("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE", value)
+    call = lambda: SU._check_lora_merge_is_complete(
+        str(tmp_path), ["model.safetensors"], _one_unplaced_lora(), "LlamaForCausalLM",
+    )
+    if refuses:
+        with pytest.raises(PartialLoraMergeError):
+            call()
+    else:
+        assert call()
+
+
+def test_the_guard_is_a_noop_when_no_shard_is_staged_yet(tmp_path):
+    """Header reads skip a shard that is not on disk. A staging directory without its
+    shards must therefore produce no report at all rather than refuse everything."""
+    assert SU._check_lora_merge_is_complete(
+        str(tmp_path), ["absent.safetensors"], _one_unplaced_lora(), "LlamaForCausalLM",
+    ) == {}
+
+
+def test_a_quantized_module_is_measured_by_its_feature_counts():
+    """A 4-bit base layer stores a packed weight whose shape says nothing about the
+    tensor the merge writes. The accounting must read the feature counts, or it silently
+    stops working on every 4-bit merge."""
+    class _Packed(torch.nn.Module):
+        in_features, out_features = _H, 2 * _H
+        def __init__(self):
+            super().__init__()
+            # What bitsandbytes stores: a flat uint8 buffer, not (out, in).
+            self.weight = torch.nn.Parameter(
+                torch.zeros(_H * 2 * _H // 2, 1, dtype = torch.uint8), requires_grad = False,
+            )
+
+    stats = LoraStats(module = _Packed(), lora_A = torch.zeros(8, _H),
+                      lora_B = torch.zeros(2 * _H, 8), alpha = 1.0)
+    assert SU._lora_target_logical_shape(stats) == (2 * _H, _H)
+
+    lora_weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+    lora_weights["model.language_model.layers.0.self_attn.q_proj"] = stats
+    # The logical shape is what the export holds, so the missed bridge is still reported.
+    assert _unresolved_lora_targets(
+        lora_weights, {"model.layers.0.self_attn.q_proj.weight"},
+        {"model.layers.0.self_attn.q_proj": (2 * _H, _H)}, "LlamaForCausalLM",
+    )
+    # The packed shape is not the module's shape, so it is not a match and not a report.
+    assert _unresolved_lora_targets(
+        lora_weights, {"model.layers.0.self_attn.q_proj.weight"},
+        {"model.layers.0.self_attn.q_proj": (_H * 2 * _H // 2, 1)}, "LlamaForCausalLM",
+    ) == {}
+
+
+def test_the_guard_stays_cheap_on_a_large_adapter():
+    """Every unplaced module walks its own prefix deletions, so the cost of the worst
+    case (nothing resolves) is worth pinning: a 1000 module adapter against an 8000 key
+    export must not turn a merge into a coffee break."""
+    import time
+
+    lora_weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+    disk_keys, disk_shapes = set(), {}
+    for layer in range(125):
+        for projection in ("q_proj", "k_proj", "v_proj", "o_proj",
+                           "gate_proj", "up_proj", "down_proj", "extra_proj"):
+            lora_weights[f"model.mystery_tower.layers.{layer}.self_attn.{projection}"] = LoraStats(
+                module = torch.nn.Linear(_H, _H, bias = False),
+                lora_A = torch.zeros(8, _H), lora_B = torch.zeros(_H, 8), alpha = 1.0,
+            )
+            key = f"model.layers.{layer}.self_attn.{projection}"
+            disk_keys.add(key + ".weight")
+            disk_shapes[key] = (_H, _H)
+    for filler in range(6000):
+        disk_keys.add(f"model.layers.{filler // 60}.mlp.filler{filler}.weight")
+
+    started = time.time()
+    unresolved = _unresolved_lora_targets(lora_weights, disk_keys, disk_shapes, "LlamaForCausalLM")
+    elapsed = time.time() - started
+
+    assert unresolved, "a wholly unplaced adapter must be reported"
+    assert elapsed < 60, f"the guard took {elapsed:.1f}s on 1000 modules"
