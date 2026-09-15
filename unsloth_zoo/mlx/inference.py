@@ -68,6 +68,9 @@ def _resolve_dotted(module, path):
 def _resolved_bindings(contract):
     """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
 
+    A fingerprint may be a tuple of alternatives, for a body that differs across the supported
+    range of an upstream package.
+
     Returns what each name resolved to, for `_bindings_intact` to recheck, or None when an entry
     differs. A fusion has to recheck the bindings of the resolution that produced the callables it
     captured, so these are returned rather than written into a list a later resolution would reuse.
@@ -83,8 +86,9 @@ def _resolved_bindings(contract):
             target = getattr(holder, name, None)
             try:
                 # inspect follows __wrapped__ to the original source, so a wrapped target is refused.
+                accepted = (expected,) if isinstance(expected, str) else expected
                 matches = target is not None and (expected is None or (
-                    not hasattr(target, "__wrapped__") and _ast_fingerprint(target) == expected
+                    not hasattr(target, "__wrapped__") and _ast_fingerprint(target) in accepted
                     and all(target.__globals__.get(alias, mod) is mod for alias, mod in _ALIASES)))
             except (OSError, TypeError, SyntaxError, AttributeError):
                 matches = False
@@ -119,26 +123,33 @@ _MOE_GATE_UP_CLASSES = {}
 _MOE_GATE_UP_LOCK = RLock()
 
 
-# Bodies the fused expert call reimplements. Both switch layer packages carry the same sources,
-# so one set of hashes covers either namespace.
+# Bodies the fused expert call reimplements. The two switch layer packages no longer share a
+# `SwitchGLU.__call__`: mlx-vlm 0.7.1 gave it a short-sequence decode path that mlx-lm has not
+# taken, so that one name is hashed per package and mlx-vlm accepts either body.
 _MOE_GATE_UP_FUNCTIONS = {
-    "SwitchGLU.__call__": "ed00798a68bad37d",
     "QuantizedSwitchLinear.__call__": "59bbb193612cbe06",
     "_gather_sort": "75657d7fb03060c6",
     "_scatter_unsort": "78d5aa7dbef7183e",
+}
+_MOE_SWITCH_GLU_CALLS = {
+    "mlx_lm.models.switch_layers": ("ed00798a68bad37d",),
+    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265"),
 }
 
 
 def _moe_switch_specs():
     specs = {}
-    for path in ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers"):
+    for path, switch_glu_call in _MOE_SWITCH_GLU_CALLS.items():
         native = sys.modules.get(path)
         if native is None or not hasattr(native, "QuantizedSwitchLinear"):
             continue
-        bindings = _resolved_bindings({path: _MOE_GATE_UP_FUNCTIONS})
+        contract = dict(_MOE_GATE_UP_FUNCTIONS, **{"SwitchGLU.__call__": switch_glu_call})
+        bindings = _resolved_bindings({path: contract})
         if bindings is not None:  # one drifted package still leaves the other
             specs[native.SwitchGLU] = (
-                native.QuantizedSwitchLinear, native._gather_sort, native._scatter_unsort, bindings,
+                native.QuantizedSwitchLinear, native._gather_sort, native._scatter_unsort,
+                # 0 where upstream has no short-sequence decode path, making the guard inert.
+                getattr(native, "DECODE_BLOCK_SIZE", 0), bindings,
             )
     return specs
 
@@ -234,14 +245,19 @@ class _PackedMoEGateUp:
         return mx.split(result, 2, axis = -1)
 
 
-def _fused_moe_gate_up_class(original_class, projection_type, gather_sort, scatter_unsort, bindings):
-    key = (original_class, projection_type, gather_sort, scatter_unsort)  # each class guards its own resolution
+def _fused_moe_gate_up_class(original_class, projection_type, gather_sort, scatter_unsort,
+                             decode_block, bindings):
+    key = (original_class, projection_type, gather_sort, scatter_unsort, decode_block)  # each class guards its own resolution
     if key not in _MOE_GATE_UP_CLASSES:
 
-        def fused_call(self, x, indices):
+        def fused_call(self, x, indices, *args, **kwargs):
             packed = self._unsloth_moe_gate_up
-            if self.training or not packed.matches(self) or not _bindings_intact(bindings):
-                return original_class.__call__(self, x, indices)
+            # Short sequences reach a separate upstream decode path, and routing weights, shared
+            # expert output and residuals are combined by one this body does not reimplement.
+            if (self.training or not packed.matches(self) or not _bindings_intact(bindings)
+                    or (x.ndim == 3 and 1 < x.shape[1] <= decode_block)
+                    or any(extra is not None for extra in (*args, *kwargs.values()))):
+                return original_class.__call__(self, x, indices, *args, **kwargs)
             x = mx.expand_dims(x, (-2, -3))
             do_sort = indices.size >= 64
             idx = indices
