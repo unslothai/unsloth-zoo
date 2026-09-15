@@ -94,6 +94,14 @@ jobs:
         # scripts/dynamic_exec_allowlist.json.
         run: python scripts/lint_dynamic_exec.py
 
+      - name: Workflow triggers (pull_request_target / cache-poisoning)
+        # Also a job in security-audit.yml, but that workflow's pull_request paths do not
+        # list .github/workflows/**, so the one change this most needs to see -- a workflow
+        # being added or edited -- was the one change that did not run it. #1192 edited two
+        # workflow files and no trigger lint ran at all. Here it runs on every PR, for the
+        # cost of one more python3 call in a job that already has PyYAML and the checkout.
+        run: python3 scripts/lint_workflow_triggers.py
+
       - name: No leftover debugger / pdb / breakpoint calls
         # Catches `import pdb`, `pdb.set_trace()`, `breakpoint()`, `import ipdb`.
         # continue-on-error during bootstrap: rl_replacements.py has a
