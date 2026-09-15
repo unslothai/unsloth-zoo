@@ -251,21 +251,21 @@ except Exception:
     CAUSAL_LOSS_TYPES = frozenset()
 
 
-def _loss_shifts_labels(trainer, model, is_encoder_decoder, detected_causal = False):
+def _loss_shifts_labels(trainer, model, is_encoder_decoder):
     # All Unsloth Zoo code licensed under LGPLv3
     """Does this model's loss shift labels, so labels[..., 1:] is the right count?
 
     A positive signal, not a list of excluded suffixes: a name cannot tell
     BertForMaskedLM (2D token aligned labels, column 0 supervised) from a causal LM.
     5.x already computed this on the Trainer; older ones get the same answer from the
-    loss_type every PreTrainedModel derives from its class name. A custom nn.Module
-    has neither, and is the case #1217 is for, so there the detector walk decides.
+    loss_type every PreTrainedModel derives from its class name. A hand written
+    nn.Module has neither, and stays out: without a signal we decline rather than
+    guess, which is today's behaviour for it anyway.
     """
     shifts = getattr(trainer, "_loss_shifts_labels", None)
     if isinstance(shifts, bool): return shifts
-    loss_type = getattr(model, "loss_type", None)
-    if loss_type is None: return detected_causal and not is_encoder_decoder
-    return loss_type in CAUSAL_LOSS_TYPES and not is_encoder_decoder
+    return getattr(model, "loss_type", None) in CAUSAL_LOSS_TYPES \
+        and not is_encoder_decoder
 pass
 
 global TRAINING_ITERATIONS
@@ -346,9 +346,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
         has_kwargs = False
         is_vlm = False
-        # Did the walk actually match a causal / VLM forward? has_kwargs alone cannot
-        # say: it is False both for no match and for a match with an explicit forward.
-        is_causal = False
         while True:
             # Stop when we encounter the name as ForConditionalGeneration or ForCausalLM
             if not hasattr(m, "forward"): break
@@ -373,16 +370,13 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             if is_vlm or "CausalLM" in name or "CausalLM" in class_name or "_fast_forward" in name:
                 signature = inspect.signature(forward).parameters.values()
                 has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
-                is_causal = True
                 break
             if not hasattr(m, "model"): break
             m = m.model
         pass
-        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm, is_causal)
+        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm)
     else:
-        # Tolerate a 2 tuple: an older cache may survive a partial upgrade.
-        has_kwargs, is_vlm, *rest = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
-        is_causal = bool(rest[0]) if rest else has_kwargs
+        has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
     pass
 
     # Iterate to find all batches
@@ -409,8 +403,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     ) is not None
     if (not is_non_causal_head) and labels_are_countable \
             and (has_kwargs or (getattr(self, "compute_loss_func", None) is not None
-                                and _loss_shifts_labels(self, top_model, is_encoder_decoder,
-                                                        is_causal))):
+                                and _loss_shifts_labels(self, top_model, is_encoder_decoder))):
         try:
             token_counts = []
             # Shape only, so no device sync and still traceable. Acted on after the
@@ -492,7 +485,23 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             num_items_in_batch = sum(token_counts)
 
             if self.args.average_tokens_across_devices:
-                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+                if getattr(self.args, "world_size", 1) > 1:
+                    # One collective, not two: the two rank-local fallback flags ride
+                    # along with the count, so this path keeps exactly the single
+                    # gather it has always had. ANY degenerate rank means the layout
+                    # is uncountable everywhere; only an ALL-short world has a truly
+                    # zero total, since a short rank beside healthy ones has simply
+                    # contributed 0 to a total that is still its right divisor.
+                    count = torch.as_tensor(num_items_in_batch).reshape(()).to(torch.int64)
+                    flags = torch.tensor([int(degenerate), int(all_short)],
+                                         dtype = torch.int64, device = count.device)
+                    packed = torch.cat([count.reshape(1), flags])
+                    packed = self.accelerator.gather(packed).reshape(-1, 3)
+                    num_items_in_batch = packed[:, 0].sum()
+                    degenerate = bool(packed[:, 1].any())
+                    all_short  = bool(packed[:, 2].all())
+                else:
+                    num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
             if torch.is_tensor(num_items_in_batch):
                 if device is not None:
                     num_items_in_batch = num_items_in_batch.to(device)
@@ -500,20 +509,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Uses DataParallel scatter gather
                     # So we have to scatter num_items_in_batch to each GPU
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
-            # Discard a count these labels could not support, last, so every collective
-            # above ran on every rank. Both flags are rank-local while the count is
-            # not, so reduce them too or one rank drops a divisor its peers keep and
-            # the two normalise differently. ANY degenerate rank means the layout is
-            # uncountable everywhere; only an ALL-short world has a truly zero total.
-            if bool(getattr(self.args, "average_tokens_across_devices", False)) \
-                    and getattr(self.args, "world_size", 1) > 1:
-                flags = torch.tensor(
-                    [[int(degenerate), int(all_short)]],
-                    device = num_items_in_batch.device if torch.is_tensor(num_items_in_batch) else None,
-                )
-                flags = self.accelerator.gather(flags).reshape(-1, 2)
-                degenerate = bool(flags[:, 0].any())
-                all_short  = bool(flags[:, 1].all())
+            # Discard a count these labels could not support. Last, so every collective
+            # above ran on every rank, and reduced above so no rank drops a divisor its
+            # peers keep.
             if degenerate or all_short: num_items_in_batch = None
         except Exception as exception:
             raise RuntimeError(exception)

@@ -255,11 +255,7 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
     )
 
 
-# shifts=None is the real shape for the model #1217 is about: a custom nn.Module has
-# no loss_type, and no Trainer before 5.x carries the flag, so the fallback has to
-# come from the detector walk or the widened gate never counts anything.
-@pytest.mark.parametrize("shifts", [True, None])
-def test_custom_loss_counts_tokens_without_model_forward_kwargs(shifts):
+def test_custom_loss_counts_tokens_without_model_forward_kwargs():
     torch = pytest.importorskip("torch")
     import torch.nn.functional as F
 
@@ -288,8 +284,7 @@ def test_custom_loss_counts_tokens_without_model_forward_kwargs(shifts):
     mod = _loss_utils()
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
     _, count = mod._unsloth_get_batch_samples(
-        _fake_trainer(model, False, compute_loss, shifts = shifts),
-        iter(batches), len(batches),
+        _fake_trainer(model, False, compute_loss), iter(batches), len(batches),
     )
     for batch in batches:
         compute_loss(model(batch["input_ids"]), batch["labels"], count).backward()
@@ -298,19 +293,20 @@ def test_custom_loss_counts_tokens_without_model_forward_kwargs(shifts):
     assert count == 14
 
 
-def test_a_custom_module_with_no_causal_signal_at_all_is_not_counted():
-    """The detector fallback is a fallback, not a blanket yes: with no loss_type, no
-    Trainer flag and nothing causal in the class or the forward, decline."""
+@pytest.mark.parametrize("name", ["ExplicitForCausalLM", "MysteryHead"])
+def test_a_module_carrying_no_shifted_label_signal_is_not_counted(name):
+    """Scope: the widened gate needs a POSITIVE shifted-label signal, and a hand
+    written nn.Module has none (no loss_type, and no Trainer flag before 5.x). It
+    keeps today's behaviour rather than being guessed at from its class name.
+    """
     torch = pytest.importorskip("torch")
     import torch.nn as nn
 
-    class MysteryHead(nn.Module):
-        def forward(self, input_ids, labels = None): return None
-
+    cls = type(name, (nn.Module,), {"forward": lambda self, input_ids, labels = None: None})
     mod = _loss_utils()
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
     _, count = mod._unsloth_get_batch_samples(
-        _fake_trainer(MysteryHead(), False, lambda *a, **k: None, shifts = None),
+        _fake_trainer(cls(), False, lambda *a, **k: None, shifts = None),
         iter(_microbatches(2, 5)), 2,
     )
     assert count is None
@@ -571,19 +567,36 @@ def test_the_shifted_label_signal_survives_patch_loss_functions():
 
 
 def _two_rank_trainer(model, peer_count, peer_flags):
-    """This rank plus one simulated peer, for both collectives the count path makes:
-    the token count, and the degenerate/all_short flags."""
+    """This rank plus one simulated peer. The count path makes ONE collective, over
+    [count, degenerate, all_short], so the stub answers with the peer's triple."""
     torch = pytest.importorskip("torch")
     t = _fake_trainer(model, True)
     t.args.average_tokens_across_devices = True
     t.args.world_size = 2
+    calls = []
 
     def gather(x):
-        if x.ndim == 2:                      # the [[degenerate, all_short]] flags
-            return torch.cat([x, torch.tensor([peer_flags], dtype = x.dtype)])
-        return torch.stack([x.reshape(()), torch.tensor(peer_count, dtype = x.dtype)])
+        calls.append(tuple(x.shape))
+        peer = torch.tensor([peer_count, *peer_flags], dtype = x.dtype)
+        return torch.cat([x.reshape(-1), peer])
     t.accelerator.gather = gather
+    t.gather_calls = calls
     return t
+
+
+def test_the_distributed_count_path_makes_exactly_one_collective():
+    """A second gather would be a second sync point per accumulation group, and every
+    rank must reach the same number of collectives or they deadlock."""
+    torch = pytest.importorskip("torch")
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+
+    ids = torch.randint(0, 11, (2, 6))
+    trainer = _two_rank_trainer(_tiny_model(), peer_count = 10, peer_flags = [0, 0])
+    mod._unsloth_get_batch_samples(trainer, iter([{"input_ids": ids, "labels": ids.clone()}]), 1)
+    assert trainer.gather_calls == [(3,)], (
+        f"expected one gather of [count, degenerate, all_short], got {trainer.gather_calls}"
+    )
 
 
 def test_a_locally_short_rank_keeps_the_gathered_count():
