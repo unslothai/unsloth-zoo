@@ -419,3 +419,62 @@ def test_every_container_discovery_yields_can_be_written_back_into():
         parent = _navigate(holder, parent_path)
         _set_child(parent, leaf, nn.Linear(4, 4))       # must not raise
         assert _navigate(holder, path) is not None
+
+
+def _recurrent_stack(pattern):
+    """A model whose `layers` lists the same physical layer at several indices."""
+    import mlx.nn as nn
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(HIDDEN, HIDDEN, bias = False)
+            self.v_proj = nn.Linear(HIDDEN, HIDDEN, bias = False)
+
+    physical = {name: Block() for name in sorted(set(pattern))}
+
+    class Recurrent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.blocks = [physical[name] for name in sorted(physical)]
+
+        @property
+        def layers(self):
+            return [physical[name] for name in pattern]
+
+    return Recurrent(), physical
+
+
+def _lora_depth(module):
+    from mlx_lm.tuner.lora import LoRALinear
+    depth = 0
+    while isinstance(module, LoRALinear):
+        depth, module = depth + 1, module.linear
+    return depth
+
+
+def test_a_layer_listed_twice_is_adapted_once():
+    # mlx-vlm's hrm_text lists 2 physical layers over 8 recurrent entries. Adapting
+    # per entry wraps an adapter in an adapter, and _mlx_lora_from_base refuses a
+    # LoRALinear, so the second visit used to raise.
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers
+    model, physical = _recurrent_stack("AABAB")
+    attached = linear_to_lora_layers(
+        model, 5, dict(keys = {"q_proj"}, rank = 4, scale = 2.0, dropout = 0.0))
+    assert attached == len(physical)
+    assert all(_lora_depth(block.q_proj) == 1 for block in physical.values())
+
+
+def test_a_layer_listed_twice_keeps_every_entry_s_targets():
+    # Deduplicating on first visit alone would drop the second entry's targets,
+    # silently leaving v_proj untrained here.
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx.loader import linear_to_lora_layers
+    model, physical = _recurrent_stack("AA")
+    attached = linear_to_lora_layers(model, 2, dict(
+        keys = {"q_proj", "v_proj"}, rank = 4, scale = 2.0, dropout = 0.0,
+        layer_keys = [["q_proj"], ["v_proj"]]))
+    block = physical["A"]
+    assert attached == 2
+    assert isinstance(block.q_proj, LoRALinear)
+    assert isinstance(block.v_proj, LoRALinear)

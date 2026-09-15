@@ -318,13 +318,21 @@ def linear_to_lora_layers(model, num_layers, config):
 
     limit = max(int(num_layers), 0)
     attached = 0
-    visited = set()
     offset = max(len(layers) - limit, 0)
+    # One adapter per PHYSICAL layer: a recurrent stack lists the same layer object at
+    # several indices (mlx-vlm's hrm_text lists 2 layers over 8 entries), and adapting
+    # it once per entry hands a LoRALinear back to _mlx_lora_from_base, which refuses
+    # it. The targets of every entry are unioned, so a layer that appears under two
+    # different `layer_keys` still gets both rather than only the first entry's.
+    order, wanted_by_layer = [], {}
     for index, layer in enumerate(layers[offset:], start=offset):
-        if id(layer) in visited:
-            continue
-        visited.add(id(layer))
         wanted = (set(layer_keys[index]) | shared) if layer_keys else keys
+        if id(layer) not in wanted_by_layer:
+            order.append(layer)
+            wanted_by_layer[id(layer)] = set()
+        wanted_by_layer[id(layer)] |= wanted
+    for layer in order:
+        wanted = wanted_by_layer[id(layer)]
         replacements = []
         for name, module in layer.named_modules():
             if name not in wanted:
