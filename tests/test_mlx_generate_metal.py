@@ -446,6 +446,34 @@ class ResidualNormBlock(nn.Module):
         return h, tail
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+@metal_only
+def test_generation_mode_applies_residual_norm_and_restores(cancel):
+    from contextlib import nullcontext
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root.train()
+    models[1].eval()
+    flags = [module.training for module in root.modules()]
+    x = mx.random.normal((1, 1, 128))
+    expected = [model(x)[0] for model in models]
+    mx.eval(expected)
+    with pytest.raises(RuntimeError, match = "cancel") if cancel else nullcontext():
+        with generation_mode(root):
+            with generation_mode(root):
+                assert all(not module.training for module in root.modules())
+                for model, native in zip(models, expected):
+                    assert type(model) is not ResidualNormBlock
+                    _residual_equal(model(x)[0], native)
+            assert all(type(model) is not ResidualNormBlock for model in models)
+            if cancel:
+                raise RuntimeError("cancel")
+    assert all(type(model) is ResidualNormBlock for model in models)
+    assert [module.training for module in root.modules()] == flags
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
 @metal_only
 def test_residual_norm_matches_reduction_rounding_and_scale(dtype):
