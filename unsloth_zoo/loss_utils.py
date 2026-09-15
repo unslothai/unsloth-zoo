@@ -230,8 +230,8 @@ global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
 # Heads whose labels are not shifted next-token targets, so the counter below cannot
-# describe them. Matched on the top level class name: the detector walk descends into
-# the backbone and would otherwise judge the head by the decoder it sits on.
+# describe them. Matched on the top level class name, since the walk below descends
+# into the backbone and would judge the head by the decoder it sits on.
 NON_CAUSAL_HEADS = (
     "ForSequenceClassification",
     "ForTokenClassification",
@@ -239,10 +239,9 @@ NON_CAUSAL_HEADS = (
     "ForMultipleChoice",
 )
 
-# Snapshot the loss_types that mean "this loss shifts labels", TAKEN AT IMPORT, before
-# anything can rewrite the mapping. patch_loss_functions() above swaps every causal entry
-# for UnslothForCausalLMLoss, so an identity test against the stock function would read
-# False for every causal model once unsloth has loaded, silently switching the count off.
+# The loss_types that shift labels, snapshotted AT IMPORT: patch_loss_functions() above
+# swaps every causal entry for UnslothForCausalLMLoss, so testing against the live
+# mapping would read False for every causal model once unsloth has loaded.
 try:
     from transformers.loss.loss_utils import LOSS_MAPPING as _LOSS_MAPPING, ForCausalLMLoss
     CAUSAL_LOSS_TYPES = frozenset(
@@ -256,15 +255,11 @@ def _loss_shifts_labels(trainer, model, is_encoder_decoder, detected_causal = Fa
     # All Unsloth Zoo code licensed under LGPLv3
     """Does this model's loss shift labels, so labels[..., 1:] is the right count?
 
-    Positive signal, not a list of excluded suffixes: a name cannot tell
-    BertForMaskedLM (2D token aligned labels, NOT shifted, column 0 supervised) from a
-    causal LM. Ask what stock transformers asks. 5.x already computed it on the
-    Trainer; older versions get the same answer from the loss_type every
-    PreTrainedModel derives from its class name, matched against the keys snapshotted
-    at import rather than against a mapping we ourselves rewrite.
-
-    A custom torch.nn.Module has neither, and it is the very case #1217 is for, so
-    there we fall back to what the detector walk decided from the forward.
+    A positive signal, not a list of excluded suffixes: a name cannot tell
+    BertForMaskedLM (2D token aligned labels, column 0 supervised) from a causal LM.
+    5.x already computed this on the Trainer; older ones get the same answer from the
+    loss_type every PreTrainedModel derives from its class name. A custom nn.Module
+    has neither, and is the case #1217 is for, so there the detector walk decides.
     """
     shifts = getattr(trainer, "_loss_shifts_labels", None)
     if isinstance(shifts, bool): return shifts
@@ -338,10 +333,10 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         m = m.get_base_model()
     model_name = m.__class__.__name__
 
-    # Read off the top level model, before the walk below reassigns m. unsloth patches
-    # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into its
-    # own .model, matches "_fast_forward" and never consults the head it trains.
-    # Not cached: is_encoder_decoder belongs to the instance, not to the class name.
+    # Read off the top level model, before the walk below reassigns m: unsloth patches
+    # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into
+    # .model, matches "_fast_forward" and never consults the head it trains. Not
+    # cached, since is_encoder_decoder belongs to the instance, not the class name.
     top_model = m
     is_encoder_decoder = bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False))
     is_non_causal_head = any(head in model_name for head in NON_CAUSAL_HEADS)
@@ -398,20 +393,17 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    # Get num_items_in_batch. Two separate questions, as in stock transformers:
+    # Get num_items_in_batch. Two questions, as in stock transformers:
     #   has a consumer: `model_accepts_loss_kwargs or compute_loss_func is not None`,
-    #     same on 4.57.6 and 5.17.0. has_kwargs is our first half; counting for a
-    #     compute_loss_func is #1217.
-    #   is countable: everything below counts SHIFTED CAUSAL targets, which is stock
-    #     5.17.0's self._loss_shifts_labels. This is patched onto the base Trainer
-    #     class, so classification and seq2seq subclasses inherit it too, and their
-    #     labels mean something else. They raise here, or come back quietly short.
-    # The guards differ in width on purpose. is_non_causal_head gates both routes (no
-    # causal or VLM class carries these substrings, and their count is always wrong).
-    # The new route additionally demands a POSITIVE shifted-label signal, so Whisper and
-    # Florence2 keep the count they get today rather than being rescaled by this change.
-    # No .ndim means no tensor ops, and a plain list would hit the except below and
-    # kill the run; stock swallows it and trains on. numpy has .ndim, so it still counts.
+    #     same on 4.57.6 and 5.17.0. has_kwargs is our first half, #1217 the second.
+    #   is countable: everything below counts SHIFTED CAUSAL targets (stock 5.17.0's
+    #     self._loss_shifts_labels). This lives on the base Trainer class, so
+    #     classification and seq2seq subclasses inherit it and their labels mean
+    #     something else: they raise here, or come back quietly short.
+    # The guards differ in width on purpose. is_non_causal_head gates both routes; the
+    # new route also demands a POSITIVE shifted-label signal, so Whisper and Florence2
+    # keep today's count rather than being rescaled here. No .ndim means no tensor ops
+    # at all: a list would hit the except below and kill a run stock trains through.
     labels_are_countable = getattr(
         batch_samples[0].get("labels") if len(batch_samples) > 0 else None, "ndim", None,
     ) is not None
@@ -421,14 +413,14 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                                                         is_causal))):
         try:
             token_counts = []
-            # Shape only, so no device sync and still traceable. Applied after the
-            # collectives below rather than by breaking out: skipping
-            # accelerator.gather on one rank alone would hang the others.
+            # Shape only, so no device sync and still traceable. Acted on after the
+            # collectives below, never by breaking out: skipping accelerator.gather on
+            # one rank alone would hang the others.
             degenerate = False
-            # One column leaves labels[..., 1:] empty. That is only fatal when EVERY
-            # microbatch is short, since then the total is 0 and a sum/count loss
-            # divides by it. A short member of a mixed accumulation group just
-            # contributes 0, and voiding the group there would lose GA invariance.
+            # One column leaves labels[..., 1:] empty. Only fatal when EVERY microbatch
+            # is short, since then the total is 0 and a sum/count loss divides by it. A
+            # short member of a mixed group just contributes 0, and voiding the group
+            # for it would lose GA invariance.
             all_short = True
             for x in batch_samples:
                 labels = x["labels"]
@@ -445,10 +437,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)
                     mark_dynamic(attention_mask, 1)
-                    # Only AND a mask describing these same targets. A seq2seq mask is
-                    # the encoder's and a different length from the decoder labels,
-                    # which used to raise. Causal shapes always match, so no existing
-                    # count changes.
+                    # Only AND a mask describing these same targets: a seq2seq mask is
+                    # the encoder's, a different length from the decoder labels, which
+                    # used to raise. Causal shapes always match, so nothing changes.
                     if attention_mask.shape != labels.shape:
                         degenerate = True
                     else:
@@ -509,16 +500,11 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Uses DataParallel scatter gather
                     # So we have to scatter num_items_in_batch to each GPU
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
-            # Discard a count these labels could not support. Done last, so every
-            # collective above ran on every rank.
-            #
-            # Both flags are rank-local, and the count above is not: acting on them
-            # unreduced lets one rank drop a divisor its peers keep, and the two then
-            # normalise differently. So reduce them too, with the meaning each one has:
-            # ANY degenerate rank means the batch layout is not countable anywhere,
-            # while only an ALL-short world has a genuinely zero total (a short rank
-            # beside healthy ones has simply contributed 0, and the global total is
-            # still the right divisor for it).
+            # Discard a count these labels could not support, last, so every collective
+            # above ran on every rank. Both flags are rank-local while the count is
+            # not, so reduce them too or one rank drops a divisor its peers keep and
+            # the two normalise differently. ANY degenerate rank means the layout is
+            # uncountable everywhere; only an ALL-short world has a truly zero total.
             if bool(getattr(self.args, "average_tokens_across_devices", False)) \
                     and getattr(self.args, "world_size", 1) > 1:
                 flags = torch.tensor(
