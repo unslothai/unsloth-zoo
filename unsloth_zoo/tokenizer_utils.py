@@ -235,6 +235,24 @@ def add_new_tokens(
 pass
 
 
+def _count_input_ids(train_dataset, mapping):
+    """Apply `mapping` over the dataset's input_ids in batches.
+
+    Everything else in fix_untrained_tokens only needs len() and [j], so a plain list of
+    rows gets this far; only .map is datasets specific. Fall back to a direct batched call
+    instead of raising AttributeError. Same row convention as the checks above: a row
+    without an "input_ids" key is skipped."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if hasattr(train_dataset, "map"):
+        train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+        return
+    pass
+    rows = [row["input_ids"] for row in train_dataset if "input_ids" in row]
+    if len(rows) == 0: return
+    mapping({"input_ids" : rows})
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -458,7 +476,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+    _count_input_ids(train_dataset, mapping)
 
     # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
