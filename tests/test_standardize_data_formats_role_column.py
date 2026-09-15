@@ -105,3 +105,56 @@ def test_a_non_sharegpt_dataset_is_returned_untouched():
     rows = [{"text": "hello"}]
     dataset = Dataset.from_list(rows)
     assert standardize_data_formats(dataset) is dataset
+
+
+# --- the map that carries this decision into worker processes ---------------
+
+@pytest.mark.parametrize("start_method", ["fork", "spawn"])
+def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
+    """`_standardize_dataset` is handed to `Dataset.map(num_proc = ...)`, so the
+    role and content columns it closed over have to reach the workers. datasets
+    pools through `multiprocess`, whose default context is its own; Windows has no
+    fork at all, so the spawn case is what runs there and it is the one where a
+    closure over a module-level helper can fail to arrive."""
+    multiprocess = pytest.importorskip("multiprocess")
+
+    previous = multiprocess.get_start_method(allow_none = True)
+    try:
+        multiprocess.set_start_method(start_method, force = True)
+    except (RuntimeError, ValueError) as error:
+        pytest.skip(f"{start_method} is unavailable here: {error}")
+    try:
+        rows = [
+            {"conversations": [{"from": "Human ", "value": "Braund, Mr. Owen Harris"},
+                               {"from": "GPT", "value": "0"}]},
+        ] * 60
+        out = standardize_data_formats(Dataset.from_list(rows), num_proc = 2)
+        assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
+        assert out[0]["conversations"][0]["content"] == "Braund, Mr. Owen Harris"
+    finally:
+        if previous is not None:
+            multiprocess.set_start_method(previous, force = True)
+
+
+def test_an_explicit_num_proc_still_resolves_the_columns():
+    rows = [
+        {"conversations": [{"from": "human", "value": "hi"}, {"from": "gpt", "value": "yo"}]},
+    ] * 40
+    out = standardize_data_formats(Dataset.from_list(rows), num_proc = 2)
+    assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
+
+
+def test_a_non_ascii_role_is_reported_not_crashed():
+    """Normalising means calling `.strip().lower()` on whatever the column holds.
+    An unknown role in another script must still come out as the aliases message."""
+    rows = [{"conversations": [{"from": "uzytkownik", "value": "czesc"},
+                               {"from": "asystent", "value": "hej"}]}]
+    with pytest.raises(TypeError, match = "aliases"):
+        standardize_data_formats(Dataset.from_list(rows))
+
+
+def test_a_role_padded_with_a_non_breaking_space_resolves():
+    rows = [{"conversations": [{"from": "human ", "value": "hi"},
+                               {"from": " gpt", "value": "yo"}]}]
+    out = standardize_data_formats(Dataset.from_list(rows))
+    assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]

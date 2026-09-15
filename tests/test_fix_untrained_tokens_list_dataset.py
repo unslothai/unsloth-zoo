@@ -187,3 +187,30 @@ def test_the_undecorated_function_cannot_write_the_rows_back():
         tokenizer_utils.fix_untrained_tokens.__wrapped__(
             model, _Tokenizer(), [{"input_ids" : [1, 2, 4]}, {"input_ids" : [2, 3, 5]}],
         )
+
+
+def test_count_input_ids_accepts_rows_whose_ids_are_arrays():
+    """A row read back from a collator or a torch dataset holds a tensor or an
+    ndarray, not a list. The counting path only chains and counts, so both work,
+    and pinning it keeps the fallback honest about what it accepts."""
+    final_counts, mapping = _counter()
+
+    tokenizer_utils._count_input_ids(
+        [{"input_ids" : np.array([1, 2])}, {"input_ids" : torch.tensor([2, 3])}], mapping,
+    )
+
+    assert final_counts.tolist() == [0, 1, 2, 1, 0, 0, 0, 0]
+
+
+def test_count_input_ids_accepts_a_generator_of_rows():
+    final_counts, mapping = _counter()
+
+    tokenizer_utils._count_input_ids(iter([{"input_ids" : [5]}, {"input_ids" : [5, 6]}]), mapping)
+
+    assert final_counts.tolist() == [0, 0, 0, 0, 0, 2, 1, 0]
+
+
+def test_count_input_ids_on_an_empty_list_never_calls_the_mapping():
+    called = []
+    tokenizer_utils._count_input_ids([], lambda examples: called.append(examples))
+    assert called == []
