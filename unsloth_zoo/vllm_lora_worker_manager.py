@@ -72,6 +72,32 @@ def dummy_lora_has_scaling_factor(create_dummy_lora):
     return "scaling_factor" in keys
 pass
 
+def _drop_stacked_weight_maps(mapper):
+    """Return `mapper` with its stacked weight maps removed, or None.
+
+    vLLM >= 0.25.0 folds q/k/v into qkv_proj and gate/up into gate_up_proj via
+    `orig_to_new_stacked`. LoRA loading maps names without the shard id, so the
+    constituents collide onto one key, the packed module holds a single 2D
+    lora_a instead of a list, and set_lora dies on `lora_a_i.shape[1]` with
+    `IndexError: tuple index out of range`.
+
+    vLLM's own worker_manager strips them first, with `get_unstacked_mapper` on
+    0.25.0 - 0.28.x and `get_rename_mapper` from 0.29.0.
+    """
+    if mapper is None: return None
+    for name in ("get_rename_mapper", "get_unstacked_mapper"):
+        method = getattr(mapper, name, None)
+        if callable(method): return method()
+    # Renamed again: drop the maps ourselves.
+    if hasattr(mapper, "orig_to_new_stacked"):
+        try:
+            import dataclasses
+            return dataclasses.replace(mapper, orig_to_new_stacked = {})
+        except Exception:
+            pass
+    return mapper
+pass
+
 def _call_create_lora_manager(model, vllm_config, **kwargs):
     sig = inspect.signature(create_lora_manager)
     if "vllm_config" in sig.parameters:
@@ -151,17 +177,11 @@ class WorkerLoRAManager(AbstractWorkerManager):
             peft_helper.validate_legal(self.lora_config)
 
             # For some models like Qwen2VL, we need hf_to_vllm_mapper for correct
-            # lora loading. On vLLM >= 0.25.0 it also folds q/k/v (and gate/up)
-            # into orig_to_new_stacked; _map_name drops the shard id so they
-            # collide onto one key -> IndexError. Drop the stacked maps (keeping
-            # genuine renames) like vLLM's own worker_manager; absent on <0.25.0.
+            # lora loading, but only its renames. See _drop_stacked_weight_maps.
             hf_to_vllm_mapper = None
             if (hasattr(model, "hf_to_vllm_mapper")
                     and model.hf_to_vllm_mapper is not None):
-                hf_to_vllm_mapper = model.hf_to_vllm_mapper
-                unstack = getattr(hf_to_vllm_mapper, "get_unstacked_mapper", None)
-                if callable(unstack):
-                    hf_to_vllm_mapper = unstack()
+                hf_to_vllm_mapper = _drop_stacked_weight_maps(model.hf_to_vllm_mapper)
 
             lora_extra_vocab_size = getattr(self.lora_config, "lora_extra_vocab_size", 0)
             kwargs = {

@@ -48,7 +48,12 @@ def _run(code, **env):
         path.append(os.environ["PYTHONPATH"])
     # `conftest.py` sets UNSLOTH_ALLOW_CPU=1 for the whole session, so each case
     # has to say for itself whether the child gets it.
-    clean = {k: v for k, v in os.environ.items() if k != "UNSLOTH_ALLOW_CPU"}
+    #
+    # UNSLOTH_ZOO_DISABLE_GPU_INIT goes with it: it skips the device detection these cases
+    # are about, so a child that inherits it imports cleanly whatever the answer should
+    # have been, and "the import still refuses" passes for the wrong reason.
+    _SKIPPED_BY = ("UNSLOTH_ALLOW_CPU", "UNSLOTH_ZOO_DISABLE_GPU_INIT")
+    clean = {k: v for k, v in os.environ.items() if k not in _SKIPPED_BY}
     return subprocess.run(
         [sys.executable, "-c", code],
         capture_output = True,

@@ -6,14 +6,23 @@ materializes the full logits and their float32 upcast at once, so at long
 sequence lengths the transient dominates peak memory. The target is capped so
 chunking keeps working regardless of how much memory is free.
 """
-import os
-# Let the module import on CPU-only CI (device detection otherwise raises).
-os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
-
 import importlib
 import types
 
 import pytest
+
+
+@pytest.fixture(autouse = True)
+def _allow_cpu_import(monkeypatch):
+    """Let `_load_module` import on CPU-only CI, where device detection otherwise raises.
+
+    A fixture rather than the module-scope `os.environ.setdefault` this used to be. That
+    ran at COLLECTION, and pytest imports every selected module before running anything, so
+    the flag was not scoped to this file: it stayed on for every test the xdist worker took
+    afterwards. test_allow_cpu_import_driverless.py is about what the import does WITHOUT
+    it, and was deciding that question against a flag this file turned on.
+    """
+    monkeypatch.setenv("UNSLOTH_ALLOW_CPU", "1")
 
 
 def _load_module(monkeypatch, free_bytes):

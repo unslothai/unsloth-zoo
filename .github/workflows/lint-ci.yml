@@ -67,10 +67,14 @@ jobs:
 
       - name: Python ruff check (narrow gate)
         # E9 / F63 / F7 / F82: syntax errors, broken comparisons, undefined names.
-        # continue-on-error during CI bootstrap: first run on main surfaced 13
-        # latent findings (rl_replacements.py L1128 F821). The gpt_oss match-on-3.9
-        # one is fixed; the rest still need clearing before this can gate.
-        continue-on-error: true
+        # The 13 findings that kept this on continue-on-error are cleared, so it gates.
+        # Two of them were real: rl_replacements called nullcontext() without importing
+        # it, and peft_utils listed two names in __all__ that had moved to saving_utils.
+        # The rest are names an exec(source, globals()) defines a line earlier, and carry
+        # an inline noqa saying so.
+        #
+        # Leaving it non-gating was not free. It still annotated every run red, which is
+        # what a real failure on a PR then had to be picked out of.
         run: |
           ruff check --select E9,F63,F7,F82 unsloth_zoo tests scripts
 
@@ -89,6 +93,14 @@ jobs:
         # flagged; a built string is, unless it carries a written justification in
         # scripts/dynamic_exec_allowlist.json.
         run: python scripts/lint_dynamic_exec.py
+
+      - name: Workflow triggers (pull_request_target / cache-poisoning)
+        # Also a job in security-audit.yml, but that workflow's pull_request paths do not
+        # list .github/workflows/**, so the one change this most needs to see -- a workflow
+        # being added or edited -- was the one change that did not run it. #1192 edited two
+        # workflow files and no trigger lint ran at all. Here it runs on every PR, for the
+        # cost of one more python3 call in a job that already has PyYAML and the checkout.
+        run: python3 scripts/lint_workflow_triggers.py
 
       - name: No leftover debugger / pdb / breakpoint calls
         # Catches `import pdb`, `pdb.set_trace()`, `breakpoint()`, `import ipdb`.

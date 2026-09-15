@@ -31,10 +31,15 @@ import torch
 import re
 import os
 import functools
+import inspect
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
+
+# get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
+QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5")
+
 
 def _is_gemma4_config(config):
     if config is None:
@@ -576,7 +581,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
-    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+    if model_type in QWEN_VL_MERGED_QKV_TYPES:
         new_config.vision_config.out_hidden_size = 1
 
     num_layers = max(text_layers, vision_layers)
@@ -890,8 +895,23 @@ def finalize_huggingface_model(
                         f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
                     )
             if hasattr(module, "rotary_pos_emb") and vision_config is not None:
-                head_dim = vision_config.hidden_size // vision_config.num_heads
-                module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+                # transformers 4 takes a positional dim, transformers 5 takes the vision
+                # config. Dispatch on the signature rather than guessing, since an int
+                # is silently accepted as a config. device= is deprecated in 5.18, so
+                # construct then move, and warn rather than abort on a signature we do
+                # not know.
+                rotary_class = module.rotary_pos_emb.__class__
+                try:
+                    if "config" in inspect.signature(rotary_class.__init__).parameters:
+                        new_rotary = rotary_class(vision_config)
+                    else:
+                        head_dim = vision_config.hidden_size // vision_config.num_heads
+                        new_rotary = rotary_class(head_dim//2)
+                    module.rotary_pos_emb = new_rotary.to(target_device)
+                except Exception as rotary_reinit_error:
+                    logger.warning(
+                        f"Unsloth: skipped rotary_pos_emb reinit for {module_name}: {rotary_reinit_error}"
+                    )
             if hasattr(module, "rotary_emb_local"):
                 if local_rope_config is None:
                     local_rope_config = deepcopy(text_config)
@@ -1219,33 +1239,36 @@ def get_model_type(config):
 def get_model_layer_counts(config):
     """Layer counts per model type (int for causal_lm, dict for VL models)."""
     model_type = get_model_type(config)
+    # get_model_type returns the vision name, so each branch matches both spellings.
+    text_config = getattr(config, "text_config", config)
+    vision_config = getattr(config, "vision_config", config)
 
-    if model_type == "mllama":
+    if model_type in ("mllama", "mllama_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
-            "global_layers": getattr(config.vision_config, "num_global_layers", 8),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
+            "global_layers": getattr(vision_config, "num_global_layers", 8),
         }
     elif model_type == "qwen2_5_vl":
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "depth", 32),
+            "vision_layers": getattr(vision_config, "depth", 32),
         }
-    elif model_type == "qwen3_vl":
+    elif model_type in ("qwen3_vl", "qwen3_vl_vision"):
         return {
             "text_layers": getattr(config, "num_hidden_layers", 36),
-            "vision_layers": getattr(config.vision_config, "depth", 27),
-            "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
+            "vision_layers": getattr(vision_config, "depth", 27),
+            "deepstack_layers": getattr(vision_config, "deepstack_depth", 3),
         }
-    elif model_type == "gemma4":
+    elif model_type in ("gemma4", "gemma4_vision", "gemma4_unified", "gemma4_unified_vision"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
         }
-    elif model_type == "gemma3":
+    elif model_type in ("gemma3", "siglip_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
         }
     else:
         # Standard causal LM
@@ -1467,7 +1490,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+                    if model_type in QWEN_VL_MERGED_QKV_TYPES:
                         # HF keeps merged qkv for these (qwen-2.5-vl, qwen-3-vl)
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:

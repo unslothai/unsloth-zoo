@@ -15,12 +15,13 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import ast
+import contextlib
 import inspect
 import linecache
 import sys
 
 import torch
-from .common import TEMPORARY_PATCHES, logger
+from .common import TEMPORARY_PATCHES, logger, torch_compile
 from .utils import raise_error, patch_function
 
 
@@ -1187,3 +1188,76 @@ def patch_Gemma4VisionPoolerFP16():
         return raise_error("Gemma4VisionPooler.forward", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4VisionPoolerFP16)
+
+
+# Force float32 through embedding_projection. Mirrors patch_Gemma3nMultimodalEmbedder_forward.
+
+@torch_compile
+def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    output = self._norm(x.float())
+    if getattr(self, "with_scale", True) and hasattr(self, "weight"):
+        output = output * self.weight.float()
+    # Stay in float32: the caller casts next, and a bfloat16 hop here costs
+    # 1.9e-3 relative on an fp32 projector.
+    return output
+
+def patch_Gemma4MultimodalEmbedder_forward():
+    """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as mod
+        Gemma4MultimodalEmbedder = mod.Gemma4MultimodalEmbedder
+    except (ImportError, AttributeError) as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        old_dtype = inputs_embeds.dtype
+        emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
+        # Call the module, never `.weight`: a PEFT lora.Linear applies its delta
+        # only in forward, so reading the weight trains the adapter to no effect.
+        projection = self.embedding_projection
+        # Match the weight dtype: only a float32 projector computes in float32.
+        # Promoting a half one needs an autocast several backends refuse, or a
+        # Parameter rebuild Dynamo cannot trace.
+        weight = getattr(projection, "weight", None)
+        compute_dtype = torch.float32 if weight is None else weight.dtype
+        # An enclosing bf16 autocast downcasts even float32 operands. Guarded
+        # because autocast rejects meta and unregistered custom backends.
+        try:
+            autocast_off = torch.autocast(device_type = emb_norm.device.type, enabled = False)
+        except (RuntimeError, AssertionError):
+            autocast_off = contextlib.nullcontext()
+        with autocast_off:
+            emb_norm_proj = projection(emb_norm.to(compute_dtype))
+        return emb_norm_proj.to(old_dtype)
+    try:
+        patch_function(
+            Gemma4MultimodalEmbedder, "forward", forward, fullgraph=True,
+        )
+    except Exception as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4MultimodalEmbedder_forward)
+
+
+def patch_Gemma4_static_cache_backport(phase = "post_compile"):
+    """#6028 backport for installs whose unsloth still forces a static cache.
+
+    A static cache makes transformers skip mask materialisation at prefill, which
+    drops Gemma's bidirectional image block overlay, so image tokens attend
+    causally. Current unsloth gates this per request; older ones consult only
+    `_supports_static_cache`, so clear it on the Gemma 4 generation classes. That
+    costs text-only generation the static cache, hence the guard below.
+    """
+    if phase != "post_compile": return
+    # unsloth_zoo must not import unsloth; absent means too early to tell.
+    vision = sys.modules.get("unsloth.models.vision")
+    if vision is None or hasattr(vision, "_needs_bidirectional_multimodal_mask"): return
+    for name in ("gemma4", "gemma4_unified"):
+        module = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
+        if module is None: continue
+        for obj in vars(module).values():
+            # Only overlay builders; causal VLMs keep the static path.
+            if isinstance(obj, type) and "create_masks_for_generate" in vars(obj):
+                obj._supports_static_cache = False
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4_static_cache_backport)

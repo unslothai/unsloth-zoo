@@ -1454,3 +1454,22 @@ def test_the_logit_sum_holds_the_widest_vocabulary_in_float16(dtype):
     rows = _row_logit_sum(wide)
     assert bool(mx.all(mx.isfinite(rows))), "the scale does not cover 256K"
     assert float(rows[0, 0]) == pytest.approx(262144 * 4000.0, rel=1e-3)
+
+
+@metal_only
+@pytest.mark.parametrize("targets,attention", [(["lm_head"], True),
+                                               (["q_proj", "lm_head"], False)])
+def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
+    from test_mlx_lora_group_selection import HIDDEN, VOCAB, _adapters, _peft
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.bitnet import Model, ModelArgs
+    model = Model(ModelArgs(
+        model_type="bitnet", hidden_size=HIDDEN, intermediate_size=HIDDEN * 2,
+        num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
+        rms_norm_eps=1e-5, vocab_size=VOCAB, tie_word_embeddings=False,
+    ))
+    _peft(model, target_modules=targets, finetune_attention_modules=attention)
+    _, grads = nn.value_and_grad(model, lambda m: m(mx.array([[1, 2]])).sum())(model)
+    assert _adapters(model) == ["lm_head"]
+    assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
