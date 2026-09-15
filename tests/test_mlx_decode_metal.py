@@ -190,4 +190,10 @@ def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
     finally:
         inner.__exit__(None, None, None)
     assert type(model) is native.Qwen3_5GatedDeltaNet
-    assert not any(k.startswith("_unsloth_decode") for k in model.__dict__)
+    # Both stores: nn.Module.__setattr__ routes only mx.array/dict/list/tuple into the
+    # mapping and pops the key there for anything else, so the count and the two class
+    # references live in __dict__. Assert the mapping too, so a value that later starts
+    # landing there cannot leak past the exit unnoticed.
+    leftover = [key for key in (*model.__dict__, *dict.keys(model))
+                if key.startswith("_unsloth_decode")]
+    assert leftover == []
