@@ -55,6 +55,7 @@ from .compile import (
     trace_compile_application,
 )
 from .attention import install_quantized_attention
+from .inference import fused_moe_gate_up
 
 _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
@@ -207,7 +208,7 @@ class _MLXLoRATypeSpec:
     wrapper_type: type
 
 
-def _mlx_lora_type_specs():
+def _mlx_lora_type_specs(*, include_convolutions=False):
     import mlx.nn as nn
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
     from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
@@ -233,7 +234,28 @@ def _mlx_lora_type_specs():
                 vlm_lora_module.LoRASwitchLinear,
             )
         )
+    if include_convolutions:
+        from .utils import LoRAPointwiseConv2d
+        specs.append(_MLXLoRATypeSpec((nn.Conv2d,), LoRAPointwiseConv2d))
     return tuple(specs)
+
+
+def _mlx_bitlinear_types():
+    return tuple(
+        cls for name in ("mlx_lm.models.bitlinear_layers",
+                         "mlx_vlm.models.bitnet.bitlinear")
+        if isinstance(cls := getattr(sys.modules.get(name), "BitLinear", None), type)
+    )
+
+
+def _check_mlx_lora_base(module):
+    if isinstance(module, _mlx_bitlinear_types()):
+        raise ValueError(
+            "Unsloth: BitLinear cannot be adapted with MLX LoRA: its packed-weight "
+            "CustomKernel has no input gradient (VJP). A residual adapter would "
+            "still block backpropagation through the base product. Use "
+            "differentiable linear layers, or target only a downstream lm_head."
+        )
 
 
 def _mlx_lora_base_types():
@@ -241,7 +263,7 @@ def _mlx_lora_base_types():
         base_type
         for spec in _mlx_lora_type_specs()
         for base_type in spec.base_types
-    )
+    ) + _mlx_bitlinear_types()
 
 
 def _mlx_quantized_switch_module_types():
@@ -271,11 +293,67 @@ def _mlx_quantized_module_types():
 def _mlx_lora_spec_for_module(module, specs):
     for spec in specs:
         if isinstance(module, spec.base_types):
-            return spec
+            supports = getattr(spec.wrapper_type, "supports", None)
+            if supports is None or supports(module):
+                return spec
     return None
 
 
-def _mlx_lora_from_base(module, config, *, specs):
+def _unfreeze_dora_magnitudes(model):
+    from .utils import iter_mlx_lora_modules
+
+    count = 0
+    # LoRA pair AND DoRA class: a base that merely owns an `m` stays frozen.
+    for _name, module in iter_mlx_lora_modules(model):
+        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+            module.unfreeze(keys=["m"], recurse=False)
+            count += 1
+    return count
+
+
+def _mlx_dora_wrapper_type(module, path):
+    import mlx.nn as nn
+
+    try:
+        from mlx_lm.tuner.dora import DoRALinear
+    except ImportError as exc:
+        raise ImportError(
+            "Unsloth MLX: DoRA training needs mlx_lm.tuner.dora.DoRALinear; "
+            "upgrade mlx-lm or train with use_dora=False."
+        ) from exc
+    # Exact types, not isinstance: a fused linear subclasses nn.Linear but
+    # returns a tuple, so a wrapper attaches cleanly then breaks forward.
+    if type(module) in (nn.Linear, nn.QuantizedLinear):
+        # mlx-lm unpacks a DoRA base only at widths dividing 32; plain LoRA
+        # is unaffected, so refuse only here.
+        bits = getattr(module, "bits", None)
+        if bits is not None and 32 % int(bits):
+            raise ValueError(
+                f"Unsloth MLX: DoRA cannot wrap {path or type(module).__name__} "
+                f"({int(bits)}-bit quantized); mlx-lm's DoRA wrapper only "
+                "recovers the unpacked width for bit widths that divide 32 "
+                "(2, 4, 8), and builds an unusable wrapper otherwise. "
+                "Requantize the base at 4 or 8 bits, or train with "
+                "use_dora=False."
+            )
+        return DoRALinear
+    raise ValueError(
+        f"Unsloth MLX: DoRA cannot wrap {path or type(module).__name__} "
+        f"({type(module).__name__}); MLX DoRA training covers plain "
+        "Linear/QuantizedLinear bases only, so fused projections and routed "
+        "experts are unsupported. Deselect it, or train with use_dora=False."
+    )
+
+
+def _mlx_lora_from_base(module, config, *, specs, path=None):
+    if config.get("use_dora"):
+        # to_lora() would silently downgrade fused linears to plain LoRA.
+        return _mlx_dora_wrapper_type(module, path).from_base(
+            module,
+            r=config["rank"],
+            scale=config["scale"],
+            dropout=config["dropout"],
+        )
     if callable(getattr(module, "to_lora", None)):
         return module.to_lora(
             r=config["rank"],
@@ -297,16 +375,24 @@ def _mlx_lora_from_base(module, config, *, specs):
 
 
 def _mlx_language_layers(model):
-    if hasattr(model, "layers"):
-        return model.layers
-    return model.model.layers
+    from .utils import _get_transformer_layers
+    layers = _get_transformer_layers(model)
+    return layers if layers is not None else ()
 
 
-def linear_to_lora_layers(model, num_layers, config):
+def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
     """Attach namespace-compatible LoRA wrappers to selected language layers."""
     from mlx.utils import tree_unflatten
 
     layers = _mlx_language_layers(model)
+    root = model
+    seen = set()
+    while not all(callable(getattr(root, name, None)) for name in ("named_modules", "update_modules")):
+        if root is None or id(root) in seen:
+            root = None
+            break
+        seen.add(id(root))
+        root = getattr(root, "model", None)
     type_specs = _mlx_lora_type_specs()
     keys = set(config.get("keys") or ())
     # A generic name is attention beside a qkv and MLP beside an fc1, so the
@@ -317,8 +403,8 @@ def linear_to_lora_layers(model, num_layers, config):
     shared = keys - {k for ks in layer_keys for k in ks} if layer_keys else keys
 
     limit = max(int(num_layers), 0)
-    attached = 0
     offset = max(len(layers) - limit, 0)
+
     # One adapter per PHYSICAL layer: a recurrent stack lists the same layer object at
     # several indices (mlx-vlm's hrm_text lists 2 layers over 8 entries), and adapting
     # it once per entry hands a LoRALinear back to _mlx_lora_from_base, which refuses
@@ -331,18 +417,40 @@ def linear_to_lora_layers(model, num_layers, config):
             order.append(layer)
             wanted_by_layer[id(layer)] = set()
         wanted_by_layer[id(layer)] |= wanted
-    for layer in order:
-        wanted = wanted_by_layer[id(layer)]
+
+    if config.get("use_dora"):
+        # Preflight so a late refusal leaves no layer converted; only the TYPE
+        # refusal is all-or-nothing. Same per-layer predicates as the
+        # conversion, not the `keys` union.
+        for layer in order:
+            for name, module in layer.named_modules():
+                if name in wanted_by_layer[id(layer)]:
+                    _mlx_dora_wrapper_type(module, name)
+        for name, module in (root.named_modules() if root is not None else ()):
+            if name in shared:
+                _mlx_dora_wrapper_type(module, name)
+    selected = [(layer, [(name, module) for name, module in layer.named_modules()
+                         if name in wanted_by_layer[id(layer)]])
+                for layer in order]
+    root_modules = [(name, module)
+                    for name, module in (root.named_modules() if root is not None else ())
+                    if name in shared]
+    for _, modules in [*selected, (root, root_modules)]:
+        for _, module in modules:
+            _check_mlx_lora_base(module)
+    if dry_run:
+        return sum(len(modules) for _, modules in selected) + len(root_modules)
+    attached = 0
+    for layer, modules in selected:
         replacements = []
-        for name, module in layer.named_modules():
-            if name not in wanted:
-                continue
+        for name, module in modules:
             replacements.append((
                 name,
                 _mlx_lora_from_base(
                     module,
                     config,
                     specs=type_specs,
+                    path=name,
                 ),
             ))
         if replacements:
@@ -353,12 +461,11 @@ def linear_to_lora_layers(model, num_layers, config):
     # layer walk above never reaches it.
     # `shared`, not `keys`: a layer-local `ff_proj` can name a root module too.
     root_replacements = [
-        (name, _mlx_lora_from_base(module, config, specs=type_specs))
-        for name, module in model.named_modules()
-        if name in shared
+        (name, _mlx_lora_from_base(module, config, specs=type_specs, path=name))
+        for name, module in root_modules
     ]
     if root_replacements:
-        model.update_modules(tree_unflatten(root_replacements))
+        root.update_modules(tree_unflatten(root_replacements))
         attached += len(root_replacements)
 
     return attached
@@ -734,7 +841,7 @@ def _materialize_mlx_vlm_config_override(
                     supports_list_extra_special_tokens=supports_list_extra_special_tokens,
                 )
             )
-        if not allow_tokenizer_remote_code:
+        if not allow_tokenizer_remote_code and os.path.isfile(os.path.join(local_path, "tokenizer.json")):
             auto_map = patched_tokenizer_config.get("auto_map")
             if isinstance(auto_map, dict) and auto_map:
                 patched_tokenizer_config = dict(patched_tokenizer_config)
@@ -802,6 +909,152 @@ def _materialize_mlx_vlm_config_override(
     return override_dir, patched_config
 
 
+_TOKENIZER_LOAD_LOCK = threading.RLock()
+_TOKENIZER_LOAD_STATE = threading.local()
+
+
+def _remote_code_reference(metadata, auto_class):
+    auto_map = metadata.get("auto_map", {})
+    reference = auto_map.get(auto_class) if isinstance(auto_map, dict) else (
+        auto_map if auto_class == "AutoTokenizer" else None
+    )
+    if isinstance(reference, (list, tuple)):
+        reference = next((item for item in reversed(reference) if item), None)
+    return reference if isinstance(reference, str) else None
+
+
+class _MLXRemoteCodeError(ValueError):
+    pass
+
+
+def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
+    if "trust_remote_code" not in str(error) and "custom code" not in str(error):
+        return
+    for filename, auto_class in (
+        ("processor_config.json", "AutoProcessor"),
+        ("preprocessor_config.json", "AutoProcessor"),
+        ("config.json", "AutoProcessor"),
+        ("tokenizer_config.json", "AutoTokenizer"),
+        ("preprocessor_config.json", "AutoImageProcessor"),
+    ):
+        if tokenizer_only and auto_class != "AutoTokenizer":
+            continue
+        reference = _remote_code_reference(
+            _read_json_file(os.path.join(str(model_path), filename)), auto_class,
+        )
+        if reference:
+            code_file = reference.split("--")[-1].rsplit(".", 1)[0] + ".py"
+            raise _MLXRemoteCodeError(
+                f"Unsloth: loading {model_path} requires {code_file} "
+                f"(declared in {filename}). Pass trust_remote_code=True "
+                "to allow this repository's custom code."
+            ) from error
+
+
+def _tokenizer_class_for_model_type(model_path):
+    """Resolve the tokenizer class from config.json's model_type STRING.
+
+    gpt2 and its relatives declare no tokenizer_class and ship no
+    special_tokens_map.json: their bos/eos/unk live in the tokenizer class's
+    __init__ defaults, so loading the bare backend silently drops them and
+    eos_token becomes None. The model_type is read as plain JSON and never
+    instantiated, so no model config validator runs.
+    """
+    from transformers.models.auto.tokenization_auto import (
+        TOKENIZER_MAPPING_NAMES, tokenizer_class_from_name,
+    )
+
+    model_type = _read_json_file(
+        os.path.join(str(model_path), "config.json"),
+    ).get("model_type")
+    if not model_type:
+        return None
+    mapped = TOKENIZER_MAPPING_NAMES.get(model_type)
+    if isinstance(mapped, (list, tuple)):
+        mapped = next((item for item in reversed(mapped) if item), None)
+    return tokenizer_class_from_name(mapped) if mapped else None
+
+
+def _load_mlx_tokenizer(model_path, *args, _auto_loader=None, **kwargs):
+    """Load a tokenizer without letting AutoTokenizer resolve the model config.
+
+    transformers 5.x resolves the model config before tokenization and only
+    catches ValueError/OSError from it, so published configs that raise
+    AttributeError or KeyError (Phi-4 multimodal, Nemotron NAS/H, DeepSeek
+    V3.2, MiniCPM3) take an otherwise loadable tokenizer down with them.
+    """
+    from transformers import AutoTokenizer, PretrainedConfig, PreTrainedTokenizerFast
+    from transformers.models.auto.tokenization_auto import (
+        get_tokenizer_config, tokenizer_class_from_name,
+    )
+
+    auto_loader = _auto_loader or AutoTokenizer.from_pretrained
+    # None != False here: transformers answers a missing trust_remote_code by
+    # prompting on stdin, and the blank config below forces has_local_code
+    # False, so a remote-code repo blocks ~15s on a question nobody asked.
+    kwargs.setdefault("trust_remote_code", False)
+    metadata = get_tokenizer_config(model_path, **kwargs)
+    class_name = metadata.get("tokenizer_class")
+    remote = _remote_code_reference(metadata, "AutoTokenizer")
+    tokenizer_class = None
+    if class_name:
+        tokenizer_class = tokenizer_class_from_name(class_name.removesuffix("Fast") + "Fast")
+        if tokenizer_class is None:
+            tokenizer_class = tokenizer_class_from_name(class_name)
+    if tokenizer_class is None and not remote:
+        tokenizer_class = _tokenizer_class_for_model_type(model_path)
+    if not remote and (Path(model_path) / "tokenizer.json").is_file():
+        if tokenizer_class is None or not issubclass(tokenizer_class, PreTrainedTokenizerFast):
+            tokenizer_class = PreTrainedTokenizerFast
+        return tokenizer_class.from_pretrained(model_path, *args, **kwargs)
+    # Tokenizer metadata selects the class; model validators have no role here.
+    if class_name or remote:
+        kwargs["config"] = PretrainedConfig()
+    try:
+        return auto_loader(model_path, *args, **kwargs)
+    except ValueError as error:
+        if not kwargs["trust_remote_code"]:
+            _raise_mlx_remote_code_refusal(model_path, error, tokenizer_only=True)
+        raise
+
+
+@contextmanager
+def _mlx_tokenizer_loading_scope(trust_remote_code=False):
+    """Cover nested processor tokenizer loads without changing other threads."""
+    from transformers import AutoTokenizer
+
+    with _TOKENIZER_LOAD_LOCK:
+        original_descriptor = AutoTokenizer.__dict__["from_pretrained"]
+        original = getattr(_TOKENIZER_LOAD_STATE, "original", AutoTokenizer.from_pretrained)
+        previous = getattr(_TOKENIZER_LOAD_STATE, "active", False)
+        _TOKENIZER_LOAD_STATE.active = True
+        _TOKENIZER_LOAD_STATE.original = original
+
+        refusals = []
+
+        @classmethod
+        def load(cls, model_path, *args, **kwargs):
+            if not getattr(_TOKENIZER_LOAD_STATE, "active", False):
+                return original(model_path, *args, **kwargs)
+            kwargs["trust_remote_code"] = bool(trust_remote_code)
+            try:
+                return _load_mlx_tokenizer(
+                    model_path, *args, _auto_loader=original, **kwargs,
+                )
+            except _MLXRemoteCodeError as error:
+                refusals.append(error)
+                raise
+
+        AutoTokenizer.from_pretrained = load
+        try:
+            yield refusals
+        finally:
+            AutoTokenizer.from_pretrained = original_descriptor
+            _TOKENIZER_LOAD_STATE.active = previous
+            if not previous:
+                del _TOKENIZER_LOAD_STATE.original
+
+
 def _load_mlx_lm_with_strict_fallback(
     model_name,
     model_type,
@@ -850,11 +1103,12 @@ def _load_mlx_lm_with_strict_fallback(
             model_config=model_config,
         )
 
-    tokenizer = load_tokenizer(
-        model_path,
-        tokenizer_config,
-        eos_token_ids=config.get("eos_token_id", None),
-    )
+    with _mlx_tokenizer_loading_scope(tokenizer_config.get("trust_remote_code", False)):
+        tokenizer = load_tokenizer(
+            model_path,
+            tokenizer_config,
+            eos_token_ids=config.get("eos_token_id", None),
+        )
     if want_config:
         return model, tokenizer, config
     return model, tokenizer
@@ -1046,11 +1300,12 @@ def _load_mlx_lm_distributed(
         cleanup_final_model_path = True
 
         try:
-            tokenizer = load_tokenizer(
-                final_model_path,
-                tokenizer_config,
-                eos_token_ids=config.get("eos_token_id", None),
-            )
+            with _mlx_tokenizer_loading_scope(tokenizer_config.get("trust_remote_code", False)):
+                tokenizer = load_tokenizer(
+                    final_model_path,
+                    tokenizer_config,
+                    eos_token_ids=config.get("eos_token_id", None),
+                )
             model, _config = load_model(
                 final_model_path,
                 lazy=True,
@@ -1286,9 +1541,6 @@ def _read_json_file(path):
 
 def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
     """Resolve a custom mlx-vlm or Transformers processor class by name."""
-    if not processor_class_name:
-        return None
-
     module_model_type = (model_type or "").replace("-", "_")
     module_types = [module_model_type]
     # Aliased model types live under their MODEL_REMAPPING target package.
@@ -1313,13 +1565,19 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
             module = importlib.import_module(module_name)
         except Exception:
             continue
-        processor_class = getattr(module, processor_class_name, None)
+        if processor_class_name:
+            processor_class = getattr(module, processor_class_name, None)
+        else:
+            candidates = [getattr(module, name) for name in getattr(module, "__all__", ())
+                          if name.endswith("Processor") and "ImageProcessor" not in name
+                          and callable(getattr(getattr(module, name, None), "from_pretrained", None))]
+            processor_class = candidates[0] if len(candidates) == 1 else None
         if isinstance(processor_class, type):
             return processor_class
 
     try:
         import transformers
-        processor_class = getattr(transformers, processor_class_name, None)
+        processor_class = getattr(transformers, processor_class_name or "", None)
         return processor_class if isinstance(processor_class, type) else None
     except Exception:
         return None
@@ -1379,10 +1637,17 @@ def _load_declared_mlx_vlm_processor(model_path, model_type, **kwargs):
             allow_tokenizer_remote_code=False,
         )
     try:
-        return scoped_processor_class.from_pretrained(
-            processor_load_path,
-            **kwargs,
-        )
+        with _mlx_tokenizer_loading_scope(kwargs.get("trust_remote_code", False)):
+            try:
+                return scoped_processor_class.from_pretrained(processor_load_path, **kwargs)
+            except AttributeError as error:
+                if ("backend_tokenizer" not in str(error)
+                        or "fix_mistral_regex" in kwargs):
+                    raise
+                # Transformers' regex repair expects a backend wrapper, not a raw Tokenizer.
+                return scoped_processor_class.from_pretrained(
+                    processor_load_path, **kwargs, fix_mistral_regex=False,
+                )
     finally:
         if str(processor_load_path) != str(model_path):
             shutil.rmtree(processor_load_path, ignore_errors=True)
@@ -1391,6 +1656,8 @@ def _load_declared_mlx_vlm_processor(model_path, model_type, **kwargs):
 def _is_mlx_vlm_processor_resolution_error(error):
     """Return whether AutoProcessor failed before native MLX construction."""
 
+    if isinstance(error, _MLXRemoteCodeError):
+        return True
     message = str(error).lower()
     if isinstance(error, ValueError):
         return any(
@@ -1402,6 +1669,18 @@ def _is_mlx_vlm_processor_resolution_error(error):
             )
         )
     return isinstance(error, ImportError) and "tensorflow" in message
+
+
+def _is_degraded_mlx_vlm_processor(processor):
+    """Return whether a VLM "processor" came back without its tokenizer.
+
+    A bare tokenizer counts as usable: that is what a text-only repo yields.
+    """
+    if processor is None:
+        return True
+    if getattr(processor, "tokenizer", None) is not None:
+        return False
+    return not hasattr(processor, "encode")
 
 
 def _inherit_mlx_vlm_processor_runtime(processor, repaired):
@@ -1466,30 +1745,53 @@ def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
                         config_data,
                         allow_tokenizer_remote_code=False,
                     )
-            try:
+            with _mlx_tokenizer_loading_scope(allow_remote_code) as refusals:
                 try:
-                    return original_auto_processor.from_pretrained(
-                        processor_load_path,
-                        *args,
-                        **call_kwargs,
-                    )
-                except Exception as error:
-                    if not _is_mlx_vlm_processor_resolution_error(error):
-                        raise
-                    config_data = _read_json_file(
-                        os.path.join(str(processor_load_path), "config.json")
-                    )
-                    processor = _load_declared_mlx_vlm_processor(
-                        processor_load_path,
-                        config_data.get("model_type"),
-                        **call_kwargs,
-                    )
-                    if processor is None:
-                        raise
+                    try:
+                        processor = original_auto_processor.from_pretrained(
+                            processor_load_path,
+                            *args,
+                            **call_kwargs,
+                        )
+                        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+                        if (isinstance(processor, PreTrainedTokenizerBase)
+                                and getattr(processor, "image_processor", None) is None):
+                            config_data = _read_json_file(
+                                os.path.join(str(processor_load_path), "config.json")
+                            )
+                            native = _load_declared_mlx_vlm_processor(
+                                processor_load_path, config_data.get("model_type"), **call_kwargs,
+                            )
+                            if native is not None:
+                                processor = _inherit_mlx_vlm_processor_runtime(processor, native)
+                    except Exception as error:
+                        if not _is_mlx_vlm_processor_resolution_error(error):
+                            raise
+                        config_data = _read_json_file(
+                            os.path.join(str(processor_load_path), "config.json")
+                        )
+                        processor = _load_declared_mlx_vlm_processor(
+                            processor_load_path,
+                            config_data.get("model_type"),
+                            **call_kwargs,
+                        )
+                        if processor is None:
+                            if refusals:
+                                raise refusals[-1] from error
+                            if not allow_remote_code:
+                                _raise_mlx_remote_code_refusal(model_path, error)
+                            raise
+                        # A fallback that produced a processor outranks a refusal.
+                        return processor
+                    # mlx_vlm.models.base's AutoProcessor shim swallows what its native
+                    # processor raises and chains to Transformers, so a refusal returns
+                    # SUCCESSFULLY with the image processor alone.
+                    if refusals and _is_degraded_mlx_vlm_processor(processor):
+                        raise refusals[-1]
                     return processor
-            finally:
-                if str(processor_load_path) != str(model_path):
-                    shutil.rmtree(processor_load_path, ignore_errors=True)
+                finally:
+                    if str(processor_load_path) != str(model_path):
+                        shutil.rmtree(processor_load_path, ignore_errors=True)
 
     processor_globals = dict(processor_loader.__globals__)
     processor_globals["AutoProcessor"] = ScopedAutoProcessor
@@ -1685,6 +1987,7 @@ def get_class_predicate(p, m):
 
 def _build_vlm_image_processor_from_config(
     model_path, processor_config, preprocessor_config, model_type=None,
+    *, trust_remote_code=False,
 ):
     """Recreate the image processor from saved processor sidecar configs."""
     image_config = processor_config.get("image_processor")
@@ -1721,7 +2024,9 @@ def _build_vlm_image_processor_from_config(
 
     try:
         from transformers import AutoImageProcessor
-        return AutoImageProcessor.from_pretrained(model_path)
+        return AutoImageProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code,
+        )
     except Exception:
         return None
 
@@ -1781,6 +2086,7 @@ def _repair_degraded_vlm_processor(
 
     image_processor = _build_vlm_image_processor_from_config(
         model_path, processor_config, preprocessor_config, model_type,
+        trust_remote_code=trust_remote_code,
     )
     if image_processor is None:
         return processor
@@ -1788,11 +2094,10 @@ def _repair_degraded_vlm_processor(
     tokenizer = getattr(processor, "tokenizer", None) or processor
     if tokenizer is None or not hasattr(tokenizer, "save_pretrained"):
         try:
-            from transformers import AutoTokenizer
             tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
             if token:
                 tokenizer_kwargs["token"] = token
-            tokenizer = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
+            tokenizer = _load_mlx_tokenizer(model_path, **tokenizer_kwargs)
         except Exception:
             return processor
 
@@ -2417,8 +2722,8 @@ def _fix_gemma3n_altup_batch(model=None):
     outright. Upstream repaired this in mlx-vlm 0.5.0, so this only ever runs
     against older releases, whose source no longer changes.
     """
-    layers = getattr(getattr(getattr(model, "language_model", None), "model", None),
-                     "layers", None)
+    from .utils import _get_transformer_layers
+    layers = _get_transformer_layers(model)
     altup = getattr(layers[0], "altup", None) if layers else None
     if altup is None:
         return False
@@ -2473,7 +2778,7 @@ def _paligemma_replace_mask(features, token_type_ids, attention_mask):
     Without token types there is no prefix boundary to derive, so upstream's mask
     is left as it is rather than guessed at.
     """
-    if token_type_ids is None or features.attention_mask_4d is None:
+    if token_type_ids is None:
         return features
     features.attention_mask_4d = _paligemma_prefix_lm_mask(
         token_type_ids, attention_mask,
@@ -4011,7 +4316,7 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
     if not module_paths:
         return 0
 
-    type_specs = _mlx_lora_type_specs()
+    type_specs = _mlx_lora_type_specs(include_convolutions=True)
     try:
         from mlx_lm.tuner.lora import LoRAEmbedding
     except Exception:
@@ -5140,7 +5445,7 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
     with _BNB_IMPORT_LOCK, _lifted_bitsandbytes_stub():
         import bitsandbytes  # noqa: F401 — real wheel; ImportError => fall back
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM
 
         device = "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -5184,7 +5489,7 @@ def _dequantize_bnb_to_tempdir(source, *, token, trust_remote_code):
                 pass
             model.save_pretrained(tmpdir, safe_serialization=True)
             # Needed by the downstream mlx-lm load.
-            AutoTokenizer.from_pretrained(
+            _load_mlx_tokenizer(
                 source, token=token, trust_remote_code=trust_remote_code,
             ).save_pretrained(tmpdir)
         except BaseException:
@@ -6373,26 +6678,26 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     generated_ids = []
     last_generation_tokens = None
-    for response in stream_generate(
-        self,
-        processor,
-        "",
-        max_tokens=max_tokens,
-        **batch,
-    ):
-        token_id = _mlx_token_to_int(getattr(response, "token", None))
-        if token_id is None:
-            continue
-        generation_tokens = getattr(response, "generation_tokens", None)
-        if (
-            generation_tokens is not None
-            and generation_tokens == last_generation_tokens
+    with fused_moe_gate_up(self):
+        for response in stream_generate(
+            self,
+            processor,
+            "",
+            max_tokens=max_tokens,
+            **batch,
         ):
-            continue
-        last_generation_tokens = generation_tokens
-        generated_ids.append(token_id)
-        _mlx_put_streamer_tokens(streamer, [token_id])
-
+            token_id = _mlx_token_to_int(getattr(response, "token", None))
+            if token_id is None:
+                continue
+            generation_tokens = getattr(response, "generation_tokens", None)
+            if (
+                generation_tokens is not None
+                and generation_tokens == last_generation_tokens
+            ):
+                continue
+            last_generation_tokens = generation_tokens
+            generated_ids.append(token_id)
+            _mlx_put_streamer_tokens(streamer, [token_id])
     if streamer is not None:
         streamer.end()
     return _mlx_generate_output(prompt_ids, generated_ids)
@@ -6496,21 +6801,22 @@ def _mlx_generate(self, *args, **kwargs):
     generated_ids = []
     eos_restore_state = _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id)
     try:
-        for response in stream_generate(
-            self,
-            tokenizer,
-            prompt_ids,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            **stream_kwargs,
-        ):
-            token = getattr(response, "token", None)
-            token_id = _mlx_token_to_int(token)
-            if token_id is None:
-                continue
-            generated_ids.append(token_id)
-            _mlx_put_streamer_tokens(streamer, [token_id])
+        with fused_moe_gate_up(self):
+            for response in stream_generate(
+                self,
+                tokenizer,
+                prompt_ids,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                **stream_kwargs,
+            ):
+                token = getattr(response, "token", None)
+                token_id = _mlx_token_to_int(token)
+                if token_id is None:
+                    continue
+                generated_ids.append(token_id)
+                _mlx_put_streamer_tokens(streamer, [token_id])
     finally:
         _mlx_restore_tokenizer_eos_ids(tokenizer, eos_restore_state)
 
@@ -6999,6 +7305,21 @@ def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
     return [path for path in paths if wanted.get(roles[path], False)]
 
 
+def _vision_projection_paths(module, attention, mlp, skip_subtrees=()):
+    paths = _role_selected_paths(module, attention, mlp, skip_subtrees)
+    if paths or not (attention and mlp):
+        return paths
+    from .utils import LoRAPointwiseConv2d
+    paths = [path for path, linear in _subtree_linears(module)
+             if _projects(linear) and _linear_role(path) is None
+             and not _under_any(path, skip_subtrees)]
+    paths.extend(path for path, child in module.named_modules()
+                 if LoRAPointwiseConv2d.supports(child) and child.weight.shape[0] > 1
+                 and _linear_role(path) != "gate"
+                 and not _under_any(path, skip_subtrees))
+    return paths
+
+
 def _raise_empty_target_modules():
     raise ValueError(
         "Unsloth: target_modules became empty after filtering by "
@@ -7088,7 +7409,7 @@ def _vlm_group_lora(model, lora_config, target_modules, *, vision_flag,
         if targets_defaulted:
             # The canonical names are this code's own vocabulary, not the
             # caller's, and a tower rarely speaks it.
-            role_paths = _role_selected_paths(
+            role_paths = _vision_projection_paths(
                 vision_module, finetune_attention_modules,
                 finetune_mlp_modules, skip_subtrees=nested_projectors,
             )
@@ -7144,7 +7465,7 @@ def _lora_walk_module(
     mlx-lm's `linear_to_lora_layers` expects."""
     try:
         # The specs selection reads, so the walk adapts all it is handed.
-        specs = _mlx_lora_type_specs()
+        specs = _mlx_lora_type_specs(include_convolutions=match_paths is not None)
     except ImportError:
         return 0
 
@@ -7169,6 +7490,7 @@ def _lora_walk_module(
                 continue
         elif not match_all_linear and not _lora_name_matches_target(name, target_modules):
             continue
+        _check_mlx_lora_base(child)
         spec = _mlx_lora_spec_for_module(child, specs)
         if spec is None:
             continue
@@ -8332,11 +8654,9 @@ class FastMLXModel:
         else:
             is_vlm = _is_vlm(config_data)
 
-        extra_kwargs = {}
+        extra_kwargs = {"trust_remote_code": bool(trust_remote_code)}
         if token:
             extra_kwargs["token"] = token
-        if trust_remote_code:
-            extra_kwargs["trust_remote_code"] = True
 
         if is_vlm:
             # VLM path via mlx-vlm
@@ -8528,6 +8848,9 @@ class FastMLXModel:
             model._processor = processor
             for fixup in _VLM_MODEL_FIXUPS:
                 _run_with_vlm_config_view(fixup, model)
+            if not force_vlm_text_path and patch_mode == "patched":
+                from .utils import bind_legacy_image_processor
+                _run_with_vlm_config_view(bind_legacy_image_processor, model, processor)
 
             model._config = getattr(model, "_config", config_data)
             model._hf_repo = model_name
@@ -8715,6 +9038,8 @@ class FastMLXModel:
         finetune_mlp_modules=True,
         finetune_last_n_layers=None,
         modules_to_save=None,
+        # Appended last, never inserted: positional callers keep binding.
+        use_dora=False,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Apply LoRA via mlx-lm on Apple Silicon.
@@ -8740,6 +9065,8 @@ class FastMLXModel:
             )
         if type(use_rslora) is not bool:
             raise TypeError("Unsloth: use_rslora must be True or False.")
+        if type(use_dora) is not bool:
+            raise TypeError("Unsloth: use_dora must be True or False.")
         _validate_mlx_init_lora_weights(init_lora_weights)
 
         if getattr(model, "_unsloth_full_finetuning", False):
@@ -8851,9 +9178,55 @@ class FastMLXModel:
             "alpha": lora_alpha,
             "dropout": lora_dropout,
             "scale": lora_alpha / (math.sqrt(r) if use_rslora else r),
+            "use_dora": bool(use_dora),
         }
 
         is_vlm = getattr(model, "_is_vlm_model", False)
+
+        if use_dora:
+            if lora_dropout:
+                print(
+                    "Unsloth: DoRA with lora_dropout > 0 trains normally in "
+                    "MLX format, but peft applies DoRA dropout inside the "
+                    "magnitude correction while mlx-lm leaves the base "
+                    "undropped, so continuing this adapter under peft would "
+                    "not reproduce the same training. Use lora_dropout=0 to "
+                    "keep the two equivalent."
+                )
+            if init_lora_weights is False:
+                # Seeded norm is the adapted norm only while lora_b is zero.
+                raise ValueError(
+                    "Unsloth MLX: DoRA does not support "
+                    "init_lora_weights=False; the magnitude vector is "
+                    "seeded from the base weight and would not match the "
+                    "randomized adapter. Use init_lora_weights=True (or "
+                    "'gaussian'), or train with use_dora=False."
+                )
+            from .utils import iter_mlx_lora_modules
+
+            existing = sorted({
+                type(module).__name__
+                for _name, module in iter_mlx_lora_modules(model)
+                if not type(module).__name__.startswith("DoRA")
+            })
+            if existing:
+                raise ValueError(
+                    "Unsloth MLX: DoRA cannot be added to a model that "
+                    f"already carries {', '.join(existing)} adapter "
+                    "modules; the saved adapter records a single type for "
+                    "the whole tree, so the mixed result would be stamped "
+                    "'dora' and reload the plain-LoRA modules as DoRA. "
+                    "Reload the base model before requesting DoRA, or train "
+                    "with use_dora=False."
+                )
+            if is_vlm and (train_vision or train_projector):
+                raise ValueError(
+                    "Unsloth MLX: DoRA is not supported for vision or "
+                    "projector towers; those wrap as plain LoRA, and the "
+                    "saved adapter records a single adapter type for the "
+                    "whole tree, so the mixed result reloads as all-DoRA. "
+                    "Train the language tower only, or use use_dora=False."
+                )
 
         if is_vlm:
             # Decide, and refuse, before anything is modified.
@@ -8865,16 +9238,6 @@ class FastMLXModel:
                 finetune_mlp_modules=finetune_mlp_modules, dry_run=True,
             )
 
-            # Scopes embedding_learning_rate to exactly these tensors.
-            model._unsloth_cpt_full_module_weight_keys = (
-                _full_module_weight_keys(model, _cpt_full_specs)
-                if _cpt_full_specs else set()
-            )
-
-            _fix_missing_no_grad(model)
-            _fix_gemma4_kv_sharing(model)
-            model.freeze()
-
             # Keys are rooted at `model`; the LoRA call below targets
             # `model.language_model`, so drop that prefix.
             _vlm_lm_head_keys = {
@@ -8882,6 +9245,7 @@ class FastMLXModel:
                 for p in _cpt_lm_head_keys
             }
             language_lora_count = 0
+            language_lora_keys = set()
             if (finetune_language_layers and (
                 target_modules is None or (isinstance(target_modules, list) and len(target_modules) > 0)
             )) or _vlm_lm_head_keys:
@@ -8901,21 +9265,32 @@ class FastMLXModel:
                     if targets_defaulted and finetune_language_layers else None
                 )
                 language_lora_keys = set(language_lora_keys or set()) | _vlm_lm_head_keys
-                if len(language_lora_keys) > 0:
-                    # Compat patch (older mlx-lm rejects scale=/dropout= on
-                    # from_base); before the seed since monkey-patching doesn't
-                    # advance mx.random.
-                    _patch_mlx_lora_from_base_compat()
-                    # Seed mx.random immediately before LoRA init (like
-                    # mlx_lm/tuner/lora.py train); otherwise lazy state
-                    # advances leak into lora_a sampling.
-                    _seed_mlx_random_state(random_state)
-                    language_lora_count = linear_to_lora_layers(
-                        lm,
-                        num_layers=num_layers,
-                        config={**lora_config, "keys": language_lora_keys,
-                                "layer_keys": language_layer_keys},
-                    )
+                linear_to_lora_layers(
+                    lm, num_layers,
+                    {**lora_config, "keys": language_lora_keys,
+                     "layer_keys": language_layer_keys}, dry_run=True,
+                )
+
+            # Scopes embedding_learning_rate to exactly these tensors.
+            model._unsloth_cpt_full_module_weight_keys = (
+                _full_module_weight_keys(model, _cpt_full_specs)
+                if _cpt_full_specs else set()
+            )
+
+            _fix_missing_no_grad(model)
+            _fix_gemma4_kv_sharing(model)
+            model.freeze()
+
+            if len(language_lora_keys) > 0:
+                # Finish compatibility setup before seeding adapter initialization.
+                _patch_mlx_lora_from_base_compat()
+                _seed_mlx_random_state(random_state)
+                language_lora_count = linear_to_lora_layers(
+                    lm,
+                    num_layers=num_layers,
+                    config={**lora_config, "keys": language_lora_keys,
+                            "layer_keys": language_layer_keys},
+                )
 
             # LoRA beats unfreezing raw weights since many projectors are
             # QuantizedLinear and MLX can't backprop into quantized weights.
@@ -8947,6 +9322,8 @@ class FastMLXModel:
                 _raise_no_lora_targets(target_modules)
 
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+            if use_dora:
+                _unfreeze_dora_magnitudes(model)
             _unfreeze_full_modules(_cpt_full_specs)
         else:
             # No tower to adapt, and nothing to name in an error either.
@@ -9027,6 +9404,8 @@ class FastMLXModel:
 
             model.freeze()
             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+            if use_dora:
+                _unfreeze_dora_magnitudes(model)
             # CPT full modules train at load dtype, scaled by embedding_learning_rate.
             _unfreeze_full_modules(_cpt_full_specs)
 

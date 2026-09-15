@@ -181,7 +181,10 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     else:
         DEBUGGING = ""
         os.environ.pop("TORCHDYNAMO_VERBOSE", None)
-        os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+        # Keep _gpu_init's forcing: Inductor's compile workers cannot enumerate a cgroup
+        # pinned GPU and raise "Could not find an active GPU backend".
+        if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") != "1":
+            os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
         os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)
         os.environ.pop("TORCH_LOGS", None)
         torch._logging.set_logs(all = logging.CRITICAL)
@@ -657,7 +660,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.compiled_autograd import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture  # noqa: F821
 
     # From https://github.com/pytorch/pytorch/pull/135795/files
     try:
@@ -683,7 +687,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.variables.misc import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method  # noqa: F821
     return
 pass
 
@@ -841,7 +846,8 @@ if _transformers_bnb is not None and \
     source = re.sub(pattern, add_score_code, source, flags=re.MULTILINE)
 
     exec(source, globals())
-    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
+    # Defined by the exec(source, globals()) directly above.
+    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear  # noqa: F821
 pass
 
 # Patch for transformers 5.x: should_convert_module uses re.match + endswith

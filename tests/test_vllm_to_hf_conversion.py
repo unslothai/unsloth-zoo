@@ -357,8 +357,10 @@ def test_extract_gdn_layers_emits_bnb_quant_state_for_all_shards():
 def test_assert_same_state_dict_tied_embed_fallback_has_tolerances():
     # Pre-fix: tied-embeddings fallback used strict tolerances vs the outer atol=1e-4, rtol=1e-3.
     from unsloth_zoo import vllm_utils
+    # the names moved to TIED_EMBED_KEYS; the fallback must still compare loosely
+    assert "model.embed_tokens.weight" in vllm_utils.TIED_EMBED_KEYS
     src = inspect.getsource(vllm_utils.assert_same_state_dict)
-    tied_idx = src.index("model.embed_tokens.weight")
+    tied_idx = src.index("TIED_EMBED_KEYS")
     tail = src[tied_idx:]
     assert "atol = 1e-4" in tail
     assert "rtol = 1e-3" in tail
@@ -1359,3 +1361,104 @@ def test_patch_gemma4_vllm_k_eq_v_support_noop_when_private_attr_missing():
                 _sys.modules.pop(name, None)
             else:
                 _sys.modules[name] = prev
+
+
+def _rotary_pos_emb_block():
+    """The shipped dispatch, as text, so the tests below exercise the real code."""
+    import textwrap
+    from unsloth_zoo import empty_model
+    src = inspect.getsource(empty_model.finalize_huggingface_model)
+    start = src.index('if hasattr(module, "rotary_pos_emb")')
+    end = src.index('if hasattr(module, "rotary_emb_local")', start)
+    return textwrap.dedent(src[start:end]).rstrip()
+
+
+def _run_rotary_dispatch(rotary_class):
+    """Returns (rebuilt module, warnings) after running the block against rotary_class."""
+    import torch.nn as nn
+
+    class _Cfg:
+        hidden_size = 1280
+        num_heads = 16
+        rope_parameters = {"rope_type": "axial", "rope_theta": 10000.0}
+
+    class _Log:
+        def __init__(self): self.warnings = []
+        def warning(self, message): self.warnings.append(message)
+
+    class _Holder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_pos_emb = nn.Module()
+
+    holder, log = _Holder(), _Log()
+    holder.rotary_pos_emb.__class__ = rotary_class
+    env = {
+        "module": holder, "module_name": "visual", "vision_config": _Cfg(),
+        "target_device": torch.device("cpu"), "logger": log,
+        "inspect": inspect, "hasattr": hasattr,
+    }
+    exec(compile(_rotary_pos_emb_block(), "<rotary>", "exec"), env, env)
+    return holder.rotary_pos_emb, log.warnings
+
+
+def _rotary_stub(init):
+    import torch.nn as nn
+    return type("Stub", (nn.Module,), {"__init__": init})
+
+
+def test_rotary_pos_emb_reinit_dispatches_on_signature():
+    """transformers 4 and early 5 take a positional dim, later 5 takes the vision config.
+    Passing a dim to the config form raised `'int' object has no attribute
+    'rope_parameters'`, which killed every Qwen2.5-VL / Qwen3-VL / Qwen3.5 fast_inference
+    load on those versions. Dispatch has to follow the signature, not guess."""
+    import torch.nn as nn
+    seen = []
+
+    def dim_init(self, dim: int, theta: float = 10000.0):
+        nn.Module.__init__(self)
+        seen.append(("dim", dim))
+        self.inv_freq = nn.Buffer(torch.arange(0, dim, 2).float(), persistent = False)
+
+    def config_init(self, config, device = None):
+        nn.Module.__init__(self)
+        seen.append(("config", config.rope_parameters["rope_type"]))
+        self.inv_freq = nn.Buffer(torch.arange(0, 8).float(), persistent = False)
+
+    rebuilt, warnings = _run_rotary_dispatch(_rotary_stub(dim_init))
+    assert seen == [("dim", 40)], f"dim form not used or wrong dim: {seen}"
+    assert not warnings and rebuilt.inv_freq.device.type == "cpu"
+
+    seen.clear()
+    rebuilt, warnings = _run_rotary_dispatch(_rotary_stub(config_init))
+    assert seen == [("config", "axial")], f"config form not used: {seen}"
+    assert not warnings and rebuilt.inv_freq.device.type == "cpu"
+
+
+def test_rotary_pos_emb_reinit_survives_the_5_18_device_kwarg_removal():
+    """`device` on the vision rotary is deprecate_kwarg(version="5.18"), so passing it
+    becomes a TypeError. That would land in the warning branch and silently skip the
+    reinit, so the ctor must be called without it and moved afterwards."""
+    import torch.nn as nn
+    assert "device = target_device" not in _rotary_pos_emb_block(), \
+        "device= is removed in transformers 5.18 and must not be passed to the rotary ctor"
+
+    def config_only_init(self, config):  # the 5.18 shape
+        nn.Module.__init__(self)
+        self.inv_freq = nn.Buffer(torch.arange(0, 8).float(), persistent = False)
+
+    rebuilt, warnings = _run_rotary_dispatch(_rotary_stub(config_only_init))
+    assert not warnings, f"5.18 signature was skipped instead of rebuilt: {warnings}"
+    assert rebuilt.inv_freq.device.type == "cpu"
+
+
+def test_rotary_pos_emb_reinit_warns_instead_of_aborting_on_an_unknown_signature():
+    """An unrecognised signature must not take the whole load down with it."""
+    import torch.nn as nn
+
+    def unknown_init(self, alpha, beta, gamma):
+        nn.Module.__init__(self)
+
+    _, warnings = _run_rotary_dispatch(_rotary_stub(unknown_init))
+    assert len(warnings) == 1, f"expected one warning, got {warnings}"
+    assert "skipped rotary_pos_emb reinit" in warnings[0]

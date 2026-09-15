@@ -160,7 +160,8 @@ class TemplateScriptTokenizer(Tokenizer):
 
 def rows(count=6):
     return [
-        {"prompt": f"question {index}: ", "chosen": "yes", "rejected": "no"}
+        {"prompt": f"question {index}: ",
+         "chosen": f"yes{index}", "rejected": f"no{index}"}
         for index in range(count)
     ]
 
@@ -176,14 +177,15 @@ def policy(kind="dpo", **kwargs):
     return PreferenceLengthPolicy(kind=kind, **options)
 
 
-def build_plan(**kwargs):
+def build_plan(dataset=None, **kwargs):
     from unsloth_zoo.mlx.preference import create_preference_batch_plan
     options = dict(
         batch_size=2, length_policy=policy(), dataset_order="sequential",
         grad_accum=2,
     )
     options.update(kwargs)
-    return create_preference_batch_plan(rows(), Tokenizer(), **options)
+    return create_preference_batch_plan(
+        rows() if dataset is None else dataset, Tokenizer(), **options)
 
 
 def test_configs_are_objective_specific_and_keyword_only():
@@ -192,6 +194,9 @@ def test_configs_are_objective_specific_and_keyword_only():
     assert not hasattr(MLXTrainingConfig(), "beta")
     assert MLXORPOConfig(beta=0.2).beta == 0.2
     assert MLXDPOConfig(beta=0.3, label_smoothing=0.1).reference_free is False
+    default = MLXDPOConfig()
+    assert (default.loss_type, default.loss_weights, default.discopop_tau) == (
+        "sigmoid", None, 0.05)
     with pytest.raises(TypeError):
         MLXORPOConfig(*([None] * 100))
 
@@ -764,7 +769,8 @@ class TinyModel:
 
 @pytest.mark.parametrize("objective", ["orpo", "dpo"])
 def test_microbatch_loss_matches_one_logical_batch(objective):
-    from unsloth_zoo.mlx.preference import make_dpo_loss_fn, make_orpo_loss_fn
+    from unsloth_zoo.mlx.preference import (
+        make_dpo_loss_fn, make_orpo_loss_fn, resolve_preference_objective)
 
     dataset = rows(3)
     from unsloth_zoo.mlx.preference import create_preference_batch_plan
@@ -777,10 +783,12 @@ def test_microbatch_loss_matches_one_logical_batch(objective):
         num_batches=1, grad_accum=1, dataset_order="sequential",
     )
     model = TinyModel()
+    resolved_objective = resolve_preference_objective(
+        objective, beta=0.1, reference_free=True)
     loss_fn = (
-        make_orpo_loss_fn(beta=0.1)
+        make_orpo_loss_fn(resolved_objective)
         if objective == "orpo"
-        else make_dpo_loss_fn(beta=0.1, reference_free=True)
+        else make_dpo_loss_fn(resolved_objective)
     )
     micro_value = sum(float(loss_fn(model, *micro[index])[0]) for index in range(2)) / 2
     whole_value = float(loss_fn(model, *whole[0])[0])
@@ -789,12 +797,12 @@ def test_microbatch_loss_matches_one_logical_batch(objective):
 
 def test_orpo_odds_term_is_finite_for_perfect_float16_logp():
     import mlx.core as mx
-    from unsloth_zoo.mlx.preference import _orpo_terms
+    from unsloth_zoo.mlx.preference import _log_sigmoid, _orpo_log_odds
 
-    value = _orpo_terms(
+    value = -_log_sigmoid(_orpo_log_odds(
         mx.array([0.0], dtype=mx.float16),
         mx.array([-1.0], dtype=mx.float16),
-    )
+    ))
     assert math.isfinite(float(value[0]))
     assert value.dtype == mx.float32
 
@@ -814,11 +822,221 @@ def test_dpo_label_smoothing_matches_conservative_formula():
         (1 - epsilon) * preference._log_sigmoid(logits)
         + epsilon * preference._log_sigmoid(-logits)
     ).mean()
-    actual, weight = preference.make_dpo_loss_fn(
-        beta=beta, label_smoothing=epsilon, reference_free=True,
+    actual, weight, _stats = preference.make_dpo_loss_fn(
+        preference.resolve_preference_objective(
+            "dpo", beta=beta, label_smoothing=epsilon, reference_free=True),
     )(model, batch, lengths, normalizers)
     assert float(actual) == pytest.approx(float(expected), rel=1e-6)
     assert int(weight) == 1
+
+
+# Run from TRL 0.23.1's own dpo_loss, not transcribed. The fourth pair pushes
+# past 1 / beta where hinge clamps; the first three sort out of their order.
+_DPO_FIXTURE = dict(
+    chosen=[-1.0, -2.5, -0.4, -0.2], rejected=[-1.8, -0.6, -2.2, -3.6],
+    ref_chosen=[-1.3, -2.0, -0.9, -2.4], ref_rejected=[-1.1, -1.4, -2.6, -1.9],
+)
+_TRL_PAIR_LOSSES = {
+    "sigmoid": (0.5993552, 0.8485404, 0.6827597, 0.4458072),
+    "robust": (0.4900695, 0.9906118, 0.6718311, 0.0195929),
+    "exo_pair": (0.2186689, 0.5223414, 0.3237762, 0.0259403),
+    "hinge": (0.7, 1.39, 0.97, 0.0),
+    "ipo": (0.4444444, 8.8011111, 2.4544444, 4.9877778),
+    "sppo_hard": (2.8022222, 10.7788889, 5.6322222, 0.2855556),
+    "nca_pair": (1.3155638, 1.4916006, 1.3839086, 1.1901117),
+    "aot_pair": (0.5832604, 0.5993552, 0.6827597, 0.568037),
+    "aot": (0.8485404, 0.5755404, 0.527488, 0.5468133),
+    "apo_zero": (0.9252073, 1.0971435, 0.9925342, 0.7159331),
+    "apo_down": (0.9480423, 1.0588529, 1.0299304, 0.8961154),
+    "discopop": (0.7068026, 0.9780284, 0.8352891, 0.3102519),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_TRL_PAIR_LOSSES))
+def test_each_dpo_variant_matches_the_trl_formula(name):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference
+
+    assert set(preference._DPO_VARIANTS) == set(_TRL_PAIR_LOSSES)
+    assert "discopop" not in preference._DPO_SMOOTHING_WARNINGS
+    objective = preference.resolve_preference_objective(
+        "dpo", beta=0.3, loss_type=name, discopop_tau=0.2,
+        label_smoothing=(
+            0.0 if name in preference._DPO_SMOOTHING_WARNINGS else 0.15),
+    )
+    arrays = {key: mx.array(value, dtype=mx.float32)
+              for key, value in _DPO_FIXTURE.items()}
+    scored = preference._dpo_pair_loss(objective, preference._DPOTerms(
+        chosen_ratio=arrays["chosen"] - arrays["ref_chosen"],
+        rejected_ratio=arrays["rejected"] - arrays["ref_rejected"],
+        delta=(arrays["chosen"] - arrays["rejected"])
+        - (arrays["ref_chosen"] - arrays["ref_rejected"]), **arrays))
+    assert scored.tolist() == pytest.approx(_TRL_PAIR_LOSSES[name], rel=1e-5)
+
+
+def test_an_objective_is_valid_however_it_was_built():
+    import dataclasses
+    from unsloth_zoo.mlx.preference import (
+        PreferenceObjective, make_dpo_loss_fn, make_orpo_loss_fn,
+        make_preference_eval_fn, resolve_preference_objective)
+
+    for kind, options, match in (
+        ("cpo", {}, "unknown objective kind"),
+        ("dpo", dict(loss_types=("bco_pair",)), "running mean"),
+        ("dpo", dict(loss_types=("kto_pair",)), "removed it"),
+        ("dpo", dict(loss_types=("sigmoidal",)), "unknown loss_type"),
+        ("dpo", dict(loss_types=(), weights=()), "at least one"),
+        ("dpo", dict(loss_types=["sigmoid", "hinge"], weights=[1.0]),
+         "same length"),
+        ("dpo", dict(loss_types=("sigmoid", "hinge"),
+                     weights=(1.0, float("nan"))), "must all be finite"),
+        ("dpo", dict(beta=float("inf")), "finite and non-negative"),
+        ("orpo", dict(beta=-1.0), "finite and non-negative"),
+        ("dpo", dict(label_smoothing=0.5), r"\[0, 0.5\)"),
+        ("dpo", dict(loss_types=("discopop",), discopop_tau=0.0),
+         "discopop_tau"),
+        ("dpo", dict(loss_types=("aot",), reference_free=True),
+         "reference_free never computes"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            PreferenceObjective(kind=kind, **{"beta": 0.1, **options})
+    with pytest.raises(ValueError, match="unknown objective kind"):
+        resolve_preference_objective("cpo", beta=0.1)
+
+    # A bound binds only where a loss reads the value.
+    kept = PreferenceObjective(
+        kind="dpo", beta=0.1, loss_types=["sigmoid", "exo_pair"],
+        weights=[0.0, -1.0], discopop_tau=0.0)
+    assert (kept.loss_types, kept.weights, kept.discopop_tau) == (
+        ("sigmoid", "exo_pair"), (0.0, -1.0), 0.0)
+    assert kept.label_smoothing == pytest.approx(1e-3)
+    assert PreferenceObjective(
+        kind="orpo", beta=0.1, label_smoothing=0.5).label_smoothing == 0.5
+    assert {f.name for f in dataclasses.fields(PreferenceObjective)} == {
+        "kind", "beta", "label_smoothing", "loss_types", "weights",
+        "discopop_tau", "reference_free"}
+
+    dpo = resolve_preference_objective("dpo", beta=0.1)
+    assert (dpo.loss_types, dpo.weights, dpo.label_smoothing) == (
+        ("sigmoid",), (1.0,), 0.0)
+    for build, wrong in ((make_dpo_loss_fn, "orpo"), (make_orpo_loss_fn, "dpo")):
+        with pytest.raises(ValueError, match="objective of kind"):
+            build(resolve_preference_objective(wrong, beta=0.1))
+    for build in (make_dpo_loss_fn, make_preference_eval_fn):
+        with pytest.raises(ValueError, match="scores against a reference"):
+            build(dpo)
+        assert build(dpo, reference_policy=object()) is not None
+
+
+def _ordered(rewards, weights):
+    """TRL's accumulation: one weighted copy of the rewards per list entry."""
+    total = rewards * weights[0]
+    for weight in weights[1:]:
+        total = total + rewards * weight
+    return total
+
+
+def _assert_reported_stats(kind, stats, expected, counts, over):
+    from unsloth_zoo.mlx import preference
+
+    names = preference.PREFERENCE_EVAL_METRICS[kind]
+    for metric, value in expected.items():
+        assert float(stats[names.index(metric)]) == pytest.approx(
+            float(value), rel=1e-5), metric
+    assert [float(stats[len(names) + at]) for at in range(len(counts))] == [
+        pytest.approx(float(value)) for value in counts]
+    named = preference._PREFERENCE_DENOMINATOR_NAMES[kind]
+    at = preference.PREFERENCE_EVAL_DENOMINATORS[kind]
+    assert {name: named[at[index] - len(names)]
+            for index, name in enumerate(names)} == over
+
+
+def test_the_training_loss_and_its_reported_metrics_follow_the_objective():
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference
+
+    # Rows of unlike length, so a count scaled from the first row is wrong.
+    batch, lengths, normalizers = build_plan([
+        {"prompt": f"question {index}: ", "chosen": "yes " * (index + 1),
+         "rejected": "no " * (2 - index)} for index in range(2)],
+        num_batches=1, grad_accum=1)[0]
+    model = TinyModel()
+    beta, weights = 0.3, [0.1, 0.2, -0.3]
+    pairs = batch.shape[0] // 2
+    # Far enough out that the two pairs order oppositely whatever the model scores.
+    held = mx.array([0.0, 60.0, 60.0, 0.0])
+    policy = types.SimpleNamespace(forward=lambda *_a: held)
+    resolve = preference.resolve_preference_objective
+    objective = resolve(
+        "dpo", beta=beta, loss_type=["hinge", "apo_down", "sigmoid"],
+        loss_weights=weights)
+    actual, weight, stats = preference.make_dpo_loss_fn(
+        objective, reference_policy=policy)(model, batch, lengths, normalizers)
+
+    logps = preference._response_logps(model, batch, lengths)
+    chosen, rejected = logps[:pairs], logps[pairs:]
+    ref_chosen, ref_rejected = held[:pairs], held[pairs:]
+    terms = preference._DPOTerms(
+        chosen=chosen, rejected=rejected, ref_chosen=ref_chosen,
+        ref_rejected=ref_rejected, chosen_ratio=chosen - ref_chosen,
+        rejected_ratio=rejected - ref_rejected,
+        delta=(chosen - rejected) - (ref_chosen - ref_rejected))
+    expected = None
+    for name, entry in zip(objective.loss_types, weights):
+        term = preference._DPO_VARIANTS[name](objective, terms) * entry
+        expected = term if expected is None else expected + term
+    assert float(actual) == pytest.approx(float(expected.mean()), rel=1e-6)
+    assert int(weight) == 1
+    assert resolve("dpo", beta=beta,
+                   loss_type=["hinge", "sigmoid"]).weights == (1.0, 1.0)
+
+    # Weights summing to zero separate TRL's per-entry copies from one scaled copy.
+    reward_chosen = _ordered(beta * (chosen - ref_chosen), weights)
+    reward_rejected = _ordered(beta * (rejected - ref_rejected), weights)
+    logits, _ce, mask = preference._preference_forward(model, batch, lengths)
+    rows, vocab = logits.astype(mx.float32).sum(axis=-1), logits.shape[-1]
+    _assert_reported_stats("dpo", stats, {
+        "rewards/chosen": reward_chosen.sum(),
+        "rewards/rejected": reward_rejected.sum(),
+        "rewards/accuracies": (reward_chosen > reward_rejected).sum(),
+        "rewards/margins": (reward_chosen - reward_rejected).sum(),
+        "logps/chosen": chosen.sum(), "logps/rejected": rejected.sum(),
+        "logits/chosen": (rows[:pairs] * mask[:pairs]).sum(),
+        "logits/rejected": (rows[pairs:] * mask[pairs:]).sum(),
+    }, (mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab, pairs), {
+        "logits/chosen": "chosen_logits", "logits/rejected": "rejected_logits",
+        **{name: "pairs" for name in preference.PREFERENCE_EVAL_METRICS["dpo"]
+           if not name.startswith("logits/")}})
+    for at, side, reference in ((0, chosen, ref_chosen), (1, rejected, ref_rejected)):
+        assert float(stats[at]) != float(
+            (beta * (side - reference) * sum(weights)).sum()), at
+
+    free = resolve("dpo", beta=beta, loss_type=["sigmoid", "ipo"],
+                   reference_free=True)
+    _terms, free_stats = preference._dpo_scores(
+        model, batch, lengths, free, reference_policy=policy)
+    counts = mx.maximum(mask.sum(axis=1), mx.array(1.0))
+    assert float(free_stats[0]) == pytest.approx(float(_ordered(
+        beta * logps[:pairs] / counts[:pairs], (1.0, 1.0)).sum()), rel=1e-6)
+
+    scored, ipo_stats = preference._dpo_scores(
+        model, batch, lengths,
+        resolve("dpo", beta=beta, loss_type=["sigmoid", "ipo"]),
+        reference_policy=policy)
+    scaled, reference = logps / counts, held / counts
+    for got, want in ((scored.chosen, scaled[:pairs]),
+                      (scored.rejected, scaled[pairs:]),
+                      (scored.ref_chosen, reference[:pairs]),
+                      (scored.ref_rejected, reference[pairs:]),
+                      (scored.chosen_ratio, scaled[:pairs] - reference[:pairs]),
+                      (scored.rejected_ratio, scaled[pairs:] - reference[pairs:]),
+                      (scored.delta, (scaled[:pairs] - scaled[pairs:])
+                       - (reference[:pairs] - reference[pairs:]))):
+        assert got.tolist() == pytest.approx(want.tolist(), rel=1e-6)
+    won = [bool(a > b) for a, b in zip(
+        (scored.chosen_ratio).tolist(), (scored.rejected_ratio).tolist())]
+    assert sorted(won) == [False, True]
+    assert float(ipo_stats[2]) == float(sum(won))
 
 
 def test_orpo_nll_covers_the_full_chosen_sequence():
@@ -841,18 +1059,41 @@ def test_orpo_nll_covers_the_full_chosen_sequence():
     response_logp = -(ce * response_mask).sum(axis=1) / mx.maximum(
         response_mask.sum(axis=1), mx.array(1.0),
     )
-    odds = preference._orpo_terms(
+    odds = -preference._log_sigmoid(preference._orpo_log_odds(
         response_logp[:pairs], response_logp[pairs:],
-    ).mean()
+    )).mean()
     full_mask = (steps < lengths[:pairs, 1:]).astype(mx.float32)
     full_nll = (ce[:pairs] * full_mask).sum() / full_mask.sum()
     response_nll = (
         ce[:pairs] * response_mask[:pairs]
     ).sum() / response_mask[:pairs].sum()
-    actual, _ = preference.make_orpo_loss_fn(beta)(
+    actual, _weight, stats = preference.make_orpo_loss_fn(
+        preference.resolve_preference_objective("orpo", beta=beta))(
         model, batch, lengths, normalizers,
     )
     assert float(actual) == pytest.approx(float(full_nll + beta * odds), rel=1e-6)
+
+    chosen_lp, rejected_lp = response_logp[:pairs], response_logp[pairs:]
+    # TRL's odds, written out rather than taken from the helper under test.
+    odds_of = lambda logp: logp - mx.log(1.0 - mx.exp(logp))
+    log_odds = odds_of(chosen_lp) - odds_of(rejected_lp)
+    raw = preference._model_logits(model(batch[:, :-1]))
+    rows, half = raw.astype(mx.float32).sum(axis=-1), math.prod(raw.shape) // 2
+    _assert_reported_stats("orpo", stats, {
+        "rewards/chosen": beta * chosen_lp.sum(),
+        "rewards/rejected": beta * rejected_lp.sum(),
+        "rewards/accuracies": (chosen_lp > rejected_lp).sum(),
+        "rewards/margins": beta * (chosen_lp - rejected_lp).sum(),
+        "logps/chosen": chosen_lp.sum(), "logps/rejected": rejected_lp.sum(),
+        "logits/chosen": rows[:pairs].sum(), "logits/rejected": rows[pairs:].sum(),
+        "nll_loss": (ce[:pairs] * full_mask).sum(),
+        "log_odds_ratio": -mx.log1p(mx.exp(-log_odds)).sum(),
+        "log_odds_chosen": log_odds.sum(),
+    }, (half, half, full_mask.sum(), pairs), {
+        "logits/chosen": "chosen_logits", "logits/rejected": "rejected_logits",
+        "nll_loss": "nll_tokens",
+        **{name: "pairs" for name in preference.PREFERENCE_EVAL_METRICS["orpo"]
+           if not name.startswith("logits/") and name != "nll_loss"}})
     assert not math.isclose(
         float(actual), float(response_nll + beta * odds), rel_tol=1e-4,
     )
@@ -1137,6 +1378,63 @@ def test_preference_trainer_runs_through_shared_training_loop(
     assert result["trained_tokens"] > 0
 
 
+def _window_mean(model, plan, indices, metric="logps/chosen"):
+    from unsloth_zoo.mlx import preference
+
+    loss_fn = preference.make_dpo_loss_fn(preference.resolve_preference_objective(
+        "dpo", beta=0.1, reference_free=True))
+    at = preference.PREFERENCE_EVAL_METRICS["dpo"].index(metric)
+    scored = [loss_fn(model, *plan[index])[2] for index in indices]
+    return (sum(float(stats[at]) for stats in scored)
+            / sum(float(stats[-1]) for stats in scored))
+
+
+class _StopMidWindow:
+    """on_substep_end fires off the accumulation boundary, so call two is mid-window."""
+
+    def __init__(self):
+        self.substeps = 0
+
+    def on_substep_end(self, args, state, control, **kwargs):
+        self.substeps += 1
+        if self.substeps == 2:
+            control.should_epoch_stop = True
+        return control
+
+
+@pytest.mark.parametrize("logging_steps,steps,epochs,stop,windows", [
+    (1, 2, 1, False, ((0, 1), (2, 3))),
+    (2, 2, 1, False, ((0, 1, 2, 3),)),
+    (1, 3, 2, True, ((0, 1), (0, 1), (2, 3))),
+])
+def test_a_logged_window_holds_its_own_metrics_and_nothing_earlier(
+    logging_steps, steps, epochs, stop, windows, monkeypatch, tmp_path,
+):
+    """Each log line covers its own window, not one already reported or dropped."""
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    model = _tiny_model()
+    trainer = MLXDPOTrainer(model, Tokenizer(), rows(6), args=MLXDPOConfig(
+        **_generation_common(
+            tmp_path, reference_free=True, beta=0.1, max_steps=steps,
+            num_train_epochs=epochs, per_device_train_batch_size=1,
+            logging_steps=logging_steps, generate_during_eval=False,
+            eval_steps=0, preserve_dataset_order=True)),
+        callbacks=[_StopMidWindow()] if stop else [])
+    plan, _ = trainer._prepare_data(False)
+    _run_generation_trainer(trainer, monkeypatch, [])
+
+    # The stubbed optimizer never moves the weights, so the plan rescores equal.
+    logged = [entry["logps/chosen"] for entry in trainer.state.log_history
+              if "logps/chosen" in entry]
+    assert len(logged) == len(windows)
+    for value, window in zip(logged, windows):
+        assert value == pytest.approx(_window_mean(model, plan, window), rel=1e-5)
+    if stop:
+        assert logged[1] != pytest.approx(
+            _window_mean(model, plan, (2, 0, 1)), rel=1e-9)
+
+
 def test_referenced_dpo_freezes_accidental_norm_before_reference_validation(
     monkeypatch, tmp_path,
 ):
@@ -1239,7 +1537,8 @@ def test_final_loss_averages_logical_updates_with_ragged_epoch_tail(
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_map
-    from unsloth_zoo.mlx.preference import make_orpo_loss_fn
+    from unsloth_zoo.mlx.preference import (
+        make_orpo_loss_fn, resolve_preference_objective)
     from unsloth_zoo.mlx.trainer import MLXORPOConfig, MLXORPOTrainer
 
     def value_and_grad_with_aux(model, fn):
@@ -1259,7 +1558,8 @@ def test_final_loss_averages_logical_updates_with_ragged_epoch_tail(
     model = _tiny_model()
     trainer = MLXORPOTrainer(model, Tokenizer(), rows(5), args=config)
     plan, _ = trainer._prepare_data(False)
-    objective = make_orpo_loss_fn(config.beta)
+    objective = make_orpo_loss_fn(
+        resolve_preference_objective("orpo", beta=config.beta))
     values = [float(objective(model, *plan[index])[0]) for index in range(3)]
     expected = ((values[0] + values[1]) / 2 + values[2]) / 2
     trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
@@ -1469,28 +1769,25 @@ def _run_generation_trainer(trainer, monkeypatch, calls, generate_batch=None):
     return trainer.train()
 
 
-def test_generation_fields_stay_appended_for_a_wholesale_config_copy():
-    """A config round-tripped without the generation fields is still a copy.
-
-    An unregistered field flips the copy detection, letting a copied default
-    warmup_steps override an explicit warmup_ratio.
-    """
+@pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig"])
+def test_a_preference_field_a_dump_predates_still_reads_as_a_wholesale_copy(
+        config_cls_name):
+    """An unregistered appended field flips the copy detection, losing warmup_ratio."""
     import dataclasses
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig
+    from unsloth_zoo.mlx import trainer as trainer_module
 
-    generation_fields = {
-        "generate_during_eval", "num_generation_prompts",
-        "generation_max_tokens", "generation_temperature",
-    }
-    baseline = MLXDPOConfig()
-    provided = {
-        field.name: getattr(baseline, field.name)
-        for field in dataclasses.fields(MLXDPOConfig)
-        if field.name not in generation_fields
-    }
-    provided["warmup_ratio"] = 0.25
-    config = MLXDPOConfig(**provided)
-    assert config._unsloth_mlx_warmup_steps_explicit is False
+    config_cls = getattr(trainer_module, config_cls_name)
+    fields = dataclasses.fields(config_cls)
+    shared = {f.name for f in dataclasses.fields(trainer_module.MLXTrainingConfig)}
+    baseline = config_cls()
+    appended = [f.name for f in fields if f.name not in shared]
+    assert appended
+    for dropped in appended:
+        config = config_cls(warmup_ratio=0.25, **{
+            f.name: getattr(baseline, f.name)
+            for f in fields if f.name not in (dropped, "warmup_ratio")})
+        assert config._unsloth_mlx_warmup_steps_explicit is False, dropped
+        assert config.warmup_ratio == 0.25, dropped
 
 
 def test_callback_requested_eval_samples_without_a_step_cadence(
@@ -1825,7 +2122,17 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
     from unsloth_zoo.mlx.preference import PREFERENCE_EVAL_METRICS
     from unsloth_zoo.mlx.trainer import (
         MLXDPOConfig, MLXDPOTrainer, MLXORPOConfig, MLXORPOTrainer,
+        _preference_metric_values,
     )
+
+    # A window sum over the denominator it names; TRL averages per-batch means.
+    batches = [[4.0, 9.0, 2.0, 3.0], [1.0, 1.0, 1.0, 1.0]]
+    summed = [sum(column) for column in zip(*batches)]
+    weighted = _preference_metric_values(("a", "b"), {0: 2, 1: 3}, summed)
+    assert weighted == {"a": 5 / 3, "b": 10 / 4}
+    assert weighted["a"] != pytest.approx((4 / 2 + 1 / 1) / 2)
+    assert set(_preference_metric_values(
+        ("a", "b"), {0: 2, 1: 3}, [0.0] * 4).values()) == {0.0}
 
     cls, config = ((MLXORPOTrainer, MLXORPOConfig) if objective == "orpo"
                    else (MLXDPOTrainer, MLXDPOConfig))
@@ -1843,11 +2150,39 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
     assert any("eval_loss" in entry for entry in trainer.state.log_history)
 
 
+def test_the_config_carries_every_objective_field_into_the_run(tmp_path,
+                                                               monkeypatch):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    captured = {}
+    for name in ("make_dpo_loss_fn", "make_preference_eval_fn"):
+        build = getattr(trainer_module, name)
+        monkeypatch.setattr(trainer_module, name, (
+            lambda objective, build=build, name=name, **kwargs: (
+                captured.setdefault(name, objective),
+                build(objective, **kwargs))[1]))
+    common = _generation_common(
+        tmp_path, max_steps=1, eval_steps=1, generate_during_eval=False,
+        reference_free=True, loss_type=["sigmoid", "robust"],
+        loss_weights=[0.25, 0.5], discopop_tau=0.2, label_smoothing=0.2)
+    trainer = MLXDPOTrainer(_tiny_model(), Tokenizer(), rows(4),
+                            eval_dataset=rows(3), args=MLXDPOConfig(**common))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    objective = captured["make_dpo_loss_fn"]
+    assert (objective.loss_types, objective.weights) == (
+        ("sigmoid", "robust"), (0.25, 0.5))
+    assert (objective.discopop_tau, objective.label_smoothing) == (0.2, 0.2)
+    assert objective.reference_free
+    assert captured["make_preference_eval_fn"] == objective
+
+
 def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
     """Three rows at batch_size 2 leave a one-pair tail. Weighting each batch
     equally would give that tail the same say as the two pairs before it."""
     from unsloth_zoo.mlx.preference import (
         create_preference_batch_plan, make_preference_eval_fn,
+        resolve_preference_objective,
     )
 
     options = dict(length_policy=resolved(max_seq_length=64), num_epochs=1,
@@ -1858,7 +2193,8 @@ def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
         rows(3), Tokenizer(), batch_size=3, **options)
     assert len(split) == 2 and len(whole) == 1
     model = TinyModel()
-    eval_fn = make_preference_eval_fn("dpo", beta=0.1, reference_free=True)
+    eval_fn = make_preference_eval_fn(resolve_preference_objective(
+        "dpo", beta=0.1, reference_free=True))
     total, weight = 0.0, 0
     for index in range(len(split)):
         loss, pairs, _stats = eval_fn(model, *split[index])
@@ -1870,16 +2206,7 @@ def test_eval_loss_weights_every_pair_once_across_a_ragged_tail():
 
 
 def test_the_orpo_logit_sum_is_accumulated_in_float32():
-    """ORPO reduces raw logits, so the accumulator dtype is the model's own.
-
-    mx.sum does not promote, and a batch holds millions of logits: in bf16 the
-    running sum stops registering addends long before the end, and the cast in
-    mx.stack lands after the damage. DPO is safe by construction -- its float32
-    response mask promotes the multiply before the reduction.
-
-    This shim runs in float32, so the assertion is on the dtype rather than on
-    the value; only a real-mlx run reproduces the drift itself.
-    """
+    """mx.sum does not promote; this shim is float32, so assert on the dtype."""
     import mlx.core as mx
     from unsloth_zoo.mlx import preference as pref
 
@@ -2175,6 +2502,7 @@ def test_evaluation_accepts_a_wrapped_model_output(objective):
     the same forward the training loss does, so it has to accept both."""
     from unsloth_zoo.mlx.preference import (
         create_preference_batch_plan, make_preference_eval_fn,
+        resolve_preference_objective,
     )
 
     class Wrapped(TinyModel):
@@ -2188,7 +2516,8 @@ def test_evaluation_accepts_a_wrapped_model_output(objective):
         rows(2), Tokenizer(), batch_size=2,
         length_policy=resolved(max_seq_length=64),
         num_epochs=1, grad_accum=1, preserve_dataset_order=True)
-    eval_fn = make_preference_eval_fn(objective, beta=0.1, reference_free=True)
+    eval_fn = make_preference_eval_fn(resolve_preference_objective(
+        objective, beta=0.1, reference_free=True))
 
     bare = TinyModel()
     wrapped = Wrapped()

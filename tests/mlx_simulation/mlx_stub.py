@@ -497,6 +497,7 @@ def argmin(a, axis=None, keepdims=False, **kw):
     return torch.argmin(a, dim=axis, keepdim=keepdims) if axis is not None else torch.argmin(a)
 
 
+def sort(a, axis=-1, **kw): return torch.sort(a, dim=axis).values
 def argsort(a, axis=-1, **kw): return torch.argsort(a, dim=axis)
 
 

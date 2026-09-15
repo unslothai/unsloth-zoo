@@ -381,6 +381,38 @@ def test_masking_utils_create_causal_mask_names(tag: str):
     )
 
 
+@pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
+def test_tokenization_auto_symbols_for_mlx_loader(tag: str):
+    """Zoo PR #1170: unsloth_zoo/mlx/loader.py:_load_mlx_tokenizer and
+    _tokenizer_class_for_model_type import get_tokenizer_config,
+    tokenizer_class_from_name and TOKENIZER_MAPPING_NAMES from
+    transformers.models.auto.tokenization_auto. None of the three is public
+    API, and losing one breaks every MLX tokenizer load with an ImportError
+    at call time rather than at import time."""
+    src = _fetch_text(
+        "huggingface/transformers",
+        tag,
+        "src/transformers/models/auto/tokenization_auto.py",
+    )
+    if src is None:
+        pytest.skip(f"{tag}: tokenization_auto.py not present")
+    missing = [
+        name for name in ("get_tokenizer_config", "tokenizer_class_from_name")
+        if not _has_def(src, name, "func")
+    ]
+    assert not missing, (
+        f"{tag}: transformers.models.auto.tokenization_auto {missing} missing; "
+        f"unsloth_zoo/mlx/loader.py::_load_mlx_tokenizer raises ImportError and "
+        f"every MLX tokenizer load fails"
+    )
+    assert re.search(r"^TOKENIZER_MAPPING_NAMES\s*=", src, re.MULTILINE), (
+        f"{tag}: TOKENIZER_MAPPING_NAMES missing from tokenization_auto; "
+        f"_tokenizer_class_for_model_type can no longer recover the tokenizer "
+        f"class for repos that declare none (gpt2 and relatives), so their "
+        f"bos/eos/unk silently become None"
+    )
+
+
 # Qwen MoE LoRA extractor reads wrapper.get_base_layer() + .parameter_name
 # / .hidden_dim / .intermediate_dim. Pin: peft keeps emitting ParamWrapper
 # (LoraLayer subclass) in peft/tuners/lora/layer.py.

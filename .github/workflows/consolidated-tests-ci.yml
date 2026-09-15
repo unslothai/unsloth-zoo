@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -143,7 +143,7 @@ jobs:
               rc=0
               {
                 "$interpreter" -m venv "$venv" &&
-                "$venv/bin/python" -m pip install --upgrade pip &&
+                retry "$venv/bin/python" -m pip install --upgrade pip &&
                 retry "$venv/bin/pip" install --index-url https://download.pytorch.org/whl/cpu \
                   "torch>=2.4.0,<2.11.0" &&
                 retry "$venv/bin/pip" install -e .[core] &&
@@ -217,7 +217,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -344,12 +344,15 @@ jobs:
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
+            tests/test_llama_cpp_install_consent.py \
+            tests/test_llama_cpp_consent_platforms.py \
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference.py \
             tests/test_mlx_trainer_internals.py \
             tests/test_mlx_arrays_cache_advance.py \
             tests/test_mlx_quantized_optimizer_routing.py \
+            tests/test_fp16_emulation.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
             tests/test_quant_status_transport_errors.py \
@@ -359,13 +362,18 @@ jobs:
             tests/test_gated_and_offline_config_classification.py \
             tests/test_find_common_token_ids_no_match.py \
             tests/test_vllm_direct_lora_loading.py \
+            tests/test_vllm_flashinfer_block_reversible.py \
+            tests/test_vllm_flashinfer_survives_spawn.py \
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
+            tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_wheel_top_level_packages.py \
             tests/test_inductor_codegen_fallback.py \
+            tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
             tests/test_recompile_limit_fallback.py \
             tests/test_checkpoint_compile_mix.py \
@@ -377,6 +385,7 @@ jobs:
             tests/test_conftest_module_leak_gate.py \
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
+            tests/test_undefined_name_gate.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -432,7 +441,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -479,7 +488,7 @@ jobs:
             rc=0
             {
               python -m venv .lanes/venv-numerics &&
-              .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-numerics/bin/pip install -e .[core] &&
@@ -496,15 +505,20 @@ jobs:
           # pins: measured 5.5.0 -> 5.14.1. Together, pip honours the cap and lands
           # on the newest mlx-vlm that fits, which is the 0.6.4 ceiling the audio
           # gate records.
+          #
+          # The <0.7.0 bound is repeated here because pyproject's copy is marker-gated
+          # to darwin + arm64 and so constrains nothing on this Linux lane. Without it
+          # the lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
+          # gating a combination pyproject forbids.
           (
             rc=0
             {
               python -m venv .lanes/venv-suites &&
-              .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
+              retry .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<0.7.0" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
@@ -600,43 +614,60 @@ jobs:
           print("declared ceiling", max(declared), "at or below the policy ceiling", CEILING)
           PY
 
+      # The five "Fail if ... skipped" gates below used to re-run their pytest
+      # file a second time and grep the output, which cost 51-62s of a ~290s job
+      # to learn what the first run already knew. Each gated run now writes a
+      # JUnit XML report and the gate reads it. Same policies, one execution:
+      # scripts/pytest_junit_gate.py documents which policy is which and fails
+      # loudly if the report is missing, empty, truncated or records no tests.
+      # The pytest step itself still decides on its own exit status, and the
+      # files still run one process each -- tests/mlx_simulation/ replaces
+      # sys.modules["mlx.core"] process-wide.
       - name: pytest tests/test_mlx_quantized_optimizer_state.py (HARD GATE)
-        # -rs surfaces skips; the next step fails the job if the file skipped,
-        # because a skipped numeric suite is not a gate.
-        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+        # -rs surfaces skips in the log; the next step fails the job if the file
+        # skipped, because a skipped numeric suite is not a gate.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml"
 
       - name: Fail if the numeric tests skipped
         run: |
-          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_quantized_optimizer_state.py -q -rs | tee out.txt
-          if grep -qiE '[0-9]+ skipped' out.txt; then
-            echo "real mlx is installed but the numeric tests skipped"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the numeric tests skipped"
 
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are
         # pure logic over a synthetic module tree: real mlx, no Metal, no
         # downloads. The metal_only half skips here and runs on the mlx job.
-        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/neftune_quant_map.xml"
 
       - name: Fail if the NEFTune logic tests all skipped
+        # one-passed, not no-skips: the metal_only half of this file is expected
+        # to skip here.
         run: |
-          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_neftune_quant_map.py -q -rs | tee neftune.txt
-          if ! grep -qiE '[1-9][0-9]* passed' neftune.txt; then
-            echo "real mlx is installed but no NEFTune logic test ran"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/neftune_quant_map.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no NEFTune logic test ran"
 
       - name: tests/test_mlx_rng_rewind.py (HARD GATE)
         # PRNG capture/rewind across the compile fallbacks. Needs mlx core, not
         # Metal, so it gates here; the Apple Silicon lane is opt-in and usually
         # skipped, which guards nothing on a pull request.
-        run: .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/rng_rewind.xml"
 
       - name: Fail if the RNG rewind tests skipped
         run: |
-          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_rng_rewind.py -q -rs | tee rng.txt
-          if grep -qiE '[0-9]+ skipped' rng.txt; then
-            echo "real mlx is installed but the RNG rewind tests skipped"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/rng_rewind.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the RNG rewind tests skipped"
 
       # One pytest process per file: tests/mlx_simulation/ replaces
       # sys.modules["mlx.core"] process-wide, disarming whatever runs after it.
@@ -658,6 +689,25 @@ jobs:
       - name: tests/test_mlx_batching_and_decay.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
 
+      # Needs the real mlx runtime but not Metal, so the merged_4bit quantize is
+      # gated on every PR here rather than only in the label-gated Apple Silicon
+      # lane; the Metal-only half is that lane's job.
+      - name: tests/test_mlx_quantized_merge_save.py
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/quantized_merge_save.xml"
+
+      - name: Fail if the merged_4bit quantize tests skipped
+        # The file skips wholesale on anything that stops mlx_lm.tuner.lora
+        # importing, so without this the gate can go green having run nothing.
+        # That whole-module skip is one <skipped> testcase in the report, so
+        # one-passed catches it; "no failures" would not.
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/quantized_merge_save.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no merged_4bit quantize test ran"
+
       # The three gated-delta files ran in no workflow at all: this lane's list
       # omitted them and the Apple Silicon lane, which is opt-in behind the `mlx`
       # label, names only test_qwen35_vjp_metal.py. So the ops VJP, the batched
@@ -674,14 +724,16 @@ jobs:
         # Gradient parity vs plain autodiff at B >= 2. Every test here needs the
         # real runtime, so under the torch shim the file skips wholesale -- which
         # is exactly what the gate below refuses to accept as a pass.
-        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -v -rs
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/gated_delta_batch_grad.xml"
 
       - name: Fail if the gated-delta gradient tests skipped
         run: |
-          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta_batch_grad.py -q -rs | tee gd.txt
-          if ! grep -qiE '[1-9][0-9]* passed' gd.txt; then
-            echo "real mlx is installed but no gated-delta gradient test ran"; exit 1
-          fi
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/gated_delta_batch_grad.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no gated-delta gradient test ran"
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
@@ -709,7 +761,7 @@ jobs:
     steps:
       - name: Harden runner (audit)
         # audit (not block): the cells pull arbitrary transformers/TRL/peft pins.
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -816,7 +868,7 @@ jobs:
                 spec_p="$(echo "$specs" | sed -n 3p)" &&
                 echo "resolved: $spec_t | $spec_r | $spec_p" &&
                 python -m venv "$venv" &&
-                "$venv/bin/python" -m pip install --upgrade pip &&
+                retry "$venv/bin/python" -m pip install --upgrade pip &&
                 # torchvision: transformers' qwen2_vl / qwen2_5_vl image processors
                 # import it at module top, so without it the existence probes go red
                 # on ModuleNotFoundError rather than on drift. CPU build is plenty.

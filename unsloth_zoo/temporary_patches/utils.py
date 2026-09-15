@@ -1185,6 +1185,35 @@ _DISABLED_HOOK_SIGNATURES = (
 )
 
 
+_DYNAMO_CONFIG = None
+
+
+def dynamo_tracing_disabled():
+    """Has the user switched Dynamo off process-wide?
+
+    `TORCH_COMPILE_DISABLE=1` is the switch torch reads into `config.disable`
+    at import; `torch._dynamo.config.disable = True` is the same thing set by
+    hand. Reads the live value, so a caller that wants a snapshot takes one:
+    `_fall_back_to_eager_on_recompile_limit` asks once, at its first call.
+
+    `TORCHDYNAMO_DISABLE=1` is NOT this flag. `torch._dynamo.optimize` checks
+    that env var itself and hands back the undecorated function, so it never
+    reaches a compiled callable and needs nothing from us.
+    """
+    global _DYNAMO_CONFIG
+    config = _DYNAMO_CONFIG
+    if config is None:
+        try:
+            import torch._dynamo
+            config = _DYNAMO_CONFIG = torch._dynamo.config
+        except Exception:
+            return False
+    # The module object is cached, the flag is not: this runs on every call
+    # into a compiled region, where the `import` statement alone cost about as
+    # much as a small torch op.
+    return bool(config.disable)
+
+
 def _is_our_own_disabled_hook(exc):
     """Did we break our own graph with our own `torch.compiler.disable`?
 
@@ -1470,6 +1499,18 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
 
     That leaves one mixed step, the one during which the latch flips. See
     `force_eager_fallback` below, which unsloth uses to close it.
+
+    The same reasoning decides the disabled-compiler branch, which asks
+    `dynamo_tracing_disabled()` once, on the first call, and keeps the answer.
+    `TORCH_COMPILE_DISABLE=1` is a process-level switch, and per-call reads of
+    it collide with checkpointing in every direction: a wrapper's pack and its
+    recompute must agree, and by the time a recompute runs, the forward that
+    packed it is long gone -- so the flag cannot be honoured mid-flight without
+    tracking a mode per outstanding pack, which torch exposes no handle for.
+    Deciding once removes the question. A flip made after the first call is
+    ignored, exactly as it is on a plain `torch.compile` region whose code is
+    already cached, and `apply_pending_eager_fallbacks` remains the supported
+    way to move a live wrapper to eager at a step boundary.
     """
     errors = _recompile_limit_errors()
     graph_break_errors = _disabled_hook_graph_break_error()
@@ -1488,7 +1529,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     # every step boundary. See that set for why the answer has to be per step
     # rather than per wrapper.
     state = {"warned": False, "eager": label in _LATCHED_EAGER_LABELS,
-             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0}
+             "pending_eager": label in _PENDING_EAGER_LABELS, "bumps": 0,
+             # Was the compiler switched off when this wrapper was FIRST called?
+             # None until then. Decided once, deliberately: see the wrapper.
+             "compiler_off": None}
 
     def _warn(message):
         if not state["warned"]:
@@ -1860,6 +1904,15 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     @functools.wraps(eager_func)
     def wrapper(*args, **kwargs):
         if state["eager"]:
+            return eager_func(*args, **kwargs)
+        if state["compiler_off"] is None:
+            state["compiler_off"] = dynamo_tracing_disabled()
+        if state["compiler_off"]:
+            # Checked BEFORE the call, not recovered from afterwards. Torch runs
+            # the body and only then raises "found no compiled frames" from its
+            # post-call bookkeeping (torch/_dynamo/eval_frame.py), so catching
+            # that and re-running eager executes the body twice, consuming RNG
+            # twice and repeating any mutation it made.
             return eager_func(*args, **kwargs)
         marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:

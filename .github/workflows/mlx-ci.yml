@@ -53,7 +53,7 @@ jobs:
     steps:
       # harden-runner block-mode is Linux-only; stay in audit on macOS for parity.
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
@@ -241,3 +241,14 @@ jobs:
         run: |
           python -m pytest tests/test_mlx_batching_and_decay.py -v -rs \
             --deselect tests/test_mlx_batching_and_decay.py::test_compiler_review_guards_are_present
+
+      - name: tests/test_mlx_quantized_merge_save.py
+        # Quantized-state detection across every MLX grid, which decides
+        # whether merged_4bit needs to quantize the merged weights.
+        run: python -m pytest tests/test_mlx_quantized_merge_save.py -v -rs
+
+      - name: tests/test_mlx_quantized_merge_save_metal.py
+        # merged_4bit really produces 4-bit from a 16-bit / full-finetuned
+        # model, plus the paths that must not change (already-quantized base,
+        # merged_16bit, push_to_hub_merged).
+        run: python -m pytest tests/test_mlx_quantized_merge_save_metal.py -v -rs

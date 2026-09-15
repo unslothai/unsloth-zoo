@@ -15,11 +15,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import ast
+import functools
 import os
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
+import functools
 import inspect
 from .common import (
     TEMPORARY_PATCHES,
@@ -50,6 +53,11 @@ torch_cuda_device = torch.cuda.device
 # UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels); else dequantized to bf16 for LoRA.
 UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
 
+# Set when patch_GptOssAttention installs the forward that routes training through
+# flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
+_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
+_TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
+
 
 def _check_triton_kernels_available():
     """Is OpenAI's triton_kernels package available for MXFP4."""
@@ -70,6 +78,142 @@ def is_triton_kernels_available():
     if _TRITON_KERNELS_AVAILABLE is None:
         _TRITON_KERNELS_AVAILABLE = _check_triton_kernels_available()
     return _TRITON_KERNELS_AVAILABLE
+
+
+# Newer triton_kernels returns a layout instance, not (class, kwargs): unpacking blind
+# raises TypeError there.
+def _mxfp4_layout_selection_is_class_contract(selection):
+    return (
+        isinstance(selection, tuple)
+        and len(selection) == 2
+        and isinstance(selection[1], dict)
+        and isinstance(selection[0], type)
+    )
+
+
+def _normalize_mxfp4_value_layout(selection):
+    """(layout_arg, ctor_kwargs) for either contract, ready for convert_layout."""
+    if _mxfp4_layout_selection_is_class_contract(selection):
+        return selection[0], selection[1]
+    return selection, {}
+
+
+_HOPPER_ONLY_VALUE_ASSERT = ast.dump(
+    ast.parse(
+        'SWIZZLE_MX_VALUE == "HOPPER_VALUE" or SWIZZLE_MX_VALUE is None',
+        mode = "eval",
+    ).body,
+    include_attributes = False,
+)
+
+
+@functools.lru_cache(maxsize = 8)
+def _source_rejects_blackwell_value_swizzle(source):
+    """Does this kernel source refuse any value swizzle other than Hopper's?
+
+    Matched as an AST node, so the same words in a comment or an error string do not
+    count. Absence is not proof Blackwell works, only that there is nothing to fix.
+    """
+    try:
+        tree = ast.parse(dedent(source))
+    except Exception:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        if not (
+            isinstance(func, ast.Attribute)
+            and func.attr == "static_assert"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "tl"
+        ):
+            continue
+        if ast.dump(node.args[0], include_attributes = False) == _HOPPER_ONLY_VALUE_ASSERT:
+            return True
+    return False
+
+
+def _blackwell_value_swizzle_unsupported():
+    """Read the matmul kernel this process would actually launch."""
+    try:
+        from triton_kernels.matmul_ogs_details import _matmul_ogs as _kernel_module
+    except Exception:
+        return False
+    found = False
+    # Every kernel: newer builds add a persistent variant the dispatcher may pick.
+    for name in dir(_kernel_module):
+        kernel = getattr(_kernel_module, name, None)
+        source = getattr(kernel, "src", None)
+        if not isinstance(source, str):
+            fn = getattr(kernel, "fn", None)
+            if fn is None:
+                continue
+            try:
+                source = inspect.getsource(fn)
+            except Exception:
+                continue
+        if not isinstance(source, str):
+            continue
+        if _source_rejects_blackwell_value_swizzle(source):
+            found = True
+    return found
+
+
+_MXFP4_STRIDED_VALUES_WARNED = False
+
+
+def _mxfp4_layout_arguments(layout_module, w):
+    """(layout_arg, ctor_kwargs, strided_arg) for this weight. strided_arg is a class or
+    an instance to match the installed convert_layout, and is reused for the scales."""
+    selection = layout_module.make_default_matmul_mxfp4_w_layout(mx_axis = 1)
+    class_contract = _mxfp4_layout_selection_is_class_contract(selection)
+    value_layout, value_layout_opts = _normalize_mxfp4_value_layout(selection)
+    StridedLayout = layout_module.StridedLayout
+    strided_argument = StridedLayout if class_contract else StridedLayout()
+
+    if _force_strided_mxfp4_values(value_layout, layout_module, w):
+        # Otherwise generate() dies in matmul_ogs: "Only Hopper swizzling is supported
+        # for values". Unswizzled values pair with the strided scales, still MXFP4.
+        global _MXFP4_STRIDED_VALUES_WARNED
+        value_layout, value_layout_opts = strided_argument, {}
+        if not _MXFP4_STRIDED_VALUES_WARNED:
+            _MXFP4_STRIDED_VALUES_WARNED = True
+            logger.info(
+                "Unsloth: This triton_kernels build cannot run Blackwell MXFP4 value "
+                "swizzling, so gpt-oss weights stay unswizzled (still MXFP4). Set "
+                "UNSLOTH_MXFP4_VALUE_LAYOUT=default to opt out."
+            )
+    return value_layout, value_layout_opts, strided_argument
+
+
+def _force_strided_mxfp4_values(value_layout, layout_module, w):
+    """Should this weight skip Blackwell value swizzling? UNSLOTH_MXFP4_VALUE_LAYOUT
+    = auto | strided | default, read per call so it can be set after import."""
+    override = os.environ.get("UNSLOTH_MXFP4_VALUE_LAYOUT", "auto").strip().lower()
+    if override == "default":
+        return False
+    try:
+        # The weight's own device: a process can hold Blackwell and non-Blackwell cards.
+        if not (hasattr(w, "is_cuda") and w.is_cuda):
+            return False
+        if override == "strided":
+            return True
+        if torch.cuda.get_device_capability(w.device)[0] < 10:
+            return False
+        blackwell = getattr(layout_module, "BlackwellMXValueLayout", None)
+        if blackwell is None:
+            return False
+        selected_is_blackwell = (
+            value_layout is blackwell
+            or (isinstance(value_layout, type) and issubclass(value_layout, blackwell))
+            or isinstance(value_layout, blackwell)
+        )
+        if not selected_is_blackwell:
+            return False
+        return _blackwell_value_swizzle_unsupported()
+    except Exception:
+        return False
 
 
 @torch_compile(dynamic = True, fullgraph = True)
@@ -168,9 +312,8 @@ def patch_gpt_oss():
             tensor.wrap_torch_tensor,
         )
         layout = tensor_details.layout
-        StridedLayout = tensor_details.layout.StridedLayout
 
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+        value_layout, value_layout_opts, strided_argument = _mxfp4_layout_arguments(layout, w)
         w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
         # TODO : add that when we are actually sure that it works on B200
         # if torch.cuda.get_device_capability()[0] == 10:
@@ -184,7 +327,7 @@ def patch_gpt_oss():
         # TODO: there is still an issue with the scales on hopper
         # scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=8)
         # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
-        w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+        w_scale = convert_layout(wrap_torch_tensor(w_scale), strided_argument)
         return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
 
@@ -1412,12 +1555,22 @@ elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
+
+# coordinate_descent_tuning used to be driven by use_combo_kernels too, so asking for combo
+# kernels also bought the tuning. Measured apart on T4/L4/A100/B200: combo kernels are free
+# (decode compile 7.36s vs 7.48s off), the tuning costs +28% on A100 and +32% on L4 decode
+# compile for no measurable gain anywhere. Default it off, opt in to re-measure.
+#
+# The 40GB test above is in GiB, so an A100-SXM4-40GB reports 39.49 and falls BELOW it.
+# Left as-is: combo kernels measured as no-effect on both sides of the boundary.
+use_coordinate_descent = os.environ.get("UNSLOTH_COORDINATE_DESCENT_TUNING", "0") == "1"
+
 fused_torch_compile_options = get_torch_compile_options(
     epilogue_fusion = True,
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = use_combo_kernels,
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -1429,7 +1582,7 @@ no_combo_fused_torch_compile_options = get_torch_compile_options(
     max_autotune = False, # Too slow
     shape_padding = True,
     cudagraphs = True,
-    coordinate_descent_tuning = use_combo_kernels, # Very slow!
+    coordinate_descent_tuning = use_coordinate_descent, # Very slow, and no measured gain
     combo_kernels = False, # Breaks on attention
     memory_planning = True,
     multi_kernel = False, # Fails on torch 2.10 nightly
@@ -2004,7 +2157,16 @@ def torch_native_forward(
 
             gated_output = gated_output.to(torch.float32)
             device_type = gated_output.device.type if isinstance(gated_output.device.type, str) and gated_output.device.type != "mps" else "cpu"
-            with torch.autocast(device_type=device_type, enabled=False): # Force float32
+            # Three separate things keep this float32, none of them redundant. On the
+            # forced-float32 path only, a quantized down_proj computes in float32 via
+            # _pre_set_compute_dtype, set in unsloth's loader; without that rule the layer
+            # takes the run's ordinary compute dtype, bfloat16 included. The float32
+            # gated_output is what Linear4bit restores the output to, since it captures
+            # inp_dtype and casts back. And autocast off is what protects the unquantized
+            # fallback, which takes F.linear and ignores compute_dtype. It does not keep the
+            # adapter matmuls in float32 -- the forced-float32 LoRA path casts those to
+            # float16 itself.
+            with torch.autocast(device_type=device_type, enabled=False):
                 out = down_proj(gated_output)
             
             weighted_output = out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32)
@@ -2026,9 +2188,12 @@ def torch_native_forward(
         # glu = gate * torch.sigmoid(gate * self.alpha)
         # fused = (up_h + 1) * glu
 
-        # Force float32 matrix multiply on down projection only
+        # Autocast off for the down projection only. As above, it is the unquantized
+        # fallback that needs this; on the forced-float32 path a quantized layer gets
+        # float32 from _pre_set_compute_dtype instead. This branch also runs in bfloat16,
+        # where no float32 rule is registered and the layer stays in bfloat16.
         device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False): # Force float32
+        with torch.autocast(device_type=device_type, enabled=False):
             out_list = [
                 down_l(fused[e].to(dtype))
                 for e, down_l in enumerate(self.down_projs)
@@ -2040,8 +2205,11 @@ def torch_native_forward(
     pass
 pass
 
-# torch_native_forward has full float32 protection (swiglu in float32, autocast
-# disabled around down_proj) to prevent NaN in fp16 training.
+# torch_native_forward protects the down projection three ways in float16 training: swiglu and
+# gated_output in float32, which is also the dtype Linear4bit restores its output to;
+# _pre_set_compute_dtype (registered by unsloth's loader on the forced-float32 path only) for
+# the quantized compute; and autocast disabled for the unquantized fallback, which ignores
+# compute_dtype. A bfloat16 run registers no float32 rule and keeps the layer in bfloat16.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():
@@ -2369,6 +2537,13 @@ def patch_GptOssAttention():
 
     functions.append(forward)
     patch_function_past_key_values(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention, "forward", functions)
+    # forward_function picks flex_attention_with_sink from self.training alone, so
+    # once it is live, training ignores whatever mask the factories build.
+    global _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
+    _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = (
+        getattr(transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention.forward, "__module__", "")
+        == forward_function.__module__
+    )
     # Set env variable for padding purposes
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
@@ -2397,6 +2572,35 @@ def patch_GptOssModel():
     # Disable mask creations since we don't need them for GPT-OSS
     import transformers.masking_utils
     import transformers.generation.utils
+    def _find_config(args, kwargs):
+        config = kwargs.get("config", None)
+        if config is None:
+            for arg in args:
+                if hasattr(arg, "_attn_implementation"):
+                    config = arg
+                    break
+        return config
+
+    # Records self.training on the config so the mask wrapper can key on the state
+    # that selects the attention backend instead of guessing from requires_grad.
+    def _record_training_state(GptOssModel):
+        original = getattr(GptOssModel, "forward", None)
+        if original is None or getattr(original, _TRAINING_FLAG_ATTR, False):
+            return
+        @functools.wraps(original)
+        def forward(self, *args, **kwargs):
+            config = getattr(self, "config", None)
+            previous = getattr(config, _TRAINING_FLAG_ATTR, None)
+            if config is not None:
+                setattr(config, _TRAINING_FLAG_ATTR, bool(self.training))
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                if config is not None:
+                    setattr(config, _TRAINING_FLAG_ATTR, previous)
+        setattr(forward, _TRAINING_FLAG_ATTR, True)
+        GptOssModel.forward = forward
+
     def wrap(f):
         def return_attention_mask(*args, **kwargs):
             input_embeds = kwargs.get("input_embeds", None)
@@ -2408,7 +2612,25 @@ def patch_GptOssModel():
                         input_embeds = arg
                         break
 
-            if input_embeds is not None and input_embeds.requires_grad:
+            # Skipping is only safe when flex_attention_with_sink takes over and
+            # ignores this mask, which it picks on self.training, not on
+            # _attn_implementation. `requires_grad` is not a training signal:
+            # enable_input_require_grads() fires on every LoRA-capable load, so
+            # skipping there hands eager attention no causal mask at all.
+            _config = _find_config(args, kwargs)
+            _is_flex = getattr(_config, "_attn_implementation", None) == "flex_attention"
+            _training = getattr(_config, _TRAINING_FLAG_ATTR, None)
+            if _training is None:
+                # Unusual caller, no model forward recorded it: at least exclude
+                # no_grad inference.
+                _training = bool(
+                    torch.is_grad_enabled()
+                    and input_embeds is not None
+                    and input_embeds.requires_grad
+                )
+            # Only zoo's patched forward builds its own BlockMask; stock flex takes
+            # causality from whatever this returns, so a flex config is not enough.
+            if _training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 if "attention_mask" in kwargs:
                     return kwargs["attention_mask"]
                 for arg in args:
@@ -2429,21 +2651,13 @@ def patch_GptOssModel():
                 #       'Tensor' and 'BlockMask'
                 # Temporarily swap to eager so the factory returns a dense
                 # 4D float mask (0 / -inf) the eager path can consume.
-                config = kwargs.get("config", None)
-                if config is None:
-                    for arg in args:
-                        if hasattr(arg, "_attn_implementation"):
-                            config = arg
-                            break
-                if config is not None and getattr(
-                    config, "_attn_implementation", None
-                ) == "flex_attention":
-                    original_impl = config._attn_implementation
-                    config._attn_implementation = "eager"
+                if _is_flex:
+                    original_impl = _config._attn_implementation
+                    _config._attn_implementation = "eager"
                     try:
                         return f(*args, **kwargs)
                     finally:
-                        config._attn_implementation = original_impl
+                        _config._attn_implementation = original_impl
                 return f(*args, **kwargs)
             pass
         return return_attention_mask
@@ -2796,11 +3010,10 @@ def patch_GptOssModel():
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
-            # During training, flex_attention_with_sink creates its own sparse
-            # BlockMask and ignores the attention_mask argument entirely.
-            # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
-            # which causes OOM at long context lengths (e.g. 500K tokens).
-            if self.training:
+            # flex_attention_with_sink builds its own BlockMask, so dropping the dense
+            # one avoids an O(seq_len^2) allocation that OOMs at long context. Only that
+            # forward ignores it: without it, stock attention loses causality entirely.
+            if self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED:
                 attention_mask = None
 
             # Accumulate hidden states if requested
@@ -2843,6 +3056,9 @@ def patch_GptOssModel():
             })
 
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
+    # After the replacement, so the recorder wraps whichever forward ended up live:
+    # zoo's own, or stock when the signature did not match.
+    _record_training_state(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel)
 pass
 TEMPORARY_PATCHES.append(patch_GptOssModel)
 
