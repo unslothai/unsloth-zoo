@@ -239,6 +239,29 @@ NON_CAUSAL_HEADS = (
     "ForMultipleChoice",
 )
 
+try:
+    from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
+except Exception:
+    LOSS_MAPPING, ForCausalLMLoss = None, None
+
+
+def _loss_shifts_labels(trainer, model, is_encoder_decoder):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Does this model's loss shift labels, so labels[..., 1:] is the right count?
+
+    Positive signal, not a list of excluded suffixes: a name cannot tell
+    BertForMaskedLM (2D token aligned labels, NOT shifted, column 0 supervised) from a
+    causal LM. Ask what stock transformers asks. 5.x already computed it on the
+    Trainer; 4.x has the same LOSS_MAPPING, keyed on the loss_type every
+    PreTrainedModel derives from its class name.
+    """
+    shifts = getattr(trainer, "_loss_shifts_labels", None)
+    if isinstance(shifts, bool): return shifts
+    if LOSS_MAPPING is None: return False
+    return LOSS_MAPPING.get(getattr(model, "loss_type", None)) is ForCausalLMLoss \
+        and not is_encoder_decoder
+pass
+
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
@@ -308,6 +331,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into its
     # own .model, matches "_fast_forward" and never consults the head it trains.
     # Not cached: is_encoder_decoder belongs to the instance, not to the class name.
+    top_model = m
     is_encoder_decoder = bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False))
     is_non_causal_head = any(head in model_name for head in NON_CAUSAL_HEADS)
 
@@ -367,33 +391,30 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     #     labels mean something else. They raise here, or come back quietly short.
     # The guards differ in width on purpose. is_non_causal_head gates both routes (no
     # causal or VLM class carries these substrings, and their count is always wrong).
-    # is_encoder_decoder and token_aligned gate only the new route, so Whisper and
+    # The new route additionally demands a POSITIVE shifted-label signal, so Whisper and
     # Florence2 keep the count they get today rather than being rescaled by this change.
     # No .ndim means no tensor ops, and a plain list would hit the except below and
     # kill the run; stock swallows it and trains on. numpy has .ndim, so it still counts.
-    first = batch_samples[0] if len(batch_samples) > 0 else {}
-    labels_0 = first.get("labels")
-    labels_are_countable = getattr(labels_0, "ndim", None) is not None
-    # Positive signal for the new route: labels must line up with a token sequence of
-    # the same rank. A suffix blacklist cannot see ViTForImageClassification or
-    # *ForSemanticSegmentation, which carry pixel_values and no attention_mask, so
-    # nothing below would flag them and N image labels would count as N-1.
-    token_aligned = labels_are_countable \
-        and getattr(first.get("input_ids"), "ndim", None) == labels_0.ndim
+    labels_are_countable = getattr(
+        batch_samples[0].get("labels") if len(batch_samples) > 0 else None, "ndim", None,
+    ) is not None
     if (not is_non_causal_head) and labels_are_countable \
-            and (has_kwargs or (token_aligned and not is_encoder_decoder
-                                and getattr(self, "compute_loss_func", None) is not None)):
+            and (has_kwargs or (getattr(self, "compute_loss_func", None) is not None
+                                and _loss_shifts_labels(self, top_model, is_encoder_decoder))):
         try:
             token_counts = []
             # Shape only, so no device sync and still traceable. Applied after the
             # collectives below rather than by breaking out: skipping
             # accelerator.gather on one rank alone would hang the others.
             degenerate = False
+            # One column leaves labels[..., 1:] empty. That is only fatal when EVERY
+            # microbatch is short, since then the total is 0 and a sum/count loss
+            # divides by it. A short member of a mixed accumulation group just
+            # contributes 0, and voiding the group there would lose GA invariance.
+            all_short = True
             for x in batch_samples:
                 labels = x["labels"]
-                # One column leaves labels[..., 1:] empty, so the count is 0 and a
-                # sum/count loss divides by it.
-                if labels.shape[-1] < 2: degenerate = True
+                if labels.shape[-1] >= 2: all_short = False
                 token_count = (labels[..., 1:] != -100)
                 if "input_ids" in x:
                     input_ids = x["input_ids"]
@@ -472,7 +493,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
             # Discard a count these labels could not support. Done last, so every
             # collective above ran on every rank.
-            if degenerate: num_items_in_batch = None
+            if degenerate or all_short: num_items_in_batch = None
         except Exception as exception:
             raise RuntimeError(exception)
     pass

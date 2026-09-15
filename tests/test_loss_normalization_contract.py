@@ -157,7 +157,7 @@ def _tiny_model():
     return TinyForCausalLM()
 
 
-def _fake_trainer(model, accepts, compute_loss_func = None):
+def _fake_trainer(model, accepts, compute_loss_func = None, shifts = True):
     from transformers.training_args import ParallelMode
 
     class Args:
@@ -181,8 +181,9 @@ def _fake_trainer(model, accepts, compute_loss_func = None):
     # transformers 5.x reads this inside the try that counts labels, and the except
     # swallows the AttributeError, so a stand-in without it makes stock look like it
     # declined to count. Every real Trainer sets it; True matches this fixture's model,
-    # which shifts labels internally like any causal LM.
-    t._loss_shifts_labels = True
+    # which shifts labels internally like any causal LM. shifts=None omits it, which is
+    # the 4.x shape, where the loss_type lookup decides instead.
+    if shifts is not None: t._loss_shifts_labels = shifts
     return t
 
 
@@ -449,35 +450,76 @@ def test_numpy_labels_still_count():
     assert count is not None and int(count) == 10, f"numpy labels stopped counting: {count}"
 
 
-@pytest.mark.parametrize("head, labels_shape, expected_true_count", [
-    ("ViTForImageClassification", (4,), 4),              # one label per image
-    ("SegformerForSemanticSegmentation", (2, 8, 8), 128),  # one label per pixel
+@pytest.mark.parametrize("via", ["flag", "loss_type"])
+@pytest.mark.parametrize("head, loss_type, labels_shape, true_count", [
+    ("ViTForImageClassification", "ForImageClassification", (4,), 4),
+    ("SegformerForSemanticSegmentation", "ForSemanticSegmentation", (2, 8, 8), 128),
+    # 2D, token aligned, column 0 supervised, and NOT shifted. Rank alone cannot tell
+    # this from a causal batch, which is why eligibility asks what the loss does.
+    ("BertForMaskedLM", "ForMaskedLM", (2, 6), 12),
 ])
-def test_vision_heads_carry_no_input_ids_so_nothing_else_flags_them(
-    head, labels_shape, expected_true_count,
+def test_only_a_shifted_label_loss_may_enable_the_new_count(
+    via, head, loss_type, labels_shape, true_count,
 ):
-    """Why the new route needs a positive signal, not a list of excluded suffixes.
+    """The new route needs a positive shifted-label signal, not a suffix list.
 
-    A vision batch is pixel_values plus labels: no input_ids and no attention_mask, so
-    every shape check below is skipped and labels[..., 1:] quietly drops one entry per
-    row. Counted 3 of 4 images, and 112 of 128 pixels, before token_aligned.
+    Vision batches carry pixel_values and no attention_mask, so no shape check fires
+    and labels[..., 1:] drops one entry per row: 3 of 4 images, 112 of 128 pixels.
+    Masked LM is worse, since it looks exactly like a causal batch by rank and every
+    column-0 target is dropped. Both branches of the signal are exercised: `flag` is
+    transformers 5.x's Trainer._loss_shifts_labels, `loss_type` is the 4.x lookup.
     """
     torch = pytest.importorskip("torch")
     import torch.nn as nn
     mod = _loss_utils()
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
 
-    cls = type(head, (nn.Module,), {"forward": lambda self, pixel_values, **kw: None})
-    batch = {
-        "pixel_values": torch.randn(labels_shape[0], 3, 8, 8),
-        "labels": torch.randint(0, 3, labels_shape),
-    }
+    cls = type(head, (nn.Module,), {"forward": lambda self, *a, **kw: None})
+    model = cls()
+    model.loss_type = loss_type
+    batch = {"labels": torch.randint(0, 3, labels_shape)}
+    if head == "BertForMaskedLM":
+        batch["input_ids"] = torch.randint(0, 11, labels_shape)
+    else:
+        batch["pixel_values"] = torch.randn(labels_shape[0], 3, 8, 8)
+
     _, count = mod._unsloth_get_batch_samples(
-        _fake_trainer(cls(), False, lambda *a, **k: None), iter([batch]), 1,
+        _fake_trainer(model, False, lambda *a, **k: None,
+                      shifts = False if via == "flag" else None),
+        iter([batch]), 1,
     )
     assert count is None, (
-        f"{head}: counted {count} where the true label count is {expected_true_count}"
+        f"{head} via {via}: counted {count} where the true label count is {true_count}"
     )
+
+
+def test_a_short_microbatch_does_not_void_the_whole_accumulation_group():
+    """A [B, 1] member contributes 0 targets; the group total is still positive.
+
+    Voiding the group would hand None to a custom loss that then averages
+    per-microbatch means, losing the GA invariance this whole path exists for, and
+    would leave the short member taking a mean over zero targets.
+    """
+    torch = pytest.importorskip("torch")
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+
+    short = {"input_ids": torch.randint(0, 11, (2, 1)), "labels": torch.randint(0, 11, (2, 1))}
+    ids = torch.randint(0, 11, (2, 6))
+    normal = {"input_ids": ids, "labels": ids.clone()}
+    _, count = mod._unsloth_get_batch_samples(
+        _fake_trainer(_tiny_model(), True), iter([short, normal]), 2,
+    )
+    assert count is not None and int(count) == 10, (
+        f"expected the group total of 10 from the normal member, got {count}"
+    )
+
+    # Every member short means the total really is 0, and that must stay a no count.
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, count = mod._unsloth_get_batch_samples(
+        _fake_trainer(_tiny_model(), True), iter([short, short]), 2,
+    )
+    assert count is None, f"an all-short group must not hand back 0, got {count}"
 
 
 def test_token_classification_labels_are_not_silently_miscounted():
@@ -655,12 +697,16 @@ def test_a_seq2seq_batch_carrying_no_encoder_mask_counts_exactly_as_before():
     )
 
 
-def test_an_lm_head_model_the_detector_cannot_name_still_gets_the_fix():
-    """GPT2LMHeadModel matches none of CausalLM / ForConditionalGeneration /
-    VisionText2Text and exposes .transformer rather than .model, so the walk never
-    matches it. It is decoder-only causal all the same, and it is the canonical
-    smoke-test model in the transformers and TRL examples, so the whole point of
-    this PR has to reach it rather than being withheld by a name whitelist.
+@pytest.mark.parametrize("shifts, expected", [(True, 10), (None, None)])
+def test_an_lm_head_model_follows_the_shifted_label_signal(shifts, expected):
+    """GPT2LMHeadModel is the edge of the signal, so pin which way it falls.
+
+    It matches none of CausalLM / ForConditionalGeneration / VisionText2Text and
+    exposes .transformer rather than .model, so the walk never sees it, and
+    `loss_type` comes back None because the name carries no LOSS_MAPPING key. It does
+    shift labels in its own forward, but neither we nor stock transformers can prove
+    that, so without the flag it takes the mean and training_step's /GA, which is
+    always correct. When the Trainer does say the loss shifts, it counts.
     """
     torch = pytest.importorskip("torch")
     import torch.nn as nn
@@ -674,15 +720,13 @@ def test_an_lm_head_model_the_detector_cannot_name_still_gets_the_fix():
 
         def forward(self, input_ids): return None
 
-    batch = {
-        "input_ids": torch.randint(0, 11, (2, 6)),
-        "labels": torch.randint(0, 11, (2, 6)),
-    }
+    ids = torch.randint(0, 11, (2, 6))
     _, count = mod._unsloth_get_batch_samples(
-        _fake_trainer(GPT2LMHeadModel(), False, lambda *a, **k: None), iter([batch]), 1,
+        _fake_trainer(GPT2LMHeadModel(), False, lambda *a, **k: None, shifts = shifts),
+        iter([{"input_ids": ids, "labels": ids.clone()}]), 1,
     )
-    assert count is not None and int(count) == 10, (
-        f"expected the widened gate to count 10 shifted targets, got {count}"
+    assert (None if count is None else int(count)) == expected, (
+        f"shifts={shifts}: expected {expected}, got {count}"
     )
 
 
