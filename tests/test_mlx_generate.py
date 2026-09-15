@@ -1544,10 +1544,12 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
     from unsloth_zoo.mlx.inference import fused_decode_conv_silu, fused_moe_gate_up
-    stub = types.SimpleNamespace(training = False)
-    model = types.SimpleNamespace(
-        training = False,
-        named_modules = lambda: [("plain", stub)],
-    )
-    with fused_moe_gate_up(model), fused_decode_conv_silu(model):
-        pass
+    # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
+    # so a scope that reads it before deciding the entry is a candidate raises instead.
+    for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
+        model = types.SimpleNamespace(
+            training = False,
+            named_modules = lambda: [("plain", stub)],
+        )
+        with fused_moe_gate_up(model), fused_decode_conv_silu(model):
+            pass

@@ -474,7 +474,9 @@ def fused_decode_conv_silu(model):
                 # the instance's own entries. Generation enters this scope for whatever
                 # named_modules() yields, including the plain stand-ins the generate
                 # tests pass, so anything that is not a Module is simply not a candidate.
-                if module.training or not isinstance(module, dict):
+                # Type first: a stand-in need not carry `training` either, and reading
+                # it before the check raises out of generation instead of skipping.
+                if not isinstance(module, dict) or module.training:
                     continue
                 if "_causal_conv1d_decode" in module or "__call__" in module:
                     continue
