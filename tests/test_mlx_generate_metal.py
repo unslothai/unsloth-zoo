@@ -474,6 +474,40 @@ def test_generation_mode_applies_residual_norm_and_restores(cancel):
     assert [module.training for module in root.modules()] == flags
 
 
+@pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
+@pytest.mark.parametrize("cancel", [False, True], ids = ["complete", "cancel"])
+@metal_only
+def test_loader_generate_applies_residual_norm_and_restores(monkeypatch, vlm, cancel):
+    from contextlib import nullcontext
+    import mlx_lm
+    import mlx_vlm
+    from unsloth_zoo.mlx import loader
+
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
+    root._is_vlm_model = vlm
+    root.eval()
+    x = mx.random.normal((1, 1, 128))
+    expected = [model(x)[0] for model in models]
+    mx.eval(expected)
+
+    def stream(model, *args, **kwargs):
+        assert model is root
+        for index, (block, native) in enumerate(zip(models, expected)):
+            assert type(block) is not ResidualNormBlock
+            _residual_equal(block(x)[0], native)
+            yield types.SimpleNamespace(token = 7 + index)
+        if cancel:
+            raise RuntimeError("cancel")
+
+    monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
+    with pytest.raises(RuntimeError, match = "cancel") if cancel else nullcontext():
+        output = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 2)
+        assert output.tolist() == [[1, 2, 7, 8]]
+    assert all(type(model) is ResidualNormBlock for model in models)
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
 @metal_only
 def test_residual_norm_matches_reduction_rounding_and_scale(dtype):
