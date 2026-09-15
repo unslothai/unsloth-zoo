@@ -68,6 +68,23 @@ def patch_bitsandbytes_linear4bit_forward():
 
         # Some layers may not be quantized (no quant_state) - fall back to regular matmul
         quant_state = getattr(self.weight, "quant_state", None)
+        if quant_state is None and self.weight.dtype == torch.uint8:
+            # A packed 4-bit weight whose quant_state did not survive onto the
+            # parameter (seen on the Qwen3.5 GatedDeltaNet projections,
+            # unsloth#9867): re-derive it from the module rather than handing
+            # the packed buffer to F.linear below, which fails with an
+            # inscrutable mat1/mat2 shape error. The shape[-1] == 1 probe
+            # above does not cover every packed layout transformers 5 leaves
+            # behind during init.
+            fix_4bit_weight_quant_state_from_module(self)
+            quant_state = getattr(self.weight, "quant_state", None)
+            if quant_state is None:
+                raise RuntimeError(
+                    f"Unsloth: a 4-bit layer holds a packed uint8 weight of shape "
+                    f"{tuple(self.weight.shape)} with no quant_state, so it cannot "
+                    "be dequantized or matmul'd. Please report the model and layer "
+                    "at https://github.com/unslothai/unsloth/issues"
+                )
         if quant_state is None:
             bias = None if self.bias is None else self.bias
             weight = self.weight
