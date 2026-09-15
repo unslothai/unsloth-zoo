@@ -245,10 +245,16 @@ def test_a_bitsandbytes_without_the_params4bit_class_is_treated_as_absent():
     import sys
 
     program = (
-        "import sys, types\n"
+        "import sys, types, importlib.machinery\n"
         "mod = types.ModuleType('bitsandbytes'); nn = types.ModuleType('bitsandbytes.nn')\n"
         "nn.Params4bit = object()\n"          # imports fine, is not a class
         "mod.nn = nn\n"
+        # A real install has a spec, and transformers 4.57's _is_package_available runs
+        # importlib.util.find_spec on it, which raises ValueError on a spec-less module.
+        # Without these two lines the stand-in fails for a reason macOS never had.
+        "mod.__spec__ = importlib.machinery.ModuleSpec('bitsandbytes', None)\n"
+        "nn.__spec__ = importlib.machinery.ModuleSpec('bitsandbytes.nn', None)\n"
+        "mod.__version__ = '0.48.0'\n"
         "sys.modules['bitsandbytes'] = mod; sys.modules['bitsandbytes.nn'] = nn\n"
         "from unsloth_zoo.temporary_patches import moe_utils as MU\n"
         "import torch, torch.nn as tnn\n"
