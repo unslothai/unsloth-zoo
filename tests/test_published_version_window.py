@@ -27,7 +27,9 @@ Reads files only: no network, no torch, no transformers install.
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -305,6 +307,95 @@ def test_the_ci_policy_gate_agrees_with_pyproject() -> None:
         f"the CI gate holds the Apple Silicon cap at {constants['MLX_CEILING']} while "
         f"pyproject says {MLX_CEILING}"
     )
+
+
+CONSOLIDATED_CI = WORKFLOWS / "consolidated-tests-ci.yml"
+
+# The stdlib-only resolver inside the core-drift job that turns the
+# `__from_pyproject__` sentinel into a real pip spec.
+_RESOLVER = re.compile(
+    r"resolve\(\)\s*\{\s*\n\s*python - \"\$@\" <<'PY'\n(.*?)\n\s*PY\n",
+    re.DOTALL,
+)
+
+
+def _sentinel_resolver_source() -> str:
+    text = CONSOLIDATED_CI.read_text(encoding = "utf-8")
+    match = _RESOLVER.search(text)
+    assert match, (
+        f"{CONSOLIDATED_CI.name} no longer carries the `__from_pyproject__` resolver this "
+        f"test exercises; retarget the test or restore the step"
+    )
+    return textwrap.dedent(match.group(1))
+
+
+def _resolve_sentinel(pyproject_text: str, tmp_path: Path) -> list[str]:
+    """Run the workflow's own resolver against `pyproject_text`, as the job does."""
+    workdir = tmp_path / "repo"
+    workdir.mkdir(exist_ok = True)
+    (workdir / "pyproject.toml").write_text(pyproject_text, encoding = "utf-8")
+    script = tmp_path / "resolve.py"
+    script.write_text(_sentinel_resolver_source(), encoding = "utf-8")
+    finished = subprocess.run(
+        [sys.executable, str(script), "__from_pyproject__", "__from_pyproject__", "__from_pyproject__"],
+        cwd = workdir,
+        capture_output = True,
+        text = True,
+    )
+    if finished.returncode != 0:
+        raise AssertionError(
+            f"the resolver exited {finished.returncode}:\n{finished.stdout}\n{finished.stderr}"
+        )
+    return finished.stdout.strip().splitlines()
+
+
+def test_the_ci_sentinel_resolves_to_the_off_darwin_half(tmp_path) -> None:
+    """The core-drift lane is Linux, so it has to install the Linux half of the cap.
+
+    Before the split there was one transformers line and any of them was the right one.
+    With two, a resolver that takes whichever comes first in the file installs the 5.5.0
+    Apple Silicon cap on a Linux runner and the lane silently measures the wrong range,
+    which is the exact failure this whole file exists to prevent. Nothing else in the repo
+    executes this step, so it is executed here.
+    """
+    transformers_spec, trl_spec, peft_spec = _resolve_sentinel(
+        PYPROJECT.read_text(encoding = "utf-8"), tmp_path
+    )
+    assert Requirement(transformers_spec).name.lower() == "transformers"
+    assert ";" not in transformers_spec, (
+        f"the resolver left an environment marker on {transformers_spec!r}; pip install "
+        f"would take it as a separate argument"
+    )
+    ceiling = max(
+        Version(str(spec.version))
+        for spec in Requirement(transformers_spec).specifier
+        if spec.operator in ("<", "<=")
+    )
+    assert ceiling == TESTED_CEILING, (
+        f"the Linux core-drift lane would install transformers {transformers_spec!r}, whose "
+        f"ceiling is {ceiling}, not the {TESTED_CEILING} that half of the cap declares. A "
+        f"lane pinned to the Apple Silicon half tests a range Linux users do not get."
+    )
+    for spec, name in ((trl_spec, "trl"), (peft_spec, "peft")):
+        assert Requirement(spec).name.lower() == name
+        assert ";" not in spec
+
+
+def test_the_ci_sentinel_refuses_two_different_off_darwin_specs(tmp_path) -> None:
+    """Negative control, so the test above cannot pass by the resolver doing nothing.
+
+    Widening the Apple Silicon half to a DIFFERENT off-darwin ceiling leaves the lane with
+    two candidates and no rule for choosing, and it has to say so rather than pick one.
+    """
+    text = PYPROJECT.read_text(encoding = "utf-8")
+    widened = text.replace(
+        "sys_platform == 'darwin' and platform_machine == 'arm64'",
+        "sys_platform != 'darwin' or platform_machine != 'arm64'",
+    )
+    assert widened != text, "the marker split is not spelled the way this test assumed"
+    with pytest.raises(AssertionError) as raised:
+        _resolve_sentinel(widened, tmp_path)
+    assert "different off-darwin specs" in str(raised.value), str(raised.value)
 
 
 def test_the_checker_rejects_the_window_that_shipped_the_defect() -> None:
