@@ -641,3 +641,122 @@ def test_merge_matches_the_adapter_forward_on_a_tiny_fused_moe(tmp_path, monkeyp
         # tensors with gc.get_objects(), where a dead weakproxy raises.
         peft_model = merged = model = None
         gc.collect()
+
+
+# ---------------------------------------------------------------------------------------
+# The fix has to reach the user, and it travels through unsloth_compiled_cache
+# ---------------------------------------------------------------------------------------
+
+
+def _write_cache_copy(directory, text):
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "moe_utils.py"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_a_cache_copy_that_matches_this_module_is_used():
+    """The control: install_to_cache writes an exact copy, which must stay usable."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        import pathlib
+        path = _write_cache_copy(
+            pathlib.Path(directory),
+            pathlib.Path(MU.__file__).read_text(encoding="utf-8"),
+        )
+        assert MU._cached_copy_is_current(str(path), MU.__file__)
+
+
+def test_a_cache_copy_from_another_version_is_ignored():
+    """`install_to_cache` swallows a failed copy, so a cache that cannot be rewritten
+    keeps an older unsloth_zoo, and every caller here prefers the cached module. That
+    would install the OLD module's patches over this release's, with no error anywhere:
+    the merge fix simply would not be there. Byte equality is the whole test, because
+    the copy is a byte copy."""
+    import pathlib
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        stale = _write_cache_copy(
+            pathlib.Path(directory),
+            "# an older unsloth_zoo\ndef patch_param_wrapper_for_moe():\n    return True\n",
+        )
+        assert not MU._cached_copy_is_current(str(stale), MU.__file__)
+
+        previous = os.environ.get("UNSLOTH_COMPILE_LOCATION")
+        os.environ["UNSLOTH_COMPILE_LOCATION"] = directory
+        try:
+            assert MU._load_cached_moe_utils_module() is None, (
+                "a stale cache copy must not be loaded and asked to patch"
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("UNSLOTH_COMPILE_LOCATION", None)
+            else:
+                os.environ["UNSLOTH_COMPILE_LOCATION"] = previous
+
+
+def test_an_unwritable_stale_cache_still_gets_this_releases_patches(tmp_path):
+    """End to end, in a fresh interpreter, which is the only place import time
+    behaviour can be measured. A pre-#6930 moe_utils.py is planted in the cache and made
+    read only, so `install_to_cache` cannot refresh it, which is a container image or a
+    read only mount. get_delta_weight must still end up patched."""
+    import pathlib
+    import subprocess
+    import textwrap
+
+    cache = tmp_path / "unsloth_compiled_cache"
+    cache.mkdir()
+    stale = cache / "moe_utils.py"
+    # A plausible pre-#6930 module: it patches the forward and nothing else.
+    stale.write_text(
+        textwrap.dedent(
+            """
+            def patch_param_wrapper_for_moe():
+                return True
+            def forward_moe_backend(*args, **kwargs):
+                raise NotImplementedError
+            """
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(stale, 0o444)
+
+    program = textwrap.dedent(
+        """
+        import json, sys
+        from unsloth_zoo.temporary_patches.moe_utils import patch_param_wrapper_for_moe
+        patch_param_wrapper_for_moe()
+        try:
+            from peft.tuners.lora.layer import ParamWrapper
+        except Exception:
+            print(json.dumps({"skip": "no ParamWrapper"})); sys.exit(0)
+        print(json.dumps({
+            "get_delta_weight_patched": bool(
+                getattr(ParamWrapper.get_delta_weight, "_unsloth_moe_layout_patched", False)
+            ),
+        }))
+        """
+    )
+    environment = dict(os.environ)
+    environment["UNSLOTH_COMPILE_LOCATION"] = str(cache)
+    environment["UNSLOTH_IS_PRESENT"] = "1"
+    root = str(pathlib.Path(MU.__file__).resolve().parents[3])
+    environment["PYTHONPATH"] = root + os.pathsep + environment.get("PYTHONPATH", "")
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", program], env=environment,
+            capture_output=True, text=True, timeout=900,
+        )
+    finally:
+        os.chmod(stale, 0o644)
+
+    assert completed.returncode == 0, completed.stderr[-4000:]
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    if "skip" in payload:
+        pytest.skip(payload["skip"])
+    assert payload["get_delta_weight_patched"], (
+        "a stale unwritable unsloth_compiled_cache/moe_utils.py silently kept the "
+        "pre-#6930 merge"
+    )

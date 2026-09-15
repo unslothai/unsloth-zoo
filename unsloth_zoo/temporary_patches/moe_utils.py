@@ -87,12 +87,51 @@ _CACHED_FORWARD_MOE_BACKEND = None
 _CACHED_MOE_UTILS_MODULE = None
 
 
+_WARNED_STALE_CACHE = set()
+
+
+def _cached_copy_is_current(cache_file, current_file) -> bool:
+    """Whether the compiled cache holds byte for byte what this module is.
+
+    `install_to_cache` rewrites the cache on every import, so the two normally
+    match and this is a cheap confirmation. They diverge when the copy could not
+    be written: a cache directory baked into an image, a read only mount, or a
+    file owned by another user. `shutil.copy` fails there and the failure is
+    swallowed, so the cache keeps an OLDER unsloth_zoo, and every caller below
+    prefers it, which silently installs that older module's patches over the
+    ones this release ships. Prefer this module in that case, and say so once.
+    """
+    try:
+        with open(cache_file, "rb") as f:
+            cached = f.read()
+        with open(current_file, "rb") as f:
+            current = f.read()
+    except Exception:
+        return False
+    if cached == current:
+        return True
+
+    if cache_file not in _WARNED_STALE_CACHE:
+        _WARNED_STALE_CACHE.add(cache_file)
+        logger = _moe_utils_logger()
+        if logger is not None:
+            logger.warning(
+                f"Unsloth: {cache_file} is from a different version of unsloth_zoo and "
+                f"could not be refreshed, so it is being ignored. Delete that directory "
+                f"if MoE behaviour looks stale."
+            )
+    return False
+
+
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 
     cache_file = os.path.abspath(os.path.join(_get_compile_location(), "moe_utils.py"))
     current_file = os.path.abspath(__file__)
     if not os.path.isfile(cache_file) or cache_file == current_file:
+        return None
+    if not _cached_copy_is_current(cache_file, current_file):
+        _CACHED_MOE_UTILS_MODULE = None
         return None
 
     try:
