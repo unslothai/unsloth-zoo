@@ -873,6 +873,225 @@ pass
 RL_REPLACEMENTS["_warn_deprecated_n_chunks"] = _warn_deprecated_n_chunks
 
 
+# The multimodal keys TRL's GRPO trainer stores in the inputs dict it hands to
+# compute_loss, and forwards into its own per-token logprob helper. Both Unsloth GRPO
+# logprob paths read this one tuple: the no-grad old/reference pass in
+# unsloth.models.rl_replacements._get_per_token_logps_and_entropies and the gradient
+# pass in grpo_accumulated_loss below. A key added here therefore reaches both, which
+# is the point: the two paths must forward the same inputs or the importance ratio
+# compares two different policies. See unslothai/unsloth#6960.
+GRPO_VISION_KEYS = (
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_attention_mask",
+    "image_sizes",
+    "spatial_shapes",
+    "num_tiles",
+    "image_position_ids",
+    "num_images",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
+
+
+def grpo_get_vision_inputs(source):
+    """Collect the GRPO multimodal inputs out of a kwargs or inputs mapping."""
+    if source is None:
+        return {}
+    get = getattr(source, "get", None)
+    if get is None:
+        return {}
+    return {key: get(key, None) for key in GRPO_VISION_KEYS}
+pass
+RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
+
+
+def grpo_vision_chunks(vision, total_samples, batch_size):
+    """Slice the GRPO multimodal inputs into per-chunk forward kwargs.
+
+    One implementation for both Unsloth GRPO logprob paths, so the no-grad pass and the
+    gradient pass cannot index the same tensors differently. The indexing mirrors TRL's
+    own ``_get_per_token_logps_and_entropies``:
+
+    * ``image_grid_thw`` models (Qwen2-VL and relatives) index ``pixel_values`` by patch
+      row and ``image_grid_thw`` by image.
+    * ``image_position_ids`` models (Gemma 4) index ``pixel_values`` and
+      ``image_position_ids`` by image.
+    * ``spatial_shapes`` models (LFM2-VL) index ``pixel_values``,
+      ``pixel_attention_mask`` and ``spatial_shapes`` by tile, with ``num_tiles`` giving
+      the tiles per sample.
+    * ``num_tiles`` alone (InternVL) indexes ``pixel_values`` by tile.
+    * anything else indexes ``pixel_values`` by image when there is one row per image,
+      and by sample otherwise.
+
+    Returns one dict per chunk holding only the keys that are actually present, ready to
+    splat into the model call. A model whose metadata keys are not recognised still gets
+    its ``pixel_values``, which is what stock TRL does; dropping them silently recomputes
+    the reference logprobs from the text alone.
+    """
+    import torch
+
+    def _as_int_list(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().reshape(-1).tolist()
+        try:
+            return [int(n) for n in value]
+        except TypeError:
+            return None
+
+    def _first_dim_len(value):
+        if value is None:
+            return None
+        if hasattr(value, "shape"):
+            return value.shape[0]
+        try:
+            return len(value)
+        except TypeError:
+            return None
+
+    pixel_values = vision.get("pixel_values", None)
+    image_grid_thw = vision.get("image_grid_thw", None)
+    pixel_attention_mask = vision.get("pixel_attention_mask", None)
+    image_sizes = vision.get("image_sizes", None)
+    spatial_shapes = vision.get("spatial_shapes", None)
+    image_position_ids = vision.get("image_position_ids", None)
+    token_type_ids = vision.get("token_type_ids", None)
+    mm_token_type_ids = vision.get("mm_token_type_ids", None)
+    num_images = _as_int_list(vision.get("num_images", None))
+    num_tiles = _as_int_list(vision.get("num_tiles", None))
+
+    # A count list is only a per-sample cumulative index when it has one entry per row.
+    if num_images is not None and len(num_images) != total_samples:
+        num_images = None
+    if num_tiles is not None and len(num_tiles) != total_samples:
+        num_tiles = None
+
+    cum_imgs = None if num_images is None else torch.tensor([0] + num_images).cumsum(0)
+    cum_tiles = None if num_tiles is None else torch.tensor([0] + num_tiles).cumsum(0)
+
+    cum_rows = None
+    if image_grid_thw is not None and pixel_values is not None and num_images is not None:
+        rows_per_image = image_grid_thw.prod(dim = -1)
+        rows_per_sample = torch.split(rows_per_image, num_images)
+        rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
+        # Indexed with .item() inside the loop, so keep it on CPU: otherwise every chunk
+        # pays a GPU to CPU sync.
+        cum_rows = torch.cat(
+            [
+                torch.tensor([0], device = rows_per_sample.device),
+                rows_per_sample.cumsum(0),
+            ]
+        ).cpu()
+
+    total_images = None if num_images is None else sum(num_images)
+    _image_sizes_n = _first_dim_len(image_sizes)
+
+    def _image_sizes_slice(start, end, img_start, img_end):
+        if image_sizes is None:
+            return None
+        if img_start is not None and _image_sizes_n == total_images:
+            return image_sizes[img_start:img_end]
+        return image_sizes[start:end]
+
+    chunks = []
+    current_pixel_idx = 0
+    for start in range(0, total_samples, batch_size):
+        end = min(start + batch_size, total_samples)
+        chunk = {}
+        if token_type_ids is not None:
+            chunk["token_type_ids"] = token_type_ids[start:end]
+        if mm_token_type_ids is not None:
+            chunk["mm_token_type_ids"] = mm_token_type_ids[start:end]
+
+        img_start = img_end = None
+        if cum_imgs is not None:
+            img_start, img_end = int(cum_imgs[start]), int(cum_imgs[end])
+
+        if pixel_values is None:
+            # Text-only rows: only image_sizes can still be present, indexed per sample.
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+            chunks.append(chunk)
+            continue
+
+        if image_grid_thw is not None:
+            if num_images is None:
+                grid_slice = image_grid_thw[start:end]
+                batch_pixel_count = grid_slice.prod(dim = -1).sum().item()
+                start_pixel_idx = current_pixel_idx
+                end_pixel_idx = current_pixel_idx + batch_pixel_count
+                current_pixel_idx = end_pixel_idx
+            else:
+                start_pixel_idx = cum_rows[start].item()
+                end_pixel_idx = cum_rows[end].item()
+                grid_slice = image_grid_thw[img_start:img_end]
+            chunk["image_grid_thw"] = grid_slice
+            chunk["pixel_values"] = pixel_values[start_pixel_idx:end_pixel_idx]
+            if pixel_attention_mask is not None:
+                if img_start is not None and pixel_attention_mask.shape[0] == image_grid_thw.shape[0]:
+                    chunk["pixel_attention_mask"] = pixel_attention_mask[img_start:img_end]
+                elif (
+                    pixel_attention_mask.shape[0] == pixel_values.shape[0]
+                    and pixel_attention_mask.shape[0] != total_samples
+                ):
+                    chunk["pixel_attention_mask"] = pixel_attention_mask[start_pixel_idx:end_pixel_idx]
+                else:
+                    chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        elif image_position_ids is not None:
+            # Gemma 4: pixel_values and image_position_ids are both indexed by image.
+            if img_start is None:
+                chunk["pixel_values"] = pixel_values[start:end]
+                chunk["image_position_ids"] = image_position_ids[start:end]
+            else:
+                chunk["pixel_values"] = pixel_values[img_start:img_end]
+                chunk["image_position_ids"] = image_position_ids[img_start:img_end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        elif spatial_shapes is not None:
+            # LFM2-VL: pixel_values, pixel_attention_mask and spatial_shapes are all tile
+            # indexed, and num_tiles carries the tiles per sample.
+            if cum_tiles is not None:
+                tile_start, tile_end = int(cum_tiles[start]), int(cum_tiles[end])
+            elif img_start is not None and _first_dim_len(spatial_shapes) == total_images:
+                tile_start, tile_end = img_start, img_end
+            else:
+                tile_start, tile_end = start, end
+            chunk["pixel_values"] = pixel_values[tile_start:tile_end]
+            chunk["spatial_shapes"] = spatial_shapes[tile_start:tile_end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[tile_start:tile_end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        elif cum_tiles is not None:
+            # InternVL: pixel_values alone is tile indexed.
+            tile_start, tile_end = int(cum_tiles[start]), int(cum_tiles[end])
+            chunk["pixel_values"] = pixel_values[tile_start:tile_end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        else:
+            # One row of pixel_values per image (Gemma 3, SmolVLM), else one per sample.
+            if img_start is not None and _first_dim_len(pixel_values) == total_images:
+                chunk["pixel_values"] = pixel_values[img_start:img_end]
+            else:
+                chunk["pixel_values"] = pixel_values[start:end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        chunks.append(chunk)
+    return chunks
+pass
+RL_REPLACEMENTS["grpo_vision_chunks"] = grpo_vision_chunks
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -894,18 +1113,26 @@ def grpo_accumulated_loss(
     except Exception:
         pass
 
-    pixel_values = kwargs.get('pixel_values',None)
-    image_grid_thw = kwargs.get('image_grid_thw',None)
-    pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
-    image_sizes = kwargs.get('image_sizes',None)
-    num_images = kwargs.get('num_images',None)
+    # One shared key tuple with unsloth.models.rl_replacements, so the no-grad logprob
+    # pass there and this gradient pass forward the same multimodal inputs. Body-local
+    # import for the same reason as the call above: this function's source is copied into
+    # the generated UnslothGRPOTrainer cache without unsloth_zoo's module imports.
+    from unsloth_zoo.rl_replacements import (
+        grpo_get_vision_inputs as _grpo_get_vision_inputs,
+        grpo_vision_chunks as _grpo_vision_chunks,
+    )
+    vision_inputs = _grpo_get_vision_inputs(kwargs)
+    pixel_values = vision_inputs.get('pixel_values', None)
+    image_grid_thw = vision_inputs.get('image_grid_thw', None)
+    num_images = vision_inputs.get('num_images', None)
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
-    token_type_ids = kwargs.get('token_type_ids',None)
-    mm_token_type_ids = kwargs.get('mm_token_type_ids',None)
+    token_type_ids = vision_inputs.get('token_type_ids', None)
+    mm_token_type_ids = vision_inputs.get('mm_token_type_ids', None)
     if mm_token_type_ids is not None or image_grid_thw is not None:
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
+        vision_inputs['mm_token_type_ids'] = mm_token_type_ids
     sampling_per_token_logps = kwargs.get("sampling_per_token_logps", None) if getattr(trainer, "vllm_importance_sampling_correction", False) else None
     temperature = kwargs.get("temperature", 1.0)
     logit_scale_multiply = kwargs.get("logit_scale_multiply", 0.0)
@@ -1024,95 +1251,28 @@ def grpo_accumulated_loss(
 
     all_logprobs_list = []
 
-    def slice_sample_axis(value, start, end):
-        if value is None:
-            return None
-        return value[start:end]
-
     import math
     total_samples = input_ids.shape[0]
     batch_size = math.ceil(total_samples / B)
-    if isinstance(num_images, torch.Tensor):
-        num_images = num_images.detach().cpu().reshape(-1).tolist()
-    if image_grid_thw is not None and pixel_values is not None and num_images is not None:
-        rows_per_image = image_grid_thw.prod(dim=-1)
-        rows_per_sample = torch.split(rows_per_image, num_images)
-        rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
-        cum_rows = torch.cat(
-            [
-                torch.tensor([0], device=rows_per_sample.device),
-                rows_per_sample.cumsum(0),
-            ]
-        )
-        cum_imgs = torch.tensor([0] + num_images).cumsum(0)
-    else:
-        cum_rows = None
-        cum_imgs = None
-
     input_ids_chunks = []
     attention_mask_chunks = []
     completion_ids_chunks = []
-    pixel_values_chunks = []
-    image_grid_thw_chunks = []
-    pixel_attention_mask_chunks = []
-    image_sizes_chunks = []
-    token_type_ids_chunks = []
-    mm_token_type_ids_chunks = []
-
-    current_pixel_idx = 0
-    #TRL 0.23.0 batching logic
     for start in range(0, total_samples, batch_size):
         end = min(start + batch_size, total_samples)
-
         input_ids_chunks.append(input_ids[start:end])
         attention_mask_chunks.append(attention_mask[start:end])
         completion_ids_chunks.append(completion_input_ids[start:end])
-        image_sizes_chunks.append(slice_sample_axis(image_sizes, start, end))
-        token_type_ids_chunks.append(slice_sample_axis(token_type_ids, start, end))
-        mm_token_type_ids_chunks.append(
-            slice_sample_axis(mm_token_type_ids, start, end)
-        )
 
-        if image_grid_thw is not None and pixel_values is not None:
-
-            if num_images is None:
-                grid_slice = image_grid_thw[start:end]
-                batch_pixel_count = grid_slice.prod(dim=-1).sum().item()
-                start_pixel_idx = current_pixel_idx
-                end_pixel_idx = current_pixel_idx + batch_pixel_count
-                current_pixel_idx = end_pixel_idx
-            else:
-                start_pixel_idx = cum_rows[start].item()
-                end_pixel_idx = cum_rows[end].item()
-                img_start, img_end = cum_imgs[start], cum_imgs[end]
-                grid_slice = image_grid_thw[img_start:img_end]
-            image_grid_thw_chunks.append(grid_slice)
-
-            pixel_values_chunks.append(pixel_values[start_pixel_idx:end_pixel_idx])
-
-            if pixel_attention_mask is not None:
-                if pixel_attention_mask.shape[0] == pixel_values.shape[0]:
-                    pixel_attention_mask_chunks.append(pixel_attention_mask[start_pixel_idx:end_pixel_idx])
-                else:
-                    pixel_attention_mask_chunks.append(pixel_attention_mask[start:end])
-            else:
-                pixel_attention_mask_chunks.append(None)
-
-        else:
-            pixel_values_chunks.append(None)
-            image_grid_thw_chunks.append(None)
-            pixel_attention_mask_chunks.append(None)
+    # Shared with the no-grad logprob pass, so the two never slice the same tensors
+    # differently, and so a model whose metadata key is not image_grid_thw still gets its
+    # pixel_values forwarded instead of silently dropped (unslothai/unsloth#6960).
+    vision_chunks = _grpo_vision_chunks(vision_inputs, total_samples, batch_size)
 
     zipped_inputs = zip(
         input_ids_chunks,
         attention_mask_chunks,
-        pixel_values_chunks,
-        image_grid_thw_chunks,
-        pixel_attention_mask_chunks,
-        image_sizes_chunks,
-        token_type_ids_chunks,
-        mm_token_type_ids_chunks,
-        completion_ids_chunks
+        vision_chunks,
+        completion_ids_chunks,
     )
 
     # Bound in the body, not at module scope, for the reason spelled out just below: this
@@ -1681,29 +1841,15 @@ def grpo_accumulated_loss(
     for (
         input_ids_chunk,
         attention_mask_chunk,
-        pixel_values_chunk,
-        image_grid_thw_chunk,
-        pixel_attention_mask_chunk,
-        image_sizes_chunk,
-        token_type_ids_chunk,
-        mm_token_type_ids_chunk,
+        vision_chunk,
         completion_ids
     ) in zipped_inputs:
-            _extra_vision_kwargs = {}
-            if token_type_ids_chunk is not None:
-                _extra_vision_kwargs["token_type_ids"] = token_type_ids_chunk
-            if mm_token_type_ids_chunk is not None:
-                _extra_vision_kwargs["mm_token_type_ids"] = mm_token_type_ids_chunk
             with autocaster:
                 if pixel_values is None:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
                         attention_mask = attention_mask_chunk,
-                        pixel_values = pixel_values_chunk,
-                        image_grid_thw = image_grid_thw_chunk,
-                        pixel_attention_mask = pixel_attention_mask_chunk,
-                        image_sizes = image_sizes_chunk,
-                        **_extra_vision_kwargs,
+                        **vision_chunk,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
@@ -1713,12 +1859,8 @@ def grpo_accumulated_loss(
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
                         attention_mask = attention_mask_chunk,
-                        pixel_values = pixel_values_chunk,
-                        image_grid_thw = image_grid_thw_chunk,
-                        pixel_attention_mask = pixel_attention_mask_chunk,
-                        image_sizes = image_sizes_chunk,
                         logits_to_keep = logits_to_keep + 1,
-                        **_extra_vision_kwargs,
+                        **vision_chunk,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
