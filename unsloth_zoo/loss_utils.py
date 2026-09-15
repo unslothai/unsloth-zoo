@@ -36,6 +36,38 @@ else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
 
+# unsloth #2491: triton 3.3.0 and 3.3.1 cannot lower cut_cross_entropy's
+# `_cce_lse_forward_kernel` for compute capability 7.5 (T4, RTX 2080 Ti). The
+# TritonGPU to LLVM pass gives up on a `tt.fp_to_fp` the sm_75 path does not
+# handle and aborts the whole process:
+#     error: Unsupported conversion from f16 to f16
+#     LLVM ERROR: Unsupported rounding mode for conversion.
+# (triton-lang/triton#6698, closed 2025-07-22.) Both ends of the range are
+# measured, not inferred: the real kernel was compiled ahead of time for
+# cuda:75 on every published release from 3.1.0 to 3.8.0, and only 3.3.0 and
+# 3.3.1 abort. They abort for every block size, dot precision and accumulator
+# dtype tried, so a narrower condition would not be safe, and the sm_80 control
+# compiles cleanly on all of them, so the two failures are specific to 7.5.
+#
+# This cannot be a floor in pyproject.toml. torch pins triton exactly, and the
+# oldest torch supported here, 2.6.0, requires `triton==3.2.0`, so any floor
+# above 3.2.0 makes that torch unresolvable instead of safe.
+_TRITON_CCE_BROKEN_ON_SM75 = ("3.3.0", "3.4.0")
+
+
+def _triton_miscompiles_cce_on_sm75(major, minor, version = triton_version):
+    if (major, minor) != (7, 5):
+        return False
+    low, high = _TRITON_CCE_BROKEN_ON_SM75
+    try:
+        installed = Version(version)
+    except Exception:
+        # An unparseable version is not evidence of a defect.
+        return False
+    return Version(low) <= installed < Version(high)
+pass
+
+
 if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
     # whether a device is present before asking what it can do. Cut cross
@@ -46,7 +78,8 @@ elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
-        (not (Version(triton_version) < Version("3.0.0"))):
+        (not (Version(triton_version) < Version("3.0.0"))) and \
+        (not _triton_miscompiles_cce_on_sm75(major, minor)):
         try:
             from cut_cross_entropy import linear_cross_entropy
             HAS_CUT_CROSS_ENTROPY = True
@@ -54,6 +87,16 @@ elif DEVICE_TYPE == "cuda":
             HAS_CUT_CROSS_ENTROPY = False
     else:
         HAS_CUT_CROSS_ENTROPY = False
+    pass
+    if _triton_miscompiles_cce_on_sm75(major, minor):
+        logger.warning(
+            f"Unsloth: triton=={triton_version} miscompiles the cut cross entropy "
+            f"kernel for compute capability {major}.{minor}, so it is disabled and "
+            f"the standard loss is used instead, at a higher memory cost. Upgrading "
+            f"to torch 2.8.0 or later, which carries triton 3.4.0, restores it; so "
+            f"does torch 2.6.0, which carries triton 3.2.0. Leaving it enabled aborts "
+            f"the process with 'LLVM ERROR: Unsupported rounding mode for conversion'."
+        )
     pass
 elif DEVICE_TYPE == "hip":
     try:
