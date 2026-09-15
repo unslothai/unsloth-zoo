@@ -92,8 +92,9 @@ generate_module = _pkg("mlx_vlm.generate")
 # forwarded, and calls turboquant_enabled to classify the scheme. The module-level
 # __getattr__ below answers any name with a _Noop, so without concrete definitions
 # those probes resolve to something signature-less and every control is reported
-# refused. Shapes copied from mlx-vlm 0.6.4, the newest release this repo's
-# transformers<=5.5.0 cap resolves.
+# refused. Shapes copied from mlx-vlm 0.6.4, the newest release the darwin + arm64
+# half of this repo's transformers cap resolves. That half stays at <=5.5.0 for
+# exactly this reason; the other half is <=5.17.0 and does not reach the MLX stack.
 generate_ar_module = _pkg("mlx_vlm.generate.ar")
 
 

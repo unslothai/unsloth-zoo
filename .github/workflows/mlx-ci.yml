@@ -108,11 +108,13 @@ jobs:
         # next release is safe to adopt.
         #
         # mlx-vlm is upgraded past its `<0.7.0` ceiling too. The ceiling exists
-        # because the current mlx-vlm wants transformers>=5.14.0 against this
-        # repo's `transformers<=5.5.0` cap, and leaving it out would mean the one
-        # lane that could ever justify lifting that ceiling never tests the
-        # version it would be lifted to. Letting transformers move with it is the
-        # point of this leg, and is why it does not gate.
+        # because the current mlx-vlm wants transformers>=5.14.0 against the
+        # darwin + arm64 half of this repo's transformers cap, which stays at
+        # <=5.5.0 for exactly that reason while the other half is now <=5.17.0.
+        # Leaving it out would mean the one lane that could ever justify lifting
+        # the MLX half never tests the version it would be lifted to. Letting
+        # transformers move with it is the point of this leg, and is why it does
+        # not gate.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm
