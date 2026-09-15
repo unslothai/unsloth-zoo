@@ -1291,7 +1291,13 @@ pass
 @torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     global CPU_BUFFERS
-    if len(CPU_BUFFERS) == 0:
+    # `not CPU_BUFFERS`, not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing
+    # sets the buffers to None rather than emptying them, and
+    # prepare_model_for_training calls it for every use_gradient_checkpointing
+    # other than "unsloth". Patching this shim in after that point - the only
+    # way to reach it - then hit `TypeError: object of type 'NoneType' has no
+    # len()` here before the RNG flag below ever mattered.
+    if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
     preserve = kwargs.pop("preserve_rng_state", True)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)

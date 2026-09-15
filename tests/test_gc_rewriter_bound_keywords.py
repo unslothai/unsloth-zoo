@@ -588,6 +588,35 @@ def test_offloaded_wrapper_matches_torch_checkpoint(cpu_offload_globals, preserv
         torch.testing.assert_close(result, reference)
 
 
+def test_offloaded_wrapper_reinitialises_after_an_unpatch(cpu_offload_globals, monkeypatch):
+    """Buffers left as None by an unpatch must re-initialise, not raise.
+
+    unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS to None rather
+    than emptying it, and prepare_model_for_training calls that unpatch for every
+    use_gradient_checkpointing other than "unsloth". Since installing this shim
+    at all means going through patch_unsloth_gradient_checkpointing after model
+    setup, None is the state it normally finds - and `len(None)` is a TypeError
+    raised before the wrapper does anything else.
+    """
+    gc_module = cpu_offload_globals
+    monkeypatch.setattr(gc_module, "CPU_BUFFERS", None, raising = False)
+
+    initialised = []
+    def fake_initialize(dtype = None):
+        initialised.append(dtype)
+        gc_module.CPU_BUFFERS = [torch.empty(0)]
+    monkeypatch.setattr(gc_module, "initialize_unsloth_gradient_checkpointing", fake_initialize)
+
+    hidden = torch.randn(2, 16, requires_grad = True)
+    output = gc_module.unsloth_offloaded_gradient_checkpoint(
+        lambda x: x * 2.0, hidden, use_reentrant = True,
+    )
+    output.sum().backward()
+
+    assert initialised == [hidden.dtype]
+    torch.testing.assert_close(hidden.grad, torch.full_like(hidden, 2.0))
+
+
 class _SideLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
