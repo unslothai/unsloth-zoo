@@ -43,6 +43,7 @@ from .utils import (
     dedent,
     KWARGS_TYPE,
     raise_error,
+    skip_patch,
     logger,
     Cache,
     process_return,
@@ -278,11 +279,12 @@ def patch_gpt_oss():
 
             transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
         except Exception as e:
-            return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
+            skip_patch("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
 
         if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
             transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
 
+        matmul_ogs_available = False
         try:
             from triton_kernels import matmul_ogs, swiglu
 
@@ -292,8 +294,9 @@ def patch_gpt_oss():
                 matmul_ogs.matmul_ogs,
             )
             swiglu_fn = swiglu.swiglu_fn
+            matmul_ogs_available = True
         except Exception as e:
-            return raise_error("triton_kernels", e)
+            skip_patch("triton_kernels", e)
     else:
         # Leave is_kernels_available intact so transformers' validate_environment()
         # correctly sets dequantize=True, enabling bf16 fallback.
@@ -567,38 +570,45 @@ def patch_gpt_oss():
 
         pass
 
-    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
+    if matmul_ogs_available:
+        patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
-    if HAS_TRITON_KERNELS:
+    routing_available = False
+    if matmul_ogs_available:
         try:
             routing = triton_kernels.routing.routing
             routing = torch.compiler.disable(routing)
+            routing_available = True
         except Exception as e:
-            return raise_error("triton_kernels.routing.routing", e)
+            skip_patch("triton_kernels.routing.routing", e)
 
-        def mlp_forward(self, hidden_states):
-            batch_size = hidden_states.shape[0]
-            hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
-            router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
+    def mlp_forward(self, hidden_states):
+        batch_size = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
+        router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
 
-            with torch_cuda_device(router_logits.device):
-                routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
+        with torch_cuda_device(router_logits.device):
+            routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
 
-            routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
-            routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
-            return routed_out, router_logits
+        routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
+        routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
+        return routed_out, router_logits
 
+    if routing_available:
         patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
 
-    if HAS_TRITON_KERNELS:
+    load_and_swizzle_ready = False
+    shard_and_distribute_module = None
+    if matmul_ogs_available:
         try:
             PrecisionConfig, FlexCtx, InFlexData = (
                 triton_kernels.matmul_ogs.PrecisionConfig,
                 triton_kernels.matmul_ogs.FlexCtx,
                 triton_kernels.matmul_ogs.InFlexData,
             )
+            load_and_swizzle_ready = True
         except Exception as e:
-            return raise_error("triton_kernels.matmul_ogs", e)
+            skip_patch("triton_kernels.matmul_ogs", e)
 
     # Legacy per-parameter TP loader hook. transformers 5.16.0 (upstream PR #47579,
     # the DTensor tensor parallel rewrite) reduced it to a tombstone that raises when
@@ -608,7 +618,7 @@ def patch_gpt_oss():
         try:
             from transformers.integrations.tensor_parallel import shard_and_distribute_module
         except Exception as e:
-            return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+            skip_patch("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
     else:
         shard_and_distribute_module = None
 
@@ -686,12 +696,15 @@ def patch_gpt_oss():
                     del blocks
 
     pass
-    patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
+    if load_and_swizzle_ready:
+        patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
 
+    replace_with_mxfp4_ready = False
     try:
         from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
+        replace_with_mxfp4_ready = True
     except Exception as e:
-        return raise_error("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
+        skip_patch("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
 
     def replace_with_mxfp4_linear(
         model,
@@ -715,7 +728,8 @@ def patch_gpt_oss():
 
         return model
 
-    patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
+    if replace_with_mxfp4_ready:
+        patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
 
