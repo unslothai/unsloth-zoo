@@ -26,6 +26,7 @@ the file, and every consumer that trusts the config goes looking for them
 """
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -347,3 +348,80 @@ def test_shared_rule_does_not_consume_a_generator_per_holder():
     names = ("model.layers.0.mlp.up_proj.weight", "mtp.fc.weight")
     generator = (name for name in names)
     assert mtp_head_is_present(generator) is True
+
+
+# ---- against the real published config, and an unwritable folder -----------
+
+
+@pytest.fixture
+def real_qwen35_config():
+    """`config.json` as Qwen publishes it, so the shape this repair assumes is
+    checked against the model it was written for rather than against our own
+    fixture. Skipped cleanly when the Hub is unreachable."""
+    requests = pytest.importorskip("requests")
+    url = "https://huggingface.co/Qwen/Qwen3.5-2B/resolve/main/config.json"
+    try:
+        response = requests.get(url, timeout = 30)
+    except requests.exceptions.RequestException as exc:
+        pytest.skip(f"hub unreachable: {exc}")
+    if response.status_code in (401, 403, 429, 503):
+        pytest.skip(f"hub unavailable: HTTP {response.status_code}")
+    if response.status_code != 200:
+        pytest.skip(f"config not published at that address: HTTP {response.status_code}")
+    try:
+        config = response.json()
+    except ValueError as exc:
+        pytest.skip(f"config is not json: {exc}")
+    if MTP_CONFIG_KEY not in json.dumps(config):
+        pytest.skip("this release no longer declares the MTP layer count")
+    return config
+
+
+def test_the_real_published_config_is_repaired_and_only_there(tmp_path, real_qwen35_config):
+    """Qwen keeps the declaration in `text_config`. A merged export of that model
+    carries no `mtp.*` tensor, so the key must go, and nothing else in a config
+    this size may move."""
+    (tmp_path / "config.json").write_text(
+        json.dumps(real_qwen35_config, indent = 2), encoding = "utf-8",
+    )
+    _write_checkpoint(tmp_path, BODY_NAMES)
+
+    assert reconcile_mtp_config(tmp_path) == "stripped"
+
+    saved = _saved(tmp_path)
+    expected = json.loads(json.dumps(real_qwen35_config))
+    for container in (expected, expected.get("text_config")):
+        if isinstance(container, dict):
+            container.pop(MTP_CONFIG_KEY, None)
+    assert saved == expected
+
+
+def test_the_real_published_config_is_kept_when_the_head_is_there(tmp_path, real_qwen35_config):
+    (tmp_path / "config.json").write_text(
+        json.dumps(real_qwen35_config, indent = 2), encoding = "utf-8",
+    )
+    _write_checkpoint(tmp_path, BODY_NAMES + QWEN35_MTP_NAMES)
+
+    before = (tmp_path / "config.json").read_bytes()
+    assert reconcile_mtp_config(tmp_path) == "agrees"
+    assert (tmp_path / "config.json").read_bytes() == before
+
+
+def test_a_config_that_cannot_be_rewritten_is_reported_not_raised(tmp_path):
+    """The repair runs after the weights are on disk, so a folder it cannot write
+    to must cost a warning, not the save."""
+    if os.name == "nt":
+        pytest.skip("read-only file permissions are not enforced the same way on Windows")
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the read-only bit")
+
+    _write_config(tmp_path)
+    _write_checkpoint(tmp_path, BODY_NAMES)
+    config_path = tmp_path / "config.json"
+    config_path.chmod(0o444)
+    try:
+        assert reconcile_mtp_config(tmp_path) == "unknown"
+        # Unwritable means unchanged, not half written.
+        assert MTP_CONFIG_KEY in json.dumps(_saved(tmp_path))
+    finally:
+        config_path.chmod(0o644)
