@@ -542,7 +542,6 @@ def _residual_norm_kernel():
             const uint row = threadgroup_position_in_grid.x * D;
 
             threadgroup float staged[LANES];
-            if (slot < LANES) staged[slot] = 0.0f;
 
             float kept[SPAN];
             float square = 0.0f;
@@ -553,19 +552,14 @@ def _residual_norm_kernel():
             }
             square = simd_sum(square);
 
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Live partials and padding have disjoint writers.
             if (lane == 0) staged[group] = square;
+            if (slot >= (D + LANES * SPAN - 1) / (LANES * SPAN) && slot < LANES)
+                staged[slot] = 0.0f;
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // The zero fill above is what makes the slots past the last simdgroup safe for
-            // this second level to fold in.
-            threadgroup float shared_inv;
-            if (group == 0) {
-                const float total = simd_sum(staged[lane]);
-                if (lane == 0) shared_inv = metal::precise::rsqrt(total / D + epsilon);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const float inv = shared_inv;
+            const float total = simd_sum(staged[lane]);
+            const float inv = metal::precise::rsqrt(total / D + epsilon);
 
             for (uint i = 0; i < SPAN; ++i) {
                 const uint c = slot * SPAN + i;

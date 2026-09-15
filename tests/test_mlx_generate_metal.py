@@ -450,7 +450,7 @@ class ResidualNormBlock(nn.Module):
 @metal_only
 def test_residual_norm_matches_reduction_rounding_and_scale(dtype):
     from unsloth_zoo.mlx import inference as decode
-    for width in (63, 128, 1536, 4096):
+    for width in (63, 127, 128, 129, 1536, 4095, 4096):
         mx.random.seed(width)
         norm = nn.RMSNorm(width, eps = 1e-6)
         norm.weight = mx.random.normal((width,)).astype(dtype)
