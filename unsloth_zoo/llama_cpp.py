@@ -1827,6 +1827,50 @@ def _apply_branding_patch_to_base(conv_base_path):
 pass
 
 
+_NUM_EXPERTS_PATTERN = re.compile(
+    rb'^([ \t]*)n_experts = self\.hparams\[(["\'])num_experts\2\](\r?\n|$)',
+    re.MULTILINE,
+)
+
+
+def _patch_num_experts(content):
+    """Rewrite `n_experts = self.hparams["num_experts"]` to also accept
+    num_local_experts, preserving whatever indentation the converter uses.
+
+    The converter script is not always written at the same depth, so the
+    replacement has to reuse the captured indent instead of hardcoding one,
+    and it reuses the captured line ending so a CRLF checkout stays CRLF.
+    Returns (new_content, applied)."""
+    def _replace(match):
+        indent, newline = match.group(1), match.group(3)
+        # A match on the last line of a file with no trailing newline still needs
+        # one between the comment and the statement.
+        eol = newline or b"\n"
+        return (
+            indent + b"# Qwen3MoE seems to use num_local_experts instead of num_experts" + eol +
+            indent + b"n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')" +
+            newline
+        )
+    new_content = _NUM_EXPERTS_PATTERN.sub(_replace, content)
+    return new_content, (new_content != content)
+pass
+
+
+def _patched_content_parses(content):
+    """True iff the patched converter is still syntactically valid Python.
+
+    Parse the bytes, not a decoded string: ast.parse applies the same source
+    decoding CPython uses when it imports the file we are about to write, so a
+    utf-8 BOM or a PEP 263 coding cookie is honoured rather than rejected.
+    Undecodable bytes and embedded NULs arrive as SyntaxError here too."""
+    try:
+        ast.parse(content)
+        return True
+    except (SyntaxError, ValueError):
+        return False
+pass
+
+
 def _qwen_already_handles_expert_aliases(conv_qwen_path):
     """True iff conversion/qwen.py already searches both num_local_experts and
     num_experts (upstream master uses
@@ -2034,15 +2078,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     _qwen_handled = True
 
             if not _qwen_handled:
-                # Use a single regex to handle both quote styles
-                num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
-                replacement = (
-                    b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
-                    b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
-                )
-
-                new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
-                num_experts_patch_applied = (new_patched_content != patched_content)
+                new_patched_content, num_experts_patch_applied = _patch_num_experts(patched_content)
 
                 if num_experts_patch_applied:
                     patched_content = new_patched_content
@@ -2060,6 +2096,16 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         patched_dir = _llama_cpp_dir if _layout == "package" else LLAMA_CPP_DEFAULT_DIR
         os.makedirs(patched_dir, exist_ok=True)
         patched_filename = os.path.join(patched_dir, f"{name}.py")
+
+        # Never write a converter we just broke: fall back to the untouched upstream
+        # script rather than failing later with an IndentationError far from the cause.
+        if patched_content != original_content and not _patched_content_parses(patched_content):
+            logger.warning(
+                "Unsloth: Patched converter script is not valid Python - "
+                "falling back to the unpatched upstream script."
+            )
+            patched_content = original_content
+
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)

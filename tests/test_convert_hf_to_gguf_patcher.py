@@ -485,3 +485,146 @@ def test_latest_upstream_arch_enumeration_non_empty(latest_llama_cpp):
     # Qwen* entries: the user's reported architecture family.
     qwen_keys = {k for k in text_archs if k.startswith("Qwen")}
     assert qwen_keys, f"upstream TEXT_MODEL_MAP has no Qwen* entries: {sorted(text_archs)[:20]}..."
+
+
+# ---------------------------------------------------------------------------
+# num_experts patch: indentation and the write-time syntax gate (unsloth#4557)
+# ---------------------------------------------------------------------------
+
+def _converter_at_indent(indent, quote = b'"', newline = b"\n", pad = b" "):
+    outer = pad * (indent - 4) if pad == b" " else pad
+    inner = pad * indent if pad == b" " else pad * 2
+    return (
+        b"class Model:" + newline + outer + b"def set_gguf_parameters(self):" + newline +
+        inner + b"n_experts = self.hparams[" + quote + b"num_experts" + quote + b"]" + newline +
+        inner + b"return n_experts" + newline
+    )
+
+
+@pytest.mark.parametrize("indent", [8, 12, 16, 20])
+@pytest.mark.parametrize("quote", [b'"', b"'"])
+def test_num_experts_patch_preserves_indentation(indent, quote):
+    import ast
+
+    module = _load_llama_cpp_module()
+    patched, applied = module._patch_num_experts(_converter_at_indent(indent, quote))
+    assert applied
+    assert b"num_local_experts" in patched
+    ast.parse(patched.decode())
+
+
+def test_num_experts_patch_is_a_noop_when_absent():
+    module = _load_llama_cpp_module()
+    source = b"class Model:\n    def set_gguf_parameters(self):\n        return 1\n"
+    patched, applied = module._patch_num_experts(source)
+    assert not applied
+    assert patched == source
+
+
+def test_patched_content_parses_gate():
+    module = _load_llama_cpp_module()
+    assert module._patched_content_parses(b"x = 1\n") is True
+    assert module._patched_content_parses(b"def f(:\n") is False
+
+
+@pytest.mark.parametrize("indent", [8, 12, 16, 20])
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_num_experts_patch_preserves_the_line_ending(indent, newline):
+    """A Windows checkout of llama.cpp has CRLF line endings. The inserted comment
+    line must use the file's ending, not a bare LF, or the converter comes out with
+    mixed endings."""
+    import ast
+
+    module = _load_llama_cpp_module()
+    source = _converter_at_indent(indent, newline = newline)
+    patched, applied = module._patch_num_experts(source)
+
+    assert applied
+    assert b"num_local_experts" in patched
+    ast.parse(patched)
+    # No LF that is not part of the file's own ending.
+    assert patched.count(b"\n") == patched.count(newline), patched
+    assert patched.replace(newline, b"\n").count(b"\n") == source.count(newline) + 1
+
+
+def test_num_experts_patch_preserves_tab_indentation():
+    import ast
+
+    module = _load_llama_cpp_module()
+    source = _converter_at_indent(2, pad = b"\t")
+    patched, applied = module._patch_num_experts(source)
+
+    assert applied
+    ast.parse(patched)
+    lines = patched.split(b"\n")
+    inserted = [line for line in lines if b"num_local_experts" in line]
+    assert inserted and all(line.startswith(b"\t\t") for line in inserted), lines
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_num_experts_patch_on_a_file_with_no_trailing_newline(newline):
+    import ast
+
+    module = _load_llama_cpp_module()
+    # The target is the last line and the buffer has no trailing newline.
+    source = (
+        b"class Model:" + newline +
+        b"    def set_gguf_parameters(self):" + newline +
+        b'        n_experts = self.hparams["num_experts"]'
+    )
+    patched, applied = module._patch_num_experts(source)
+
+    assert applied
+    ast.parse(patched)
+    assert patched.rstrip().endswith(b"self.hparams.get('num_local_experts')")
+
+
+def test_num_experts_patch_is_not_fooled_by_a_similar_line():
+    module = _load_llama_cpp_module()
+    source = (
+        b"class Model:\n"
+        b"    def set_gguf_parameters(self):\n"
+        b'        n_experts = self.other_hparams["num_experts"]\n'
+        b'        m_experts = self.hparams["num_experts_extra"]\n'
+    )
+    patched, applied = module._patch_num_experts(source)
+
+    assert not applied
+    assert patched == source
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        (b"x = 1\n", True),
+        (b"def f(:\n", False),
+        # CRLF source is valid Python.
+        (b"def f():\r\n    return 1\r\n", True),
+        # A utf-8 BOM is stripped by CPython's own source decoding, so the gate must
+        # not reject it. Decoding to str first and parsing that does reject it.
+        (b"\xef\xbb\xbfx = 1\n", True),
+        # PEP 263 coding cookie, honoured by ast.parse on bytes.
+        (b"# -*- coding: utf-8 -*-\nx = 1\n", True),
+        (b"# -*- coding: no-such-codec -*-\nx = 1\n", False),
+        # Undecodable bytes and embedded NULs must be rejected, not raised.
+        (b"x = '\xff\xfe'\n", False),
+        (b"x = 1\x00\n", False),
+    ],
+)
+def test_patched_content_parses_gate_cases(content, expected):
+    module = _load_llama_cpp_module()
+    assert module._patched_content_parses(content) is expected
+
+
+def test_the_gate_rejects_the_hardcoded_indent_failure_mode():
+    """What the old replacement produced on a converter written at 16 spaces: the
+    statement landed at 12, one dedent below the comment, and the file was written
+    without a syntax check."""
+    module = _load_llama_cpp_module()
+    broken = (
+        b"class Model:\n"
+        b"            def set_gguf_parameters(self):\n"
+        b"                # Qwen3MoE seems to use num_local_experts instead of num_experts\n"
+        b"            n_experts = self.hparams.get('num_experts', None)\n"
+    )
+    assert module._patched_content_parses(broken) is False
