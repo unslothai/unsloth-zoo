@@ -165,7 +165,15 @@ def loss_utils():
         ("3.3.1", True),
         # pytorch-triton nightlies carry a local version; 3.3.x is still 3.3.x.
         ("3.3.1+git1234abcd", True),
+        # Windows gets Triton from the separate `triton-windows` distribution, which
+        # installs as the `triton` package and carries a `.postN` suffix on the same
+        # upstream version. `from triton import __version__` reads it either way, so
+        # the gate has to treat a repackaged 3.3.x as 3.3.x and a repackaged 3.4.x as
+        # 3.4.x, rather than reading the post segment as a different release.
+        ("3.3.1.post19", True),
+        ("3.3.0.post1", True),
         ("3.4.0", False),
+        ("3.4.0.post28", False),
         ("3.4.0+git1234abcd", False),
         ("3.5.1", False),
         ("3.6.0", False),
