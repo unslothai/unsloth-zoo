@@ -229,10 +229,9 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
-# Task heads whose labels are not shifted next-token targets, so the token counter in
-# _unsloth_get_batch_samples cannot describe them. Matched on the TOP LEVEL class name,
-# because the detector walk below descends into the inner decoder and would otherwise
-# classify a classification model by the backbone it happens to sit on.
+# Heads whose labels are not shifted next-token targets, so the counter below cannot
+# describe them. Matched on the top level class name: the detector walk descends into
+# the backbone and would otherwise judge the head by the decoder it sits on.
 NON_CAUSAL_HEADS = (
     "ForSequenceClassification",
     "ForTokenClassification",
@@ -305,17 +304,11 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         m = m.get_base_model()
     model_name = m.__class__.__name__
 
-    # Decided on the TOP LEVEL model, before the walk below descends. The walk stops
-    # at the first forward whose qualname looks causal, and unsloth patches
-    # LlamaModel.forward to LlamaModel_fast_forward class-wide, so a
-    # LlamaForSequenceClassification descends into its own .model and matches on
-    # "_fast_forward" - the head it is actually training is never consulted. Neither
-    # of these is cached with (has_kwargs, is_vlm): is_encoder_decoder is a config
-    # value that belongs to the instance, not to the class name the cache is keyed on.
+    # Read off the top level model, before the walk below reassigns m. unsloth patches
+    # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into its
+    # own .model, matches "_fast_forward" and never consults the head it trains.
+    # Not cached: is_encoder_decoder belongs to the instance, not to the class name.
     is_encoder_decoder = bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False))
-    # Heads whose labels are not shifted causal targets: one label per row for
-    # sequence classification and multiple choice, one unshifted label per token for
-    # token classification, start/end positions for QA.
     is_non_causal_head = any(head in model_name for head in NON_CAUSAL_HEADS)
 
     global ALLOWED_NUM_ITEMS_IN_BATCH
@@ -364,39 +357,20 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    # Get num_items_in_batch
-    # Two independent questions, which stock transformers also keeps apart:
-    #
-    #   has a consumer - the count is only useful if something divides by it. Stock
-    #     Trainer._get_num_items_in_batch asks `model_accepts_loss_kwargs or
-    #     compute_loss_func is not None`, identically on 4.57.6 and 5.17.0, and
-    #     has_kwargs is our equivalent of the first half. Counting for a
-    #     compute_loss_func is the fix from #1217.
-    #
-    #   is countable - everything below counts SHIFTED CAUSAL targets. Stock 5.17.0
-    #     asks the same thing as self._loss_shifts_labels, which is
-    #     `LOSS_MAPPING[loss_type] is ForCausalLMLoss and not config.is_encoder_decoder`.
-    #     get_batch_samples is patched onto transformers' base Trainer class, so every
-    #     Trainer subclass in the process inherits this, classification heads and
-    #     seq2seq included, and for those the labels mean something else entirely:
-    #     one per row, one unshifted label per token, or decoder targets the model
-    #     shifts itself. Those either raise here (re-raised as RuntimeError, killing
-    #     the run) or, worse, come back quietly short. Both return no count instead
-    #     and normalise through training_step's /GA, which is always correct.
-    #
-    # The two signals are applied at different widths on purpose:
-    #   is_non_causal_head gates BOTH routes. No causal or VLM class in transformers
-    #     carries one of these substrings (swept all of them, zero overlap), and the
-    #     count these heads get today is always wrong, so there is nothing to keep.
-    #   is_encoder_decoder gates only the NEW route. Whisper, Florence2, T5Gemma and
-    #     friends are counted today through has_kwargs, off by one row-start each, and
-    #     silently rescaling an existing seq2seq run is not this change's business.
-    #     The shape checks below still stop them crashing. See the follow-up note.
-    # Anything without .ndim cannot be counted: the arithmetic below is tensor ops, and
-    # a plain list of ids reaches `except Exception: raise RuntimeError`, turning a
-    # batch we merely cannot measure into a dead run. Stock transformers swallows the
-    # same case (`except (TypeError, AttributeError): pass`) and trains on unchanged.
-    # numpy keeps working, since it has .ndim and .shape too.
+    # Get num_items_in_batch. Two separate questions, as in stock transformers:
+    #   has a consumer: `model_accepts_loss_kwargs or compute_loss_func is not None`,
+    #     same on 4.57.6 and 5.17.0. has_kwargs is our first half; counting for a
+    #     compute_loss_func is #1217.
+    #   is countable: everything below counts SHIFTED CAUSAL targets, which is stock
+    #     5.17.0's self._loss_shifts_labels. This is patched onto the base Trainer
+    #     class, so classification and seq2seq subclasses inherit it too, and their
+    #     labels mean something else. They raise here, or come back quietly short.
+    # The two guards differ in width on purpose. is_non_causal_head gates both routes
+    # (no causal or VLM class carries these substrings, and their count is always
+    # wrong). is_encoder_decoder gates only the new route, so Whisper and Florence2
+    # keep the count they get today rather than being rescaled by this change.
+    # No .ndim means no tensor ops, and a plain list would hit the except below and
+    # kill the run; stock swallows it and trains on. numpy has .ndim, so it still counts.
     labels_are_countable = getattr(
         batch_samples[0].get("labels") if len(batch_samples) > 0 else None, "ndim", None,
     ) is not None
@@ -405,16 +379,14 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                                 and getattr(self, "compute_loss_func", None) is not None)):
         try:
             token_counts = []
-            # Shape only, so it costs no device sync and stays traceable, and it is
-            # applied AFTER the collectives below rather than by breaking out of the
-            # loop: skipping self.accelerator.gather on one rank only would hang the
-            # others. A batch whose labels are not the shifted causal layout is
-            # counted harmlessly and then discarded, falling back to the mean.
+            # Shape only, so no device sync and still traceable. Applied after the
+            # collectives below rather than by breaking out: skipping
+            # accelerator.gather on one rank alone would hang the others.
             degenerate = False
             for x in batch_samples:
                 labels = x["labels"]
-                # One column leaves labels[..., 1:] empty, so the count is 0 and any
-                # sum/count loss divides by zero.
+                # One column leaves labels[..., 1:] empty, so the count is 0 and a
+                # sum/count loss divides by it.
                 if labels.shape[-1] < 2: degenerate = True
                 token_count = (labels[..., 1:] != -100)
                 if "input_ids" in x:
@@ -422,17 +394,16 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     mark_static (input_ids, 0)
                     mark_dynamic(input_ids, 1)
                     # One label per row against 2D input_ids is a classification
-                    # batch, not a causal one, whatever the class is called.
+                    # batch, whatever the class is called.
                     if labels.ndim != input_ids.ndim: degenerate = True
                 if "attention_mask" in x:
                     attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)
                     mark_dynamic(attention_mask, 1)
-                    # Only AND a mask that describes these same targets. A seq2seq
-                    # attention_mask belongs to the ENCODER and is a different length
-                    # from the decoder labels, so this used to raise and get re-raised
-                    # as RuntimeError, killing the run. Shapes match for every causal
-                    # batch, so this never changes an existing count.
+                    # Only AND a mask describing these same targets. A seq2seq mask is
+                    # the encoder's and a different length from the decoder labels,
+                    # which used to raise. Causal shapes always match, so no existing
+                    # count changes.
                     if attention_mask.shape != labels.shape:
                         degenerate = True
                     else:

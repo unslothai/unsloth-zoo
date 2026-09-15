@@ -306,11 +306,10 @@ def test_custom_loss_counts_tokens_without_model_forward_kwargs():
 def _tiny_sequence_classifier():
     """LlamaForSequenceClassification as _unsloth_get_batch_samples really sees it.
 
-    The inner .model matters. unsloth sets LlamaModel.forward = LlamaModel_fast_forward
-    class-wide (unsloth/models/llama.py), and the detector walk stops at the first
-    forward whose qualname contains "_fast_forward", so a classification model
-    descends into its own backbone and is detected as causal with has_kwargs True.
-    A fixture without that inner model would pass for the wrong reason.
+    unsloth sets LlamaModel.forward = LlamaModel_fast_forward class-wide, and the
+    walk stops at the first "_fast_forward" qualname, so a classification model
+    descends into its own backbone and is detected as causal. A fixture without that
+    inner model would pass for the wrong reason.
     """
     torch = pytest.importorskip("torch")
     import torch.nn as nn
@@ -392,13 +391,9 @@ def test_classification_labels_are_never_run_through_the_causal_counter(
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_a_classifier_the_detector_never_matches_is_not_widened_into(batch_size):
-    """The case the widened gate adds on its own.
-
-    A classification model whose backbone forward is NOT patched, so the walk matches
-    nothing and has_kwargs stays False. Before #1217 it was never counted; the
-    compute_loss_func disjunct is the only thing that lets the causal counter reach
-    it. Distinct from the fixture above, which unsloth's LlamaModel patch already
-    admits through has_kwargs on main.
+    """The case the widened gate adds on its own: an unpatched backbone, so the walk
+    matches nothing and has_kwargs stays False. Before #1217 it was never counted.
+    Distinct from the fixture above, which main already admits via has_kwargs.
     """
     torch = pytest.importorskip("torch")
     import torch.nn as nn
@@ -420,14 +415,10 @@ def test_a_classifier_the_detector_never_matches_is_not_widened_into(batch_size)
     "not labels at all",             # a string, which has no .ndim either
 ])
 def test_labels_without_ndim_are_not_counted_instead_of_killing_the_run(labels):
-    """Found by sweeping the cartesian product, not by reading the diff.
-
-    Everything in the counting body is tensor arithmetic, and the enclosing
+    """The counting body is tensor arithmetic, and the enclosing
     `except Exception: raise RuntimeError(...)` turns a batch we merely cannot
-    measure into a dead training run. Stock transformers swallows exactly this
-    (`except (TypeError, AttributeError): pass`) and keeps training. Widening the
-    gate to compute_loss_func is what newly routes explicit-forward models here, so
-    without this the PR converts a working run into a crash.
+    measure into a dead run. Stock swallows this and keeps training. Widening to
+    compute_loss_func is what newly routes explicit-forward models here.
     """
     torch = pytest.importorskip("torch")
     mod = _loss_utils()
@@ -560,19 +551,11 @@ def test_a_vlm_with_an_explicit_forward_and_a_custom_loss_still_counts():
 @pytest.mark.parametrize("forward_has_kwargs", [True, False])
 @pytest.mark.parametrize("custom_loss", [True, False])
 def test_seq2seq_is_never_run_through_the_causal_counter(forward_has_kwargs, custom_loss):
-    """T5, Bart, Marian, LED, Whisper, M2M100. Their labels are decoder targets the
-    model shifts itself, and their attention_mask is the ENCODER mask, a different
-    length from labels, so the AND raises and the run dies.
+    """T5, Bart, Marian, LED, Whisper, M2M100: decoder targets the model shifts
+    itself, against an ENCODER mask of a different length, so the AND raises.
 
-    Both signature shapes are real: transformers 4.57.6 ships these with explicit
-    forwards, and 5.17.0 gives every one of them **kwargs.
-
-    The two shapes are held to different standards on purpose. The explicit-forward
-    one must not be counted at all: only the widened gate could admit it, so keeping
-    it out costs nothing. The **kwargs one is counted today through has_kwargs, so it
-    keeps being counted, and all that is required is that it stops RAISING - the
-    mismatched encoder mask is simply not ANDed in. Rescaling live Whisper and
-    Florence2 runs is a separate change.
+    Both signatures are real, explicit on 4.57.6 and **kwargs on 5.17.0. The
+    **kwargs one is reached through has_kwargs, so it fails on main too.
     """
     torch = pytest.importorskip("torch")
     mod = _loss_utils()
