@@ -18,6 +18,10 @@ __all__ = [
     "create_huggingface_repo",
     "merge_and_dequantize_lora",
     "merge_and_overwrite_lora",
+    "MTP_CONFIG_KEY",
+    "is_mtp_tensor_name",
+    "mtp_head_is_present",
+    "reconcile_mtp_config",
 ]
 import warnings
 from .peft_utils import get_lora_layer_modules
@@ -2839,6 +2843,226 @@ def _remove_transformers_version(config_path: Path):
         json.dump(config, f, indent = 4)
     pass
 pass
+
+# Multi-token-prediction (MTP) reconciliation for exported checkpoints.
+#
+# Qwen3.5 / Qwen3.6 checkpoints ship a built-in MTP head as top-level `mtp.*`
+# tensors and declare it with `mtp_num_hidden_layers` (in `text_config` for the
+# multimodal configs). transformers has no MTP module for these architectures and
+# drops those tensors on load (`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`
+# in transformers' modeling_qwen3_5.py), so any export that round-trips the model
+# writes weights with no MTP head while the config still declares one. Consumers
+# that trust the config then look for weights that are not there: llama.cpp's
+# converter asserts on the missing layer, which is why convert_to_gguf already
+# reconciles the same key before converting, and vLLM resolves its MTP draft
+# config off `mtp_num_hidden_layers` too.
+#
+# The rule below is the one invariant worth enforcing at export time: what the
+# config declares and what the weights contain must agree. It never invents
+# weights, and it only edits the declaration when the weights can actually be
+# inspected, so an unreadable checkpoint is left exactly as it was.
+MTP_CONFIG_KEY = "mtp_num_hidden_layers"
+
+# Matches llama.cpp's converter view of an MTP tensor: a top-level `mtp.` block,
+# optionally behind the `model.` / `language_model.` prefixes the multimodal
+# checkpoints use. The prefix group is repeatable and order free on purpose:
+# Qwen3.5 writes `model.language_model.mtp.*` but the older Qwen2-VL naming is
+# `language_model.model.mtp.*`, and a name read back off someone else's
+# checkpoint is not guaranteed to have been through Unsloth's remap.
+_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model)\.)*mtp\.")
+
+
+def is_mtp_tensor_name(name):
+    """Whether a checkpoint tensor name belongs to the MTP head."""
+    return _MTP_TENSOR_RE.match(str(name)) is not None
+
+
+def _checkpoint_tensor_names(folder):
+    """Every tensor name in a saved checkpoint, or None when it cannot be read.
+
+    None is not "no tensors": callers must treat it as "unknown" and leave the
+    config alone, else an unreadable shard would look like a missing MTP head.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return None
+
+    for index_name, pattern in (
+        ("model.safetensors.index.json", "model*.safetensors"),
+        ("pytorch_model.bin.index.json", "pytorch_model*.bin"),
+    ):
+        parts = sorted(folder.glob(pattern))
+        if not parts:
+            continue
+        index_path = folder / index_name
+        # The index is canonical whenever it exists, matching llama.cpp.
+        if index_path.is_file():
+            try:
+                with index_path.open("r", encoding = "utf-8") as f:
+                    index = json.load(f)
+                weight_map = index["weight_map"]
+                if not isinstance(weight_map, dict):
+                    return None
+                return list(weight_map.keys())
+            except Exception:
+                return None
+        if pattern.endswith(".bin"):
+            # Reading a pickle just to list names is not worth it here; the
+            # safetensors path is what every current export writes.
+            return None
+        names = []
+        for part in parts:
+            try:
+                with safe_open(part, framework = "pt", device = "cpu") as f:
+                    names.extend(f.keys())
+            except Exception:
+                return None
+        return names
+    return None
+
+
+# The other MTP spelling: DeepSeek-V3 / GLM style heads are stored as extra
+# `layers.N` blocks past `num_hidden_layers` and declared with
+# `num_nextn_predict_layers`, not as `mtp.*`. That form needs a layer count to
+# decide anything, so it is deliberately left to the writers that already do it
+# (`unsloth_zoo/mlx/utils.py` for the MLX export, `_has_mtp_weight_tensors` in
+# `unsloth_zoo/llama_cpp.py` for the GGUF converter). It is checked here only to
+# keep this repair from firing on such a checkpoint.
+_LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model)\.)*layers\.(\d+)\.")
+
+
+def _has_layers_past(tensor_names, num_hidden_layers):
+    """Whether any `layers.N` index reaches past the declared layer count."""
+    if not isinstance(num_hidden_layers, int) or isinstance(num_hidden_layers, bool):
+        return False
+    if num_hidden_layers <= 0:
+        return False
+    for name in tensor_names:
+        match = _LAYER_INDEX_RE.match(str(name))
+        if match is not None and int(match.group(1)) >= num_hidden_layers:
+            return True
+    return False
+
+
+def _config_layer_count(config, container = None):
+    """The transformer layer count for a config, looked up across the whole
+    object rather than only in the container that declares the MTP key.
+
+    A multimodal config can declare `mtp_num_hidden_layers` at the top level
+    while keeping `num_hidden_layers` in `text_config`. Reading the count out of
+    the declaring container alone returns None there, which silently disables
+    the extra-layers check below and turns an `agrees` into a `stripped`.
+    Accepts dicts (a loaded config.json), objects (a live PretrainedConfig), and
+    a bare layer count, so a caller that already has the integer cannot pass it
+    in and silently get None back.
+    """
+    for value in (container, config):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+
+    def _get(holder, key):
+        if holder is None:
+            return None
+        if isinstance(holder, dict):
+            return holder.get(key)
+        return getattr(holder, key, None)
+
+    def _nested(holder):
+        return _get(holder, "text_config")
+
+    for holder in (container, config, _nested(config), _nested(container)):
+        value = _get(holder, "num_hidden_layers")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def mtp_head_is_present(tensor_names, config = None, container = None):
+    """Whether these tensor names carry a multi-token prediction head.
+
+    One rule for every writer, covering both spellings the ecosystem uses:
+    Qwen3.5's top-level `mtp.*` block, and the DeepSeek-V3 / GLM form that
+    stores the head as extra `layers.N` blocks past `num_hidden_layers`. The
+    second form cannot be decided without a layer count, so pass the config
+    (and, if the declaration lives in a nested one, the `container` that holds
+    it); without a count a head stored that way reads as absent. `config` and
+    `container` may be dicts or live config objects.
+    """
+    tensor_names = list(tensor_names or ())
+    if any(is_mtp_tensor_name(name) for name in tensor_names):
+        return True
+    return _has_layers_past(tensor_names, _config_layer_count(config, container))
+
+
+def _mtp_config_containers(config):
+    """Every dict inside a loaded config.json that declares the MTP key."""
+    if not isinstance(config, dict):
+        return []
+    containers = []
+    if MTP_CONFIG_KEY in config:
+        containers.append(config)
+    nested = config.get("text_config")
+    if isinstance(nested, dict) and MTP_CONFIG_KEY in nested:
+        containers.append(nested)
+    return containers
+
+
+def reconcile_mtp_config(save_directory, tensor_names = None):
+    """Make an exported config.json's MTP declaration agree with its weights.
+
+    Returns "no-config", "not-declared", "unknown", "agrees" or "stripped".
+    Idempotent and never raises: a save must not fail because of a metadata
+    repair. Pass `tensor_names` when the writer already knows what it wrote
+    (a push_to_hub export has no local folder to inspect).
+    """
+    try:
+        config_path = os.path.join(str(save_directory), "config.json")
+        if not os.path.isfile(config_path):
+            return "no-config"
+        with open(config_path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+        containers = _mtp_config_containers(config)
+        if not containers:
+            return "not-declared"
+
+        if tensor_names is None:
+            tensor_names = _checkpoint_tensor_names(save_directory)
+        if tensor_names is None:
+            return "unknown"
+        tensor_names = list(tensor_names)
+        # One rule, shared with `unsloth/save.py`'s dict-level stripper. A head
+        # stored as extra `layers.N` blocks rather than as `mtp.*` is still a
+        # head, and the layer count is resolved across the whole config because
+        # the declaration and the count do not have to live in the same place.
+        if any(
+            mtp_head_is_present(tensor_names, config, container)
+            for container in containers
+        ):
+            return "agrees"
+
+        for container in containers:
+            container.pop(MTP_CONFIG_KEY, None)
+        with open(config_path, "w", encoding = "utf-8") as f:
+            json.dump(config, f, indent = 2, ensure_ascii = False)
+            f.write("\n")
+        logger.warning_once(
+            f"Unsloth: `{os.path.basename(config_path)}` declared "
+            f"`{MTP_CONFIG_KEY}` but the exported weights carry no `mtp.*` "
+            f"tensors, so the declaration was removed. This model is exported "
+            f"without its multi-token prediction head: transformers does not "
+            f"load that head, so a merge or re-save cannot preserve it. The "
+            f"export is otherwise complete and serves normally without "
+            f"speculative decoding."
+        )
+        return "stripped"
+    except Exception as error:
+        logger.warning_once(
+            f"Unsloth: Could not reconcile `{MTP_CONFIG_KEY}` in "
+            f"{save_directory}: {error}"
+        )
+        return "unknown"
+pass
+
 
 def fix_tokenizer_config_json(tokenizer, saved_folder):
     # Add "chat_template" to tokenizer_config.json
