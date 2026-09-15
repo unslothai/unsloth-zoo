@@ -9,13 +9,11 @@
 name: Security audit
 
 on:
+  # Deliberately unfiltered. The scans below still only run when something they read has
+  # changed -- the `changes` job decides that now, in place of the paths filter -- but the
+  # workflow itself has to start on every PR, because a filtered workflow reports no check
+  # at all when it is skipped, and a check that never reports can never be a required one.
   pull_request:
-    paths:
-      - 'pyproject.toml'
-      - 'scripts/scan_packages.py'
-      - 'scripts/lint_workflow_triggers.py'
-      - 'tests/security/**'
-      - '.github/workflows/security-audit.yml'
   push:
     branches: [main]
   schedule:
@@ -37,9 +35,56 @@ permissions:
   contents: read
 
 jobs:
+  # What the paths filter used to decide, as a job, so the workflow still starts and can
+  # still report. Every scan here is a function of the dependency manifests or the scanner
+  # sources: a PR touching none of them cannot change any verdict, so they stay skipped and
+  # the gate at the bottom passes on their behalf.
+  changes:
+    name: scanned paths changed?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.detect.outputs.relevant }}
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Decide whether anything the scans read has changed
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # push, schedule and workflow_dispatch scan unconditionally, as they always have.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "not a pull request ($EVENT): scanning everything"
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' > changed.txt
+          echo "changed files:"; sed 's/^/  /' changed.txt
+          # The list the paths filter used to hold. It lives here only, so the two cannot drift.
+          if grep -qE '^(pyproject\.toml|scripts/scan_packages\.py|scripts/lint_workflow_triggers\.py|tests/security/|\.github/workflows/security-audit\.yml$)' changed.txt; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "=> a scanned path changed; running the audit"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "=> nothing the audit reads changed; skipping the scans"
+          fi
+
   # Advisory-DB audit: pip-audit + trufflehog. Non-blocking while baseline settles.
   advisory-audit:
     name: advisory audit (pip + secrets)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -106,6 +151,8 @@ jobs:
   # pattern-scans (catches the malicious-upload class that precedes CVE publication).
   pip-scan-packages:
     name: pip scan-packages (zoo transitive closure)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -179,6 +226,8 @@ jobs:
   # restricted workflow_run without justification, and cache-key collisions.
   workflow-trigger-lint:
     name: workflow-trigger lint (pull_request_target / cache-poisoning)
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -213,6 +262,8 @@ jobs:
   # or scanner exit semantics fails this PR at review time.
   tests-security:
     name: pytest tests/security
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     # 10 was sized for the pytest-and-pyyaml install this job used to do. Importing
     # the real torch/transformers stack costs several minutes on its own.
@@ -284,3 +335,44 @@ jobs:
           # touches what that init sets up.
           UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
         run: python3 -m pytest tests/security -v
+
+
+  # The context to require. Always runs, so it always reports, which is the whole point:
+  # a skipped scan is the detector saying this PR cannot affect it, and that is a pass.
+  # A failed or cancelled one is not.
+  security-audit:
+    name: security audit
+    needs: [changes, advisory-audit, pip-scan-packages, workflow-trigger-lint, tests-security]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Verdict
+        env:
+          RELEVANT: ${{ needs.changes.outputs.relevant }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$RESULTS"
+          bad=0
+          for job in changes advisory-audit pip-scan-packages workflow-trigger-lint tests-security; do
+            r=$(printf '%s' "$RESULTS" | python3 -c "import json,sys; print(json.load(sys.stdin)['$job']['result'])")
+            case "$r" in
+              success|skipped) echo "ok       $job: $r" ;;
+              *)               echo "::error::$job: $r"; bad=1 ;;
+            esac
+          done
+          if [ "$bad" != "0" ]; then
+            echo "::error::the security audit did not pass"
+            exit 1
+          fi
+          if [ "$RELEVANT" = "true" ]; then
+            echo "security audit passed"
+          else
+            echo "nothing the security audit reads changed in this PR"
+          fi
