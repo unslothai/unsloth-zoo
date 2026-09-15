@@ -2,25 +2,22 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Lesser General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""``unsloth_offloaded_gradient_checkpoint`` against the real offload buffers.
 
-The CPU coverage in ``test_gc_rewriter_bound_keywords.py`` pins ``MINIMUM_SIZE``
-above every tensor it builds, so the D2H/H2D machinery this wrapper exists for
-never runs there - only the plain recompute path. These tests size activations
-*over* ``MINIMUM_SIZE`` on a real accelerator so the pinned-CPU-buffer branch at
-``gradient_checkpointing.py:773-870`` is the one under test, and assert it was
-actually taken rather than trusting that it was.
+"""Offloaded checkpointing against the real pinned buffers.
+
+The CPU coverage pins MINIMUM_SIZE above every tensor it builds, so the D2H/H2D
+branch never runs there. These size activations over it and assert it was taken.
 """
 import pytest
 import torch
@@ -30,14 +27,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 DTYPE = torch.bfloat16
-# initialize_unsloth_gradient_checkpointing sets MINIMUM_SIZE to 2MB worth of
-# elements; this shape is comfortably above it in bf16 so offload engages.
-SHAPE = (4, 512, 1024)
+SHAPE = (4, 512, 1024)   # over MINIMUM_SIZE (2MB of elements) in bf16, so offload engages
 
 
 @pytest.fixture
 def offload_module():
-    """Seed the offload globals the way a real run does, then tear them down."""
     from unsloth_zoo import gradient_checkpointing as gc_module
     names = (
         "CPU_BUFFERS", "GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER",
@@ -84,12 +78,7 @@ def _run(checkpoint_fn, kwargs, device):
 
 @pytest.mark.parametrize("preserve_rng_state", [None, True, False])
 def test_offloaded_matches_torch_with_real_offload(offload_module, preserve_rng_state):
-    """Outputs and both input grads match pristine torch checkpointing.
-
-    ``side`` is the second positional: pre-fix it was ``hidden`` that got eaten
-    by the ``preserve_rng_state`` slot, so asserting on *both* grads is what
-    distinguishes a real fix from a shape-compatible accident.
-    """
+    """Pre-fix the ``preserve_rng_state`` slot ate ``hidden``, so both grads matter."""
     device = torch.device("cuda")
     kwargs = {} if preserve_rng_state is None else {"preserve_rng_state" : preserve_rng_state}
 
@@ -105,12 +94,9 @@ def test_offloaded_matches_torch_with_real_offload(offload_module, preserve_rng_
 
 
 def test_offloaded_preserve_rng_state_false_reaches_the_function(offload_module):
-    """The flag must actually arrive, not merely be accepted.
+    """True forks the RNG and restores it; False lets the recompute advance it.
 
-    With ``preserve_rng_state = True`` the recompute is wrapped in ``fork_rng``
-    and the global RNG is left where the forward left it. With ``False`` the
-    recomputed dropout advances it. Comparing the two final states is an
-    observable that only holds if the flag reached ``ctx.preserve_rng_state``.
+    Differing final states is the only observable that the flag reached ctx.
     """
     device = torch.device("cuda")
 
@@ -126,17 +112,10 @@ def test_offloaded_preserve_rng_state_false_reaches_the_function(offload_module)
 
 
 def test_offloaded_binds_tensor_keywords_after_the_rng_flag(offload_module):
-    """A grad-requiring tensor keyword rides at the tail of the positionals.
+    """Tensor keywords ride at the tail of the positionals; the flag goes before them.
 
-    ``_bind_checkpoint_kwargs`` appends such tensors after ``*args`` and
-    ``_KeywordArgumentCall`` slices them back off, so the fix must insert
-    ``preserve_rng_state`` *before* ``*args`` without disturbing that tail.
-
-    The reference is an eager run, not torch's checkpoint: torch's reentrant
-    path rejects keywords outright (``Unexpected keyword arguments``), which is
-    the behaviour ``_bind_checkpoint_kwargs`` deliberately replaces. With
-    ``preserve_rng_state = True`` the recomputed dropout mask is the forward's,
-    so a correct checkpoint reproduces eager exactly.
+    Reference is eager, not torch's checkpoint: torch's reentrant path rejects
+    keywords outright, which is what _bind_checkpoint_kwargs deliberately replaces.
     """
     device = torch.device("cuda")
 
@@ -162,12 +141,8 @@ def test_offloaded_binds_tensor_keywords_after_the_rng_flag(offload_module):
 
 
 def test_offloaded_stays_correct_across_repeated_steps(offload_module):
-    """Cross FIRST_PASS / LAST_GC_INDEX / BACKWARD_PASS at least once.
-
-    The first iteration runs with ``FIRST_PASS = True``; backward clears it and
-    sets ``BACKWARD_PASS``, which changes which layers offload on the next
-    forward. A single step never reaches that second regime.
-    """
+    """Backward clears FIRST_PASS and sets BACKWARD_PASS, changing which layers
+    offload next forward; one step never reaches that second regime."""
     device = torch.device("cuda")
     checkpoint = offload_module.unsloth_offloaded_gradient_checkpoint
 
