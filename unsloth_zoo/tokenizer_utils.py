@@ -60,7 +60,8 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     lm_head_matrix   = model.get_output_embeddings().weight.clone()
 
     # Get untrained tokens
-    indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
@@ -264,11 +265,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix   = lm_head_matrix  [:min_size]
     
     # Get untrained tokens
-    indicator_untrained1 = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     # Check lm_head as well
 
     # Does NOT work for Llama 3.1!!
-    indicator_untrained2 = torch.amax(lm_head_matrix,   axis = 1) <= eps
+    indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
+        (torch.amin(lm_head_matrix, axis = 1) >= -eps)
 
     # We instead check for repeated vectors
     lm_head_where = torch.where(indicator_untrained1)[0]
