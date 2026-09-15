@@ -932,7 +932,9 @@ def generation_mode(model):
         _require_evaluable(model)()
         _GENERATION_MODE_DEPTH += 1
         entered = True
-        yield model
+        from .inference import fused_moe_gate_up
+        with fused_moe_gate_up(model):
+            yield model
     except BaseException as exc:
         active_error = exc
         raise
