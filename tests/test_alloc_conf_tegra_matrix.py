@@ -22,6 +22,12 @@ what is measured is the decision, not the driver.
 This file deliberately imports nothing from the module under test, so it still
 collects against a checkout that predates it and fails there on the behaviour
 rather than on an ImportError.
+
+Linux only, and measured to be: the child fakes a Linux CUDA host, so on Windows
+``os.name == "nt"`` sends the same import down the WSL/Windows branch instead, and
+unsloth-zoo declares no torch on Apple Silicon, where the allocator block therefore
+never runs. ``test_tegra_expandable_segments.py`` covers the detector itself and is
+platform neutral, so the decision is still checked on every OS.
 """
 
 from __future__ import annotations
@@ -33,6 +39,13 @@ import sys
 import textwrap
 
 import pytest
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux",
+    reason = "each case fakes a Linux CUDA host in a subprocess: Windows takes the WSL/Windows "
+             "branch instead, and unsloth-zoo declares no torch on Apple Silicon, so the "
+             "allocator block does not run there at all",
+)
 
 _ALLOC_KEYS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")
 _WIPE = _ALLOC_KEYS + (
@@ -173,7 +186,7 @@ def _conf(*, torch_version, jetson, tmp_path = None, preset = None, force = None
         [sys.executable, "-c", _CHILD],
         env = env, cwd = _REPO_ROOT, capture_output = True, text = True, timeout = 600,
     )
-    lines = [l for l in (proc.stdout + proc.stderr).splitlines() if l.startswith("RESULT:")]
+    lines = [line for line in (proc.stdout + proc.stderr).splitlines() if line.startswith("RESULT:")]
     if not lines:
         raise AssertionError(
             "child produced no RESULT.\nSTDOUT:\n{}\nSTDERR:\n{}".format(
