@@ -31,6 +31,7 @@ from .qwen3_moe_float32 import *
 from .qwen3_vl_moe import *
 from .qwen3_next_moe import *
 from .qwen3_5_moe import *
+from .qwen3_5_float32 import *
 from .glm4_moe import *
 from .deepseek_v3_moe import *
 from .gemma4_moe import *
