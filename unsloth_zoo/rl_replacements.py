@@ -887,7 +887,12 @@ GRPO_VISION_KEYS = (
     "image_sizes",
     "spatial_shapes",
     "num_tiles",
+    # The same Gemma 4 metadata under both names TRL has given it: `pixel_position_ids`
+    # in TRL 1.0.x, renamed `image_position_ids` in 1.1.0. Both are read, because the key
+    # tuple has to cover every TRL an installed Unsloth can be sitting next to, and only
+    # one of the two is ever present in a given inputs dict.
     "image_position_ids",
+    "pixel_position_ids",
     "num_images",
     "token_type_ids",
     "mm_token_type_ids",
@@ -916,7 +921,8 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
     * ``image_grid_thw`` models (Qwen2-VL and relatives) index ``pixel_values`` by patch
       row and ``image_grid_thw`` by image.
     * ``image_position_ids`` models (Gemma 4) index ``pixel_values`` and
-      ``image_position_ids`` by image.
+      ``image_position_ids`` by image. ``pixel_position_ids``, the TRL 1.0.x name for the
+      same thing, is read and forwarded under its own name.
     * ``spatial_shapes`` models (LFM2-VL) index ``pixel_values``,
       ``pixel_attention_mask`` and ``spatial_shapes`` by tile, with ``num_tiles`` giving
       the tiles per sample.
@@ -956,7 +962,14 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
     pixel_attention_mask = vision.get("pixel_attention_mask", None)
     image_sizes = vision.get("image_sizes", None)
     spatial_shapes = vision.get("spatial_shapes", None)
+    # One local for both spellings: TRL 1.0.x called it pixel_position_ids and 1.1.0
+    # renamed it image_position_ids, and the model kwarg is named the same as the inputs
+    # key, so the name it arrived under is the name it has to leave under.
     image_position_ids = vision.get("image_position_ids", None)
+    position_ids_key = "image_position_ids"
+    if image_position_ids is None:
+        image_position_ids = vision.get("pixel_position_ids", None)
+        position_ids_key = "pixel_position_ids"
     token_type_ids = vision.get("token_type_ids", None)
     mm_token_type_ids = vision.get("mm_token_type_ids", None)
     num_images = _as_int_list(vision.get("num_images", None))
@@ -1042,13 +1055,13 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
         elif image_position_ids is not None:
-            # Gemma 4: pixel_values and image_position_ids are both indexed by image.
+            # Gemma 4: pixel_values and the position ids are both indexed by image.
             if img_start is None:
                 chunk["pixel_values"] = pixel_values[start:end]
-                chunk["image_position_ids"] = image_position_ids[start:end]
+                chunk[position_ids_key] = image_position_ids[start:end]
             else:
                 chunk["pixel_values"] = pixel_values[img_start:img_end]
-                chunk["image_position_ids"] = image_position_ids[img_start:img_end]
+                chunk[position_ids_key] = image_position_ids[img_start:img_end]
             if pixel_attention_mask is not None:
                 chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
             if image_sizes is not None:
@@ -1124,7 +1137,6 @@ def grpo_accumulated_loss(
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
     image_grid_thw = vision_inputs.get('image_grid_thw', None)
-    num_images = vision_inputs.get('num_images', None)
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
     token_type_ids = vision_inputs.get('token_type_ids', None)
     mm_token_type_ids = vision_inputs.get('mm_token_type_ids', None)
