@@ -493,6 +493,54 @@ def test_only_a_shifted_label_loss_may_enable_the_new_count(
     )
 
 
+def test_the_shifted_label_signal_survives_patch_loss_functions():
+    """patch_loss_functions rewrites every causal entry in the very LOSS_MAPPING this
+    signal reads, so an identity test against the stock function reads False for every
+    causal model the moment unsloth loads, silently switching the count back off on any
+    transformers without Trainer._loss_shifts_labels. The keys are snapshotted at
+    import instead, so run the patch and check the answer does not move.
+    """
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn
+    mod = _loss_utils()
+    if not hasattr(mod, "_loss_shifts_labels"): pytest.skip("signal helper not present")
+
+    causal = type("LlamaForCausalLM", (nn.Module,), {"forward": lambda self, x: None})()
+    causal.loss_type = "ForCausalLM"
+    masked = type("BertForMaskedLM", (nn.Module,), {"forward": lambda self, x: None})()
+    masked.loss_type = "ForMaskedLM"
+    trainer = object()  # no _loss_shifts_labels, so the loss_type branch answers
+
+    assert mod._loss_shifts_labels(trainer, causal, False) is True
+    mod.patch_loss_functions(lambda *a, **k: None, torch_compile = False)
+    assert mod._loss_shifts_labels(trainer, causal, False) is True, (
+        "patching LOSS_MAPPING switched the causal signal off, which silently disables "
+        "the count for every custom loss on this transformers"
+    )
+    assert mod._loss_shifts_labels(trainer, masked, False) is False
+
+
+def test_a_locally_short_rank_keeps_the_gathered_count():
+    """all_short is rank-local. Once the count has been gathered it is global, so a
+    rank holding only [B, 1] batches must keep it rather than drop a divisor its peers
+    still use, or the two ranks normalise differently."""
+    torch = pytest.importorskip("torch")
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+
+    short = {"input_ids": torch.randint(0, 11, (2, 1)), "labels": torch.randint(0, 11, (2, 1))}
+    trainer = _fake_trainer(_tiny_model(), True)
+    trainer.args.average_tokens_across_devices = True
+    trainer.args.world_size = 2
+    # Stand in for the peer rank's contribution, which is what gather returns.
+    trainer.accelerator.gather = lambda x: torch.stack([x.reshape(()), torch.tensor(10)])
+
+    _, count = mod._unsloth_get_batch_samples(trainer, iter([short]), 1)
+    assert count is not None and int(count) == 10, (
+        f"the short rank dropped the gathered count and got {count}"
+    )
+
+
 def test_a_short_microbatch_does_not_void_the_whole_accumulation_group():
     """A [B, 1] member contributes 0 targets; the group total is still positive.
 

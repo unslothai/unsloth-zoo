@@ -239,10 +239,17 @@ NON_CAUSAL_HEADS = (
     "ForMultipleChoice",
 )
 
+# Snapshot the loss_types that mean "this loss shifts labels", TAKEN AT IMPORT, before
+# anything can rewrite the mapping. patch_loss_functions() above swaps every causal entry
+# for UnslothForCausalLMLoss, so an identity test against the stock function would read
+# False for every causal model once unsloth has loaded, silently switching the count off.
 try:
-    from transformers.loss.loss_utils import LOSS_MAPPING, ForCausalLMLoss
+    from transformers.loss.loss_utils import LOSS_MAPPING as _LOSS_MAPPING, ForCausalLMLoss
+    CAUSAL_LOSS_TYPES = frozenset(
+        key for key, fn in _LOSS_MAPPING.items() if fn is ForCausalLMLoss
+    )
 except Exception:
-    LOSS_MAPPING, ForCausalLMLoss = None, None
+    CAUSAL_LOSS_TYPES = frozenset()
 
 
 def _loss_shifts_labels(trainer, model, is_encoder_decoder):
@@ -252,13 +259,13 @@ def _loss_shifts_labels(trainer, model, is_encoder_decoder):
     Positive signal, not a list of excluded suffixes: a name cannot tell
     BertForMaskedLM (2D token aligned labels, NOT shifted, column 0 supervised) from a
     causal LM. Ask what stock transformers asks. 5.x already computed it on the
-    Trainer; 4.x has the same LOSS_MAPPING, keyed on the loss_type every
-    PreTrainedModel derives from its class name.
+    Trainer; older versions get the same answer from the loss_type every
+    PreTrainedModel derives from its class name, matched against the keys snapshotted
+    at import rather than against a mapping we ourselves rewrite.
     """
     shifts = getattr(trainer, "_loss_shifts_labels", None)
     if isinstance(shifts, bool): return shifts
-    if LOSS_MAPPING is None: return False
-    return LOSS_MAPPING.get(getattr(model, "loss_type", None)) is ForCausalLMLoss \
+    return getattr(model, "loss_type", None) in CAUSAL_LOSS_TYPES \
         and not is_encoder_decoder
 pass
 
@@ -493,7 +500,16 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
             # Discard a count these labels could not support. Done last, so every
             # collective above ran on every rank.
-            if degenerate or all_short: num_items_in_batch = None
+            #
+            # all_short is rank-local, so it must not be acted on once the count has
+            # been gathered: a rank holding only [B, 1] batches would drop a global
+            # count its peers keep, and the two would normalise differently. Its local
+            # contribution is already 0, and the global total is the right divisor for
+            # every rank, so it simply keeps it. A globally zero total is the
+            # all-masked case, which is not this function's to fix.
+            gathered = bool(getattr(self.args, "average_tokens_across_devices", False)) \
+                and getattr(self.args, "world_size", 1) > 1
+            if degenerate or (all_short and not gathered): num_items_in_batch = None
         except Exception as exception:
             raise RuntimeError(exception)
     pass
