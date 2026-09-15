@@ -227,6 +227,44 @@ def test_peft_still_packs_lora_b_rank_major():
 # ---------------------------------------------------------------------------------------
 
 
+def test_a_bitsandbytes_without_the_params4bit_class_is_treated_as_absent():
+    """The macOS bitsandbytes imports but does not expose Params4bit as a class, so the
+    `isinstance(param, Params4bit)` checks in this module raised TypeError instead of
+    answering False, and every fused expert layout question died with it. Measured on a
+    macOS 15 runner, where 10 of these tests failed that way.
+
+    Two halves: the invariant on whatever bitsandbytes this machine has, and the macOS
+    combination itself, in a subprocess because the normalisation runs at import."""
+    assert MU.Params4bit is None or isinstance(MU.Params4bit, type)
+    if MU.Params4bit is None:
+        assert MU.HAS_BNB is False, (
+            "HAS_BNB with no Params4bit class is the combination that raises"
+        )
+
+    import subprocess
+    import sys
+
+    program = (
+        "import sys, types\n"
+        "mod = types.ModuleType('bitsandbytes'); nn = types.ModuleType('bitsandbytes.nn')\n"
+        "nn.Params4bit = object()\n"          # imports fine, is not a class
+        "mod.nn = nn\n"
+        "sys.modules['bitsandbytes'] = mod; sys.modules['bitsandbytes.nn'] = nn\n"
+        "from unsloth_zoo.temporary_patches import moe_utils as MU\n"
+        "import torch, torch.nn as tnn\n"
+        "class Experts(tnn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.gate_up_proj = tnn.Parameter(torch.zeros(4, 8, 6))\n"
+        "print('HAS_BNB', MU.HAS_BNB)\n"
+        "print('is_moe', MU._is_moe_experts_module(Experts()))\n"
+    )
+    done = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert "HAS_BNB False" in done.stdout, done.stdout
+    assert "is_moe True" in done.stdout, done.stdout
+
+
 @requires_target_parameters
 def test_layout_of_a_fused_expert_wrapper_is_grouped_by_expert(moe_param_wrapper_patch):
     _, wrappers = _wrap(["experts.gate_up_proj"])

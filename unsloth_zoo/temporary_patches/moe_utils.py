@@ -38,6 +38,15 @@ except Exception:
     HAS_BNB = False
     Params4bit = None
 
+if not isinstance(Params4bit, type):
+    # A bitsandbytes that imports but does not expose Params4bit as a class, which is what
+    # the macOS build does, makes every `isinstance(param, Params4bit)` below raise
+    # TypeError instead of answering False. Probe the object, not the platform or the
+    # version, and treat that install as no bitsandbytes at all: there is no 4-bit expert
+    # path without the class.
+    HAS_BNB = False
+    Params4bit = None
+
 
 def _get_compile_location() -> str:
     return os.path.abspath(
