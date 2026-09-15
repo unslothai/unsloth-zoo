@@ -312,6 +312,10 @@ jobs:
         # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
         # so this job exercises the regressed regime on every pull request.
         #
+        # test_olmoe_moe_routing pins the OLMoE fused-experts routing through the MoE
+        # backend and its preprocessor registration (#850): stub OlmoeConfig, CPU-pure,
+        # sub-second. The zoo-specific step below is continue-on-error, so a
+        # regression there would only ever be yellow.
         # test_hip_bf16_offload_dtype pins that the HIP branch ASKS whether bf16 is
         # supported rather than hardcoding True, which is what kills an RDNA 1/2 card
         # at step 0. No job here has an AMD runner, so it stubs device_count to 0 and
@@ -341,6 +345,7 @@ jobs:
           python -m pytest \
             tests/test_training_utils_use_cache.py \
             tests/test_loss_normalization_contract.py \
+            tests/test_olmoe_moe_routing.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
