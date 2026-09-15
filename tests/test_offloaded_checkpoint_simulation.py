@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Behaviour simulation for the offloaded gradient checkpoint shim.
-
-CPU-only on purpose, so the same assertions run on Linux, macOS and Windows.
-The GPU counterpart (real pinned-buffer offload) is test_offloaded_checkpoint_rng.py.
-"""
+"""Offloaded checkpoint shim, CPU-only so it also runs on macOS and Windows.
+GPU counterpart (real pinned-buffer offload): test_offloaded_checkpoint_rng.py."""
 import functools
 import inspect
 
@@ -28,8 +25,7 @@ import torch
 
 @pytest.fixture
 def gc_module(monkeypatch):
-    """MINIMUM_SIZE above every tensor here keeps the offload branch off, so what is
-    under test is argument handling and the plain recompute path."""
+    """MINIMUM_SIZE above every tensor keeps the offload branch off."""
     from unsloth_zoo import gradient_checkpointing as module
     for name, value in (
         ("FIRST_PASS", False), ("LAST_GC_INDEX", 0), ("CURRENT_GC_INDEX", 0),
@@ -49,8 +45,7 @@ def pristine():
 
 
 def test_apply_receives_preserve_in_slot_two_and_untouched_args(gc_module, monkeypatch):
-    """Pre-fix the call was apply(function, *args), so slot 2 held the first
-    activation and the list ran one short."""
+    """Pre-fix: apply(function, *args) put the first activation in slot 2."""
     recorded = {}
     real_apply = gc_module.UnslothCheckpointFunction.apply
 
@@ -91,8 +86,7 @@ def test_explicit_preserve_flag_is_forwarded_verbatim(gc_module, monkeypatch, fl
 
 
 def test_backward_returns_one_gradient_per_input(gc_module):
-    """backward returns (None, None) + grads; disagreeing about the leading slots
-    raises "returned an incorrect number of gradients"."""
+    """backward returns (None, None) + grads; a slot mismatch raises here."""
     tensors = [torch.randn(3, 5, requires_grad = True) for _ in range(4)]
     out = gc_module.unsloth_offloaded_gradient_checkpoint(
         lambda *t: sum(t), *tensors, use_reentrant = True,
@@ -104,7 +98,7 @@ def test_backward_returns_one_gradient_per_input(gc_module):
 
 
 def test_frozen_first_input_next_to_trainable_later_one(gc_module):
-    """The shape that made an earlier requires_grad-of-input-zero check bail out early."""
+    """Keying the check off input zero alone made backward bail out early."""
     frozen    = torch.randn(3, 5)
     trainable = torch.randn(3, 5, requires_grad = True)
     out = gc_module.unsloth_offloaded_gradient_checkpoint(
@@ -132,7 +126,6 @@ def test_matches_pristine_torch_checkpoint(gc_module, preserve):
 
 
 def test_preserve_true_reproduces_the_forward_dropout_mask(gc_module):
-    """Recompute must see the forward's mask, so checkpointed == uncheckpointed."""
     def run(fn):
         torch.manual_seed(11)
         h = torch.randn(4, 32, requires_grad = True)
@@ -146,8 +139,7 @@ def test_preserve_true_reproduces_the_forward_dropout_mask(gc_module):
 
 
 def test_preserve_false_leaves_rng_advanced(gc_module):
-    """Comparing gradients cannot prove the flag arrived - the reference moves with
-    it. The advanced RNG state can."""
+    """Gradients cannot prove the flag arrived - the reference moves with it."""
     def final_state(preserve):
         torch.manual_seed(5)
         h = torch.randn(4, 32, requires_grad = True)
@@ -163,8 +155,7 @@ def test_preserve_false_leaves_rng_advanced(gc_module):
 
 @pytest.mark.parametrize("keyword", ["context_fn", "determinism_check", "debug", "early_stop"])
 def test_checkpoint_machinery_keywords_are_dropped_not_bound(gc_module, keyword):
-    """Binding one onto the block turns a call that works on unpatched torch into a
-    TypeError the moment Unsloth patches checkpointing."""
+    """Binding one onto the block would TypeError the moment Unsloth patches."""
     def block(x):                      # strict signature: one parameter only
         return x * 2
     value = (lambda: None) if keyword == "context_fn" else "default"
@@ -177,8 +168,7 @@ def test_checkpoint_machinery_keywords_are_dropped_not_bound(gc_module, keyword)
 
 
 def test_tensor_keyword_requiring_grad_gets_a_gradient(gc_module):
-    """Routed through the positional list so autograd sees them; the RNG flag must
-    not disturb that tail."""
+    """Routed positionally so autograd sees them; the flag must not move that tail."""
     def block(hidden, *, side):
         return hidden + side
     hidden = torch.randn(3, 6, requires_grad = True)
@@ -220,8 +210,7 @@ def test_mixed_tensor_and_constant_keywords(gc_module):
 
 
 def test_caller_keyword_dict_is_not_mutated(gc_module):
-    """A caller reusing one options dict across layers - which is what
-    gradient_checkpointing_kwargs is - would else lose the flag after layer one."""
+    """gradient_checkpointing_kwargs is one dict reused across every layer."""
     options = {"preserve_rng_state" : False}
     snapshot = dict(options)
     x = torch.randn(2, 4, requires_grad = True)
@@ -232,7 +221,7 @@ def test_caller_keyword_dict_is_not_mutated(gc_module):
 
 
 def test_functools_partial_bound_flag_still_works(gc_module):
-    """How transformers delivers it: gradient_checkpointing_enable partial-binds it."""
+    """The shape gradient_checkpointing_enable actually produces."""
     bound = functools.partial(
         gc_module.unsloth_offloaded_gradient_checkpoint,
         use_reentrant = True, preserve_rng_state = True,
@@ -244,7 +233,7 @@ def test_functools_partial_bound_flag_still_works(gc_module):
 
 
 def test_use_reentrant_false_is_accepted_and_ignored(gc_module):
-    """transformers 5.x defaults it False; the shim forces reentrant regardless."""
+    """transformers 5.x defaults it False; the shim forces reentrant anyway."""
     x = torch.randn(2, 4, requires_grad = True)
     out = gc_module.unsloth_offloaded_gradient_checkpoint(
         lambda t: t * 5, x, use_reentrant = False,
@@ -255,8 +244,7 @@ def test_use_reentrant_false_is_accepted_and_ignored(gc_module):
 
 @pytest.mark.parametrize("initial", [None, []], ids = ["unpatched-to-None", "empty-list"])
 def test_buffers_are_reinitialised_when_absent(gc_module, monkeypatch, initial):
-    """unpatch nulls the buffers and prepare_model_for_training calls it for every
-    non-"unsloth" setting, so None - not [] - is the normal starting state."""
+    """unpatch nulls the buffers, so None - not [] - is the normal starting state."""
     monkeypatch.setattr(gc_module, "CPU_BUFFERS", initial, raising = False)
     called = []
     def fake_init(dtype = None):
@@ -288,7 +276,6 @@ def _rng_run(fn):
 
 
 def test_offloaded_shim_now_agrees_with_unsloth_checkpoint(gc_module):
-    """unsloth_checkpoint always honoured the flag; the offloaded wrapper did not."""
     reference = _rng_run(pristine())
     for shim in (
         gc_module.unsloth_offloaded_gradient_checkpoint,
@@ -299,9 +286,8 @@ def test_offloaded_shim_now_agrees_with_unsloth_checkpoint(gc_module):
 
 
 def test_plain_shim_still_ignores_the_flag_as_documented(gc_module):
-    """Unsloth_Gradient_Checkpointer has no preserve_rng_state slot, so its recompute
-    draws a fresh mask. Deliberate per the _TORCH_CHECKPOINT_KEYWORDS_LITERAL comment,
-    and now the only shim like that - so fail loudly if someone changes it."""
+    """Unsloth_Gradient_Checkpointer has no such slot, so it redraws the mask.
+    Deliberate per _TORCH_CHECKPOINT_KEYWORDS_LITERAL; now the only shim like that."""
     reference = _rng_run(pristine())
     actual    = _rng_run(gc_module.unsloth_gradient_checkpoint)
     assert not torch.allclose(actual[1], reference[1]), \
@@ -309,7 +295,6 @@ def test_plain_shim_still_ignores_the_flag_as_documented(gc_module):
 
 
 def test_tuple_output_with_a_non_tensor_member(gc_module):
-    """Decoder blocks return tuples, sometimes with None or metadata in them."""
     def block(x):
         return (x * 2, None, "meta")
     x = torch.randn(2, 4, requires_grad = True)
@@ -336,7 +321,7 @@ def test_all_inputs_frozen_produces_no_graph(gc_module):
 
 
 def test_repeated_calls_are_stable(gc_module):
-    """Module-level FIRST_PASS / CURRENT_GC_INDEX must not drift over a loop."""
+    """FIRST_PASS / CURRENT_GC_INDEX must not drift over a training loop."""
     for _ in range(5):
         x = torch.randn(2, 4, requires_grad = True)
         out = gc_module.unsloth_offloaded_gradient_checkpoint(
@@ -347,8 +332,7 @@ def test_repeated_calls_are_stable(gc_module):
 
 
 def test_public_signature_is_unchanged(gc_module):
-    """Re-exported through unsloth.models._utils, so an older unsloth calls this
-    newer unsloth_zoo. The fix is body-only; a signature move breaks that silently."""
+    """An older unsloth calls this newer unsloth_zoo; a signature move breaks it."""
     parameters = inspect.signature(gc_module.unsloth_offloaded_gradient_checkpoint).parameters
     assert list(parameters) == ["function", "args", "use_reentrant", "kwargs"]
     assert parameters["args"].kind  is inspect.Parameter.VAR_POSITIONAL
@@ -370,7 +354,7 @@ def test_patch_then_unpatch_restores_torch_exactly():
 
 
 def test_pristine_checkpoint_is_still_recoverable_after_patching():
-    """How consumers that must force use_reentrant=False (Gemma-4 KV sharing) escape."""
+    """How the Gemma-4 KV-sharing fix escapes the shim to force use_reentrant=False."""
     from unsloth_zoo import gradient_checkpointing as module
     original = torch.utils.checkpoint.checkpoint
     try:

@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Offloaded checkpointing against the real pinned buffers.
-
-The CPU coverage pins MINIMUM_SIZE above every tensor it builds, so the D2H/H2D
-branch never runs there. These size activations over it and assert it was taken.
-"""
+"""Offloaded checkpointing against the real pinned buffers: the CPU coverage keeps
+MINIMUM_SIZE above every tensor, so the D2H/H2D branch never runs there."""
 import pytest
 import torch
 
@@ -78,7 +75,7 @@ def _run(checkpoint_fn, kwargs, device):
 
 @pytest.mark.parametrize("preserve_rng_state", [None, True, False])
 def test_offloaded_matches_torch_with_real_offload(offload_module, preserve_rng_state):
-    """Pre-fix the ``preserve_rng_state`` slot ate ``hidden``, so both grads matter."""
+    """Pre-fix the flag slot ate ``hidden``, so both grads matter."""
     device = torch.device("cuda")
     kwargs = {} if preserve_rng_state is None else {"preserve_rng_state" : preserve_rng_state}
 
@@ -94,10 +91,7 @@ def test_offloaded_matches_torch_with_real_offload(offload_module, preserve_rng_
 
 
 def test_offloaded_preserve_rng_state_false_reaches_the_function(offload_module):
-    """True forks the RNG and restores it; False lets the recompute advance it.
-
-    Differing final states is the only observable that the flag reached ctx.
-    """
+    """True forks and restores the RNG; False lets the recompute advance it."""
     device = torch.device("cuda")
 
     _run(offload_module.unsloth_offloaded_gradient_checkpoint, {"preserve_rng_state" : True}, device)
@@ -112,11 +106,8 @@ def test_offloaded_preserve_rng_state_false_reaches_the_function(offload_module)
 
 
 def test_offloaded_binds_tensor_keywords_after_the_rng_flag(offload_module):
-    """Tensor keywords ride at the tail of the positionals; the flag goes before them.
-
-    Reference is eager, not torch's checkpoint: torch's reentrant path rejects
-    keywords outright, which is what _bind_checkpoint_kwargs deliberately replaces.
-    """
+    """Reference is eager, not torch: torch's reentrant path rejects keywords
+    outright, which is what _bind_checkpoint_kwargs deliberately replaces."""
     device = torch.device("cuda")
 
     def run(checkpoint_fn):
@@ -142,7 +133,7 @@ def test_offloaded_binds_tensor_keywords_after_the_rng_flag(offload_module):
 
 def test_offloaded_stays_correct_across_repeated_steps(offload_module):
     """Backward clears FIRST_PASS and sets BACKWARD_PASS, changing which layers
-    offload next forward; one step never reaches that second regime."""
+    offload next forward; one step never reaches that regime."""
     device = torch.device("cuda")
     checkpoint = offload_module.unsloth_offloaded_gradient_checkpoint
 
