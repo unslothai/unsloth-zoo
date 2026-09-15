@@ -55,6 +55,7 @@ from .compile import (
     trace_compile_application,
 )
 from .attention import install_quantized_attention
+from .inference import fused_decode_conv_silu, fused_moe_gate_up
 
 _vlm_model_types_cache = None
 _VLM_MODALITY_CONFIG_FIELDS = ("vision_config", "audio_config", "dflash_config")
@@ -404,26 +405,33 @@ def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
     limit = max(int(num_layers), 0)
     offset = max(len(layers) - limit, 0)
 
-    def _layer_wanted(index):
-        return (set(layer_keys[index]) | shared) if layer_keys else keys
+    # One adapter per PHYSICAL layer: a recurrent stack lists the same layer object at
+    # several indices (mlx-vlm's hrm_text lists 2 layers over 8 entries), and adapting
+    # it once per entry hands a LoRALinear back to _mlx_lora_from_base, which refuses
+    # it. The targets of every entry are unioned, so a layer that appears under two
+    # different `layer_keys` still gets both rather than only the first entry's.
+    order, wanted_by_layer = [], {}
+    for index, layer in enumerate(layers[offset:], start=offset):
+        wanted = (set(layer_keys[index]) | shared) if layer_keys else keys
+        if id(layer) not in wanted_by_layer:
+            order.append(layer)
+            wanted_by_layer[id(layer)] = set()
+        wanted_by_layer[id(layer)] |= wanted
 
     if config.get("use_dora"):
         # Preflight so a late refusal leaves no layer converted; only the TYPE
         # refusal is all-or-nothing. Same per-layer predicates as the
         # conversion, not the `keys` union.
-        for index, layer in enumerate(layers[offset:], start=offset):
-            wanted = _layer_wanted(index)
+        for layer in order:
             for name, module in layer.named_modules():
-                if name in wanted:
+                if name in wanted_by_layer[id(layer)]:
                     _mlx_dora_wrapper_type(module, name)
         for name, module in (root.named_modules() if root is not None else ()):
             if name in shared:
                 _mlx_dora_wrapper_type(module, name)
-    selected = []
-    for index, layer in enumerate(layers[offset:], start=offset):
-        wanted = _layer_wanted(index)
-        selected.append((layer, [(name, module) for name, module in layer.named_modules()
-                                 if name in wanted]))
+    selected = [(layer, [(name, module) for name, module in layer.named_modules()
+                         if name in wanted_by_layer[id(layer)]])
+                for layer in order]
     root_modules = [(name, module)
                     for name, module in (root.named_modules() if root is not None else ())
                     if name in shared]
@@ -2989,6 +2997,64 @@ def _prefer_vlm_loader_for_text(config: dict, model_type: str) -> bool:
         return _resolve_mlx_vlm_model_class(model_type) is not None
 
     return _has_multimodal_strip_sanitize(cls)
+
+
+def _mlx_vlm_only_text_model(config: dict, model_type: str) -> bool:
+    if _is_vlm(config) or not model_type:
+        return False
+    module_name = _mlx_lm_module_name(model_type)
+    try:
+        spec = importlib.util.find_spec(f"mlx_lm.models.{module_name}")
+    except (ImportError, ValueError):
+        return False
+    if spec is not None:
+        return False
+    return _resolve_mlx_vlm_model_class(model_type) is not None
+
+
+class _NativeVLMWeightSanitizer:
+    def __init__(self, original):
+        self.original = original
+
+    def __get__(self, model, owner):
+        sanitize = self.original.__get__(model, owner)
+        # Class calls and export inspection retain the backend's own sanitizer.
+        if model is None:
+            return sanitize
+
+        @wraps(sanitize)
+        def preserving_native_names(weights):
+            from mlx.utils import tree_flatten
+
+            native = dict(tree_flatten(model.parameters()))
+            native.update({
+                key[:-len("weight")] + suffix: None
+                for key in tuple(native) if key.endswith(".weight")
+                for suffix in ("scales", "biases")
+            })
+            sources = {}
+            for key, value in weights.items():
+                if key in native:
+                    sources.setdefault(id(value), []).append(key)
+            sanitized = sanitize(weights)
+            for key, value in list(sanitized.items()):
+                candidates = sources.get(id(value), ())
+                # Undo only unambiguous pure renames of already-native parameters.
+                if key not in native and len(candidates) == 1:
+                    original = candidates[0]
+                    if original not in sanitized:
+                        sanitized[original] = sanitized.pop(key)
+            return sanitized
+
+        return preserving_native_names
+
+
+def _ensure_native_vlm_weight_names(model_type: str) -> None:
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    sanitize = inspect.getattr_static(cls, "sanitize", None)
+    if sanitize is None or isinstance(sanitize, _NativeVLMWeightSanitizer):
+        return
+    cls.sanitize = _NativeVLMWeightSanitizer(sanitize)
 
 
 def _ensure_safe_text_wrapper_sanitize(model_type: str) -> None:
@@ -6612,26 +6678,26 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     generated_ids = []
     last_generation_tokens = None
-    for response in stream_generate(
-        self,
-        processor,
-        "",
-        max_tokens=max_tokens,
-        **batch,
-    ):
-        token_id = _mlx_token_to_int(getattr(response, "token", None))
-        if token_id is None:
-            continue
-        generation_tokens = getattr(response, "generation_tokens", None)
-        if (
-            generation_tokens is not None
-            and generation_tokens == last_generation_tokens
+    with fused_moe_gate_up(self), fused_decode_conv_silu(self):
+        for response in stream_generate(
+            self,
+            processor,
+            "",
+            max_tokens=max_tokens,
+            **batch,
         ):
-            continue
-        last_generation_tokens = generation_tokens
-        generated_ids.append(token_id)
-        _mlx_put_streamer_tokens(streamer, [token_id])
-
+            token_id = _mlx_token_to_int(getattr(response, "token", None))
+            if token_id is None:
+                continue
+            generation_tokens = getattr(response, "generation_tokens", None)
+            if (
+                generation_tokens is not None
+                and generation_tokens == last_generation_tokens
+            ):
+                continue
+            last_generation_tokens = generation_tokens
+            generated_ids.append(token_id)
+            _mlx_put_streamer_tokens(streamer, [token_id])
     if streamer is not None:
         streamer.end()
     return _mlx_generate_output(prompt_ids, generated_ids)
@@ -6735,21 +6801,22 @@ def _mlx_generate(self, *args, **kwargs):
     generated_ids = []
     eos_restore_state = _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id)
     try:
-        for response in stream_generate(
-            self,
-            tokenizer,
-            prompt_ids,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            **stream_kwargs,
-        ):
-            token = getattr(response, "token", None)
-            token_id = _mlx_token_to_int(token)
-            if token_id is None:
-                continue
-            generated_ids.append(token_id)
-            _mlx_put_streamer_tokens(streamer, [token_id])
+        with fused_moe_gate_up(self), fused_decode_conv_silu(self):
+            for response in stream_generate(
+                self,
+                tokenizer,
+                prompt_ids,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                **stream_kwargs,
+            ):
+                token = getattr(response, "token", None)
+                token_id = _mlx_token_to_int(token)
+                if token_id is None:
+                    continue
+                generated_ids.append(token_id)
+                _mlx_put_streamer_tokens(streamer, [token_id])
     finally:
         _mlx_restore_tokenizer_eos_ids(tokenizer, eos_restore_state)
 
@@ -8575,9 +8642,12 @@ class FastMLXModel:
         is_vlm = False
         force_vlm_text_path = bool(
             text_only is True and _prefer_vlm_loader_for_text(config_data, model_type)
+            or text_only is not False and _mlx_vlm_only_text_model(config_data, model_type)
         )
 
-        if text_only is True and not force_vlm_text_path:
+        if force_vlm_text_path:
+            is_vlm = True
+        elif text_only is True:
             is_vlm = False
         elif text_only is False:
             is_vlm = True
@@ -8621,6 +8691,7 @@ class FastMLXModel:
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
             _ensure_audio_conv_sanitize(model_type)
+            _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(
                 config_data, quantization_spec, model_name,
@@ -8769,7 +8840,7 @@ class FastMLXModel:
             )
             if force_vlm_text_path:
                 print(
-                    "Unsloth: text_only=True requested for a multimodal wrapper; "
+                    "Unsloth: Loading a text model through mlx-vlm; "
                     "keeping the model on the mlx-vlm path and returning its tokenizer."
                 )
                 _mark_text_only_vlm(model, model_type)

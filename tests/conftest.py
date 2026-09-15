@@ -328,6 +328,18 @@ def _is_module_stub(mod):
     return mod is not None and getattr(mod, "__file__", None) is None
 
 
+def _is_unsloth_stub(mod):
+    """unsloth_zoo installs its own bitsandbytes stub where no real wheel exists, which
+    is every Apple Silicon machine (stubs/bitsandbytes_stub.py). The finder mints
+    submodules on first import, so the first test to import anything that touches
+    bitsandbytes.nn looks like a polluter while doing nothing wrong: the stub is
+    process wide, deliberate and idempotent, and putting it "back" would mean deleting
+    a module the rest of the session expects. Every stub module carries the marker,
+    finder-minted ones included.
+    """
+    return bool(getattr(mod, "IS_UNSLOTH_STUB", False))
+
+
 def pytest_runtest_setup(item):
     import sys as _sys
 
@@ -364,10 +376,10 @@ def pytest_runtest_teardown(item, nextitem):
             if _is_from_pytest_tmp(now):
                 leaked.append(name)
             continue
-        if was is None and not _is_module_stub(now):
-            # Nothing was there and the test imported the real thing. That is an
-            # import, not a swap, and flagging it would fail every test that touches
-            # the package.
+        if was is None and (not _is_module_stub(now) or _is_unsloth_stub(now)):
+            # Nothing was there and the test imported the real thing, or the zoo's own
+            # bitsandbytes stub. Either is an import, not a swap, and flagging it would
+            # fail every test that touches the package.
             continue
         leaked.append(name)
     if leaked:

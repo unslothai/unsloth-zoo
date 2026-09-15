@@ -1291,10 +1291,13 @@ pass
 @torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     global CPU_BUFFERS
-    if len(CPU_BUFFERS) == 0:
+    # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
+    # to None, which is the state this shim normally starts from, and len(None) raises.
+    if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
+    preserve = kwargs.pop("preserve_rng_state", True)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
-    return UnslothCheckpointFunction.apply(function, *args, *tensor_args)
+    return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

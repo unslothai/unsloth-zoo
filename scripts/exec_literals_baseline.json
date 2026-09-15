@@ -223,6 +223,20 @@
       "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
     },
     {
+      "file": "unsloth_zoo/mlx/inference.py",
+      "sink": "compile",
+      "digest": "bcb6972ff2f41122",
+      "count": 1,
+      "reason": "Recompiles an mlx-vlm decode method from its own AST. The tree comes from inspect.getsource on the installed module, the only edit swaps two fixed attribute names spelled out in unsloth_zoo/mlx/inference.py, and it is compiled under the original co_filename and executed in that function's own globals. No caller input, file content or network data reaches the compiled text."
+    },
+    {
+      "file": "unsloth_zoo/mlx/inference.py",
+      "sink": "exec",
+      "digest": "ae8d4def96cf1884",
+      "count": 1,
+      "reason": "Recompiles an mlx-vlm decode method from its own AST. The tree comes from inspect.getsource on the installed module, the only edit swaps two fixed attribute names spelled out in unsloth_zoo/mlx/inference.py, and it is compiled under the original co_filename and executed in that function's own globals. No caller input, file content or network data reaches the compiled text."
+    },
+    {
       "file": "unsloth_zoo/patching_utils.py",
       "sink": "compile",
       "digest": "748ca8caa706cbb1",
