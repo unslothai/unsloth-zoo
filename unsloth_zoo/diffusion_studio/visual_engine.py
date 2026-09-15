@@ -217,7 +217,7 @@ class VisualServer:
         """Launch the subprocess and finish the READY handshake. Used at startup and by restart()
         after a crash (re-loads the model, so it costs tens of seconds)."""
         self.p = subprocess.Popen([self.server_bin, self.gguf], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  env=self.env, bufsize=1, text=True,
+                                  env=self.env, bufsize=1, text=True, encoding="utf-8",
                                   preexec_fn=_set_pdeathsig if os.name == "posix" else None)
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):
