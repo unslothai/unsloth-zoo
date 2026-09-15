@@ -410,6 +410,9 @@ jobs:
           python -m pytest tests/test_mlx_save_export_edge_cases.py -v
           python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
 
+      - name: Token initialization regressions
+        run: python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
+
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block
