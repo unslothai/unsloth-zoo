@@ -3034,6 +3034,31 @@ def _gguf_blocking_missing(report, certain):
     return sorted(set(report.get("missing") or ()) & set(certain or ()))
 
 
+def _installed_gguf_tree(python_exe):
+    """The directory holding the installed `gguf` package, as the child sees it with
+    the converter's own sibling tree suppressed, or None.
+
+    This is the candidate the other three cannot express. Someone who upgraded the
+    `gguf` wheel past the llama.cpp checkout on disk has a satisfying `gguf` already
+    installed, but every llama.cpp entrypoint puts its sibling `gguf-py` ahead of it
+    with `sys.path.insert(1, ...)`, so the wheel only wins if it is pinned like any
+    other tree. Discovered by asking the child rather than by importing `gguf` here:
+    the parent may resolve a different one, and importing it would be a side effect.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    env = dict(os.environ)
+    env["NO_LOCAL_GGUF"] = "1"
+    report = _probe_child_gguf(python_exe, env, ())
+    location = (report or {}).get("location")
+    if not location:
+        return None
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(location)))
+    if not os.path.isfile(os.path.join(tree, "gguf", "__init__.py")):
+        return None
+    return tree
+pass
+
+
 def _gguf_candidate_converters(converter_location):
     """(converter, gguf_py_dir, label) candidates, best first.
 
@@ -3136,6 +3161,19 @@ def _resolve_converter_and_gguf(converter_location, python_exe, architecture = N
                 # Either nothing is missing, or only names that may never be
                 # reached. Never move off the requested pair on a maybe.
                 return converter_location, gguf_py, report
+            # Only now, and only once: the installed `gguf` wheel, with the
+            # converter's sibling tree out of the way. Probing for it costs a
+            # subprocess, so it is not paid by an install that already works.
+            installed_tree = _installed_gguf_tree(python_exe)
+            known = {
+                os.path.abspath(tree) for _candidate, tree, _label in candidates if tree
+            }
+            if installed_tree and os.path.abspath(installed_tree) not in known:
+                # Ahead of the older trees: the requested converter is the newest
+                # thing here, so the newest gguf is the one most likely to match it.
+                candidates.insert(1, (
+                    converter_location, installed_tree, "the installed gguf package",
+                ))
             continue
         if report.get("error"):
             continue

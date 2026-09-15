@@ -312,6 +312,10 @@ def test_a_missing_architecture_on_this_path_still_switches(
     """The complement: when the architecture being converted is the one the
     installed gguf-py cannot satisfy, falling back is correct and required."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
+    # The reported host's installed `gguf` wheel does not satisfy the converter
+    # either, which is why the fallback is what has to happen. This runner's does,
+    # so it is pinned out; the case where it satisfies has its own test below.
+    monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     entry = _make_conversion_tree(tmp_path)
     (tmp_path / "gguf-py").mkdir(exist_ok=True)
     pkg = tmp_path / "gguf-py" / "gguf"
@@ -461,6 +465,9 @@ def test_resolver_falls_back_to_the_co_versioned_converter(mod, tmp_path, monkey
     """The reported case: a newer downloaded entrypoint, an older sibling gguf-py,
     and the checkout's own matching converter sitting right next to it."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
+    # Same as above: on the reported host nothing installed satisfies the newer
+    # entrypoint, so the co-versioned converter beside it is the only way out.
+    monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     _make_gguf_py(tmp_path, symbols=("Metadata",), version="0.17.1")
     (tmp_path / "convert_hf_to_gguf.py").write_text("import gguf\nX = gguf.Metadata\n")
     newer = tmp_path / "unsloth_convert_hf_to_gguf.py"
@@ -739,3 +746,77 @@ def test_the_preflight_returns_a_pin_not_a_frozen_environment(mod, tmp_path, mon
     entry.write_text("import gguf\nX = gguf.Metadata\n")
     _chosen, pin, _report = mod._resolve_converter_and_gguf(str(entry), sys.executable)
     assert pin is None or isinstance(pin, str)
+
+
+# ---------------------------------------------------------------------------
+# The installed gguf wheel as a candidate (verification pass)
+# ---------------------------------------------------------------------------
+
+def test_the_installed_gguf_wheel_is_used_when_the_sibling_tree_is_too_old(
+    mod, tmp_path, monkeypatch, capsys,
+):
+    """Someone who upgraded the `gguf` wheel past their llama.cpp checkout has a
+    satisfying gguf already installed, but the entrypoint's own
+    `sys.path.insert(1, <sibling gguf-py>)` puts the old tree first, so it never
+    gets used. The resolver must pin it and keep the newer converter rather than
+    dropping back to an older one."""
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
+    wheel = _make_gguf_py(tmp_path / "site-packages", symbols=("Metadata", "SafetensorsLocal"))
+    monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *a, **kw: str(wheel))
+
+    _make_gguf_py(tmp_path, symbols=("Metadata",), version="0.17.1")
+    (tmp_path / "convert_hf_to_gguf.py").write_text("import gguf\nX = gguf.Metadata\n")
+    newer = tmp_path / "unsloth_convert_hf_to_gguf.py"
+    newer.write_text("import gguf\nX = gguf.SafetensorsLocal\n")
+
+    chosen, pin, _report = mod._resolve_converter_and_gguf(str(newer), sys.executable)
+
+    assert chosen == str(newer), "the newer converter must be kept"
+    assert pin == str(wheel), pin
+    # Keeping the requested converter is not a fallback, so it is not announced.
+    assert "Falling back" not in capsys.readouterr().out
+
+
+def test_the_installed_wheel_is_not_probed_when_the_request_already_works(
+    mod, tmp_path, monkeypatch,
+):
+    """The extra probe is a subprocess. An install that already works must not pay
+    for it."""
+    called = {"hit": False}
+    def _trap(*args, **kwargs):
+        called["hit"] = True
+        return None
+    monkeypatch.setattr(mod, "_installed_gguf_tree", _trap)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
+
+    converter = tmp_path / "convert_hf_to_gguf.py"
+    converter.write_text("import gguf\nX = gguf.GGUFWriter\n")
+    chosen, _pin, _report = mod._resolve_converter_and_gguf(str(converter), sys.executable)
+
+    assert chosen == str(converter)
+    assert called["hit"] is False
+
+
+def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tmp_path):
+    """The tree is whatever the CHILD resolves with the sibling tree suppressed, and
+    it is only accepted when a real package sits inside it."""
+    captured = {}
+    tree = tmp_path / "site-packages"
+    (tree / "gguf").mkdir(parents=True)
+    (tree / "gguf" / "__init__.py").write_text("# gguf\n")
+
+    def _fake_probe(python_exe, env, requirements, converter_location=None, timeout=120):
+        captured["env"] = env
+        captured["converter"] = converter_location
+        return {"location": str(tree / "gguf" / "__init__.py")}
+    monkeypatch.setattr(mod, "_probe_child_gguf", _fake_probe)
+
+    assert mod._installed_gguf_tree(sys.executable) == str(tree)
+    assert captured["env"]["NO_LOCAL_GGUF"] == "1"
+    assert captured["converter"] is None
+
+    monkeypatch.setattr(mod, "_probe_child_gguf", lambda *a, **kw: None)
+    assert mod._installed_gguf_tree(sys.executable) is None
+    monkeypatch.setattr(mod, "_probe_child_gguf",
+                        lambda *a, **kw: {"location": str(tmp_path / "nothing" / "gguf" / "__init__.py")})
+    assert mod._installed_gguf_tree(sys.executable) is None
