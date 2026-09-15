@@ -520,6 +520,22 @@ def test_the_shifted_label_signal_survives_patch_loss_functions():
     assert mod._loss_shifts_labels(trainer, masked, False) is False
 
 
+def _two_rank_trainer(model, peer_count, peer_flags):
+    """This rank plus one simulated peer, for both collectives the count path makes:
+    the token count, and the degenerate/all_short flags."""
+    torch = pytest.importorskip("torch")
+    t = _fake_trainer(model, True)
+    t.args.average_tokens_across_devices = True
+    t.args.world_size = 2
+
+    def gather(x):
+        if x.ndim == 2:                      # the [[degenerate, all_short]] flags
+            return torch.cat([x, torch.tensor([peer_flags], dtype = x.dtype)])
+        return torch.stack([x.reshape(()), torch.tensor(peer_count, dtype = x.dtype)])
+    t.accelerator.gather = gather
+    return t
+
+
 def test_a_locally_short_rank_keeps_the_gathered_count():
     """all_short is rank-local. Once the count has been gathered it is global, so a
     rank holding only [B, 1] batches must keep it rather than drop a divisor its peers
@@ -529,15 +545,41 @@ def test_a_locally_short_rank_keeps_the_gathered_count():
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
 
     short = {"input_ids": torch.randint(0, 11, (2, 1)), "labels": torch.randint(0, 11, (2, 1))}
-    trainer = _fake_trainer(_tiny_model(), True)
-    trainer.args.average_tokens_across_devices = True
-    trainer.args.world_size = 2
-    # Stand in for the peer rank's contribution, which is what gather returns.
-    trainer.accelerator.gather = lambda x: torch.stack([x.reshape(()), torch.tensor(10)])
-
+    # Peer is healthy: 10 targets, neither flag set.
+    trainer = _two_rank_trainer(_tiny_model(), peer_count = 10, peer_flags = [0, 0])
     _, count = mod._unsloth_get_batch_samples(trainer, iter([short]), 1)
     assert count is not None and int(count) == 10, (
         f"the short rank dropped the gathered count and got {count}"
+    )
+
+
+def test_an_all_short_world_still_declines_the_zero_count():
+    """The other side of the same reduction: if EVERY rank is short the gathered total
+    really is 0, and handing that back is a division by zero in the custom loss."""
+    torch = pytest.importorskip("torch")
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+
+    short = {"input_ids": torch.randint(0, 11, (2, 1)), "labels": torch.randint(0, 11, (2, 1))}
+    trainer = _two_rank_trainer(_tiny_model(), peer_count = 0, peer_flags = [0, 1])
+    _, count = mod._unsloth_get_batch_samples(trainer, iter([short]), 1)
+    assert count is None, f"an all-short world handed back {count}"
+
+
+def test_one_degenerate_rank_makes_every_rank_decline():
+    """A layout this cannot count on one rank cannot be counted on any: the peers must
+    not keep a divisor that rank has thrown away, or they scale gradients differently."""
+    torch = pytest.importorskip("torch")
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+
+    ids = torch.randint(0, 11, (2, 6))
+    healthy = {"input_ids": ids, "labels": ids.clone()}
+    # This rank is fine; the peer reports degenerate.
+    trainer = _two_rank_trainer(_tiny_model(), peer_count = 10, peer_flags = [1, 0])
+    _, count = mod._unsloth_get_batch_samples(trainer, iter([healthy]), 1)
+    assert count is None, (
+        f"a healthy rank kept {count} while its peer dropped the count"
     )
 
 

@@ -501,15 +501,23 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             # Discard a count these labels could not support. Done last, so every
             # collective above ran on every rank.
             #
-            # all_short is rank-local, so it must not be acted on once the count has
-            # been gathered: a rank holding only [B, 1] batches would drop a global
-            # count its peers keep, and the two would normalise differently. Its local
-            # contribution is already 0, and the global total is the right divisor for
-            # every rank, so it simply keeps it. A globally zero total is the
-            # all-masked case, which is not this function's to fix.
-            gathered = bool(getattr(self.args, "average_tokens_across_devices", False)) \
-                and getattr(self.args, "world_size", 1) > 1
-            if degenerate or (all_short and not gathered): num_items_in_batch = None
+            # Both flags are rank-local, and the count above is not: acting on them
+            # unreduced lets one rank drop a divisor its peers keep, and the two then
+            # normalise differently. So reduce them too, with the meaning each one has:
+            # ANY degenerate rank means the batch layout is not countable anywhere,
+            # while only an ALL-short world has a genuinely zero total (a short rank
+            # beside healthy ones has simply contributed 0, and the global total is
+            # still the right divisor for it).
+            if bool(getattr(self.args, "average_tokens_across_devices", False)) \
+                    and getattr(self.args, "world_size", 1) > 1:
+                flags = torch.tensor(
+                    [[int(degenerate), int(all_short)]],
+                    device = num_items_in_batch.device if torch.is_tensor(num_items_in_batch) else None,
+                )
+                flags = self.accelerator.gather(flags).reshape(-1, 2)
+                degenerate = bool(flags[:, 0].any())
+                all_short  = bool(flags[:, 1].all())
+            if degenerate or all_short: num_items_in_batch = None
         except Exception as exception:
             raise RuntimeError(exception)
     pass
