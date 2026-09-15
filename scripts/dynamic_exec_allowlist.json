@@ -366,8 +366,8 @@
       "qualname": "patch_merge_quantization_configs",
       "sink": "exec",
       "kind": "string concatenation",
-      "hash": "13fce184fe981cb2",
-      "reason": "Imports names selected by `x in source` from dir(transformers.quantizers.auto)."
+      "hash": "4fa12b50b62060cd",
+      "reason": "Imports names selected by `x in source` from dir(transformers.quantizers.auto); the list is now bound to non-empty before the exec runs."
     },
     {
       "path": "unsloth_zoo/temporary_patches/misc.py",
