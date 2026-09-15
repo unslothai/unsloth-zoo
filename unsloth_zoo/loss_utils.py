@@ -252,7 +252,7 @@ except Exception:
     CAUSAL_LOSS_TYPES = frozenset()
 
 
-def _loss_shifts_labels(trainer, model, is_encoder_decoder):
+def _loss_shifts_labels(trainer, model, is_encoder_decoder, detected_causal = False):
     # All Unsloth Zoo code licensed under LGPLv3
     """Does this model's loss shift labels, so labels[..., 1:] is the right count?
 
@@ -262,11 +262,15 @@ def _loss_shifts_labels(trainer, model, is_encoder_decoder):
     Trainer; older versions get the same answer from the loss_type every
     PreTrainedModel derives from its class name, matched against the keys snapshotted
     at import rather than against a mapping we ourselves rewrite.
+
+    A custom torch.nn.Module has neither, and it is the very case #1217 is for, so
+    there we fall back to what the detector walk decided from the forward.
     """
     shifts = getattr(trainer, "_loss_shifts_labels", None)
     if isinstance(shifts, bool): return shifts
-    return getattr(model, "loss_type", None) in CAUSAL_LOSS_TYPES \
-        and not is_encoder_decoder
+    loss_type = getattr(model, "loss_type", None)
+    if loss_type is None: return detected_causal and not is_encoder_decoder
+    return loss_type in CAUSAL_LOSS_TYPES and not is_encoder_decoder
 pass
 
 global TRAINING_ITERATIONS
@@ -347,6 +351,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
         has_kwargs = False
         is_vlm = False
+        # Did the walk actually match a causal / VLM forward? has_kwargs alone cannot
+        # say: it is False both for no match and for a match with an explicit forward.
+        is_causal = False
         while True:
             # Stop when we encounter the name as ForConditionalGeneration or ForCausalLM
             if not hasattr(m, "forward"): break
@@ -371,13 +378,16 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             if is_vlm or "CausalLM" in name or "CausalLM" in class_name or "_fast_forward" in name:
                 signature = inspect.signature(forward).parameters.values()
                 has_kwargs = tuple(signature)[-1].kind == inspect._VAR_KEYWORD
+                is_causal = True
                 break
             if not hasattr(m, "model"): break
             m = m.model
         pass
-        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm)
+        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm, is_causal)
     else:
-        has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
+        # Tolerate a 2 tuple: an older cache may survive a partial upgrade.
+        has_kwargs, is_vlm, *rest = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
+        is_causal = bool(rest[0]) if rest else has_kwargs
     pass
 
     # Iterate to find all batches
@@ -407,7 +417,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     ) is not None
     if (not is_non_causal_head) and labels_are_countable \
             and (has_kwargs or (getattr(self, "compute_loss_func", None) is not None
-                                and _loss_shifts_labels(self, top_model, is_encoder_decoder))):
+                                and _loss_shifts_labels(self, top_model, is_encoder_decoder,
+                                                        is_causal))):
         try:
             token_counts = []
             # Shape only, so no device sync and still traceable. Applied after the

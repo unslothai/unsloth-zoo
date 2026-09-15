@@ -255,7 +255,11 @@ def test_accumulated_gradient_matches_the_single_batch_gradient():
     )
 
 
-def test_custom_loss_counts_tokens_without_model_forward_kwargs():
+# shifts=None is the real shape for the model #1217 is about: a custom nn.Module has
+# no loss_type, and no Trainer before 5.x carries the flag, so the fallback has to
+# come from the detector walk or the widened gate never counts anything.
+@pytest.mark.parametrize("shifts", [True, None])
+def test_custom_loss_counts_tokens_without_model_forward_kwargs(shifts):
     torch = pytest.importorskip("torch")
     import torch.nn.functional as F
 
@@ -284,13 +288,51 @@ def test_custom_loss_counts_tokens_without_model_forward_kwargs():
     mod = _loss_utils()
     mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
     _, count = mod._unsloth_get_batch_samples(
-        _fake_trainer(model, False, compute_loss), iter(batches), len(batches),
+        _fake_trainer(model, False, compute_loss, shifts = shifts),
+        iter(batches), len(batches),
     )
     for batch in batches:
         compute_loss(model(batch["input_ids"]), batch["labels"], count).backward()
 
     torch.testing.assert_close(model.lm_head.weight.grad, reference_grad)
     assert count == 14
+
+
+def test_a_custom_module_with_no_causal_signal_at_all_is_not_counted():
+    """The detector fallback is a fallback, not a blanket yes: with no loss_type, no
+    Trainer flag and nothing causal in the class or the forward, decline."""
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn
+
+    class MysteryHead(nn.Module):
+        def forward(self, input_ids, labels = None): return None
+
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, count = mod._unsloth_get_batch_samples(
+        _fake_trainer(MysteryHead(), False, lambda *a, **k: None, shifts = None),
+        iter(_microbatches(2, 5)), 2,
+    )
+    assert count is None
+
+
+def test_a_real_loss_type_outranks_the_detector_fallback():
+    """A masked LM whose forward the detector would match anyway still declines,
+    because its own loss_type says the labels are not shifted."""
+    pytest.importorskip("torch")
+
+    class ExplicitForCausalLM(type(_tiny_model())):
+        def forward(self, input_ids, labels = None): return None
+
+    model = ExplicitForCausalLM()
+    model.loss_type = "ForMaskedLM"
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+    _, count = mod._unsloth_get_batch_samples(
+        _fake_trainer(model, False, lambda *a, **k: None, shifts = None),
+        iter(_microbatches(2, 5)), 2,
+    )
+    assert count is None
 
 
 # Widening the gate to compute_loss_func widens WHO is eligible, not what the
@@ -342,7 +384,7 @@ def test_the_classifier_fixture_really_is_detected_as_causal():
     mod._unsloth_get_batch_samples(
         _fake_trainer(_tiny_sequence_classifier(), True), iter([]), 0,
     )
-    has_kwargs, _ = mod.ALLOWED_NUM_ITEMS_IN_BATCH["LlamaForSequenceClassification"]
+    has_kwargs, *_ = mod.ALLOWED_NUM_ITEMS_IN_BATCH["LlamaForSequenceClassification"]
     assert has_kwargs, (
         "the fixture no longer reproduces the _fast_forward descent, so the "
         "classification tests are no longer testing the real situation"
@@ -512,12 +554,20 @@ def test_the_shifted_label_signal_survives_patch_loss_functions():
     trainer = object()  # no _loss_shifts_labels, so the loss_type branch answers
 
     assert mod._loss_shifts_labels(trainer, causal, False) is True
-    mod.patch_loss_functions(lambda *a, **k: None, torch_compile = False)
-    assert mod._loss_shifts_labels(trainer, causal, False) is True, (
-        "patching LOSS_MAPPING switched the causal signal off, which silently disables "
-        "the count for every custom loss on this transformers"
-    )
-    assert mod._loss_shifts_labels(trainer, masked, False) is False
+    # Restore the mapping: it is process global, and leaving it rewritten changes what
+    # every later test in the session sees.
+    lu = pytest.importorskip("transformers.loss.loss_utils")
+    saved = dict(lu.LOSS_MAPPING)
+    try:
+        mod.patch_loss_functions(lambda *a, **k: None, torch_compile = False)
+        assert mod._loss_shifts_labels(trainer, causal, False) is True, (
+            "patching LOSS_MAPPING switched the causal signal off, which silently "
+            "disables the count for every custom loss on this transformers"
+        )
+        assert mod._loss_shifts_labels(trainer, masked, False) is False
+    finally:
+        lu.LOSS_MAPPING.clear()
+        lu.LOSS_MAPPING.update(saved)
 
 
 def _two_rank_trainer(model, peer_count, peer_flags):
