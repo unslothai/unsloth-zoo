@@ -2959,6 +2959,213 @@ def _carry_over_vocab_size(base_config, trained_config):
 pass
 
 
+class TextOnlyRemapError(RuntimeError):
+    """The text-only key remap could not be derived, so the merge keeps the VLM tensors."""
+pass
+
+
+def _is_text_only_export(config, base_config):
+    """True when the in-memory config is the text section of a composite base config.
+
+    That is the `text_only = True` signature seen from inside the merge: the weights come
+    from a composite checkpoint while `model.config` has already been replaced by its
+    nested text config. A normal VLM save has `config is` the composite one, so this is
+    False and nothing below runs.
+    """
+    if config is None or base_config is None or config is base_config: return False
+    base_text = None
+    for holder in _text_configs(base_config):
+        if holder is not base_config: base_text = holder; break
+    if base_text is None: return False
+    base_type = getattr(base_config, "model_type", None)
+    text_type = getattr(base_text, "model_type", None)
+    this_type = getattr(config, "model_type", None)
+    if this_type is None or text_type is None or base_type is None: return False
+    return this_type == text_type and this_type != base_type
+pass
+
+
+def _text_only_key_map(text_keys, base_keys, tie_word_embeddings = False):
+    """Map every expected text-only key onto its key in the composite base checkpoint.
+
+    Where a VLM keeps its text weights is decided when the checkpoint is written, not by the
+    installed transformers, and the arrangements genuinely differ. Observed on real files:
+
+        language_model.model.*                     gemma3 on the Hub (tied, so no lm_head)
+        model.text_model.*      + lm_head.weight   idefics3 on the Hub
+        thinker.model.*         + thinker.lm_head  qwen2_5_omni on the Hub
+        model.language_model.*  + lm_head.weight   gemma3 in memory
+        model.language_model.model.*               gemma3 written by save_pretrained on 4.57/5.5
+
+    All five are the text key with one prefix swapped for another, so derive that pair from
+    the two key sets rather than hardcoding any of them: for each text key the base does not
+    already hold, offer every (text prefix, base prefix) that lands it on a real tensor, keep
+    only the pairs every such key agrees on, and require the survivors to describe the same
+    mapping. Anything else raises, which tells the caller to leave the export alone instead of
+    writing a checkpoint whose weights it could not place.
+    """
+    base_keys = set(base_keys)
+    text_keys = set(text_keys)
+    # A tied head owns no tensor anywhere: gemma3 ships 883 keys and not one is an lm_head,
+    # because the reload reties it from the embeddings. Its absence is the checkpoint being
+    # right, not a key this failed to place.
+    tied = {
+        key for key in text_keys
+        if tie_word_embeddings and key.rpartition(".")[0].rpartition(".")[2] == "lm_head"
+    }
+
+    # Component suffix -> the prefixes it appears under, so a text key can be looked up.
+    by_suffix = {}
+    for key in base_keys:
+        parts = key.split(".")
+        for i in range(len(parts)):
+            by_suffix.setdefault(".".join(parts[i:]), set()).add(".".join(parts[:i] + [""]) if i else "")
+    pass
+
+    candidates = None
+    for key in text_keys - base_keys - tied:
+        parts = key.split(".")
+        options = set()
+        for i in range(len(parts)):
+            text_prefix = ".".join(parts[:i] + [""]) if i else ""
+            for base_prefix in by_suffix.get(".".join(parts[i:]), ()):
+                if base_prefix != text_prefix: options.add((text_prefix, base_prefix))
+        pass
+        if not options:
+            raise TextOnlyRemapError(f"no tensor in the base checkpoint corresponds to `{key}`")
+        candidates = options if candidates is None else (candidates & options)
+        if not candidates:
+            raise TextOnlyRemapError(
+                "the text weights are not under one common prefix in the base checkpoint"
+            )
+    pass
+    if candidates is None:
+        # Nothing to strip, so dropping by this map would be a no-op the caller must not run.
+        raise TextOnlyRemapError("the base checkpoint is already text-only")
+
+    def _build(text_prefix, base_prefix):
+        key_map = {}
+        for key in text_keys:
+            if text_prefix and not key.startswith(text_prefix): candidate = key
+            else: candidate = base_prefix + key[len(text_prefix):]
+            if candidate in base_keys: key_map[key] = candidate
+            elif key not in tied: return None
+        return key_map
+    pass
+
+    # Several prefix pairs can describe the same rewrite (a longer text prefix against a
+    # correspondingly longer base one). That is harmless while they agree; disagreeing means
+    # the checkpoint admits two readings and guessing between them is how #969 happened.
+    resolved = []
+    for text_prefix, base_prefix in sorted(candidates):
+        key_map = _build(text_prefix, base_prefix)
+        if key_map is not None and key_map not in resolved: resolved.append(key_map)
+    pass
+    if not resolved:
+        raise TextOnlyRemapError("no prefix places every text tensor in the base checkpoint")
+    if len(resolved) != 1:
+        raise TextOnlyRemapError("the base checkpoint admits more than one text-weight prefix")
+    return resolved[0]
+pass
+
+
+def _text_only_expected_keys(config):
+    """The keys a reload of the exported text config will look for.
+
+    Built from `config` rather than from the model in memory because `config` is what gets
+    written, so this is the reload contract itself: whatever `AutoModelForCausalLM` builds
+    from the saved config is exactly the set of tensors that must be on disk. Meta device,
+    so no weights are allocated.
+    """
+    from transformers import AutoModelForCausalLM
+    with torch.device("meta"):
+        text_model = AutoModelForCausalLM.from_config(config)
+    return set(text_model.state_dict().keys()), text_model.__class__.__name__
+pass
+
+
+def _shard_keys_on_disk(save_directory, filenames):
+    keys = set()
+    for filename in filenames:
+        file_path = os.path.join(save_directory, filename)
+        if not os.path.exists(file_path): continue
+        with safe_open(file_path, framework = "pt", device = "cpu") as f:
+            keys.update(f.keys())
+    return keys
+pass
+
+
+def _rewrite_shards_text_only(save_directory, filenames, key_map):
+    """Rewrite each shard to hold only the text tensors, under their text-only names.
+
+    One shard is read at a time, which is the same working set as `split_safetensors_to_shards`
+    already uses on this path. A shard that was pure vision or pure audio keeps nothing and is
+    deleted outright, which is where most of the size saving comes from.
+    """
+    to_text_key = {base_key : text_key for text_key, base_key in key_map.items()}
+    kept_files = []
+    for filename in filenames:
+        file_path = os.path.join(save_directory, filename)
+        if not os.path.exists(file_path): continue
+        tensors = OrderedDict()
+        with safe_open(file_path, framework = "pt", device = "cpu") as f:
+            for key in f.keys():
+                text_key = to_text_key.get(key)
+                if text_key is not None: tensors[text_key] = f.get_tensor(key)
+        pass
+        if not tensors:
+            os.remove(file_path)
+            continue
+        temp_path = file_path + ".text_only"
+        save_file(tensors, temp_path, metadata = {"format" : "pt"})
+        del tensors
+        os.replace(temp_path, file_path)
+        kept_files.append(filename)
+    pass
+    return kept_files
+pass
+
+
+def _write_text_only_index(save_directory, filenames):
+    """Point the index at the surviving shards, or remove it when a single file is left.
+
+    A stale index is not a cosmetic problem: it still lists the vision keys and the shard
+    names from before the drop, so the reload it drives fails on files that no longer exist.
+    """
+    index_path = os.path.join(save_directory, "model.safetensors.index.json")
+    if len(filenames) <= 1:
+        if os.path.exists(index_path): os.remove(index_path)
+        return None
+    weight_map = {}
+    for filename in filenames:
+        file_path = os.path.join(save_directory, filename)
+        with safe_open(file_path, framework = "pt", device = "cpu") as f:
+            for key in f.keys(): weight_map[key] = filename
+    pass
+    # Same shape the dequant/split path writes at Step 6, empty metadata included.
+    with open(index_path, "w", encoding = "utf-8") as f:
+        json.dump({"metadata" : {}, "weight_map" : weight_map}, f, indent = 4)
+    return index_path
+pass
+
+
+def _export_text_only_config(save_directory, config, architecture):
+    """Write the text config the dropped weights now match, naming its architecture.
+
+    #969 saw `architectures: null` beside the text config, so an `AutoModel` load had only
+    `model_type` to go on. The class is known here because the expected key set was built
+    from it, so say so. The config is copied first: this is a save path and must not leave
+    the caller's live model carrying an architecture it did not have.
+    """
+    import copy
+    text_config = copy.deepcopy(config)
+    text_config.architectures = [architecture]
+    text_config.save_pretrained(save_directory)
+    _remove_quantization_config(config_path = Path(save_directory) / "config.json")
+    _remove_transformers_version(config_path = Path(save_directory) / "config.json")
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -3295,6 +3502,7 @@ def merge_and_overwrite_lora(
 
     # Default handle 16 bit merge and save/push
     # Step 1: Save base model config/architecture (no weights needed here)
+    _text_only_base_config = None
     if save_method == "merged_16bit":
         # `config` is `model.config`, already the nested text config under `text_only = True`,
         # while the weights come from `model_name` and keep their VLM prefixes. Saving it wrote
@@ -3316,6 +3524,10 @@ def merge_and_overwrite_lora(
             base_config = config
         else:
             _carry_over_vocab_size(base_config, config)
+        # Kept for the text-only drop after the merge, which needs to know the weights came
+        # from a composite checkpoint. The `except` above sets this to `config` itself, and
+        # `_is_text_only_export` reads that as "not composite", which is right.
+        _text_only_base_config = base_config
         base_config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
@@ -3661,6 +3873,72 @@ def merge_and_overwrite_lora(
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")
+
+    # `text_only = True` asked for a text model. #1073 made the export loadable by declaring
+    # the VLM architecture the weights actually carry; this brings the weights to the request
+    # instead, dropping the vision and audio tensors and renaming what is left into the
+    # text-only namespace, so the checkpoint is the model that was asked for (#969, second
+    # direction). How much smaller that makes it is entirely the model's business: it is 10%
+    # off gemma-3-4b-it, whose SigLIP tower is small next to the decoder, and far more off an
+    # omni model carrying audio and speech stacks. Anything that cannot be mapped leaves the
+    # export exactly as #1073 writes it.
+    if save_method == "merged_16bit" and _is_text_only_export(config, _text_only_base_config):
+        if low_disk_space_usage and push_to_hub:
+            warnings.warn(
+                "Unsloth: keeping the vision/audio tensors in this `text_only` export, "
+                "because `low_disk_space_usage` uploads and deletes each shard inside the "
+                "merge loop, so there is nothing left on disk here to read the text weights "
+                "out of. The checkpoint is correct, just larger than asked for (#969)."
+            )
+        else:
+            _text_only_key_plan = None
+            _text_only_before = _shard_keys_on_disk(save_directory, final_safetensors_list)
+            try:
+                _text_only_keys, _text_only_architecture = _text_only_expected_keys(config)
+                _text_only_key_plan = _text_only_key_map(
+                    _text_only_keys, _text_only_before,
+                    tie_word_embeddings = _merge_tie_word_embeddings,
+                )
+            except Exception as text_only_error:
+                # Degrade to the #1073 export rather than write weights we could not place.
+                warnings.warn(
+                    f"Unsloth: could not separate the text weights of `{model_name}` "
+                    f"({text_only_error}). Keeping the full checkpoint and its own config, "
+                    f"which reloads correctly but carries the vision/audio tensors that "
+                    f"`text_only = True` asked to skip (#969)."
+                )
+            pass
+            if _text_only_key_plan is not None:
+                _kept_files = _rewrite_shards_text_only(
+                    save_directory, final_safetensors_list, _text_only_key_plan,
+                )
+                final_safetensors_list = renumber_safetensor_files(_kept_files, save_directory)
+                # The bug this follows from was silent, so prove the drop landed instead of
+                # trusting it: what is on disk now must be the mapped set exactly.
+                _written = _shard_keys_on_disk(save_directory, final_safetensors_list)
+                _expected = set(_text_only_key_plan)
+                if _written != _expected:
+                    raise RuntimeError(
+                        f"Unsloth: the text_only export wrote {len(_written)} tensor(s) but "
+                        f"its config describes {len(_expected)}. Missing: "
+                        f"{sorted(_expected - _written)[:4]}. Unexpected: "
+                        f"{sorted(_written - _expected)[:4]}. The shards in "
+                        f"`{save_directory}` have already been rewritten, so delete it and "
+                        f"merge again rather than loading it. Please file a bug report!"
+                    )
+                _write_text_only_index(save_directory, final_safetensors_list)
+                _export_text_only_config(save_directory, config, _text_only_architecture)
+                # Step 7 uploads by name, and the names just changed.
+                safetensors_list = final_safetensors_list
+                print(
+                    f"Unsloth: text_only export dropped "
+                    f"{len(_text_only_before) - len(_written)} vision/audio "
+                    f"tensor(s) and kept {len(_written)} as {_text_only_architecture}."
+                )
+                if push_to_hub: upload_items("config.json")
+            pass
+        pass
+    pass
 
     # Step 7: Final upload of all shards if not using low disk space mode and pushing
     if not low_disk_space_usage and push_to_hub:
