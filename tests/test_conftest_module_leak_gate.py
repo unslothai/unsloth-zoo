@@ -72,3 +72,42 @@ def test_a_module_with_no_file_is_not_reported():
     # A namespace package or a bare ModuleType substitute: nothing to go stale.
     assert not _is_from_pytest_tmp(_module(None))
     assert not _is_from_pytest_tmp(None)
+
+
+# The other half of the gate: the bitsandbytes names, where a bare ModuleType is the
+# thing being watched for. unsloth_zoo mints exactly such a module on Apple Silicon,
+# which made the first test importing anything bitsandbytes-adjacent fail at teardown
+# on macOS while passing everywhere a real wheel exists (unsloth-zoo#1217's macOS leg:
+# "84 passed, 1 error", the error being test_guard_is_present_and_mirrors_the_stock
+# _predicate leaving bitsandbytes.nn behind).
+
+from conftest import _GUARDED_MODULES, _is_module_stub, _is_unsloth_stub
+
+
+def _stub_module(name, marked):
+    module = types.ModuleType(name)
+    if marked:
+        module.IS_UNSLOTH_STUB = True
+    return module
+
+
+def test_the_bitsandbytes_names_are_guarded():
+    assert "bitsandbytes.nn" in _GUARDED_MODULES
+
+
+def test_the_zoo_stub_is_not_a_leak():
+    stub = _stub_module("bitsandbytes.nn", marked = True)
+    # It is a bare ModuleType, so the file test alone cannot tell it from a swap.
+    assert _is_module_stub(stub)
+    assert _is_unsloth_stub(stub)
+
+
+def test_an_unmarked_substitute_is_still_a_leak():
+    """The narrowing must not swallow the case the gate exists for: a test that drops
+    its own hand rolled bitsandbytes.functional in and leaves it there."""
+    assert not _is_unsloth_stub(_stub_module("bitsandbytes.functional", marked = False))
+    assert not _is_unsloth_stub(None)
+
+
+def test_the_real_wheel_is_not_a_stub():
+    assert not _is_unsloth_stub(_module("/usr/lib/python3/bitsandbytes/nn/__init__.py"))
