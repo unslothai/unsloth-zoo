@@ -266,22 +266,6 @@
       "reason": "`model_location` is built from `model_type`, re-validated against [a-z0-9_]+ at the top of this function (see PR #1083); `module` / `check` / `key` come from dir() of the imported modeling file or from class and dict regexes over its inspect.getsource. Nothing here is read from a downloaded config or checkpoint."
     },
     {
-      "path": "unsloth_zoo/llama_cpp.py",
-      "qualname": "_assert_correct_gguf",
-      "sink": "exec",
-      "kind": "f-string via `source`",
-      "hash": "3725bba562bb6fff",
-      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
-    },
-    {
-      "path": "unsloth_zoo/llama_cpp.py",
-      "qualname": "_assert_correct_gguf",
-      "sink": "exec",
-      "kind": "f-string via `functions`",
-      "hash": "7330700d494b9249",
-      "reason": "Both operands are self-generated from the INSTALLED gguf package: `source` is inspect.getsource(GGUFReader.__init__) with one literal edit, and `functions` is dir(gguf.gguf_reader) filtered to names that appear in that source. Nothing downloaded or user supplied reaches either."
-    },
-    {
       "path": "unsloth_zoo/patching_utils.py",
       "qualname": "<module>",
       "sink": "exec",
