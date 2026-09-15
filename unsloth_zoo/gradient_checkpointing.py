@@ -25,6 +25,10 @@ import warnings
 import gc
 import threading
 from .utils import _get_dtype, Version
+# _any_device_integrated lives in integrated_device.py so the import-time allocator
+# block in __init__.py can share the topic without importing torch. Re-exported
+# under this name because that is where it was defined and where it is read from.
+from .integrated_device import _any_device_integrated
 from .device_type import (
     is_hip,
     get_device_type,
@@ -57,19 +61,6 @@ INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
-
-
-def _any_device_integrated():
-    # True if ANY visible CUDA/HIP device is integrated (unified memory). A single
-    # static check on purpose: an integrated device anywhere makes double buffering
-    # pure overhead, and a mixed integrated + discrete box is rare.
-    try:
-        return any(
-            bool(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0))
-            for i in range(torch.cuda.device_count())
-        )
-    except Exception:
-        return False
 
 
 @functools.cache
