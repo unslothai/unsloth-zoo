@@ -628,3 +628,332 @@ def test_the_gate_rejects_the_hardcoded_indent_failure_mode():
         b"            n_experts = self.hparams.get('num_experts', None)\n"
     )
     assert module._patched_content_parses(broken) is False
+
+
+# ---------------------------------------------------------------------------
+# Verification pass: a target line with a trailer, and the staged fallback
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "trailer",
+    [b"  ", b"\t", b"  # noqa", b"  # keep this comment", b" #x"],
+)
+def test_num_experts_patch_keeps_a_trailing_comment_or_spaces(trailer):
+    """The old unanchored regex patched the statement wherever it appeared, so a
+    checkout whose target line carries trailing spaces or an inline comment was
+    patched too. Anchoring the pattern on the whole line must not lose those
+    files: the trailer is preserved and the patch still applies."""
+    import ast
+
+    module = _load_llama_cpp_module()
+    source = (
+        b"class Model:\n"
+        b"    def set_gguf_parameters(self):\n"
+        b'        n_experts = self.hparams["num_experts"]' + trailer + b"\n"
+        b"        return n_experts\n"
+    )
+    patched, applied = module._patch_num_experts(source)
+
+    assert applied, source
+    ast.parse(patched)
+    assert b"num_local_experts" in patched
+    assert trailer.strip() in patched or not trailer.strip()
+    assert b"        return n_experts\n" in patched
+
+
+def test_num_experts_patch_ignores_a_commented_out_target():
+    """A commented-out target must stay a comment, not become a statement."""
+    module = _load_llama_cpp_module()
+    source = b'class Model:\n    # n_experts = self.hparams["num_experts"]\n    pass\n'
+    patched, applied = module._patch_num_experts(source)
+    assert not applied
+    assert patched == source
+
+
+def _stage_list(*pairs):
+    return list(pairs)
+
+
+def test_choose_content_keeps_the_fully_patched_content_when_it_parses():
+    module = _load_llama_cpp_module()
+    label, content, dropped = module._choose_content_to_write(
+        _stage_list(("base", b"x = 1\n"), ("p1", b"x = 1\ny = 2\n"), ("p2", b"x = 1\ny = 2\nz = 3\n"))
+    )
+    assert (label, dropped) == ("p2", [])
+    assert content == b"x = 1\ny = 2\nz = 3\n"
+
+
+def test_choose_content_drops_only_the_patch_that_broke_the_file():
+    module = _load_llama_cpp_module()
+    label, content, dropped = module._choose_content_to_write(
+        _stage_list(("base", b"x = 1\n"), ("p1", b"x = 1\ny = 2\n"), ("p2", b"x = 1\ny = 2\n   oops(\n"))
+    )
+    assert label == "p1"
+    assert dropped == ["p2"]
+    assert content == b"x = 1\ny = 2\n"
+
+
+def test_choose_content_falls_back_to_the_original_when_the_first_patch_broke_it():
+    module = _load_llama_cpp_module()
+    label, content, dropped = module._choose_content_to_write(
+        _stage_list(("base", b"x = 1\n"), ("p1", b"x = 1\n  oops(\n"), ("p2", b"x = 1\n  oops(\ny = 2\n"))
+    )
+    assert label == "base"
+    assert dropped == ["p1", "p2"]
+    assert content == b"x = 1\n"
+
+
+def test_choose_content_does_not_blame_our_patches_when_upstream_needs_a_newer_python():
+    """If the untouched converter does not parse on the running interpreter (for
+    instance upstream adopting syntax newer than this Python), dropping our
+    patches fixes nothing and would silently disable them. Keep them."""
+    module = _load_llama_cpp_module()
+    broken_base = b"class C[T]:\n    pass\n" if sys.version_info < (3, 12) else b"def f(:\n"
+    stages = _stage_list(("base", broken_base), ("p1", broken_base + b"x = 1\n"))
+    label, content, dropped = module._choose_content_to_write(stages)
+    assert label == "p1"
+    assert dropped == []
+    assert content == stages[-1][1]
+
+
+def test_choose_content_reports_no_drops_when_no_patch_applied():
+    module = _load_llama_cpp_module()
+    same = b"x = 1\n"
+    label, content, dropped = module._choose_content_to_write(
+        _stage_list(("base", same), ("p1", same))
+    )
+    assert dropped == []
+    assert content == same
+
+
+# --- end to end through the patcher, monolith layout -----------------------
+
+_MONOLITH_HEAD = b"""\
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+from pathlib import Path
+
+if 'NO_LOCAL_GGUF' not in os.environ:
+    sys.path.insert(1, str(Path(__file__).parent / 'gguf-py'))
+import gguf
+
+logger = None
+
+
+class ModelBase:
+    def prepare_metadata(self):
+        self.metadata = gguf.Metadata.load(None, None, None, None)
+        return self.metadata
+
+
+class TextModel(ModelBase):
+    model_arch = gguf.MODEL_ARCH.LLAMA
+
+
+@ModelBase.register("LlamaForCausalLM")
+class LlamaModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.LLAMA
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model")
+    parser.add_argument("--outfile", default=None)
+    parser.add_argument("--outtype", default="f16")
+    parser.add_argument("--vocab-only", action="store_true")
+    return parser.parse_args()
+"""
+
+
+def _monolith_with_num_experts(indent, trailer = b""):
+    body = (
+        b"\n\n@ModelBase.register(\"Qwen3MoeForCausalLM\")\n"
+        b"class Qwen3MoeModel(TextModel):\n"
+        b"    class Inner:\n"
+        b"        def modify_tensors(self):\n"
+        + b" " * indent + b"n_experts = self.hparams[\"num_experts\"]" + trailer + b"\n"
+        + b" " * indent + b"return n_experts\n"
+    )
+    return _MONOLITH_HEAD + body
+
+
+def _drive_patcher(llama_cpp, tmp_path, monkeypatch, source, name = "convert_hf_to_gguf"):
+    root = tmp_path / "llama_cpp_monolith"
+    root.mkdir(exist_ok = True)
+    (root / f"{name}.py").write_bytes(source)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(root))
+    out_dir = tmp_path / "patched_out"
+    out_dir.mkdir(exist_ok = True)
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(out_dir))
+    llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        patched_path, text_archs, vision_archs = llama_cpp._download_convert_hf_to_gguf(name)
+    finally:
+        llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
+    return Path(patched_path).read_bytes(), text_archs
+
+
+@pytest.mark.parametrize("indent", [12, 16])
+@pytest.mark.parametrize("trailer", [b"", b"  # inline"])
+def test_end_to_end_monolith_patch_is_written_and_parses(tmp_path, monkeypatch, indent, trailer):
+    """Drive the whole patcher over a monolith converter whose target sits at a
+    depth the old hardcoded replacement could not produce. The file that lands on
+    disk must parse and must carry the alias patch."""
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+    written, text_archs = _drive_patcher(
+        llama_cpp, tmp_path, monkeypatch, _monolith_with_num_experts(indent, trailer)
+    )
+    ast.parse(written)
+    assert b"num_local_experts" in written
+    assert b" " * indent + b"n_experts = self.hparams.get(" in written
+    assert b"self.metadata.quantized_by = 'Unsloth'" in written
+    assert "LlamaForCausalLM" in text_archs
+
+
+def test_end_to_end_keeps_earlier_patches_when_the_last_one_breaks_the_file(tmp_path, monkeypatch):
+    """A broken num_experts patch must not cost the gguf guards and the branding."""
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+
+    def _broken(content):
+        return content + b"\n   this is not python(\n", True
+    monkeypatch.setattr(llama_cpp, "_patch_num_experts", _broken)
+
+    written, _ = _drive_patcher(
+        llama_cpp, tmp_path, monkeypatch, _monolith_with_num_experts(12)
+    )
+    ast.parse(written)
+    assert b"this is not python(" not in written
+    assert b"self.metadata.quantized_by = 'Unsloth'" in written
+    assert b"try: gguf.MODEL_ARCH" in written
+
+
+def test_end_to_end_writes_the_original_when_every_patch_stage_is_broken(tmp_path, monkeypatch):
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+    source = _monolith_with_num_experts(12)
+
+    def _broken_first(content, *args, **kwargs):
+        return content + b"\n  not python(\n"
+    # Break the very first patch stage: everything after it inherits the breakage.
+    monkeypatch.setattr(llama_cpp.re, "sub", lambda *a, **k: _broken_first(a[2]))
+
+    written, _ = _drive_patcher(llama_cpp, tmp_path, monkeypatch, source)
+    ast.parse(written)
+    assert written == source
+
+
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
+def test_end_to_end_crlf_and_bom_monolith(tmp_path, monkeypatch, prefix):
+    """A Windows checkout: CRLF throughout, optionally with a utf-8 BOM. The
+    written converter must parse and must not gain a lone LF."""
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+    source = prefix + _monolith_with_num_experts(12).replace(b"\n", b"\r\n")
+    written, _ = _drive_patcher(llama_cpp, tmp_path, monkeypatch, source)
+    ast.parse(written)
+    assert b"num_local_experts" in written
+    assert written.startswith(prefix) if prefix else True
+    inserted = [line for line in written.split(b"\r\n") if b"num_local_experts" in line]
+    assert inserted, written
+    assert b"\n" not in written.replace(b"\r\n", b"")
+
+
+# --- network: the real monolith converter from a pinned upstream tag --------
+
+@pytest.fixture
+def real_monolith_converter(tmp_path):
+    """The real pre-package convert_hf_to_gguf.py from a pinned llama.cpp tag.
+    b4600 is a monolith whose two Qwen MoE sites use the patched spelling."""
+    requests = pytest.importorskip("requests")
+    url = "https://raw.githubusercontent.com/ggml-org/llama.cpp/b4600/convert_hf_to_gguf.py"
+    try:
+        response = requests.get(url, timeout = 30)
+    except requests.exceptions.RequestException as exc:
+        pytest.skip(f"network unreachable: {exc}")
+    if response.status_code in (403, 429, 503):
+        pytest.skip(f"upstream rate-limited / unavailable: HTTP {response.status_code}")
+    if response.status_code != 200:
+        pytest.skip(f"upstream missing the pinned converter: HTTP {response.status_code}")
+    if b'n_experts = self.hparams["num_experts"]' not in response.content:
+        pytest.skip("pinned converter no longer contains the patch target")
+    return response.content
+
+
+def test_real_monolith_converter_patch_applies_to_every_site(real_monolith_converter):
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+    expected = real_monolith_converter.count(b'n_experts = self.hparams["num_experts"]')
+    patched, applied = llama_cpp._patch_num_experts(real_monolith_converter)
+
+    assert applied
+    ast.parse(patched)
+    assert patched.count(b"or self.hparams.get('num_local_experts')") == expected
+    assert b'n_experts = self.hparams["num_experts"]\n' not in patched
+    # Indentation of every rewritten site is the one the file used (12 spaces).
+    for line in patched.split(b"\n"):
+        if b"or self.hparams.get('num_local_experts')" in line:
+            assert line.startswith(b" " * 12) and not line.startswith(b" " * 13), line
+
+
+def test_real_monolith_converter_patch_survives_a_crlf_checkout(real_monolith_converter):
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+    crlf = real_monolith_converter.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    patched, applied = llama_cpp._patch_num_experts(crlf)
+
+    assert applied
+    ast.parse(patched)
+    assert b"\n" not in patched.replace(b"\r\n", b"")
+
+
+# --- line endings of the inserted lines -------------------------------------
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        (b"a = 1\nb = 2\n", b"\n"),
+        (b"a = 1\r\nb = 2\r\n", b"\r\n"),
+        (b"", b"\n"),
+        (b"a = 1", b"\n"),
+        # Mixed, majority wins.
+        (b"a\r\nb\r\nc\n", b"\r\n"),
+        (b"a\nb\nc\r\n", b"\n"),
+    ],
+)
+def test_dominant_newline(content, expected):
+    module = _load_llama_cpp_module()
+    assert module._dominant_newline(content) == expected
+
+
+def test_branding_patch_on_a_crlf_base_py_stays_crlf(tmp_path):
+    """conversion/base.py in a Windows checkout is CRLF. The branding lines we
+    insert must use the same ending, not a bare LF."""
+    module = _load_llama_cpp_module()
+    base_py = tmp_path / "base.py"
+    base_py.write_bytes(_PACKAGE_BASE_PY.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+
+    assert module._apply_branding_patch_to_base(str(base_py)) == "applied"
+    content = base_py.read_bytes()
+    assert b"self.metadata.quantized_by = 'Unsloth'" in content
+    assert b"\n" not in content.replace(b"\r\n", b"")
+    assert module._apply_branding_patch_to_base(str(base_py)) == "already-applied"
+
+
+def test_gguf_attribute_patch_keeps_the_blank_lines_after_the_import(tmp_path, monkeypatch):
+    """The guards go straight after `import gguf`; the lines that followed it stay
+    where they were."""
+    module = _load_llama_cpp_module()
+    source = _MONOLITH_HEAD.replace(b"import gguf\n", b"import gguf\n\n\n") + b"\n"
+    written, _ = _drive_patcher(module, tmp_path, monkeypatch, source)
+    assert b"try: gguf.MODEL_ARCH" in written
+    assert b"\n\n\nlogger = None" in written

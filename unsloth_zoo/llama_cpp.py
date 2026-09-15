@@ -1790,6 +1790,21 @@ def _extract_dict_keys_from_conversion_init(conv_init_path, dict_name):
 pass
 
 
+def _dominant_newline(content):
+    """The line ending the file mostly uses, b"\r\n" or b"\n".
+
+    Every patch below inserts whole lines into somebody else's checkout. A
+    Windows checkout of llama.cpp is CRLF throughout, so inserting bare LF lines
+    leaves a mixed-ending converter (Python runs it, but nothing else in that
+    tree looks like that, and a later diff or a CRLF-only editor shows the seam).
+    Counting is enough: a lone CR is not a line ending in any Python 3 source."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    crlf = content.count(b"\r\n")
+    if crlf == 0: return b"\n"
+    return b"\r\n" if crlf >= (content.count(b"\n") - crlf) else b"\n"
+pass
+
+
 def _apply_branding_patch_to_base(conv_base_path):
     """Insert Unsloth metadata branding after `self.metadata = gguf.Metadata.load(...)`
     in conversion/base.py (idempotent via a one-line marker).
@@ -1802,15 +1817,17 @@ def _apply_branding_patch_to_base(conv_base_path):
     if _UNSLOTH_BRANDING_MARKER in content:
         return "already-applied"
 
+    eol = _dominant_newline(content)
+
     def _replace(match):
         load_call = match.group(1)
         suffix    = match.group(2)   # already starts with newline + indent
         indent    = match.group(3)
         return (
-            load_call + b"\n"
-            + indent + _UNSLOTH_BRANDING_MARKER + b"\n"
-            + indent + b"if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
-            + indent + b"if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
+            load_call + eol
+            + indent + _UNSLOTH_BRANDING_MARKER + eol
+            + indent + b"if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'" + eol
+            + indent + b"if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'" + eol
             + indent + b"if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']"
             + suffix
         )
@@ -1828,7 +1845,8 @@ pass
 
 
 _NUM_EXPERTS_PATTERN = re.compile(
-    rb'^([ \t]*)n_experts = self\.hparams\[(["\'])num_experts\2\](\r?\n|$)',
+    rb'^([ \t]*)n_experts = self\.hparams\[(["\'])num_experts\2\]'
+    rb'([ \t]*(?:\#[^\r\n]*)?)(\r?\n|$)',
     re.MULTILINE,
 )
 
@@ -1842,14 +1860,17 @@ def _patch_num_experts(content):
     and it reuses the captured line ending so a CRLF checkout stays CRLF.
     Returns (new_content, applied)."""
     def _replace(match):
-        indent, newline = match.group(1), match.group(3)
+        indent, trailer, newline = match.group(1), match.group(3), match.group(4)
         # A match on the last line of a file with no trailing newline still needs
         # one between the comment and the statement.
         eol = newline or b"\n"
+        # `trailer` is the trailing spaces or inline comment that followed the
+        # statement. The old unanchored regex left it in place, so keep it: a
+        # checkout that carries one still gets patched instead of silently not.
         return (
             indent + b"# Qwen3MoE seems to use num_local_experts instead of num_experts" + eol +
             indent + b"n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')" +
-            newline
+            trailer + newline
         )
     new_content = _NUM_EXPERTS_PATTERN.sub(_replace, content)
     return new_content, (new_content != content)
@@ -1866,8 +1887,45 @@ def _patched_content_parses(content):
     try:
         ast.parse(content)
         return True
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError):
+        # RecursionError: ast.parse recurses over nested expressions, so a
+        # pathological converter can exhaust the stack instead of reporting a
+        # syntax problem. Treat that as "cannot vouch for this content" too.
         return False
+pass
+
+
+def _choose_content_to_write(stages):
+    """Pick the most patched converter content that is still valid Python.
+
+    `stages` is [(label, content), ...] oldest first, starting with the
+    untouched upstream script. Returns (label, content, dropped_labels).
+
+    Two rules, both from the failure this guards against:
+      * Only blame our own patches. If the untouched script does not parse on
+        this interpreter (upstream adopting syntax newer than the running
+        Python), every stage fails the check and dropping our patches would fix
+        nothing, so keep the fully patched content.
+      * Drop the fewest patches possible. Walking back one stage at a time
+        keeps the earlier patches (gguf attribute guards, metadata branding)
+        when it is a later one that broke the file."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    base_label, base_content = stages[0]
+    final_label, final_content = stages[-1]
+    if final_content == base_content:
+        return final_label, final_content, []
+    if _patched_content_parses(final_content):
+        return final_label, final_content, []
+    if not _patched_content_parses(base_content):
+        return final_label, final_content, []
+    for index in range(len(stages) - 2, -1, -1):
+        label, content = stages[index]
+        if _patched_content_parses(content):
+            dropped = [name for name, _ in stages[index + 1:]]
+            return label, content, dropped
+        pass
+    pass
+    return base_label, base_content, [name for name, _ in stages[1:]]
 pass
 
 
@@ -2009,6 +2067,10 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
     # --- Proceed with patching and saving ---
     try:
         patched_content = original_content # Start patching from original
+        # Snapshot after every patch so a patch that breaks the file can be
+        # dropped on its own instead of discarding the others (see
+        # _choose_content_to_write).
+        _patch_stages = [("unpatched upstream script", original_content)]
 
         # 3. Apply Patches (gguf attributes, metadata branding - same logic as before)
         logger.info("Unsloth: Applying patches...")
@@ -2017,11 +2079,16 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
             archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", patched_content)))
             archs = [x.decode("utf-8") for x in archs if not x.startswith(b"_")]
             if archs:
-                all_edits = "\n".join(f"try: gguf.{x}\nexcept AttributeError: gguf.{x} = None" for x in archs).encode("utf-8")
-                patched_content = re.sub(rb"(import gguf\s*\n)", rb"\1" + all_edits + b"\n\n", patched_content, count=1)
+                _eol = _dominant_newline(patched_content)
+                _eol_text = _eol.decode("utf-8")
+                all_edits = _eol_text.join(
+                    f"try: gguf.{x}{_eol_text}except AttributeError: gguf.{x} = None" for x in archs
+                ).encode("utf-8")
+                patched_content = re.sub(rb"(import gguf[ \t]*\r?\n)", rb"\1" + all_edits + _eol + _eol, patched_content, count=1)
                 if original_content == patched_content and archs: logger.warning("Unsloth: gguf attribute patch did not seem to apply.")
             else: logger.info("Unsloth: No specific gguf attributes found to patch.")
         except Exception as e: logger.error(f"Unsloth: Error applying gguf attribute patch: {e}", exc_info=True); raise
+        _patch_stages.append(("gguf attribute guards", patched_content))
 
 
 
@@ -2045,12 +2112,13 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     )
             else:
                 metadata_patch_applied = False
+                _eol = _dominant_newline(patched_content)
                 new_patched_content = re.sub(
                     rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
-                    rb"\1\n"
-                    rb"\3if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
-                    rb"\3if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
-                    rb"\3if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"
+                    rb"\1" + _eol +
+                    rb"\3if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'" + _eol +
+                    rb"\3if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'" + _eol +
+                    rb"\3if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']" + _eol +
                     rb"\2",
                     patched_content, count=1, flags=re.MULTILINE
                 )
@@ -2059,6 +2127,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                      if re.search(rb"self\.metadata \= gguf\.Metadata\.load\(", patched_content): logger.warning("Unsloth: Metadata branding patch target found, but regex failed to apply.")
                      else: logger.warning("Unsloth: Metadata branding patch target 'self.metadata = gguf.Metadata.load(...)' not found.")
         except Exception as e: logger.error(f"Unsloth: Error applying metadata branding patch: {e}", exc_info=True); raise
+        _patch_stages.append(("metadata branding", patched_content))
 
 
         # Patch 3: Qwen2MoE / Qwen3MoE num_experts fix.
@@ -2088,6 +2157,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         except Exception as e:
             logger.error(f"Unsloth: Error applying Qwen2MoE num_experts patch: {e}", exc_info=True)
             raise
+        _patch_stages.append(("Qwen2MoE num_experts alias", patched_content))
 
 
         # 4. Write Patched File
@@ -2097,14 +2167,18 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         os.makedirs(patched_dir, exist_ok=True)
         patched_filename = os.path.join(patched_dir, f"{name}.py")
 
-        # Never write a converter we just broke: fall back to the untouched upstream
-        # script rather than failing later with an IndentationError far from the cause.
-        if patched_content != original_content and not _patched_content_parses(patched_content):
+        # Never write a converter we just broke: fall back to the last content that
+        # still parses rather than failing later with an IndentationError far from
+        # the cause.
+        _kept_label, _kept_content, _dropped_labels = _choose_content_to_write(_patch_stages)
+        if _dropped_labels:
             logger.warning(
-                "Unsloth: Patched converter script is not valid Python - "
-                "falling back to the unpatched upstream script."
+                f"Unsloth: Patched converter script is not valid Python - dropping "
+                f"{', '.join(_dropped_labels)} and writing the content after "
+                f"{_kept_label} instead."
             )
-            patched_content = original_content
+            patched_content = _kept_content
+        pass
 
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
