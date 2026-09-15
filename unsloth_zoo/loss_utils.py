@@ -365,17 +365,23 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     #     5.17.0's self._loss_shifts_labels. This is patched onto the base Trainer
     #     class, so classification and seq2seq subclasses inherit it too, and their
     #     labels mean something else. They raise here, or come back quietly short.
-    # The two guards differ in width on purpose. is_non_causal_head gates both routes
-    # (no causal or VLM class carries these substrings, and their count is always
-    # wrong). is_encoder_decoder gates only the new route, so Whisper and Florence2
-    # keep the count they get today rather than being rescaled by this change.
+    # The guards differ in width on purpose. is_non_causal_head gates both routes (no
+    # causal or VLM class carries these substrings, and their count is always wrong).
+    # is_encoder_decoder and token_aligned gate only the new route, so Whisper and
+    # Florence2 keep the count they get today rather than being rescaled by this change.
     # No .ndim means no tensor ops, and a plain list would hit the except below and
     # kill the run; stock swallows it and trains on. numpy has .ndim, so it still counts.
-    labels_are_countable = getattr(
-        batch_samples[0].get("labels") if len(batch_samples) > 0 else None, "ndim", None,
-    ) is not None
+    first = batch_samples[0] if len(batch_samples) > 0 else {}
+    labels_0 = first.get("labels")
+    labels_are_countable = getattr(labels_0, "ndim", None) is not None
+    # Positive signal for the new route: labels must line up with a token sequence of
+    # the same rank. A suffix blacklist cannot see ViTForImageClassification or
+    # *ForSemanticSegmentation, which carry pixel_values and no attention_mask, so
+    # nothing below would flag them and N image labels would count as N-1.
+    token_aligned = labels_are_countable \
+        and getattr(first.get("input_ids"), "ndim", None) == labels_0.ndim
     if (not is_non_causal_head) and labels_are_countable \
-            and (has_kwargs or (not is_encoder_decoder
+            and (has_kwargs or (token_aligned and not is_encoder_decoder
                                 and getattr(self, "compute_loss_func", None) is not None)):
         try:
             token_counts = []

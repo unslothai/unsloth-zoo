@@ -449,6 +449,37 @@ def test_numpy_labels_still_count():
     assert count is not None and int(count) == 10, f"numpy labels stopped counting: {count}"
 
 
+@pytest.mark.parametrize("head, labels_shape, expected_true_count", [
+    ("ViTForImageClassification", (4,), 4),              # one label per image
+    ("SegformerForSemanticSegmentation", (2, 8, 8), 128),  # one label per pixel
+])
+def test_vision_heads_carry_no_input_ids_so_nothing_else_flags_them(
+    head, labels_shape, expected_true_count,
+):
+    """Why the new route needs a positive signal, not a list of excluded suffixes.
+
+    A vision batch is pixel_values plus labels: no input_ids and no attention_mask, so
+    every shape check below is skipped and labels[..., 1:] quietly drops one entry per
+    row. Counted 3 of 4 images, and 112 of 128 pixels, before token_aligned.
+    """
+    torch = pytest.importorskip("torch")
+    import torch.nn as nn
+    mod = _loss_utils()
+    mod.ALLOWED_NUM_ITEMS_IN_BATCH.clear()
+
+    cls = type(head, (nn.Module,), {"forward": lambda self, pixel_values, **kw: None})
+    batch = {
+        "pixel_values": torch.randn(labels_shape[0], 3, 8, 8),
+        "labels": torch.randint(0, 3, labels_shape),
+    }
+    _, count = mod._unsloth_get_batch_samples(
+        _fake_trainer(cls(), False, lambda *a, **k: None), iter([batch]), 1,
+    )
+    assert count is None, (
+        f"{head}: counted {count} where the true label count is {expected_true_count}"
+    )
+
+
 def test_token_classification_labels_are_not_silently_miscounted():
     """The quiet one. Token-classification labels are (B, T), unshifted, one per
     token, so nothing raises: they clear every shape check and the count comes back
