@@ -485,6 +485,13 @@ jobs:
           }
 
           # numerics: minimal on purpose -- mlx core only, no mlx-lm / mlx-vlm.
+          #
+          # transformers is capped here at the darwin + arm64 half of pyproject's
+          # marker-split cap. pyproject allows a newer transformers off darwin, so
+          # without this the MLX lanes would follow a CUDA-motivated bump and this
+          # lane would stop measuring the stack Apple Silicon actually ships. The
+          # newly allowed range is covered by the "Repo tests (CPU)" job, which
+          # installs .[core] unpinned.
           (
             rc=0
             {
@@ -492,7 +499,7 @@ jobs:
               retry .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
-              retry .lanes/venv-numerics/bin/pip install -e .[core] &&
+              retry .lanes/venv-numerics/bin/pip install -e .[core] "transformers<=5.5.0" &&
               { .lanes/venv-numerics/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
@@ -502,15 +509,22 @@ jobs:
 
           # suites: the MLX packages MUST resolve in the SAME pip call as .[core].
           # Split, pip solves them independently and mlx-vlm 0.6.9
-          # (transformers>=5.14) drags transformers past the <=5.5.0 this project
-          # pins: measured 5.5.0 -> 5.14.1. Together, pip honours the cap and lands
-          # on the newest mlx-vlm that fits, which is the 0.6.4 ceiling the audio
-          # gate records.
+          # (transformers>=5.14) drags transformers past the <=5.5.0 the MLX half
+          # of the cap holds: measured 5.5.0 -> 5.14.1. Together, pip honours the
+          # cap and lands on the newest mlx-vlm that fits, which is the 0.6.4
+          # ceiling the audio gate records.
           #
-          # The <0.7.0 bound is repeated here because pyproject's copy is marker-gated
-          # to darwin + arm64 and so constrains nothing on this Linux lane. Without it
-          # the lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
-          # gating a combination pyproject forbids.
+          # Two bounds are repeated here rather than left to pyproject, for the
+          # same reason: pyproject's mlx-vlm ceiling and the 5.5.0 half of its
+          # transformers cap are both marker-gated to darwin + arm64, so neither
+          # constrains anything on this Linux lane. Without the <0.7.0 bound the
+          # lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
+          # gating a combination pyproject forbids; without the <=5.5.0 bound it
+          # now follows the higher off-darwin cap up to mlx-vlm 0.6.17 and stops
+          # measuring the stack Apple Silicon ships. tests/mlx_simulation models
+          # the 0.6.4 surface, so this lane holds 0.6.4 on purpose. Coverage of
+          # the newly allowed transformers range is the "Repo tests (CPU)" job's
+          # to provide, and it installs .[core] unpinned.
           (
             rc=0
             {
@@ -518,7 +532,7 @@ jobs:
               retry .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
-              retry .lanes/venv-suites/bin/pip install -e .[core] \
+              retry .lanes/venv-suites/bin/pip install -e .[core] "transformers<=5.5.0" \
                 "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<0.7.0" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
@@ -567,25 +581,51 @@ jobs:
           # landing on one of the excluded releases (4.57.4, 5.0.0, ...) passed.
           # The whole specifier set is the contract, so assert the whole thing.
           .lanes/venv-suites/bin/python - <<'PY'
-          from importlib.metadata import requires, version
+          from importlib.metadata import metadata, requires, version
           from packaging.requirements import Requirement
           from packaging.version import Version
 
-          specifiers = {
-              str(req.specifier)
+          # The cap is marker-split: one half for darwin + arm64, one for
+          # everywhere else. So the gate can no longer collapse the requirement
+          # lines into one set of specifier strings; it has to ask which line
+          # applies where. Both halves are checked from this Linux lane, because
+          # the Apple Silicon half is a policy the Linux runner can still read.
+          extras = [""] + list(metadata("unsloth_zoo").get_all("Provides-Extra") or [])
+          reqs = [
+              req
               for raw in (requires("unsloth_zoo") or [])
               for req in [Requirement(raw)]
               if req.name.lower().replace("_", "-") == "transformers"
-          }
-          assert specifiers, (
+          ]
+          assert reqs, (
               "unsloth_zoo declares no transformers requirement, so this gate is "
               "checking nothing. Did the dependency move out of pyproject.toml?"
           )
-          assert len(specifiers) == 1, (
-              f"unsloth_zoo pins transformers inconsistently across extras: "
-              f"{sorted(specifiers)}. Pick one before this gate can mean anything."
+
+          def applies(req, **overrides):
+              """True when this requirement is live for some extra of this package.
+
+              `extra` has no value in the default marker environment, so a
+              requirement that carries one raises rather than answering; supply
+              every extra the distribution declares, plus the no-extra case.
+              """
+              if req.marker is None:
+                  return True
+              for extra in extras:
+                  try:
+                      if req.marker.evaluate({**overrides, "extra": extra}):
+                          return True
+                  except Exception:
+                      continue
+              return False
+
+          here = {str(req.specifier) for req in reqs if applies(req)}
+          assert len(here) == 1, (
+              f"on this platform unsloth_zoo pins transformers inconsistently "
+              f"across extras: {sorted(here)}. Pick one before this gate can "
+              f"mean anything."
           )
-          pinned = Requirement(f"transformers{specifiers.pop()}").specifier
+          pinned = Requirement(f"transformers{here.pop()}").specifier
           transformers = Version(version("transformers"))
           assert transformers in pinned, (
               f"transformers {transformers} is outside the range this package "
@@ -593,26 +633,60 @@ jobs:
           )
           print("transformers", transformers, "within the pinned range", pinned)
 
-          # The ceiling is a deliberate policy choice, not an incidental number,
-          # so state it here as well and on purpose. mlx-vlm >= 0.6.9 requires
-          # transformers >= 5.14, and we are not taking that jump yet; the cap is
-          # what keeps the joint MLX resolution off it. Checking only "matches
-          # pyproject" above would let an automated dependency bump raise the cap
-          # and quietly opt the whole project in -- which is exactly what #1144
-          # did. Raising this is a decision: change CEILING in the same commit
-          # that changes pyproject.toml, deliberately.
-          CEILING = Version("5.5.0")
-          declared = [
-              Version(str(s.version)) for s in pinned if s.operator == "<="
-          ]
-          assert declared and max(declared) <= CEILING, (
-              f"pyproject.toml pins transformers <= {max(declared) if declared else None}, "
-              f"above the {CEILING} ceiling this project holds on purpose. "
-              "mlx-vlm >= 0.6.9 needs transformers >= 5.14 and we are not "
-              "following it yet. If raising it is intended, raise CEILING here "
-              "in the same commit and say why."
+          # Two ceilings, and they are separate decisions rather than one number
+          # written twice. Checking only "matches pyproject" above would let an
+          # automated dependency bump raise a cap and quietly opt the whole
+          # project in, which is exactly what #1144 did. Raising either of these
+          # is a decision: change it here in the same commit that changes
+          # pyproject.toml, deliberately.
+          #
+          # CEILING is the newest transformers the version matrix was run
+          # against on the CUDA platforms. It moved from 5.5.0 to 5.17.0 with
+          # the sweep that unblocked the prequantized bnb-4bit quant_state
+          # failures (unsloth #9867, #10010, #10017, #10276) and Gemma 4 E4B
+          # LoRA (unsloth #5355).
+          #
+          # MLX_CEILING is a different question and did NOT move. mlx-vlm 0.6.5
+          # and up require transformers >= 5.14, tests/mlx_simulation models the
+          # 0.6.4 surface, and the mlx / mlx-lm pins above are exact. Holding
+          # darwin + arm64 at 5.5.0 is what keeps the joint MLX resolution off
+          # that jump, so a CUDA-motivated bump cannot make it for the Apple
+          # Silicon lane.
+          CEILING = Version("5.17.0")
+          MLX_CEILING = Version("5.5.0")
+          DARWIN_ARM = {"sys_platform": "darwin", "platform_machine": "arm64"}
+          LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
+
+          def ceiling_of(**overrides):
+              seen = {str(req.specifier) for req in reqs if applies(req, **overrides)}
+              assert len(seen) == 1, f"{overrides}: expected one pin, got {sorted(seen)}"
+              spec = Requirement(f"transformers{seen.pop()}").specifier
+              tops = [Version(str(s.version)) for s in spec if s.operator == "<="]
+              assert tops, f"{overrides}: the pin declares no <= ceiling: {spec}"
+              return max(tops)
+
+          general = ceiling_of(**LINUX_X86)
+          apple = ceiling_of(**DARWIN_ARM)
+          assert general <= CEILING, (
+              f"pyproject.toml pins transformers <= {general} off darwin, above the "
+              f"{CEILING} ceiling this project holds on purpose. That ceiling is the "
+              f"newest release the version matrix was run against. If raising it is "
+              f"intended, raise CEILING here in the same commit and say what was run."
           )
-          print("declared ceiling", max(declared), "at or below the policy ceiling", CEILING)
+          assert apple <= MLX_CEILING, (
+              f"pyproject.toml pins transformers <= {apple} on darwin + arm64, above "
+              f"the {MLX_CEILING} ceiling the MLX stack holds on purpose. mlx-vlm "
+              f">= 0.6.5 needs transformers >= 5.14 and we are not following it yet. "
+              f"If raising it is intended, raise MLX_CEILING here in the same commit, "
+              f"say why, and show the Apple Silicon lane green on the new mlx-vlm."
+          )
+          assert apple < general or MLX_CEILING == CEILING, (
+              f"the darwin + arm64 cap ({apple}) is no longer below the general one "
+              f"({general}), so the marker split is doing nothing. Either drop the "
+              f"split or restore the lower Apple Silicon cap."
+          )
+          print("declared ceilings: general", general, "<=", CEILING,
+                "| darwin arm64", apple, "<=", MLX_CEILING)
           PY
 
       # The five "Fail if ... skipped" gates below used to re-run their pytest
@@ -819,10 +893,33 @@ jobs:
               def _strip_marker(s):
                   return s.split(";", 1)[0].strip()
 
+              def _marker(s):
+                  return s.split(";", 1)[1] if ";" in s else ""
+
+              # The transformers cap is marker-split: darwin + arm64 is held lower
+              # than everywhere else, because there it is also what holds the MLX
+              # resolution at mlx-vlm 0.6.4. This lane is Linux, so it has to take
+              # the line that applies to Linux rather than whichever one happens to
+              # come first in the file. Markers are matched as text because this
+              # step is stdlib-only by design (no packaging, no pip install yet).
+              _darwin_only = re.compile(r"sys_platform\s*==\s*['\"]darwin['\"]")
+
               def _pick(spec, name):
                   if spec != "__from_pyproject__":
                       return spec
-                  return next((_strip_marker(x) for x in all_deps if _pkg_name(x) == name), name)
+                  matches = [x for x in all_deps if _pkg_name(x) == name]
+                  usable = [x for x in matches if not _darwin_only.search(_marker(x))]
+                  if not usable:
+                      usable = matches
+                  if not usable:
+                      return name
+                  if len(usable) > 1 and len({_strip_marker(x) for x in usable}) > 1:
+                      raise SystemExit(
+                          f"pyproject declares {len(usable)} different off-darwin specs "
+                          f"for {name}: {sorted({_strip_marker(x) for x in usable})}. "
+                          f"This lane cannot pick one for you."
+                      )
+                  return _strip_marker(usable[0])
 
               spec_t = _pick(spec_t, "transformers")
               spec_r = _pick(spec_r, "trl")

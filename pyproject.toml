@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     # --- GPU-only deps (skipped on macOS arm64) ---
-    "torch>=2.4.0,<2.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "torch>=2.4.0,<2.15.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "torchao>=0.13.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "triton>=3.0.0 ; ('linux' in sys_platform)",
     "tyro ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
@@ -43,8 +43,9 @@ dependencies = [
     # generation drives, first ship in mlx-lm 0.31.2.
     "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # A ceiling rather than an exact pin, because the two consumers resolve
-    # different patches and both are correct. Under the transformers<=5.5.0 cap
-    # below, the newest mlx-vlm that fits is 0.6.4 (0.6.9+ requires
+    # different patches and both are correct. Under the darwin + arm64 half of
+    # the transformers cap below, which stays at <=5.5.0 for exactly this
+    # reason, the newest mlx-vlm that fits is 0.6.4 (0.6.5+ requires
     # transformers>=5.14). Studio's installer overrides that requirement, so it
     # gets 0.6.15 -- which matters: the UnicodeDecodeError during generation in
     # unsloth #9466 is fixed in 0.6.9. Pinning either patch exactly would make
@@ -52,7 +53,26 @@ dependencies = [
     "mlx-vlm>=0.4.4,<0.7.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
-    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
+    # Marker-split on purpose, and the two halves answer different questions.
+    #
+    # Everywhere except Apple Silicon the ceiling is the newest release the
+    # version matrix was run against. 5.5.0 held it until now, and 5.5.0 is
+    # exactly where prequantized bnb-4bit checkpoints lose quant_state on every
+    # Linear4bit (unsloth #9867, #10010, #10017, #10276). It also puts the Gemma 4
+    # E4B LoRA fix one patch release out of reach, since that shipped in 5.5.2
+    # (unsloth #5355). Every `!=` is a release that was tested and rejected, so
+    # they all stay.
+    #
+    # On darwin + arm64 the ceiling stays at 5.5.0, because it is not only a
+    # transformers cap there: it is what holds the joint MLX resolution at
+    # mlx-vlm 0.6.4 (0.6.5 and up require transformers >= 5.14.0). The mlx and
+    # mlx-lm pins above are deliberate for the same reason, tests/mlx_simulation
+    # models the 0.6.4 surface, and moving that stack is a decision for the
+    # Apple Silicon lane to make on its own rather than a side effect of a
+    # CUDA-motivated bump. The CEILING gate in consolidated-tests-ci.yml holds
+    # this half at 5.5.0 and is what makes an accidental move fail loudly.
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
     "sentencepiece>=0.2.0",
     "tqdm",
@@ -97,7 +117,9 @@ mlx = [
 core = [
     "packaging>=24.1",
     "tyro",
-    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
+    # Same marker split as the base dependency list above; see the comment there.
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
+    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
     "sentencepiece>=0.2.0",
     "tqdm",
