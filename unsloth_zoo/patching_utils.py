@@ -311,13 +311,33 @@ pass
 
 def verify_and_set_device(module,):
     """
-    Verify that all parameters of a module are on the same device.
+    Verify that all parameters of a module are on the same device, and record that
+    device on the module for the pipeline-parallel inference paths to read back.
+
+    Two attributes are published, deliberately:
+
+    * `_per_layer_device` is the `torch.device` itself, which is what a consumer
+      moving tensors onto the layer actually wants.
+    * `_per_layer_device_index` keeps its existing meaning and stays an index,
+      because readers in `unsloth` also use it to subscript a tuple of per-device
+      buffers, which a `torch.device` cannot do.
+
+    `torch.device("cpu").index` and `torch.device("meta").index` are both None, and
+    `unsloth.models._utils.move_to_device` rejects None, so a CPU-offloaded or
+    not-yet-materialised layer used to end every one of those readers with
+    "ValueError: Invalid target device: None" (unsloth#3538). When there is no
+    index, publish the device type instead: `move_to_device` accepts it as a
+    string and it resolves to the layer's own device, where the obvious `or 0`
+    would silently resolve to cuda:0 and move the activations off the layer.
     """
     set_of_devices = set(x.device for x in module.parameters())
     if len(set_of_devices) > 1:
         raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
     device = set_of_devices.pop()
-    module._per_layer_device_index = device.index
+    module._per_layer_device = device
+    module._per_layer_device_index = (
+        device.index if device.index is not None else device.type
+    )
 pass
 
 def patch_to_dict():
