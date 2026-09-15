@@ -170,3 +170,24 @@ def test_inherited_contract_has_no_model_name_restriction():
     with decode.fused_decode_conv_silu(model):
         assert type(model) is not OtherRecurrentBlock
     assert type(model) is OtherRecurrentBlock
+
+def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
+    # Generation enters this beside fused_moe_gate_up and Studio enters it again per
+    # request, so two scopes own the same module. Without a count the first exit
+    # restores the native class and the still-open scope silently loses the kernel.
+    model = _model()
+    root = nn.Sequential(model)
+    root.eval()
+    outer = decode.fused_decode_conv_silu(root)
+    outer.__enter__()
+    fused = type(model)
+    assert fused is not native.Qwen3_5GatedDeltaNet
+    inner = decode.fused_decode_conv_silu(root)
+    inner.__enter__()
+    try:
+        outer.__exit__(None, None, None)
+        assert type(model) is fused
+    finally:
+        inner.__exit__(None, None, None)
+    assert type(model) is native.Qwen3_5GatedDeltaNet
+    assert not any(k.startswith("_unsloth_decode") for k in model.__dict__)

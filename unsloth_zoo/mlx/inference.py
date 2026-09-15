@@ -470,9 +470,23 @@ def fused_decode_conv_silu(model):
         if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
             for _, module in modules:
                 base = type(module)
-                if module.training or hasattr(base, "_unsloth_decode_conv_silu"):
+                # mlx's nn.Module subclasses dict, and the membership tests below read
+                # the instance's own entries. Generation enters this scope for whatever
+                # named_modules() yields, including the plain stand-ins the generate
+                # tests pass, so anything that is not a Module is simply not a candidate.
+                if module.training or not isinstance(module, dict):
                     continue
                 if "_causal_conv1d_decode" in module or "__call__" in module:
+                    continue
+                if hasattr(base, "_unsloth_decode_conv_silu"):
+                    # Already fused by another scope. Count this one as an owner too,
+                    # so that scope's exit cannot unfuse a module this scope still
+                    # holds; only the last owner restores. Generation enters this
+                    # alongside fused_moe_gate_up, and Studio enters it again per
+                    # request, so overlapping ownership is the normal case.
+                    if getattr(module, "_unsloth_decode_scopes", 0):
+                        module._unsloth_decode_scopes += 1
+                        changed.append(module)
                     continue
                 if base not in specs:
                     specs[base] = _decode_conv_silu_contract(base)
@@ -481,9 +495,19 @@ def fused_decode_conv_silu(model):
                     continue
                 patched = _fused_decode_conv_silu_class(base, *contract)
                 module.__class__ = patched
-                changed.append((module, base, patched))
+                module._unsloth_decode_native = base
+                module._unsloth_decode_patched = patched
+                module._unsloth_decode_scopes = 1
+                changed.append(module)
         yield model
     finally:
-        for module, base, patched in reversed(changed):
-            if type(module) is patched:
-                module.__class__ = base
+        for module in reversed(changed):
+            scopes = getattr(module, "_unsloth_decode_scopes", 0)
+            if scopes > 1:
+                module._unsloth_decode_scopes = scopes - 1
+                continue
+            if type(module) is getattr(module, "_unsloth_decode_patched", None):
+                module.__class__ = module._unsloth_decode_native
+            for name in ("_unsloth_decode_scopes", "_unsloth_decode_native",
+                         "_unsloth_decode_patched"):
+                module.__dict__.pop(name, None)
