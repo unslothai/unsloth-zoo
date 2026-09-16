@@ -3641,6 +3641,53 @@ def _is_moe_expert_lora_key(key):
     return any(part in _MOE_EXPERT_LORA_SEGMENTS for part in key.split("."))
 
 
+def _saved_adapter_expert_lora_keys(save_directory):
+    """Expert adapter keys in a saved PEFT adapter, read from the file on disk.
+
+    `load_lora`'s default is load_tensors=False, which hands vLLM a path instead of
+    tensors, so the in-memory state_dict check never sees those adapters. Read the key
+    names off the checkpoint instead. safetensors exposes them from the header alone, so
+    the common case costs no tensor IO. Returns [] when the adapter cannot be read, since
+    an unreadable adapter is vLLM's error to raise, not ours to pre-empt.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    keys = []
+    safetensors_path = os.path.join(save_directory, "adapter_model.safetensors")
+    bin_path = os.path.join(save_directory, "adapter_model.bin")
+    if os.path.isfile(safetensors_path):
+        try:
+            from safetensors import safe_open
+            with safe_open(safetensors_path, framework = "pt") as f:
+                keys = list(f.keys())
+        except Exception:
+            return []
+    elif os.path.isfile(bin_path):
+        try:
+            state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
+            keys = list(state_dict.keys())
+        except Exception:
+            return []
+    else:
+        return []
+    return [
+        k for k in keys
+        if (".lora_A." in k or ".lora_B." in k) and _is_moe_expert_lora_key(k)
+    ]
+
+
+def _raise_moe_expert_lora_unsupported(expert_lora_keys, source):
+    """One message for both branches, so they cannot drift apart."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    raise NotImplementedError(
+        "Unsloth: fast_inference=True does not support LoRA on MoE expert weights yet "
+        f"({len(expert_lora_keys)} adapter tensors in {source}, e.g. "
+        f"'{sorted(expert_lora_keys)[0]}').\n"
+        "vLLM would silently generate from the base experts while training updates the "
+        "adapters, so rollouts would not match the policy.\n"
+        "Use fast_inference=False, or target only the attention and dense MLP projections."
+    )
+
+
 @torch.inference_mode
 def load_lora(model, save_directory, load_tensors = False, lora_request_id = None):
     # vllm_lora_already_loaded(model)
@@ -3689,15 +3736,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # and nothing raises. Refuse instead, and say why.
         _expert_lora_keys = [k for k in state_dict if _is_moe_expert_lora_key(k)]
         if len(_expert_lora_keys) != 0:
-            raise NotImplementedError(
-                "Unsloth: fast_inference=True does not support LoRA on MoE expert "
-                f"weights yet ({len(_expert_lora_keys)} adapter tensors, e.g. "
-                f"'{_expert_lora_keys[0]}').\n"
-                "vLLM would silently generate from the base experts while training "
-                "updates the adapters, so rollouts would not match the policy.\n"
-                "Use fast_inference=False, or target only the attention and dense MLP "
-                "projections."
-            )
+            _raise_moe_expert_lora_unsupported(_expert_lora_keys, "the training model")
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
@@ -3710,6 +3749,13 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
+        # Same refusal for the default path-based branch. vLLM's local-checkpoint loader
+        # skips expert keys it cannot place, so without this an ordinary
+        # load_lora(model, adapter_dir) would return a request that generates from the
+        # base experts, which is the silent failure this guard exists to prevent.
+        _expert_lora_keys = _saved_adapter_expert_lora_keys(save_directory)
+        if len(_expert_lora_keys) != 0:
+            _raise_moe_expert_lora_unsupported(_expert_lora_keys, save_directory)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
     pass
     # vllm_lora_already_loaded(model)
