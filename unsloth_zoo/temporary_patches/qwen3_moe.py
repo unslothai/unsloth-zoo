@@ -79,6 +79,28 @@ def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
 
 
 def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name: Optional[str] = None):
+    # Why this is still here (measured on B200, torch 2.13.0, Qwen3.5-35B-A3B,
+    # 2048 tokens, separated LoRA on mlp.experts.gate_up_proj + down_proj, which is
+    # the default since _should_use_separated_lora() defaults to True):
+    #
+    #   * fullgraph=True raises InternalTorchDynamoError while BUILDING GUARDS:
+    #     TYPE_MATCH on the global
+    #     G['...modeling_qwen3_5_moe'].Qwen3_5MoeMLP_forward, which does not exist
+    #     on that module. Unrelated to this block's body, but it is a hard stop.
+    #   * fullgraph=False traces to 9 graphs / 8 graph breaks. Every break reports
+    #     "Opaque object type: <class 'torch._C.Generator'>", i.e. a torch.Generator
+    #     built inside the compiled region, not anything in the routing prologue.
+    #     6 of the 8 are present with no LoRA attached at all.
+    #
+    # Note the routing counter is NOT what blocks this: the break count is
+    # identical (8) with torch.bincount and with the sync-free
+    # count_tokens_per_expert, so the sync fix neither helps nor hurts here.
+    # Removing the decorator with fullgraph=False did compile and ran the block
+    # 1.22-1.40x faster with zero recompiles over 40 varied routings, so there is
+    # a real win waiting behind the Generator and the stale-global guard. It has
+    # not been validated end to end, and PR #608 measured only 1.03-1.04x for the
+    # whole compile/CUDA-graph pass and found capture incompatible with gradient
+    # checkpointing. Do not drop this decorator without an end-to-end measurement.
     @torch.compiler.disable
     def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         use_shared_expert = hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate")
