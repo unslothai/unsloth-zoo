@@ -741,9 +741,28 @@ def test_a_fork_that_cannot_be_set_up_leaves_the_forward_running(monkeypatch):
     assert experts.calls == 1, "the probe forward did not run"
 
 
-def test_the_probe_does_not_fork_while_dynamo_is_tracing(monkeypatch):
-    """A generator-based context manager is a graph break, and under
-    torch.compile(fullgraph=True) a graph break is a hard error rather than a slow path."""
+def test_the_probe_does_not_run_at_all_while_dynamo_is_tracing(monkeypatch):
+    """Dynamo has no notion of a one-time measurement.
+
+    It traces the throwaway forward into the graph beside the call that counts, so the
+    compiled region runs the experts forward three times on EVERY invocation rather than
+    once during a warm-up: six expert einsums in one graph where two are correct, measured
+    on PyTorch 2.12 with fullgraph. Returning None caches no verdict and leaves the call on
+    the stash path, which is what this module did before the probe existed.
+    """
+    experts = _RNGConsumingExperts()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert _run_probe(monkeypatch, experts) is None
+    assert experts.calls == 0, "the probe forward was traced into the compiled graph"
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    assert _run_probe(monkeypatch, experts) is True
+    assert experts.calls == 1, "the eager path must still measure"
+
+
+def test_the_rng_guard_is_inert_while_tracing(monkeypatch):
+    """The helper is usable on its own, so it keeps its own check: a generator-based
+    context manager in a captured graph is a break, and under fullgraph a hard error."""
     called = {"n": 0}
 
     def _count(*args, **kwargs):

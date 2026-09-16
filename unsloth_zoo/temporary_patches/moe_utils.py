@@ -1628,9 +1628,9 @@ def _preserved_rng_for_probe(x):
       `fork_rng` that raised would silently keep the LoRA unapplied on a family that
       ignores the stash. Anything that goes wrong setting the fork up leaves the forward
       to run unforked instead.
-    * Under `torch.compile(fullgraph = True)` a generator-based context manager is a graph
-      break, which is a hard error rather than a slow path. The probe runs at most once per
-      module and parameter, so being inert while tracing costs nothing that matters.
+    Reached only on the eager path: `_measure_moe_lora_stash_read` returns before it while
+    Dynamo is tracing, so a generator-based context manager never enters a captured graph.
+    The check is kept here as well because this helper is usable on its own.
     """
     if torch.compiler.is_compiling():
         yield
@@ -1687,6 +1687,18 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    if torch.compiler.is_compiling():
+        # Never inside a captured graph. Dynamo has no notion of a one-time measurement: it
+        # traces this whole throwaway forward into the graph alongside the call that counts,
+        # so the compiled region ends up running the experts forward three times on EVERY
+        # invocation, not once during a single warm-up. Measured on PyTorch 2.12 with
+        # fullgraph: six expert einsums in one graph where two are correct.
+        #
+        # None, which is the "no evidence" answer: it caches no verdict and leaves the call
+        # on the stash path, which is exactly what this module did before the probe existed.
+        # An eager forward before or after compilation still establishes the verdict, and the
+        # cached one is consulted before this function is ever called.
+        return None
     lora_data = _extract_lora_from_wrapper(wrapper)
     lora_attr = moe_lora_stash_name(parameter_name)
     if lora_data is not None:
