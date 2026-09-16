@@ -590,3 +590,41 @@ def test_a_split_set_missing_its_first_shard_says_so(llama_cpp, tmp_path):
     assert len(problems) == 1, problems
     assert "m-00001-of-00002.gguf" in problems[0], problems
     assert "not present" in problems[0], problems
+
+
+def test_the_read_back_announces_itself_and_reports_its_cost(llama_cpp, tmp_path, capsys, monkeypatch):
+    """The gate costs seconds on a large vocabulary, and it runs straight after
+    "Successfully saved". A silent stall there reads like a hang, so it must say what it
+    is doing, that the cost does not grow with the model, and how to turn it off."""
+    path = tmp_path / "m.gguf"
+    path.write_bytes(b"not a gguf")
+    monkeypatch.setattr(llama_cpp, "_gguf_open_shards", lambda f: [(str(path), None)])
+
+    llama_cpp._verify_converted_gguf([str(path)], "bf16", print_output = True)
+
+    out = capsys.readouterr().out
+    assert "Reading the GGUF back" in out
+    assert "UNSLOTH_GGUF_VERIFY=0" in out, "the opt-out must be named where the cost is paid"
+    assert "does not grow with the model" in out
+    assert "Verified 1 GGUF file(s) in " in out and "s." in out
+
+
+def test_the_announcement_is_not_printed_when_verification_is_off(llama_cpp, tmp_path, capsys,
+                                                                 monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GGUF_VERIFY", "0")
+    path = tmp_path / "m.gguf"
+    path.write_bytes(b"not a gguf")
+    llama_cpp._verify_converted_gguf([str(path)], "bf16", print_output = True)
+    assert "Reading the GGUF back" not in capsys.readouterr().out
+
+
+def test_the_announcement_is_printed_once_for_a_split_set(llama_cpp, tmp_path, capsys, monkeypatch):
+    """One announcement per export, not one per shard."""
+    paths = []
+    for i in (1, 2, 3):
+        p = tmp_path / f"m-{i:05d}-of-00003.gguf"
+        p.write_bytes(b"not a gguf")
+        paths.append(str(p))
+    monkeypatch.setattr(llama_cpp, "_gguf_open_shards", lambda f: [(paths[0], None)])
+    llama_cpp._verify_converted_gguf(paths, "bf16", print_output = True)
+    assert capsys.readouterr().out.count("Reading the GGUF back") == 1

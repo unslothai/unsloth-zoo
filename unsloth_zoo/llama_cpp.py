@@ -4512,10 +4512,27 @@ def _verify_converted_gguf(
             )
     # One entry per split set, so a 40 shard export is checked once.
     checked = set()
+    started = time.perf_counter()
     for output_file in output_files:
         shards = _gguf_shard_siblings(output_file)
         if shards[0] in checked:
             continue
+        # Say what the wait is for before paying for it. Almost all of the cost is
+        # gguf.GGUFReader parsing the vocabulary, which is seconds on a large one, and a
+        # silent stall right after "Successfully saved" reads like a hang. Measured on
+        # this design: 8 ms for a file with no vocabulary, 0.9 s at 32k entries, 15 s at
+        # 262k, and the same 15 s whether that file is 16 MB or 4.2 GB, because the cost
+        # is the vocabulary rather than the weights.
+        if not checked:
+            message = (
+                "Unsloth: Reading the GGUF back to check it before anything publishes or "
+                "quantizes it. This parses the file's metadata, which takes a few seconds "
+                "on a large vocabulary and does not grow with the model. Set "
+                "UNSLOTH_GGUF_VERIFY=0 to skip it."
+            )
+            if print_output: print(message)
+            else: logger.info(message)
+        pass
         checked.add(shards[0])
         readers = _gguf_open_shards(output_file)
         if any(reader is None for _, reader in readers):
@@ -4553,7 +4570,8 @@ def _verify_converted_gguf(
             f"UNSLOTH_GGUF_VERIFY=0 if you need the file anyway."
         )
     if print_output and checked:
-        print(f"Unsloth: Verified {len(checked)} GGUF file(s).")
+        print(f"Unsloth: Verified {len(checked)} GGUF file(s) in "
+              f"{time.perf_counter() - started:.1f}s.")
 
 
 # GGUF special token id key -> the tokenizer attribute holding the same id.
