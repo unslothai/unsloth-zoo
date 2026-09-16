@@ -906,6 +906,21 @@ pass
 RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
 
 
+# What every released unsloth up to 2026.9.4 forwards on the no-grad side, hard coded in its
+# own `_get_per_token_logps_and_entropies` replacement. The conservative answer when the
+# installed companion is present but cannot be read: forwarding MORE than this on the gradient
+# side alone is what makes the two policies differ, so an unknown companion is assumed to be
+# one of those rather than assumed to be current.
+GRPO_RELEASED_VISION_KEYS = (
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_attention_mask",
+    "image_sizes",
+    "num_images",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
+
 # Memo for grpo_companion_vision_keys. Set once per process; tests reset it to None.
 _GRPO_COMPANION_VISION_KEYS = None
 
@@ -934,11 +949,22 @@ def grpo_companion_vision_keys():
     module = sys.modules.get("unsloth.models.rl_replacements")
     patcher = getattr(module, "grpo_trainer__get_per_token_logps_and_entropies", None)
     source = None
+    unreadable = False
     if patcher is not None:
         try:
             source = inspect.getsource(patcher)
         except (OSError, TypeError):
+            # Source stripped, frozen, or dynamically wrapped. The companion is THERE -- the
+            # patcher exists -- and the only thing missing is the ability to see which keys it
+            # forwards. Leaving the full tuple there was the unsafe half of the guess: the
+            # gradient pass would forward spatial_shapes, num_tiles and the position ids that
+            # every released companion omits, and the importance ratio and KL term would then
+            # compare two different policies with nothing to show for it. Assume the released
+            # set instead, which is the answer for every unsloth that does not carry the
+            # companion change, and do not memoize it: this is a failure to look, not a fact
+            # about the process, so a later call gets to look again.
             source = None
+            unreadable = True
     shares = source is not None and (
         "grpo_get_vision_inputs" in source or "grpo_vision_chunks" in source
     )
@@ -957,6 +983,13 @@ def grpo_companion_vision_keys():
                 "gradient pass to the same inputs so both policies match. Upgrade unsloth to "
                 "forward every vision kwarg on both paths."
             )
+    if unreadable:
+        logger.warning(
+            "Unsloth: the installed unsloth's GRPO reference-logprob pass cannot be read, so "
+            "which vision kwargs it forwards is unknown. Holding the gradient pass to the "
+            "keys every released unsloth forwards, so both policies still match."
+        )
+        return GRPO_RELEASED_VISION_KEYS
     _GRPO_COMPANION_VISION_KEYS = keys
     return keys
 pass

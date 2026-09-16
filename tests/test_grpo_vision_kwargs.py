@@ -338,6 +338,49 @@ def test_a_no_grad_pass_this_reader_cannot_parse_does_not_turn_vision_off(
     assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
 
 
+def test_a_companion_whose_source_cannot_be_read_falls_back_to_the_released_keys(
+    monkeypatch, tmp_path
+):
+    """Source-stripped, frozen or dynamically wrapped packaging.
+
+    The companion is THERE -- the patcher exists -- and the only thing missing is the ability
+    to see which keys it forwards. Leaving the full tuple there was the unsafe half of that
+    guess: the gradient pass would forward spatial_shapes, num_tiles and the position ids that
+    every released unsloth omits, and the importance ratio and the KL term would then compare
+    two different policies. The released set is the answer for every unsloth that does not
+    carry the companion change, so it is the one an unknown companion gets.
+    """
+    module = _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                return kwargs
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+
+    def _no_source(target):
+        raise OSError("source not available")
+
+    monkeypatch.setattr(_rl.inspect, "getsource", _no_source)
+    assert _rl.grpo_companion_vision_keys() == _RELEASED_KEYS
+    assert _rl.GRPO_RELEASED_VISION_KEYS == _RELEASED_KEYS
+    shared = _rl.grpo_shared_vision_inputs(dict.fromkeys(_rl.GRPO_VISION_KEYS, 1))
+    for dropped in ("spatial_shapes", "num_tiles", "image_position_ids"):
+        assert dropped not in shared, dropped
+    assert "pixel_values" in shared
+
+    # Not memoized: this is a failure to look, not a fact about the process, so a run that can
+    # read the source afterwards is not stuck with the conservative answer.
+    assert _rl._GRPO_COMPANION_VISION_KEYS is None
+    monkeypatch.undo()
+    monkeypatch.setitem(sys.modules, "unsloth.models.rl_replacements", module)
+    monkeypatch.setattr(_rl, "_GRPO_COMPANION_VISION_KEYS", None)
+    assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
+
+
 def test_the_companion_probe_reads_the_really_installed_unsloth():
     """Not a mock: whatever unsloth is installed here must be classified, and if it does not
     share the helper the answer must be a strict subset that still carries pixel_values."""
