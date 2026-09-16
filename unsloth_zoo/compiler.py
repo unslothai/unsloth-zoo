@@ -1239,9 +1239,12 @@ def _bytecode_would_be_used(function_location, bytecode_location):
 pass
 
 def _remove_compiled_cache_bytecode(function_location):
-    """Remove this rank's pyc before importing source we just rewrote.
+    """Remove this rank's pyc before importing verified source.
 
-    Only called when the bytes changed, the only time the pyc can be stale.
+    Called before EVERY verified import, not only after a rewrite. The digest
+    covers the .py, but CPython can execute an unchecked-hash pyc without ever
+    consulting the source beside it, so a cache holding the expected source and
+    a planted pyc verifies clean and still runs foreign code.
     An unlink failure is fatal only when the pyc would really be used: on
     Windows os.remove raises PermissionError whenever a scanner or other
     interpreter holds the file, and raising on that forced the whole group into
@@ -1931,8 +1934,7 @@ def create_new_function(
             with lock:
                 # Try standard import
                 _verify_cache_digest_under_lock(target_name, expected_digest)
-                if rewrote_cache_file:
-                    _remove_compiled_cache_bytecode(target_name)
+                _remove_compiled_cache_bytecode(target_name)
                 importlib.invalidate_caches()
                 new_module = importlib.import_module(name)
                 return new_module, old_path
@@ -1976,8 +1978,7 @@ def create_new_function(
     def _exec_module_under_lock(lock, file_location, module_name, expected_digest):
         with lock:
             _verify_cache_digest_under_lock(file_location, expected_digest)
-            if rewrote_cache_file:
-                _remove_compiled_cache_bytecode(file_location)
+            _remove_compiled_cache_bytecode(file_location)
             spec = importlib.util.spec_from_file_location(module_name, file_location)
             new_module = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = new_module

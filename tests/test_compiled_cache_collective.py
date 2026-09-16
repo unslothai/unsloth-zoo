@@ -502,21 +502,27 @@ def test_undeletable_usable_bytecode_still_fails_over(
 
 
 @pytest.mark.parametrize("overwrite", [False, True])
-def test_warm_cache_removes_no_bytecode(
+def test_warm_cache_still_removes_bytecode(
     monkeypatch, compiler, probe, cache_dirs, overwrite,
 ):
-    """An unchanged cache is imported as-is, bytecode included.
+    """An unchanged cache drops its pyc before the import anyway.
 
-    Every process start walks this path once per generated module. Deleting
-    the pyc here forced CPython to re-parse and re-compile the whole generated
-    source on every single import, and on Windows it is also the step that can
-    fail.
+    This reverses what PR #967 pinned here, and the reason is that the warm
+    path is exactly where the unchecked-hash pyc lands. The digest covers the
+    .py; CPython can execute a pyc without consulting the source beside it, and
+    a pyc an attacker writes can carry whatever mtime, size or source hash makes
+    CPython accept it. So metadata cannot tell a planted pyc from ours, and the
+    warm path, where the source verifies clean and nothing is rewritten, is the
+    one case the old gate left unprotected.
 
-    overwrite=True is parametrised because it is the DEFAULT, and the one both
-    unsloth_compile_transformers and patch_lora_forwards use. It only grants
-    permission to rewrite; when write_file() finds the bytes identical it writes
-    nothing, so there is still no stale bytecode. Gating on the write decision
-    rather than on the write left this case removing the pyc every time.
+    The cost #967 measured is real and is now paid deliberately: re-parsing a
+    71 KB generated module costs about 22 ms per import, once per process per
+    module. The Windows concern it raised is handled by
+    _bytecode_would_be_used(), which keeps an unremovable pyc fatal only when
+    CPython would actually load it.
+
+    overwrite=True is parametrised because it is the DEFAULT, used by both
+    unsloth_compile_transformers and patch_lora_forwards.
     """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
@@ -536,18 +542,19 @@ def test_warm_cache_removes_no_bytecode(
     module = probe(name, "return x * 2", overwrite=overwrite)
 
     assert getattr(module, f"{name}_fn")(21) == 42
-    assert not [p for p in removed if p.endswith(".pyc")], (
-        f"an unchanged import removed bytecode (overwrite={overwrite}): {removed}"
+    assert [p for p in removed if p.endswith(".pyc")], (
+        f"an unchanged import kept bytecode it never verified "
+        f"(overwrite={overwrite}): {removed}"
     )
 
 
 def test_rewriting_the_cache_still_removes_stale_bytecode(
     monkeypatch, compiler, probe, cache_dirs,
 ):
-    """The rewrite path keeps the defence the warm path no longer needs.
+    """The rewrite path drops stale bytecode too.
 
-    Pins that the gate is on "did this call rewrite the file", not on some
-    weaker condition that would let a same-size rewrite import stale bytecode.
+    Both paths now do, so this pins that the rewrite case did not regress while
+    the warm case was being closed.
     """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)

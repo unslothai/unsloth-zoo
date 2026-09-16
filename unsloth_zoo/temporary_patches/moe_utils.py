@@ -167,6 +167,28 @@ _CACHED_FORWARD_MOE_BACKEND = None
 _CACHED_MOE_UTILS_MODULE = None
 
 
+def _remove_cached_bytecode(source_file):
+    """Drop the pyc beside a cache copy we are about to execute.
+
+    The comparison in _load_cached_moe_utils_module() covers the .py only, and
+    CPython can execute an unchecked-hash pyc without consulting the source
+    beside it. A pyc we cannot remove is one CPython may still prefer, so a
+    failure here is a reason to fall back to this module's own definitions
+    rather than to execute the cache copy.
+    """
+    try:
+        bytecode_location = importlib.util.cache_from_source(source_file)
+    except NotImplementedError:
+        return True
+    try:
+        os.remove(bytecode_location)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return not os.path.isfile(bytecode_location)
+    return True
+
+
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 
@@ -189,6 +211,9 @@ def _load_cached_moe_utils_module():
         if module is not None and os.path.abspath(getattr(module, "__file__", "")) == cache_file:
             _CACHED_MOE_UTILS_MODULE = module
             return module
+
+        if not _remove_cached_bytecode(cache_file):
+            return None
 
         spec = importlib.util.spec_from_file_location(module_name, cache_file)
         if spec is None or spec.loader is None:
