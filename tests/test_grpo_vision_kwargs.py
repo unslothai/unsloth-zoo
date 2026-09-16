@@ -418,6 +418,91 @@ def test_the_gradient_pass_goes_through_the_gate():
     assert "grpo_shared_vision_inputs" in source
 
 
+# Real tensors, because the chunker slices them and the branch under test reads the one it
+# is handed rather than a marker string.
+_PIXELS = torch.zeros(1, 4)
+_MASK = torch.ones(1, 4)
+_GRID = torch.tensor([[1, 1, 1]])
+_SIZES = torch.tensor([[4, 4]])
+_TTI = torch.tensor([[0, 0, 1, 1]])
+
+
+class _TookTheTextBranch(Exception):
+    """left_pack_padding was entered: the batch was repacked and the mask rebuilt."""
+
+
+class _ReachedTheVisionBranch(Exception):
+    """The branch was not entered: input_ids and completion_mask are as they arrived."""
+
+
+def _which_branch(monkeypatch, vision_kwargs):
+    """Which arrangement branch `grpo_accumulated_loss` takes for these vision kwargs.
+
+    Observed, not read off the returned mapping. `pixel_values` is a sentinel in the caller as
+    well as a model input: a None there makes the GRADIENT pass recompute max_left_pad,
+    left-pack input_ids and rebuild completion_mask through
+    create_completion_attention_mask, and it also switches the sequence-packing path on. The
+    companion's no-grad pass decides both on its own pixel_values, which is not None. So a
+    gate that blanks the key does not make the two passes agree; it makes them disagree about
+    something worse. Every other test in this file passes by inspecting the dict, which is
+    exactly how that got through, so this one runs the function and reports which branch it
+    took -- each side raises its own sentinel the moment it is reached.
+    """
+    import types
+
+    def _no_packing(*_a, **_k):
+        raise _TookTheTextBranch
+
+    def _no_vision(*_a, **_k):
+        raise _ReachedTheVisionBranch
+
+    monkeypatch.setattr(_rl, "left_pack_padding", _no_packing)
+    trainer = types.SimpleNamespace(
+        args = types.SimpleNamespace(
+            unsloth_grpo_mini_batch = 1,
+            unsloth_logit_chunk_multiplier = 1,
+        ),
+        processing_class = types.SimpleNamespace(pad_token_id = 0),
+        model = types.SimpleNamespace(
+            get_output_embeddings = lambda: types.SimpleNamespace(
+                weight = torch.zeros(8, 4)
+            )
+        ),
+        accelerator = types.SimpleNamespace(unwrap_model = _no_vision),
+        use_vllm = False,
+        _autocast_dtype = torch.bfloat16,
+    )
+    input_ids = torch.tensor([[0, 5, 6, 7]])
+    try:
+        _rl.grpo_accumulated_loss(
+            trainer,
+            input_ids,
+            torch.ones_like(input_ids),
+            2,
+            torch.ones(1, 2),
+            torch.zeros(1),
+            None,
+            None,
+            **dict(vision_kwargs),
+        )
+    except _TookTheTextBranch:
+        return "text"
+    except _ReachedTheVisionBranch:
+        return "vision"
+    raise AssertionError("neither branch was reached; the harness has drifted")
+
+
+def test_the_branch_harness_tells_the_two_apart(monkeypatch):
+    """The control for `_which_branch`. A harness that answered "vision" whatever it was given
+    would make the assertion above pass for nothing, which is the failure mode this whole
+    exercise is about."""
+    assert _which_branch(monkeypatch, {}) == "text"
+    assert (
+        _which_branch(monkeypatch, {"pixel_values": _PIXELS, "image_grid_thw": _GRID})
+        == "vision"
+    )
+
+
 def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
     monkeypatch, tmp_path
 ):
@@ -451,27 +536,47 @@ def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
     monkeypatch.setattr(_rl, "_GRPO_COMPANION_PIXELS_WARNED", False, raising = False)
 
     gridless = {
-        "pixel_values": "PIXELS",
-        "pixel_attention_mask": "MASK",
-        "image_sizes": "SIZES",
-        "token_type_ids": "TTI",
+        "pixel_values": _PIXELS,
+        "pixel_attention_mask": _MASK,
+        "image_sizes": _SIZES,
+        "token_type_ids": _TTI,
         "num_images": [1],
     }
     shared = _rl.grpo_shared_vision_inputs(gridless)
-    assert shared.get("pixel_values") is None, shared
-    assert shared.get("pixel_attention_mask") is None, shared
+    # The SENTINEL survives. `grpo_accumulated_loss` reads pixel_values to choose between the
+    # vision branch and the text branch, and the companion chooses on its own pixel_values,
+    # which is a real tensor: it appends None per chunk inside its loop, after the branch is
+    # already decided. Blanking it here would stop the two passes disagreeing about pixels and
+    # start them disagreeing about how the sequences are ARRANGED -- left-packed input_ids, a
+    # rebuilt completion_mask and the packed forward on one side only -- which is the worse
+    # comparison of the two, for exactly the models this is for.
+    assert shared["pixel_values"] is _PIXELS, shared
+    assert shared["pixel_attention_mask"] is _MASK, shared
+    # What is actually FORWARDED carries no pixels, which is where the companion drops them.
+    chunk = _rl.grpo_vision_chunks(shared, 1, 1)[0]
+    assert "pixel_values" not in chunk, chunk
+    assert "pixel_attention_mask" not in chunk, chunk
     # Everything the companion DOES forward is still forwarded, or the two passes disagree in
     # the other direction.
-    assert shared["image_sizes"] == "SIZES"
-    assert shared["token_type_ids"] == "TTI"
+    assert shared["image_sizes"] is _SIZES
+    assert shared["token_type_ids"] is _TTI
     assert shared["num_images"] == [1]
+    assert torch.equal(chunk["image_sizes"], _SIZES)
+    assert torch.equal(chunk["token_type_ids"], _TTI)
+
+    # And the branch is observed, not read off the mapping: the gradient pass must still take
+    # the vision branch for this batch, leaving input_ids exactly as the companion has them.
+    assert _which_branch(monkeypatch, gridless) == "vision"
 
     # With a grid the companion slices the pixels, so they are forwarded on both sides.
-    withgrid = dict(gridless, image_grid_thw = "GRID")
+    withgrid = dict(gridless, image_grid_thw = _GRID)
     shared = _rl.grpo_shared_vision_inputs(withgrid)
-    assert shared["pixel_values"] == "PIXELS"
-    assert shared["image_grid_thw"] == "GRID"
-    assert shared["pixel_attention_mask"] == "MASK"
+    assert shared["pixel_values"] is _PIXELS
+    assert shared["image_grid_thw"] is _GRID
+    assert shared["pixel_attention_mask"] is _MASK
+    chunk = _rl.grpo_vision_chunks(shared, 1, 1)[0]
+    assert chunk["pixel_values"] is not None
+    assert chunk["pixel_attention_mask"] is not None
 
 
 def test_a_companion_that_shares_the_chunker_keeps_the_pixels(monkeypatch, tmp_path):

@@ -1020,33 +1020,44 @@ def grpo_shared_vision_inputs(source):
     importance ratio and the KL term would compare two different policies however carefully the
     key names were matched.
 
-    So for that shape the pixels are dropped here too, which is what the installed companion
-    does and what this package did before the shared chunker existed. Text is what both passes
-    then see, and a comparison of like with like is the thing the objective requires; a louder
-    answer is available by upgrading unsloth, and the warning says so. Nothing is dropped when
-    the companion shares the chunker: there the two passes slice with the same code.
+    That second restriction is NOT applied here, and the layer matters. ``pixel_values`` is a
+    sentinel in the caller as well as a model input: ``grpo_accumulated_loss`` reads it to
+    decide whether to left-pack the batch (recomputing ``max_left_pad``, repacking
+    ``input_ids`` and rebuilding ``completion_mask``) and whether to take the sequence-packing
+    path. The companion chooses those on its own ``pixel_values``, which is a real tensor --
+    it appends None per chunk INSIDE its loop, after the branch is already chosen -- so
+    blanking the key here would stop the two passes disagreeing about pixels and start them
+    disagreeing about how the sequences are arranged, which is the worse comparison of the
+    two. The suppression therefore happens one layer down, in ``grpo_vision_chunks``, on the
+    chunk that is actually forwarded. See ``grpo_companion_drops_pixels``.
     """
-    global _GRPO_COMPANION_PIXELS_WARNED
     keys = grpo_companion_vision_keys()
     if len(keys) == len(GRPO_VISION_KEYS):
         return grpo_get_vision_inputs(source)
-    shared = {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
-    if shared.get("pixel_values") is not None and shared.get("image_grid_thw") is None:
-        # Both of them: the companion appends None for the mask in the same branch.
-        shared["pixel_values"] = None
-        shared["pixel_attention_mask"] = None
-        if not _GRPO_COMPANION_PIXELS_WARNED:
-            _GRPO_COMPANION_PIXELS_WARNED = True
-            logger.warning(
-                "Unsloth: the installed unsloth computes GRPO reference logprobs with a chunk "
-                "loop of its own, and that loop forwards no pixel_values for a model without "
-                "image_grid_thw. Holding the gradient pass to the same inputs, so both "
-                "policies match, which means this run trains on the text of these samples. "
-                "Upgrade unsloth to train on the images."
-            )
-    return shared
+    return {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
 pass
 RL_REPLACEMENTS["grpo_shared_vision_inputs"] = grpo_shared_vision_inputs
+
+
+def grpo_companion_drops_pixels(vision):
+    """Whether the installed companion's no-grad loop forwards no pixels for THIS batch.
+
+    Its else branch is ``pixel_values_chunks.append(None)``: with no ``image_grid_thw`` to
+    slice the pixels by, that loop has nothing to forward, so for a VLM that carries no grid
+    -- Gemma 3, InternVL, LFM2-VL -- the reference policy sees text where the gradient pass
+    would see images. Matching it is what keeps the importance ratio and the KL term a
+    comparison of one policy with itself.
+
+    False whenever the companion shares this module's chunker, because then both passes slice
+    with the same code and nothing needs to be given up.
+    """
+    if vision.get("pixel_values", None) is None:
+        return False
+    if vision.get("image_grid_thw", None) is not None:
+        return False
+    return len(grpo_companion_vision_keys()) != len(GRPO_VISION_KEYS)
+pass
+RL_REPLACEMENTS["grpo_companion_drops_pixels"] = grpo_companion_drops_pixels
 
 
 def grpo_vision_chunks(vision, total_samples, batch_size):
@@ -1136,6 +1147,19 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             return image_sizes[img_start:img_end]
         return image_sizes[start:end]
 
+    # Asked once per call, not per chunk: it reads the installed companion's source.
+    drop_pixels = grpo_companion_drops_pixels(vision)
+    global _GRPO_COMPANION_PIXELS_WARNED
+    if drop_pixels and not _GRPO_COMPANION_PIXELS_WARNED:
+        _GRPO_COMPANION_PIXELS_WARNED = True
+        logger.warning(
+            "Unsloth: the installed unsloth computes GRPO reference logprobs with a chunk "
+            "loop of its own, and that loop forwards no pixel_values for a model without "
+            "image_grid_thw. Holding the gradient pass to the same inputs, so both policies "
+            "match, which means this run trains on the text of these samples. Upgrade "
+            "unsloth to train on the images."
+        )
+
     chunks = []
     current_pixel_idx = 0
     for start in range(0, total_samples, batch_size):
@@ -1221,6 +1245,12 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
                 chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        if drop_pixels:
+            # Here, on the forwarded chunk, rather than on the mapping the caller branches on.
+            # The mask goes with the pixels: the companion appends None for it in the same
+            # branch, and a mask with nothing to mask is not a shape any of these models take.
+            chunk.pop("pixel_values", None)
+            chunk.pop("pixel_attention_mask", None)
         chunks.append(chunk)
     return chunks
 pass
