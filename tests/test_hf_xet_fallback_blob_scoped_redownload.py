@@ -581,13 +581,112 @@ def test_a_baseline_scan_that_failed_is_unknown_rather_than_empty(tmp_path, monk
         "model", REPO, cache_dir = str(tmp_path / "no-such-cache"),
     ) == set()
 
-    # A scan that raises is UNKNOWN, the case the empty set used to swallow.
+    # A scan that raises is UNKNOWN, the case the empty set used to swallow. Patched on the
+    # strict resolver rather than on iter_active_repo_cache_dirs, because delegating to that
+    # one was the defect: it catches the root's own OSError and yields nothing, so the raise
+    # never reached this function and a permission flap read as an empty baseline.
     def _boom(*args, **kwargs):
         raise OSError("cache temporarily unreadable")
 
+    monkeypatch.setattr(xf, "_strict_repo_cache_dirs", _boom)
     monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", _boom)
     assert xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path)) is None, (
         "a failed baseline scan must be unknown, not an empty ownership baseline"
     )
     # The sizes scan means bytes in flight, where unreadable is honestly zero.
     assert xf._active_incomplete_blob_sizes("model", REPO, cache_dir = str(tmp_path)) == {}
+    monkeypatch.undo()
+
+    # And the real thing: a root that cannot be listed is unknown, while a root that is merely
+    # not there yet is the honestly empty baseline of a first download.
+    unreadable = tmp_path / "locked"
+    unreadable.mkdir()
+    (unreadable / REPO_DIR).mkdir()
+    os.chmod(unreadable, 0o000)
+    try:
+        if os.access(unreadable, os.R_OK):
+            pytest.skip("this user can read a 0o000 directory (root), so the flap cannot be posed")
+        assert xf._baseline_incomplete_blob_names(
+            "model", REPO, cache_dir = str(unreadable),
+        ) is None, "an unlistable cache root must be unknown, not empty"
+    finally:
+        os.chmod(unreadable, 0o755)
+
+
+def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
+    monkeypatch, tmp_path
+):
+    """The guard reads dangling links too, and an older interrupted download leaves one with no
+    partial beside it at all.
+
+    Nothing in either blob-scoped pass could see it -- there is no `.incomplete` to delete -- so
+    `has_active_incomplete_blobs` stayed true, the clearance reported failure, and the caller
+    fell back to the repo-wide `force_download` that re-fetches every verified shard (#9094),
+    for a symlink pointing at nothing.
+    """
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: set())
+    snap = _build_cache(tmp_path, partial_age_s = 5.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    (blobs / mine).unlink()
+    # What an older crash leaves: the link was written, the blob never was, and no partial
+    # remains to say a download is in progress.
+    orphan = snap / "tokenizer.model"
+    orphan.symlink_to(os.path.relpath(blobs / _blob_name("tokenizer.model"), snap))
+    assert orphan.is_symlink() and not orphan.exists()
+
+    from unsloth_zoo.hf_cache_state import has_active_incomplete_blobs
+
+    assert has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is True
+    before = _identity(tmp_path)
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert survivors == set(), survivors
+    assert not orphan.is_symlink(), "the orphan link survived, so the caller still forces"
+    assert has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is False
+    # And nothing that was verified was touched: that is the whole point of staying blob-scoped.
+    assert _identity(tmp_path) == before
+    for name in INTACT:
+        assert (snap / name).exists(), name
+
+
+def test_a_dangling_link_whose_partial_is_still_being_written_is_kept(monkeypatch, tmp_path):
+    """A link with an `.incomplete` partner names a download that may still be running.
+
+    Hub creates the link when it finalises the blob, so removing it would delete the record of a
+    file a live writer is about to complete -- and while that partial survives, the repo-wide
+    force is the right answer anyway.
+    """
+    stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: {stranger})
+    snap = _build_cache(tmp_path, partial_age_s = 1800.0)
+    link = snap / IN_FLIGHT
+    assert link.is_symlink() and not link.exists()
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert survivors == {stranger}
+    assert link.is_symlink(), "a link whose blob is mid-download was removed"
+    assert (tmp_path / REPO_DIR / "blobs" / stranger).exists()
+
+
+def test_an_unremovable_orphan_link_is_reported_as_a_survivor(monkeypatch, tmp_path):
+    """Absence is the only evidence the caller accepts, so a link this pass could not remove has
+    to be named rather than silently omitted."""
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: set())
+    snap = _build_cache(tmp_path, partial_age_s = 5.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    (blobs / (_blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX)).unlink()
+
+    def _unlink(self):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(Path, "unlink", _unlink)
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert survivors == {IN_FLIGHT}, survivors
+    assert (snap / IN_FLIGHT).is_symlink()

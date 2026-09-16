@@ -51,6 +51,7 @@ import math
 import multiprocessing as mp
 import logging
 import os
+import stat
 import queue
 import re
 import signal
@@ -80,6 +81,7 @@ from unsloth_zoo.hf_cache_state import (
     _read_format_kept,
     _selected_shard_index_incomplete,
     _sentence_transformers_subfolder_incomplete,
+    _iter_snapshot_dirs,
     _weight_shard_index_complete,
     blob_bytes_present,
     repo_cache_dir_name,
@@ -606,6 +608,71 @@ def _active_incomplete_blob_sizes(
     return sizes
 
 
+def _cache_root_is_merely_absent(cache_dir: Optional[str] = None) -> bool:
+    """Whether the cache root is simply NOT THERE, as against there but unreadable.
+
+    ``hf_cache_root`` answers None to both, which is right for a guard (either way there is
+    nothing to trust) and wrong for a baseline taken before the first download, where a root
+    that does not exist yet is an honestly empty one. ``os.stat`` separates them: missing
+    raises ``FileNotFoundError``, a permission or FUSE failure raises something else.
+    """
+    if cache_dir is None:
+        try:
+            from huggingface_hub import constants as hf_constants
+        except ImportError:
+            return False
+        candidate = Path(hf_constants.HF_HUB_CACHE)
+    else:
+        try:
+            candidate = Path(cache_dir).expanduser()
+        except (RuntimeError, OSError):
+            candidate = Path(cache_dir)
+    try:
+        stat_result = os.stat(candidate)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    # There, and not a directory: nothing was ever cached under it either.
+    return not stat.S_ISDIR(stat_result.st_mode)
+
+
+def _strict_repo_cache_dirs(
+    repo_type: Optional[str],
+    repo_id: str,
+    cache_dir: Optional[str] = None,
+    *,
+    absent_root_is_empty: bool = False,
+) -> list:
+    """This repo's cache dir(s), with every read error RAISED rather than swallowed.
+
+    The same attribution rule as ``_case_safe_repo_cache_dirs`` -- exact case, else a lone folded
+    match that the exact name also resolves to, else neither -- but that one answers an
+    unreadable or briefly absent root with "no directories", which every caller here would read
+    as "no partials". A root that disappears is a remount or a permission flap, and for a scan
+    whose empty answer releases a guard or licenses a deletion, "cannot tell" has to stay
+    distinguishable from "nothing there". Callers wrap this in the ``try`` that turns a raise
+    into their own ``None``.
+    """
+    root = hf_cache_root(cache_dir = cache_dir)
+    if root is None:
+        # Only a baseline asks for this: before the first download the root legitimately does
+        # not exist, and calling that unknown would leave our own child's partial unowned and
+        # protected by the sibling grace, which is the case #9094 is about.
+        if absent_root_is_empty and _cache_root_is_merely_absent(cache_dir):
+            return []
+        raise OSError(f"no HF cache root for {cache_dir!r}")
+    target = repo_cache_dir_name(repo_type, repo_id)
+    folded_target = target.lower()
+    entries = [entry for entry in root.iterdir() if entry.name.lower() == folded_target]
+    exact = [entry for entry in entries if entry.name == target]
+    if exact:
+        return exact
+    if len(entries) == 1 and (root / target).exists():
+        return entries
+    return []
+
+
 def _baseline_incomplete_blob_names(
     repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
 ) -> Optional[set]:
@@ -617,7 +684,14 @@ def _baseline_incomplete_blob_names(
     """
     try:
         names = set()
-        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+        # Enumerated strictly, like _incomplete_partial_names below and for the same reason:
+        # iter_active_repo_cache_dirs catches the root's own OSError and yields nothing, so a
+        # permission or FUSE flap here returned an EMPTY baseline rather than None -- and every
+        # pre-existing sibling partial then looked child-owned, exempt from the grace, and was
+        # deleted mid-write.
+        for entry in _strict_repo_cache_dirs(
+            repo_type, repo_id, cache_dir, absent_root_is_empty = True,
+        ):
             blobs_dir = entry / "blobs"
             if not blobs_dir.is_dir():
                 continue
@@ -657,24 +731,10 @@ def _incomplete_partial_names(
     """
     names: set = set()
     try:
-        root = hf_cache_root(cache_dir = cache_dir)
-        if root is None:
-            return None
         # Selected off ONE root listing rather than via iter_active_repo_cache_dirs, which swallows
         # OSError and reported a permission flap or a remount as "no repo dirs" and then "no
-        # partials" -- the empty set that releases the guard. Here every error surfaces. The rule
-        # mirrors _case_safe_repo_cache_dirs: exact case, else a lone folded match, else neither.
-        target = repo_cache_dir_name(repo_type, repo_id)
-        folded_target = target.lower()
-        entries = [e for e in root.iterdir() if e.name.lower() == folded_target]
-        exact = [e for e in entries if e.name == target]
-        if exact:
-            repo_dirs = exact
-        elif len(entries) == 1 and (root / target).exists():
-            repo_dirs = entries
-        else:
-            repo_dirs = []
-        for entry in repo_dirs:
+        # partials" -- the empty set that releases the guard. Here every error surfaces.
+        for entry in _strict_repo_cache_dirs(repo_type, repo_id, cache_dir):
             blobs_dir = entry / "blobs"
             if not blobs_dir.is_dir():
                 continue
@@ -745,6 +805,62 @@ def _unowned_partials_safe_to_clear(
     return clearable
 
 
+def _orphan_snapshot_links_safe_to_clear(
+    repo_type: str, repo_id: str, cache_dir: Optional[str] = None
+) -> Optional[list]:
+    """Snapshot symlinks pointing at a blob that is not on disk in ANY form, or ``None`` if the
+    cache could not be read.
+
+    The guard this clearance answers to, ``has_active_incomplete_blobs``, fires on a dangling
+    snapshot link as well as on an ``*.incomplete`` blob, and an older interrupted download can
+    leave a link whose target has no partial beside it at all. No partial means nothing for the
+    blob-scoped passes to delete, so the guard kept reading "active", and the alternative it
+    forces is the REPO-WIDE ``force_download`` that re-fetches every verified shard (#9094).
+
+    Only a link with NO ``.incomplete`` partner is listed. One that has a partner names a
+    download that may still be running: hub creates the link when it finalises the blob, so
+    removing it would delete the record of a file a live writer is about to complete. Those are
+    the partials' business, and while one survives the force is the right answer anyway.
+    """
+    orphans: list = []
+    try:
+        for entry in _strict_repo_cache_dirs(repo_type, repo_id, cache_dir):
+            for snapshot in _iter_snapshot_dirs(entry):
+                for link in snapshot.rglob("*"):
+                    try:
+                        if not link.is_symlink() or link.exists():
+                            continue
+                        target = Path(os.path.realpath(link))
+                        if Path(str(target) + INCOMPLETE_SUFFIX).exists():
+                            continue
+                    except OSError:
+                        continue
+                    orphans.append(link)
+    except Exception:
+        return None
+    return orphans
+
+
+def _clear_orphan_snapshot_links(
+    repo_type: str, repo_id: str, cache_dir: Optional[str] = None
+) -> Optional[set]:
+    """Unlink those orphans. Returns the ones that SURVIVED, by name, or ``None`` if unreadable.
+
+    A survivor is a link this pass tried and failed to remove -- locked, or a permission the
+    process does not have -- which is exactly the case the caller must still force for.
+    """
+    orphans = _orphan_snapshot_links_safe_to_clear(repo_type, repo_id, cache_dir)
+    if orphans is None:
+        return None
+    survivors: set = set()
+    for link in orphans:
+        try:
+            link.unlink()
+        except OSError:
+            survivors.add(link.name)
+    return survivors
+
+
 def _clear_unsafe_partials_for_http(
     repo_type: str,
     repo_id: str,
@@ -777,7 +893,17 @@ def _clear_unsafe_partials_for_http(
             repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace,
             owned_incomplete_blobs = clearable,
         )
-    return _incomplete_partial_names(repo_type, repo_id, cache_dir)
+    survivors = _incomplete_partial_names(repo_type, repo_id, cache_dir)
+    if survivors is None:
+        return None
+    # Partials are not the only thing the guard reads. A dangling snapshot link with no
+    # partial beside it is the residue of an older interrupted download, invisible to both
+    # passes above, and it kept `has_active_incomplete_blobs` true on its own -- so this
+    # blob-scoped attempt ended in the repo-wide force it exists to avoid.
+    orphan_survivors = _clear_orphan_snapshot_links(repo_type, repo_id, cache_dir)
+    if orphan_survivors is None:
+        return None
+    return survivors | orphan_survivors
 
 
 def _child_rss(pid: int) -> Optional[int]:
