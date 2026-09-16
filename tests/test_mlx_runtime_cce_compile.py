@@ -881,3 +881,35 @@ def test_finite_logits_past_the_cap_match_the_saturated_loss(dtype, ratio):
     # Even classes saturate to the cap, odd ones stay at 0.
     expected = math.log(vocab / 2 * (1.0 + math.exp(-cap)))
     assert losses.item() == pytest.approx(rows * expected, rel=1e-4)
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_lora_head_backward_recomputes_logits_past_the_budget(monkeypatch, quantized):
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    mx.random.seed(6)
+    hidden = (mx.random.normal((64, 64)) * 0.2).astype(mx.bfloat16)
+    weight = (mx.random.normal((4096, 64)) * 0.05).astype(mx.bfloat16)
+    lora_a = (mx.random.normal((64, 4)) * 0.05).astype(mx.bfloat16)
+    lora_b = (mx.random.normal((4, 4096)) * 0.05).astype(mx.bfloat16)
+    bias = (mx.random.normal((4096,)) * 0.05).astype(mx.bfloat16)
+    targets = mx.random.randint(0, 4096, (64,)).astype(mx.int32)
+    head = (*mx.quantize(weight, group_size=64, bits=4),) if quantized else (weight, None, None)
+    loss = runtime_cce.make_lora_head_cce(
+        chunk_size=1024, adapter_scale=2.0, logit_scale=0.5,
+        **(dict(group_size=64, bits=4) if quantized else {}))
+    slices, original = [], runtime_cce._unmerged_slice
+    monkeypatch.setattr(runtime_cce, "_unmerged_slice",
+                        lambda *args, **kwargs: (slices.append(args[1]), original(*args, **kwargs))[1])
+
+    grads = []
+    for threshold in (1 << 40, 1):
+        monkeypatch.setattr(runtime_cce, "_RECOMPUTE_LOGITS_BYTES", threshold)
+        grad = mx.compile(mx.grad(
+            lambda h, a, b, c: loss(h, *head, h @ a, b, c, targets).astype(mx.float32).sum(),
+            argnums=(0, 1, 2, 3)))
+        grads.append(grad(hidden, lora_a, lora_b, bias))
+        mx.eval(grads[-1])
+        assert sorted(set(slices)) == ([] if threshold > 1 else [0, 1024, 2048, 3072])
+    for want, got in zip(*grads):
+        assert mx.array_equal(want, got).item()

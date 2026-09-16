@@ -5115,9 +5115,7 @@ class MLXTrainer:
                 if hasattr(loss_fn, "_unsloth_compiled_loss_fn"):
                     _main_print(
                         "Unsloth: LoRA head CCE is available for compiled steps; "
-                        "eager steps use standard cross-entropy. It lowers peak "
-                        "memory by reprojecting logits in the backward, so "
-                        "expect slower steps in exchange."
+                        "eager steps use standard cross-entropy."
                     )
                 elif cce_backend == "baseline-fallback":
                     use_cce = False

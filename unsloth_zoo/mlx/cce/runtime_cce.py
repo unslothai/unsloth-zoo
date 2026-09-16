@@ -111,6 +111,37 @@ def _resolve_chunk_size(
     return min(chunk_v, vocab_size)
 
 
+_RECOMPUTE_LOGITS_BYTES: int | None = None
+
+
+def _recomputes_logits(n_tokens: int, vocab_size: int, bytes_per_element: int) -> bool:
+    """Whether a compiled backward should recompute chunk logits.
+
+    mx.compile merges the backward's chunk projection with the identical forward
+    one, which keeps every chunk's logits alive. That is faster, so it is kept
+    until those logits would take a tenth of the working set.
+    """
+    global _RECOMPUTE_LOGITS_BYTES
+    if _RECOMPUTE_LOGITS_BYTES is None:
+        try:
+            recommended = mx.device_info().get("max_recommended_working_set_size", 0)
+        except Exception:
+            recommended = 0
+        _RECOMPUTE_LOGITS_BYTES = recommended // 10 if recommended > 0 else 100 * 128 * 1024 * 1024
+    return n_tokens * vocab_size * bytes_per_element > _RECOMPUTE_LOGITS_BYTES
+
+
+def _unmerged_slice(x: mx.array | None, start: int, end: int, axis: int = 0) -> mx.array | None:
+    """``x[start:end]`` along ``axis`` with a traced start, which mx.compile cannot merge."""
+    if x is None:
+        return None
+    starts = [0] * x.ndim
+    starts[axis] = start
+    sizes = list(x.shape)
+    sizes[axis] = end - start
+    return mx.slice(x, mx.array(starts, dtype=mx.int32), tuple(range(x.ndim)), tuple(sizes))
+
+
 def _normalize_label_smoothing(value) -> float:
     """Shared domain check for every loss entry point: finite real 0<=eps<=1."""
     import numbers
@@ -1452,13 +1483,11 @@ def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
                        group_size=None, bits=None, mode="affine"):
     """Chunked cross entropy over a LoRA-adapted classifier.
 
-    This trades time for memory and is not a speedup: the backward reprojects
-    every vocabulary chunk instead of keeping the logits, which measures around
-    2.1x lower peak against dense cross entropy at the cost of roughly 1.1-1.2x
-    the step time on an unquantized head. A quantized head is close to even, because
-    there the dense baseline pays to materialize the same logits in half
-    precision anyway. Choose it when the dense logits do not fit, not to go
-    faster.
+    In a compiled step the backward keeps each chunk's logits, which measures
+    about 3.9x lower peak than compiled dense cross entropy at a slightly faster
+    step. Once those logits would pass a tenth of the working set it reprojects
+    every chunk instead, for about 7.5x lower peak at roughly 1.2x the dense
+    step time.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
@@ -1538,9 +1567,18 @@ def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
         grad_h = mx.zeros_like(h)
         grad_rank = mx.zeros_like(rank_h)
         grad_b, grad_bias = [], []
+        recompute = _recomputes_logits(
+            h.shape[0], w.shape[0], 2 if base_dtype in (mx.float16, mx.bfloat16) else 4,
+        )
         for start in range(0, w.shape[0], chunk_size):
             end = min(start + chunk_size, w.shape[0])
-            logits = project(h, projection_weight, sc, qb, rank_h, b, bias, start, end)
+            if recompute:
+                logits = project(
+                    h, _unmerged_slice(projection_weight, start, end), _unmerged_slice(sc, start, end),
+                    _unmerged_slice(qb, start, end), rank_h, _unmerged_slice(b, start, end, axis=1),
+                    _unmerged_slice(bias, start, end), 0, end - start)
+            else:
+                logits = project(h, projection_weight, sc, qb, rank_h, b, bias, start, end)
             dg = dlogits(
                 inputs=[logits, outputs[1], targets32, grad_output,
                         mx.array([start], dtype=mx.int32), ignore_arr, softcap_arr],
@@ -1553,9 +1591,16 @@ def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
                 dg.astype(base_dtype), projection_weight, sc, qb, start, end, transpose=False).astype(h.dtype)
             grad_delta = dg.astype(h.dtype).astype(adapter_dtype) * adapter_scale
             grad_rank = grad_rank + (grad_delta @ b[:, start:end].T).astype(rank_h.dtype)
-            grad_b.append((rank_h.T @ grad_delta).astype(b.dtype))
+            chunk_grads = [grad_h, grad_rank, (rank_h.T @ grad_delta).astype(b.dtype)]
             if bias is not None:
-                grad_bias.append(dg.sum(axis=0).astype(bias.dtype))
+                chunk_grads.append(dg.sum(axis=0).astype(bias.dtype))
+            # Evaluating each chunk's consumers together lets its dg be freed;
+            # a compiled graph would otherwise keep every chunk's buffers alive.
+            chunk_grads = mx.depends(chunk_grads, [dg])
+            grad_h, grad_rank = chunk_grads[:2]
+            grad_b.append(chunk_grads[2])
+            if bias is not None:
+                grad_bias.append(chunk_grads[3])
         return (grad_h, mx.zeros_like(w),
                 None if sc is None else mx.zeros_like(sc),
                 None if qb is None else mx.zeros_like(qb),
