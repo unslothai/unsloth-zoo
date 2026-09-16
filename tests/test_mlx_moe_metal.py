@@ -455,6 +455,32 @@ def test_gemma_router_is_fused_and_falls_back_on_the_raw_input(native, scale_dty
     assert type(router) is native.Router
 
 
+def test_gemma_holds_the_norm_weight_for_the_scope_and_refuses_a_stale_one(monkeypatch):
+    router = _router(vlm_gemma)
+    samples = _routing_samples(router)
+    partitions = _counting_argpartition(monkeypatch)
+    weights, rms_norm = [], mx.fast.rms_norm
+    monkeypatch.setattr(mx.fast, "rms_norm", lambda x, w, eps: weights.append(w) or rms_norm(x, w, eps))
+    with fusion.fused_moe_router(router):
+        held = router._unsloth_router_norm
+        mx.eval(router(samples[0][0]))
+        partitions.clear()
+        weights.clear()
+        _check(router, samples)
+        assert not partitions and router._unsloth_router_norm is held
+        assert weights and all(w is held.weight for w in weights)  # the held product, not a fresh one
+        router.scale = router.scale * 1.5
+        edited = _routing_samples(router)  # a replaced weight is not the held one, so these take the native chain
+        assert partitions
+    assert "_unsloth_router_norm" not in router.__dict__
+    with fusion.fused_moe_router(router):
+        assert router._unsloth_router_norm.weight is not held.weight
+        mx.eval(router(edited[0][0]))
+        partitions.clear()
+        _check(router, edited)
+        assert not partitions
+
+
 def _unpinned_call(self, x):
     return x
 

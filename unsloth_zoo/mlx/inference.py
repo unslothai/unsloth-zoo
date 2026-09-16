@@ -965,14 +965,26 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
     return fused_call
 
 
+class _RouterNormScale:
+    """The Gemma router's `scale * root_size`, built at scope entry, used while `scale` is that array."""
+
+    def __init__(self, module):
+        self.scale = module.scale
+        self.weight = self.scale * module._root_size
+
+    def matches(self, module):
+        return module.scale is self.scale
+
+
 def _gemma4_router_call(native):
     def fused_call(self, x):
         drifted = _drifted_call(self, native)
         if drifted is not None:
             return drifted(self, x)
-        if self.training:
+        norm = getattr(self, "_unsloth_router_norm", None)
+        if self.training or norm is None or not norm.matches(self):
             return native(self, x)
-        normed = mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
+        normed = mx.fast.rms_norm(x, norm.weight, self.eps)
         routed = _fused_moe_router(self.proj(normed), self.per_expert_scale,
                                    self.config.top_k_experts, _GEMMA_ROUTING, False)
         return native(self, x) if routed is None else routed
@@ -1019,6 +1031,10 @@ def fused_moe_router(model):
     their native call, as do training and distributed models; the native call is also
     taken per invocation when the kernel cannot reproduce this MLX build's rounding.
     Instance classes are restored when the context exits, including on cancellation.
+    Gemma routers fold `scale` into a normalization weight held until the outermost
+    scope exits, so `scale` must stay fixed while the scope is open, as the gate and up
+    packing requires of its own weights: replacing it is detected and takes the native
+    call, editing it in place is not detected. Edits between scopes are always picked up.
     """
     changed = []
     try:
@@ -1047,6 +1063,8 @@ def fused_moe_router(model):
                 module.__class__ = patched
                 module._unsloth_router_scopes = 1
                 changed.append(module)
+                if mode == _GEMMA_ROUTING:
+                    module._unsloth_router_norm = _RouterNormScale(module)
         yield model
     finally:
         for module in reversed(changed):
@@ -1058,3 +1076,4 @@ def fused_moe_router(model):
             if native is not None:
                 module.__class__ = native
             module.__dict__.pop("_unsloth_router_scopes", None)
+            module.__dict__.pop("_unsloth_router_norm", None)
