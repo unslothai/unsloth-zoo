@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import torch
 import torch.nn.functional as F
+import json
 import os
 import shutil
 import sys
@@ -34,6 +35,15 @@ try:
     HAS_BNB = True
 except Exception:
     # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
+    HAS_BNB = False
+    Params4bit = None
+
+if not isinstance(Params4bit, type):
+    # A bitsandbytes that imports but does not expose Params4bit as a class, which is what
+    # the macOS build does, makes every `isinstance(param, Params4bit)` below raise
+    # TypeError instead of answering False. Probe the object, not the platform or the
+    # version, and treat that install as no bitsandbytes at all: there is no 4-bit expert
+    # path without the class.
     HAS_BNB = False
     Params4bit = None
 
@@ -77,12 +87,51 @@ _CACHED_FORWARD_MOE_BACKEND = None
 _CACHED_MOE_UTILS_MODULE = None
 
 
+_WARNED_STALE_CACHE = set()
+
+
+def _cached_copy_is_current(cache_file, current_file) -> bool:
+    """Whether the compiled cache holds byte for byte what this module is.
+
+    `install_to_cache` rewrites the cache on every import, so the two normally
+    match and this is a cheap confirmation. They diverge when the copy could not
+    be written: a cache directory baked into an image, a read only mount, or a
+    file owned by another user. `shutil.copy` fails there and the failure is
+    swallowed, so the cache keeps an OLDER unsloth_zoo, and every caller below
+    prefers it, which silently installs that older module's patches over the
+    ones this release ships. Prefer this module in that case, and say so once.
+    """
+    try:
+        with open(cache_file, "rb") as f:
+            cached = f.read()
+        with open(current_file, "rb") as f:
+            current = f.read()
+    except Exception:
+        return False
+    if cached == current:
+        return True
+
+    if cache_file not in _WARNED_STALE_CACHE:
+        _WARNED_STALE_CACHE.add(cache_file)
+        logger = _moe_utils_logger()
+        if logger is not None:
+            logger.warning(
+                f"Unsloth: {cache_file} is from a different version of unsloth_zoo and "
+                f"could not be refreshed, so it is being ignored. Delete that directory "
+                f"if MoE behaviour looks stale."
+            )
+    return False
+
+
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 
     cache_file = os.path.abspath(os.path.join(_get_compile_location(), "moe_utils.py"))
     current_file = os.path.abspath(__file__)
     if not os.path.isfile(cache_file) or cache_file == current_file:
+        return None
+    if not _cached_copy_is_current(cache_file, current_file):
+        _CACHED_MOE_UTILS_MODULE = None
         return None
 
     try:
@@ -1431,6 +1480,70 @@ def _is_moe_experts_module(module) -> bool:
 _get_moe_lora_weights = _extract_lora_from_wrapper
 
 
+# ---------------------------------------------------------------------------------------
+# Which convention packs lora_B's (num_experts * rank) axis.
+#
+# PEFT's ParamWrapper builds lora_A as (E*R, in) and lora_B as (out, E*R) and pairs them
+# in get_delta_weight by reading A as (E, R, in) and B as (out, R, E): lora_A is grouped
+# by expert, lora_B is NOT, its expert index is the fastest axis. Unsloth does not use
+# PEFT's forward for fused MoE experts; the separated forward reads the same lora_B as
+# (out, E, R) (`_canonical_lora_weights_for_grouped_mm`), so a rank-contiguous block of
+# columns belongs to one expert. Both stacks are internally consistent, and they disagree
+# with each other whenever num_experts != rank, which is every real MoE checkpoint.
+#
+# So the layout is a property of the forward that ran, not of the architecture, and every
+# consumer has to ask the same question of the same wrapper. That is what these two
+# helpers are for: the forward routing test below, and the layout name derived from it.
+# The name is also written into adapter_config.json on save (unsloth#6930), because a
+# downstream converter has no wrapper to ask.
+# ---------------------------------------------------------------------------------------
+
+LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
+LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
+
+# The only parameter names the separated forward claims. Anything else on an experts
+# module (the unfused experts.gate_proj / experts.up_proj pair that NemotronH uses, for
+# instance) stays on PEFT's own forward and keeps PEFT's own packing.
+_SEPARATED_MOE_LORA_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
+
+
+def _wrapper_uses_separated_moe_lora(wrapper, experts_module = None) -> bool:
+    """True when `_patched_param_wrapper_forward` routes this wrapper to the separated
+    MoE forward instead of PEFT's `_activate_lora`. Kept in one place so the forward, the
+    delta reconstruction and the saved layout marker cannot drift apart."""
+    if not _should_use_separated_lora():
+        return False
+    if getattr(wrapper, "parameter_name", None) not in _SEPARATED_MOE_LORA_PARAMETER_NAMES:
+        return False
+    if experts_module is None:
+        get_base_layer = getattr(wrapper, "get_base_layer", None)
+        if get_base_layer is None:
+            return False
+        try:
+            experts_module = get_base_layer()
+        except Exception:
+            return False
+    return _is_moe_experts_module(experts_module)
+
+
+def moe_lora_b_layout(wrapper) -> str:
+    """Which convention packs `wrapper`'s lora_B columns: `grouped_by_expert` when the
+    separated MoE forward owns the wrapper, else PEFT's `rank_major`. A single expert (or
+    a wrapper PEFT collapses to a plain Linear) has no packing to get wrong and is
+    reported as rank_major, which is what PEFT's own reconstruction does for it.
+
+    `wrapper` must be the PEFT ParamWrapper. Hand it anything else, the experts module
+    itself for instance, and the answer is rank_major, because nothing on it says the
+    separated forward claimed a parameter. That reads as a confident "PEFT packed this"
+    when the truth is "cannot tell", so callers that may hold something else have to
+    check for `parameter_name` and `lora_A` first."""
+    if int(getattr(wrapper, "num_experts", 1) or 1) <= 1:
+        return LORA_B_LAYOUT_RANK_MAJOR
+    if _wrapper_uses_separated_moe_lora(wrapper):
+        return LORA_B_LAYOUT_GROUPED_BY_EXPERT
+    return LORA_B_LAYOUT_RANK_MAJOR
+
+
 # Store original ParamWrapper.forward for fallback
 _original_param_wrapper_forward = None
 
@@ -1453,14 +1566,9 @@ def _patched_param_wrapper_forward(
     # For stashing LoRA data we need the actual experts module (recursive lookup).
     experts_module = self.get_base_layer()
 
-    use_separated = _should_use_separated_lora()
     param_name = getattr(self, "parameter_name", None)
 
-    if (
-        use_separated
-        and param_name in ("gate_up_proj", "down_proj")
-        and _is_moe_experts_module(experts_module)
-    ):
+    if _wrapper_uses_separated_moe_lora(self, experts_module):
         # MoE experts: bypass PEFT's _activate_lora, use separated computation.
         if self.disable_adapters:
             if self.merged:
@@ -1502,11 +1610,255 @@ def _patched_param_wrapper_forward(
     return _original_param_wrapper_forward(self, x, *args, **kwargs)
 
 
+# Store original ParamWrapper.get_delta_weight for fallback
+_original_param_wrapper_get_delta_weight = None
+
+
+def _grouped_by_expert_delta_weight(wrapper, adapter_name):
+    """PEFT's ParamWrapper.get_delta_weight arithmetic with lora_B read the way the
+    separated MoE forward reads it: (out, num_experts, rank) rather than PEFT's
+    (out, rank, num_experts). Everything else, including which einsum the swapped
+    in/out orientation needs, is PEFT's own."""
+    weight_A = wrapper.lora_A[adapter_name].weight
+    weight_B = wrapper.lora_B[adapter_name].weight
+    num_experts = int(wrapper.num_experts)
+
+    # experts x rank x in_features, as in PEFT: lora_A is grouped by expert there too.
+    weight_A = weight_A.reshape(num_experts, -1, weight_A.shape[-1])
+    # out_features x experts x rank. This is the one line that differs from PEFT.
+    weight_B = weight_B.reshape(weight_B.shape[0], num_experts, -1)
+
+    scaling = wrapper.scaling[adapter_name]
+    if not getattr(wrapper, "_did_swap_in_out_features", False):
+        return torch.einsum("o e r, e r i -> e i o", weight_B, weight_A) * scaling
+    # for some MoE layers, the order is (experts, out_features, in_features)
+    return torch.einsum("o e r, e r i -> e o i", weight_B, weight_A) * scaling
+
+
+def _cast_delta_weight_like_param(delta_weight, param):
+    """PEFT's own tail: move the delta to the parameter, and match its dtype unless that
+    dtype is a low precision one PEFT deliberately adds in higher precision (float8 and
+    friends). Probed from PEFT when it publishes the set, so this follows PEFT rather
+    than hardcoding a dtype list that a new release would make wrong."""
+    try:
+        from peft.tuners.lora.layer import ALLOWED_COMPUTE_DTYPES
+        allowed = param.dtype in ALLOWED_COMPUTE_DTYPES
+    except Exception:
+        # PEFT 0.18 has no such set and casts unconditionally, 0.19.0 onwards do; every dtype
+        # 0.18 accepts for a 3D expert parameter is an ordinary floating point one.
+        allowed = param.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    if allowed:
+        return delta_weight.to(param.device, param.dtype)
+    return delta_weight.to(param.device)
+
+
+def _patched_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs):
+    """PEFT reconstructs a fused MoE expert delta with lora_B packed rank-major, which is
+    not how Unsloth's separated forward trained it, so PEFT's merge_and_unload,
+    merge_adapter and unmerge all bake a per-expert delta whose expert blocks are
+    scrambled (unsloth#6930). Reconstruct it the way the forward that ran packs it, and
+    leave every other wrapper on PEFT's own code."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if moe_lora_b_layout(self) != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
+        return _original_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
+
+    delta_weight = _grouped_by_expert_delta_weight(self, adapter_name)
+    return _cast_delta_weight_like_param(delta_weight, self.get_param())
+
+
+def _moe_utils_logger():
+    """The shared patch logger, imported lazily and absolutely: this file is also copied
+    into unsloth_compiled_cache and executed there as a top level module, where a
+    relative import has no package to resolve against."""
+    try:
+        from unsloth_zoo.temporary_patches.common import logger
+        return logger
+    except Exception:
+        return None
+
+
+# The adapter_config.json keys. The flat one is what a converter branches on
+# (unsloth#6930 asks for exactly this key); the nested one carries the detail, because a
+# checkpoint can in principle hold one fused parameter trained through the separated
+# forward and another PEFT kept for itself.
+FUSED_EXPERT_LORA_LAYOUT_KEY = "lora_B_layout"
+FUSED_EXPERT_LORA_DETAIL_KEY = "unsloth_fused_expert_lora"
+
+
+def fused_expert_lora_layout(peft_model) -> Optional[dict]:
+    """How every fused MoE expert LoRA on `peft_model` packs its lora_A and lora_B, or
+    None when the model has no fused expert LoRA at all.
+
+    lora_A is grouped by expert in both stacks. lora_B is the one that differs, and it is
+    reported per PEFT parameter name, since that is what decides whether Unsloth's
+    separated forward or PEFT's own forward owns the wrapper."""
+    parameters = {}
+    try:
+        modules = list(peft_model.modules())
+    except Exception:
+        return None
+
+    for module in modules:
+        parameter_name = getattr(module, "parameter_name", None)
+        if not parameter_name or not hasattr(module, "lora_A"):
+            continue
+        num_experts = int(getattr(module, "num_experts", 1) or 1)
+        if num_experts <= 1:
+            # Not a fused expert stack, so there is no expert axis to pack.
+            continue
+        layout = moe_lora_b_layout(module)
+        entry = parameters.get(parameter_name)
+        if entry is None:
+            parameters[parameter_name] = {
+                "lora_B_layout": layout,
+                "num_experts": num_experts,
+            }
+        elif entry["lora_B_layout"] != layout:
+            entry["lora_B_layout"] = "mixed"
+
+    if not parameters:
+        return None
+
+    detail = {
+        "lora_A_layout": LORA_B_LAYOUT_GROUPED_BY_EXPERT,
+        "parameters": parameters,
+    }
+    layouts = {entry["lora_B_layout"] for entry in parameters.values()}
+    if len(layouts) == 1:
+        detail["lora_B_layout"] = layouts.pop()
+    return detail
+
+
+def _fused_expert_lora_adapter_config_paths(peft_model, save_directory, selected_adapters):
+    """Where PEFT just wrote an adapter_config.json: the root for `default`, a
+    subdirectory named after any other adapter."""
+    if selected_adapters is None:
+        try:
+            selected_adapters = list(peft_model.peft_config.keys())
+        except Exception:
+            selected_adapters = ["default"]
+    paths = []
+    for adapter_name in selected_adapters:
+        directory = save_directory
+        if adapter_name != "default":
+            directory = os.path.join(save_directory, adapter_name)
+        path = os.path.join(directory, "adapter_config.json")
+        if os.path.isfile(path):
+            paths.append(path)
+    return paths
+
+
+def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters = None):
+    """Record the fused MoE expert lora_B packing in the adapter_config.json PEFT has
+    just written, and return the files updated. Nothing is written for a model with no
+    fused expert LoRA. PEFT ignores keys it does not know, so the checkpoint stays
+    loadable by any PEFT version; this only stops a downstream converter, or PEFT's own
+    merge in a differently configured process, from having to guess (unsloth#6930)."""
+    detail = fused_expert_lora_layout(peft_model)
+    if detail is None:
+        return []
+
+    written = []
+    for path in _fused_expert_lora_adapter_config_paths(
+        peft_model, save_directory, selected_adapters,
+    ):
+        with open(path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            continue
+        config[FUSED_EXPERT_LORA_DETAIL_KEY] = detail
+        if "lora_B_layout" in detail:
+            config[FUSED_EXPERT_LORA_LAYOUT_KEY] = detail["lora_B_layout"]
+        else:
+            config.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
+        with open(path, "w", encoding = "utf-8") as f:
+            # Byte for byte how PeftConfigMixin.save_pretrained writes it, so adding the
+            # marker does not also reformat the file PEFT produced.
+            f.write(json.dumps(config, indent = 2, sort_keys = True))
+        written.append(path)
+    return written
+
+
+# Store original PeftModel.save_pretrained for fallback
+_original_peft_model_save_pretrained = None
+
+
+def _save_pretrained_argument(name, default, args, kwargs):
+    """One of PeftModel.save_pretrained's arguments, whether the caller passed it by
+    keyword or positionally. Resolved against the real signature rather than a copy of
+    it, so a PEFT release that adds an argument cannot silently shift the index. `args`
+    excludes self and save_directory."""
+    if name in kwargs:
+        return kwargs[name]
+    try:
+        import inspect
+        parameters = list(
+            inspect.signature(_original_peft_model_save_pretrained).parameters
+        )
+        index = parameters.index(name) - 2
+        if 0 <= index < len(args):
+            return args[index]
+    except Exception:
+        pass
+    return default
+
+
+def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
+    """Add the fused expert layout marker to what PEFT saved. Never fails a save: the
+    adapter itself is already on disk by the time this runs."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    result = _original_peft_model_save_pretrained(self, save_directory, *args, **kwargs)
+    if _save_pretrained_argument("is_main_process", True, args, kwargs):
+        try:
+            write_fused_expert_lora_layout(
+                self, save_directory,
+                selected_adapters = _save_pretrained_argument(
+                    "selected_adapters", None, args, kwargs,
+                ),
+            )
+        except Exception as exception:
+            logger = _moe_utils_logger()
+            if logger is not None:
+                logger.warning(
+                    f"Unsloth: could not record the fused MoE expert LoRA layout in "
+                    f"adapter_config.json ({type(exception).__name__}: {exception}). The "
+                    f"adapter itself saved correctly."
+                )
+    return result
+
+
+def _patch_peft_save_pretrained_for_moe_layout():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_peft_model_save_pretrained
+
+    try:
+        from peft import PeftModel
+    except Exception:
+        return False
+
+    if getattr(PeftModel.save_pretrained, "_unsloth_moe_layout_patched", False):
+        return True
+
+    if _original_peft_model_save_pretrained is None:
+        _original_peft_model_save_pretrained = PeftModel.save_pretrained
+
+    patched = wraps(_original_peft_model_save_pretrained)(
+        _patched_peft_model_save_pretrained,
+    )
+    patched._unsloth_moe_layout_patched = True
+    PeftModel.save_pretrained = patched
+    return True
+
+
 def patch_param_wrapper_for_moe():
     """Patch PEFT's ParamWrapper.forward for MoE separated LoRA (call after PEFT import)."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     global _original_param_wrapper_forward
+    global _original_param_wrapper_get_delta_weight
 
     module = _load_cached_moe_utils_module()
     if module is not None and hasattr(module, "patch_param_wrapper_for_moe"):
@@ -1522,6 +1874,19 @@ def patch_param_wrapper_for_moe():
             _original_param_wrapper_forward = ParamWrapper.forward
 
         ParamWrapper.forward = _patched_param_wrapper_forward
+
+        # The forward is only half of it: the merge path reads lora_B through
+        # get_delta_weight, which is PEFT's and packs it the other way.
+        if not getattr(ParamWrapper.get_delta_weight, "_unsloth_moe_layout_patched", False):
+            if _original_param_wrapper_get_delta_weight is None:
+                _original_param_wrapper_get_delta_weight = ParamWrapper.get_delta_weight
+            patched = wraps(_original_param_wrapper_get_delta_weight)(
+                _patched_param_wrapper_get_delta_weight,
+            )
+            patched._unsloth_moe_layout_patched = True
+            ParamWrapper.get_delta_weight = patched
+
+        _patch_peft_save_pretrained_for_moe_layout()
         _patch_peft_get_peft_model_for_moe()
 
         return True
