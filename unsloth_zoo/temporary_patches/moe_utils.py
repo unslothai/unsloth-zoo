@@ -1603,6 +1603,92 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
     )
 
 
+def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
+    """Run one throwaway experts forward under `no_grad` and report whether it read the stash.
+
+    Measured on a separate graph-free call rather than on the call that counts. The call
+    that counts then runs exactly one experts forward, on whichever path the verdict names,
+    and it runs that same single path again on a recompute. That is the property
+    non-reentrant gradient checkpointing requires: it replays the region and refuses, with
+    `CheckpointError: a different number of tensors was saved during the original forward
+    and recomputation`, if the replay does not save what the forward saved. Measuring in
+    band cannot have that property, because the measuring call has to run the forward once
+    to find out and then a second time through PEFT when the answer is no, while the
+    recompute already knows the answer and runs it once. transformers 5 enables gradient
+    checkpointing with `use_reentrant = False` by default
+    (`modeling_utils.py`: `gradient_checkpointing_kwargs = {"use_reentrant": False}`), and
+    Unsloth's own vision path selects it whenever the run is distributed, so that is the
+    common configuration and not a corner.
+
+    `no_grad` and the discarded result are what make this cheap enough to do eagerly: no
+    graph is built, nothing is saved for backward, and it happens once per experts module
+    and parameter for the lifetime of the process. A stash-reading family pays one extra
+    forward on its first step and nothing afterwards; a family that ignores the stash now
+    pays two forwards on its first step where the in-band measurement paid three.
+
+    Returns True, False, or None when the probe itself raised. None caches nothing and
+    leaves the call on the stash path, so the real call raises the real error with the real
+    traceback instead of a second, confusing one from PEFT's fold.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    lora_data = _extract_lora_from_wrapper(wrapper)
+    lora_attr = moe_lora_stash_name(parameter_name)
+    if lora_data is not None:
+        setattr(experts_module, lora_attr, lora_data)
+    _reset_moe_lora_stash_read(experts_module, parameter_name)
+    try:
+        with torch.no_grad():
+            wrapper.base_layer(x, *args, **kwargs)
+    except Exception:
+        # Not evidence either way, and not ours to report. Do not cache a verdict.
+        return None
+    finally:
+        if hasattr(experts_module, lora_attr):
+            delattr(experts_module, lora_attr)
+    was_read = _moe_lora_stash_was_read(experts_module, parameter_name)
+    _record_moe_lora_forward_verdict(experts_module, parameter_name, was_read)
+    return was_read
+
+
+def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool:
+    """Whether handing this parameter back to PEFT would fold a delta into a real weight.
+
+    PEFT folds by registering a parametrization that adds `delta_weight` to the stored
+    parameter, which is only defined for a plain floating-point tensor. A stacked expert
+    weight held as bitsandbytes `Params4bit`, an MXFP4 blocked tensor or an FP8 tensor is
+    none of those: the add is a dtype or shape error at best and silent corruption at
+    worst. `_forward_native_fp8_expert_loop` says the same thing from the other side, that
+    the reroute must not take charge of a quantized parameter, and enforces it by recording
+    its reads; this enforces it for the quantized forwards that have no such hook, the
+    MXFP4 GPT-OSS experts forward among them, where `_get_lora_wrapper_for_param` resolves
+    to None against PEFT's `target_parameters` layout and so records nothing.
+
+    Refusing to reroute leaves that case exactly as it is on main: the stash is written and
+    the forward does what it does with it. That is not a fix for a quantized family, and it
+    is not meant to be one; it is a guarantee that this change cannot make one worse.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if _original_param_wrapper_forward is None:
+        return False
+    param = getattr(experts_module, parameter_name, None)
+    if not isinstance(param, torch.Tensor):
+        return False
+    if not param.dtype.is_floating_point:
+        return False
+    # `is_floating_point` is True for float8_e4m3fn and float8_e5m2, and PEFT's own
+    # `get_delta_weight` special-cases them precisely because the add is not defined there.
+    if param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return False
+    # bitsandbytes stores 4-bit weights in a float or uint8 tensor of the packed shape, and
+    # marks them with `quant_state`. Neither the dtype nor the shape gives it away.
+    if getattr(param, "quant_state", None) is not None:
+        return False
+    if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
+        return False
+    return True
+
 
 # Store original ParamWrapper.forward for fallback
 _original_param_wrapper_forward = None
@@ -1653,10 +1739,17 @@ def _patched_param_wrapper_forward(
                     self.num_experts = p.shape[0]
 
         # An experts forward that does not read the stash never sees this LoRA, so hand the
-        # wrapper back to PEFT, which folds the delta into the weight instead. Checked before
-        # the call so only the very first call on an experts module pays for measuring it.
+        # wrapper back to PEFT, which folds the delta into the weight instead. Measured once
+        # per experts module and parameter, before the call that counts, so the call that
+        # counts always runs exactly one experts forward on the path the verdict names.
         applies_stash = moe_lora_forward_applies_stash(experts_module, param_name)
-        if applies_stash is False and _original_param_wrapper_forward is not None:
+        if applies_stash is None:
+            applies_stash = _measure_moe_lora_stash_read(
+                self, experts_module, param_name, x, args, kwargs
+            )
+            if applies_stash is False:
+                _log_moe_lora_stash_unread_once(experts_module, param_name)
+        if applies_stash is False and _can_fold_moe_lora_through_peft(experts_module, param_name):
             return _original_param_wrapper_forward(self, x, *args, **kwargs)
 
         # Extract LoRA for this parameter and stash on the experts module
@@ -1667,9 +1760,6 @@ def _patched_param_wrapper_forward(
             lora_attr = moe_lora_stash_name(param_name)
             setattr(experts_module, lora_attr, lora_data)
 
-        if applies_stash is None:
-            _reset_moe_lora_stash_read(experts_module, param_name)
-
         try:
             # Immediate base_layer preserves the wrapper chain.
             result = immediate_base_layer(x, *args, **kwargs)
@@ -1678,16 +1768,6 @@ def _patched_param_wrapper_forward(
                 lora_attr = moe_lora_stash_name(param_name)
                 if hasattr(experts_module, lora_attr):
                     delattr(experts_module, lora_attr)
-
-        if applies_stash is None:
-            was_read = _moe_lora_stash_was_read(experts_module, param_name)
-            _record_moe_lora_forward_verdict(experts_module, param_name, was_read)
-            if not was_read:
-                # This result has no expert LoRA in it. Redo the call PEFT's way and return
-                # that; the verdict just recorded keeps every later call on the short path.
-                _log_moe_lora_stash_unread_once(experts_module, param_name)
-                if _original_param_wrapper_forward is not None:
-                    return _original_param_wrapper_forward(self, x, *args, **kwargs)
 
         return result
 

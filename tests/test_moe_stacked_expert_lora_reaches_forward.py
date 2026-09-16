@@ -408,3 +408,111 @@ def test_is_moe_experts_module_survives_a_stubbed_params4bit(monkeypatch):
     monkeypatch.setattr(MU, "HAS_BNB", False, raising=False)
     experts = _StashIgnoringExperts()
     assert MU._is_moe_experts_module(experts) is True
+
+
+# ------------------------------------------- what the measuring call is allowed to cost
+
+
+def test_non_reentrant_gradient_checkpointing_survives_the_measurement(restore_param_wrapper):
+    """The measuring call must not save tensors the later calls do not save.
+
+    `torch.utils.checkpoint` with `use_reentrant = False` replays the region in the
+    backward and refuses, with `CheckpointError: A different number of tensors was saved
+    during the original forward and recomputation`, if the replay does not save what the
+    forward saved. Measuring in band cannot satisfy that: the first call runs the experts
+    forward to find out and then again through PEFT when the answer is no, while the
+    recompute already has the verdict and runs it once.
+
+    This is the configuration transformers 5 chooses by default, from
+    `modeling_utils.gradient_checkpointing_enable`:
+    `gradient_checkpointing_kwargs = {"use_reentrant": False}`, and the one Unsloth's own
+    vision path selects whenever the run is distributed. Both halves of the family split
+    are checked, because a fix that only reroutes differently would still leave the
+    stash-reading half saving a different number of tensors on its first call.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    assert MU.patch_param_wrapper_for_moe()
+    for experts_cls in (_StashIgnoringExperts, _StashReadingExperts):
+        model = _build(experts_cls)
+        x = _inputs().requires_grad_(True)
+        # The assertion is that this does not raise CheckpointError.
+        out = checkpoint(lambda t: model(t), x, use_reentrant=False)
+        out.sum().backward()
+        if experts_cls is _StashIgnoringExperts:
+            # This half is rerouted to PEFT, so the adapter is in the graph and trains.
+            grads = [p.grad for name, p in model.named_parameters() if "lora_B" in name]
+            assert grads and all(g is not None and g.abs().sum() > 0 for g in grads), (
+                f"{experts_cls.__name__}: expert LoRA received no gradient"
+            )
+
+
+def test_the_measurement_happens_once_and_costs_one_forward_afterwards(restore_param_wrapper):
+    """Steady state is one experts forward per call, for both halves of the family split.
+
+    The measurement is a one-off. If it were not, a family that ignores the stash would pay
+    the double call on every step, and a family that reads it would stop being byte for
+    byte what main runs.
+    """
+    assert MU.patch_param_wrapper_for_moe()
+    x = _inputs()
+    for experts_cls in (_StashIgnoringExperts, _StashReadingExperts):
+        model = _build(experts_cls)
+        experts = model.base_model.model.experts
+        while not isinstance(experts, experts_cls):
+            experts = experts.get_base_layer()
+        calls = {"n": 0}
+        underlying = type(experts).forward
+
+        def counting(self, hidden_states, _underlying=underlying):
+            calls["n"] += 1
+            return _underlying(self, hidden_states)
+
+        type(experts).forward = counting
+        try:
+            with torch.no_grad():
+                model(x)
+                calls["n"] = 0
+                first = model(x)
+                assert calls["n"] == 1, (
+                    f"{experts_cls.__name__}: {calls['n']} experts forwards per steady call"
+                )
+                calls["n"] = 0
+                second = model(x)
+                assert calls["n"] == 1
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+        finally:
+            type(experts).forward = underlying
+
+
+def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold():
+    """PEFT folds by adding a delta to the stored parameter, which needs a real float.
+
+    A stacked expert weight held as `Params4bit`, MXFP4 blocks or FP8 is not one, so the
+    reroute must decline and leave that case as it is on main. The MXFP4 GPT-OSS experts
+    forward is the live one: it reads its LoRA through `_get_lora_wrapper_for_param`, which
+    resolves to None against PEFT's `target_parameters` layout, so nothing records a read
+    and the verdict for that forward is False.
+    """
+    MU._original_param_wrapper_forward = MU._original_param_wrapper_forward or (lambda *a: None)
+
+    experts = _StashIgnoringExperts()
+    assert MU._can_fold_moe_lora_through_peft(experts, "gate_up_proj") is True
+
+    experts.gate_up_proj = nn.Parameter(
+        torch.zeros(4, 8, 12, dtype=torch.uint8), requires_grad=False
+    )
+    assert MU._can_fold_moe_lora_through_peft(experts, "gate_up_proj") is False
+
+    float8 = getattr(torch, "float8_e4m3fn", None)
+    if float8 is not None:
+        experts.gate_up_proj = nn.Parameter(
+            torch.zeros(4, 8, 12).to(float8), requires_grad=False
+        )
+        assert MU._can_fold_moe_lora_through_peft(experts, "gate_up_proj") is False
+
+    # bitsandbytes marks a packed 4-bit weight with quant_state, not with a dtype.
+    packed = nn.Parameter(torch.zeros(4, 8, 12), requires_grad=False)
+    packed.quant_state = object()
+    experts.gate_up_proj = packed
+    assert MU._can_fold_moe_lora_through_peft(experts, "gate_up_proj") is False
