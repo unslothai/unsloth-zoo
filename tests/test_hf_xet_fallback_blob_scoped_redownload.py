@@ -664,6 +664,76 @@ def test_a_baseline_scan_that_failed_is_unknown_rather_than_empty(tmp_path, monk
         os.chmod(unreadable, 0o755)
 
 
+def test_a_link_that_stops_dangling_before_the_unlink_is_left_alone(monkeypatch, tmp_path):
+    """Eligibility and deletion are two moments, and the cache moves in between.
+
+    Another downloader finalizing the blob makes this pointer VALID: hub then leaves it alone
+    because it already resolves, so unlinking it here deletes the only record of a file that
+    is on disk -- and a link under an older revision is not recreated by the current retry,
+    which breaks a later offline load with the blob cached. Same for a partial appearing
+    beside the target, which names a download in progress.
+    """
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    snap = _build_cache(tmp_path, partial_age_s = 5.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    (blobs / (_blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX)).unlink()
+    orphan = snap / "tokenizer.model"
+    target = blobs / _blob_name("tokenizer.model")
+    orphan.symlink_to(os.path.relpath(target, snap))
+    assert orphan.is_symlink() and not orphan.exists()
+
+    scanned = xf._orphan_snapshot_links_safe_to_clear("model", REPO, str(tmp_path))
+    assert "tokenizer.model" in [link.name for link in scanned]
+
+    # The scan is pinned to what it found, and the sibling finishes the blob after it: this is
+    # the window between the eligibility list and the unlink that walks it.
+    monkeypatch.setattr(
+        xf, "_orphan_snapshot_links_safe_to_clear", lambda *args, **kwargs: [orphan],
+    )
+    target.write_bytes(_file_bytes("tokenizer.model"))
+    assert xf._clear_orphan_snapshot_links("model", REPO, str(tmp_path)) == set()
+    assert orphan.is_symlink() and orphan.exists(), (
+        "a pointer that had become valid was unlinked, so the cached blob lost its only name"
+    )
+
+    # And the other way the moment can change: a partial appears beside the target, which
+    # names a download in progress.
+    target.unlink()
+    (blobs / (_blob_name("tokenizer.model") + xf.INCOMPLETE_SUFFIX)).write_bytes(b"\xa5" * 32)
+    assert xf._clear_orphan_snapshot_links("model", REPO, str(tmp_path)) == set()
+    assert orphan.is_symlink(), "a link whose blob is being written was unlinked"
+
+
+def test_a_partial_a_sibling_reopens_after_the_scan_is_not_unlinked(monkeypatch, tmp_path):
+    """The whitelist is the result of an earlier scan, not a fact about our own dead child.
+
+    Ownership exempts a blob from the age and live-writer guards, which is right for the
+    partial a killed child was writing and wrong for one a scan merely judged idle: hub reuses
+    a deterministic `<etag>.incomplete` path, so a sibling can open exactly that file in
+    between, and the whitelist would then unlink an active download.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    stale = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+
+    seen = {"scans": 0}
+
+    def _walk():
+        # Nobody is writing when eligibility is decided; a sibling has it open by the time
+        # the deletion runs.
+        seen["scans"] += 1
+        return set() if seen["scans"] == 1 else {_held(tmp_path, stale)}
+
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", _walk)
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert seen["scans"] >= 2, "the deletion reused the eligibility scan's reading"
+    assert (blobs / stale).exists(), "a partial a live sibling had reopened was unlinked"
+    assert survivors == {stale}
+
+
 def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
     monkeypatch, tmp_path
 ):

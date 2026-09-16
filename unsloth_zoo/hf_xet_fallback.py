@@ -480,6 +480,7 @@ def _clear_partials(
     cache_dir: Optional[str] = None,
     active_grace: float = DEFAULT_STALL_TIMEOUT,
     owned_incomplete_blobs: Optional[set] = None,
+    ownership_is_an_earlier_scan: bool = False,
 ) -> None:
     """Delete the repo's active ``*.incomplete`` blobs and the broken snapshot symlinks the detector
     counts as active (else the next attempt inherits stale state and re-trips).
@@ -490,8 +491,21 @@ def _clear_partials(
     purge so a same-repo sibling writing a DIFFERENT blob is spared even if aged past *active_grace*;
     None -> coarser mtime guard only.
 
+    *ownership_is_an_earlier_scan* says the whitelist is not a captured fact about our own dead
+    child but the RESULT of a previous scan -- `_unowned_partials_safe_to_clear`. Ownership
+    exempts a blob from the age and live-writer guards, which is right for a partial our own
+    killed child was writing and wrong for one a scan merely judged idle a moment ago: hub
+    reuses a deterministic `<etag>.incomplete` path, so a sibling can open or refresh exactly
+    that file in between and the whitelist would then unlink an active download. With this set,
+    both guards are re-applied against fresh readings taken here, at the unlink.
+
     Both retry directions need exactly this, for different reasons -- see the two wrappers below.
     """
+    # Once per call rather than per blob: `process_iter` walks the whole host. Taken here so it
+    # describes the moment of the deletion rather than the moment of the eligibility scan.
+    rescanned_writers = (
+        _partial_paths_with_a_live_writer() if ownership_is_an_earlier_scan else None
+    )
     try:
         for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
@@ -509,8 +523,17 @@ def _clear_partials(
                             owned = (
                                 owned_incomplete_blobs is not None
                                 and blob.name in owned_incomplete_blobs
+                                and not ownership_is_an_earlier_scan
                             )
                             if not owned and time.time() - blob.stat().st_mtime < active_grace:
+                                continue
+                            if ownership_is_an_earlier_scan and (
+                                rescanned_writers is None
+                                or _normalized_partial_key(blob) in rescanned_writers
+                            ):
+                                # A writer appeared between the scan and here, or the table
+                                # could not be read at all. Either way this is no longer a
+                                # partial nobody is writing, which is the whole claim.
                                 continue
                             blob.unlink()
                         except OSError:
@@ -1065,6 +1088,17 @@ def _clear_orphan_snapshot_links(
     survivors: set = set()
     for link in orphans:
         try:
+            # Re-read at the unlink, not only at the scan. Another downloader can finalize the
+            # blob in between, which makes this pointer VALID: hub then leaves it alone because
+            # it already resolves, and removing it here would delete the only record of a file
+            # that is on disk -- and a link under an older revision is not recreated by the
+            # current retry, so a later offline load would fail with the blob cached. A partial
+            # appearing beside the target says the same thing about a download in progress.
+            if not link.is_symlink() or link.exists():
+                continue
+            target = Path(os.path.realpath(link))
+            if Path(str(target) + INCOMPLETE_SUFFIX).exists():
+                continue
             link.unlink()
         except OSError:
             survivors.add(link.name)
@@ -1102,6 +1136,8 @@ def _clear_unsafe_partials_for_http(
         _clear_partials(
             repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace,
             owned_incomplete_blobs = clearable,
+            # A whitelist, not a fact about our own child: re-checked at the unlink.
+            ownership_is_an_earlier_scan = True,
         )
     survivors = _incomplete_partial_names(repo_type, repo_id, cache_dir)
     if survivors is None:
