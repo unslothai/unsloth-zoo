@@ -553,7 +553,7 @@ def grpo_compute_loss(
 
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
-        kl_i = torch.exp(ref - new) - (ref - new) - 1.0
+        kl_i = torch.expm1(ref - new) - (ref - new)
         # TRL order: pre-clamp non-detached coef_1, before the loss_type dispatch.
         if use_bias_correction_kl:
             kl_i = kl_i * coef_1
