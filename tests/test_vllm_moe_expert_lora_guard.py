@@ -151,6 +151,8 @@ def test_moe_spelling_is_still_segment_matched():
 # `.output_linear`, which carry neither "experts" nor "moe" as a segment. They cannot be
 # matched bare: the same pair is a DENSE nn.Linear under `shared_mlp` in granitemoeshared /
 # _swa / hybrid, and a projector in granite_speech. Hence (parent, child) matching.
+# GraniteMoeShared on 4.57.6 carries both spellings at once, and PEFT
+# target_parameters=["input_linear.weight"] adapts both, so this really is one checkpoint.
 
 GRANITE_EXPERT_KEYS = [
     "base_model.model.model.layers.0.block_sparse_moe.input_linear.lora_A.default.weight",
