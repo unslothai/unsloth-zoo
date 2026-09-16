@@ -21,6 +21,7 @@ __all__ = [
 import torch
 import inspect
 import os
+import sys
 import math
 import logging
 from typing import Union, Callable, Optional, List, Dict
@@ -905,6 +906,73 @@ pass
 RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
 
 
+# Memo for grpo_companion_vision_keys. Set once per process; tests reset it to None.
+_GRPO_COMPANION_VISION_KEYS = None
+
+
+def grpo_companion_vision_keys():
+    """Which of GRPO_VISION_KEYS the installed unsloth also forwards on the no-grad side.
+
+    unsloth ships separately from this package, and up to 2026.9.4 its
+    ``_get_per_token_logps_and_entropies`` replacement, which computes the old and reference
+    logprobs, carries its own hard coded list of seven keys. Forwarding more than that on the
+    gradient side alone would let the current policy see image metadata the reference policy
+    never saw, so the importance ratio and the KL term would compare two different policies.
+    Agreeing on the smaller set is what makes the ratio meaningful, and it is still strictly
+    better than before, since the shared chunker no longer drops pixel_values outright.
+
+    Read out of the installed unsloth's source rather than its version, so an unsloth carrying
+    the companion change lifts the restriction on its own: either shared name appearing in that
+    replacement means the no-grad pass reads this module's tuple. Only sys.modules is consulted:
+    at this point unsloth is what is driving the run, and importing it from here is circular.
+    """
+    global _GRPO_COMPANION_VISION_KEYS
+    if _GRPO_COMPANION_VISION_KEYS is not None:
+        return _GRPO_COMPANION_VISION_KEYS
+
+    keys = GRPO_VISION_KEYS
+    module = sys.modules.get("unsloth.models.rl_replacements")
+    patcher = getattr(module, "grpo_trainer__get_per_token_logps_and_entropies", None)
+    source = None
+    if patcher is not None:
+        try:
+            source = inspect.getsource(patcher)
+        except (OSError, TypeError):
+            source = None
+    shares = source is not None and (
+        "grpo_get_vision_inputs" in source or "grpo_vision_chunks" in source
+    )
+    if source is not None and not shares:
+        named = tuple(
+            key for key in GRPO_VISION_KEYS
+            if '"%s"' % key in source or "'%s'" % key in source
+        )
+        # A no-grad pass that names no pixel_values at all is one this reader does not
+        # understand; leave the full set rather than silently turning vision off.
+        if "pixel_values" in named and len(named) != len(GRPO_VISION_KEYS):
+            keys = named
+            logger.warning(
+                "Unsloth: the installed unsloth computes GRPO reference logprobs without "
+                f"{', '.join(k for k in GRPO_VISION_KEYS if k not in named)}. Holding the "
+                "gradient pass to the same inputs so both policies match. Upgrade unsloth to "
+                "forward every vision kwarg on both paths."
+            )
+    _GRPO_COMPANION_VISION_KEYS = keys
+    return keys
+pass
+RL_REPLACEMENTS["grpo_companion_vision_keys"] = grpo_companion_vision_keys
+
+
+def grpo_shared_vision_inputs(source):
+    """grpo_get_vision_inputs, restricted to what both logprob passes forward."""
+    keys = grpo_companion_vision_keys()
+    if len(keys) == len(GRPO_VISION_KEYS):
+        return grpo_get_vision_inputs(source)
+    return {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
+pass
+RL_REPLACEMENTS["grpo_shared_vision_inputs"] = grpo_shared_vision_inputs
+
+
 def grpo_vision_chunks(vision, total_samples, batch_size):
     """Slice the GRPO multimodal inputs into per-chunk forward kwargs, one dict per chunk.
 
@@ -1106,7 +1174,7 @@ def grpo_accumulated_loss(
 
     # Body-local: this source is copied into the generated trainer without its imports.
     from unsloth_zoo.rl_replacements import (
-        grpo_get_vision_inputs as _grpo_get_vision_inputs,
+        grpo_shared_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
     )
     vision_inputs = _grpo_get_vision_inputs(kwargs)

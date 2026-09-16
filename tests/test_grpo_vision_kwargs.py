@@ -203,3 +203,158 @@ def test_released_unsloth_can_still_see_num_images_in_this_function():
         "num_images survives only in a comment; a comment-reduction pass would delete it and "
         "released unsloth would start refusing multi-image GRPO again"
     )
+
+
+# The gate that keeps the two logprob passes on the same inputs when the installed unsloth
+# still carries its own hard coded no-grad key list. See grpo_companion_vision_keys.
+
+import sys
+import textwrap
+import types
+
+import pytest
+
+import unsloth_zoo.rl_replacements as _rl
+
+
+_RELEASED_KEYS = (
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_attention_mask",
+    "image_sizes",
+    "num_images",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
+
+
+def _install_companion(monkeypatch, tmp_path, body, name = "companion_rl"):
+    """Put a module named like unsloth's under sys.modules with real, readable source.
+
+    inspect.getsource needs a file, so the patcher cannot be built with exec or a lambda.
+    """
+    path = tmp_path / f"{name}.py"
+    path.write_text(textwrap.dedent(body))
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    code = compile(path.read_text(), str(path), "exec")
+    exec(code, module.__dict__)
+    monkeypatch.setitem(sys.modules, "unsloth.models.rl_replacements", module)
+    monkeypatch.setattr(_rl, "_GRPO_COMPANION_VISION_KEYS", None)
+    return module
+
+
+@pytest.fixture(autouse = True)
+def _reset_companion_memo(monkeypatch):
+    monkeypatch.setattr(_rl, "_GRPO_COMPANION_VISION_KEYS", None)
+    monkeypatch.delitem(sys.modules, "unsloth.models.rl_replacements", raising = False)
+
+
+def test_an_unsloth_with_a_hard_coded_no_grad_list_holds_the_gradient_pass_to_it(
+    monkeypatch, tmp_path
+):
+    _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                pixel_values = kwargs.get("pixel_values", None)
+                image_grid_thw = kwargs.get("image_grid_thw", None)
+                pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+                image_sizes = kwargs.get("image_sizes", None)
+                num_images = kwargs.get("num_images", None)
+                token_type_ids = kwargs.get("token_type_ids", None)
+                mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
+                return pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, \\
+                    num_images, token_type_ids, mm_token_type_ids
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+    assert _rl.grpo_companion_vision_keys() == _RELEASED_KEYS
+
+    source = dict.fromkeys(_rl.GRPO_VISION_KEYS, 1)
+    shared = _rl.grpo_shared_vision_inputs(source)
+    assert set(shared) == set(_RELEASED_KEYS)
+    for dropped in ("spatial_shapes", "num_tiles", "image_position_ids"):
+        assert dropped not in shared
+
+
+def test_an_unsloth_that_shares_the_helper_lifts_the_restriction(monkeypatch, tmp_path):
+    _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                from unsloth_zoo.rl_replacements import grpo_get_vision_inputs
+                return grpo_get_vision_inputs(kwargs)
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+    assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
+    assert set(_rl.grpo_shared_vision_inputs(dict.fromkeys(_rl.GRPO_VISION_KEYS, 1))) == set(
+        _rl.GRPO_VISION_KEYS
+    )
+
+
+def test_an_unsloth_that_only_names_the_chunker_also_lifts_it(monkeypatch, tmp_path):
+    """The companion change (unslothai/unsloth#11031) collects the keys in a module level
+    helper and names only grpo_vision_chunks inside the replacement itself."""
+    _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                from unsloth_zoo.rl_replacements import grpo_vision_chunks
+                return grpo_vision_chunks(kwargs, 1, 1)
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+    assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
+
+
+def test_no_companion_in_sys_modules_forwards_everything():
+    """unsloth_zoo used on its own, or before unsloth has imported that module."""
+    assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
+
+
+def test_a_no_grad_pass_this_reader_cannot_parse_does_not_turn_vision_off(
+    monkeypatch, tmp_path
+):
+    """Fail open: a rewritten replacement that names no keys must not be read as naming none
+    of them, which would drop pixel_values and train on the text alone."""
+    _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                return {key: kwargs.get(key) for key in SOME_TUPLE_DEFINED_ELSEWHERE}
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+    assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
+
+
+def test_the_companion_probe_reads_the_really_installed_unsloth():
+    """Not a mock: whatever unsloth is installed here must be classified, and if it does not
+    share the helper the answer must be a strict subset that still carries pixel_values."""
+    pytest.importorskip("unsloth.models.rl_replacements")
+    import unsloth.models.rl_replacements as installed
+
+    keys = _rl.grpo_companion_vision_keys()
+    patcher = getattr(installed, "grpo_trainer__get_per_token_logps_and_entropies", None)
+    assert patcher is not None, "unsloth no longer exposes the no-grad replacement to probe"
+    shares = "grpo_get_vision_inputs" in inspect.getsource(patcher)
+    if shares:
+        assert keys == _rl.GRPO_VISION_KEYS
+    else:
+        assert set(keys) < set(_rl.GRPO_VISION_KEYS)
+        assert "pixel_values" in keys
+
+
+def test_the_gradient_pass_goes_through_the_gate():
+    source = inspect.getsource(grpo_accumulated_loss)
+    assert "grpo_shared_vision_inputs" in source
