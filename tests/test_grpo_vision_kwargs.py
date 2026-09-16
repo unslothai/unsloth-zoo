@@ -159,3 +159,47 @@ def test_gradient_pass_forwards_the_whole_chunk():
     assert "**vision_chunk" in source
     assert "image_grid_thw = image_grid_thw_chunk" not in source
     assert "pixel_values = pixel_values_chunk" not in source
+
+
+def test_released_unsloth_can_still_see_num_images_in_this_function():
+    """unsloth 2026.9.4 on PyPI gates multi-image GRPO on a source-text probe:
+
+        _supports_num_images = "num_images" in inspect.signature(grpo_accumulated_loss).parameters
+        if not _supports_num_images:
+            _supports_num_images = "num_images" in inspect.getsource(grpo_accumulated_loss)
+        if not _supports_num_images:
+            raise RuntimeError("Multi-image GRPO requires an unsloth_zoo build ... upgrade unsloth_zoo")
+
+    The two packages ship independently, so a zoo that moves num_images handling out of this
+    function tells every released-unsloth user with two images in a sample to upgrade the zoo
+    they just upgraded. This runs that probe verbatim rather than describing it.
+    """
+    from unsloth_zoo.rl_replacements import grpo_accumulated_loss
+
+    source = inspect.getsource(grpo_accumulated_loss)
+    supports = "num_images" in inspect.signature(grpo_accumulated_loss).parameters
+    if not supports:
+        supports = "num_images" in source
+    assert supports, (
+        "released unsloth would raise 'Please upgrade unsloth_zoo' for a multi-image sample: "
+        "grpo_accumulated_loss no longer mentions num_images"
+    )
+
+    # The probe above is satisfied by a COMMENT mentioning num_images, which the periodic
+    # comment-reduction pass is entitled to delete. So pin the binding itself: parsed, not
+    # grepped, so the guarantee survives any rewording of the text around it.
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(source))
+    bound = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    assert "num_images" in bound, (
+        "num_images survives only in a comment; a comment-reduction pass would delete it and "
+        "released unsloth would start refusing multi-image GRPO again"
+    )

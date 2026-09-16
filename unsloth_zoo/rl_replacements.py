@@ -1112,6 +1112,12 @@ def grpo_accumulated_loss(
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
     image_grid_thw = vision_inputs.get('image_grid_thw', None)
+    # Released unsloth 2026.9.4 decides whether multi-image GRPO is supported by grepping
+    # inspect.getsource(grpo_accumulated_loss) for "num_images", so moving the handling into
+    # grpo_vision_chunks makes that probe answer no and raise "Please upgrade unsloth_zoo" at
+    # the user who just did. The chunker reads num_images out of vision_inputs itself; this
+    # binding is what the released probe looks for, and it keeps the name meaningful here.
+    num_images = vision_inputs.get('num_images', None)
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
     token_type_ids = vision_inputs.get('token_type_ids', None)
     mm_token_type_ids = vision_inputs.get('mm_token_type_ids', None)
