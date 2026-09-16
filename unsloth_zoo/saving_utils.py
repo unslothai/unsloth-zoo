@@ -3073,8 +3073,17 @@ def merge_and_overwrite_lora(
                         index_data = json.load(f)
                         # Extract file names from the index if available
                         if "weight_map" in index_data:
-                            # Get unique filenames from weight map
-                            indexed_files = set(index_data["weight_map"].values())
+                            # Get unique filenames from weight map. Keep only the last
+                            # component, as the listing branches above and below do: these
+                            # names are joined onto `save_directory` and copied there, so a
+                            # value like `../../x.safetensors` would write outside the
+                            # directory the user asked to export to. `.`, `..` and `""`
+                            # survive a split and still escape, so they are dropped.
+                            indexed_files = {
+                                _name for _name in
+                                (os.path.split(v)[-1] for v in index_data["weight_map"].values())
+                                if _name not in ("", os.curdir, os.pardir)
+                            }
                             # Only use these if we didn't find files directly
                             if not safetensors_list:
                                 safetensors_list = list(indexed_files)
