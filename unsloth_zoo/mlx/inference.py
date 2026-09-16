@@ -717,7 +717,13 @@ def fused_residual_norm(model):
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and _residual_norm_kernel() is not None:
                 for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
                     base = type(module)
-                    if module.training or hasattr(base, "_unsloth_residual_norm_base"):
+                    # Type first, for the reason fused_decode_conv_silu gives: generation enters
+                    # this scope for whatever named_modules() yields, including plain stand-ins
+                    # that need not carry `training`, and reading it before the check raises out
+                    # of generation instead of skipping an ineligible entry.
+                    if not isinstance(module, dict) or module.training:
+                        continue
+                    if hasattr(base, "_unsloth_residual_norm_base"):
                         continue
                     fused = _residual_norm_class(base)
                     if (fused is not None and all(type(getattr(module, name, None)) is nn.RMSNorm

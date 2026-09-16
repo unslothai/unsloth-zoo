@@ -604,3 +604,23 @@ def test_residual_norm_respects_an_existing_native_patch(monkeypatch):
     expected = model(x)[0]
     with decode.fused_residual_norm(model):
         _residual_equal(model(x)[0], expected)
+
+
+def test_residual_norm_scope_tolerates_a_stand_in_without_training(monkeypatch):
+    """named_modules() yields whatever the generation API was handed, including the plain
+    stand-ins it deliberately tolerates. Reading `.training` on one raises out of generation
+    instead of skipping it, which is why the decode-fusion scope checks the type first."""
+    from unsloth_zoo.mlx import inference as decode
+
+    class _StandIn:
+        pass
+
+    class _Root:
+        def named_modules(self):
+            return [("stand_in", _StandIn())]
+
+    # Off Metal the scope returns before the loop, so give it a kernel to get past that.
+    monkeypatch.setattr(decode, "_residual_norm_kernel", lambda: object())
+    root = _Root()
+    with decode.fused_residual_norm(root) as yielded:
+        assert yielded is root
