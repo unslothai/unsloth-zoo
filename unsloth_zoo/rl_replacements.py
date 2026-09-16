@@ -947,6 +947,8 @@ def grpo_companion_vision_keys():
     the companion change lifts the restriction on its own: either shared name appearing in that
     replacement means the no-grad pass reads this module's tuple. Only sys.modules is consulted:
     at this point unsloth is what is driving the run, and importing it from here is circular.
+    Only an answer READ off a patcher is memoized: a module that is not there yet is a call
+    that came too early, not an unsloth without the companion.
     """
     global _GRPO_COMPANION_VISION_KEYS
     if _GRPO_COMPANION_VISION_KEYS is not None:
@@ -955,23 +957,31 @@ def grpo_companion_vision_keys():
     keys = GRPO_VISION_KEYS
     module = sys.modules.get("unsloth.models.rl_replacements")
     patcher = getattr(module, "grpo_trainer__get_per_token_logps_and_entropies", None)
+    if patcher is None:
+        # Nothing to classify yet, and an absence here is not a fact about the process: this
+        # module can be imported before unsloth installs its RL replacements, and the first
+        # caller would otherwise memoize "no companion" permanently, so the restriction could
+        # never be applied to the run that actually needs it. Treat it like the unreadable
+        # case and leave it unmemoized, so a later call gets to look again once the import has
+        # happened. The full tuple is the right answer while nothing is known to restrict it.
+        return GRPO_VISION_KEYS
+
     source = None
     unreadable = False
-    if patcher is not None:
-        try:
-            source = inspect.getsource(patcher)
-        except (OSError, TypeError):
-            # Source stripped, frozen, or dynamically wrapped. The companion is THERE -- the
-            # patcher exists -- and the only thing missing is the ability to see which keys it
-            # forwards. Leaving the full tuple there was the unsafe half of the guess: the
-            # gradient pass would forward spatial_shapes, num_tiles and the position ids that
-            # every released companion omits, and the importance ratio and KL term would then
-            # compare two different policies with nothing to show for it. Assume the released
-            # set instead, which is the answer for every unsloth that does not carry the
-            # companion change, and do not memoize it: this is a failure to look, not a fact
-            # about the process, so a later call gets to look again.
-            source = None
-            unreadable = True
+    try:
+        source = inspect.getsource(patcher)
+    except (OSError, TypeError):
+        # Source stripped, frozen, or dynamically wrapped. The companion is THERE -- the
+        # patcher exists -- and the only thing missing is the ability to see which keys it
+        # forwards. Leaving the full tuple there was the unsafe half of the guess: the
+        # gradient pass would forward spatial_shapes, num_tiles and the position ids that
+        # every released companion omits, and the importance ratio and KL term would then
+        # compare two different policies with nothing to show for it. Assume the released
+        # set instead, which is the answer for every unsloth that does not carry the
+        # companion change, and do not memoize it: this is a failure to look, not a fact
+        # about the process, so a later call gets to look again.
+        source = None
+        unreadable = True
     shares = source is not None and any(
         marker in source for marker in GRPO_SHARED_HELPER_MARKERS
     )

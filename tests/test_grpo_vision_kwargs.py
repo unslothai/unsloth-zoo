@@ -320,6 +320,47 @@ def test_no_companion_in_sys_modules_forwards_everything():
     assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
 
 
+def test_an_absent_companion_is_not_memoized(monkeypatch, tmp_path):
+    """The early call must not decide the run.
+
+    Import order is not fixed: this module can be read before unsloth installs its RL
+    replacements, so the first caller can find nothing there. Memoizing that would pin the
+    full tuple for the process, and the restriction could then never be applied to the run
+    that needs it -- the gradient pass would forward keys the released no-grad pass does not,
+    which is the mismatch this whole gate exists to prevent. Like the unreadable case, an
+    absence is a call that came too early and not a fact about the process.
+    """
+    assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
+    assert _rl._GRPO_COMPANION_VISION_KEYS is None
+
+    # The same process, after unsloth has imported: the restriction still applies.
+    _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                pixel_values = kwargs.get("pixel_values", None)
+                image_grid_thw = kwargs.get("image_grid_thw", None)
+                pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+                image_sizes = kwargs.get("image_sizes", None)
+                num_images = kwargs.get("num_images", None)
+                token_type_ids = kwargs.get("token_type_ids", None)
+                mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
+                return pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, \\
+                    num_images, token_type_ids, mm_token_type_ids
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+    assert _rl.grpo_companion_vision_keys() == _RELEASED_KEYS
+    # A module present but not yet carrying the patcher is the same early call.
+    monkeypatch.setattr(_rl, "_GRPO_COMPANION_VISION_KEYS", None)
+    empty = types.ModuleType("unsloth.models.rl_replacements")
+    monkeypatch.setitem(sys.modules, "unsloth.models.rl_replacements", empty)
+    assert _rl.grpo_companion_vision_keys() == _rl.GRPO_VISION_KEYS
+    assert _rl._GRPO_COMPANION_VISION_KEYS is None
+
+
 def test_a_no_grad_pass_this_reader_cannot_parse_does_not_turn_vision_off(
     monkeypatch, tmp_path
 ):
