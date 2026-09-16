@@ -87,6 +87,7 @@ except:
 pass
 from transformers.modeling_utils import PushToHubMixin
 import json
+import ntpath
 import os
 from pathlib import Path
 from typing import Union, List, Optional
@@ -2959,6 +2960,29 @@ def _carry_over_vocab_size(base_config, trained_config):
 pass
 
 
+# A path that exists nowhere, used only to ask whether a relative name would stay
+# under whatever directory it is joined onto.
+_SHARD_CONTAINMENT_ROOT = os.path.abspath(os.path.join(os.sep, "unsloth_shard_root"))
+
+
+def _shard_name_stays_inside(name):
+    """Whether `name` resolves under the directory it is joined onto.
+
+    Index `weight_map` values are attacker-reachable (a local directory shadowing
+    a repo id supplies the index), and they reach both `os.path.join(model_name,
+    name)` and `os.path.join(save_directory, name)`. Anything absolute, empty, or
+    climbing out with `..` is dropped; an ordinary nested name like
+    `weights/model-00001-of-00002.safetensors` is kept, because collapsing it
+    would break the index it came from.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if os.path.isabs(name) or ntpath.isabs(name):
+        return False
+    joined = os.path.normpath(os.path.join(_SHARD_CONTAINMENT_ROOT, name))
+    return joined.startswith(_SHARD_CONTAINMENT_ROOT + os.sep)
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -3073,16 +3097,18 @@ def merge_and_overwrite_lora(
                         index_data = json.load(f)
                         # Extract file names from the index if available
                         if "weight_map" in index_data:
-                            # Get unique filenames from weight map. Keep only the last
-                            # component, as the listing branches above and below do: these
-                            # names are joined onto `save_directory` and copied there, so a
-                            # value like `../../x.safetensors` would write outside the
-                            # directory the user asked to export to. `.`, `..` and `""`
-                            # survive a split and still escape, so they are dropped.
+                            # Keep the names that stay inside the directory they are
+                            # joined onto. These values are joined onto both `model_name`
+                            # (to size the shard) and `save_directory` (to copy it, and to
+                            # open it "r+b" for the in-place merge), so one that escapes
+                            # reads or writes outside the directory the user asked for.
+                            # Containment rather than a basename: an index may legitimately
+                            # name a shard in a subdirectory, and collapsing that to its
+                            # last component makes the size lookup miss the real file and
+                            # collides two shards that share a basename.
                             indexed_files = {
-                                _name for _name in
-                                (os.path.split(v)[-1] for v in index_data["weight_map"].values())
-                                if _name not in ("", os.curdir, os.pardir)
+                                v for v in index_data["weight_map"].values()
+                                if _shard_name_stays_inside(v)
                             }
                             # Only use these if we didn't find files directly
                             if not safetensors_list:

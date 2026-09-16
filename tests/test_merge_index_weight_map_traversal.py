@@ -287,3 +287,51 @@ def test_an_absolute_entry_cannot_overwrite_an_existing_file_outside_the_output(
             f"{name!r} survived as a shard name and resolves to {joined!r}, "
             f"outside {inside!r}"
         )
+
+
+def test_a_nested_shard_name_is_preserved_not_collapsed(monkeypatch, tmp_path):
+    """An index may legitimately name a shard in a subdirectory.
+
+    Reducing such a value to its last component makes the size lookup check
+    `model_name/model-...` instead of the nested file that exists, so both size
+    counters stay zero and the merge aborts, and two shards sharing a basename
+    collapse onto each other. Containment has to keep this case working.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    model = H.build_and_save_base(spec, os.path.join(str(tmp_path), "real_base"))
+    peft_model = H.attach_lora(model, spec, "full")
+
+    nested = os.path.join("weights", "model-00001-of-00002.safetensors")
+    base_rel = _shadow_directory(tmp_path, nested)
+
+    # The nested shard has to exist, or the case cannot be told apart from the
+    # collapse it is guarding against.
+    real_base = os.path.join(str(tmp_path), "real_base")
+    shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
+    planted = os.path.join(str(tmp_path), base_rel, nested)
+    os.makedirs(os.path.dirname(planted), exist_ok = True)
+    shutil.copy2(os.path.join(real_base, shards[0]), planted)
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+    shard_names = _record_shard_names(monkeypatch)
+
+    try:
+        saving_utils.merge_and_overwrite_lora(
+            get_model_name  = lambda *a, **k: base_rel,
+            model           = peft_model,
+            tokenizer       = None,
+            save_directory  = os.path.join("out", "deep", "merged"),
+            save_method     = "merged_16bit",
+            push_to_hub     = False,
+        )
+    except Exception:
+        pass
+
+    assert nested in shard_names, (
+        f"the nested shard name was not preserved; the merge saw {shard_names!r}"
+    )
