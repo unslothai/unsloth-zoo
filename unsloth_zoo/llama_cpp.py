@@ -2915,6 +2915,48 @@ def _conversion_modules_for(conversion_dir, architecture):
     return modules
 
 
+def _converter_maps_architecture(script_path, architecture):
+    """Whether this converter's OWN maps name *architecture*.
+
+    Asked of a fallback before it is chosen. The requirement scan is scoped to the modules a
+    conversion will really import, and a converter that predates the architecture maps it to
+    nothing: the scan then sees only the two eager modules, the candidate misses nothing
+    certain, and it ranks as a perfect match for a model it cannot convert at all. The support
+    check that would have caught it reads the arch sets of the converter that was REQUESTED,
+    not of the one being substituted, so it does not fire either, and the export dies on
+    "unsupported model" with a working candidate left unused further down the ranking.
+
+    True on anything that is not positive evidence of absence: a monolith entrypoint with no
+    conversion package dispatches by class registration rather than by these maps, an
+    unreadable __init__.py is a failure to look, and no architecture to check is not a
+    question. Only a converter whose maps are readable, non-empty and do not contain the
+    architecture is refused.
+    """
+    if not architecture:
+        return True
+    # The same structural signal the requirement scan uses: a package sitting beside a
+    # monolith entrypoint (left by a newer install in the same directory, which is where every
+    # sibling candidate lives) is not that entrypoint's dispatch table, and reading it would
+    # answer for the wrong converter in both directions.
+    try:
+        with open(script_path, "rb") as f:
+            entry_source = f.read()
+    except OSError:
+        return True
+    if b"from conversion import" not in entry_source:
+        return True
+    conversion_dir = os.path.join(os.path.dirname(script_path) or ".", "conversion")
+    conv_init = os.path.join(conversion_dir, "__init__.py")
+    if not os.path.isfile(conv_init):
+        return True
+    mapped = {}
+    for dict_name in ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP"):
+        mapped.update(_extract_dict_values_from_conversion_init(conv_init, dict_name))
+    if not mapped:
+        return True
+    return architecture in mapped
+
+
 def _converter_gguf_requirements(script_path, architecture = None):
     """Everything the entrypoint and the conversion/ modules this conversion will
     actually import need from `gguf`. Returns `(certain, advisory)` as sorted
@@ -3275,6 +3317,11 @@ def _resolve_converter_and_gguf(converter_location, python_exe, architecture = N
         if candidate == converter_location:
             certain, advisory = requested_certain, requested_advisory
         else:
+            # Before the probe, which costs a subprocess: a converter that does not map this
+            # architecture cannot convert this model however well its gguf matches, and its
+            # empty requirement scan is exactly what makes it rank first.
+            if not _converter_maps_architecture(candidate, architecture):
+                continue
             certain, advisory = _converter_gguf_requirements(candidate, architecture)
         env = _converter_child_env(gguf_py)
         report = _probe_child_gguf(

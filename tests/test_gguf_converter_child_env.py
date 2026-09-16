@@ -942,3 +942,87 @@ def test_a_signature_under_a_try_is_still_advisory(mod):
     certain, advisory = mod._gguf_requirements_from_source(source)
     assert "gguf.NEW_KIND" in advisory
     assert "gguf.NEW_KIND" not in certain
+
+
+def _make_older_sibling_converter(tmp_path, *, maps_the_architecture):
+    """A checkout's own package-based converter, co-versioned with the sibling gguf-py.
+
+    Its maps are what decide whether it can convert this model at all, and a converter that
+    predates the architecture maps it to nothing.
+    """
+    conversion = tmp_path / "conversion"
+    conversion.mkdir(exist_ok = True)
+    mapped = '"Gemma3ForCausalLM": "gemma",' if maps_the_architecture else ""
+    (conversion / "__init__.py").write_text(textwrap.dedent(f"""
+        from .base import ModelBase
+        TEXT_MODEL_MAP: dict[str, str] = {{
+            "AfmoeForCausalLM": "afmoe",
+            {mapped}
+        }}
+        MMPROJ_MODEL_MAP: dict[str, str] = {{}}
+    """))
+    (conversion / "base.py").write_text("import gguf\nBASE = gguf.Metadata\n")
+    (conversion / "gemma.py").write_text("import gguf\nG = gguf.Metadata\n")
+    (conversion / "afmoe.py").write_text("import gguf\nA = gguf.Metadata\n")
+    sibling = tmp_path / "convert_hf_to_gguf.py"
+    sibling.write_text("from conversion import get_model_class\nimport gguf\n")
+    return sibling
+
+
+def test_a_fallback_that_cannot_convert_this_architecture_is_not_taken(
+    mod, tmp_path, monkeypatch, capsys,
+):
+    """A converter that predates the architecture maps it to nothing, so the requirement scan
+    sees only the two eager modules and the candidate ranks as missing nothing certain -- a
+    perfect match for a model it cannot convert at all. The support check that would catch it
+    reads the arch sets of the converter that was REQUESTED, not of the one substituted in, so
+    the export would have died on "unsupported model" instead of on the gguf skew it really
+    has."""
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
+    _make_gguf_py(tmp_path, symbols = ("Metadata",), version = "0.17.1")
+    _make_older_sibling_converter(tmp_path, maps_the_architecture = False)
+    newer = tmp_path / "unsloth_convert_hf_to_gguf.py"
+    newer.write_text("import gguf\nX = gguf.SafetensorsLocal\n")
+
+    chosen, _pin, _report = mod._resolve_converter_and_gguf(
+        str(newer), sys.executable, "Gemma3ForCausalLM",
+    )
+    assert chosen == str(newer), "switched to a converter that does not map this architecture"
+    assert "Falling back" not in capsys.readouterr().out
+
+
+def test_a_fallback_that_does_map_this_architecture_is_still_taken(
+    mod, tmp_path, monkeypatch, capsys,
+):
+    """The control, and the behaviour the fallback exists for: the same shape with the
+    architecture mapped is chosen exactly as before."""
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
+    monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
+    _make_gguf_py(tmp_path, symbols = ("Metadata",), version = "0.17.1")
+    sibling = _make_older_sibling_converter(tmp_path, maps_the_architecture = True)
+    newer = tmp_path / "unsloth_convert_hf_to_gguf.py"
+    newer.write_text("import gguf\nX = gguf.SafetensorsLocal\n")
+
+    chosen, _pin, _report = mod._resolve_converter_and_gguf(
+        str(newer), sys.executable, "Gemma3ForCausalLM",
+    )
+    assert chosen == str(sibling)
+    assert "Falling back" in capsys.readouterr().out
+
+
+def test_the_architecture_check_only_refuses_on_evidence(mod, tmp_path):
+    """Everything that is not a readable map without this architecture in it is left alone: a
+    monolith entrypoint dispatches by class registration rather than by these maps, a package
+    beside it is not its dispatch table, an unreadable __init__.py is a failure to look, and no
+    architecture to check is not a question."""
+    monolith = tmp_path / "unsloth_convert_hf_to_gguf.py"
+    monolith.write_text("import gguf\nX = gguf.Metadata\n")
+    # A package in the same directory, which is where every sibling candidate lives.
+    packaged = _make_older_sibling_converter(tmp_path, maps_the_architecture = False)
+    assert mod._converter_maps_architecture(str(monolith), "Gemma3ForCausalLM") is True
+    assert mod._converter_maps_architecture(str(monolith), None) is True
+    assert mod._converter_maps_architecture(str(packaged), "AfmoeForCausalLM") is True
+    assert mod._converter_maps_architecture(str(packaged), "Gemma3ForCausalLM") is False
+    (tmp_path / "conversion" / "__init__.py").write_text("TEXT_MODEL_MAP = broken(\n")
+    assert mod._converter_maps_architecture(str(packaged), "Gemma3ForCausalLM") is True
