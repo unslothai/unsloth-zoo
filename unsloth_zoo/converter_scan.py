@@ -32,6 +32,12 @@ or for vendoring it. A static regex scan can be evaded by anyone who knows it is
 there; what it buys is that an off-the-shelf stealer payload of the kind seen in
 recent supply-chain waves does not run silently.
 
+Scope is that one download and nothing else. On llama.cpp's current layout the
+downloaded entrypoint imports a ``conversion`` package, and those modules come
+from the local checkout or from a prebuilt bundle whose asset is checked against
+a published sha256, so they are not part of the unverified fetch and are not
+scanned here.
+
 Why the logic lives here and not in ``scripts/``:
 ``pyproject.toml`` excludes ``scripts*`` from the wheel, so
 ``scripts/scan_packages.py`` does not exist on a pip-installed unsloth_zoo, which
@@ -398,28 +404,297 @@ class ConverterScanError(RuntimeError):
     """Raised instead of running the converter when UNSLOTH_CONVERTER_SCAN_STRICT=1."""
 
 
-def _extract_evidence(content, pattern, max_matches = 3):
-    """Pull matching lines as evidence snippets. Ported from scan_packages.py."""
-    lines = content.splitlines()
-    matches = []
+# ---------------------------------------------------------------------------
+# Linear-time evaluation of the whole-file patterns
+# ---------------------------------------------------------------------------
+# Several canonical patterns are shaped `A.*B.*C` under re.DOTALL. Run against a
+# file that holds many A and B but no C, the engine tries every (A, B) pair
+# before it can report "no match": measured at 2.0s on 5 KB and 17.3s on 11 KB,
+# growing with the cube of the input. The bytes being scanned are the ones we do
+# not trust, so an attacker who cannot beat the rules could still hang every GGUF
+# export with a file full of the word "socket". A try/except cannot catch a hang.
+#
+# So the boolean is computed without backtracking across the `.*` joins. For
+# existence, `A.*B` under DOTALL holds exactly when some A is followed by some B,
+# which is what searching for B from the end of the earliest A answers, in linear
+# time. Top-level `|` is split the same way, since "either alternative matches"
+# is the same question. The compiled pattern is untouched and still byte-pinned
+# to scan_packages; only how its answer is computed changes, and
+# test_llama_cpp_converter_scan.py fuzzes the two against each other.
+#
+# Anything this decomposition cannot handle safely (a `.` wildcard nested inside
+# a group, a `.+` whose "at least one character" would be lost, a segment that
+# does not compile on its own) falls back to the pattern itself.
+
+
+def _split_top_level_alternatives(source):
+    """Split a regex source on `|` at paren depth 0, outside character classes."""
+    parts, start, depth, in_class, i = [], 0, 0, False, 0
+    while i < len(source):
+        char = source[i]
+        if char == "\\":
+            i += 2
+            continue
+        if in_class:
+            if char == "]":
+                in_class = False
+        elif char == "[":
+            in_class = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "|" and depth == 0:
+            parts.append(source[start:i])
+            start = i + 1
+        i += 1
+    parts.append(source[start:])
+    return parts
+
+
+def _split_on_dot_star(alternative):
+    """Split one alternative on top-level `.*` / `.*?`. None if it is not safe.
+
+    Returns None for a `.+`, whose "at least one character" the split would drop,
+    and for a `.` wildcard inside a group, where the split would break the group.
+    """
+    segments, start, depth, in_class, i = [], 0, 0, False, 0
+    while i < len(alternative):
+        char = alternative[i]
+        if char == "\\":
+            i += 2
+            continue
+        if in_class:
+            if char == "]":
+                in_class = False
+            i += 1
+            continue
+        if char == "[":
+            in_class = True
+            i += 1
+            continue
+        if char == "(":
+            depth += 1
+            i += 1
+            continue
+        if char == ")":
+            depth -= 1
+            i += 1
+            continue
+        if char == "." and i + 1 < len(alternative) and alternative[i + 1] in "*+":
+            if depth != 0:
+                # Nested in a group, so not a top-level join. Left in place: it
+                # still backtracks, but only inside one segment.
+                i += 2
+                continue
+            if alternative[i + 1] == "+":
+                # `.+` demands at least one character, which a split would drop,
+                # and relaxing it to `.*` would invent matches. Use the pattern.
+                return None
+            end = i + 2
+            if end < len(alternative) and alternative[end] == "?":
+                end += 1
+            segments.append(alternative[start:i])
+            start = end
+            i = end
+            continue
+        i += 1
+    segments.append(alternative[start:])
+    return [segment for segment in segments if segment]
+
+
+def _end_is_pinned(segment):
+    """True when this segment's match end is fixed by whatever it ends with.
+
+    A non-final segment whose own tail can stretch, `/tmp/\\S+` for example, is
+    not safe to chain from: the greedy match runs to the end of the token and the
+    next segment is then searched from too far right, which loses matches the
+    pattern would find by giving the tail back. Such a tail is made lazy instead,
+    so the earliest match also has the earliest end.
+    """
+    stripped = segment[:-1] if segment.endswith("?") else segment
+    return not stripped.endswith(("*", "+", "}"))
+
+
+def _make_tail_lazy(segment):
+    """`\\S+` to `\\S+?`. Minimal repetitions, so the match ends as early as it can."""
+    if _end_is_pinned(segment):
+        return segment
+    return segment + "?"
+
+
+# An unbounded negated class scans to end of input when its terminator is absent:
+# `(?:open|Path)\s*\([^)]*?(?:\.ssh/...)` on a file of `open(` with no closing
+# paren took 68s over 218 KB, quadratic in the input. Bounding the span keeps the
+# rule's intent, which is "inside this call", and makes the cost linear. The cost
+# is that a match needing more than this many characters between the two halves
+# is missed; inside one function call that is not a shape worth paying 68s for.
+MAX_CLASS_SPAN = 512
+
+
+def _bound_class_repeats(source, span = MAX_CLASS_SPAN):
+    """Rewrite `[^)]*` as `[^)]{0,span}`, preserving a lazy `?`."""
+    out, i = [], 0
+    while i < len(source):
+        char = source[i]
+        if char == "\\":
+            out.append(source[i:i + 2])
+            i += 2
+            continue
+        if char != "[":
+            out.append(char)
+            i += 1
+            continue
+        end = i + 1
+        if end < len(source) and source[end] == "^":
+            end += 1
+        if end < len(source) and source[end] == "]":
+            end += 1
+        while end < len(source) and source[end] != "]":
+            end += 2 if source[end] == "\\" else 1
+        if end >= len(source):
+            out.append(source[i:])
+            break
+        body = source[i:end + 1]
+        i = end + 1
+        if i < len(source) and source[i] == "*":
+            i += 1
+            lazy = ""
+            if i < len(source) and source[i] == "?":
+                lazy = "?"
+                i += 1
+            out.append(f"{body}{{0,{span}}}{lazy}")
+        else:
+            out.append(body)
+    return "".join(out)
+
+
+def _build_evaluator(pattern):
+    """Compile `pattern` into alternatives of ordered, individually bounded segments."""
+    alternatives = []
+    for alternative in _split_top_level_alternatives(pattern.pattern):
+        segments = None
+        if pattern.flags & re.DOTALL and ".*" in alternative:
+            # Without DOTALL a `.*` cannot cross a newline, so the span it can
+            # backtrack over is one line and the cost is already bounded.
+            segments = _split_on_dot_star(alternative)
+        if segments is None:
+            segments = [alternative]
+        segments = [_make_tail_lazy(s) for s in segments[:-1]] + segments[-1:]
+        alternatives.append(
+            [re.compile(_bound_class_repeats(s), pattern.flags) for s in segments]
+        )
+    return alternatives
+
+
+_EVALUATORS = {}
+
+
+def _evaluator(pattern):
+    if pattern not in _EVALUATORS:
+        try:
+            _EVALUATORS[pattern] = _build_evaluator(pattern)
+        except Exception:
+            _EVALUATORS[pattern] = [[pattern]]
+    return _EVALUATORS[pattern]
+
+
+def _matches(pattern, text):
+    """`bool(pattern.search(text))`, without the backtracking blowup."""
+    for segments in _evaluator(pattern):
+        position = 0
+        for segment in segments:
+            found = segment.search(text, position)
+            if found is None:
+                break
+            position = found.end()
+        else:
+            return True
+    return False
+
+
+# Evidence is extracted a line at a time, which bounds the same patterns, unless
+# a "line" is the whole file. Probe a prefix rather than reintroduce the hang.
+MAX_EVIDENCE_LINE_CHARS = 4096
+
+
+def _matching_lines(lines, probe, max_matches):
+    found = []
     for i, line in enumerate(lines, 1):
-        if pattern.search(line):
+        if _matches(probe, line[:MAX_EVIDENCE_LINE_CHARS]):
             snippet = line.strip()
             if len(snippet) > 160:
                 snippet = snippet[:160] + "..."
-            matches.append(f"L{i}: {snippet}")
-            if len(matches) >= max_matches:
+            found.append(f"L{i}: {snippet}")
+            if len(found) >= max_matches:
                 break
-    return " | ".join(matches) if matches else ""
+    return found
+
+
+def _extract_evidence(content, pattern, max_matches = 3):
+    """Pull matching lines as evidence snippets. Ported from scan_packages.py.
+
+    With one addition: a rule like `socket .* connect .* subprocess` matches the
+    file but no single line, and canonical then reports the finding with no
+    evidence at all. Where the whole pattern finds nothing line by line, the
+    lines matching its individual parts are reported instead, so a warning always
+    points somewhere the reader can look.
+    """
+    lines = content.splitlines()
+    matches = _matching_lines(lines, pattern, max_matches)
+    if matches:
+        return " | ".join(matches)
+    for segments in _evaluator(pattern):
+        if len(segments) < 2:
+            continue
+        parts, located = [], 0
+        for segment in segments:
+            for snippet in _matching_lines(lines, segment, 1):
+                located += 1
+                if snippet not in parts:      # two parts often share one line
+                    parts.append(snippet)
+            if located >= max_matches:
+                break
+        # Only report this alternative if every part of it was located, or the
+        # snippet budget ran out first. A partial alternative is not why the
+        # pattern matched.
+        if located >= min(len(segments), max_matches):
+            return " | ".join(parts[:max_matches])
+    return ""
+
+
+def _default_is_inert(node):
+    """True when evaluating this expression cannot do anything but produce a value.
+
+    Literals are inert. So is a plain name or dotted name: with no call syntax
+    there is nothing to invoke, and these are what a converter that defines its
+    default next to a constant looks like.
+    """
+    try:
+        ast.literal_eval(node)
+        return True
+    except Exception:
+        pass
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, ast.Name)
 
 
 def _argparse_default_findings(raw):
-    """Flag argparse defaults that are not literals or plain names.
+    """Flag argparse defaults that would do something when eval() reaches them.
 
-    llama_cpp.py scrapes these out of the downloaded file and eval()s them in the
-    Unsloth process. The capture stops at the first comma, space or closing
-    paren, which makes a direct call awkward to smuggle through, but eval() on
-    text a third party controls is not something to leave unexamined.
+    llama_cpp.py scrapes these tokens out of the downloaded file and eval()s them
+    in the Unsloth process. The capture stops at the first comma, whitespace or
+    closing paren, so a complete call cannot survive it and neither can most
+    ordinary defaults: `default=[0, 1]` arrives as `[0`, `default=os.cpu_count()`
+    as `os.cpu_count(`. Those raise SyntaxError inside llama_cpp.py's own
+    try/except, which logs and falls back to None. A token that cannot be parsed
+    cannot run, so it is not reported: flagging it would warn on a converter that
+    did nothing wrong.
+
+    What survives the capture and still evaluates is subscripting and attribute
+    access, so an expression that parses and is neither a literal nor a name is
+    what gets reported.
     """
     findings = []
     for flag_bytes, default_bytes in RE_ARGPARSE_DEFAULT.findall(raw):
@@ -431,15 +706,19 @@ def _argparse_default_findings(raw):
         if RE_PLAIN_NAME.match(default):
             continue
         try:
-            ast.literal_eval(default)
+            node = ast.parse(default, mode = "eval").body
         except Exception:
-            findings.append(
-                ConverterScanFinding(
-                    CRITICAL,
-                    "argparse default is neither a literal nor a name, and Unsloth eval()s it in-process",
-                    f"{flag}: default={default}",
-                )
+            # Not a parseable expression, so eval() raises and nothing runs.
+            continue
+        if _default_is_inert(node):
+            continue
+        findings.append(
+            ConverterScanFinding(
+                CRITICAL,
+                "argparse default evaluates to more than a literal, and Unsloth eval()s it in-process",
+                f"{flag}: default={default}",
             )
+        )
     return findings
 
 
@@ -464,35 +743,47 @@ def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
     else:
         raw = content.encode("utf-8", errors = "replace")
         text = content
+
+    truncated = None
     if len(raw) > MAX_SCAN_BYTES:
+        # The whole file is still patched, written and executed, so a partial
+        # scan has to be said out loud rather than left to look like a pass.
+        # Reported at the end, so it cannot perturb the one order-dependent rule
+        # carried over from check_py_file.
+        truncated = ConverterScanFinding(
+            HIGH,
+            "Converter is larger than the scan cap, so only its first "
+            f"{MAX_SCAN_BYTES} bytes were scanned",
+            f"{len(raw)} bytes; a real converter is under 500 KB",
+        )
         raw = raw[:MAX_SCAN_BYTES]
         text = text[:MAX_SCAN_BYTES]
 
     findings = []
 
-    has_network      = bool(RE_NETWORK.search(text))
-    has_subprocess   = bool(RE_SUBPROCESS.search(text))
-    has_base64       = bool(RE_BASE64.search(text))
-    has_exec_eval    = bool(RE_EXEC_EVAL.search(text))
-    has_creds        = bool(RE_CRED_ACCESS.search(text))
-    has_blob         = bool(RE_LARGE_BLOB.search(text))
-    has_obfuscation  = bool(RE_OBFUSCATION.search(text))
-    has_keys         = bool(RE_EMBEDDED_KEYS.search(text))
-    has_cloud_meta   = bool(RE_CLOUD_METADATA.search(text))
-    has_persistence  = bool(RE_PERSISTENCE.search(text))
-    has_container    = bool(RE_CONTAINER_ABUSE.search(text))
-    has_env_harvest  = bool(RE_ENV_HARVEST.search(text))
-    has_archive      = bool(RE_ARCHIVE_STAGING.search(text))
-    has_anti         = bool(RE_ANTI_ANALYSIS.search(text))
-    has_dns_exfil    = bool(RE_DNS_EXFIL.search(text))
-    has_fs_enum      = bool(RE_FS_ENUM.search(text))
-    has_rev_shell    = bool(RE_REVERSE_SHELL.search(text))
-    has_remote_code  = bool(RE_REMOTE_CODE.search(text))
-    has_crypto_theft = bool(RE_CRYPTO_THEFT.search(text))
-    has_openssl_cli  = bool(RE_OPENSSL_CLI.search(text))
-    has_temp_exec    = bool(RE_TEMP_EXEC.search(text))
-    has_c2_polling   = bool(RE_C2_POLLING.search(text))
-    has_may12_ioc    = bool(RE_MAY12_IOC.search(text))
+    has_network      = _matches(RE_NETWORK, text)
+    has_subprocess   = _matches(RE_SUBPROCESS, text)
+    has_base64       = _matches(RE_BASE64, text)
+    has_exec_eval    = _matches(RE_EXEC_EVAL, text)
+    has_creds        = _matches(RE_CRED_ACCESS, text)
+    has_blob         = _matches(RE_LARGE_BLOB, text)
+    has_obfuscation  = _matches(RE_OBFUSCATION, text)
+    has_keys         = _matches(RE_EMBEDDED_KEYS, text)
+    has_cloud_meta   = _matches(RE_CLOUD_METADATA, text)
+    has_persistence  = _matches(RE_PERSISTENCE, text)
+    has_container    = _matches(RE_CONTAINER_ABUSE, text)
+    has_env_harvest  = _matches(RE_ENV_HARVEST, text)
+    has_archive      = _matches(RE_ARCHIVE_STAGING, text)
+    has_anti         = _matches(RE_ANTI_ANALYSIS, text)
+    has_dns_exfil    = _matches(RE_DNS_EXFIL, text)
+    has_fs_enum      = _matches(RE_FS_ENUM, text)
+    has_rev_shell    = _matches(RE_REVERSE_SHELL, text)
+    has_remote_code  = _matches(RE_REMOTE_CODE, text)
+    has_crypto_theft = _matches(RE_CRYPTO_THEFT, text)
+    has_openssl_cli  = _matches(RE_OPENSSL_CLI, text)
+    has_temp_exec    = _matches(RE_TEMP_EXEC, text)
+    has_c2_polling   = _matches(RE_C2_POLLING, text)
+    has_may12_ioc    = _matches(RE_MAY12_IOC, text)
 
     def _add(severity, check, *patterns):
         evidence = "\n".join(
@@ -570,6 +861,9 @@ def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
 
     # --- Converter-specific: the in-process eval sink -----------------------
     findings.extend(_argparse_default_findings(raw))
+
+    if truncated is not None:
+        findings.append(truncated)
 
     return findings
 
