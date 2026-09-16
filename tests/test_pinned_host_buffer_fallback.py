@@ -15,30 +15,11 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Running out of PINNED HOST memory must degrade, not kill the run.
 
-`use_gradient_checkpointing = "unsloth"` stages each offloaded activation
-through a page-locked host buffer. Pinned memory is a third budget, separate
-from both VRAM and system RAM, and exhausting it raises
-cudaErrorMemoryAllocation, which torch reports as a bare
-"CUDA error: out of memory" carrying no allocator summary. So the run dies
-claiming OOM while `nvidia-smi` shows the card nearly empty.
-
-WSL2 is where this actually bites: it caps a process at roughly 1-2GB of pinned
-memory and refuses single pinned allocations past a few MB
-(https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications).
-Four separate reports are this one defect, all on WSL, all with `"unsloth"`
-checkpointing, all with most of the card free, and every one of them worked
-again with `use_gradient_checkpointing = True`, which does not offload:
-unslothai/unsloth issues 338, 1552, 1744 and 1797.
-
-The load-bearing call is the growth path, not the first allocation. The initial
-buffers are 128KB each and fit anywhere; it is `resize_` on an already-pinned
-buffer that reallocates through the CUDA host allocator at the new, larger size
-once a real activation arrives. Reporters on 1744 and 1797 bisected to exactly
-that line. Pageable host memory serves every one of these copies and only costs
-overlap, so falling back to it is strictly better than aborting.
-
-`rl_replacements.py` already guards its GRPO offload this way; these tests pin
-the same contract for the gradient-checkpointing path.
+Pinned memory is a third budget, separate from VRAM and system RAM; exhausting it
+surfaces as a bare "CUDA error: out of memory" while nvidia-smi shows the card
+nearly empty. WSL2 caps it near 1-2GB and refuses allocations past a few MB
+(unslothai/unsloth 338, 1552, 1744, 1797); resize_ on an already-pinned buffer is
+the load-bearing call, not the 128KB startup allocation.
 """
 
 import pytest
@@ -52,21 +33,15 @@ requires_cuda = pytest.mark.skipif(
     reason = "pinned host memory requires a CUDA context",
 )
 
-# The message torch raises when cudaHostAlloc returns cudaErrorMemoryAllocation.
 HOST_OOM = "CUDA error: out of memory"
 
 
 @pytest.fixture(autouse = True)
 def _reset_pinned_state(monkeypatch):
-    """Each test starts believing pinning works, and no test leaks the warning latch."""
     monkeypatch.setattr(gc, "PINNED_MEMORY_AVAILABLE", True, raising = False)
     monkeypatch.setattr(gc, "_WARNED_ABOUT_PINNED_MEMORY", False, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
 
-
-# --------------------------------------------------------------------------
-# Telling a host-allocation OOM from an unrelated CUDA error
-# --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("message", [
     "CUDA error: out of memory",
@@ -87,10 +62,6 @@ def test_unrelated_errors_are_not_swallowed(message):
     """A fallback that eats every RuntimeError would hide real corruption."""
     assert not gc._is_host_alloc_oom(RuntimeError(message))
 
-
-# --------------------------------------------------------------------------
-# The two allocation helpers
-# --------------------------------------------------------------------------
 
 @requires_cuda
 def test_new_host_buffer_is_pinned_when_pinning_works():
@@ -129,11 +100,7 @@ def test_new_host_buffer_reraises_unrelated_errors(monkeypatch):
 
 @requires_cuda
 def test_grow_host_buffer_falls_back_when_pinned_resize_refuses(monkeypatch):
-    """The exact line issues 1744 and 1797 bisected to.
-
-    resize_ reallocates through the tensor's own allocator, so growing a pinned
-    buffer issues a fresh, larger cudaHostAlloc, and that is what WSL refuses.
-    """
+    """Issues 1744 and 1797 bisected here: growing a pinned buffer re-pins, and WSL refuses."""
     buffer = torch.empty(128 * 1024, dtype = torch.float16, device = "cpu", pin_memory = True)
     real_resize = torch.Tensor.resize_
 
@@ -165,7 +132,6 @@ def test_grow_host_buffer_is_a_noop_when_already_large_enough():
 
 @requires_cuda
 def test_env_var_skips_pinning_entirely(monkeypatch):
-    """WSL users know pinning will fail; let them skip the failing call."""
     monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
 
     def explode(*args, **kwargs):
@@ -178,17 +144,10 @@ def test_env_var_skips_pinning_entirely(monkeypatch):
     assert not buffer.is_pinned()
 
 
-# --------------------------------------------------------------------------
-# End to end through the real checkpoint function
-# --------------------------------------------------------------------------
-
 @requires_cuda
 def test_initialisation_survives_a_platform_that_refuses_all_pinning(monkeypatch):
-    """Pinning fails at get_peft_model time on a hard-capped host.
-
-    The 200 startup buffers were allocated outside any try, so a host that
-    refuses pinning outright never reached the first training step.
-    """
+    """Startup buffers were allocated outside any try, so a host that refuses pinning
+    outright never reached the first training step."""
     real_empty = torch.empty
 
     def refuse_pinned(*args, **kwargs):
@@ -204,13 +163,7 @@ def test_initialisation_survives_a_platform_that_refuses_all_pinning(monkeypatch
 
 @requires_cuda
 def test_checkpointed_block_survives_pinned_exhaustion_and_keeps_gradients():
-    """The whole point: the step completes, with the gradients it would have had.
-
-    Runs the real offload branch (the activation is deliberately over
-    MINIMUM_SIZE) on a host where every pinned allocation and every pinned
-    resize is refused, and checks the gradient against an identical
-    uncheckpointed block.
-    """
+    """The step completes with the gradients it would have had, pinning fully refused."""
     import unittest.mock as mock
 
     device = "cuda"
@@ -259,13 +212,8 @@ def test_checkpointed_block_survives_pinned_exhaustion_and_keeps_gradients():
 
 @requires_cuda
 def test_checkpointed_block_survives_a_per_allocation_pinned_cap():
-    """WSL's actual shape: small pinned allocations succeed, large ones do not.
-
-    This is the case that isolates the growth path. The 128KB startup buffers
-    pin fine, so initialisation is never exercised; the run dies only when a
-    real activation arrives and `resize_` asks the host allocator for a bigger
-    pinned block. A fallback on the first allocation alone does not save it.
-    """
+    """WSL's shape: small pinned allocations succeed, large ones do not, so only the
+    growth path saves the run."""
     import unittest.mock as mock
 
     CAP = 1 << 20  # 1MB, between the 128KB startup buffers and the 4MB activation
@@ -307,10 +255,7 @@ def test_checkpointed_block_survives_a_per_allocation_pinned_cap():
 
 @requires_cuda
 def test_pageable_buffers_are_not_copied_with_a_non_blocking_claim(monkeypatch):
-    """An async copy into pageable memory is a synchronising copy wearing a flag.
-
-    Only a pinned destination can overlap, so the flag has to follow the buffer.
-    """
+    """non_blocking must follow the buffer: async into pageable memory is really sync."""
     seen = {}
     real_copy = torch.Tensor.copy_
 
