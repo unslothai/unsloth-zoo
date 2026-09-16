@@ -1877,11 +1877,28 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
         name,
         local_script_info,
         _conversion_sibling_info(_get_llama_cpp_dir(local_script_info)),
+        _converter_scan_mode(),
+    )
+
+
+def _converter_scan_mode():
+    """The scan switches, read at call time so they are part of the cache key.
+
+    The scan runs inside the cached patcher below, so without this a user who
+    sees a warning, sets UNSLOTH_CONVERTER_SCAN_STRICT=1 and retries in the same
+    session gets the cached converter back and no second scan, which reads as the
+    strict mode having accepted the file.
+    """
+    return (
+        os.environ.get("UNSLOTH_CONVERTER_SCAN_STRICT", ""),
+        os.environ.get("UNSLOTH_DISABLE_CONVERTER_SCAN", ""),
     )
 
 
 @lru_cache(1)
-def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_info):
+def _download_convert_hf_to_gguf_cached(
+    name, _local_script_info, _conversion_info, _scan_mode = None,
+):
     # All Unsloth Zoo code licensed under LGPLv3
     # Download from llama.cpp's GitHub, or read a local copy when
     # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set. _local_script_info is
