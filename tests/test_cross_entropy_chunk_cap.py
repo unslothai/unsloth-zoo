@@ -25,16 +25,28 @@ def _allow_cpu_import(monkeypatch):
     monkeypatch.setenv("UNSLOTH_ALLOW_CPU", "1")
 
 
-def _load_module(monkeypatch, free_bytes):
+def _modules():
+    """The CE module and the one that owns the memory budget it defers to."""
     try:
         ce = importlib.import_module("unsloth_zoo.fused_losses.cross_entropy_loss")
+        tiled = importlib.import_module("unsloth_zoo.tiled_mlp")
     except ImportError as e:
         # A zoo-only checkout (no `unsloth` installed) makes `unsloth_zoo/__init__` raise first.
         pytest.skip(f"unsloth_zoo import unavailable: {e}")
-    monkeypatch.setattr(ce, "DEVICE_TYPE", "cuda", raising=False)
+    return ce, tiled
 
-    fake_cuda = types.SimpleNamespace(mem_get_info=lambda index=0: (free_bytes, free_bytes))
-    monkeypatch.setattr(ce.torch, "cuda", fake_cuda, raising=False)
+
+def _load_module(monkeypatch, free_bytes):
+    ce, tiled = _modules()
+    # `_free_target_gb` calls `tiled_mlp._default_target_gb`, so the backend is mocked THERE.
+    # One implementation of "how much memory may this chunk use" is the point; a copy in the
+    # CE module that measured something else would be the bug this fixes, one module over.
+    monkeypatch.setattr(tiled, "DEVICE_TYPE", "cuda", raising=False)
+    fake_cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        mem_get_info=lambda index=0: (free_bytes, free_bytes),
+    )
+    monkeypatch.setattr(tiled.torch, "cuda", fake_cuda, raising=False)
     # _get_chunk_multiplier is functools.cache'd; clear so the mock is honored.
     ce._get_chunk_multiplier.cache_clear()
     return ce
@@ -114,23 +126,30 @@ def test_cap_bounds_target_independent_of_free(monkeypatch):
     assert m_120 == pytest.approx(m_320), (m_120, m_320)
 
 
-def _no_device_pool(monkeypatch, device_type):
-    """The module with no free-memory figure available, as on CPU, MLX or a CUDA-less torch.
+def _no_device_pool(monkeypatch, device_type, host_gb = 64.0):
+    """No device pool to ask, as on CPU, MLX or a torch built without CUDA.
 
-    Only `mem_get_info` is replaced, not the whole `torch.cuda` namespace: `torch.manual_seed`
-    reaches `torch.cuda._is_in_bad_fork`, so a stand-in namespace breaks seeding rather than
-    the thing under test.
+    Only `mem_get_info` and `is_available` are replaced, not the whole `torch.cuda` namespace:
+    `torch.manual_seed` reaches `torch.cuda._is_in_bad_fork`, so a stand-in namespace breaks
+    seeding rather than the thing under test.
     """
-    ce = importlib.import_module("unsloth_zoo.fused_losses.cross_entropy_loss")
-    monkeypatch.setattr(ce, "DEVICE_TYPE", device_type, raising = False)
+    ce, tiled = _modules()
+    monkeypatch.setattr(tiled, "DEVICE_TYPE", device_type, raising = False)
 
     def refuse(index = 0):
         raise AssertionError("Torch not compiled with CUDA enabled")
 
     for namespace in ("cuda", "xpu"):
-        target = getattr(ce.torch, namespace, None)
+        target = getattr(tiled.torch, namespace, None)
         if target is not None:
             monkeypatch.setattr(target, "mem_get_info", refuse, raising = False)
+            monkeypatch.setattr(target, "is_available", lambda: False, raising = False)
+    psutil = pytest.importorskip("psutil")
+    monkeypatch.setattr(
+        psutil,
+        "virtual_memory",
+        lambda: types.SimpleNamespace(available = int(host_gb * 1024 ** 3)),
+    )
     ce._get_chunk_multiplier.cache_clear()
     return ce
 
@@ -152,9 +171,34 @@ def test_the_no_gpu_budget_matches_what_a_large_gpu_lands_on(monkeypatch):
     """Not a number invented for CPU: the same cap any device with 8 GiB free reaches."""
     ce = _load_module(monkeypatch, 180 * 1024 ** 3)
     with_gpu = ce._get_chunk_multiplier(256_000)
-    ce = _no_device_pool(monkeypatch, "cpu")
+    ce = _no_device_pool(monkeypatch, "cpu", host_gb = 64.0)
     without = ce._get_chunk_multiplier(256_000)
     assert with_gpu == pytest.approx(without), (with_gpu, without)
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "mlx"])
+def test_a_small_host_budgets_smaller_chunks_rather_than_assuming_the_cap(
+    monkeypatch, device_type
+):
+    """The activations live in host RAM here, so a machine with little of it must chunk finer.
+
+    Returning the GPU-oriented cap unconditionally lets a chunk's transient approach 4 GiB on
+    a box that does not have it, on top of the model already resident, which is an OOM kill
+    where smaller chunks would have fit.
+    """
+    ce = _no_device_pool(monkeypatch, device_type, host_gb = 2.0)
+    assert ce._free_target_gb() == pytest.approx(1.0)  # half of 2 GiB available
+    small_host = ce.get_chunk_size(1, 8_192, 256_000)
+
+    ce = _no_device_pool(monkeypatch, device_type, host_gb = 64.0)
+    big_host = ce.get_chunk_size(1, 8_192, 256_000)
+    assert small_host > big_host, (small_host, big_host)
+
+
+def test_a_host_with_plenty_still_respects_the_cap(monkeypatch):
+    """Half of a large host RAM would overshoot the cap the GPU path is held to."""
+    ce = _no_device_pool(monkeypatch, "cpu", host_gb = 512.0)
+    assert ce._free_target_gb() == ce._CE_TARGET_GB_CAP
 
 
 def test_a_gpu_that_answers_is_still_measured_not_capped_blindly(monkeypatch):

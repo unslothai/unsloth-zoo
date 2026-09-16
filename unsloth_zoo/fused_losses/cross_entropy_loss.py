@@ -141,36 +141,29 @@ pass
 # 4 counted the logits alone.
 _CE_BYTES_PER_LOGIT = 16.0
 
-# What to size the chunk against when there is no device pool to ask. This is the value the
-# GPU path already lands on for any device with 8 GB or more free, so a machine without one
-# behaves like the common GPU case rather than under a number invented for it.
+# Cap per-chunk target: on very large GPUs half the free pool rounds to a single chunk,
+# materializing full float32 logits and dominating peak memory.
 _CE_TARGET_GB_CAP = 4.0
 
 
 def _free_target_gb():
-    """Half the free device memory, capped, or the cap where nothing can be asked.
+    """Half the memory actually available to this backend, capped.
 
-    `DEVICE_TYPE` is legitimately "cpu" or "mlx", and torch itself may be built without CUDA,
-    in which case `mem_get_info` does not return a number: it raises "Torch not compiled with
-    CUDA enabled". Reached through the ordinary forward, so a CPU or Apple Silicon run died on
-    a memory query rather than on anything it was computing. Chunking is still wanted there,
-    since the transient it bounds is float32 logits and host RAM is finite too.
+    `_default_target_gb` already answers this for every backend the zoo supports, and it
+    answers it for the reason this needed: it checks `is_available()` before asking a device
+    how much memory it has, and budgets CPU, MPS and other unified-memory backends from host
+    RAM. `DEVICE_TYPE` is legitimately "cpu" or "mlx", and on a torch built without CUDA
+    `mem_get_info` does not return a number, it raises "Torch not compiled with CUDA enabled".
+    That query sat under the ordinary forward, so a CPU or Apple Silicon run died inside a
+    memory lookup rather than on anything it was computing.
+
+    Reused rather than reimplemented: a second copy that measured something different would be
+    the same bug again, one module over.
     """
 
-    try:
-        if DEVICE_TYPE == "xpu":
-            free, _total = torch.xpu.mem_get_info(0)
-        elif DEVICE_TYPE in ("cpu", "mlx"):
-            return _CE_TARGET_GB_CAP
-        else:
-            free, _total = torch.cuda.mem_get_info(0)
-    except Exception:
-        # A device type that claims a GPU on a torch that has none, and any other refusal to
-        # answer. No free-memory figure is not a reason to fail a loss that can be computed.
-        return _CE_TARGET_GB_CAP
-    # Cap per-chunk target: on very large GPUs half the free pool rounds to a
-    # single chunk, materializing full float32 logits and dominating peak memory.
-    return min(free / 1024 / 1024 / 1024 * 0.5, _CE_TARGET_GB_CAP)
+    from ..tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
+
+    return min(_default_target_gb(), _CE_TARGET_GB_CAP)
 
 
 @functools.cache
