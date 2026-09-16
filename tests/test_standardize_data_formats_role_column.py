@@ -158,3 +158,40 @@ def test_a_role_padded_with_a_non_breaking_space_resolves():
                                {"from": " gpt", "value": "yo"}]}]
     out = standardize_data_formats(Dataset.from_list(rows))
     assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
+
+
+def test_many_spellings_of_one_role_all_resolve():
+    """The map memoises each raw spelling it sees so the common already-normal role costs
+    a single dict hit. The memo is capped, so a dataset carrying more distinct spellings
+    than the cap must still resolve every one of them, cap or no cap."""
+    spellings = ["human", "Human", "HUMAN", " human", "human ", "  HuMaN  "]
+    spellings += [" " * n + "human" for n in range(2, 90)]
+    rows = [
+        {"conversations": [{"from": s, "value": f"q{i}"}, {"from": "gpt", "value": f"a{i}"}]}
+        for i, s in enumerate(spellings)
+    ]
+    out = standardize_data_formats(Dataset.from_list(rows))
+    assert len(out) == len(spellings)
+    for row in out:
+        assert [m["role"] for m in row["conversations"]] == ["user", "assistant"]
+
+
+def test_the_memo_never_changes_the_resolved_role():
+    """Every spelling must map to what normalising it alone would have produced, whatever
+    order the rows arrive in, and whichever batch boundary falls between them."""
+    pairs = [("human", "user"), ("GPT", "assistant"), ("System", "system"),
+             (" input ", "user"), ("OUTPUT", "assistant"), ("human", "user")]
+    rows = [{"conversations": [{"from": role, "value": "x"}]} for role, _ in pairs]
+    # A system turn on its own makes the role column the only all-alias column either way.
+    out = standardize_data_formats(Dataset.from_list(rows), batch_size = 2)
+    assert [row["conversations"][0]["role"] for row in out] == [want for _, want in pairs]
+
+
+def test_an_unknown_role_beyond_the_sampled_rows_still_raises():
+    """Only the first ten rows decide the column, so a role that appears later and is not
+    an alias has always blown up inside the map. The fast path must not silently accept it."""
+    rows = [{"conversations": [{"from": "human", "value": "hi"},
+                               {"from": "gpt", "value": "yo"}]} for _ in range(12)]
+    rows.append({"conversations": [{"from": "moderator", "value": "stop"}]})
+    with pytest.raises(Exception):
+        standardize_data_formats(Dataset.from_list(rows), num_proc = 1)
