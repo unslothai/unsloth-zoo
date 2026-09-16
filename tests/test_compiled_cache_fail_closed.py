@@ -63,6 +63,15 @@ _PLANTED_SOURCE = (
 _GENUINE_SOURCE = "def probe():\n    return 'genuine'\n"
 
 
+# Every test below leans on a mode bit actually stopping a write. Root bypasses
+# them all: a 0444 planted file is rewritten rather than refused, so the guards
+# either fail outright or pass without exercising anything.
+_needs_mode_enforcement = pytest.mark.skipif(
+    os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason = "POSIX file permissions, which root bypasses",
+)
+
+
 @pytest.fixture(autouse = True)
 def _sandbox(tmp_path, monkeypatch):
     """Keep the cache, the temp fallback and sys.modules inside this test.
@@ -119,7 +128,7 @@ def _planted_ran():
     return os.environ.get(_MARKER, "0") == "1"
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "POSIX file permissions")
+@_needs_mode_enforcement
 def test_planted_read_only_cache_file_is_not_executed(cache_dir):
     """The core case: a 0444 cache file is replaced, never imported.
 
@@ -137,7 +146,7 @@ def test_planted_read_only_cache_file_is_not_executed(cache_dir):
     assert "def probe():" in planted.read_text()
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "POSIX file permissions")
+@_needs_mode_enforcement
 def test_victim_writable_planted_cache_file_is_overwritten(cache_dir):
     """Already-safe behaviour that has to stay: a writable file is rewritten."""
     name = "UnslothFailClosedProbeWritable"
@@ -166,7 +175,7 @@ def test_generated_cache_file_is_written_and_imported(cache_dir):
     assert (cache_dir / f"{name}.py").read_text() == written
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "POSIX file permissions")
+@_needs_mode_enforcement
 def test_read_only_cache_directory_still_falls_back(cache_dir):
     """Already-safe behaviour that has to stay: an unwritable directory recovers.
 
@@ -185,7 +194,7 @@ def test_read_only_cache_directory_still_falls_back(cache_dir):
     )
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "POSIX file permissions")
+@_needs_mode_enforcement
 def test_unlandable_rewrite_over_planted_bytes_is_not_imported(cache_dir, monkeypatch):
     """When even the replacement cannot land, the write must report failure.
 
@@ -272,7 +281,7 @@ def test_cache_file_swapped_after_the_write_is_not_imported(cache_dir, monkeypat
     assert module.probe() == "genuine"
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "POSIX file permissions")
+@_needs_mode_enforcement
 def test_read_only_moe_utils_cache_copy_is_replaced(tmp_path, monkeypatch):
     """install_to_cache() must land its copy over a read-only destination."""
     location = tmp_path / "moe_cache_replaceable"
@@ -289,7 +298,7 @@ def test_read_only_moe_utils_cache_copy_is_replaced(tmp_path, monkeypatch):
     assert installed is True
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "POSIX file permissions")
+@_needs_mode_enforcement
 def test_unreplaceable_moe_utils_cache_copy_is_not_loaded(tmp_path, monkeypatch):
     """When the copy cannot land, the planted file must not be executed.
 
@@ -367,7 +376,7 @@ def test_moe_utils_cache_copy_loads_when_it_matches(tmp_path, monkeypatch):
         sys.modules.pop("unsloth_cached_moe_utils", None)
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "POSIX file permissions")
+@_needs_mode_enforcement
 def test_foreign_bytes_are_reported_rather_than_accepted(cache_dir):
     """The write-side helpers: absent and generated are fine, other bytes are not."""
     location = str(cache_dir / "UnslothFailClosedProbeForeign.py")
