@@ -726,7 +726,7 @@ def test_a_process_we_cannot_read_stops_the_unowned_purge_on_a_shared_cache(
     # possible writer here.
     monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None: False)
     assert xf._blobs_with_a_live_writer() == set()
-    assert xf._LIVE_WRITER_WALK_WAS_COMPLETE is False
+    assert xf._live_writer_walk_was_complete() is False
     assert xf._unowned_partials_safe_to_clear(
         "model", REPO, str(tmp_path), 180.0, None,
     ) is None
@@ -747,7 +747,7 @@ def test_a_process_we_cannot_read_stops_the_unowned_purge_on_a_shared_cache(
 
     monkeypatch.setattr(_FakePsutil, "process_iter", staticmethod(lambda: [_Gone()]))
     assert xf._blobs_with_a_live_writer() == set()
-    assert xf._LIVE_WRITER_WALK_WAS_COMPLETE is True
+    assert xf._live_writer_walk_was_complete() is True
 
 
 def test_the_private_cache_test_is_about_who_can_write_into_it(tmp_path):
@@ -788,3 +788,105 @@ def test_a_baseline_entry_that_cannot_be_inspected_is_unknown(monkeypatch, tmp_p
 
     monkeypatch.setattr(Path, "is_file", _flaky)
     assert xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path)) is None
+
+
+def test_a_siblings_new_partial_is_not_claimed_by_the_stalled_child(monkeypatch, tmp_path):
+    """Appearing after the baseline says WHEN, not WHO.
+
+    The subtraction is the fallback used wherever the child's own open files cannot be read,
+    and a same-repo sibling downloading beside this one creates partials in the same window.
+    Claiming one hands it to a purge scoped by ownership, which skips the age and live-writer
+    guards entirely -- so the sibling's active download is deleted mid-write.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    mine = _blob_name("model-00001-of-00002.safetensors") + ".child" + xf.INCOMPLETE_SUFFIX
+    theirs = _blob_name("tokenizer.model") + ".sibling" + xf.INCOMPLETE_SUFFIX
+
+    def _open_partial():
+        (blobs / mine).write_bytes(b"\xa5" * 256)
+        (blobs / theirs).write_bytes(b"\xa5" * 256)
+
+    class _Ctx:
+        def Process(self, *, target = None, kwargs = None, daemon = None):
+            return _StalledProc(_open_partial)
+
+        def Queue(self):
+            return _StalledQueue()
+
+    monkeypatch.setattr(xf, "_CTX", _Ctx())
+    monkeypatch.setattr(xf, "_terminate_process_group", lambda proc, grace: None)
+    # The child's own table cannot be read -- Windows, and the case the subtraction exists for.
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: None)
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: {theirs})
+    params = {"repo_id": REPO, "revision": REV, "cache_dir": str(tmp_path)}
+    kind_result, _ = xf._run_download_attempt(
+        REPO, kind = "snapshot", params = params, token = None, repo_type = "model",
+        disable_xet = False, cancel_event = None, stall_timeout = 0.3, interval = 0.05,
+        grace_period = 0.1, on_status = None,
+    )
+    assert kind_result == "stall"
+    assert params.get("_owned_incomplete_blobs") == {mine}, (
+        "a partial a live sibling holds open was claimed as this child's"
+    )
+
+    # And with the writer walk unusable, nothing is claimed by subtraction at all: the purge
+    # falls back to unscoped, where the age and live-writer guards still apply.
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
+    params = {"repo_id": REPO, "revision": REV, "cache_dir": str(tmp_path)}
+    xf._run_download_attempt(
+        REPO, kind = "snapshot", params = params, token = None, repo_type = "model",
+        disable_xet = False, cancel_event = None, stall_timeout = 0.3, interval = 0.05,
+        grace_period = 0.1, on_status = None,
+    )
+    assert params.get("_owned_incomplete_blobs") is None
+
+
+def test_the_walk_completeness_is_per_thread(monkeypatch):
+    """Two downloads run this clearance concurrently.
+
+    Communicating the completeness through a module global let a complete walk in one thread
+    overwrite the incomplete verdict another thread had not read yet -- and that thread is
+    exactly the one that would then unlink a partial held by a process it could not inspect.
+    """
+    import threading
+
+    class _Denied(Exception):
+        pass
+
+    class _Blind:
+        def open_files(self):
+            raise _Denied("not yours")
+
+    class _Open:
+        def open_files(self):
+            return []
+
+    class _FakePsutil:
+        NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+        ZombieProcess = type("ZombieProcess", (Exception,), {})
+        visible = [_Blind()]
+
+        @classmethod
+        def process_iter(cls):
+            return cls.visible
+
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+    xf._blobs_with_a_live_writer()
+    assert xf._live_writer_walk_was_complete() is False
+
+    seen = {}
+
+    def _other_thread():
+        _FakePsutil.visible = [_Open()]
+        xf._blobs_with_a_live_writer()
+        seen["theirs"] = xf._live_writer_walk_was_complete()
+
+    thread = threading.Thread(target = _other_thread)
+    thread.start()
+    thread.join()
+
+    assert seen["theirs"] is True, "the other thread's own walk was complete"
+    assert xf._live_writer_walk_was_complete() is False, (
+        "another thread's complete walk overwrote this thread's incomplete verdict"
+    )

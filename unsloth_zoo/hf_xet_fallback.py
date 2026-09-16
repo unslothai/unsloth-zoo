@@ -752,10 +752,23 @@ def _incomplete_partial_names(
 # are unreadable -- a sibling downloader running under another UID on a shared cache, which is
 # what `psutil.AccessDenied` means here -- is invisible to the probe, so the set it returns is
 # a lower bound and "no live writer" is not a fact. The caller weighs that against who can
-# write into the cache at all; see `_cache_is_private_to_this_user`. Module level rather than a
-# second return value so a caller (or a test) that holds the existing one-value contract is
-# unaffected.
-_LIVE_WRITER_WALK_WAS_COMPLETE = True
+# write into the cache at all; see `_cache_is_private_to_this_user`.
+#
+# PER THREAD, not module level: two downloads run this clearance concurrently, and a module
+# global let a complete walk in one thread overwrite the incomplete verdict another thread had
+# not yet read -- which is precisely the thread that would then unlink a partial held by the
+# process it could not inspect. Kept beside the probe rather than returned from it so a caller
+# (or a test) holding the existing one-value contract is unaffected.
+_LIVE_WRITER_WALK = threading.local()
+
+
+def _live_writer_walk_was_complete() -> bool:
+    """Whether THIS thread's last live-writer walk read every process it listed.
+
+    True by default, which is the answer for a caller that never ran one -- a test with the
+    probe monkeypatched, say: it is describing a walk that did not happen here.
+    """
+    return bool(getattr(_LIVE_WRITER_WALK, "complete", True))
 
 
 def _cache_is_private_to_this_user(cache_dir: Optional[str] = None) -> bool:
@@ -789,9 +802,8 @@ def _blobs_with_a_live_writer() -> Optional[set]:
     """Basenames of every ``*.incomplete`` blob some LIVE process holds open, or ``None`` when this
     host cannot answer (no psutil, no open-file table) and the caller must decline. Walks every
     visible process, unlike ``_child_open_incomplete_blobs``; an uninspectable one is skipped, so
-    the set is a LOWER bound -- and `_LIVE_WRITER_WALK_WAS_COMPLETE` records whether it is one."""
-    global _LIVE_WRITER_WALK_WAS_COMPLETE
-    _LIVE_WRITER_WALK_WAS_COMPLETE = True
+    the set is a LOWER bound -- and `_live_writer_walk_was_complete` records whether it is one."""
+    _LIVE_WRITER_WALK.complete = True
     try:
         import psutil  # type: ignore
     except ImportError:
@@ -809,7 +821,7 @@ def _blobs_with_a_live_writer() -> Optional[set]:
             except Exception:
                 # One unreadable process is not a reason to abandon the rest, but it IS a
                 # reason not to call the result proof of absence.
-                _LIVE_WRITER_WALK_WAS_COMPLETE = False
+                _LIVE_WRITER_WALK.complete = False
                 continue
     except Exception:
         return None
@@ -828,7 +840,7 @@ def _unowned_partials_safe_to_clear(
     live_writers = _blobs_with_a_live_writer()
     if live_writers is None:
         return None
-    if not _LIVE_WRITER_WALK_WAS_COMPLETE and not _cache_is_private_to_this_user(cache_dir):
+    if not _live_writer_walk_was_complete() and not _cache_is_private_to_this_user(cache_dir):
         # A process this host would not let us read is a possible writer, and on a cache
         # another user can write into it is a LIKELY one: unlinking an aged partial there
         # interrupts that sibling's download mid-write, which age alone can never rule out.
@@ -1963,7 +1975,26 @@ def _run_download_attempt(
                     current = set(
                         _active_incomplete_blob_sizes(repo_type, repo_id, params.get("cache_dir"))
                     )
-                    owned = current - baseline_partials
+                    inferred = current - baseline_partials
+                    # Appearing AFTER the baseline does not say WHICH process created it: a
+                    # same-repo sibling downloading beside this one makes partials in the same
+                    # window, and treating one as ours hands it to a purge that skips the age
+                    # and live-writer guards entirely. So the names another live process holds
+                    # open are dropped -- all but our own child's, which is the one being
+                    # killed -- and the walk that says so has to have been able to read every
+                    # process, or the cache has to be one nobody else can write into.
+                    writers = _blobs_with_a_live_writer()
+                    trustworthy = writers is not None and (
+                        _live_writer_walk_was_complete()
+                        or _cache_is_private_to_this_user(params.get("cache_dir"))
+                    )
+                    if not trustworthy:
+                        inferred = set()
+                    else:
+                        inferred -= writers - (
+                            _child_open_incomplete_blobs(proc.pid) or set() if proc.pid else set()
+                        )
+                    owned = inferred
                 # An empty ownership set would scope the HTTP-prep purge to NOTHING, leaving a pre-existing
                 # stale *.incomplete blob / dangling link for the retry to inherit and re-trip on. Fall back
                 # to None (unscoped) so the mtime + active-partner guards still clear genuinely-stale state
