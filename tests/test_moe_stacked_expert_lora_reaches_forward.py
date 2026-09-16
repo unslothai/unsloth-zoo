@@ -977,16 +977,19 @@ def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_w
     assert torch.allclose(compiled(_inputs()), expected, atol = 1e-5)
 
 
-def test_a_peft_without_the_factored_api_still_folds(restore_param_wrapper):
+def test_a_peft_without_the_factored_api_still_folds(restore_param_wrapper, monkeypatch):
     """NEGATIVE CONTROL: `get_delta_factors` is newer than the oldest PEFT that has
-    `target_parameters`, so its absence must fall back to the dense delta, not to
-    nothing."""
+    `target_parameters`, so its absence must fall back to the dense delta, not to nothing.
+
+    The absence is simulated rather than asserted, since peft>=0.18.0 is unbounded here and
+    0.21.0 already ships the factored API, so asserting it would fail on a resolution the
+    package allows.
+    """
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(m for m in model.modules() if type(m).__name__ == "ParamWrapper")
-    assert not hasattr(wrapper, "get_delta_factors"), (
-        "this peft has the factored API, so this control measures nothing"
-    )
+    monkeypatch.delattr(type(wrapper), "get_delta_factors", raising = False)
+    assert not hasattr(wrapper, "get_delta_factors")
 
     param = wrapper.get_param()
     active = list(wrapper.active_adapters)
