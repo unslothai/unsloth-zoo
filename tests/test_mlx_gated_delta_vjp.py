@@ -388,6 +388,42 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
     assert vlm_pkg.language.gated_delta_update is patched
 
 
+def test_vlm_patch_rebinds_language_holding_a_stale_copy(fake_mlx_lm, monkeypatch):
+    """`language` from-imports the function at import time, so a later reload of
+    .gated_delta leaves it holding a different object than the one being replaced.
+    The identity sweep cannot see that; the patch must bind `language` by name or
+    qwen3_5 trains without the memory-efficient VJP."""
+    def _update(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True):
+        return "y", state
+
+    # Same source, distinct objects: exactly what importlib.reload produces.
+    stale = types.FunctionType(
+        _update.__code__, _update.__globals__, "gated_delta_update",
+        _update.__defaults__, _update.__closure__,
+    )
+    current = types.FunctionType(
+        _update.__code__, _update.__globals__, "gated_delta_update",
+        _update.__defaults__, _update.__closure__,
+    )
+    assert stale is not current
+
+    vlm_gd = types.ModuleType("mlx_vlm.models.qwen3_5.gated_delta")
+    vlm_gd.gated_delta_update = current
+    vlm_pkg = types.ModuleType("mlx_vlm.models.qwen3_5")
+    vlm_pkg.gated_delta = vlm_gd
+    vlm_pkg.language = fake_mlx_lm.consumers["mlx_vlm.models.qwen3_5.language"]
+    vlm_pkg.language.gated_delta_update = stale
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5", vlm_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.gated_delta", vlm_gd)
+
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm
+    patch_gated_delta_vlm()
+
+    patched = vlm_gd.gated_delta_update
+    assert patched is not current
+    assert vlm_pkg.language.gated_delta_update is patched
+
+
 @requires_metal
 def test_kernel_dispatch_guards_partial_threadgroup_rows():
     """Dv not divisible by the threadgroup row count must fall back to the

@@ -448,11 +448,11 @@ def patch_gated_delta_vlm():
             )
         return
     try:
-        # Imported for its side effect: the rebind sweep below only reaches
+        # Also imported for its side effect: the rebind sweep below only reaches
         # consumers that are already in sys.modules.
-        from mlx_vlm.models.qwen3_5 import language  # noqa: F401
+        from mlx_vlm.models.qwen3_5 import language as vlm_language
     except ImportError:
-        pass
+        vlm_language = None
     try:
         from mlx_lm.models import gated_delta
     except ImportError:
@@ -492,6 +492,12 @@ def patch_gated_delta_vlm():
     _rebind_vlm_gated_delta_consumers(
         original_update, patched_vlm_gated_delta_update,
     )
+    # The sweep matches on identity, so it misses a consumer holding a DIFFERENT copy of the
+    # function than the one just replaced -- which is what importlib.reload on .gated_delta
+    # leaves behind, and what tests/test_qwen35_vjp_metal.py does before calling this. `language`
+    # is the consumer that always exists and the one training runs through, so bind it by name.
+    if vlm_language is not None:
+        vlm_language.gated_delta_update = patched_vlm_gated_delta_update
     print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
 
 
