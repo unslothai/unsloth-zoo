@@ -3631,8 +3631,14 @@ pass
 # Parameter-name segments that mark a stacked MoE expert tensor. Matched as a dotted
 # segment ("...mlp.experts.gate_up_proj.lora_A.weight") rather than as a substring, so a
 # dense projection that merely contains the word is not caught. Qwen3 MoE, Qwen3.5/3.6
-# MoE, Gemma 4 MoE and gpt-oss all expose their stacked experts under ".experts.".
-_MOE_EXPERT_LORA_SEGMENTS = ("experts",)
+# MoE and gpt-oss expose their stacked experts under ".experts.".
+#
+# ".moe." is the second spelling and it is not hypothetical: saving_utils.py keys its own
+# expert-shard mapping off `".experts" in lora_key or ".moe" in lora_key` and then remaps
+# ".moe" -> ".experts" for the Gemma 4 layout, so an adapter saved from that layout carries
+# ".moe." and is just as unservable by vLLM as an ".experts." one. Segment matching keeps
+# Qwen MoE's dense `shared_expert` out of both.
+_MOE_EXPERT_LORA_SEGMENTS = ("experts", "moe")
 
 
 def _is_moe_expert_lora_key(key):

@@ -127,3 +127,37 @@ def test_non_lora_expert_tensors_are_ignored(tmp_path):
         "base_model.model.model.layers.0.mlp.experts.gate_up_proj.weight",
     ])
     assert _saved_adapter_expert_lora_keys(str(tmp_path)) == []
+
+
+# --- the ".moe." spelling -------------------------------------------------------------
+#
+# saving_utils.py treats ".moe" as an expert-adapter prefix alongside ".experts" and remaps
+# it for the Gemma 4 layout, so an adapter saved from that layout carries ".moe." and is
+# equally unservable by vLLM. Matching only "experts" let those through both branches.
+
+MOE_SPELLING_KEYS = [
+    "base_model.model.model.layers.0.moe.gate_up_proj.lora_A.weight",
+    "base_model.model.model.layers.7.moe.down_proj.lora_B.weight",
+    "model.layers.0.mlp.moe.gate_up_proj.lora_A.weight",
+]
+
+
+@pytest.mark.parametrize("key", MOE_SPELLING_KEYS)
+def test_moe_spelling_is_detected(key):
+    assert _is_moe_expert_lora_key(key), key
+
+
+def test_moe_spelling_is_still_segment_matched():
+    # "moe" must be a whole segment, so these dense names stay servable.
+    assert not _is_moe_expert_lora_key("a.moecoder.b.lora_A.weight")
+    assert not _is_moe_expert_lora_key("a.my_moe_thing.b.lora_A.weight")
+    assert not _is_moe_expert_lora_key("base_model.model.model.layers.0.mlp.shared_expert.up_proj.lora_A.weight")
+
+
+def test_moe_spelling_is_caught_on_disk(tmp_path):
+    _write_safetensors(str(tmp_path / "adapter_model.safetensors"), [
+        "base_model.model.model.layers.0.moe.gate_up_proj.lora_A.weight",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+    ])
+    got = _saved_adapter_expert_lora_keys(str(tmp_path))
+    assert len(got) == 1 and ".moe." in got[0]
