@@ -328,13 +328,9 @@ jobs:
         # they fix, so left to --collect-only they would prove only that they
         # import, which is the failure every paragraph above already describes.
         #
-        # test_published_version_window.py is here for the same reason as everything
-        # else in this list. It is the assertion that the published window matches what
-        # the caps actually admit, and left to `pytest tests/ --collect-only` it proves
-        # only that it imports: a later cap regression, such as lowering the general
-        # transformers ceiling, keeps CI green even though this file's assertion fails.
-        # It is stdlib plus packaging and reads files only, so it costs no measurable
-        # time here.
+        # test_published_version_window.py asserts the published window matches what the
+        # caps admit. Left to --collect-only it proves only that it imports, so a later cap
+        # regression would keep CI green. Stdlib plus packaging, reads files only.
         #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
@@ -495,12 +491,10 @@ jobs:
 
           # numerics: minimal on purpose -- mlx core only, no mlx-lm / mlx-vlm.
           #
-          # transformers is capped here at the darwin + arm64 half of pyproject's
-          # marker-split cap. pyproject allows a newer transformers off darwin, so
-          # without this the MLX lanes would follow a CUDA-motivated bump and this
-          # lane would stop measuring the stack Apple Silicon actually ships. The
-          # newly allowed range is covered by the "Repo tests (CPU)" job, which
-          # installs .[core] unpinned.
+          # transformers pinned to the darwin + arm64 half of pyproject's marker-split
+          # cap: pyproject allows a newer one off darwin, so without this the MLX lanes
+          # would follow a CUDA-motivated bump and stop measuring the Apple Silicon
+          # stack. The newly allowed range is the unpinned "Repo tests (CPU)" job's.
           (
             rc=0
             {
@@ -523,17 +517,12 @@ jobs:
           # cap and lands on the newest mlx-vlm that fits, which is the 0.6.4
           # ceiling the audio gate records.
           #
-          # Two bounds are repeated here rather than left to pyproject, for the
-          # same reason: pyproject's mlx-vlm ceiling and the 5.5.0 half of its
-          # transformers cap are both marker-gated to darwin + arm64, so neither
-          # constrains anything on this Linux lane. Without the <0.7.0 bound the
-          # lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
-          # gating a combination pyproject forbids; without the <=5.5.0 bound it
-          # now follows the higher off-darwin cap up to mlx-vlm 0.6.17 and stops
-          # measuring the stack Apple Silicon ships. tests/mlx_simulation models
-          # the 0.6.4 surface, so this lane holds 0.6.4 on purpose. Coverage of
-          # the newly allowed transformers range is the "Repo tests (CPU)" job's
-          # to provide, and it installs .[core] unpinned.
+          # Both bounds are repeated here because pyproject's mlx-vlm ceiling and the
+          # 5.5.0 half of its transformers cap are marker-gated to darwin + arm64 and so
+          # constrain nothing on this Linux lane. Without <0.7.0 the lane resolved
+          # mlx-vlm 0.7.0, a combination pyproject forbids; without <=5.5.0 it follows
+          # the off-darwin cap to 0.6.17 and stops measuring the Apple Silicon stack.
+          # tests/mlx_simulation models the 0.6.4 surface, so 0.6.4 is deliberate.
           (
             rc=0
             {
@@ -594,11 +583,9 @@ jobs:
           from packaging.requirements import Requirement
           from packaging.version import Version
 
-          # The cap is marker-split: one half for darwin + arm64, one for
-          # everywhere else. So the gate can no longer collapse the requirement
-          # lines into one set of specifier strings; it has to ask which line
-          # applies where. Both halves are checked from this Linux lane, because
-          # the Apple Silicon half is a policy the Linux runner can still read.
+          # The cap is marker-split, so the gate has to ask which requirement line
+          # applies where rather than collapsing them. Both halves are checked here,
+          # since the Apple Silicon half is a policy a Linux runner can still read.
           extras = [""] + list(metadata("unsloth_zoo").get_all("Provides-Extra") or [])
           reqs = [
               req
@@ -642,18 +629,15 @@ jobs:
           )
           print("transformers", transformers, "within the pinned range", pinned)
 
-          # Two ceilings, and they are separate decisions rather than one number
-          # written twice. Checking only "matches pyproject" above would let an
-          # automated dependency bump raise a cap and quietly opt the whole
-          # project in, which is exactly what #1144 did. Raising either of these
-          # is a decision: change it here in the same commit that changes
-          # pyproject.toml, deliberately.
+          # Two ceilings, separate decisions rather than one number written twice.
+          # Checking only "matches pyproject" would let an automated bump raise a cap and
+          # opt the project in, which is what #1144 did. Raise either one deliberately, in
+          # the same commit that changes pyproject.toml.
           #
-          # CEILING is the newest transformers the version matrix was run
-          # against on the CUDA platforms. It moved from 5.5.0 to 5.17.0 with
-          # the sweep that unblocked the prequantized bnb-4bit quant_state
-          # failures (unsloth #9867, #10010, #10017, #10276) and Gemma 4 E4B
-          # LoRA (unsloth #5355).
+          # CEILING is the newest transformers the version matrix was run against on
+          # CUDA. It moved from 5.5.0 to 5.17.0 with the sweep that unblocked the
+          # prequantized bnb-4bit quant_state failures (unsloth #9867, #10010, #10017,
+          # #10276) and Gemma 4 E4B LoRA (unsloth #5355).
           #
           # MLX_CEILING is a different question and did NOT move. mlx-vlm 0.6.5
           # and up require transformers >= 5.14, tests/mlx_simulation models the
