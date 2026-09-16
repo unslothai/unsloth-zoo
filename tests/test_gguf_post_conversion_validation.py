@@ -959,3 +959,80 @@ def test_the_exemption_is_read_from_the_metadata_pass_constant(llama_cpp):
     body = source[source.index("def _assert_correct_gguf("):source.index("def assert_correct_gguf(")]
     assert "GGUF_METADATA_EXEMPT_ARCHITECTURES" in body
     assert '"clip"' not in body, "the architecture name is re-spelled instead of imported"
+
+
+def test_the_named_tree_takes_precedence_over_every_other_path_entry(llama_cpp, tmp_path):
+    """`sys.path[0]` is the script or working directory, and a process launched from inside
+    another gguf-py checkout has that checkout there.
+
+    The tree handed to this context manager is NAMED, not searched for: it is the one the
+    converter child reported, and reading the file back with the package that wrote it is
+    the entire point. Inserting it after position 0 let the ambient checkout win the
+    reimport, so the verification ran against a reader that may not understand what was
+    written -- and then warned and skipped rather than failing loudly.
+    """
+    tree, _location = _fake_gguf_tree(tmp_path)
+    decoy = tmp_path / "decoy"
+    (decoy / "gguf").mkdir(parents = True)
+    (decoy / "gguf" / "__init__.py").write_text("", encoding = "utf-8")
+
+    import sys as _sys
+
+    original = list(_sys.path)
+    _sys.path.insert(0, str(decoy))
+    try:
+        with llama_cpp.use_local_gguf(tree):
+            assert _sys.path[0] == tree, _sys.path[:3]
+    finally:
+        _sys.path[:] = original
+
+
+class _RecordingNameMap:
+    """Stands in for gguf-py's TensorNameMap and records how it was sized."""
+
+    calls: list = []
+
+    def __init__(self, arch, n_blocks):
+        type(self).calls.append(n_blocks)
+        self.mapping = {}
+
+
+def _many_parameter_model(llama_cpp, tmp_path, block_count_key = True):
+    """Two blocks, and a great many separately named MoE expert parameters."""
+    shapes = {
+        "model.layers.0.self_attn.q_proj.weight": (4, 4),
+        "model.layers.1.self_attn.q_proj.weight": (4, 4),
+    }
+    for block in (0, 1):
+        for expert in range(2000):
+            shapes[f"model.layers.{block}.mlp.experts.{expert}.down_proj.weight"] = (4, 4)
+    keys = dict(UNIVERSAL)
+    if not block_count_key:
+        keys.pop("llama.block_count")
+    path = write_gguf(
+        tmp_path / "model.gguf", keys = keys,
+        tensors = {"blk.0.attn_q.weight": np.ones((4, 4), dtype = np.float32)},
+    )
+    return _FakeModel(shapes), [(path, llama_cpp._open_gguf_reader(path))]
+
+
+@pytest.mark.parametrize("block_count_key", [True, False])
+def test_the_name_map_is_sized_by_the_blocks_not_the_parameters(
+    llama_cpp, tmp_path, monkeypatch, block_count_key,
+):
+    """`TensorNameMap`'s second argument is the BLOCK count and it expands every per-block
+    template once per index.
+
+    A model with separately named MoE experts has tens of thousands of parameters and a few
+    dozen blocks, so sizing the map by the parameter count builds names for thousands of
+    layers that do not exist before a single tensor is compared. The file declares its own
+    block count -- llama.cpp refuses to load without it -- and the parameter names are the
+    fallback when it is somehow absent.
+    """
+    import gguf.tensor_mapping as tensor_mapping
+
+    _RecordingNameMap.calls = []
+    monkeypatch.setattr(tensor_mapping, "TensorNameMap", _RecordingNameMap)
+    model, readers = _many_parameter_model(llama_cpp, tmp_path, block_count_key)
+    assert llama_cpp._gguf_shape_problems(model, readers, sample_size = 8) == []
+    assert _RecordingNameMap.calls == [2], _RecordingNameMap.calls

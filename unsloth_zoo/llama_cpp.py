@@ -270,7 +270,14 @@ def use_local_gguf(gguf_py_path = None):
     try:
         if os.path.exists(gguf_py_path):
             logger.debug(f"Adding {gguf_py_path} to sys.path")
-            sys.path.insert(1, gguf_py_path)
+            # Index 0, ahead of everything including the script or working directory that
+            # Python puts there. This tree is named, not searched for: `convert_to_gguf`
+            # passes the one the converter child reported, and the whole point of the read
+            # back is to parse the file with the `gguf` that wrote it. A process launched
+            # from inside another gguf-py checkout has that checkout at sys.path[0], so
+            # inserting after it re-imports the wrong package and the verification runs
+            # against a reader that may not understand what was written.
+            sys.path.insert(0, gguf_py_path)
 
             # Drop system gguf modules to force a reimport from gguf-py
             gguf_modules = [key for key in sys.modules.keys() if key.startswith('gguf')]
@@ -4185,6 +4192,43 @@ def _gguf_field_text(reader, key):
     return None if value is None else str(value)
 
 
+def _gguf_field_int(reader, key):
+    """An integer KV value, or None when absent or not readable as one."""
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+    try:
+        value = field.contents()
+    except Exception:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+# A block index in a parameter name: `model.layers.31.mlp...`, `transformer.h.5...`.
+_HF_BLOCK_INDEX_RE = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
+
+
+def _model_block_count(shapes):
+    """Blocks inferred from parameter names, or None. The fallback for a missing KV."""
+    highest = -1
+    for name in shapes:
+        match = _HF_BLOCK_INDEX_RE.search(name)
+        if match is None:
+            continue
+        try:
+            index = int(match.group(1))
+        except ValueError:
+            continue
+        if index > highest:
+            highest = index
+    return highest + 1 if highest >= 0 else None
+
+
 def _open_gguf_reader(path):
     """A plain `GGUFReader`, imported at the call site.
 
@@ -4780,8 +4824,21 @@ def _gguf_shape_problems(model, readers, sample_size):
     )
     if arch_enum is None:
         return []
+    # `TensorNameMap`'s second argument is the BLOCK count, and it expands every per-block
+    # template once per index, so the number it is given is the size of the map. The
+    # parameter count is not that number: a model with separately named MoE experts has
+    # tens of thousands of parameters and a few dozen blocks, and asking for one mapping per
+    # parameter builds hundreds of megabytes of names for layers that do not exist before
+    # a single tensor is looked at. The file says how many blocks it has -- llama.cpp
+    # refuses to load without `{arch}.block_count` -- and the parameter names are the
+    # fallback for a file that somehow lacks it.
+    block_count = _gguf_field_int(reader, f"{architecture}.block_count")
+    if block_count is None or block_count <= 0:
+        block_count = _model_block_count(shapes)
+    if block_count is None or block_count <= 0:
+        return []
     try:
-        name_map = TensorNameMap(arch_enum, len(shapes))
+        name_map = TensorNameMap(arch_enum, block_count)
     except Exception:
         return []
     # HF name -> GGUF name, inverted so a sampled GGUF tensor finds its parameter.

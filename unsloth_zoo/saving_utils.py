@@ -92,6 +92,7 @@ pass
 from transformers.modeling_utils import PushToHubMixin
 import json
 import os
+import stat
 from pathlib import Path
 from typing import Union, List, Optional
 import tempfile
@@ -3042,9 +3043,46 @@ def reconcile_mtp_config(save_directory, tensor_names = None):
 
         for container in containers:
             container.pop(MTP_CONFIG_KEY, None)
-        with open(config_path, "w", encoding = "utf-8") as f:
-            json.dump(config, f, indent = 2, ensure_ascii = False)
-            f.write("\n")
+        # Written to a sibling and moved into place, never over the original. Opening the
+        # real file "w" truncates it before the dump runs, so a dump that fails part way --
+        # a full disk at the end of an export is the realistic one -- leaves the checkpoint
+        # with an empty or half-written `config.json` and the handler below then reports
+        # "unknown" and lets the save continue. A repair that cannot succeed has to leave
+        # the valid file it found, and `os.replace` is atomic on the same filesystem.
+        directory = os.path.dirname(config_path) or "."
+        if not os.access(config_path, os.W_OK):
+            # Asked before anything is staged, because `os.replace` only needs the
+            # DIRECTORY to be writable: without this, a config.json the user marked
+            # read-only would be replaced anyway, where the previous open("w") reported
+            # "unknown" and left it alone. Refusing to write a file the operator protected
+            # is the behaviour to keep.
+            raise PermissionError(f"{config_path} is not writable")
+        handle, staged_path = tempfile.mkstemp(
+            prefix = os.path.basename(config_path) + ".",
+            suffix = ".tmp",
+            dir = directory,
+        )
+        try:
+            # mkstemp creates 0600. The replacement must not be more restrictive than what
+            # it replaces, or an export becomes unreadable to everyone but its owner.
+            try:
+                os.chmod(staged_path, stat.S_IMODE(os.stat(config_path).st_mode))
+            except OSError:
+                pass
+            with os.fdopen(handle, "w", encoding = "utf-8") as f:
+                json.dump(config, f, indent = 2, ensure_ascii = False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(staged_path, config_path)
+        except BaseException:
+            # Including the interpreter shutting down mid-write: the original is still
+            # whole, so the only thing to clean up is the staged copy.
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+            raise
         logger.warning_once(
             f"Unsloth: `{os.path.basename(config_path)}` declared "
             f"`{MTP_CONFIG_KEY}` but the exported weights carry no `mtp.*` "

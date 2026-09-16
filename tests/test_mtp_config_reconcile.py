@@ -27,6 +27,7 @@ the file, and every consumer that trusts the config goes looking for them
 
 import json
 import os
+import stat
 
 import numpy as np
 import pytest
@@ -425,3 +426,43 @@ def test_a_config_that_cannot_be_rewritten_is_reported_not_raised(tmp_path):
         assert MTP_CONFIG_KEY in json.dumps(_saved(tmp_path))
     finally:
         config_path.chmod(0o644)
+
+
+def test_a_dump_that_fails_part_way_leaves_the_original_config(tmp_path, monkeypatch):
+    """The repair runs after the weights are on disk and promises it cannot break the export.
+
+    Opening the real file "w" truncates it before `json.dump` has written a byte, so a dump
+    that fails part way -- a disk that fills at the end of an export is the realistic one --
+    left the checkpoint with an empty or half-written config.json while the handler reported
+    "unknown" and the save carried on.
+    """
+    import unsloth_zoo.saving_utils as saving_utils
+
+    _write_config(tmp_path)
+    _write_checkpoint(tmp_path, BODY_NAMES)
+    config_path = tmp_path / "config.json"
+    before = config_path.read_bytes()
+
+    def _fails(obj, handle, **kwargs):
+        handle.write('{"partial": ')
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(saving_utils.json, "dump", _fails)
+    assert reconcile_mtp_config(tmp_path) == "unknown"
+    assert config_path.read_bytes() == before
+    assert MTP_CONFIG_KEY in json.dumps(_saved(tmp_path))
+    # And nothing is left behind in the checkpoint folder.
+    assert [p.name for p in tmp_path.glob("config.json.*")] == []
+
+
+def test_the_repaired_config_keeps_the_mode_it_had(tmp_path):
+    """Staged through a temporary file, which is created 0600. A repaired export must not
+    become unreadable to everyone but the user who ran it."""
+    if os.name == "nt":
+        pytest.skip("POSIX file modes are not what Windows enforces")
+    _write_config(tmp_path)
+    _write_checkpoint(tmp_path, BODY_NAMES)
+    config_path = tmp_path / "config.json"
+    config_path.chmod(0o644)
+    assert reconcile_mtp_config(tmp_path) == "stripped"
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o644
