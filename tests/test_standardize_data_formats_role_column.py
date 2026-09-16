@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""standardize_data_formats must pick the role column by alias membership, not by a
-unique-value cardinality tie, and must match aliases without regard to case or
-surrounding whitespace (unsloth#1766)."""
+"""Pick the role column by alias membership, not a cardinality tie, and match aliases
+regardless of case or whitespace (unsloth#1766)."""
 
 import pytest
 from datasets import Dataset
@@ -25,7 +24,6 @@ from unsloth_zoo.dataset_utils import standardize_data_formats
 
 
 CASES = {
-    # Both columns have two unique values, so the cardinality heuristic ties.
     "two_row_tie": [
         {"conversations": [{"from": "human", "value": "Braund, Mr. Owen Harris"},
                            {"from": "gpt", "value": "0"}]},
@@ -45,7 +43,6 @@ CASES = {
     "single_turn": [
         {"conversations": [{"from": "human", "value": "hi"}]},
     ],
-    # Capitalised role names are common in hand-built ShareGPT exports.
     "mixed_case_tie": [
         {"conversations": [{"from": "Human", "value": "hi"}, {"from": "GPT", "value": "yo"}]},
     ],
@@ -53,7 +50,6 @@ CASES = {
         {"conversations": [{"role": "User", "content": "hi"},
                            {"role": "Assistant", "content": "yo"}]},
     ],
-    # Trailing and leading whitespace around the role name.
     "padded_role_tie": [
         {"conversations": [{"from": "user ", "value": "hi"}, {"from": " assistant", "value": "yo"}]},
     ],
@@ -83,8 +79,7 @@ def test_many_row_dataset_still_resolves():
 
 
 def test_mixed_case_roles_resolve_on_a_large_dataset():
-    """No cardinality tie here; what used to fail is the alias check, which compared
-    "Human" against the lowercase alias list and raised TypeError."""
+    """No tie here: the alias check itself compared "Human" against a lowercase list."""
     rows = [
         {"conversations": [{"from": "Human", "value": f"q{i}"}, {"from": "GPT", "value": f"a{i}"}]}
         for i in range(20)
@@ -122,13 +117,10 @@ def test_a_non_sharegpt_dataset_is_returned_untouched():
     assert standardize_data_formats(dataset) is dataset
 
 
-# --- the map that carries this decision into worker processes ---------------
-
 @pytest.mark.parametrize("start_method", ["fork", "spawn"])
 def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
-    """`_standardize_dataset` is handed to `Dataset.map(num_proc = ...)`, so what it closed
-    over has to reach the workers. Windows has no fork, so spawn is what runs there and it is
-    where a closure over a module-level helper can fail to arrive."""
+    """What `_standardize_dataset` closed over has to reach the workers. Windows has no
+    fork, so spawn is what runs there, and spawn is where a closure can fail to arrive."""
     multiprocess = pytest.importorskip("multiprocess")
 
     previous = multiprocess.get_start_method(allow_none = True)
@@ -145,10 +137,9 @@ def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
         assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
         assert out[0]["conversations"][0]["content"] == "Braund, Mr. Owen Harris"
     finally:
-        # `previous is None` is the normal state of a fresh test process, and leaving the
+        # `previous is None` is the normal state of a fresh process, and leaving the
         # parametrised method pinned makes every later test order-dependent.
-        # `set_start_method(None, force = True)` is multiprocess's own reset: it clears
-        # `_actual_context` rather than choosing a method.
+        # `set_start_method(None, force = True)` clears `_actual_context`, it does not pick.
         multiprocess.set_start_method(previous, force = True)
 
 
@@ -161,8 +152,6 @@ def test_an_explicit_num_proc_still_resolves_the_columns():
 
 
 def test_a_non_ascii_role_is_reported_not_crashed():
-    """Normalising means calling `.strip().lower()` on whatever the column holds.
-    An unknown role in another script must still come out as the aliases message."""
     rows = [{"conversations": [{"from": "uzytkownik", "value": "czesc"},
                                {"from": "asystent", "value": "hej"}]}]
     with pytest.raises(TypeError, match = "aliases"):
@@ -177,8 +166,7 @@ def test_a_role_padded_with_a_non_breaking_space_resolves():
 
 
 def test_many_spellings_of_one_role_all_resolve():
-    """The map memoises each raw spelling it sees, and the memo is capped, so a dataset with
-    more distinct spellings than the cap must still resolve every one of them."""
+    """More distinct spellings than the memo cap must still all resolve."""
     spellings = ["human", "Human", "HUMAN", " human", "human ", "  HuMaN  "]
     spellings += [" " * n + "human" for n in range(2, 90)]
     rows = [
@@ -192,19 +180,17 @@ def test_many_spellings_of_one_role_all_resolve():
 
 
 def test_the_memo_never_changes_the_resolved_role():
-    """Every spelling must map to what normalising it alone would have produced, whatever
-    order the rows arrive in, and whichever batch boundary falls between them."""
+    """The memo may not depend on row order or on where a batch boundary falls."""
     pairs = [("human", "user"), ("GPT", "assistant"), ("System", "system"),
              (" input ", "user"), ("OUTPUT", "assistant"), ("human", "user")]
     rows = [{"conversations": [{"from": role, "value": "x"}]} for role, _ in pairs]
-    # A system turn on its own makes the role column the only all-alias column either way.
     out = standardize_data_formats(Dataset.from_list(rows), batch_size = 2)
     assert [row["conversations"][0]["role"] for row in out] == [want for _, want in pairs]
 
 
 def test_an_unknown_role_beyond_the_sampled_rows_still_raises():
-    """Only the first ten rows decide the column, so a role that appears later and is not
-    an alias has always blown up inside the map. The fast path must not silently accept it."""
+    """Only the first ten rows decide the column, so a later non-alias role has always
+    blown up inside the map. The memo fast path must not swallow it."""
     rows = [{"conversations": [{"from": "human", "value": "hi"},
                                {"from": "gpt", "value": "yo"}]} for _ in range(12)]
     rows.append({"conversations": [{"from": "moderator", "value": "stop"}]})
@@ -213,10 +199,8 @@ def test_an_unknown_role_beyond_the_sampled_rows_still_raises():
 
 
 def test_aliases_that_normalize_into_each_other_are_refused():
-    """Normalization can collapse two aliases the caller meant to keep apart: "Human" for
-    user and "human" for assistant were distinct keys and both worked, and afterwards the
-    later assignment wins and every such message is silently relabelled. Mislabelled training
-    data is worse than a refusal, so this raises with the pair named."""
+    """"Human" for user and "human" for assistant were distinct keys and both worked; after
+    normalization the later assignment would silently relabel every such message."""
     rows = [
         {"conversations": [{"from": "Human", "value": "hi"},
                            {"from": "gpt", "value": "yo"}]},
@@ -230,8 +214,6 @@ def test_aliases_that_normalize_into_each_other_are_refused():
 
 
 def test_a_repeated_alias_within_one_role_is_fine():
-    """Only a collision ACROSS roles is ambiguous; listing a spelling twice for the same
-    role says nothing contradictory."""
     rows = [
         {"conversations": [{"from": "Human", "value": "hi"},
                            {"from": "gpt", "value": "yo"}]},
@@ -261,10 +243,9 @@ def test_the_default_alias_lists_are_disjoint():
 
 
 def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
-    """The regression the fixture above exists to avoid: a fresh test process has no start
-    method pinned, so restoring only a non-None `previous` leaves the parametrised method
-    globally selected, and `test_start_method_probe_matches_the_pool_multiprocess_would_build`
-    skips as soon as it sees one, silently switching a real assertion off."""
+    """Restoring only a non-None `previous` leaves the parametrised method globally pinned,
+    and `test_start_method_probe_matches_the_pool_multiprocess_would_build` then skips,
+    switching a real assertion off."""
     multiprocess = pytest.importorskip("multiprocess")
 
     before = multiprocess.get_start_method(allow_none = True)
@@ -279,11 +260,9 @@ def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
         multiprocess.set_start_method(before, force = True)
 
 
-# --- both columns alias-only, which no value can disambiguate --------------
-
 _BOTH_ALIAS_CASES = {
-    # A one-turn record whose CONTENT is a role word: both columns are alias-only with one
-    # unique value, so the cardinality heuristic used to take the second key and swap them.
+    # CONTENT is a role word, so both columns are alias-only with one unique value and the
+    # cardinality heuristic used to take the second key and swap them.
     "role_content_one_turn": (
         [{"conversations": [{"role": "user", "content": "assistant"}]}],
         [("user", "assistant")],
@@ -313,8 +292,7 @@ def test_the_conventional_key_name_breaks_a_two_alias_tie(name):
 
 
 def test_an_unconventional_key_pair_still_uses_the_value_evidence():
-    """NEGATIVE CONTROL: the key names only break a tie the values cannot. A pair of names
-    neither convention uses must still be resolved by which column holds the aliases."""
+    """NEGATIVE CONTROL: the key names may only break a tie the values cannot."""
     rows = [
         {"conversations": [{"speaker": "human", "utterance": "hello there"},
                            {"speaker": "gpt", "utterance": "hi"}]},
@@ -325,8 +303,7 @@ def test_an_unconventional_key_pair_still_uses_the_value_evidence():
 
 
 def test_an_ordinary_dataset_is_unaffected_by_the_tie_break():
-    """The control that matters most: a normal dataset never reaches the new branch,
-    because its content column is not alias-only."""
+    """A normal dataset never reaches the new branch: its content is not alias-only."""
     rows = [
         {"conversations": [{"content": "what is 2 + 2", "role": "user"},
                            {"content": "4", "role": "assistant"}]},

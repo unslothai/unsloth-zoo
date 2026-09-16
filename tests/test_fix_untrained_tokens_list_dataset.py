@@ -1,18 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_untrained_tokens must accept any indexable train_dataset, not only a
-datasets.Dataset (unsloth#2953).
+"""fix_untrained_tokens must accept any indexable train_dataset (unsloth#2953).
 
-Every other train_dataset use in that function needs only len() and [j], so a plain list of
-rows reached the one line that required .map and died with AttributeError. TRL 1.x rejects a
-list before the trainer is built, but TRL 0.22.x does not, so this guard is the only
-protection on the older line.
-
-The second half pins the decorator: `fix_untrained_tokens` writes rows back with an in-place
-write to a leaf weight that requires grad, which torch refuses outside inference mode, so the
-new helper has to be defined ABOVE the `@_maybe_inference_mode` line, not between the
-decorator and the function.
+Everything else there needs only len() and [j], so a plain list reached the one line that
+required .map. TRL 1.x rejects a list before the trainer is built, TRL 0.22.x does not.
+The second half pins the decorator: the write-back is in place on a leaf that requires grad,
+so the helper must be defined ABOVE the `@_maybe_inference_mode` line, not between it and
+the function.
 """
 
 import itertools
@@ -53,7 +48,6 @@ def test_count_input_ids_skips_rows_without_input_ids():
 
 
 def test_count_input_ids_still_uses_map_when_it_exists():
-    """The datasets path must not regress: batched .map with the progress desc."""
     seen = {}
 
     class _FakeDataset(list):
@@ -109,8 +103,8 @@ class _Model:
 
 
 def _untrained_model():
-    """Rows 4 and 5 are all zero, so both untrained indicators fire on them, and the
-    weight is a trainable leaf, so the write-back needs inference mode."""
+    """Rows 4 and 5 are all zero, so both untrained indicators fire; the weight is a
+    trainable leaf, so the write-back needs inference mode."""
     embedding = torch.nn.Embedding(8, 4)
     with torch.no_grad():
         embedding.weight.fill_(1.0)
@@ -153,8 +147,7 @@ def test_fix_untrained_tokens_runs_under_inference_mode():
         tokenizer_utils._count_input_ids = original
 
     assert seen == [True], "fix_untrained_tokens body did not run under inference mode"
-    # The whole point of the inference mode: the untrained rows are written back in
-    # place on a leaf that requires grad, which torch rejects otherwise.
+    # The in-place write on a leaf that requires grad is what inference mode is for.
     assert not torch.equal(model.get_input_embeddings().weight[4], torch.zeros(4))
 
 
@@ -183,8 +176,6 @@ def test_the_undecorated_function_cannot_write_the_rows_back():
 
 
 def test_count_input_ids_accepts_rows_whose_ids_are_arrays():
-    """A row read back from a collator or a torch dataset holds a tensor or an ndarray, not
-    a list; the counting path only chains and counts, so both work."""
     final_counts, mapping = _counter()
 
     tokenizer_utils._count_input_ids(
@@ -209,10 +200,8 @@ def test_count_input_ids_on_an_empty_list_never_calls_the_mapping():
 
 
 def test_the_plain_list_fallback_counts_in_bounded_batches():
-    """`mapping` flattens whatever batch it is handed into one array of every token in it, so
-    one call with the whole dataset is an O(total tokens) transient where `.map` is bounded.
-    Chunking is safe because `mapping` accumulates rather than returning, which
-    `.map(batched=True)` already requires."""
+    """One call with the whole dataset is an O(total tokens) transient where `.map` is
+    bounded. Chunking is safe because `mapping` accumulates rather than returning."""
     final_counts, mapping = _counter()
     sizes = []
 
@@ -229,7 +218,6 @@ def test_the_plain_list_fallback_counts_in_bounded_batches():
 
 
 def test_the_batched_fallback_agrees_with_one_big_call():
-    """The equivalence, asserted rather than argued."""
     batched_counts, batched = _counter()
     rows = [{"input_ids" : [i % 8]} for i in range(3333)]
     tokenizer_utils._count_input_ids(rows, batched)
@@ -241,7 +229,6 @@ def test_the_batched_fallback_agrees_with_one_big_call():
 
 
 def test_a_short_list_is_still_one_call():
-    """Nothing changes for the ordinary small dataset."""
     _final_counts, mapping = _counter()
     calls = []
 
