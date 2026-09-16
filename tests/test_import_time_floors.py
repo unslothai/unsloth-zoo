@@ -212,6 +212,11 @@ def test_the_gate_reaches_has_cut_cross_entropy(monkeypatch, version, expected):
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
+    # device_count too, since the gate enumerates the visible devices rather than reading
+    # the current one. On a CPU-only runner it answers 0, the enumeration finds nothing to
+    # be affected by, and the version=3.3.1 case would enable CCE and pass for the wrong
+    # reason -- while claiming to have tested the wiring.
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(triton, "__version__", version)
 
     module = importlib.import_module("unsloth_zoo.loss_utils")
