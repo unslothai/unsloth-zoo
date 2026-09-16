@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import torch
 import torch.nn.functional as F
+import contextlib
 import os
 import shutil
 import sys
@@ -1603,6 +1604,60 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
     )
 
 
+@contextlib.contextmanager
+def _preserved_rng_for_probe(x):
+    """Run the probe forward without advancing any generator the real forward will read.
+
+    `no_grad` only turns off the graph; every random draw inside the throwaway forward
+    still advances the generator, so a family with dropout in the experts path would get
+    different numbers out of the call that counts than it got before this probe existed.
+    Gradient checkpointing makes that a wrong-gradient bug rather than a reproducibility
+    one: non-reentrant checkpointing restores the RNG state at the start of the region and
+    replays it, so the original pass (probe plus real forward) and the recompute (verdict
+    cached, real forward only) would draw different masks for the same region.
+
+    Three things this is careful about, all of them ways a preservation attempt could be
+    worse than none:
+
+    * The BACKEND is named, not inferred. `fork_rng`'s `devices` identifies devices within
+      `device_type`, which it resolves from `torch.accelerator.current_accelerator()` and
+      falls back to "cuda" for, so handing it an XPU device without saying so can ask the
+      wrong module for a generator state.
+    * A failure here must not become the probe's answer. The caller turns any exception
+      into `None`, which caches no verdict and leaves the stash path selected, so a
+      `fork_rng` that raised would silently keep the LoRA unapplied on a family that
+      ignores the stash. Anything that goes wrong setting the fork up leaves the forward
+      to run unforked instead.
+    * Under `torch.compile(fullgraph = True)` a generator-based context manager is a graph
+      break, which is a hard error rather than a slow path. The probe runs at most once per
+      module and parameter, so being inert while tracing costs nothing that matters.
+    """
+    if torch.compiler.is_compiling():
+        yield
+        return
+    device = x.device if isinstance(x, torch.Tensor) else None
+    fork = None
+    try:
+        if device is None or device.type in ("cpu", "meta"):
+            # The CPU generator is forked whatever `devices` says; an empty list is what
+            # keeps `fork_rng` from initialising every visible accelerator, which it does
+            # when `devices` is None, and warns about.
+            fork = torch.random.fork_rng(devices = [], device_type = "cpu")
+        else:
+            fork = torch.random.fork_rng(devices = [device], device_type = device.type)
+        fork.__enter__()
+    except Exception:
+        fork = None
+    try:
+        yield
+    finally:
+        if fork is not None:
+            try:
+                fork.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
 def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
     """Run one throwaway experts forward under `no_grad` and report whether it read the stash.
 
@@ -1638,22 +1693,7 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
         setattr(experts_module, lora_attr, lora_data)
     _reset_moe_lora_stash_read(experts_module, parameter_name)
     try:
-        # RNG forked, not just `no_grad`. `no_grad` only turns off the graph; every
-        # random draw inside the throwaway forward still advances the generator, so a
-        # family with dropout in the experts path would get different numbers out of the
-        # call that counts than it got before this probe existed. Gradient checkpointing
-        # makes that a wrong-gradient bug rather than a reproducibility one: non-reentrant
-        # checkpointing restores the RNG state at the start of the region and replays it,
-        # so the original pass (probe plus real forward) and the recompute (verdict cached,
-        # real forward only) would draw different masks for the same region. Forked on the
-        # activation's device only, because `fork_rng` with no `devices` initialises every
-        # visible GPU and warns.
-        probe_devices = (
-            [x.device]
-            if isinstance(x, torch.Tensor) and x.device.type not in ("cpu", "meta")
-            else []
-        )
-        with torch.random.fork_rng(devices = probe_devices, enabled = True):
+        with _preserved_rng_for_probe(x):
             with torch.no_grad():
                 wrapper.base_layer(x, *args, **kwargs)
     except Exception:

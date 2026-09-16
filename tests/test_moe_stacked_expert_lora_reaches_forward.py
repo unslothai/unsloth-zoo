@@ -29,6 +29,7 @@ and a forward that ignores the stash gets handed back to PEFT so the LoRA is app
 
 from __future__ import annotations
 
+import contextlib
 import textwrap
 import re
 import sys
@@ -694,3 +695,69 @@ def test_the_probe_still_reports_a_raising_forward_as_no_evidence(monkeypatch):
             raise RuntimeError("no")
 
     assert _run_probe(monkeypatch, _Raises()) is None
+
+
+def test_the_probe_names_the_backend_rather_than_letting_fork_rng_guess(monkeypatch):
+    """`fork_rng`'s `devices` identifies devices WITHIN `device_type`, which it otherwise
+    resolves from `torch.accelerator.current_accelerator()` and falls back to "cuda" for.
+    An XPU activation forked without naming the backend asks the wrong module for a
+    generator state."""
+    seen = {}
+
+    def _record(devices = None, enabled = True, device_type = None, **kwargs):
+        seen["devices"] = devices
+        seen["device_type"] = device_type
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(torch.random, "fork_rng", _record)
+
+    class _OnXPU(nn.Module):
+        def forward(self, x, *args, **kwargs):
+            return x
+
+    activation = torch.ones(2, 2)
+    device = torch.device("xpu", 3)
+    monkeypatch.setattr(type(activation), "device", property(lambda self: device), raising = False)
+
+    with MU._preserved_rng_for_probe(activation):
+        pass
+
+    assert seen["device_type"] == "xpu"
+    assert seen["devices"] == [device]
+
+
+def test_a_fork_that_cannot_be_set_up_leaves_the_forward_running(monkeypatch):
+    """The caller turns any exception into None, which caches no verdict and keeps the
+    stash path, so a raising fork_rng would silently leave the LoRA unapplied on a family
+    that ignores the stash. Failing to preserve is better than failing to probe."""
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("no generator for this device")
+
+    monkeypatch.setattr(torch.random, "fork_rng", _explode)
+
+    experts = _RNGConsumingExperts()
+    assert _run_probe(monkeypatch, experts) is True
+    assert experts.calls == 1, "the probe forward did not run"
+
+
+def test_the_probe_does_not_fork_while_dynamo_is_tracing(monkeypatch):
+    """A generator-based context manager is a graph break, and under
+    torch.compile(fullgraph=True) a graph break is a hard error rather than a slow path."""
+    called = {"n": 0}
+
+    def _count(*args, **kwargs):
+        called["n"] += 1
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(torch.random, "fork_rng", _count)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    with MU._preserved_rng_for_probe(torch.ones(2, 2)):
+        pass
+    assert called["n"] == 0
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    with MU._preserved_rng_for_probe(torch.ones(2, 2)):
+        pass
+    assert called["n"] == 1, "the eager path must still preserve the RNG"
