@@ -569,22 +569,55 @@ def _bound_class_repeats(source, span = MAX_CLASS_SPAN):
     return "".join(out)
 
 
+# Only the string anchors. A word boundary is decided by the characters either
+# side of it, not by where the subject begins, and the spans below are cut at
+# newlines, which are non-word characters on both readings. Treating \b as an
+# anchor here excluded `\.service\b.*\[Service\]`, which is the one alternative
+# that actually needed splitting.
+_ANCHOR_TOKENS = ("^", "$", "\\A", "\\Z")
+
+
+def _has_anchor(alternative):
+    """Whether an alternative's meaning depends on where the subject starts or ends.
+
+    Per-line evaluation reinterprets those, so an anchored alternative keeps the
+    whole-text path even though it is the slower one.
+    """
+    text = alternative.decode("latin-1") if isinstance(alternative, bytes) else alternative
+    return any(token in text for token in _ANCHOR_TOKENS)
+
+
 def _build_evaluator(pattern):
-    """Compile `pattern` into alternatives of ordered, individually bounded segments."""
+    """Compile `pattern` into alternatives of ordered, individually bounded segments.
+
+    Returns `(alternatives, per_line)`. `per_line` says the caller must apply the
+    segments to one line at a time: a non-DOTALL `.*` cannot cross a newline, so
+    that is what the pattern already meant, and it is the only thing that bounds
+    the span when the file is one enormous line. Bounding by "a line" was the
+    original reasoning here and it is only true when lines are short; a crafted
+    352 KB single line took over five seconds through RE_PERSISTENCE.
+    """
+    dotall = bool(pattern.flags & re.DOTALL)
     alternatives = []
+    per_line = False
     for alternative in _split_top_level_alternatives(pattern.pattern):
         segments = None
-        if pattern.flags & re.DOTALL and ".*" in alternative:
-            # Without DOTALL a `.*` cannot cross a newline, so the span it can
-            # backtrack over is one line and the cost is already bounded.
-            segments = _split_on_dot_star(alternative)
+        if ".*" in (
+            alternative.decode("latin-1") if isinstance(alternative, bytes) else alternative
+        ):
+            if dotall:
+                segments = _split_on_dot_star(alternative)
+            elif not _has_anchor(alternative):
+                segments = _split_on_dot_star(alternative)
+                if segments is not None and len(segments) > 1:
+                    per_line = True
         if segments is None:
             segments = [alternative]
         segments = [_make_tail_lazy(s) for s in segments[:-1]] + segments[-1:]
         alternatives.append(
             [re.compile(_bound_class_repeats(s), pattern.flags) for s in segments]
         )
-    return alternatives
+    return alternatives, per_line
 
 
 _EVALUATORS = {}
@@ -595,21 +628,42 @@ def _evaluator(pattern):
         try:
             _EVALUATORS[pattern] = _build_evaluator(pattern)
         except Exception:
-            _EVALUATORS[pattern] = [[pattern]]
+            _EVALUATORS[pattern] = ([[pattern]], False)
     return _EVALUATORS[pattern]
+
+
+def _segments_match(segments, text, start = 0, end = None):
+    position = start
+    limit = len(text) if end is None else end
+    for segment in segments:
+        found = segment.search(text, position, limit)
+        if found is None:
+            return False
+        position = found.end()
+    return True
 
 
 def _matches(pattern, text):
     """`bool(pattern.search(text))`, without the backtracking blowup."""
-    for segments in _evaluator(pattern):
-        position = 0
-        for segment in segments:
-            found = segment.search(text, position)
-            if found is None:
-                break
-            position = found.end()
-        else:
-            return True
+    alternatives, per_line = _evaluator(pattern)
+    if not per_line:
+        for segments in alternatives:
+            if _segments_match(segments, text):
+                return True
+        return False
+    # Walk line spans in place rather than materialising them: the whole match
+    # has to sit inside one line for a non-DOTALL pattern anyway.
+    newline = b"\n" if isinstance(text, (bytes, bytearray)) else "\n"
+    start = 0
+    length = len(text)
+    while start <= length:
+        stop = text.find(newline, start)
+        if stop == -1:
+            stop = length
+        for segments in alternatives:
+            if _segments_match(segments, text, start, stop):
+                return True
+        start = stop + 1
     return False
 
 
@@ -644,7 +698,7 @@ def _extract_evidence(content, pattern, max_matches = 3):
     matches = _matching_lines(lines, pattern, max_matches)
     if matches:
         return " | ".join(matches)
-    for segments in _evaluator(pattern):
+    for segments in _evaluator(pattern)[0]:
         if len(segments) < 2:
             continue
         parts, located = [], 0
@@ -858,6 +912,19 @@ def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
         _add(HIGH, "Interacts with container/orchestration runtime", RE_CONTAINER_ABUSE)
     if has_openssl_cli and not (has_network or has_keys):
         _add(HIGH, "Invokes openssl CLI (uncommon in a model converter)", RE_OPENSSL_CLI)
+
+    # --- Converter-specific: any process execution at all -------------------
+    # check_py_file only reports subprocess use in combination with base64 or
+    # anti-analysis markers, which is right for a general package and wrong here.
+    # A converter reads tensors and writes a GGUF; it spawns nothing. So
+    # os.system("curl ... | sh") on its own produced no finding, and neither did
+    # subprocess.run(["rm", "-rf", path]), because a shell-level curl does not
+    # match RE_NETWORK either. Verified against the current entrypoint and the
+    # b4000 monolith: neither matches RE_SUBPROCESS, so this cannot fire on a
+    # genuine converter.
+    if has_subprocess and not has_base64 and not has_anti:
+        _add(HIGH, "Spawns a process (a converter reads tensors and writes a GGUF)",
+             RE_SUBPROCESS)
 
     # --- Converter-specific: the in-process eval sink -----------------------
     findings.extend(_argparse_default_findings(raw))
