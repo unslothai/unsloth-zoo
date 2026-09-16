@@ -1638,8 +1638,24 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
         setattr(experts_module, lora_attr, lora_data)
     _reset_moe_lora_stash_read(experts_module, parameter_name)
     try:
-        with torch.no_grad():
-            wrapper.base_layer(x, *args, **kwargs)
+        # RNG forked, not just `no_grad`. `no_grad` only turns off the graph; every
+        # random draw inside the throwaway forward still advances the generator, so a
+        # family with dropout in the experts path would get different numbers out of the
+        # call that counts than it got before this probe existed. Gradient checkpointing
+        # makes that a wrong-gradient bug rather than a reproducibility one: non-reentrant
+        # checkpointing restores the RNG state at the start of the region and replays it,
+        # so the original pass (probe plus real forward) and the recompute (verdict cached,
+        # real forward only) would draw different masks for the same region. Forked on the
+        # activation's device only, because `fork_rng` with no `devices` initialises every
+        # visible GPU and warns.
+        probe_devices = (
+            [x.device]
+            if isinstance(x, torch.Tensor) and x.device.type not in ("cpu", "meta")
+            else []
+        )
+        with torch.random.fork_rng(devices = probe_devices, enabled = True):
+            with torch.no_grad():
+                wrapper.base_layer(x, *args, **kwargs)
     except Exception:
         # Not evidence either way, and not ours to report. Do not cache a verdict.
         return None

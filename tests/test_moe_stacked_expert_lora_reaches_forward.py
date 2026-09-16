@@ -624,3 +624,73 @@ def test_the_probe_result_never_reaches_the_peft_fallback():
             f"the patched forward still holds graph-carrying tensors while PEFT's forward "
             f"runs, so both forwards' activations are resident at once: {names}"
         )
+
+
+# --------------------------------------------------------- the probe is RNG-invisible
+
+
+class _RNGConsumingExperts(nn.Module):
+    """An experts forward with dropout in it, which is all the probe needs to disturb."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, x, *args, **kwargs):
+        self.calls += 1
+        return F.dropout(x, p = 0.5, training = True)
+
+
+class _ProbeWrapper(nn.Module):
+    def __init__(self, base_layer):
+        super().__init__()
+        self.base_layer = base_layer
+
+
+def _run_probe(monkeypatch, experts):
+    """Drive `_measure_moe_lora_stash_read` with the surrounding machinery stubbed out,
+    so what the test observes is the probe forward and nothing else."""
+    monkeypatch.setattr(MU, "_extract_lora_from_wrapper", lambda wrapper: None)
+    monkeypatch.setattr(MU, "_reset_moe_lora_stash_read", lambda module, name: None)
+    monkeypatch.setattr(MU, "_moe_lora_stash_was_read", lambda module, name: True)
+    monkeypatch.setattr(MU, "_record_moe_lora_forward_verdict", lambda module, name, read: None)
+    return MU._measure_moe_lora_stash_read(
+        _ProbeWrapper(experts), experts, "gate_up_proj", torch.ones(4, 8), (), {}
+    )
+
+
+def test_the_probe_forward_leaves_the_rng_where_it_found_it(monkeypatch):
+    """`no_grad` turns off the graph, it does not preserve RNG.
+
+    Every random draw in the throwaway forward advances the generator, so without a fork
+    the call that counts gets different numbers than it would have without the probe. The
+    sharp edge is gradient checkpointing: non-reentrant checkpointing restores the RNG
+    state at the start of the region and replays it, and the original pass runs probe plus
+    real forward while the recompute has the verdict cached and runs the real forward
+    alone, so the two draw different dropout masks for the same region and the gradients
+    are computed against a mask the forward never used.
+    """
+    experts = _RNGConsumingExperts()
+
+    torch.manual_seed(1234)
+    expected = torch.rand(6)
+
+    torch.manual_seed(1234)
+    assert _run_probe(monkeypatch, experts) is True
+    assert experts.calls == 1, "the probe did not run the forward it is supposed to measure"
+    after_probe = torch.rand(6)
+
+    assert torch.equal(after_probe, expected), (
+        "the probe forward consumed random numbers the real forward was going to use"
+    )
+
+
+def test_the_probe_still_reports_a_raising_forward_as_no_evidence(monkeypatch):
+    """NEGATIVE CONTROL: the fork must not swallow the failure path. A probe that raises
+    still returns None, which caches nothing and leaves the call on the stash path."""
+
+    class _Raises(nn.Module):
+        def forward(self, x, *args, **kwargs):
+            raise RuntimeError("no")
+
+    assert _run_probe(monkeypatch, _Raises()) is None
