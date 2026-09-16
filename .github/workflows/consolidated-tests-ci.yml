@@ -328,6 +328,14 @@ jobs:
         # they fix, so left to --collect-only they would prove only that they
         # import, which is the failure every paragraph above already describes.
         #
+        # test_published_version_window.py is here for the same reason as everything
+        # else in this list. It is the assertion that the published window matches what
+        # the caps actually admit, and left to `pytest tests/ --collect-only` it proves
+        # only that it imports: a later cap regression, such as lowering the general
+        # transformers ceiling, keeps CI green even though this file's assertion fails.
+        # It is stdlib plus packaging and reads files only, so it costs no measurable
+        # time here.
+        #
         # The last two are here because `--collect-only` is exactly what missed
         # the bug they cover. `tests/` is not a package, so `from tests.x import
         # y` binds to whatever `tests` package is importable; unsloth's CI runs
@@ -387,6 +395,7 @@ jobs:
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
             tests/test_undefined_name_gate.py \
+            tests/test_published_version_window.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

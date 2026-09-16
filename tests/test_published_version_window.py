@@ -470,3 +470,31 @@ def test_the_checker_rejects_the_window_that_shipped_the_defect() -> None:
     assert "5.17.0" not in shipped
     assert Version("2.14.0") not in SpecifierSet(">=2.4.0,<2.13.0")
     assert Version("2.14.0") in SpecifierSet(f">=2.4.0,{TORCH_BOUND}")
+
+
+def test_this_file_runs_in_an_executing_ci_step():
+    """A gate nothing executes is not a gate.
+
+    Across `.github/workflows` this file used to be reached only by
+    `pytest tests/ --collect-only`, which proves it imports and nothing else. The
+    assertions above are what stop a cap regression -- the inline gate checks only
+    `general <= CEILING`, so lowering the ceiling passes it while failing here -- and
+    with no executing step that regression merges green.
+    """
+    import re
+    from pathlib import Path
+
+    workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    name = Path(__file__).name
+    executing = []
+    for workflow in sorted(workflows.glob("*.yml")):
+        text = workflow.read_text(encoding = "utf-8")
+        for run_block in re.findall(r"run:\s*\|(.*?)(?=\n\s{6}[-\w]|\Z)", text, re.S):
+            if "--collect-only" in run_block:
+                continue
+            if name in run_block and "pytest" in run_block:
+                executing.append(workflow.name)
+    assert executing, (
+        f"{name} is not named in any executing pytest step; it is collected but never "
+        f"run, so every assertion in it is inert in CI"
+    )
