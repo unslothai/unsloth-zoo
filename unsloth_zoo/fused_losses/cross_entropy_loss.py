@@ -161,7 +161,10 @@ def _free_target_gb():
     the same bug again, one module over.
     """
 
-    from ..tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
+    # Absolute, not `from ..tiled_mlp`: transformers' dynamic_module_utils builds the path by
+    # joining the raw regex capture onto this directory, so the relative spelling sends it looking
+    # for fused_losses/.tiled_mlp.py and every remote-code save walking this graph fails.
+    from unsloth_zoo.tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
 
     return min(_default_target_gb(), _CE_TARGET_GB_CAP)
 

@@ -2270,6 +2270,18 @@ def train_on_responses_only(
 pass
 
 
+def _normalize_role_alias(role):
+    """Module level, not a closure: `_standardize_dataset` is sent through
+    `dataset.map(num_proc = ...)` and has to pickle."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return role.strip().lower()
+pass
+
+
+# Only ever used to break a tie no value can break, so unconventional names are unaffected.
+_ROLE_KEY_NAMES = ("role", "from")
+
+
 def standardize_data_formats(
     dataset,
     tokenizer             = None,
@@ -2311,21 +2323,44 @@ def standardize_data_formats(
     assert(len(uniques.keys()) == 2)
 
     keys = list(uniques.keys())
-    length_first  = len(set(uniques[keys[0]]))
-    length_second = len(set(uniques[keys[1]]))
+    all_aliases = set(
+        _normalize_role_alias(alias)
+        for alias in (aliases_for_system + aliases_for_user + aliases_for_assistant)
+    )
 
-    if length_first < length_second:
-        # Role is assigned to the first element
-        role_key    = keys[0]
-        content_key = keys[1]
+    # The cardinality heuristic below ties on small datasets, picks the content column, and
+    # the alias check then rejects the user's own text.
+    alias_keys = [
+        key for key in keys
+        if set(_normalize_role_alias(value) for value in uniques[key]) <= all_aliases
+    ]
+
+    # Both columns alias-only is real: {"role": "user", "content": "assistant"} comes out
+    # swapped with no error anywhere. The key NAMES are the only tiebreak left.
+    named_role_keys = [key for key in keys if str(key).strip().lower() in _ROLE_KEY_NAMES]
+
+    if len(alias_keys) == 1:
+        role_key    = alias_keys[0]
+        content_key = keys[1] if keys[0] == role_key else keys[0]
+    elif len(alias_keys) == 2 and len(named_role_keys) == 1:
+        role_key    = named_role_keys[0]
+        content_key = keys[1] if keys[0] == role_key else keys[0]
     else:
-        role_key    = keys[1]
-        content_key = keys[0]
+        length_first  = len(set(uniques[keys[0]]))
+        length_second = len(set(uniques[keys[1]]))
+
+        if length_first < length_second:
+            # Role is assigned to the first element
+            role_key    = keys[0]
+            content_key = keys[1]
+        else:
+            role_key    = keys[1]
+            content_key = keys[0]
+        pass
     pass
 
     # Check roles are in aliases
-    all_aliases = set(aliases_for_system + aliases_for_user + aliases_for_assistant)
-    roles = set(uniques[role_key])
+    roles = set(_normalize_role_alias(value) for value in uniques[role_key])
     leftover_aliases = (all_aliases | roles) - all_aliases
     if len(leftover_aliases) != 0:
         raise TypeError(
@@ -2333,19 +2368,45 @@ def standardize_data_formats(
         )
     pass
 
-    # Mapping for aliases
+    # Normalization can collapse two aliases the caller meant to keep apart ("Human" for
+    # user, "human" for assistant), silently relabelling every such message. Refuse instead.
     aliases_mapping = {}
-    for x in aliases_for_system:    aliases_mapping[x] = "system"
-    for x in aliases_for_user:      aliases_mapping[x] = "user"
-    for x in aliases_for_assistant: aliases_mapping[x] = "assistant"
+    for group, role in (
+        (aliases_for_system, "system"),
+        (aliases_for_user, "user"),
+        (aliases_for_assistant, "assistant"),
+    ):
+        for x in group:
+            key = _normalize_role_alias(x)
+            previous = aliases_mapping.get(key)
+            if previous is not None and previous != role:
+                raise TypeError(
+                    f"Unsloth: the alias {x!r} normalizes to {key!r}, which is already "
+                    f"mapped to {previous!r}, so it cannot also mean {role!r}. Alias "
+                    f"lists are compared case insensitively and without surrounding "
+                    f"whitespace; give each role aliases that differ by more than that."
+                )
+            aliases_mapping[key] = role
+
+    # Normalise only on a miss and memoise the spelling this dataset uses, capped so a
+    # pathological dataset cannot grow the dict without limit.
+    _ALIAS_MEMO_LIMIT = 64
 
     def _standardize_dataset(examples):
         convos = examples["conversations"]
         all_convos = []
+        lookup = aliases_mapping.get
         for convo in convos:
             new_convo = []
             for message in convo:
-                role = aliases_mapping[message[role_key]]
+                raw_role = message[role_key]
+                role = lookup(raw_role)
+                if role is None:
+                    role = aliases_mapping[_normalize_role_alias(raw_role)]
+                    if len(aliases_mapping) < _ALIAS_MEMO_LIMIT:
+                        aliases_mapping[raw_role] = role
+                    pass
+                pass
                 text = message[content_key]
                 if is_vlm: text = [ {"type" : "text", "text" : text} ]
                 x = {"role" : role, "content" : text}
