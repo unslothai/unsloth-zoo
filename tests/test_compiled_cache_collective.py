@@ -681,17 +681,30 @@ def test_unknown_rank0_digest_forces_regeneration(
     assert digest == hashlib.sha256(source.encode()).hexdigest()
 
 
-def test_decision_skips_hashing_without_process_group(
+def test_decision_still_hashes_without_process_group(
     tmp_path, monkeypatch, compiler,
 ):
-    """A launched process without a group keeps the old independent behavior."""
+    """A process without a group takes the same decision, and still digests it.
+
+    The digest is not only cross-rank agreement: it is what
+    _verify_cache_digest_under_lock() checks the file against just before the
+    import, so a single process needs one too or the bytes on disk are executed
+    unverified. See tests/test_compiled_cache_fail_closed.py.
+    """
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: False)
     location = tmp_path / "mod.py"
+    generated = hashlib.sha256(b"src").hexdigest()
 
-    assert compiler._compiled_cache_decision(str(location), "src", False) == (True, None)
+    assert compiler._compiled_cache_decision(str(location), "src", False) == (
+        True, generated,
+    )
     location.write_bytes(b"cached")
-    assert compiler._compiled_cache_decision(str(location), "src", False) == (False, None)
-    assert compiler._compiled_cache_decision(str(location), "src", True) == (True, None)
+    assert compiler._compiled_cache_decision(str(location), "src", False) == (
+        False, hashlib.sha256(b"cached").hexdigest(),
+    )
+    assert compiler._compiled_cache_decision(str(location), "src", True) == (
+        True, generated,
+    )
 
 
 def test_collective_verification_skips_without_process_group(

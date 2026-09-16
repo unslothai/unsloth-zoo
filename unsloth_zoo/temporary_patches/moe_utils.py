@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import os
 import shutil
 import sys
+import tempfile
+import warnings
 import importlib
 import importlib.util
 from typing import Optional, Tuple
@@ -49,8 +51,69 @@ def _log_info(message: str):
         print(message)
 
 
+def _warn_without_raising(message):
+    """warnings.warn, except that it cannot be the thing that fails the import.
+
+    install_to_cache() runs at module import, and a consumer running under
+    warnings.simplefilter("error") turns a warning into a raise. The condition
+    being reported is one we already handle by not using the file, so it must
+    not take `import unsloth_zoo` down with it.
+    """
+    try:
+        warnings.warn(message)
+    except Exception:
+        print(message)
+
+
+def _read_file_bytes(path):
+    """The file's bytes, or None when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _replace_with_copy(current_file, destination):
+    """Copy over `destination` by replacing the path, not by writing into it.
+
+    Two reasons to prefer this over shutil.copy(). It opens the destination for
+    writing, so a destination left read-only refuses it even when the directory
+    is ours. It is also not atomic, and nothing locks this file: every rank of a
+    multi-GPU launch installs it at import, so a rank can otherwise read a copy
+    another rank is halfway through writing. os.replace() needs only the
+    directory and is atomic, so neither happens.
+    """
+    directory = os.path.dirname(destination) or "."
+    descriptor, temporary = tempfile.mkstemp(
+        prefix = f".{os.path.basename(destination)}.", suffix = ".tmp", dir = directory,
+    )
+    os.close(descriptor)
+    try:
+        shutil.copyfile(current_file, temporary)
+        # mkstemp is owner-only; keep the mode shutil.copy() would have left.
+        shutil.copymode(current_file, temporary)
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def install_to_cache(source_path, destination_filename=None):
-    """Copy a file into unsloth_compiled_cache so compiled modules can use it."""
+    """Copy a file into unsloth_compiled_cache so compiled modules can use it.
+
+    Returns whether the cache copy is known to match `source_path`.
+
+    This runs at import time, so a cache directory we cannot create or write is
+    not fatal: nothing is installed and the compiled modules fall back to the
+    definitions in this module. A destination that exists and does not match
+    what we meant to install is a different matter, because
+    _load_cached_moe_utils_module() imports and executes it, so report it
+    instead of silently accepting it.
+    """
     compile_location = _get_compile_location()
     if not os.path.exists(compile_location):
         try:
@@ -64,11 +127,38 @@ def install_to_cache(source_path, destination_filename=None):
 
     destination = os.path.abspath(os.path.join(compile_location, destination_filename))
 
-    if current_file != destination:
+    if current_file == destination:
+        return True
+
+    try:
+        _replace_with_copy(current_file, destination)
+    except Exception as replace_error:
+        # A directory we cannot add a temp file to can still hold a destination
+        # we can write through, so the plain copy is worth one attempt. It gives
+        # up the atomicity above, so the readback below is what keeps a partial
+        # copy from being used.
         try:
             shutil.copy(current_file, destination)
-        except Exception:
-            pass
+        except Exception as copy_error:
+            _log_info(
+                f"Unsloth: Could not install {destination}: "
+                f"{replace_error}; {copy_error}"
+            )
+
+    current = _read_file_bytes(current_file)
+    installed = _read_file_bytes(destination)
+    if installed is None or current is None:
+        # Nothing landed, or there is nothing to compare it against. Either way
+        # no compiled module gets to use it.
+        return False
+    if installed == current:
+        return True
+    _warn_without_raising(
+        f"Unsloth: {destination} does not match {current_file} and could not be "
+        "replaced, so it will not be used. Delete it to restore the compiled "
+        "cache copy."
+    )
+    return False
 
 
 install_to_cache(__file__, "moe_utils.py")
@@ -83,6 +173,14 @@ def _load_cached_moe_utils_module():
     cache_file = os.path.abspath(os.path.join(_get_compile_location(), "moe_utils.py"))
     current_file = os.path.abspath(__file__)
     if not os.path.isfile(cache_file) or cache_file == current_file:
+        return None
+
+    # The cache copy is only ever a copy of this file, so bytes that differ are
+    # bytes install_to_cache() did not put there, and exec_module() below runs
+    # whatever is in the file. Use this module's own definitions instead, which
+    # is what every caller falls back to anyway.
+    cached_bytes = _read_file_bytes(cache_file)
+    if cached_bytes is None or cached_bytes != _read_file_bytes(current_file):
         return None
 
     try:
