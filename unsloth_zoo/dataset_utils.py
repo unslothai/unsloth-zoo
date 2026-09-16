@@ -2279,6 +2279,12 @@ def _normalize_role_alias(role):
 pass
 
 
+# The two conventional spellings of the role column: ShareGPT writes `from`/`value`, ChatML
+# writes `role`/`content`. Used only to break a tie no value can break, never to decide a
+# case the values already answer, so an unconventional pair of names is unaffected.
+_ROLE_KEY_NAMES = ("role", "from")
+
+
 def standardize_data_formats(
     dataset,
     tokenizer             = None,
@@ -2334,8 +2340,19 @@ def standardize_data_formats(
         if set(_normalize_role_alias(value) for value in uniques[key]) <= all_aliases
     ]
 
+    # Both columns alias-only is a real shape, not a degenerate one: a one-turn record
+    # such as {"role": "user", "content": "assistant"} puts a role word in the content
+    # column, both sides have one unique value, and the cardinality heuristic below then
+    # takes keys[1] and emits {"role": "assistant", "content": "user"} with the two
+    # swapped and no error anywhere. The conventional key NAMES break that tie, and they
+    # are the same pair the format inference elsewhere keys on.
+    named_role_keys = [key for key in keys if str(key).strip().lower() in _ROLE_KEY_NAMES]
+
     if len(alias_keys) == 1:
         role_key    = alias_keys[0]
+        content_key = keys[1] if keys[0] == role_key else keys[0]
+    elif len(alias_keys) == 2 and len(named_role_keys) == 1:
+        role_key    = named_role_keys[0]
         content_key = keys[1] if keys[0] == role_key else keys[0]
     else:
         length_first  = len(set(uniques[keys[0]]))

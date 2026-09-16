@@ -289,3 +289,61 @@ def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
         )
     finally:
         multiprocess.set_start_method(before, force = True)
+
+
+# --- both columns alias-only, which no value can disambiguate --------------
+
+_BOTH_ALIAS_CASES = {
+    # A one-turn record whose CONTENT happens to be a role word. Both columns are
+    # alias-only and both have one unique value, so the cardinality heuristic has nothing
+    # to work with and used to take the second key, swapping roles and contents.
+    "role_content_one_turn": (
+        [{"conversations": [{"role": "user", "content": "assistant"}]}],
+        [("user", "assistant")],
+    ),
+    "from_value_one_turn": (
+        [{"conversations": [{"from": "human", "value": "gpt"}]}],
+        [("user", "gpt")],
+    ),
+    "role_content_two_turns": (
+        [{"conversations": [{"role": "user", "content": "assistant"},
+                            {"role": "assistant", "content": "user"}]}],
+        [("user", "assistant"), ("assistant", "user")],
+    ),
+    "mixed_case_both_sides": (
+        [{"conversations": [{"from": " Human ", "value": "GPT"}]}],
+        [("user", "GPT")],
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_BOTH_ALIAS_CASES))
+def test_the_conventional_key_name_breaks_a_two_alias_tie(name):
+    rows, expected = _BOTH_ALIAS_CASES[name]
+    out = standardize_data_formats(Dataset.from_list(rows * 2))
+    got = [(m["role"], m["content"]) for m in out[0]["conversations"]]
+    assert got == expected
+
+
+def test_an_unconventional_key_pair_still_uses_the_value_evidence():
+    """NEGATIVE CONTROL: the key names only break a tie the values cannot. A pair of names
+    neither convention uses must still be resolved by which column holds the aliases."""
+    rows = [
+        {"conversations": [{"speaker": "human", "utterance": "hello there"},
+                           {"speaker": "gpt", "utterance": "hi"}]},
+    ] * 4
+    out = standardize_data_formats(Dataset.from_list(rows))
+    assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
+    assert out[0]["conversations"][0]["content"] == "hello there"
+
+
+def test_an_ordinary_dataset_is_unaffected_by_the_tie_break():
+    """The control that matters most: a normal dataset never reaches the new branch,
+    because its content column is not alias-only."""
+    rows = [
+        {"conversations": [{"content": "what is 2 + 2", "role": "user"},
+                           {"content": "4", "role": "assistant"}]},
+    ] * 4
+    out = standardize_data_formats(Dataset.from_list(rows))
+    assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
+    assert out[0]["conversations"][0]["content"] == "what is 2 + 2"
