@@ -571,6 +571,7 @@ from .utils import (
     _create_vlm_batch_plan,
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
+    _compact_vlm_cce_batch,
     _preserved_preprocessing_rng,
     _mlx_rng_key,
     _restore_mlx_rng_key,
@@ -3911,10 +3912,15 @@ class MLXTrainer:
         Returns ``(all_losses, ntokens, stats)``; ``stats`` is None unless the
         loss function also reports per-batch metric sums.
         """
+        compaction = getattr(loss_fn, "_unsloth_cce_compaction", False)
         compact_batches = (
-            isinstance(eval_batches, (FiniteTextBatchPlan, FinitePreferenceBatchPlan))
-            and getattr(loss_fn, "_unsloth_cce_compaction", False)
+            compaction and not is_vlm
+            and isinstance(eval_batches, _FINITE_BATCH_PLAN_TYPES)
         )
+        # Evaluation runs eager, so compacted VLM shapes cost no compiled
+        # variants and the eager batch lists qualify as well as plans.
+        compact_vlm = compaction and is_vlm
+        small_capacity_limit = getattr(loss_fn, "_unsloth_cce_small_capacity_limit", 0)
         if compact_batches:
             if isinstance(eval_batches, FinitePreferenceBatchPlan):
                 eval_batches.configure_cce_compaction(kind=loss_fn._unsloth_cce_kind)
@@ -3953,6 +3959,10 @@ class MLXTrainer:
                 try:
                     if compact_batches:
                         batch_data = eval_batches.prepare_cce_batch(batch_index, batch_data)
+                    elif compact_vlm and isinstance(batch_data, dict):
+                        batch_data = _compact_vlm_cce_batch(
+                            batch_data, small_capacity_limit,
+                        ) or batch_data
                     if is_vlm:
                         scored = loss_fn(self.model, batch_data)
                     else:

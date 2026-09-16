@@ -1425,6 +1425,67 @@ def test_vlm_cce_small_capacity_admission_and_rebuilds():
 
 
 @metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    mx.random.seed(412)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    ids = mx.arange(2050).reshape(2, 1025)
+    batch = {"input_ids": ids, "labels": mx.where(ids % 17 == 5, ids, -100)}
+
+    def forward(m, b, **kwargs):
+        target = b["labels"][:, 1:]
+        return (m.model.embed_tokens(b["input_ids"])[:, :-1], target,
+                (target != -100).sum())
+
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", forward)
+    projected = []
+    original = mlx_utils._get_runtime_cce
+
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+
+        def record(hidden, *args):
+            projected.append(hidden.shape[0])
+            return runtime(hidden, *args)
+
+        return record
+
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    loss_fn = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_compaction
+    steps = []
+    trainer = SimpleNamespace(
+        model=model, stop_requested=False,
+        _distributed_eval_status=lambda failed=False: (False, failed),
+        _raise_distributed_failure_from_any=lambda failed, _context, error: None,
+        _fire_prediction_step=lambda: steps.append(1),
+    )
+
+    def dense_fn(model, batch):
+        return loss_fn(model, batch)
+
+    def totals(fn):
+        projected.clear()
+        # Trainer VLM evaluation batches are an eager list, not a plan.
+        result = MLXTrainer._evaluate_batch_totals(trainer, [batch, batch], fn, is_vlm=True)
+        mx.eval(result[:2])
+        return result, list(projected)
+
+    expected, dense_rows = totals(dense_fn)
+    actual, compact_rows = totals(loss_fn)
+    # The plan admits half the tokens, or 256 once a quantized head raises the
+    # small-capacity limit; either way evaluation must stop projecting all of them.
+    assert dense_rows == [2048] * 2
+    assert compact_rows == [256 if quantized else 1024] * 2
+    assert len(steps) == 4 and actual[1].item() == expected[1].item()
+    assert actual[0].item() == pytest.approx(expected[0].item(), rel=2e-5)
+
+
+@metal_only
 def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
     """Real-runtime contract for planned VLM training: with a qualified
     compile decision the trainer surveys, installs a width plan, and runs

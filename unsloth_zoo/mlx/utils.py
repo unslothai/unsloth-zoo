@@ -10476,6 +10476,29 @@ def _restore_vlm_row_image_handles(item, _depth=0):
     return item
 
 
+def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
+    """Attach fixed-capacity CCE indices for a VLM batch's supervised targets.
+
+    Returns None when the batch has no 2-D labels or its supervised targets
+    fill more than half of the target positions.
+    """
+    labels = batch.get("labels")
+    if labels is None or labels.ndim != 2:
+        return None
+    tokens = labels.shape[0] * (labels.shape[1] - 1)
+    capacity = tokens // 512 * 256
+    if capacity <= 0:
+        return None
+    selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
+    if len(selected) > capacity:
+        return None
+    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
+        capacity = 256
+    indices = np.full((capacity, 2), -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return {**batch, "_unsloth_cce_indices": mx.array(indices)}
+
+
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
@@ -10676,23 +10699,14 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         return report
 
     def prepare_cce_batch(self, index, batch):
-        labels = batch.get("labels")
-        if not self._cce_compaction or index in self._cce_dense_batches or labels is None or labels.ndim != 2:
+        if not self._cce_compaction or index in self._cce_dense_batches:
             return batch
-        tokens = labels.shape[0] * (labels.shape[1] - 1)
-        capacity = tokens // 512 * 256
-        if capacity <= 0:
-            return batch
-        selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
-        if len(selected) > capacity:
+        compacted = _compact_vlm_cce_batch(batch, self._cce_small_capacity_limit)
+        if compacted is None:
             # Keep dense slots off the fast path, including later stochastic rebuilds.
             self._cce_dense_batches.add(index)
             return batch
-        if 256 < capacity <= self._cce_small_capacity_limit and len(selected) <= 256:
-            capacity = 256
-        indices = np.full((capacity, 2), -1, dtype=np.int32)
-        indices[:len(selected)] = selected
-        return {**batch, "_unsloth_cce_indices": mx.array(indices)}
+        return compacted
 
     def materialize(self, index, target_width=None, *, phase=None):
         """Build one batch through the complete existing VLM builder.
