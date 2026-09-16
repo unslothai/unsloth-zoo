@@ -777,7 +777,7 @@ def test_a_process_we_cannot_read_stops_the_unowned_purge_on_a_shared_cache(
     monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
     # Shared: another user can write into this cache, so the process we could not read is a
     # possible writer here.
-    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None: False)
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None, **_kwargs: False)
     assert xf._partial_paths_with_a_live_writer() == set()
     assert xf._live_writer_walk_was_complete() is False
     assert xf._unowned_partials_safe_to_clear(
@@ -787,7 +787,7 @@ def test_a_process_we_cannot_read_stops_the_unowned_purge_on_a_shared_cache(
 
     # Private: nobody else can write here, so the processes we could not read cannot be
     # writing into THIS cache and the lower bound is exact for it.
-    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None: True)
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None, **_kwargs: True)
     assert xf._unowned_partials_safe_to_clear(
         "model", REPO, str(tmp_path), 180.0, None,
     ) == {stranger}
@@ -815,10 +815,83 @@ def test_the_private_cache_test_is_about_who_can_write_into_it(tmp_path):
         )
         os.chmod(cache, 0o750)
         assert xf._cache_is_private_to_this_user(str(cache)) is True
+        # Group-writable is shared only when somebody else is in the group. Under the
+        # user-private-group scheme (Fedora, RHEL, any host at umask 002) the group is this
+        # user alone, and declining there would turn the purge off on all of those hosts --
+        # so the expectation is read from the same rule rather than from this host's groups.
         os.chmod(cache, 0o770)
-        assert xf._cache_is_private_to_this_user(str(cache)) is False
+        assert xf._cache_is_private_to_this_user(str(cache)) is (
+            xf._group_is_private_to_this_user(os.getegid())
+        )
     # A cache that is not there at all cannot be established as private.
     assert xf._cache_is_private_to_this_user(str(tmp_path / "no-such-cache")) is False
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid"), reason = "POSIX permissions only")
+def test_a_shared_directory_under_a_private_root_is_still_shared(monkeypatch, tmp_path):
+    """The root says nothing about what is underneath it.
+
+    A 0700 root owned by this user with a group-writable repo directory inside it is a cache
+    another UID can put a partial in, and `blobs` is where the partials actually live. Read
+    off the root alone, an incomplete process walk was called trustworthy there, and an aged
+    partial that sibling was still writing could be unlinked mid-write.
+    """
+    monkeypatch.setattr(xf, "_group_is_private_to_this_user", lambda _gid: False)
+    cache = tmp_path / "cache"
+    _build_cache(cache, partial_age_s = 1800.0)
+    os.chmod(cache, 0o700)
+    repo = cache / REPO_DIR
+    blobs = repo / "blobs"
+    for directory in (repo, blobs):
+        os.chmod(directory, 0o755)
+    assert xf._cache_is_private_to_this_user(
+        str(cache), repo_type = "model", repo_id = REPO,
+    ) is True
+
+    os.chmod(repo, 0o775)
+    assert xf._cache_is_private_to_this_user(
+        str(cache), repo_type = "model", repo_id = REPO,
+    ) is False, "a group-writable repo directory under a private root read as private"
+
+    os.chmod(repo, 0o755)
+    os.chmod(blobs, 0o775)
+    assert xf._cache_is_private_to_this_user(
+        str(cache), repo_type = "model", repo_id = REPO,
+    ) is False, "a group-writable blobs directory is where the partials actually go"
+    os.chmod(blobs, 0o755)
+
+
+def test_a_repo_directory_that_cannot_be_read_is_unknown_not_empty(tmp_path):
+    """`Path.is_dir()` answers False for "not allowed to look" as well as for "not there".
+
+    A permission or FUSE flap on the repo directory therefore reported NO partials, which is
+    the empty answer that releases the guard -- and an unforced HTTP child then resumes the
+    sparse Xet partial onto a finalized blob. Only ENOENT and ENOTDIR are absence.
+
+    Python 3.13 began propagating that error from `is_dir()`, so on THIS interpreter the old
+    code already answered None. The scans are read by 3.9 through 3.12 as well, where it is
+    swallowed, which is why the helper is asserted directly below as well as through them.
+    """
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    repo = tmp_path / REPO_DIR
+    os.chmod(repo, 0o000)
+    try:
+        if os.access(repo, os.R_OK):
+            pytest.skip("this user can read a 0o000 directory (root), so the flap cannot be posed")
+        # The helper itself, on every supported version: absence is answered, and anything
+        # else is raised so the caller reports None rather than an empty set.
+        with pytest.raises(OSError):
+            xf._blobs_dir_is_absent(repo / "blobs")
+        assert xf._incomplete_partial_names("model", REPO, str(tmp_path)) is None, (
+            "an unreadable repo directory reported as having no partials"
+        )
+        assert xf._baseline_incomplete_blob_names("model", REPO, str(tmp_path)) is None
+    finally:
+        os.chmod(repo, 0o755)
+    assert xf._blobs_dir_is_absent(repo / "no-such-blobs") is True
+    # And a repo that simply has no blobs directory yet is honestly empty, not unknown.
+    (tmp_path / REPO_DIR / "blobs").rename(tmp_path / REPO_DIR / "blobs-moved")
+    assert xf._incomplete_partial_names("model", REPO, str(tmp_path)) == set()
 
 
 def test_a_baseline_entry_that_cannot_be_inspected_is_unknown(monkeypatch, tmp_path):

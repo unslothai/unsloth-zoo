@@ -673,6 +673,22 @@ def _strict_repo_cache_dirs(
     return []
 
 
+def _blobs_dir_is_absent(blobs_dir) -> bool:
+    """Whether there is honestly no ``blobs`` directory there. Raises when it cannot be told.
+
+    ``Path.is_dir()`` answers False for BOTH "not a directory" and "I was not allowed to
+    look", because it swallows ``OSError``: a permission or FUSE flap on the repo directory
+    read as "no partials here", which is the empty answer that releases the guard and lets an
+    unforced HTTP child resume a sparse Xet partial onto a finalized blob. Only ENOENT and
+    ENOTDIR are absence; every other error is unknown and is raised, so the caller reports
+    ``None`` rather than an empty set.
+    """
+    try:
+        return not stat.S_ISDIR(os.stat(blobs_dir).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+
+
 def _baseline_incomplete_blob_names(
     repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
 ) -> Optional[set]:
@@ -693,7 +709,7 @@ def _baseline_incomplete_blob_names(
             repo_type, repo_id, cache_dir, absent_root_is_empty = True,
         ):
             blobs_dir = entry / "blobs"
-            if not blobs_dir.is_dir():
+            if _blobs_dir_is_absent(blobs_dir):
                 continue
             # NOT per-blob, unlike the sizes scan: a name this scan misses is a name the
             # ownership subtraction then credits to our child. A transient FUSE or permission
@@ -738,7 +754,7 @@ def _incomplete_partial_names(
         # partials" -- the empty set that releases the guard. Here every error surfaces.
         for entry in _strict_repo_cache_dirs(repo_type, repo_id, cache_dir):
             blobs_dir = entry / "blobs"
-            if not blobs_dir.is_dir():
+            if _blobs_dir_is_absent(blobs_dir):
                 continue
             for blob in blobs_dir.iterdir():
                 if blob.name.endswith(INCOMPLETE_SUFFIX):
@@ -771,14 +787,79 @@ def _live_writer_walk_was_complete() -> bool:
     return bool(getattr(_LIVE_WRITER_WALK, "complete", True))
 
 
-def _cache_is_private_to_this_user(cache_dir: Optional[str] = None) -> bool:
+def _group_is_private_to_this_user(gid: int) -> bool:
+    """Whether *gid* is a group this user is alone in.
+
+    The user-private-group scheme -- Fedora, RHEL and any host running umask 002 -- gives
+    every user a group of their own, and every directory they create is then group-writable.
+    Reading that as shared would decline the purge on all of those hosts for a group nobody
+    else is in. Membership is read both ways round, because `gr_mem` lists SUPPLEMENTARY
+    members only and says nothing about a user whose primary group this is. Anything that
+    cannot be read is not evidence, so it answers False.
+    """
+    if gid != os.getegid():
+        return False
+    try:
+        import grp  # noqa: PLC0415 -- POSIX only, and only on this path
+        import pwd  # noqa: PLC0415
+
+        if grp.getgrgid(gid).gr_mem:
+            return False
+        me = os.geteuid()
+        return all(user.pw_gid != gid or user.pw_uid == me for user in pwd.getpwall())
+    except Exception:
+        return False
+
+
+def _posix_directory_is_private(path) -> bool:
+    """Whether only this UID can create or replace entries in *path*, on POSIX.
+
+    Ownership and the write bits, plus the absence of a POSIX ACL: an ACL can grant another
+    user write access with the mode bits reading 0755, and a directory that carries one is
+    treated as shared because this cannot evaluate who it names. Where extended attributes
+    cannot be listed at all the ACL question is unanswerable, and an unanswerable question is
+    not evidence of privacy.
+    """
+    info = os.stat(path)
+    if info.st_uid != os.geteuid():
+        return False
+    if info.st_mode & stat.S_IWOTH:
+        return False
+    if info.st_mode & stat.S_IWGRP and not _group_is_private_to_this_user(info.st_gid):
+        return False
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is None:
+        # No reader for extended attributes on this platform build, so an ACL cannot be
+        # ruled out. The mode bits are all there is, and they have already been checked.
+        return True
+    try:
+        names = listxattr(path)
+    except OSError:
+        return False
+    return not any(
+        name in ("system.posix_acl_access", "system.posix_acl_default")
+        or name.startswith("system.nfs4_acl")
+        for name in names
+    )
+
+
+def _cache_is_private_to_this_user(
+    cache_dir: Optional[str] = None,
+    *,
+    repo_type: Optional[str] = None,
+    repo_id: Optional[str] = None,
+) -> bool:
     """Whether only THIS user can write partials into the cache.
 
     It decides whether a process the probe could not read matters: a downloader under another
     UID can only be writing here if another UID can write here at all. On POSIX that is the
-    ownership and the group/other write bits of the cache root itself. Where there is no uid to
-    compare -- Windows -- containment in this user's home stands in for it, which is where the
-    default cache lives; anything else is treated as shared, i.e. not private.
+    ownership, the group/other write bits and the ACL of every directory a partial can be
+    created in -- the root AND, when the repo is named, that repo's directory and its
+    ``blobs``. A private root says nothing about a repo directory somebody made
+    group-writable underneath it, and ``blobs`` is where the partials actually live. Where
+    there is no uid to compare -- Windows -- containment in this user's home stands in for
+    it, which is where the default cache lives; anything else is treated as shared, i.e. not
+    private.
 
     False whenever it cannot be established, so the uncertain answer is the careful one.
     """
@@ -786,14 +867,27 @@ def _cache_is_private_to_this_user(cache_dir: Optional[str] = None) -> bool:
         root = hf_cache_root(cache_dir = cache_dir)
         if root is None:
             return False
-        info = os.stat(root)
-        geteuid = getattr(os, "geteuid", None)
-        if geteuid is not None:
-            if info.st_uid != geteuid():
+        if getattr(os, "geteuid", None) is None:
+            home = Path.home().resolve()
+            return home in Path(root).resolve().parents or Path(root).resolve() == home
+        if not _posix_directory_is_private(root):
+            return False
+        if repo_id is None:
+            return True
+        # The repo may not exist yet, which is not a reason to call the cache shared: there
+        # is nothing there for another user to be writing into either. What must not happen
+        # is a directory that EXISTS and is writable by somebody else being missed.
+        for entry in _strict_repo_cache_dirs(
+            repo_type, repo_id, cache_dir, absent_root_is_empty = True,
+        ):
+            if not _posix_directory_is_private(entry):
                 return False
-            return not bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
-        home = Path.home().resolve()
-        return home in Path(root).resolve().parents or Path(root).resolve() == home
+            blobs_dir = entry / "blobs"
+            if _blobs_dir_is_absent(blobs_dir):
+                continue
+            if not _posix_directory_is_private(blobs_dir):
+                return False
+        return True
     except Exception:
         return False
 
@@ -886,7 +980,9 @@ def _unowned_partials_safe_to_clear(
     live_writers = _partial_paths_with_a_live_writer()
     if live_writers is None:
         return None
-    if not _live_writer_walk_was_complete() and not _cache_is_private_to_this_user(cache_dir):
+    if not _live_writer_walk_was_complete() and not _cache_is_private_to_this_user(
+        cache_dir, repo_type = repo_type, repo_id = repo_id,
+    ):
         # A process this host would not let us read is a possible writer, and on a cache
         # another user can write into it is a LIKELY one: unlinking an aged partial there
         # interrupts that sibling's download mid-write, which age alone can never rule out.
@@ -2034,7 +2130,11 @@ def _run_download_attempt(
                     writer_paths = _partial_paths_with_a_live_writer()
                     trustworthy = writer_paths is not None and (
                         _live_writer_walk_was_complete()
-                        or _cache_is_private_to_this_user(params.get("cache_dir"))
+                        or _cache_is_private_to_this_user(
+                            params.get("cache_dir"),
+                            repo_type = repo_type,
+                            repo_id = repo_id,
+                        )
                     )
                     if not trustworthy:
                         inferred = set()
