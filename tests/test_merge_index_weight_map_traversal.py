@@ -40,8 +40,10 @@ target, and the payload is an obviously fake non-shard file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pathlib
 import shutil
 
 import pytest
@@ -209,3 +211,79 @@ def test_a_hostile_weight_map_entry_cannot_escape_the_save_directory(
         f"{weight_map_value!r} planted {os.listdir(escaped)} in a directory outside "
         f"the requested output directory"
     )
+
+
+def _shadow_directory_for(tmp_path, weight_map_value):
+    """`_shadow_directory` with the index value supplied verbatim."""
+    return _shadow_directory(tmp_path, weight_map_value)
+
+
+def _existing_external_shard(tmp_path):
+    """A real safetensors file outside the output directory, for the merge to find.
+
+    The parametrised cases deliberately leave the absolute target missing, which
+    makes the vulnerable code fail on the size check before the shard list is even
+    used. That is a pass for the wrong reason, and it hides the second sink: the
+    merge opens a shard it believes is its own with `open(..., "r+b")` and an
+    `mmap` write, so an absolute entry naming a file that DOES exist is modified in
+    place and never goes near `shutil.copy2` or its `not os.path.exists` gate.
+    """
+    real_base = os.path.join(str(tmp_path), "real_base")
+    shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
+    assert shards, "the base model produced no safetensors to copy"
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+    victim = os.path.join(outside, "victim.safetensors")
+    shutil.copy2(os.path.join(real_base, shards[0]), victim)
+    return victim
+
+
+def test_an_absolute_entry_cannot_overwrite_an_existing_file_outside_the_output(
+    monkeypatch, tmp_path,
+):
+    """The overwrite variant, which the missing-target cases cannot reach."""
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    model = H.build_and_save_base(spec, os.path.join(str(tmp_path), "real_base"))
+    peft_model = H.attach_lora(model, spec, "full")
+
+    victim = _existing_external_shard(tmp_path)
+    before = hashlib.sha256(pathlib.Path(victim).read_bytes()).hexdigest()
+
+    base_rel = _shadow_directory(tmp_path, victim)
+    save_directory = os.path.join("out", "deep", "merged")
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+    shard_names = _record_shard_names(monkeypatch)
+
+    try:
+        saving_utils.merge_and_overwrite_lora(
+            get_model_name  = lambda *a, **k: base_rel,
+            model           = peft_model,
+            tokenizer       = None,
+            save_directory  = save_directory,
+            save_method     = "merged_16bit",
+            push_to_hub     = False,
+        )
+    except Exception:
+        # Same as the parametrised cases: failing to merge is fine, touching a file
+        # outside the output directory is not.
+        pass
+
+    after = hashlib.sha256(pathlib.Path(victim).read_bytes()).hexdigest()
+    assert after == before, (
+        f"an absolute weight_map entry modified {victim!r}, a file outside "
+        f"{save_directory!r}"
+    )
+
+    inside = os.path.realpath(os.path.join(str(tmp_path), save_directory))
+    for name in shard_names:
+        joined = os.path.normpath(os.path.join(inside, name))
+        assert joined.startswith(inside + os.sep), (
+            f"{name!r} survived as a shard name and resolves to {joined!r}, "
+            f"outside {inside!r}"
+        )
