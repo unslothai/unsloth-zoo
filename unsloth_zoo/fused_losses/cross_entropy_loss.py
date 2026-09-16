@@ -141,17 +141,162 @@ pass
 # 4 counted the logits alone.
 _CE_BYTES_PER_LOGIT = 16.0
 
-@functools.cache
+# ---------------------------------------------------------------------------
+# Per-chunk memory budget policy.
+#
+# target_gb is "how much transient memory one chunk of the lm_head + CE
+# computation may use". A smaller target means more chunks, which lowers peak
+# memory but is strictly slower: every extra chunk re-reads the whole lm_head
+# weight and relaunches the matmul + softmax + backward chain.
+#
+# The policy used to be a constant cap:
+#     target_gb = min(free_gb * 0.5, 4.0)
+# The 4.0 GiB constant is deliberate. On a very large GPU, half the free pool
+# rounds the chunk count down to a single chunk, which materializes the full
+# float32 logits at once and then dominates peak memory. That reasoning is
+# correct on a 16 GiB card, but the constant does not scale up: on a 183 GiB
+# B200 at vocab 248320 / hidden 2048 / 2048 tokens the ENTIRE transient is only
+# ~7.6 GiB, and the cap still forces 4 chunks - measured 13.46 ms instead of
+# 8.84 ms (1.52x slower) to save 0.71 GiB on a card with ~175 GiB spare.
+#
+# Setting UNSLOTH_CE_VRAM_AWARE_CAP=1 opts in to a cap that scales with how big
+# the card actually is, instead of being a constant:
+#     cap_gb = clamp(total_vram_gb / _CE_CAP_VRAM_DIVISOR, 4.0, 16.0)
+#
+# This is OPT-IN and off by default, because it is not a universal win. It is
+# clearly worth it when the lm_head is trained: chunking cost is dominated by the
+# lm_head weight gradient, so with lm_head frozen (ordinary LoRA) the curve is
+# much flatter and the extra memory buys far less. Measured at
+# vocab 248320 / hidden 2048 / 2048 tokens on a B200:
+#     lm_head trained: 4 chunks 13.50 ms -> 1 chunk 8.81 ms   (+0.71 GiB)
+#     lm_head frozen : 4 chunks  6.99 ms -> 1 chunk 4.99 ms   (+1.42 GiB)
+# and on a 40 GiB A100 at vocab 151936 / hidden 896 with lm_head frozen the
+# single-chunk landing was slightly SLOWER than 4 chunks while using ~1.9x the
+# peak, because the optimum there is 2 chunks rather than 1. Until the policy
+# targets the knee of that curve rather than the fewest chunks that fit, the
+# default stays exactly where it is.
+#
+# _CE_CAP_VRAM_DIVISOR = 6.0 is picked so that the cap is EXACTLY 4.0 at 24 GiB.
+# That matters for backwards compatibility:
+#   * every card <= 24 GiB (T4 16, P100 16, V100 16/32->see below, L4 22.5,
+#     3090/4090 24, A10 24) clamps to the 4.0 floor, i.e. bit-for-bit the old
+#     policy. Nothing small can regress, and a 16 GiB T4 sees no change at all.
+#   * 40 GiB A100 -> 6.67, 80 GiB A100/H100 -> 13.33, >= 96 GiB -> 16.0.
+#   * the 16.0 GiB ceiling keeps the cap BOUNDED. A bigger card never degenerates
+#     into "one chunk of unbounded size": any transient above 16 GiB still gets
+#     chunked, which is the property the original cap was protecting.
+# free_gb * 0.5 remains the other half of the min(), so a card that is large but
+# already mostly full still chunks aggressively.
+#
+# The free-VRAM half is read LIVE on every sizing call (see get_chunk_size).
+# _get_chunk_multiplier is memoized on (vocab_size, target_gb, fixed_gb), so if
+# the live reading were left as the `None` sentinel the first observation would
+# be frozen for the whole process - the chunk count would never react to memory
+# pressure that appeared later. get_chunk_size therefore resolves None to a
+# concrete number BEFORE the memoized call, so the reading is part of the key.
+# Because a live float key can take unboundedly many values (on a small or busy
+# card the free half binds and drifts every step), the memo is an LRU with a
+# bounded size rather than an unbounded functools.cache. It still exposes
+# .cache_clear() / .cache_info(), which existing tests rely on.
+_CE_CAP_MIN_GB       = 4.0   # floor: the historical constant
+_CE_CAP_MAX_GB       = 16.0  # ceiling: keeps the cap bounded on huge GPUs
+_CE_CAP_VRAM_DIVISOR = 6.0   # total_gb / 6 == 4.0 exactly at 24 GiB
+_CE_MULTIPLIER_CACHE_SIZE = 1024
+
+
+def _device_mem_info(index = 0):
+    """(free_bytes, total_bytes) for the accelerator, or None if unavailable.
+
+    Covers CUDA, ROCm/HIP (torch.cuda.* is the ROCm API too) and XPU. Returns
+    None on CPU / MPS / MLX builds, on driverless CI, and on any backend whose
+    mem_get_info is missing or raises - callers then fall back to the historical
+    constant rather than crashing.
+    """
+    if index is None: index = 0
+    try:
+        if DEVICE_TYPE == "xpu":
+            return torch.xpu.mem_get_info(index)
+        return torch.cuda.mem_get_info(index)
+    except Exception:
+        return None
+pass
+
+
+def _device_index_of(device):
+    """Accelerator index of `device`, or None if it is not an indexed accelerator.
+
+    The budget must be read from the card the logits will actually land on. With
+    device_map="balanced" the lm_head can sit on cuda:3 while the old code always
+    asked cuda:0 - harmless while the cap was a constant, but not once the cap is
+    derived from that card's own size and free pool.
+    """
+    try:
+        if not isinstance(device, torch.device): device = torch.device(device)
+        if device.type in ("cpu", "meta"): return None
+        return 0 if device.index is None else int(device.index)
+    except Exception:
+        return None
+pass
+
+
+def _vram_aware_cap_enabled():
+    """Whether the VRAM-scaled cap is switched on. Off by default.
+
+    Read live rather than captured at import so it can be toggled inside a
+    process (tests, and A/B measurement in a single run).
+    """
+    return os.environ.get("UNSLOTH_CE_VRAM_AWARE_CAP", "0") == "1"
+pass
+
+
+def _auto_target_gb_from(free_bytes, total_bytes, vram_aware = None):
+    """Pure policy: per-chunk budget in GiB from a (free, total) memory pair.
+
+    Split out from the device read so it can be reasoned about and tested
+    without a GPU.
+
+    With vram_aware off (the default) this is exactly the historical
+    `min(free_gb * 0.5, 4.0)`. With it on, the 4.0 constant becomes a cap that
+    scales with the size of the card.
+    """
+    if vram_aware is None: vram_aware = _vram_aware_cap_enabled()
+    free_gb  = free_bytes  / 1024 / 1024 / 1024
+    cap_gb   = _CE_CAP_MIN_GB
+    if vram_aware:
+        total_gb = total_bytes / 1024 / 1024 / 1024
+        # Cap scales with the card, clamped to [_CE_CAP_MIN_GB, _CE_CAP_MAX_GB].
+        cap_gb = total_gb / _CE_CAP_VRAM_DIVISOR
+        if cap_gb < _CE_CAP_MIN_GB: cap_gb = _CE_CAP_MIN_GB
+        if cap_gb > _CE_CAP_MAX_GB: cap_gb = _CE_CAP_MAX_GB
+    pass
+    # Still never use more than 50% of what is actually free right now. On every
+    # card <= 24 GiB cap_gb is exactly _CE_CAP_MIN_GB == 4.0, so even with the
+    # flag on this reduces to the previous `min(free_gb * 0.5, 4.0)` bit-for-bit.
+    return min(free_gb * 0.5, cap_gb)
+pass
+
+
+def _auto_target_gb(index = 0):
+    """Resolve the automatic per-chunk budget from live device memory.
+
+    Returns the historical 4.0 GiB constant when the device cannot report its
+    memory, so an unknown backend degrades to exactly the previous behaviour.
+    """
+    if index is None: index = 0
+    info = _device_mem_info(index)
+    if info is None:
+        return _CE_CAP_MIN_GB
+    return _auto_target_gb_from(info[0], info[1])
+pass
+
+
+@functools.lru_cache(maxsize = _CE_MULTIPLIER_CACHE_SIZE)
 def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Find current VRAM left in the GPU, and use 50% or less of it
-        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
-        free_gb = free / 1024 / 1024 / 1024
-        free_gb = free_gb * 0.5
-        # Cap per-chunk target: on very large GPUs half the free pool rounds to a
-        # single chunk, materializing full float32 logits and dominating peak memory.
-        target_gb = min(free_gb, 4.0)
+        # Legacy/direct callers may still pass None. get_chunk_size resolves it
+        # before this point so the hot path never freezes a VRAM reading here.
+        target_gb = _auto_target_gb()
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -169,8 +314,21 @@ def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     return multiplier
 pass
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
-    """Number of chunks that fits the target max memory usage."""
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0,
+                   device_index = None):
+    """Number of chunks that fits the target max memory usage.
+
+    device_index is optional and trailing, so every existing positional or
+    keyword call site keeps working unchanged; when omitted the budget is read
+    from device 0 exactly as before.
+    """
+    # Resolve the automatic budget HERE, not inside the memoized multiplier:
+    # _get_chunk_multiplier is cached on its arguments, so passing the None
+    # sentinel through would pin the very first VRAM observation for the
+    # lifetime of the process. Resolving first makes the live reading part of
+    # the cache key, so the cache stays correct as memory pressure changes.
+    if target_gb is None:
+        target_gb = _auto_target_gb(device_index)
     multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
     n_splits = (bsz*qlen) * multiplier
     # n_splits * 4 == (chunk transient GiB) / target. Round UP: nearest-rounding
@@ -271,6 +429,8 @@ class UnslothFusedLoss(torch.autograd.Function):
             n_chunks = get_chunk_size(
                 bsz, qlen, vocab_size, target_gb = target_gb,
                 fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
+                # Size against the card the logits actually land on, not cuda:0.
+                device_index = _device_index_of(device),
             )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
