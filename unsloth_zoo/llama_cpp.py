@@ -3099,6 +3099,76 @@ def _gguf_candidate_converters(converter_location):
     return candidates
 
 
+def _gguf_tree_of_location(location):
+    """The sys.path entry that makes the `gguf` at `location` importable, or None.
+
+    `location` is the child's `gguf.__file__`, so `<tree>/gguf/__init__.py`. Anything that
+    is not laid out as a package directory named `gguf` is rejected rather than guessed at:
+    putting the wrong directory on the parent's sys.path is worse than not reading the file
+    back with the child's tree.
+    """
+    if not isinstance(location, str) or not location:
+        return None
+    package = os.path.dirname(os.path.abspath(location))
+    if os.path.basename(package) != "gguf":
+        return None
+    if not os.path.isfile(os.path.join(package, "__init__.py")):
+        return None
+    return os.path.dirname(package)
+
+
+def _gguf_version_tuple(value):
+    """A dotted version as a tuple of ints, ignoring any suffix. None when unusable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parts = []
+    for chunk in value.strip().split("."):
+        digits = ""
+        for character in chunk:
+            if not character.isdigit():
+                break
+            digits += character
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
+
+def _gguf_readback_tree(report):
+    """The tree to read a fresh GGUF back with, when the parent's own `gguf` is behind it.
+
+    Candidate zero -- the requested converter with the environment untouched -- is the
+    common path and deliberately pins nothing, because changing a working child's
+    environment is the one thing this resolver must not do. But the pin was also what told
+    `_verify_converted_gguf` which `gguf` wrote the file, so on that path the read-back ran
+    against whatever the PARENT happens to have. Where the parent has an older wheel, or no
+    `gguf` at all, every reader comes back None and the whole gate -- the required metadata,
+    the tensor sanity pass and the missing-shard check this PR adds -- degrades into one
+    warning and the file is published unverified.
+
+    The probe report already names the package the child resolved, so the read-back tree is
+    derivable without touching the child at all. Returned only when it would be an
+    improvement: no `gguf` in the parent, or a strictly older one. Equal or newer parents
+    keep reading with themselves, so the healthy install sees no change and no foreign tree
+    is put on sys.path for nothing.
+    """
+    tree = _gguf_tree_of_location((report or {}).get("location"))
+    if not tree:
+        return None
+    try:
+        import gguf as _parent_gguf  # type: ignore
+    except Exception:
+        # Nothing in the parent to read with, so the child's tree is the only option there
+        # is and using it cannot be worse than the warning.
+        return tree
+    child = _gguf_version_tuple((report or {}).get("version"))
+    parent = _gguf_version_tuple(getattr(_parent_gguf, "__version__", None))
+    if child is None or parent is None:
+        # Cannot establish which is newer. Leave the parent's resolution alone.
+        return None
+    return tree if child > parent else None
+
+
 def _resolve_converter_and_gguf(converter_location, python_exe, architecture = None):
     """Pick the (converter, gguf-py) pair whose `gguf` can satisfy the converter.
 
@@ -3710,9 +3780,13 @@ def convert_to_gguf(
     # it never re-reads what it wrote. Check the architecture required metadata,
     # and on an unquantized export the sampled tensors, before any caller
     # uploads or quantizes this (unsloth#6056, unsloth#8360, unsloth#8513).
+    # `_gguf_py_pin` is None on the common path, where nothing was pinned because nothing
+    # needed to be. The read-back still has to know which `gguf` wrote the file: see
+    # `_gguf_readback_tree`, which derives it from the probe report without changing what
+    # the child ran with.
     _verify_converted_gguf(
         all_output_files, quantization_type, print_output = print_output,
-        gguf_py_dir = _gguf_py_pin,
+        gguf_py_dir = _gguf_py_pin or _gguf_readback_tree(_gguf_report),
     )
 
     return all_output_files, is_vlm
@@ -4676,8 +4750,16 @@ def _model_tensor_shapes(model):
         return {}
 
 
-def _gguf_shape_problems(model, reader, sample_size):
+def _gguf_shape_problems(model, readers, sample_size):
     """Sampled GGUF tensors whose shape contradicts the model's, as strings.
+
+    `readers` is the whole shard set, not one file. A split export puts most of its
+    tensors in shards 1..N, so checking only shard 0 left the bulk of the model
+    unvalidated while every other check in `assert_correct_gguf` covered all of it, and a
+    tensor whose dimensions were wrong past the first shard passed verification. The
+    architecture and the name map come from the first readable shard, which is where the
+    KV block lives; the tensor walk then runs over every readable shard, sampled per shard
+    the way `gguf_tensor_problems` samples.
 
     Matched by NAME, through gguf-py's own `TensorNameMap` inverted, rather
     than by `shape[0]` as before: that matched `output_norm.weight` of shape
@@ -4697,6 +4779,12 @@ def _gguf_shape_problems(model, reader, sample_size):
         from gguf.tensor_mapping import TensorNameMap  # type: ignore
     except Exception:
         return []
+    readable = [(shard, reader) for shard, reader in readers if reader is not None]
+    if not readable:
+        # An unreadable shard set is already reported as fatal by the metadata pass, and
+        # saying it again here would only duplicate it.
+        return []
+    reader = readable[0][1]
     architecture = _gguf_field_text(reader, GGUF_ARCHITECTURE_KEY)
     arch_enum = next(
         (enum for enum, name in MODEL_ARCH_NAMES.items() if name == architecture), None,
@@ -4716,22 +4804,27 @@ def _gguf_shape_problems(model, reader, sample_size):
                 gguf_to_hf.setdefault(f"{gguf_name}{suffix}", candidate)
                 break
 
-    tensors = reader.tensors
-    indices = _gguf_sample_indices(len(tensors), sample_size, ("shapes", len(tensors)))
     problems = []
-    for index in indices:
-        tensor = tensors[index]
-        hf_name = gguf_to_hf.get(tensor.name)
-        if hf_name is None:
-            continue
-        # GGUF stores dimensions in reverse order.
-        gguf_shape = tuple(int(x) for x in reversed(list(tensor.shape)))
-        model_shape = shapes[hf_name]
-        if gguf_shape != model_shape:
-            problems.append(
-                f"`{tensor.name}` has shape {gguf_shape} but the model's "
-                f"`{hf_name}` has shape {model_shape}"
-            )
+    for shard, shard_reader in readable:
+        tensors = shard_reader.tensors
+        # Keyed on the shard name as well, so two shards holding the same number of
+        # tensors do not sample the same positions and leave the same gaps.
+        indices = _gguf_sample_indices(
+            len(tensors), sample_size, ("shapes", os.path.basename(shard), len(tensors)),
+        )
+        for index in indices:
+            tensor = tensors[index]
+            hf_name = gguf_to_hf.get(tensor.name)
+            if hf_name is None:
+                continue
+            # GGUF stores dimensions in reverse order.
+            gguf_shape = tuple(int(x) for x in reversed(list(tensor.shape)))
+            model_shape = shapes[hf_name]
+            if gguf_shape != model_shape:
+                problems.append(
+                    f"`{tensor.name}` has shape {gguf_shape} but the model's "
+                    f"`{hf_name}` has shape {model_shape}"
+                )
     return problems
 
 
@@ -4749,7 +4842,7 @@ def _assert_correct_gguf(model_name, model, tokenizer, sample_size = None):
 
     problems = list(gguf_metadata_problems(model_name, readers = readers))
     problems += _gguf_tokenizer_problems(tokenizer, reader)
-    problems += _gguf_shape_problems(model, reader, sample_size)
+    problems += _gguf_shape_problems(model, readers, sample_size)
     problems += gguf_tensor_problems(model_name, sample_size = sample_size, readers = readers)
 
     if problems:

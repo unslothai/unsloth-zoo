@@ -718,3 +718,191 @@ def test_the_announcement_is_printed_once_for_a_split_set(llama_cpp, tmp_path, c
     monkeypatch.setattr(llama_cpp, "_gguf_open_shards", lambda f: [(paths[0], None)])
     llama_cpp._verify_converted_gguf(paths, "bf16", print_output = True)
     assert capsys.readouterr().out.count("Reading the GGUF back") == 1
+
+
+# ---------------------------------------------------------------------------
+# The shape comparison covers the whole model, not just the first shard
+# ---------------------------------------------------------------------------
+
+class _FakeParameter:
+    def __init__(self, shape):
+        self.shape = shape
+
+
+class _FakeModel:
+    """Just enough of a torch model for `_model_tensor_shapes`."""
+
+    def __init__(self, shapes):
+        self._shapes = shapes
+
+    def named_parameters(self):
+        return [(name, _FakeParameter(shape)) for name, shape in self._shapes.items()]
+
+
+def _two_shard_readers(llama_cpp, tmp_path, second_shape):
+    """A two shard set holding one block each, the second sized by the caller."""
+    shapes = {
+        "model.layers.0.self_attn.q_proj.weight": (4, 4),
+        "model.layers.1.self_attn.q_proj.weight": (4, 4),
+    }
+    first = write_gguf(
+        tmp_path / "model-00001-of-00002.gguf", keys = UNIVERSAL,
+        tensors = {"blk.0.attn_q.weight": np.ones((4, 4), dtype = np.float32)},
+    )
+    second = write_gguf(
+        tmp_path / "model-00002-of-00002.gguf", keys = UNIVERSAL,
+        tensors = {"blk.1.attn_q.weight": np.ones(second_shape, dtype = np.float32)},
+    )
+    readers = [
+        (first, llama_cpp._open_gguf_reader(first)),
+        (second, llama_cpp._open_gguf_reader(second)),
+    ]
+    return _FakeModel(shapes), readers
+
+
+def test_a_wrong_shape_past_the_first_shard_is_reported(llama_cpp, tmp_path):
+    """A split export puts most of its tensors in shards 1..N.
+
+    Every other check in `assert_correct_gguf` is handed the whole shard set; the shape
+    comparison was handed `readers[0][1]` alone, so a tensor whose dimensions were wrong
+    anywhere past the first file was never compared with the model at all, and the export
+    passed verification on the strength of checks that only prove the bytes are not
+    degenerate and the metadata is present.
+    """
+    model, readers = _two_shard_readers(llama_cpp, tmp_path, (2, 2))
+    problems = llama_cpp._gguf_shape_problems(model, readers, sample_size = 8)
+    assert any("blk.1.attn_q.weight" in problem for problem in problems), problems
+    assert any("(2, 2)" in problem for problem in problems), problems
+
+
+def test_a_correct_split_export_reports_nothing(llama_cpp, tmp_path):
+    """The other half, and the one that matters more: walking every shard must not start
+    reporting problems on a good export."""
+    model, readers = _two_shard_readers(llama_cpp, tmp_path, (4, 4))
+    assert llama_cpp._gguf_shape_problems(model, readers, sample_size = 8) == []
+
+
+def test_an_unreadable_later_shard_does_not_break_the_shape_pass(llama_cpp, tmp_path):
+    """An unreadable shard is already fatal through the metadata pass, so this one skips it
+    rather than saying it twice, and still checks the shards it can read."""
+    model, readers = _two_shard_readers(llama_cpp, tmp_path, (2, 2))
+    readers = [readers[0], (readers[1][0], None)]
+    assert llama_cpp._gguf_shape_problems(model, readers, sample_size = 8) == []
+
+    # And with only the unreadable one left there is nothing to compare against, rather
+    # than an exception out of `reader.tensors` on None.
+    model, readers = _two_shard_readers(llama_cpp, tmp_path, (2, 2))
+    assert llama_cpp._gguf_shape_problems(
+        model, [(readers[0][0], None)], sample_size = 8,
+    ) == []
+
+
+# ---------------------------------------------------------------------------
+# The read-back uses the gguf that wrote the file, not whatever the parent has
+# ---------------------------------------------------------------------------
+
+def _fake_gguf_tree(tmp_path, name = "gguf-py"):
+    """A directory laid out the way an importable gguf-py tree is."""
+    package = tmp_path / name / "gguf"
+    package.mkdir(parents = True)
+    (package / "__init__.py").write_text("", encoding = "utf-8")
+    return str(tmp_path / name), str(package / "__init__.py")
+
+
+def test_the_tree_is_derived_from_the_probe_report(llama_cpp, tmp_path):
+    tree, location = _fake_gguf_tree(tmp_path)
+    assert llama_cpp._gguf_tree_of_location(location) == tree
+
+
+@pytest.mark.parametrize("location", [None, "", 5, "/nowhere/gguf/__init__.py"])
+def test_a_location_that_is_not_a_package_is_refused(llama_cpp, location):
+    """Putting the wrong directory on the parent's sys.path is worse than not pinning."""
+    assert llama_cpp._gguf_tree_of_location(location) is None
+
+
+def test_a_location_outside_a_gguf_package_is_refused(llama_cpp, tmp_path):
+    _tree, location = _fake_gguf_tree(tmp_path, name = "tree")
+    moved = Path(location).parent.parent / "notgguf"
+    moved.mkdir()
+    (moved / "__init__.py").write_text("", encoding = "utf-8")
+    assert llama_cpp._gguf_tree_of_location(str(moved / "__init__.py")) is None
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("0.17.1", (0, 17, 1)),
+        ("0.9.0", (0, 9, 0)),
+        # A suffix stops the parse at the last numeric component rather than failing it.
+        ("0.18.0.dev0", (0, 18, 0)),
+        ("1.0", (1, 0)),
+        ("", None),
+        (None, None),
+        ("not-a-version", None),
+    ],
+)
+def test_the_version_parse_orders_what_it_can_and_refuses_the_rest(llama_cpp, value, expected):
+    assert llama_cpp._gguf_version_tuple(value) == expected
+    if expected is not None:
+        assert llama_cpp._gguf_version_tuple("0.9.0") < llama_cpp._gguf_version_tuple("0.17.1")
+
+
+def test_an_older_parent_reads_back_with_the_childs_tree(llama_cpp, tmp_path, monkeypatch):
+    """The whole point. Candidate zero pins nothing, so the read-back used to run against
+    the parent's `gguf`; where that is older than the converter's, every reader comes back
+    None and the gate -- metadata, tensor sanity and the missing-shard check -- degrades
+    into a warning and the file is published unverified."""
+    tree, location = _fake_gguf_tree(tmp_path)
+    import sys as _sys
+    monkeypatch.setitem(
+        _sys.modules, "gguf", __import__("types").SimpleNamespace(__version__ = "0.9.0"),
+    )
+    report = {"location": location, "version": "0.17.1"}
+    assert llama_cpp._gguf_readback_tree(report) == tree
+
+
+def test_an_equal_or_newer_parent_keeps_reading_with_itself(llama_cpp, tmp_path, monkeypatch):
+    """The healthy install must see no change, and no foreign tree goes on sys.path for
+    nothing."""
+    _tree, location = _fake_gguf_tree(tmp_path)
+    import sys as _sys
+    monkeypatch.setitem(
+        _sys.modules, "gguf", __import__("types").SimpleNamespace(__version__ = "0.17.1"),
+    )
+    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.17.1"}) is None
+    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.9.0"}) is None
+
+
+def test_an_unknowable_version_leaves_the_parent_alone(llama_cpp, tmp_path, monkeypatch):
+    """Cannot establish which is newer, so do not move the parent's resolution."""
+    _tree, location = _fake_gguf_tree(tmp_path)
+    import sys as _sys
+    monkeypatch.setitem(
+        _sys.modules, "gguf", __import__("types").SimpleNamespace(__version__ = None),
+    )
+    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.17.1"}) is None
+
+
+def test_no_gguf_in_the_parent_takes_the_childs_tree(llama_cpp, tmp_path, monkeypatch):
+    """There is nothing to read with, so the child's tree cannot be worse than the warning."""
+    tree, location = _fake_gguf_tree(tmp_path)
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_gguf(name, *args, **kwargs):
+        if name == "gguf":
+            raise ImportError("no module named gguf")
+        return real_import(name, *args, **kwargs)
+
+    import sys as _sys
+    monkeypatch.delitem(_sys.modules, "gguf", raising = False)
+    monkeypatch.setattr(builtins, "__import__", _no_gguf)
+    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.17.1"}) == tree
+
+
+def test_the_conversion_passes_the_derived_tree_to_the_verifier(llama_cpp):
+    """The derivation is only worth anything if `convert_to_gguf` uses it. A call site still
+    passing `_gguf_py_pin` alone would leave every case above passing while the common path
+    read the file back with the parent's gguf exactly as before."""
+    source = Path(llama_cpp.__file__).read_text()
+    assert "gguf_py_dir = _gguf_py_pin or _gguf_readback_tree(_gguf_report)," in source
