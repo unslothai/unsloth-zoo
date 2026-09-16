@@ -221,10 +221,32 @@ def test_type_checking_imports_are_advisory(mod):
     assert "gguf.vocab.Real" in certain
     assert "gguf.future.TypeOnly" in advisory
 
-    # An `if` this cannot prove false keeps its eager reading: nothing else is claimed.
+    # An ordinary guard runs AT MOST ONE of its branches, so neither is certainly evaluated.
+    # This used to keep the eager reading, which is the wrong direction for this scan: a
+    # symbol only the inactive branch reads could pin a different gguf, or replace a converter
+    # that works perfectly well with an older fallback. The platform and version guards at the
+    # top of a converter are exactly this shape.
     source = b"import os\nif os.environ.get('X'):\n    from gguf.vocab import Real\n"
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.vocab.Real" not in certain
+    assert "gguf.vocab.Real" in advisory
+
+    # Both arms of one, so neither can be blamed for the other.
+    source = (
+        b"import sys\n"
+        b"if sys.platform == 'win32':\n"
+        b"    from gguf.vocab import WindowsOnly\n"
+        b"else:\n"
+        b"    from gguf.vocab import PosixOnly\n"
+    )
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert not certain, certain
+    assert {"gguf.vocab.WindowsOnly", "gguf.vocab.PosixOnly"} <= set(advisory)
+
+    # The TEST is evaluated whichever way it goes, so a gguf symbol inside it stays certain.
+    source = b"import gguf\nif gguf.HAS_FEATURE:\n    X = 1\n"
     certain, _ = mod._gguf_requirements_from_source(source)
-    assert "gguf.vocab.Real" in certain
+    assert "gguf.HAS_FEATURE" in certain, certain
 
 
 def test_unrelated_names_are_ignored(mod):
@@ -944,7 +966,7 @@ def test_a_signature_under_a_try_is_still_advisory(mod):
     assert "gguf.NEW_KIND" not in certain
 
 
-def _make_older_sibling_converter(tmp_path, *, maps_the_architecture):
+def _make_older_sibling_converter(tmp_path, *, maps_the_architecture, mmproj_only = False):
     """A checkout's own package-based converter, co-versioned with the sibling gguf-py.
 
     Its maps are what decide whether it can convert this model at all, and a converter that
@@ -953,13 +975,18 @@ def _make_older_sibling_converter(tmp_path, *, maps_the_architecture):
     conversion = tmp_path / "conversion"
     conversion.mkdir(exist_ok = True)
     mapped = '"Gemma3ForCausalLM": "gemma",' if maps_the_architecture else ""
+    projector = mapped if mmproj_only else ""
+    if mmproj_only:
+        mapped = ""
     (conversion / "__init__.py").write_text(textwrap.dedent(f"""
         from .base import ModelBase
         TEXT_MODEL_MAP: dict[str, str] = {{
             "AfmoeForCausalLM": "afmoe",
             {mapped}
         }}
-        MMPROJ_MODEL_MAP: dict[str, str] = {{}}
+        MMPROJ_MODEL_MAP: dict[str, str] = {{
+            {projector}
+        }}
     """))
     (conversion / "base.py").write_text("import gguf\nBASE = gguf.Metadata\n")
     (conversion / "gemma.py").write_text("import gguf\nG = gguf.Metadata\n")
@@ -1025,4 +1052,52 @@ def test_the_architecture_check_only_refuses_on_evidence(mod, tmp_path):
     assert mod._converter_maps_architecture(str(packaged), "AfmoeForCausalLM") is True
     assert mod._converter_maps_architecture(str(packaged), "Gemma3ForCausalLM") is False
     (tmp_path / "conversion" / "__init__.py").write_text("TEXT_MODEL_MAP = broken(\n")
+    assert mod._converter_maps_architecture(str(packaged), "Gemma3ForCausalLM") is True
+
+
+def test_a_fallback_that_maps_this_architecture_in_the_wrong_half_is_refused(mod, tmp_path):
+    """The two maps are not interchangeable.
+
+    TEXT_MODEL_MAP dispatches the text conversion, which every export runs; MMPROJ_MODEL_MAP
+    dispatches the projector a VLM export adds. A fallback that names the architecture only in
+    the projector map cannot run the text half at all, and presence in EITHER map used to
+    approve it.
+
+    Asserted on the predicate rather than through a resolver run, because every sibling
+    candidate lives in the requested converter's own directory and therefore reads the SAME
+    conversion package: a divergence between two converters' maps cannot be built there, and
+    a test that pretended otherwise would be testing the fixture.
+    """
+    _make_older_sibling_converter(
+        tmp_path, maps_the_architecture = True, mmproj_only = True
+    )
+    projector_only = tmp_path / "convert_hf_to_gguf.py"
+    # The half the export needs is the half this candidate does not have.
+    assert mod._converter_maps_architecture(
+        str(projector_only), "Gemma3ForCausalLM", {"TEXT_MODEL_MAP"}
+    ) is False
+    # And it does serve the projector half, so a request that needs only that one is fine.
+    assert mod._converter_maps_architecture(
+        str(projector_only), "Gemma3ForCausalLM", {"MMPROJ_MODEL_MAP"}
+    ) is True
+    # Both halves required, only one served: refused.
+    assert mod._converter_maps_architecture(
+        str(projector_only), "Gemma3ForCausalLM",
+        {"TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP"},
+    ) is False
+
+
+def test_the_required_halves_are_read_off_the_requested_converter(mod, tmp_path):
+    """And they are the halves that architecture really has, not a guess."""
+    _make_older_sibling_converter(tmp_path, maps_the_architecture = True)
+    packaged = tmp_path / "convert_hf_to_gguf.py"
+    assert mod._converter_architecture_maps(str(packaged), "Gemma3ForCausalLM") == {
+        "TEXT_MODEL_MAP"
+    }
+    assert mod._converter_architecture_maps(str(packaged), "NobodyForCausalLM") == set()
+    # A monolith has no maps to read, which is a failure to look and not an answer.
+    monolith = tmp_path / "unsloth_convert_hf_to_gguf.py"
+    monolith.write_text("import gguf\nX = gguf.Metadata\n")
+    assert mod._converter_architecture_maps(str(monolith), "Gemma3ForCausalLM") == set()
+    # With nothing required, presence in either map still stands.
     assert mod._converter_maps_architecture(str(packaged), "Gemma3ForCausalLM") is True

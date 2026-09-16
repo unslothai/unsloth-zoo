@@ -2833,6 +2833,18 @@ def _gguf_requirements_from_source(source_bytes):
                     visit(ast.Module(body = [statement], type_ignores = []), False)
                 for statement in child.orelse:
                     visit(ast.Module(body = [statement], type_ignores = []), eager)
+            elif isinstance(child, ast.If):
+                # An ordinary module-level guard -- `if sys.platform == "win32":`, `if
+                # importlib.util.find_spec(...)`, a version test -- runs AT MOST ONE of its
+                # two branches, so a name referenced in the other is not certainly evaluated.
+                # Counting both as certain let a symbol that only the inactive branch reads
+                # pin a different gguf, or replace a converter that works perfectly well with
+                # an older fallback. The TEST itself is evaluated whichever way it goes, so it
+                # keeps the eager reading; the branches are advisory, like a try body, unless
+                # the branch is one this can prove (above).
+                visit_expression(child.test, eager)
+                for statement in list(child.body) + list(child.orelse):
+                    visit(ast.Module(body = [statement], type_ignores = []), False)
             else:
                 visit(child, eager)
 
@@ -2915,7 +2927,39 @@ def _conversion_modules_for(conversion_dir, architecture):
     return modules
 
 
-def _converter_maps_architecture(script_path, architecture):
+def _converter_architecture_maps(script_path, architecture):
+    """Which of a converter's maps name *architecture*, as a set of dict names.
+
+    The pair is not interchangeable. ``TEXT_MODEL_MAP`` dispatches the text conversion, which
+    every export runs, and ``MMPROJ_MODEL_MAP`` dispatches the projector, which a VLM export
+    runs in addition. A fallback that maps the architecture in only one of them therefore
+    fails the other half outright, and the support check that would have caught it describes
+    the converter that was REQUESTED rather than the one substituted in.
+
+    Empty for a monolith entrypoint (no package to read) and for an unreadable __init__.py,
+    which are failures to look rather than answers.
+    """
+    if not architecture:
+        return set()
+    try:
+        with open(script_path, "rb") as f:
+            entry_source = f.read()
+    except OSError:
+        return set()
+    if b"from conversion import" not in entry_source:
+        return set()
+    conversion_dir = os.path.join(os.path.dirname(script_path) or ".", "conversion")
+    conv_init = os.path.join(conversion_dir, "__init__.py")
+    if not os.path.isfile(conv_init):
+        return set()
+    return {
+        dict_name
+        for dict_name in ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP")
+        if architecture in _extract_dict_values_from_conversion_init(conv_init, dict_name)
+    }
+
+
+def _converter_maps_architecture(script_path, architecture, required_maps = None):
     """Whether this converter's OWN maps name *architecture*.
 
     Asked of a fallback before it is chosen. The requirement scan is scoped to the modules a
@@ -2925,6 +2969,14 @@ def _converter_maps_architecture(script_path, architecture):
     check that would have caught it reads the arch sets of the converter that was REQUESTED,
     not of the one being substituted, so it does not fire either, and the export dies on
     "unsupported model" with a working candidate left unused further down the ranking.
+
+    ``required_maps`` is which of them have to name it, read off the converter that was
+    REQUESTED: the text map dispatches the text conversion that every export runs, the
+    projector map the mmproj half a VLM export adds, and a fallback that maps the
+    architecture in only one of them fails the other outright. Taken from the request rather
+    than from a flag, because the request is what this is falling back FROM and it already
+    knows which halves this architecture has. Absent, presence in either map stands, which is
+    the answer for a request whose own maps could not be read.
 
     True on anything that is not positive evidence of absence: a monolith entrypoint with no
     conversion package dispatches by class registration rather than by these maps, an
@@ -2949,12 +3001,15 @@ def _converter_maps_architecture(script_path, architecture):
     conv_init = os.path.join(conversion_dir, "__init__.py")
     if not os.path.isfile(conv_init):
         return True
-    mapped = {}
-    for dict_name in ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP"):
-        mapped.update(_extract_dict_values_from_conversion_init(conv_init, dict_name))
-    if not mapped:
+    mapped = {
+        dict_name: _extract_dict_values_from_conversion_init(conv_init, dict_name)
+        for dict_name in ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP")
+    }
+    if not any(mapped.values()):
         return True
-    return architecture in mapped
+    if required_maps:
+        return all(architecture in mapped.get(name, {}) for name in required_maps)
+    return any(architecture in one for one in mapped.values())
 
 
 def _converter_gguf_requirements(script_path, architecture = None):
@@ -3308,6 +3363,9 @@ def _resolve_converter_and_gguf(converter_location, python_exe, architecture = N
     if not requested_certain and not requested_advisory:
         return converter_location, None, None
 
+    # Which halves of the conversion this architecture has, read off the converter that was
+    # asked for. A fallback has to serve the same ones.
+    requested_maps = _converter_architecture_maps(converter_location, architecture)
     candidates = _gguf_candidate_converters(converter_location)
     baseline_report = None
     baseline_blocking = ()
@@ -3320,7 +3378,7 @@ def _resolve_converter_and_gguf(converter_location, python_exe, architecture = N
             # Before the probe, which costs a subprocess: a converter that does not map this
             # architecture cannot convert this model however well its gguf matches, and its
             # empty requirement scan is exactly what makes it rank first.
-            if not _converter_maps_architecture(candidate, architecture):
+            if not _converter_maps_architecture(candidate, architecture, requested_maps):
                 continue
             certain, advisory = _converter_gguf_requirements(candidate, architecture)
         env = _converter_child_env(gguf_py)
