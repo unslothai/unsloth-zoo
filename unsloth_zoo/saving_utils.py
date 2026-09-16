@@ -2983,6 +2983,35 @@ def _shard_name_stays_inside(name):
     return joined.startswith(_SHARD_CONTAINMENT_ROOT + os.sep)
 
 
+def _reject_unsafe_shard_index(index_path):
+    """Refuse an index whose weight_map points outside the directory it sits in.
+
+    Raised rather than silently rewritten: an index naming a shard the merge
+    refused to copy is inconsistent whatever we do with it, and a quiet rewrite
+    would hand the user an export whose tensors no longer resolve.
+    """
+    try:
+        with open(index_path, "r", encoding = "utf-8") as file:
+            index_data = json.load(file)
+    except Exception:
+        # An index we cannot read is not one we can vouch for, but it is also not
+        # the traversal being guarded against; leave it to the reader that needs it.
+        return
+    weight_map = index_data.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return
+    unsafe = sorted({
+        str(value) for value in weight_map.values()
+        if not _shard_name_stays_inside(value)
+    })
+    if unsafe:
+        raise RuntimeError(
+            f"Unsloth: Refusing to export {index_path} because its weight_map names "
+            f"{len(unsafe)} shard path(s) outside the model directory: "
+            f"{', '.join(repr(name) for name in unsafe[:5])}."
+        )
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -3403,6 +3432,12 @@ def merge_and_overwrite_lora(
             if safe_tensor_index_files:
                 local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
+                    # Filtering the in-memory shard list is not enough on its own: the
+                    # index itself is what a later from_pretrained reads, and
+                    # get_checkpoint_shard_files joins its raw weight_map values onto
+                    # the model directory. Copying it verbatim would export a file that
+                    # still points outside the directory the user asked for.
+                    _reject_unsafe_shard_index(local_index_path)
                     try:
                         shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
                     except shutil.SameFileError:

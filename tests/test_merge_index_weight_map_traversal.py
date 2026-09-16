@@ -335,3 +335,38 @@ def test_a_nested_shard_name_is_preserved_not_collapsed(monkeypatch, tmp_path):
     assert nested in shard_names, (
         f"the nested shard name was not preserved; the merge saw {shard_names!r}"
     )
+
+
+def test_a_mixed_index_is_not_exported_verbatim(monkeypatch, tmp_path):
+    """An index with good shards plus one escaping entry must not be copied out.
+
+    Filtering the in-memory list still left `model.safetensors.index.json` itself
+    copied verbatim whenever the remaining shards kept it nonempty, so the export
+    carried a map that a later `from_pretrained` would join raw. The whole index
+    is refused instead.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+
+    shadow = tmp_path / "ns" / "base"
+    shadow.mkdir(parents = True)
+    index = {
+        "metadata"   : {"total_size" : 8},
+        "weight_map" : {
+            "a.weight" : "model-00001-of-00002.safetensors",
+            "b.weight" : "weights/model-00002-of-00002.safetensors",
+            "c.weight" : f"../../escaped/{PAYLOAD}",
+        },
+    }
+    index_path = shadow / "model.safetensors.index.json"
+    with open(index_path, "w", encoding = "utf-8") as f:
+        json.dump(index, f)
+
+    with pytest.raises(RuntimeError, match = "outside the model directory"):
+        saving_utils._reject_unsafe_shard_index(str(index_path))
+
+    # The two contained names, including the nested one, are not what triggered it.
+    del index["weight_map"]["c.weight"]
+    with open(index_path, "w", encoding = "utf-8") as f:
+        json.dump(index, f)
+    saving_utils._reject_unsafe_shard_index(str(index_path))
