@@ -536,3 +536,30 @@ def test_an_undeletable_checked_hash_pyc_is_refused(cache_dir, monkeypatch):
         assert os.path.abspath(module.__file__) != os.path.abspath(str(source_path)), (
             "recovery should have imported from somewhere other than the poisoned cache"
         )
+
+
+def test_a_planted_package_does_not_shadow_the_verified_module(cache_dir):
+    """A `<name>/__init__.py` beside the verified source must not be imported.
+
+    The digest is checked against `<name>.py`, but import_module resolves by
+    name and a regular package beats a module, so the verification passes and
+    the package runs. No race is needed: the directory can just be sitting there.
+    """
+    name = "UnslothFailClosedProbeShadowPkg"
+
+    first = _emit(name)
+    assert first.probe() == "genuine"
+
+    package = cache_dir / name
+    package.mkdir()
+    (package / "__init__.py").write_text(_PLANTED_SOURCE)
+
+    sys.modules.pop(name, None)
+    try:
+        module = _emit(name)
+    except Exception:
+        module = None
+
+    assert not _planted_ran(), "the planted package was imported and executed"
+    if module is not None:
+        assert module.probe() == "genuine"

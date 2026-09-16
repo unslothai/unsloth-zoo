@@ -1238,6 +1238,24 @@ def _bytecode_would_be_used(function_location, bytecode_location):
     return mtime == int(source.st_mtime) & 0xFFFFFFFF and size == source.st_size & 0xFFFFFFFF
 pass
 
+def _reject_shadowing_import_candidates(compile_folder, name):
+    """Refuse a cache entry that would win the import over the verified file.
+
+    The digest is checked against `<name>.py`, but import_module() resolves by
+    name, and a regular package beats a module of the same name. A planted
+    `<name>/__init__.py` beside the verified source is therefore imported and
+    executed with the verification having passed, and it needs no race: the
+    directory can simply be sitting there. Nothing here ever creates one, so its
+    presence is reason enough to stop.
+    """
+    candidate = os.path.join(compile_folder, name)
+    if os.path.isdir(candidate):
+        raise RuntimeError(
+            f"Unsloth: Refusing to import {name} because {candidate} would be "
+            f"imported instead of the verified source beside it."
+        )
+
+
 def _remove_compiled_cache_bytecode(function_location):
     """Remove this rank's pyc before importing verified source.
 
@@ -1939,6 +1957,7 @@ def create_new_function(
                 # Try standard import
                 _verify_cache_digest_under_lock(target_name, expected_digest)
                 _remove_compiled_cache_bytecode(target_name)
+                _reject_shadowing_import_candidates(compile_folder, name)
                 importlib.invalidate_caches()
                 new_module = importlib.import_module(name)
                 return new_module, old_path
