@@ -1715,6 +1715,17 @@ _UNSLOTH_BRANDING_LINE = b"self.metadata.quantized_by = 'Unsloth'"
 # idempotency marker for the same reason: it edits the in-memory entrypoint
 # and has no marker comment of its own.
 _GGUF_GUARD_LINE = b"except AttributeError: gguf."
+# One guard as this patch writes it, so the names already covered can be read back out of a
+# converter that has been through here before. Anchored on the `except` half rather than the
+# `try` half: `try: gguf.X` is also what the scan below would find as a REFERENCE, and a
+# pattern that matched both could not tell "already guarded" from "needs guarding".
+_GGUF_GUARD_PATTERN = re.compile(rb"except AttributeError: gguf\.([\.A-Z_0-9]{3,}) = None")
+# The whole guard, try half included, so the reference scan can be run over a converter with
+# the previous patch removed. Without this the scan finds `gguf.X` inside the guards it wrote
+# last time and every already-guarded name reads as a fresh reference.
+_GGUF_GUARD_BLOCK_PATTERN = re.compile(
+    rb"try: gguf\.[\.A-Z_0-9]{3,}\r?\n?except AttributeError: gguf\.[\.A-Z_0-9]{3,} = None\r?\n?"
+)
 _BRANDING_PATTERN = re.compile(
     rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
     flags = re.MULTILINE,
@@ -2087,17 +2098,30 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         logger.info("Unsloth: Applying patches...")
         # Patch 1: gguf Attribute Handling
         try:
-            archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", patched_content)))
+            # Scan with any previous patch's guards taken out, not with them left in. The
+            # guards spell `gguf.X` themselves, so a scan over the patched file finds every
+            # name it already covers and re-inserts the whole block, which is why this used
+            # to bail out on the first guard line it saw. Bailing out is too blunt: one
+            # pre-existing guard then suppressed guarding for EVERY name, so a converter
+            # updated to reference a new `gguf` enum after it had been patched once kept
+            # that enum unguarded and still raised AttributeError on an older `gguf`.
+            _unguarded_source = _GGUF_GUARD_BLOCK_PATTERN.sub(b"", patched_content)
+            archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", _unguarded_source)))
             archs = [x.decode("utf-8") for x in archs if not x.startswith(b"_")]
-            if _GGUF_GUARD_LINE in patched_content:
-                # Already guarded. Without this the scan finds the `gguf.X` names
-                # inside the guards it inserted last time and inserts the whole block
-                # again, so the converter grows one copy per patch. Harmless (the
-                # guards are idempotent assignments) but it is not convergence, and
-                # upstream never ships this line, so a pristine checkout is unaffected.
+            _already_guarded = {
+                name.decode("utf-8")
+                for name in _GGUF_GUARD_PATTERN.findall(patched_content)
+            }
+            # Sorted, so a re-patch writes the same bytes in the same order and the result
+            # is comparable run to run rather than dependent on set iteration.
+            archs = sorted(name for name in archs if name not in _already_guarded)
+            if not archs and _GGUF_GUARD_LINE in patched_content:
+                # Everything this scan can see is already covered, so there is nothing to
+                # add and the file converges: a second run over a patched converter writes
+                # the same bytes rather than growing one copy of the block per patch.
                 logger.info(
-                    "Unsloth: gguf attribute guards already present in the converter "
-                    "(idempotent skip)."
+                    "Unsloth: gguf attribute guards already cover every referenced "
+                    "attribute (idempotent skip)."
                 )
             elif archs:
                 _eol = _dominant_newline(patched_content)

@@ -999,3 +999,65 @@ def test_a_pristine_converter_is_still_branded(tmp_path, monkeypatch):
     assert written.count(b"self.metadata.quantized_by = 'Unsloth'") == 1
     assert b"self.metadata.repo_url = 'https://huggingface.co/unsloth'" in written
     assert b"self.metadata.tags = ['unsloth', 'llama.cpp']" in written
+
+
+def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
+    tmp_path, monkeypatch
+):
+    """One pre-existing guard must not suppress guarding for every other name.
+
+    The convergence guard keyed on a single substring: seeing `except AttributeError: gguf.`
+    anywhere meant "this patch is complete". A converter that has been through the patcher
+    once and is then updated to reference a new `gguf` enum therefore kept that enum
+    unguarded, which is the exact AttributeError on an older `gguf` that this patch exists to
+    prevent, and it is now silent because the file looks patched.
+    """
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(); second.mkdir()
+
+    once, _ = _drive_patcher(llama_cpp, first, monkeypatch, _monolith_with_num_experts(12))
+    assert b"except AttributeError: gguf." in once, "fixture did not reach the guard patch"
+    assert b"gguf.LATER_ENUM" not in once
+
+    # The update: the same patched converter, now referencing an enum that did not exist
+    # when it was patched. Placed in a body line, the way a real converter reference is.
+    updated = once.replace(
+        b"        return n_experts\n",
+        b"        _later = gguf.LATER_ENUM\n        return n_experts\n",
+        1,
+    )
+    assert updated != once, "the fixture rewrite did not apply"
+
+    twice, _ = _drive_patcher(llama_cpp, second, monkeypatch, updated)
+    ast.parse(twice)
+    assert b"except AttributeError: gguf.LATER_ENUM = None" in twice, (
+        "the new reference was left unguarded because the file already held a guard"
+    )
+    # And only that one is added: the names already covered are not guarded twice, so the
+    # converter still converges rather than growing a copy of the block per patch.
+    assert twice.count(b"except AttributeError: gguf.MODEL_ARCH.LLAMA = None") == 1
+    assert twice.count(b"except AttributeError: gguf.LATER_ENUM = None") == 1
+
+    # A third pass over that output changes nothing, which is the property the blunt
+    # substring check was bought with and the one this must not give up.
+    third = tmp_path / "third"
+    third.mkdir()
+    thrice, _ = _drive_patcher(llama_cpp, third, monkeypatch, twice)
+    assert thrice == twice
+
+
+def test_a_converter_with_nothing_new_is_still_byte_identical(tmp_path, monkeypatch):
+    """The convergence property the old guard bought has to survive the change.
+
+    Per-attribute detection is only safe if re-patching a file whose references are all
+    covered writes the same bytes: otherwise every conversion grows the converter.
+    """
+    llama_cpp = _load_llama_cpp_module()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(); second.mkdir()
+    once, _ = _drive_patcher(llama_cpp, first, monkeypatch, _monolith_with_num_experts(12))
+    twice, _ = _drive_patcher(llama_cpp, second, monkeypatch, once)
+    assert twice == once
