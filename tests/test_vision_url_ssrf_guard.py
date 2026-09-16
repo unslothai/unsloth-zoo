@@ -121,6 +121,10 @@ class _FakeSession:
     def __init__(self):
         type(self).instances.append(self)
         self.closed = False
+        self.mounted = {}
+
+    def mount(self, prefix, adapter):
+        self.mounted[prefix] = adapter
 
     def get(self, url, **kwargs):
         return vision_utils.requests.get(url, **kwargs)
@@ -532,6 +536,8 @@ def test_one_session_spans_the_whole_redirect_chain(monkeypatch, public_dns, _fa
     assert image.size[0] > 0
     assert len(_fake_session.instances) == 1, "every hop must share one session"
     assert _fake_session.instances[0].closed, "the session must be closed"
+    assert sorted(_fake_session.instances[0].mounted) == ["http://", "https://"], \
+        "both schemes must go through the address-pinning adapter"
 
 
 def test_video_backend_missing_leaves_no_download(monkeypatch, public_dns, tmp_path):
