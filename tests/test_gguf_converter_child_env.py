@@ -789,6 +789,14 @@ def test_the_installed_wheel_is_not_probed_when_the_request_already_works(
     monkeypatch.setattr(mod, "_installed_gguf_tree", _trap)
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
 
+    # The converter gets its own sibling gguf-py carrying the symbol it needs, which
+    # is the tree every llama.cpp entrypoint puts on sys.path ahead of anything else.
+    # Without it this test asserts on whatever `gguf` the developer's venv happens to
+    # ship: in an environment with no `gguf` wheel the requested pair does NOT work,
+    # the resolver legitimately reaches for the installed tree, and the assertion
+    # below fails for a reason that has nothing to do with the behaviour under test.
+    _make_gguf_py(tmp_path, symbols=("GGUFWriter",))
+
     converter = tmp_path / "convert_hf_to_gguf.py"
     converter.write_text("import gguf\nX = gguf.GGUFWriter\n")
     chosen, _pin, _report = mod._resolve_converter_and_gguf(str(converter), sys.executable)
