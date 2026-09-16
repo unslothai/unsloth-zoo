@@ -52,7 +52,14 @@ dependencies = [
     "mlx-vlm>=0.4.4,<0.7.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
-    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
+    # Floor is 4.52.4, not 4.51.3: peft declares no transformers floor of its own (a
+    # bare `transformers` on 0.18.0 through 0.21.0), and peft 0.18.0 -- the peft floor
+    # below -- imports `GradientCheckpointingLayer` from `transformers.modeling_layers`
+    # at peft/tuners/lora/model.py:26, a module that first exists in transformers
+    # 4.52.0. At 4.51.3 `import unsloth_zoo.saving_utils` raised ModuleNotFoundError
+    # after a resolve that satisfied every declared constraint. 4.52.4 rather than
+    # 4.52.0 because 4.52.0 through 4.52.3 were already rejected by name.
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
     "sentencepiece>=0.2.0",
     "tqdm",
@@ -97,7 +104,8 @@ mlx = [
 core = [
     "packaging>=24.1",
     "tyro",
-    "transformers>=4.51.3,!=4.52.0,!=4.52.1,!=4.52.2,!=4.52.3,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
+    # Floor rationale as above: peft 0.18.0 needs transformers.modeling_layers, 4.52.0+.
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,<4.4.0",
     "sentencepiece>=0.2.0",
     "tqdm",
