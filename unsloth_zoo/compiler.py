@@ -3896,17 +3896,9 @@ pass
 """
 
 
-# How PEFT spells the cast of the LoRA input to the LoRA dtype, as
-# (statement, expression) so the guarded rewrite below never has to split the
-# statement back apart. Checked against the published wheels: PEFT 0.18.0,
-# 0.19.0, 0.19.1 and 0.20.0 use `_cast_input_dtype` in every patched `Linear*`
-# forward (layer.Linear, bnb.Linear4bit, bnb.Linear8bitLt, gptq, hqq, eetq, awq,
-# aqlm, te, tp_layer) and only `peft.tuners.lora.variants`, which is not patched
-# here, still carries the bare `.to()` form. The `.to()` spelling is kept for
-# older releases and for any layer that has not moved yet. If PEFT renames both,
-# every replacement below becomes a no-op and PEFT's own cast simply stays, which
-# is the safe direction; test_lora_input_cast_rewrite.py fails loudly on that
-# drift rather than letting it pass silently.
+# Both spellings PEFT uses for the LoRA input cast, as (statement, expression).
+# A rename of both no-ops every replacement, leaving PEFT's own cast, which is the safe
+# direction; test_lora_input_cast_rewrite.py fails loudly on that drift.
 _LORA_INPUT_CASTS = (
     (
         "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
@@ -3923,24 +3915,11 @@ def _patch_lora_input_cast(source, force_float32 = None):
     # All Unsloth Zoo code licensed under LGPLv3
     """Rewrites PEFT's LoRA input cast inside the active-adapter loop.
 
-    `force_float32` defaults to reading UNSLOTH_FORCE_FLOAT32 so the caller and
-    the tests exercise the same switch.
-
-    UNSLOTH_FORCE_FLOAT32 unset: add an explicit cast of both `result` and `x`
-    when autocast is off. A forward that already branches on autocast itself
-    (the bitsandbytes layers) keeps PEFT's own handling untouched.
-
-    UNSLOTH_FORCE_FLOAT32 set: the vanilla LoRA branch is rewritten into
-    `lora_forward`, which casts `x` itself, so PEFT's cast is redundant there and
-    used to be deleted outright. LoRA variants (DoRA, QALoRA, aLoRA) keep PEFT's
-    own branch and are handed `x` directly, so deleting the cast left a float16
-    activation meeting float32 LoRA weights and the matmul raised "expected mat1
-    and mat2 to have the same dtype" (unsloth#4127). Keep the cast, gated on this
-    adapter actually using a variant, so the vanilla path stays byte for byte what
-    it was. `active_adapter` is the loop variable PEFT's cast already sits under in
-    every patched layer, so the guard is always in scope where the cast was, and
-    `lora_variant` is read through `getattr` because the layers that have no
-    variant branch at all must not start raising AttributeError here.
+    Without UNSLOTH_FORCE_FLOAT32: cast `result` and `x` when autocast is off, leaving a
+    forward that branches on autocast itself alone. With it: the vanilla branch becomes
+    the self-casting `lora_forward`, but variants keep PEFT's branch and take `x` directly,
+    so deleting the cast left float16 meeting float32 LoRA weights (unsloth#4127). Hence
+    the variant-gated cast, with `getattr` for layers that have no variant branch.
     """
     if force_float32 is None:
         force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0"

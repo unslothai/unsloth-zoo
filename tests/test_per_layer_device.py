@@ -16,13 +16,8 @@
 
 """verify_and_set_device must publish a usable device for every layer (#3538).
 
-`torch.device("cpu").index` and `torch.device("meta").index` are both None, and
-`unsloth.models._utils.move_to_device` rejects None with
-"ValueError: Invalid target device: None", which is what a CPU-offloaded layer
-used to produce the moment one of the pipeline-parallel inference readers in
-unsloth reached it. These tests pin both halves of the contract: nothing
-unusable ever lands on the attributes, and an indexed accelerator is recorded
-exactly as before. CPU-only, no GPU required.
+CPU and meta both have index None, which `move_to_device` rejects with "Invalid target
+device: None" the moment a pipeline-parallel reader in unsloth reaches the layer.
 """
 
 from __future__ import annotations
@@ -36,8 +31,6 @@ from unsloth_zoo.patching_utils import verify_and_set_device
 
 
 class _FakeLayer:
-    """The only surface verify_and_set_device touches is parameters()."""
-
     def __init__(self, *devices):
         self._devices = devices
 
@@ -47,12 +40,7 @@ class _FakeLayer:
 
 
 def _move_to_device_accepts(target_device) -> bool:
-    """The exact type contract of unsloth.models._utils.move_to_device:2542.
-
-    Copied rather than imported so this test does not need `unsloth` installed,
-    which it is not on the CPU-only lanes. test_per_layer_device_readers.py on
-    the unsloth side asserts against the real function.
-    """
+    """move_to_device's type contract, copied so this does not need `unsloth` installed."""
     return isinstance(target_device, (int, str, torch.device))
 
 
@@ -83,12 +71,7 @@ def test_both_attributes_are_usable(case):
 
 @pytest.mark.parametrize("device_string", ["cuda:0", "cuda:2", "xpu:1"])
 def test_indexed_accelerators_keep_the_integer_index(device_string):
-    """The CUDA path is untouched: still an int, still a valid tuple subscript.
-
-    Readers in unsloth (models/gemma.py, gemma2.py, cohere.py) use this value to
-    pick their float32 layernorm buffer out of a per-device tuple, so the type
-    matters as much as the value.
-    """
+    """Still an int: readers subscript a per-device tuple of layernorm buffers with it."""
     layer = _FakeLayer(device_string)
     verify_and_set_device(layer)
 
@@ -101,7 +84,6 @@ def test_indexed_accelerators_keep_the_integer_index(device_string):
 
 
 def test_cpu_index_does_not_silently_become_cuda_zero():
-    """`device.index or 0` would move a CPU layer's activations onto cuda:0."""
     layer = _FakeLayer("cpu")
     verify_and_set_device(layer)
 
@@ -116,7 +98,6 @@ def test_a_layer_on_two_devices_still_raises():
 
 
 def test_real_module_on_cpu():
-    """End to end on a real nn.Module, which is what patching_utils calls it with."""
     layer = torch.nn.Linear(4, 4)
     verify_and_set_device(layer)
 
@@ -137,14 +118,8 @@ def test_real_module_on_cuda():
 
 
 def test_a_meta_layer_publishes_nothing_rather_than_meta():
-    """meta satisfies every type check the readers make and is still fatal.
-
-    `tensor.to("meta")` succeeds and discards the data, and mixing the result with a real
-    tensor propagates meta instead of raising, so publishing meta would turn the #3538
-    ValueError into a decode that runs to completion and returns nothing. With no
-    accelerate hook to ask, the attributes are left unset and each reader keeps its
-    historical `getattr(layer, ..., 0)` default.
-    """
+    """meta passes every reader's type check and still propagates through matmul rather
+    than raising, so publishing it turns the #3538 ValueError into a silent empty decode."""
     activation = torch.ones(2, 4)
     assert activation.to("meta").device.type == "meta"
     assert torch.matmul(activation.to("meta"), torch.ones(4, 4)).device.type == "meta"
@@ -157,8 +132,7 @@ def test_a_meta_layer_publishes_nothing_rather_than_meta():
 
 
 def test_a_meta_layer_publishes_the_accelerate_execution_device():
-    """accelerate's AlignDevicesHook sends the layer's own inputs to `execution_device`
-    in pre_forward, so that is where this layer's activations belong."""
+    """AlignDevicesHook sends the layer's inputs there, so that is where they belong."""
     layer = _FakeLayer("meta")
     layer._hf_hook = SimpleNamespace(execution_device = "cpu")
     verify_and_set_device(layer)
@@ -176,8 +150,7 @@ def test_a_meta_layer_publishes_the_accelerate_execution_device():
 
 @pytest.mark.parametrize("execution_device", [None, "meta", "not-a-device", object()])
 def test_a_hook_that_cannot_name_a_device_publishes_nothing(execution_device):
-    """accelerate sets execution_device to meta while a model is still being built and
-    the field is optional, so neither is an answer."""
+    """execution_device is optional and is itself "meta" mid-build."""
     layer = _FakeLayer("meta")
     layer._hf_hook = SimpleNamespace(execution_device = execution_device)
     verify_and_set_device(layer)
@@ -186,7 +159,6 @@ def test_a_hook_that_cannot_name_a_device_publishes_nothing(execution_device):
 
 
 def test_a_stale_pair_is_cleared_when_the_layer_goes_back_to_meta():
-    """A layer materialised and then released must not keep describing where it was."""
     layer = _FakeLayer("cpu")
     verify_and_set_device(layer)
     assert layer._per_layer_device == torch.device("cpu")
@@ -198,7 +170,6 @@ def test_a_stale_pair_is_cleared_when_the_layer_goes_back_to_meta():
 
 
 def test_the_non_meta_placements_are_untouched():
-    """The control: nothing above may change an ordinary layer."""
     for device_string, expected in (("cuda:3", 3), ("cpu", "cpu"), ("xpu:1", 1)):
         layer = _FakeLayer(device_string)
         verify_and_set_device(layer)
@@ -207,19 +178,12 @@ def test_the_non_meta_placements_are_untouched():
 
 
 def test_a_chained_hook_is_unwrapped_to_the_alignment_device():
-    """accelerate chains hooks, it does not replace them.
-
-    `add_hook_to_module(module, hook, append=True)` stores `SequentialHook(old, new)`, and
-    `attach_align_device_hook` appends the `AlignDevicesHook` exactly that way on every
-    offloaded submodule. `SequentialHook` keeps the chain in `.hooks` and defines no
-    `execution_device`, so reading the attribute off the outer hook answered None for the
-    offloaded, meta-resident layers this lookup exists for, and the readers fell back to
-    device 0 -- the wrong GPU whenever the nested hook names another one.
-    """
+    """`append=True` stores `SequentialHook(old, new)`, which defines no
+    `execution_device`, so the outer hook alone answered None and readers fell to device 0."""
     outer = SimpleNamespace(
         hooks = (
-            SimpleNamespace(),                              # a hook with no device to give
-            SimpleNamespace(execution_device = 1),          # the AlignDevicesHook
+            SimpleNamespace(),
+            SimpleNamespace(execution_device = 1),
         )
     )
     layer = _FakeLayer("meta")
@@ -231,9 +195,7 @@ def test_a_chained_hook_is_unwrapped_to_the_alignment_device():
 
 
 def test_a_nested_chain_is_followed_and_the_outermost_real_device_wins():
-    """Chains nest: appending twice gives SequentialHook(SequentialHook(a, b), c). The
-    first hook that names a real device is the answer, and a meta one is skipped rather
-    than ending the search."""
+    """The first hook naming a REAL device wins; a meta one does not end the search."""
     layer = _FakeLayer("meta")
     layer._hf_hook = SimpleNamespace(
         hooks = (
@@ -252,8 +214,6 @@ def test_a_nested_chain_is_followed_and_the_outermost_real_device_wins():
 
 
 def test_a_chain_that_names_no_device_still_publishes_nothing():
-    """NEGATIVE CONTROL: unwrapping must not invent an answer. A chain of hooks with no
-    usable execution_device leaves the attributes unset, as an absent hook does."""
     layer = _FakeLayer("meta")
     layer._hf_hook = SimpleNamespace(
         hooks = (
@@ -269,7 +229,6 @@ def test_a_chain_that_names_no_device_still_publishes_nothing():
 
 
 def test_a_self_referential_hook_chain_terminates():
-    """The chain is data from another library; nothing here needs to trust it."""
     loop = SimpleNamespace()
     loop.hooks = (loop,)
     layer = _FakeLayer("meta")

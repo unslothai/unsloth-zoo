@@ -16,17 +16,9 @@
 
 """Source-level tests for the LoRA input cast rewrite in compiler.py (#4127).
 
-`patch_lora_forwards` used to delete PEFT's `x = <cast to lora_A dtype>` line
-outright when UNSLOTH_FORCE_FLOAT32 was set, because the vanilla LoRA branch is
-rewritten into `lora_forward`, which casts internally. LoRA variants (DoRA,
-QALoRA, aLoRA) keep PEFT's own branch and were then handed an uncast `x`, so
-DoRA under forced float32 died in `peft/tuners/lora/dora.py` with "expected mat1
-and mat2 to have the same dtype, but got: c10::Half != float".
-
-These tests pin the rewrite at the source level, for both values of
-UNSLOTH_FORCE_FLOAT32 and for both spellings PEFT has used for the cast, and
-execute the rewritten forward to prove the guard routes the cast to the variant
-branch only. CPU-only, no model download.
+Deleting PEFT's cast outright under UNSLOTH_FORCE_FLOAT32 is safe for vanilla LoRA, which
+is rewritten into the self-casting `lora_forward`, but handed variants (DoRA, QALoRA,
+aLoRA) an uncast `x` and killed DoRA with "c10::Half != float".
 """
 
 from __future__ import annotations
@@ -47,11 +39,7 @@ from unsloth_zoo.compiler import (
 )
 
 
-# The three shapes the rewrite has to handle, copied from the published wheels.
-#
-# LAYER_LINEAR: peft/tuners/lora/layer.py, class Linear. Identical in PEFT
-# 0.18.0, 0.19.0, 0.19.1 and 0.20.0. The cast sits directly in the
-# active-adapter loop, one line above the variant branch.
+# peft/tuners/lora/layer.py, class Linear: the cast sits directly in the adapter loop.
 LAYER_LINEAR = """\
     def forward(self, x, *args, **kwargs):
         self._check_forward_args(x, *args, **kwargs)
@@ -89,11 +77,8 @@ LAYER_LINEAR = """\
         return result
 """
 
-# BNB_LINEAR4BIT: peft/tuners/lora/bnb.py, class Linear4bit, same in 0.18.0
-# through 0.20.0. The cast is nested one level deeper, under
-# `if requires_conversion:`, and is the last statement of that block, so a
-# rewrite that removes the line rather than replacing it has to keep the block
-# non-empty. It is also the layer every 4-bit QLoRA run goes through.
+# peft/tuners/lora/bnb.py, class Linear4bit: the cast is the LAST statement of an
+# `if requires_conversion:` block, so removing the line would leave it empty.
 BNB_LINEAR4BIT = """\
     def forward(self, x, *args, **kwargs):
         self._check_forward_args(x, *args, **kwargs)
@@ -135,10 +120,7 @@ BNB_LINEAR4BIT = """\
         return result
 """
 
-# LEGACY_TO_SPELLING: the bare `.to()` form. PEFT moved the patched Linear
-# layers onto `_cast_input_dtype` before 0.18.0, but this spelling is still the
-# one `peft/tuners/lora/variants.py` uses, and compiler.py has always carried
-# both, so the rewrite is pinned against both.
+# The bare `.to()` form, still what peft/tuners/lora/variants.py uses.
 LEGACY_TO_SPELLING = LAYER_LINEAR.replace(
     "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
     "x = x.to(lora_A.weight.dtype)",
@@ -154,13 +136,11 @@ CAST_STATEMENTS = tuple(statement for statement, _ in _LORA_INPUT_CASTS)
 
 
 def _dedent_like_compiler(source: str) -> str:
-    """The dedent `patch_lora_forwards` applies to inspect.getsource output."""
     spaces = source.find("def")
     return "\n".join(line[spaces:] for line in source.split("\n"))
 
 
 def _assigns_x(node: ast.Assign) -> bool:
-    """Whether this assignment binds `x`, on its own or as part of a tuple."""
     for target in node.targets:
         if isinstance(target, ast.Name) and target.id == "x":
             return True
@@ -172,12 +152,8 @@ def _assigns_x(node: ast.Assign) -> bool:
 
 
 def _cast_assignments_in_adapter_loop(source: str) -> list[str]:
-    """Every assignment to `x` that casts to the LoRA dtype, if and only if it
-    is lexically inside a `for active_adapter in ...` loop.
-
-    A cast placed outside that loop would compile and then raise NameError on
-    `active_adapter` at the first forward, so scope is asserted, not assumed.
-    """
+    """Casts of `x` to the LoRA dtype inside a `for active_adapter` loop. Outside one,
+    the guard compiles and then raises NameError at the first forward."""
     tree = ast.parse(source)
     found: list[str] = []
 
@@ -202,7 +178,6 @@ def _cast_assignments_in_adapter_loop(source: str) -> list[str]:
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 @pytest.mark.parametrize("force_float32", ["0", "1"])
 def test_cast_survives_for_every_shape_and_switch(shape, force_float32, monkeypatch):
-    """The rewritten forward still casts x to the LoRA dtype, in scope, and parses."""
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", force_float32)
     source = _dedent_like_compiler(SHAPES[shape])
     assert any(statement in source for statement in CAST_STATEMENTS), (
@@ -211,7 +186,7 @@ def test_cast_survives_for_every_shape_and_switch(shape, force_float32, monkeypa
 
     rewritten = _patch_lora_input_cast(source)
     rewritten = rewritten.replace("def forward", "def unsloth_forward", 1)
-    ast.parse(rewritten)  # raises SyntaxError on a broken rewrite
+    ast.parse(rewritten)
 
     assert "lora_A.weight.dtype" in rewritten, (
         f"{shape} under UNSLOTH_FORCE_FLOAT32={force_float32}: the cast to the "
@@ -226,7 +201,6 @@ def test_cast_survives_for_every_shape_and_switch(shape, force_float32, monkeypa
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_forced_float32_guards_the_cast_on_the_variant(shape, monkeypatch):
-    """Under forced float32 the surviving cast is gated on this adapter using a variant."""
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     rewritten = _patch_lora_input_cast(_dedent_like_compiler(SHAPES[shape]))
     casts = _cast_assignments_in_adapter_loop(rewritten)
@@ -236,19 +210,16 @@ def test_forced_float32_guards_the_cast_on_the_variant(shape, monkeypatch):
         f"casts inside lora_forward, is untouched: {casts[0]}"
     )
     assert "active_adapter in" in casts[0], casts[0]
-    # No cast spelling may be left deleted outright.
     for statement in CAST_STATEMENTS:
         assert statement not in rewritten or "lora_variant" in rewritten
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_unforced_path_is_unchanged_by_the_fix(shape, monkeypatch):
-    """With UNSLOTH_FORCE_FLOAT32 unset the rewrite is the pre-existing one."""
     monkeypatch.delenv("UNSLOTH_FORCE_FLOAT32", raising=False)
     source = _dedent_like_compiler(SHAPES[shape])
     rewritten = _patch_lora_input_cast(source)
     if "torch.is_autocast_enabled()" in source:
-        # bitsandbytes layers branch on autocast themselves and are left alone.
         assert rewritten == source
     else:
         assert "if not torch.is_autocast_enabled(): result, x = " in rewritten
@@ -256,8 +227,6 @@ def test_unforced_path_is_unchanged_by_the_fix(shape, monkeypatch):
 
 
 class _Recorder:
-    """Stands in for lora_A / lora_B: records the dtype it was called with."""
-
     def __init__(self, dtype):
         self.weight = SimpleNamespace(dtype=dtype)
         self.seen: list[torch.dtype] = []
@@ -277,7 +246,6 @@ class _RecordingVariant:
 
 
 def _run_rewritten_forward(source: str, *, variant: bool):
-    """exec the rewritten forward and call it, returning the dtype each branch saw."""
     namespace: dict = {"torch": torch}
     exec(textwrap.dedent(source), namespace)
     forward = namespace["unsloth_forward"]
@@ -304,7 +272,6 @@ def _run_rewritten_forward(source: str, *, variant: bool):
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_variant_branch_receives_a_cast_activation(shape, monkeypatch):
-    """The DoRA half of #4127: the variant sees x in the LoRA dtype, not float16."""
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     rewritten = _patch_lora_input_cast(_dedent_like_compiler(SHAPES[shape]))
     rewritten = rewritten.replace("def forward", "def unsloth_forward", 1)
@@ -332,7 +299,6 @@ def test_vanilla_branch_is_not_cast_under_forced_float32(shape, monkeypatch):
 
 
 def test_patch_lora_forwards_routes_through_the_helper():
-    """The caller must not grow a second copy of the cast rewrite."""
     source = inspect.getsource(patch_lora_forwards)
     assert "_patch_lora_input_cast(source)" in source
     assert 'source.replace(replace, "")' not in source, (
@@ -341,7 +307,6 @@ def test_patch_lora_forwards_routes_through_the_helper():
 
 
 def test_installed_peft_still_spells_the_cast_the_way_we_match():
-    """Drift detector: a PEFT that renames the cast makes the rewrite a silent no-op."""
     peft = pytest.importorskip("peft")
     from unsloth_zoo.peft_utils import get_lora_layer_modules
 
@@ -377,7 +342,6 @@ def test_installed_peft_still_spells_the_cast_the_way_we_match():
 
 
 def test_cast_spelling_table_is_well_formed():
-    """Each entry is the statement plus exactly the expression it assigns."""
     for statement, expression in _LORA_INPUT_CASTS:
         assert statement == f"x = {expression}"
         assert re.search(r"lora_A\.weight\.dtype", expression)

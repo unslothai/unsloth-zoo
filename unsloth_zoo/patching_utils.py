@@ -312,10 +312,8 @@ pass
 def _execution_device_for_meta_layer(module):
     """Where accelerate will actually run a layer whose weights are still on meta.
 
-    `module._hf_hook.execution_device` is accelerate's own answer to that question and is
-    what it sends the layer's inputs to. It is typed `int | str | torch.device | None` and
-    accelerate itself checks for a literal "meta" there while a model is being built, so
-    every one of those shapes is handled and only a real device is returned.
+    `execution_device` is typed `int | str | torch.device | None` and can itself be "meta"
+    mid-build, so only a real device is returned.
     """
     for hook in _iter_accelerate_hooks(getattr(module, "_hf_hook", None)):
         execution_device = getattr(hook, "execution_device", None)
@@ -331,17 +329,9 @@ def _execution_device_for_meta_layer(module):
 
 
 def _iter_accelerate_hooks(hook, _depth = 0):
-    """`hook` and every hook nested inside it, outermost first.
-
-    accelerate chains rather than replaces: `add_hook_to_module(module, hook, append=True)`
-    stores `SequentialHook(old_hook, new_hook)`, and `attach_align_device_hook` appends the
-    `AlignDevicesHook` that way on every offloaded submodule. `SequentialHook` holds the
-    chain in `.hooks` and defines no `execution_device` of its own, so reading the attribute
-    off the outer hook answers None for exactly the offloaded, meta-resident layers this
-    lookup exists to serve, and `verify_and_set_device` then publishes nothing and leaves
-    the readers on their historical device-0 default. Depth-limited because a hook chain is
-    data from another library and nothing here needs to trust it to be acyclic.
-    """
+    """`hook` and every hook nested inside it, outermost first: accelerate chains rather
+    than replaces, and the `SequentialHook` wrapper defines no `execution_device` of its
+    own. Depth-limited, since the chain is another library's data."""
     if hook is None or _depth > 8:
         return
     yield hook
@@ -354,31 +344,12 @@ def verify_and_set_device(module,):
     Verify that all parameters of a module are on the same device, and record that
     device on the module for the pipeline-parallel inference paths to read back.
 
-    Two attributes are published, deliberately:
-
-    * `_per_layer_device` is the `torch.device` itself, which is what a consumer
-      moving tensors onto the layer actually wants.
-    * `_per_layer_device_index` keeps its existing meaning and stays an index,
-      because readers in `unsloth` also use it to subscript a tuple of per-device
-      buffers, which a `torch.device` cannot do.
-
-    `torch.device("cpu").index` and `torch.device("meta").index` are both None, and
-    `unsloth.models._utils.move_to_device` rejects None, so a CPU-offloaded or
-    not-yet-materialised layer used to end every one of those readers with
-    "ValueError: Invalid target device: None" (unsloth#3538). When there is no
-    index, publish the device type instead: `move_to_device` accepts it as a
-    string and it resolves to the layer's own device, where the obvious `or 0`
-    would silently resolve to cuda:0 and move the activations off the layer.
-
-    meta is the one placement that is never published. It satisfies every type check
-    the readers make and is still not somewhere an activation may go: `tensor.to("meta")`
-    succeeds and discards the data, and `torch.matmul(meta, cuda)` returns a meta tensor
-    rather than raising, so a whole decode would run and produce nothing. accelerate
-    already answers this properly -- its `AlignDevicesHook` moves the layer's own inputs
-    with `send_to_device(args, self.execution_device)` in `pre_forward` -- so for a layer
-    parked on meta the hook's execution device is published instead. With no hook to ask,
-    nothing is published at all, which leaves each reader on its historical
-    `getattr(layer, ..., 0)` default rather than on a target that destroys the tensor.
+    `_per_layer_device_index` stays an index because readers subscript per-device tuples
+    with it. CPU and meta have index None, which `move_to_device` rejects (unsloth#3538),
+    so the device TYPE is published instead; the obvious `or 0` would move activations to
+    cuda:0. meta is never published at all: it passes every type check yet propagates
+    through matmul rather than raising, so a decode runs and returns nothing. For a meta
+    layer accelerate's execution device is published instead, or nothing if there is none.
     """
     set_of_devices = set(x.device for x in module.parameters())
     if len(set_of_devices) > 1:
@@ -387,9 +358,7 @@ def verify_and_set_device(module,):
     if device.type == "meta":
         device = _execution_device_for_meta_layer(module)
         if device is None:
-            # Publish nothing rather than meta. Clear a stale pair from an earlier call
-            # too, so a layer that was materialised and then moved back cannot leave a
-            # device behind that no longer describes it.
+            # Clear a stale pair: a layer moved back must not keep describing where it was.
             for name in ("_per_layer_device", "_per_layer_device_index"):
                 module.__dict__.pop(name, None)
             return
