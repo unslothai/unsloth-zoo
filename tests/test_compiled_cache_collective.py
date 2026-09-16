@@ -471,12 +471,16 @@ def test_undeletable_stale_bytecode_does_not_abandon_the_persistent_cache(
 def test_undeletable_usable_bytecode_still_fails_over(
     monkeypatch, compiler, probe, cache_dirs, tmp_path,
 ):
-    """A pyc CPython would still accept is the case the removal exists for.
+    """An undeletable pyc raises rather than being tolerated.
 
     Same size, same timestamp second: importlib accepts the old bytecode, so
     source-digest verification would pass while this rank executes the previous
-    implementation. Tolerating the unlink failure here is the one shape that is
-    not safe, so it must still raise rather than warn.
+    implementation.
+
+    The refusal no longer reads the pyc's invalidation mode to decide. A header
+    is as attacker-controlled as the body, so a CHECKED_HASH entry can carry the
+    expected source's hash beside foreign code and be accepted. Any pyc that
+    survives the unlink is fatal now, and this case stays covered by that.
     """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
@@ -497,7 +501,7 @@ def test_undeletable_usable_bytecode_still_fails_over(
             PermissionError("simulated locked pycache")),
     )
 
-    with pytest.raises(RuntimeError, match="Cannot remove stale bytecode"):
+    with pytest.raises(RuntimeError, match="Cannot remove bytecode"):
         compiler._remove_compiled_cache_bytecode(str(source))
 
 

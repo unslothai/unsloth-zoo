@@ -1245,10 +1245,17 @@ def _remove_compiled_cache_bytecode(function_location):
     covers the .py, but CPython can execute an unchecked-hash pyc without ever
     consulting the source beside it, so a cache holding the expected source and
     a planted pyc verifies clean and still runs foreign code.
-    An unlink failure is fatal only when the pyc would really be used: on
-    Windows os.remove raises PermissionError whenever a scanner or other
-    interpreter holds the file, and raising on that forced the whole group into
-    tempfile recovery. A pyc CPython would still accept still fails over.
+    A pyc that survives the unlink is fatal whatever its invalidation mode says.
+    The mode cannot be trusted here: an attacker who writes the pyc also writes
+    its header, so a CHECKED_HASH entry can carry source_hash(expected source)
+    beside a foreign marshalled body, and CPython validates that header, accepts
+    it, and runs the body. Reading the flags to decide would exempt exactly the
+    case being defended against.
+
+    On Windows os.remove raises PermissionError whenever a scanner or another
+    interpreter holds the file, so this does turn some benign cases fatal. That
+    is a recovery, not a crash: the caller treats the failure as an unwritable
+    cache and falls back to a node-local temp directory.
     """
     try:
         bytecode_location = importlib.util.cache_from_source(function_location)
@@ -1259,15 +1266,12 @@ def _remove_compiled_cache_bytecode(function_location):
     except FileNotFoundError:
         pass
     except OSError as error:
-        if _bytecode_would_be_used(function_location, bytecode_location):
+        if os.path.isfile(bytecode_location):
             raise RuntimeError(
-                f"Unsloth: Cannot remove stale bytecode for {function_location}: "
-                f"{error}."
+                f"Unsloth: Cannot remove bytecode for {function_location}: "
+                f"{error}. Refusing to import the source while bytecode we did "
+                f"not write survives beside it."
             ) from error
-        logger.warning_once(
-            f"Unsloth: Cannot remove bytecode for {function_location}: {error}. "
-            "Continuing, since the rewritten source no longer matches it."
-        )
 pass
 
 def _replace_compiled_cache_file(function_location, new_write_bytes):

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import pathlib
 import shutil
 import stat
 import sys
@@ -467,3 +468,71 @@ def test_planted_bytecode_beside_moe_utils_cache_copy_is_not_executed(tmp_path, 
     moe_utils._load_cached_moe_utils_module()
 
     assert not _planted_ran(), "the planted moe_utils cache bytecode was executed"
+
+
+def _plant_checked_hash_bytecode_over(source_path, payload_source):
+    """A CHECKED_HASH pyc carrying the real source's hash and a foreign body.
+
+    The invalidation mode proves nothing about the body: an attacker who writes
+    the pyc writes its header too, so CPython validates the hash against the
+    source, accepts it, and executes whatever was marshalled.
+    """
+    import py_compile
+    import struct
+
+    payload = source_path.parent / "planted_checked_payload.py"
+    payload.write_text(payload_source)
+    bytecode_location = importlib.util.cache_from_source(str(source_path))
+    os.makedirs(os.path.dirname(bytecode_location), exist_ok = True)
+    py_compile.compile(
+        str(payload),
+        cfile = bytecode_location,
+        dfile = str(source_path),
+        invalidation_mode = py_compile.PycInvalidationMode.CHECKED_HASH,
+    )
+    data = bytearray(pathlib.Path(bytecode_location).read_bytes())
+    data[8:16] = importlib.util.source_hash(source_path.read_bytes())
+    pathlib.Path(bytecode_location).write_bytes(bytes(data))
+    payload.unlink()
+    flags = struct.unpack("<I", bytes(data[4:8]))[0]
+    assert flags & 0b1 and flags & 0b10, "the planted pyc must be CHECKED_HASH"
+    return bytecode_location
+
+
+@_needs_mode_enforcement
+def test_an_undeletable_checked_hash_pyc_is_refused(cache_dir, monkeypatch):
+    """Removal failing is fatal even when the pyc claims to be checked.
+
+    Reading the invalidation mode to decide would exempt this exact case, since
+    the header is as attacker-controlled as the body.
+    """
+    name = "UnslothFailClosedProbeCheckedHash"
+
+    first = _emit(name)
+    assert first.probe() == "genuine"
+    source_path = cache_dir / f"{name}.py"
+    bytecode_location = _plant_checked_hash_bytecode_over(source_path, _PLANTED_SOURCE)
+
+    # Stand in for the pyc an attacker made undeletable.
+    def refuse_removal(path, *args, **kwargs):
+        if str(path) == str(bytecode_location):
+            raise PermissionError("simulated undeletable pycache entry")
+        return _real_remove(path, *args, **kwargs)
+    _real_remove = os.remove
+    monkeypatch.setattr(compiler.os, "remove", refuse_removal)
+
+    sys.modules.pop(name, None)
+    # The refusal does not have to surface as an exception: the caller treats an
+    # unremovable pyc as an unwritable cache and recovers into a node-local temp
+    # directory. What must hold either way is that the planted body never runs.
+    try:
+        module = _emit(name)
+    except Exception:
+        module = None
+
+    assert not _planted_ran(), "the planted checked-hash bytecode was executed"
+    if module is not None:
+        assert module.probe() == "genuine"
+        assert os.path.abspath(module.__file__) != os.path.abspath(str(source_path)), (
+            "recovery should have imported from somewhere other than the poisoned cache"
+        )
