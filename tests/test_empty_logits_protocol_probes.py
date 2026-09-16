@@ -1,24 +1,9 @@
 """unsloth#409: the compiled trainers' EMPTY_LOGITS must not claim protocol dunders.
 
-``EmptyLogits.__getattr__`` answers every name, so ``hasattr`` on the sentinel
-used to be true for every name too. Libraries duck-type on dunders:
-``torch.distributed.utils._apply_to_tensors`` tests
-``hasattr(x, "__dataclass_fields__")`` and then calls ``dataclasses.replace(x)``
-on whatever said yes, so FSDP2's mixed-precision output cast
-(``_fsdp_state._cast_output_dtype``) killed every training step with
-``TypeError: replace() should be called on dataclass instances``.
-
-This file tests the copy that lives in ``compiler._cross_entropy_code``, the
-source text written into ``unsloth_compiled_cache``. It is never imported, so
-the test execs it the way a generated module does. unsloth/models/_utils.py
-carries the twin; both have to answer the probe the same way or the failure
-comes back through whichever copy the run happens to use.
-
-Measured on 2 GPUs with ``accelerate launch`` and an FSDP2 config: before, every
-step of a Qwen2.5-0.5B LoRA SFT died in that TypeError; after, the same run
-logged ``[3.5781, 3.9453, 3.5156, 3.4297]`` on both ranks.
-
-No GPU and no distributed launcher: the probe below is exactly torch's.
+A catch-all ``__getattr__`` made ``hasattr`` true for every name, so torch's
+``_apply_to_tensors`` saw ``__dataclass_fields__``, called ``dataclasses.replace``
+and killed every FSDP2 mixed-precision step. Under test is the source text in
+``compiler._cross_entropy_code`` (never imported, so exec'd); _utils.py has a twin.
 """
 
 import dataclasses
@@ -30,7 +15,6 @@ from unsloth_zoo.compiler import _cross_entropy_code
 
 
 def _exec_sentinel():
-    """Run the emitted sentinel definition on its own, as a generated module does."""
     start = _cross_entropy_code.index("LOGITS_ERROR_STRING = ")
     end = _cross_entropy_code.index("EMPTY_LOGITS = EmptyLogits()")
     namespace = {"torch": torch}
@@ -44,9 +28,7 @@ EMPTY_LOGITS = _NS["EMPTY_LOGITS"]
 LOGITS_ERROR_STRING = _NS["LOGITS_ERROR_STRING"]
 
 
-# Deliberately none of `dir(torch.Tensor)`: the loop that follows the definition
-# binds every tensor dunder as a real instance attribute, so those never reach
-# `__getattr__`. These are the ones only `__getattr__` could have invented.
+# Not tensor dunders: the loop after the definition binds those as real attributes.
 PROTOCOL_DUNDERS = (
     "__dataclass_fields__",
     "__fields__",
@@ -72,8 +54,7 @@ def test_the_torch_distributed_output_walk_leaves_the_sentinel_alone():
 
 
 def test_an_ordinary_attribute_still_explains_how_to_get_real_logits():
-    """The AttributeError is for protocol probes only, or the fix trades a
-    TypeError for a silent `AttributeError: shape`."""
+    """Protocol probes only, or the fix trades the TypeError for `AttributeError: shape`."""
     raiser = EMPTY_LOGITS.shape
     with pytest.raises(NotImplementedError) as excinfo:
         raiser()
