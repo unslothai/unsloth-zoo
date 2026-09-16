@@ -416,3 +416,82 @@ def test_the_companion_probe_reads_the_really_installed_unsloth():
 def test_the_gradient_pass_goes_through_the_gate():
     source = inspect.getsource(grpo_accumulated_loss)
     assert "grpo_shared_vision_inputs" in source
+
+
+def test_a_companion_without_the_chunker_gets_no_pixels_for_a_gridless_vlm(
+    monkeypatch, tmp_path
+):
+    """Intersecting key NAMES cannot express a shape.
+
+    A companion that does not share the chunker slices the pixels with a loop of its own, and
+    that loop appends None for pixel_values unless image_grid_thw is there to slice them by.
+    For a VLM that carries no grid -- Gemma 3, InternVL, LFM2-VL -- forwarding pixels on the
+    gradient side alone leaves the current policy looking at images the reference policy never
+    saw, so the ratio and the KL term compare two different policies however well the names
+    match.
+    """
+    _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                pixel_values = kwargs.get("pixel_values", None)
+                image_grid_thw = kwargs.get("image_grid_thw", None)
+                pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+                image_sizes = kwargs.get("image_sizes", None)
+                num_images = kwargs.get("num_images", None)
+                token_type_ids = kwargs.get("token_type_ids", None)
+                mm_token_type_ids = kwargs.get("mm_token_type_ids", None)
+                return pixel_values, image_grid_thw, pixel_attention_mask, image_sizes, \\
+                    num_images, token_type_ids, mm_token_type_ids
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+    monkeypatch.setattr(_rl, "_GRPO_COMPANION_PIXELS_WARNED", False, raising = False)
+
+    gridless = {
+        "pixel_values": "PIXELS",
+        "pixel_attention_mask": "MASK",
+        "image_sizes": "SIZES",
+        "token_type_ids": "TTI",
+        "num_images": [1],
+    }
+    shared = _rl.grpo_shared_vision_inputs(gridless)
+    assert shared.get("pixel_values") is None, shared
+    assert shared.get("pixel_attention_mask") is None, shared
+    # Everything the companion DOES forward is still forwarded, or the two passes disagree in
+    # the other direction.
+    assert shared["image_sizes"] == "SIZES"
+    assert shared["token_type_ids"] == "TTI"
+    assert shared["num_images"] == [1]
+
+    # With a grid the companion slices the pixels, so they are forwarded on both sides.
+    withgrid = dict(gridless, image_grid_thw = "GRID")
+    shared = _rl.grpo_shared_vision_inputs(withgrid)
+    assert shared["pixel_values"] == "PIXELS"
+    assert shared["image_grid_thw"] == "GRID"
+    assert shared["pixel_attention_mask"] == "MASK"
+
+
+def test_a_companion_that_shares_the_chunker_keeps_the_pixels(monkeypatch, tmp_path):
+    """The narrowing is only for a companion that slices with a loop of its own. Where the two
+    passes run the same chunker there is nothing to disagree about, and dropping the pixels
+    there would throw away the whole point of sharing it."""
+    _install_companion(
+        monkeypatch,
+        tmp_path,
+        '''
+        def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
+            def _get_per_token_logps_and_entropies(self, model, **kwargs):
+                from unsloth_zoo.rl_replacements import grpo_vision_chunks
+                return grpo_vision_chunks(kwargs, 1, 1)
+            return _get_per_token_logps_and_entropies
+        ''',
+    )
+    shared = _rl.grpo_shared_vision_inputs(
+        {"pixel_values": "PIXELS", "spatial_shapes": "SHAPES", "num_tiles": "TILES"}
+    )
+    assert shared["pixel_values"] == "PIXELS"
+    assert shared["spatial_shapes"] == "SHAPES"
+    assert shared["num_tiles"] == "TILES"

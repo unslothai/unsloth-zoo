@@ -1003,12 +1003,48 @@ pass
 RL_REPLACEMENTS["grpo_companion_vision_keys"] = grpo_companion_vision_keys
 
 
+# Warned once per process, not per step: this is a property of the installed packages.
+_GRPO_COMPANION_PIXELS_WARNED = False
+
+
 def grpo_shared_vision_inputs(source):
-    """grpo_get_vision_inputs, restricted to what both logprob passes forward."""
+    """grpo_get_vision_inputs, restricted to what both logprob passes actually forward.
+
+    Two restrictions, not one. The key list is the first: a companion with its own hard coded
+    tuple never sees the keys outside it. The second is a SHAPE, and intersecting names cannot
+    express it -- a companion that does not share the chunker slices the pixels itself, and its
+    loop drops ``pixel_values`` outright unless ``image_grid_thw`` is there to slice them by
+    (``pixel_values_chunks.append(None)`` in its else branch). For a VLM that carries no grid,
+    which is Gemma 3, InternVL and LFM2-VL, forwarding pixels on the gradient side alone would
+    leave the current policy looking at images the reference policy never saw, and the
+    importance ratio and the KL term would compare two different policies however carefully the
+    key names were matched.
+
+    So for that shape the pixels are dropped here too, which is what the installed companion
+    does and what this package did before the shared chunker existed. Text is what both passes
+    then see, and a comparison of like with like is the thing the objective requires; a louder
+    answer is available by upgrading unsloth, and the warning says so. Nothing is dropped when
+    the companion shares the chunker: there the two passes slice with the same code.
+    """
+    global _GRPO_COMPANION_PIXELS_WARNED
     keys = grpo_companion_vision_keys()
     if len(keys) == len(GRPO_VISION_KEYS):
         return grpo_get_vision_inputs(source)
-    return {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
+    shared = {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
+    if shared.get("pixel_values") is not None and shared.get("image_grid_thw") is None:
+        # Both of them: the companion appends None for the mask in the same branch.
+        shared["pixel_values"] = None
+        shared["pixel_attention_mask"] = None
+        if not _GRPO_COMPANION_PIXELS_WARNED:
+            _GRPO_COMPANION_PIXELS_WARNED = True
+            logger.warning(
+                "Unsloth: the installed unsloth computes GRPO reference logprobs with a chunk "
+                "loop of its own, and that loop forwards no pixel_values for a model without "
+                "image_grid_thw. Holding the gradient pass to the same inputs, so both "
+                "policies match, which means this run trains on the text of these samples. "
+                "Upgrade unsloth to train on the images."
+            )
+    return shared
 pass
 RL_REPLACEMENTS["grpo_shared_vision_inputs"] = grpo_shared_vision_inputs
 
