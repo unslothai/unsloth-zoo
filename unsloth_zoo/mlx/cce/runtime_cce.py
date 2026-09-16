@@ -19,6 +19,7 @@
 """Chunked cross-entropy helpers built from MLX runtime custom kernels."""
 
 from collections import OrderedDict
+import math
 from typing import Callable
 
 import mlx.core as mx
@@ -1421,3 +1422,149 @@ def make_chunked_cross_entropy_loss(
         weight_is_frozen=weight_is_frozen,
         precompute_hidden_gradient=precompute_hidden_gradient,
     )
+
+
+def supported_lora_head(head):
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+    from mlx.utils import tree_flatten
+
+    if type(head) is not LoRALinear:
+        return False
+    base = head.linear
+    if type(base) not in (nn.Linear, nn.QuantizedLinear):
+        return False
+    if type(head.dropout) is not nn.Dropout or not math.isfinite(float(head.scale)):
+        return False
+    if any(key != "bias" for key, _ in tree_flatten(base.trainable_parameters())):
+        return False
+    a, b = head.lora_a, head.lora_b
+    hidden = base.weight.shape[1]
+    if type(base) is nn.QuantizedLinear:
+        hidden = hidden * 32 // base.bits
+    return (a.ndim == b.ndim == 2 and a.shape[1] == b.shape[0]
+            and a.shape[0] == hidden and a.shape[1] > 0
+            and b.shape[1] == base.weight.shape[0])
+
+
+def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
+                       logit_scale=1.0, logit_softcap=0.0,
+                       group_size=None, bits=None, mode="affine"):
+    """Chunked cross entropy over a LoRA-adapted classifier.
+
+    This trades time for memory and is not a speedup: the backward reprojects
+    every vocabulary chunk instead of keeping the logits, which measures around
+    2.1x lower peak against dense cross entropy at the cost of roughly 1.1-1.2x
+    the step time on an unquantized head. A quantized head is close to even, because
+    there the dense baseline pays to materialize the same logits in half
+    precision anyway. Choose it when the dense logits do not fit, not to go
+    faster.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    update, finalize, dlogits = _build_kernel_set(logit_softcap)
+    if update is None:
+        raise RuntimeError("head CCE requires Metal")
+    ignore_arr = mx.array([-100], dtype=mx.int32)
+    softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
+
+    def base_matmul(h, w, sc, qb, start, end, transpose=True):
+        return _chunk_matmul(
+            h, w[start:end], scales=None if sc is None else sc[start:end],
+            biases=None if qb is None else qb[start:end], group_size=group_size,
+            bits=bits, mode=mode, transpose=transpose)
+
+    def project(h, w, sc, qb, rank_h, b, bias, start, end):
+        if sc is None and bias is not None:
+            logits = mx.addmm(bias[start:end], h, w[start:end].T)
+        else:
+            logits = base_matmul(h, w, sc, qb, start, end)
+            if bias is not None:
+                logits = logits + bias[start:end]
+        delta = (adapter_scale * (rank_h @ b[:, start:end])).astype(h.dtype)
+        logits = logits + delta
+        if logit_scale != 1.0:
+            logits = logits * logit_scale
+        return logits
+
+    @mx.custom_function
+    def full(h, w, sc, qb, rank_h, b, bias, targets):
+        n, vocab = h.shape[0], w.shape[0]
+        if targets.ndim != 1 or targets.shape[0] != n:
+            raise ValueError("targets must match the flat hidden rows")
+        if n == 0:
+            return mx.zeros((0,), dtype=mx.float32), mx.zeros((0,), dtype=mx.float32)
+        # Promote before slicing so recomputation reuses one dense weight cast.
+        projection_weight = w
+        if sc is None:
+            dtype = mx.result_type(h.dtype, w.dtype, w.dtype if bias is None else bias.dtype)
+            projection_weight = w.astype(dtype)
+        _, invalid = _target_validity_masks(targets, vocab, -100)
+        targets32 = targets.astype(mx.int32)
+        running_max = mx.full((n,), -mx.inf, dtype=mx.float32)
+        running_sum = mx.zeros((n,), dtype=mx.float32)
+        target_logit = mx.zeros((n,), dtype=mx.float32)
+        for start in range(0, vocab, chunk_size):
+            end = min(start + chunk_size, vocab)
+            logits = project(h, projection_weight, sc, qb, rank_h, b, bias, start, end)
+            inputs = [logits, targets32, running_max, running_sum, target_logit,
+                      mx.array([start], dtype=mx.int32), ignore_arr, softcap_arr]
+            if end == vocab:
+                result = finalize(inputs=inputs, output_shapes=[(n,)] * 5,
+                                  output_dtypes=[mx.float32] * 5,
+                                  grid=(n * 256, 1, 1), threadgroup=(256, 1, 1))
+                return (_poison_invalid_targets(result[3], invalid),
+                        _poison_invalid_targets(result[4], invalid))
+            running_max, running_sum, target_logit = update(
+                inputs=inputs, output_shapes=[(n,)] * 3,
+                output_dtypes=[mx.float32] * 3,
+                grid=(n * 256, 1, 1), threadgroup=(256, 1, 1))
+
+    @full.vjp
+    def backward(primals, cotangents, outputs):
+        h, w, sc, qb, rank_h, b, bias, targets = primals
+        if h.shape[0] == 0:
+            return tuple(None if x is None else mx.zeros_like(x) for x in primals)
+        grad_output = cotangents[0].astype(mx.float32)
+        if sc is None:
+            base_dtype = mx.result_type(h.dtype, w.dtype, w.dtype if bias is None else bias.dtype)
+        elif mode == "affine":
+            base_dtype = mx.result_type(h.dtype, sc.dtype, sc.dtype if qb is None else qb.dtype)
+        else:
+            base_dtype = h.dtype
+        projection_weight = w.astype(base_dtype) if sc is None else w
+        adapter_dtype = mx.result_type(rank_h.dtype, b.dtype)
+        targets32 = targets.astype(mx.int32)
+        grad_h = mx.zeros_like(h)
+        grad_rank = mx.zeros_like(rank_h)
+        grad_b, grad_bias = [], []
+        for start in range(0, w.shape[0], chunk_size):
+            end = min(start + chunk_size, w.shape[0])
+            logits = project(h, projection_weight, sc, qb, rank_h, b, bias, start, end)
+            dg = dlogits(
+                inputs=[logits, outputs[1], targets32, grad_output,
+                        mx.array([start], dtype=mx.int32), ignore_arr, softcap_arr],
+                output_shapes=[logits.shape], output_dtypes=[logits.dtype],
+                template=[("O", logits.dtype)],
+                grid=((logits.size + 3) // 4, 1, 1), threadgroup=(256, 1, 1))[0]
+            if logit_scale != 1.0:
+                dg = dg * logit_scale
+            grad_h = grad_h + base_matmul(
+                dg.astype(base_dtype), projection_weight, sc, qb, start, end, transpose=False).astype(h.dtype)
+            grad_delta = dg.astype(h.dtype).astype(adapter_dtype) * adapter_scale
+            grad_rank = grad_rank + (grad_delta @ b[:, start:end].T).astype(rank_h.dtype)
+            grad_b.append((rank_h.T @ grad_delta).astype(b.dtype))
+            if bias is not None:
+                grad_bias.append(dg.sum(axis=0).astype(bias.dtype))
+        return (grad_h, mx.zeros_like(w),
+                None if sc is None else mx.zeros_like(sc),
+                None if qb is None else mx.zeros_like(qb),
+                grad_rank, mx.concatenate(grad_b, axis=1),
+                None if bias is None else mx.concatenate(grad_bias),
+                mx.zeros_like(targets))
+
+    def loss(h, w, sc, qb, rank_h, b, bias, targets):
+        losses, lse = full(h, w, sc, qb, rank_h, b, bias, targets)
+        return losses + lse * mx.array(0.0, dtype=mx.float32)
+
+    return loss

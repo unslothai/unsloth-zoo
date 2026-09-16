@@ -748,6 +748,86 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
     assert peaks[1] < peaks[0]
 
 
+@metal_only
+def test_trainer_compiled_step_uses_lora_head_cce(monkeypatch, tmp_path):
+    calls = []
+    factory = mlx_utils._make_text_lora_cce_loss_fn
+
+    def recording(*args, **kwargs):
+        loss = factory(*args, **kwargs)
+
+        def record(model, *batch):
+            calls.append(len(batch))
+            return loss(model, *batch)
+
+        return record
+
+    monkeypatch.setattr(mlx_utils, "_make_text_lora_cce_loss_fn", recording)
+    mx.random.seed(919)
+    model = _cce_text_model(2049, 1024, quantized=False, lora=True)
+    ids = tuple(range(2049))
+    labels = tuple(i if i % 10 == 0 else -100 for i in ids)
+    trainer = MLXTrainer(model=model, tokenizer=None, train_dataset=[], args=MLXTrainingConfig(
+        max_steps=1, per_device_train_batch_size=1, gradient_accumulation_steps=1,
+        learning_rate=1e-4, logging_steps=1, save_steps=0, output_dir=str(tmp_path),
+        compile=True, gradient_checkpointing=False, report_to="none",
+    ))
+    trainer._batches = FiniteTextBatchPlan(
+        [_FiniteTextRow(ids, offset=0, labels=labels)], [(0,)], max_seq_length=2049, pad_id=0,
+    )
+    trainer.save_model = lambda output_dir=None: None
+    trainer.train()
+    # One trace of the compiled step; compaction must not hand this loss cce_indices.
+    assert calls == [3]
+
+
+def test_lora_head_cce_without_metal_keeps_baseline(monkeypatch):
+    model = _cce_text_model(2049, 1024, quantized=False, lora=True)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+    loss = mlx_utils.make_cce_loss_fn(model)
+    assert not hasattr(loss, "_unsloth_compiled_loss_fn")
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("tokens, softcap, dim, promoted", [(128, 0.0, 1024, False), (2048, 0.0, 1024, False), (2048, 5.0, 1024, False), (2048, 0.0, 4096, False), (2048, 0.0, 4096, True)])
+def test_lora_head_cce_live_gradients_and_early_fallback(quantized, tokens, softcap, dim, promoted):
+    calls = []
+    low_precision = softcap > 0 or (dim > 1024 and not promoted)
+    mx.random.seed(917)
+    model = _cce_text_model(2049, dim, quantized=quantized, lora=True, calls=calls, softcap=softcap)
+    if promoted:
+        model.model.embed_tokens.weight = model.model.embed_tokens.weight.astype(mx.float32)
+    ids = mx.arange(tokens + 1, dtype=mx.int32)[None, :]
+    labels = mx.where(ids % 5 == 0, -100, ids)
+    batch = (ids, mx.array([[0, tokens + 1]], dtype=mx.int32), labels)
+    loss = mlx_utils.make_cce_loss_fn(model)
+    grad = nn.value_and_grad(model, getattr(loss, "_unsloth_compiled_loss_fn", loss))
+    compiled = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    native_loss = make_baseline_loss_fn()
+    # Compare against float32 CE rather than rounded bf16 loss values.
+    reference = nn.value_and_grad(model, lambda m, *b: native_loss(lambda ids: m(ids).astype(mx.float32), *b))
+    first_loss = None
+    for iteration in range(2):
+        calls.clear()
+        actual = compiled(*batch)
+        mx.eval(actual)
+        assert calls == ([] if iteration else (["model", "backbone"] if tokens == 128 else ["backbone"]))
+        expected = reference(model, *batch)
+        mx.eval(expected)
+        assert actual[0][1].item() == expected[0][1].item()
+        assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=(0.005 if low_precision else 1e-5) if tokens > 128 else 0, rel=0)
+        for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+            assert (mx.allclose(want, got, atol=2e-5 if low_precision else 2e-6, rtol=0.02 if low_precision else 2e-4) if tokens > 128 else mx.array_equal(want, got)).item()
+        for key in ("lora_a", "lora_b"):
+            assert mx.any(actual[1]["lm_head"][key] != 0).item()
+        if iteration:
+            assert actual[0][0].item() != first_loss
+        first_loss = actual[0][0].item()
+        model.lm_head.lora_a = model.lm_head.lora_a * 2.0
+        model.lm_head.lora_b = model.lm_head.lora_b * 3.0
+
+
 def _norm_model(seed=77, dtype=None):
     class _TinyLM(nn.Module):
         def __init__(self):
