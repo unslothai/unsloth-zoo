@@ -216,6 +216,16 @@ def _chunk_matmul(
     )
 
 
+# fast::tanh is not IEEE-strict (MSL 6.5.1): an overflowing ratio can return NaN
+# rather than saturating. True tanh is already 1.0 to float precision far below
+# 20, so the branch costs no accuracy and keeps a capped logit finite.
+_SOFTCAP_HEADER = """
+inline float cce_softcap_tanh(float ratio) {
+    return ratio > 20.0f ? 1.0f : fast::tanh(ratio);
+}
+"""
+
+
 def _build_forward_update_kernel() -> Callable:
     source = """
         uint gid = thread_position_in_grid.x;
@@ -244,7 +254,7 @@ def _build_forward_update_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_max = metal::max(local_max, val);
         }
@@ -266,7 +276,7 @@ def _build_forward_update_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_sum += fast::exp(val - chunk_max);
             int global_v = v_start + int(col);
@@ -322,6 +332,7 @@ def _build_forward_update_kernel() -> Callable:
         ],
         output_names=["running_max_out", "running_sum_out", "target_out"],
         source=source,
+        header=_SOFTCAP_HEADER,
         ensure_row_contiguous=True,
     )
 
@@ -357,7 +368,7 @@ def _build_forward_update_finalize_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_max = metal::max(local_max, val);
         }
@@ -379,7 +390,7 @@ def _build_forward_update_finalize_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_sum += fast::exp(val - chunk_max);
             int global_v = v_start + int(col);
@@ -443,6 +454,7 @@ def _build_forward_update_finalize_kernel() -> Callable:
         ],
         output_names=["running_max_out", "running_sum_out", "target_out", "loss_out", "lse_out"],
         source=source,
+        header=_SOFTCAP_HEADER,
         ensure_row_contiguous=True,
     )
 
@@ -490,13 +502,13 @@ def _build_dlogits_kernel() -> Callable:
             float raw = logits[elem];
             float capped = raw;
             if (softcap > 0.0f) {
-                capped = softcap * fast::tanh(raw / softcap);
+                capped = softcap * cce_softcap_tanh(raw / softcap);
             }
 
             float prob = fast::exp(capped - lse[row]);
             float grad = (prob - float(global_v == target)) * grad_output[row];
             if (softcap > 0.0f) {
-                float t = fast::tanh(raw / softcap);
+                float t = cce_softcap_tanh(raw / softcap);
                 grad *= (1.0f - t * t);
             }
             d_logits[elem] = static_cast<O>(grad);
@@ -516,6 +528,7 @@ def _build_dlogits_kernel() -> Callable:
         ],
         output_names=["d_logits"],
         source=source,
+        header=_SOFTCAP_HEADER,
         ensure_row_contiguous=True,
     )
 
