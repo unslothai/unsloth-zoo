@@ -37,21 +37,17 @@ else:
 pass
 
 # unsloth #2491: triton 3.3.0 and 3.3.1 cannot lower cut_cross_entropy's
-# `_cce_lse_forward_kernel` for compute capability 7.5 (T4, RTX 2080 Ti). The
-# TritonGPU to LLVM pass gives up on a `tt.fp_to_fp` the sm_75 path does not
-# handle and aborts the whole process:
+# `_cce_lse_forward_kernel` for compute capability 7.5 (T4, RTX 2080 Ti). The TritonGPU to
+# LLVM pass gives up on a `tt.fp_to_fp` and aborts the process:
 #     error: Unsupported conversion from f16 to f16
 #     LLVM ERROR: Unsupported rounding mode for conversion.
-# (triton-lang/triton#6698, closed 2025-07-22.) Both ends of the range are
-# measured, not inferred: the real kernel was compiled ahead of time for
-# cuda:75 on every published release from 3.1.0 to 3.8.0, and only 3.3.0 and
-# 3.3.1 abort. They abort for every block size, dot precision and accumulator
-# dtype tried, so a narrower condition would not be safe, and the sm_80 control
-# compiles cleanly on all of them, so the two failures are specific to 7.5.
+# (triton-lang/triton#6698, closed 2025-07-22.) The range is measured: the kernel was
+# compiled ahead of time for cuda:75 on every release from 3.1.0 to 3.8.0 and only these
+# two abort, for every block size, dot precision and accumulator dtype tried, while the
+# sm_80 control compiles on all of them.
 #
-# This cannot be a floor in pyproject.toml. torch pins triton exactly, and the
-# oldest torch supported here, 2.6.0, requires `triton==3.2.0`, so any floor
-# above 3.2.0 makes that torch unresolvable instead of safe.
+# Not expressible as a floor: torch pins triton exactly and the oldest supported torch,
+# 2.6.0, requires `triton==3.2.0`.
 _TRITON_CCE_BROKEN_ON_SM75 = ("3.3.0", "3.4.0")
 
 
@@ -105,11 +101,9 @@ if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
-    # Every VISIBLE device, not just the current one. A supported device_map can place
-    # lm_head on another GPU, so on a heterogeneous host the kernel can execute on an
-    # sm_75 while device 0 is an sm_80 and the import-time reading said it was safe. The
-    # failure is `LLVM ERROR: Unsupported rounding mode for conversion`, which aborts the
-    # process rather than raising, so the conservative answer is the only usable one.
+    # Every VISIBLE device, not just the current one: a device_map can place lm_head on
+    # another GPU, so the kernel can run on an sm_75 while device 0 is an sm_80. The
+    # failure aborts the process rather than raising, so be conservative.
     _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \

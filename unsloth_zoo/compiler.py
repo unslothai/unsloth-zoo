@@ -269,12 +269,10 @@ from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 )
 
 # HAS_CUT_CROSS_ENTROPY travels with fused_linear_cross_entropy because the generated
-# causal-LM branch has to consult it. UNSLOTH_ENABLE_CCE is an env flag that defaults on
-# and knows nothing about whether loss_utils could import `linear_cross_entropy`, so on
-# any host where that import is refused -- a compute-capability gate, a Triton the kernel
-# miscompiles on, or simply no cut_cross_entropy installed -- the flag alone still routed
-# into fused_linear_cross_entropy and raised NameError on the unimported symbol. The
-# elif below it computes the standard loss, which is exactly the documented fallback.
+# causal-LM branch consults it. UNSLOTH_ENABLE_CCE defaults on and knows nothing about
+# whether `linear_cross_entropy` imported, so wherever that import is refused the flag
+# alone routed into fused_linear_cross_entropy and raised NameError. The elif below it
+# computes the standard loss, the documented fallback.
 _disabled_sdpa_code = f"""{_license_header}
 
 from unsloth_zoo.loss_utils import (
