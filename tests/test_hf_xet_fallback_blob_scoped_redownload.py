@@ -14,20 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The Xet -> HTTP transition must scope a forced clean re-download to the blob at fault (issue #9094).
-
-``force_download`` is repo-wide: huggingface_hub hands back an already-resolvable pointer only under
-``not force_download``, so one partial surviving the pre-HTTP purge used to cost a re-download of
-every completed shard in the repo. These tests run the REAL ladder against a REAL (temporary) HF
-cache -- the detectors are not stubbed -- and measure both what the retry was told and what happened
-to the blobs on disk.
-
-The invariants that must survive the scoping are tested too: a partial that may belong to a live
-sibling, one that cannot be removed at all, an uninspectable cache, and the caller's own
-``force_download`` all still behave exactly as before.
-
-CPU-only, no network, no real subprocess.
-"""
+"""The Xet -> HTTP transition must scope a forced re-download to the blob at fault (#9094):
+``force_download`` is repo-wide, so one surviving partial cost every completed shard."""
 
 from __future__ import annotations
 
@@ -55,8 +43,7 @@ def _load(name: str, filename: str):
     return module
 
 
-# Package placeholder so intra-package imports in hf_xet_fallback resolve to the files loaded
-# below. Restored afterwards: a leftover would shadow the real unsloth_zoo.
+# Package placeholder for hf_xet_fallback's imports; restored after, or it shadows the real one.
 _saved_modules = {
     name: sys.modules.get(name)
     for name in ("unsloth_zoo", "unsloth_zoo.hf_cache_state", "unsloth_zoo.hf_xet_fallback")
@@ -108,7 +95,6 @@ def _file_bytes(name: str) -> bytes:
 
 
 def _build_cache(root: Path, *, partial_age_s: float, extra_partial: str = None) -> Path:
-    """Three finalized files plus one in-flight partial, laid out as huggingface_hub does."""
     repo = root / REPO_DIR
     blobs, snap, refs = repo / "blobs", repo / "snapshots" / REV, repo / "refs"
     for directory in (blobs, snap, refs):
@@ -121,7 +107,7 @@ def _build_cache(root: Path, *, partial_age_s: float, extra_partial: str = None)
     partial = blobs / (_blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX)
     partial.write_bytes(b"\xa5" * 512)
     os.utime(partial, (time.time() - partial_age_s, time.time() - partial_age_s))
-    # The snapshot link for the in-flight file dangles: its blob was never finalized.
+    # Dangles: the in-flight blob was never finalized.
     (snap / IN_FLIGHT).symlink_to(os.path.relpath(blobs / _blob_name(IN_FLIGHT), snap))
     if extra_partial is not None:
         other = blobs / (_blob_name(extra_partial) + xf.INCOMPLETE_SUFFIX)
@@ -131,7 +117,6 @@ def _build_cache(root: Path, *, partial_age_s: float, extra_partial: str = None)
 
 
 def _identity(root: Path) -> dict:
-    """``{file: (inode, mtime_ns)}`` for the finalized blobs, so a re-download shows up."""
     blobs = root / REPO_DIR / "blobs"
     out = {}
     for name in INTACT:
@@ -144,13 +129,8 @@ def _identity(root: Path) -> dict:
 
 
 class _Attempt:
-    """Download seam stub: records the params of each attempt and writes what hub would write.
-
-    Two behaviours are copied from the real ``_run_download_attempt``: a stalled child publishes the
-    ``.incomplete`` basenames it held open before it is killed, and a child that runs FETCHES -- and
-    hub skips an already-resolvable pointer only while ``force_download`` is unset (huggingface_hub
-    1.31 ``file_download.py`` :1204 / :1248, 0.36.2 the same two checks).
-    """
+    """Hub skips an already-resolvable pointer only while ``force_download`` is unset
+    (huggingface_hub 1.31 ``file_download.py`` :1204 / :1248)."""
 
     def __init__(self, root: Path, results, owned = None):
         self.root = root
@@ -187,13 +167,12 @@ class _Attempt:
                     pointer.unlink()
                 pointer.symlink_to(os.path.relpath(blob, snap))
             except OSError:
-                continue                     # an unwritable cache: the retry fails, as it did live
+                continue
             self.fetched.append(name)
 
 
 @pytest.fixture(autouse = True)
 def _hermetic(monkeypatch):
-    """One Xet child then the transport changes, no health-state writes, no hf_xet log scan."""
     monkeypatch.setenv("UNSLOTH_XET_ATTEMPTS", "1")
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
     monkeypatch.delenv("UNSLOTH_DISABLE_XET", raising = False)
@@ -212,7 +191,6 @@ def _run_ladder(
     caller_force: bool = False,
     results = None,
 ) -> _Attempt:
-    """One stalled Xet child, then one HTTP child, through the real ladder."""
     snap = root / REPO_DIR / "snapshots" / REV
     attempt = _Attempt(
         root, results if results is not None else [("stall", STALL), ("ok", str(snap))],
@@ -263,10 +241,7 @@ def _partials(root: Path) -> list:
 def test_stale_partial_outside_the_ownership_set_does_not_force_the_whole_repo(
     monkeypatch, tmp_path
 ):
-    """Issue #9094. The purge drops the ownership SET over the grace and then skips every blob
-    outside it whatever its age, so a partial left by an EARLIER crashed attempt survives, and the
-    repo-wide force_download re-downloaded every completed shard. Clear that blob instead: the
-    retry fetches only the file it belonged to."""
+    """#9094: the purge skips blobs outside the ownership set at any age, so an earlier crash's partial forced a repo-wide re-download."""
     snap = _build_cache(tmp_path, partial_age_s = 1800.0, extra_partial = "vocab.json")
     before = _identity(tmp_path)
     attempt = _run_ladder(
@@ -281,9 +256,7 @@ def test_stale_partial_outside_the_ownership_set_does_not_force_the_whole_repo(
 
 
 def test_injected_prepare_hook_declining_still_scopes_the_force_to_the_blob(monkeypatch, tmp_path):
-    """Unsloth injects its own marker-aware ``prepare_for_http_fn``, so the zoo purge never runs and
-    a partial its markers decline to trust survives with the ownership set unused. The scoped pass
-    is what reaches it: the reporter was on the Studio path, which always injects the hook."""
+    """An injected ``prepare_for_http_fn`` (the Studio path) replaces the zoo purge and never sees the ownership set."""
     snap = _build_cache(tmp_path, partial_age_s = 20.0)
     before = _identity(tmp_path)
     attempt = _run_ladder(
@@ -299,9 +272,7 @@ def test_injected_prepare_hook_declining_still_scopes_the_force_to_the_blob(monk
 
 
 def test_a_partial_that_may_belong_to_a_live_sibling_still_forces(monkeypatch, tmp_path):
-    """The invariant the scoping must not break. With no ownership evidence and a partial younger
-    than the patient grace, deleting it could destroy a live sibling's in-flight blob, so it stays
-    and the clean re-download still happens -- the resume hazard is real and unprovable either way."""
+    """No ownership evidence, younger than the grace: deleting it could destroy a live sibling's blob."""
     _build_cache(tmp_path, partial_age_s = 10.0)
     attempt = _run_ladder(monkeypatch, tmp_path, owned = None)
     assert _http_force(attempt) is True
@@ -311,8 +282,6 @@ def test_a_partial_that_may_belong_to_a_live_sibling_still_forces(monkeypatch, t
 
 
 def test_an_unclearable_partial_still_forces(monkeypatch, tmp_path):
-    """The reporter's literal "could not be cleared": a locked / denied blob (Windows AV, a handle a
-    dead child never released). Removal fails, so force_download stands exactly as before."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     real_unlink = Path.unlink
 
@@ -331,10 +300,7 @@ def test_an_unclearable_partial_still_forces(monkeypatch, tmp_path):
 
 
 def test_an_uninspectable_cache_after_the_clear_still_forces(monkeypatch, tmp_path):
-    """``None`` from ``_incomplete_partial_names`` means the cache could not be READ, which is not the
-    same answer as "no partials left" and must never be read as proof of a clear -- a remount or a
-    permission flap would otherwise hand the retry an unsafe resume. Isolated: this partial is old
-    enough that the scoped pass does remove it, so only the missing proof forces."""
+    """``None`` means the cache could not be READ, never "no partials left"."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     monkeypatch.setattr(xf, "_incomplete_partial_names", lambda *a, **k: None)
     attempt = _run_ladder(monkeypatch, tmp_path, inject_hook = True, owned = None)
@@ -342,8 +308,6 @@ def test_an_uninspectable_cache_after_the_clear_still_forces(monkeypatch, tmp_pa
 
 
 def test_the_scoped_clear_keeps_a_caller_requested_force_download(monkeypatch, tmp_path):
-    """Scoping decides whether the LADDER adds a force, never whether the caller's own one survives:
-    Unsloth's model-update path passes force_download=True to re-fetch a republished blob."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     attempt = _run_ladder(
         monkeypatch, tmp_path, caller_force = True,
@@ -353,9 +317,7 @@ def test_the_scoped_clear_keeps_a_caller_requested_force_download(monkeypatch, t
 
 
 def test_the_latch_still_holds_force_download_while_a_partial_survives(monkeypatch, tmp_path):
-    """Once the ladder HAS forced, the latch rule is unchanged: a forced HTTP child that failed
-    before replacing the partial leaves the next child forced too, because only the partial's
-    ABSENCE proves a resume is safe."""
+    """Only the partial's ABSENCE proves a resume is safe, so the force latches."""
     _build_cache(tmp_path, partial_age_s = 10.0)          # unremovable: possibly a live sibling's
     snap = tmp_path / REPO_DIR / "snapshots" / REV
     attempt = _run_ladder(
@@ -366,8 +328,7 @@ def test_the_latch_still_holds_force_download_while_a_partial_survives(monkeypat
 
 
 def test_a_cancel_at_the_stall_runs_no_clearance_at_all(monkeypatch, tmp_path):
-    """Cancellation still wins over every failure verdict, and it wins BEFORE the transition: the
-    user's decision must not spend a destructive purge, scoped or not, on a download they abandoned."""
+    """Cancellation wins BEFORE the transition: an abandoned download buys no destructive purge."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     before = _identity(tmp_path)
     attempt = _Attempt(tmp_path, [("stall", STALL)])
@@ -396,12 +357,6 @@ def test_a_cancel_at_the_stall_runs_no_clearance_at_all(monkeypatch, tmp_path):
     assert _identity(tmp_path) == before
 
 
-# ---------------------------------------------------------------------------------------------
-# Ownership evidence for a SNAPSHOT child. Without it the transition above has nothing to scope
-# to wherever open files cannot be inspected (no psutil and no /proc, i.e. Windows), because the
-# killed child's own seconds-old partial is spared by the patient grace.
-# ---------------------------------------------------------------------------------------------
-
 
 class _StalledQueue:
     """Never yields a result, so the attempt loop runs until the watchdog fires."""
@@ -423,8 +378,6 @@ class _StalledQueue:
 
 
 class _StalledProc:
-    """A child that opens one new partial and then wedges."""
-
     def __init__(self, on_start):
         self._on_start = on_start
         self.pid = None          # open files uninspectable, exactly as on Windows
@@ -441,9 +394,7 @@ class _StalledProc:
 
 
 def test_a_stalled_snapshot_child_publishes_its_own_new_partial_as_owned(monkeypatch, tmp_path):
-    """The partial that appeared AFTER the spawn is provably this child's, so the HTTP prep may
-    clear it; the one that was there before is not claimed. A snapshot used to capture no ownership
-    at all, which is why the reporter's cached shards were re-downloaded (issue #9094)."""
+    """Snapshots used to claim no ownership at all, so the reporter's cached shards were re-downloaded (#9094)."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     blobs = tmp_path / REPO_DIR / "blobs"
     pre_existing = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
@@ -475,9 +426,7 @@ def test_a_stalled_snapshot_child_publishes_its_own_new_partial_as_owned(monkeyp
 
 
 def test_the_snapshot_watchdog_still_measures_the_whole_repo(monkeypatch, tmp_path):
-    """The baseline is ownership evidence only. Narrowing what a SNAPSHOT measures would let a
-    sibling's growth mask a wedged child, and hub serialises same-file callers on an unbounded lock,
-    so the repo-wide measurement stays."""
+    """Narrowing what a SNAPSHOT measures would let a sibling's growth mask a wedged child."""
     _build_cache(tmp_path, partial_age_s = 10.0)
     seen: list = []
 
@@ -538,14 +487,8 @@ def test_the_snapshot_watchdog_still_measures_the_whole_repo(monkeypatch, tmp_pa
 
 
 def test_an_aged_partial_a_live_process_still_holds_open_is_not_cleared(monkeypatch, tmp_path):
-    """AGE IS NOT PROOF THAT A WRITER EXITED.
-
-    A sibling downloader that is paused, blocked on a slow connection or waiting on a retry leaves a
-    partial older than any grace and is still going to finish it. Deleting it wastes the transfer
-    and makes its final rename fail, and on POSIX it can be deleted out from under an open handle
-    without the writer noticing. The unscoped pass therefore asks the open-file table, and a blob
-    that is open stays whatever its age, so the caller forces exactly as it did before.
-    """
+    """AGE IS NOT PROOF THAT A WRITER EXITED: a paused or retrying sibling leaves a partial older
+    than any grace and will still finish it, so the open-file table decides, not the mtime."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: {stranger})
@@ -558,10 +501,8 @@ def test_an_aged_partial_a_live_process_still_holds_open_is_not_cleared(monkeypa
 
 
 def test_an_unreadable_open_file_table_declines_the_unscoped_pass(monkeypatch, tmp_path):
-    """No psutil, or a platform that will not list open files. The question cannot be put, so the
-    purge is not widened on age alone: the partial survives and the caller forces, which is what it
-    did before this pass existed. Failing the other way would make the least inspectable hosts the
-    most destructive ones."""
+    """Unanswerable, so the purge is not widened on age alone: failing the other way would make the
+    least inspectable hosts the most destructive."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
@@ -574,9 +515,8 @@ def test_an_unreadable_open_file_table_declines_the_unscoped_pass(monkeypatch, t
 
 
 def test_our_own_partial_is_cleared_even_with_the_table_unreadable(monkeypatch, tmp_path):
-    """The ownership set is separate evidence and does not depend on the table: our own dead child
-    wrote it, so there is no live writer to protect. #9094 is fixed by THIS pass, and the unscoped
-    one only reaches an earlier crashed attempt's leftovers."""
+    """The ownership set is separate evidence: our own dead child wrote it, so there is no live
+    writer to protect. #9094 is fixed by THIS pass."""
     _build_cache(tmp_path, partial_age_s = 5.0)
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
@@ -590,11 +530,6 @@ def test_our_own_partial_is_cleared_even_with_the_table_unreadable(monkeypatch, 
 
 
 def test_the_live_writer_probe_finds_this_processs_own_open_partial(tmp_path):
-    """The probe itself, unfaked, against a real open file descriptor on this host.
-
-    Skipped where the open-file table cannot be read, which is the same condition the caller
-    declines on, so a host that skips this is a host the pass never runs on.
-    """
     blob = tmp_path / ("deadbeef" + xf.INCOMPLETE_SUFFIX)
     blob.write_bytes(b"x")
     with blob.open("ab") as handle:
@@ -604,16 +539,13 @@ def test_the_live_writer_probe_finds_this_processs_own_open_partial(tmp_path):
         if seen is None:
             pytest.skip("this host cannot read the open-file table")
         assert blob.name in seen, "an open partial was not seen as having a live writer"
-    # closed: nothing holds it now
     after = xf._blobs_with_a_live_writer()
     assert after is not None and blob.name not in after
 
 
 def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(monkeypatch, tmp_path):
-    """The helper's contract, directly: ours goes whatever its age, a stranger goes only once past
-    the grace AND with no live writer, and the return value names what SURVIVED (``None`` for an
-    unreadable cache). The open-file table is pinned to empty so the case is about the grace rather
-    than about whatever else this host happens to be downloading."""
+    """Ours goes at any age, a stranger only past the grace AND with no live writer; the return
+    names what SURVIVED. The table is pinned empty so the case is about the grace."""
     monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: set())
     _build_cache(tmp_path, partial_age_s = 5.0, extra_partial = "vocab.json")
     blobs = tmp_path / REPO_DIR / "blobs"
@@ -626,7 +558,6 @@ def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(mon
     assert survivors == {stranger}, "ours is cleared even fresh; a fresh stranger is spared"
     assert not (blobs / mine).exists()
     assert (blobs / stranger).exists()
-    # Age the stranger past the grace, with no process holding it open: now it is clearable.
     os.utime(blobs / stranger, (time.time() - 1800.0, time.time() - 1800.0))
     assert xf._clear_unsafe_partials_for_http(
         "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
@@ -637,29 +568,20 @@ def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(mon
 
 
 def test_a_baseline_scan_that_failed_is_unknown_rather_than_empty(tmp_path, monkeypatch):
-    """An ownership baseline has to tell "nothing was here" from "could not look".
-
-    The kill site derives ownership as ``current - baseline``, and a blob in the ownership
-    set is exempt from the patient grace -- that exemption is the whole point of scoping the
-    purge. So a scan that failed and returned an empty set does not merely miscount: it
-    claims every partial in the repo, including a live same-repo sibling's, as this child's,
-    and the HTTP prep then unlinks it while it is still being written.
-
-    ``None`` is already the vocabulary for "unknown" at that site: it skips the diff and
-    leaves the purge unscoped, where the mtime and active-partner guards still clear stale
-    state while sparing a sibling.
-    """
+    """Ownership is ``current - baseline`` and an owned blob is exempt from the grace, so a failed
+    scan reading as an empty baseline claims a live sibling's partial and unlinks it. ``None`` is
+    the vocabulary for "unknown" at that site."""
     _build_cache(tmp_path, partial_age_s = 5.0)
 
     present = xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path))
     assert isinstance(present, set) and present, "a readable cache reports the names it has"
 
-    # A cache that is not there is a genuinely empty baseline, not a failure.
+    # Absent cache: a genuinely empty baseline, not a failure.
     assert xf._baseline_incomplete_blob_names(
         "model", REPO, cache_dir = str(tmp_path / "no-such-cache"),
     ) == set()
 
-    # A scan that raises is UNKNOWN. This is the case the empty set used to swallow.
+    # A scan that raises is UNKNOWN, the case the empty set used to swallow.
     def _boom(*args, **kwargs):
         raise OSError("cache temporarily unreadable")
 
@@ -667,5 +589,5 @@ def test_a_baseline_scan_that_failed_is_unknown_rather_than_empty(tmp_path, monk
     assert xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path)) is None, (
         "a failed baseline scan must be unknown, not an empty ownership baseline"
     )
-    # The sizes scan keeps its own meaning: bytes in flight, where unreadable is honestly zero.
+    # The sizes scan means bytes in flight, where unreadable is honestly zero.
     assert xf._active_incomplete_blob_sizes("model", REPO, cache_dir = str(tmp_path)) == {}

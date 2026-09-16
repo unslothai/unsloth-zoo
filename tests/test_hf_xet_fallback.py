@@ -5859,8 +5859,7 @@ def test_a_partial_appearing_after_a_release_re_arms_the_guard(tmp_path, monkeyp
     real = xf._incomplete_partial_names
 
     def _staged(*a, **k):
-        # Staged on the HTTP CHILD, not on the probe: the transition probes the cache too (it clears
-        # what it can before forcing repo-wide), so counting probes would move these two events.
+        # Staged on the HTTP CHILD, not the probe: the transition probes the cache too.
         # Gone by the second HTTP child (the guard releases), then a sibling recreates it.
         http_children = len([c for c in fake.calls if c.disable_xet])
         if http_children == 1 and partial.exists():
