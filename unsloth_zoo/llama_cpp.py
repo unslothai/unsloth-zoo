@@ -1705,24 +1705,18 @@ pass
 
 _UNSLOTH_BRANDING_MARKER = b"# UNSLOTH_BRANDING_APPLIED"
 
-# The line the monolith branding patch inserts. Used as that patch's own
-# idempotency marker, since unlike the package-layout patch it edits the
-# in-memory entrypoint rather than conversion/base.py and has nowhere to put a
-# comment marker without changing the bytes users already have.
+# Idempotency marker for the monolith branding patch: it edits the in-memory
+# entrypoint, so it has nowhere to put a marker comment of its own.
 _UNSLOTH_BRANDING_LINE = b"self.metadata.quantized_by = 'Unsloth'"
 
-# The shape the gguf attribute guard patch inserts, used as that patch's own
-# idempotency marker for the same reason: it edits the in-memory entrypoint
-# and has no marker comment of its own.
+# Same for the gguf attribute guard patch.
 _GGUF_GUARD_LINE = b"except AttributeError: gguf."
-# One guard as this patch writes it, so the names already covered can be read back out of a
-# converter that has been through here before. Anchored on the `except` half rather than the
-# `try` half: `try: gguf.X` is also what the scan below would find as a REFERENCE, and a
-# pattern that matched both could not tell "already guarded" from "needs guarding".
+# Reads back the names already guarded. Anchored on the `except` half: `try: gguf.X`
+# is also what the reference scan looks for, so a pattern matching both could not
+# tell "already guarded" from "needs guarding".
 _GGUF_GUARD_PATTERN = re.compile(rb"except AttributeError: gguf\.([\.A-Z_0-9]{3,}) = None")
-# The whole guard, try half included, so the reference scan can be run over a converter with
-# the previous patch removed. Without this the scan finds `gguf.X` inside the guards it wrote
-# last time and every already-guarded name reads as a fresh reference.
+# The whole guard, so the reference scan can run with previous guards stripped out.
+# Otherwise it finds `gguf.X` inside its own guards and re-guards every name.
 _GGUF_GUARD_BLOCK_PATTERN = re.compile(
     rb"try: gguf\.[\.A-Z_0-9]{3,}\r?\n?except AttributeError: gguf\.[\.A-Z_0-9]{3,} = None\r?\n?"
 )
@@ -1815,11 +1809,9 @@ pass
 def _dominant_newline(content):
     """The line ending the file mostly uses, b"\r\n" or b"\n".
 
-    Every patch below inserts whole lines into somebody else's checkout. A
-    Windows checkout of llama.cpp is CRLF throughout, so inserting bare LF lines
-    leaves a mixed-ending converter (Python runs it, but nothing else in that
-    tree looks like that, and a later diff or a CRLF-only editor shows the seam).
-    Counting is enough: a lone CR is not a line ending in any Python 3 source."""
+    The patches below insert whole lines, so a CRLF checkout must stay CRLF rather
+    than come out mixed. A lone CR is not a line ending in Python 3, so counting
+    is enough."""
     # All Unsloth Zoo code licensed under LGPLv3
     crlf = content.count(b"\r\n")
     if crlf == 0: return b"\n"
@@ -1875,27 +1867,16 @@ _NUM_EXPERTS_PATTERN = re.compile(
 
 def _patch_num_experts(content, eol_fallback = None):
     """Rewrite `n_experts = self.hparams["num_experts"]` to also accept
-    num_local_experts, preserving whatever indentation the converter uses.
-
-    The converter script is not always written at the same depth, so the
-    replacement has to reuse the captured indent instead of hardcoding one,
-    and it reuses the captured line ending so a CRLF checkout stays CRLF.
-    Returns (new_content, applied)."""
-    # A converter whose last line IS the match carries no terminator to reuse, and a bare
-    # LF there leaves a CRLF checkout with mixed endings: the file still parses, but the
-    # guarantee this function makes about line endings stops holding on exactly the file
-    # that is hardest to notice it on. The file's own dominant ending is what the rest of
-    # it uses, so it is the right thing to inherit.
+    num_local_experts, reusing the captured indent (the converter is not always
+    written at the same depth) and line ending. Returns (new_content, applied)."""
+    # A match on the last line carries no terminator to reuse; inherit the file's own.
     fallback = eol_fallback or _dominant_newline(content)
 
     def _replace(match):
         indent, trailer, newline = match.group(1), match.group(3), match.group(4)
-        # A match on the last line of a file with no trailing newline still needs
-        # one between the comment and the statement.
         eol = newline or fallback
-        # `trailer` is the trailing spaces or inline comment that followed the
-        # statement. The old unanchored regex left it in place, so keep it: a
-        # checkout that carries one still gets patched instead of silently not.
+        # Keep `trailer` (trailing spaces or an inline comment) so a checkout that
+        # carries one still gets patched, as it did under the old unanchored regex.
         return (
             indent + b"# Qwen3MoE seems to use num_local_experts instead of num_experts" + eol +
             indent + b"n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')" +
@@ -1909,17 +1890,13 @@ pass
 def _patched_content_parses(content):
     """True iff the patched converter is still syntactically valid Python.
 
-    Parse the bytes, not a decoded string: ast.parse applies the same source
-    decoding CPython uses when it imports the file we are about to write, so a
-    utf-8 BOM or a PEP 263 coding cookie is honoured rather than rejected.
-    Undecodable bytes and embedded NULs arrive as SyntaxError here too."""
+    Parse the bytes, not a decoded string, so a utf-8 BOM or a PEP 263 coding
+    cookie is honoured the way CPython honours it on import."""
     try:
         ast.parse(content)
         return True
     except (SyntaxError, ValueError, RecursionError):
-        # RecursionError: ast.parse recurses over nested expressions, so a
-        # pathological converter can exhaust the stack instead of reporting a
-        # syntax problem. Treat that as "cannot vouch for this content" too.
+        # RecursionError: deeply nested expressions can exhaust the stack.
         return False
 pass
 
@@ -1930,14 +1907,9 @@ def _choose_content_to_write(stages):
     `stages` is [(label, content), ...] oldest first, starting with the
     untouched upstream script. Returns (label, content, dropped_labels).
 
-    Two rules, both from the failure this guards against:
-      * Only blame our own patches. If the untouched script does not parse on
-        this interpreter (upstream adopting syntax newer than the running
-        Python), every stage fails the check and dropping our patches would fix
-        nothing, so keep the fully patched content.
-      * Drop the fewest patches possible. Walking back one stage at a time
-        keeps the earlier patches (gguf attribute guards, metadata branding)
-        when it is a later one that broke the file."""
+      * Only blame our own patches: if the untouched script does not parse on
+        this interpreter, dropping them fixes nothing, so keep them all.
+      * Drop the fewest possible, by walking back one stage at a time."""
     # All Unsloth Zoo code licensed under LGPLv3
     base_label, base_content = stages[0]
     final_label, final_content = stages[-1]
@@ -2096,22 +2068,18 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
     # --- Proceed with patching and saving ---
     try:
         patched_content = original_content # Start patching from original
-        # Snapshot after every patch so a patch that breaks the file can be
-        # dropped on its own instead of discarding the others (see
-        # _choose_content_to_write).
+        # Snapshot after every patch so a patch that breaks the file can be dropped
+        # on its own instead of discarding the others (see _choose_content_to_write).
         _patch_stages = [("unpatched upstream script", original_content)]
 
         # 3. Apply Patches (gguf attributes, metadata branding - same logic as before)
         logger.info("Unsloth: Applying patches...")
         # Patch 1: gguf Attribute Handling
         try:
-            # Scan with any previous patch's guards taken out, not with them left in. The
-            # guards spell `gguf.X` themselves, so a scan over the patched file finds every
-            # name it already covers and re-inserts the whole block, which is why this used
-            # to bail out on the first guard line it saw. Bailing out is too blunt: one
-            # pre-existing guard then suppressed guarding for EVERY name, so a converter
-            # updated to reference a new `gguf` enum after it had been patched once kept
-            # that enum unguarded and still raised AttributeError on an older `gguf`.
+            # Scan with any previous guards stripped out: they spell `gguf.X` themselves,
+            # so a scan over the patched file re-finds every name it already covers. The
+            # old fix was to bail out on the first guard line, which left a newly
+            # referenced enum unguarded on a converter that had been patched once.
             _unguarded_source = _GGUF_GUARD_BLOCK_PATTERN.sub(b"", patched_content)
             archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", _unguarded_source)))
             archs = [x.decode("utf-8") for x in archs if not x.startswith(b"_")]
@@ -2119,13 +2087,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                 name.decode("utf-8")
                 for name in _GGUF_GUARD_PATTERN.findall(patched_content)
             }
-            # Sorted, so a re-patch writes the same bytes in the same order and the result
-            # is comparable run to run rather than dependent on set iteration.
+            # Sorted, so a re-patch writes the same bytes rather than a set's order.
             archs = sorted(name for name in archs if name not in _already_guarded)
             if not archs and _GGUF_GUARD_LINE in patched_content:
-                # Everything this scan can see is already covered, so there is nothing to
-                # add and the file converges: a second run over a patched converter writes
-                # the same bytes rather than growing one copy of the block per patch.
+                # Everything is already covered, so the file converges instead of
+                # growing one copy of the block per patch.
                 logger.info(
                     "Unsloth: gguf attribute guards already cover every referenced "
                     "attribute (idempotent skip)."
@@ -2163,15 +2129,10 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                         f"Upstream may have refactored Metadata.load again."
                     )
             elif _UNSLOTH_BRANDING_LINE in patched_content:
-                # The monolith branding patch has no marker of its own, so running it
-                # over content that already carries it inserted a second copy: the
-                # regex matches `Metadata.load(...)` again and the lines it inserted
-                # last time do not stop it. Harmless (the assignments are idempotent
-                # and the file still parses) but it is not convergence, and a checkout
-                # where a previously patched script was copied back over
-                # convert_hf_to_gguf.py grows another copy on every conversion.
-                # The upstream converter never contains this string, so a pristine
-                # checkout is unaffected.
+                # This patch has no marker of its own, so without this check the regex
+                # matches `Metadata.load(...)` again and appends another copy of the
+                # branding on every conversion. Upstream never ships this line, so a
+                # pristine checkout is unaffected.
                 logger.info(
                     "Unsloth: Metadata branding patch already present in the converter "
                     "(idempotent skip)."
@@ -2234,8 +2195,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         patched_filename = os.path.join(patched_dir, f"{name}.py")
 
         # Never write a converter we just broke: fall back to the last content that
-        # still parses rather than failing later with an IndentationError far from
-        # the cause.
+        # still parses, rather than failing later far from the cause.
         _kept_label, _kept_content, _dropped_labels = _choose_content_to_write(_patch_stages)
         if _dropped_labels:
             logger.warning(

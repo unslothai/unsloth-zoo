@@ -530,9 +530,8 @@ def test_patched_content_parses_gate():
 @pytest.mark.parametrize("indent", [8, 12, 16, 20])
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
 def test_num_experts_patch_preserves_the_line_ending(indent, newline):
-    """A Windows checkout of llama.cpp has CRLF line endings. The inserted comment
-    line must use the file's ending, not a bare LF, or the converter comes out with
-    mixed endings."""
+    """The inserted lines must use the file's own ending, not a bare LF, or a CRLF
+    checkout comes out with mixed endings."""
     import ast
 
     module = _load_llama_cpp_module()
@@ -600,8 +599,7 @@ def test_num_experts_patch_is_not_fooled_by_a_similar_line():
         (b"def f(:\n", False),
         # CRLF source is valid Python.
         (b"def f():\r\n    return 1\r\n", True),
-        # A utf-8 BOM is stripped by CPython's own source decoding, so the gate must
-        # not reject it. Decoding to str first and parsing that does reject it.
+        # A utf-8 BOM must be accepted; parsing a decoded str would reject it.
         (b"\xef\xbb\xbfx = 1\n", True),
         # PEP 263 coding cookie, honoured by ast.parse on bytes.
         (b"# -*- coding: utf-8 -*-\nx = 1\n", True),
@@ -617,9 +615,8 @@ def test_patched_content_parses_gate_cases(content, expected):
 
 
 def test_the_gate_rejects_the_hardcoded_indent_failure_mode():
-    """What the old replacement produced on a converter written at 16 spaces: the
-    statement landed at 12, one dedent below the comment, and the file was written
-    without a syntax check."""
+    """What the old hardcoded replacement produced at 16 spaces: the statement landed
+    at 12, one dedent below the comment, and was written without a syntax check."""
     module = _load_llama_cpp_module()
     broken = (
         b"class Model:\n"
@@ -639,10 +636,8 @@ def test_the_gate_rejects_the_hardcoded_indent_failure_mode():
     [b"  ", b"\t", b"  # noqa", b"  # keep this comment", b" #x"],
 )
 def test_num_experts_patch_keeps_a_trailing_comment_or_spaces(trailer):
-    """The old unanchored regex patched the statement wherever it appeared, so a
-    checkout whose target line carries trailing spaces or an inline comment was
-    patched too. Anchoring the pattern on the whole line must not lose those
-    files: the trailer is preserved and the patch still applies."""
+    """Anchoring the pattern on the whole line must not lose the checkouts the old
+    unanchored regex covered: a trailer is preserved and the patch still applies."""
     import ast
 
     module = _load_llama_cpp_module()
@@ -704,9 +699,8 @@ def test_choose_content_falls_back_to_the_original_when_the_first_patch_broke_it
 
 
 def test_choose_content_does_not_blame_our_patches_when_upstream_needs_a_newer_python():
-    """If the untouched converter does not parse on the running interpreter (for
-    instance upstream adopting syntax newer than this Python), dropping our
-    patches fixes nothing and would silently disable them. Keep them."""
+    """If the untouched converter does not parse on the running interpreter, dropping
+    our patches fixes nothing and would silently disable them. Keep them."""
     module = _load_llama_cpp_module()
     broken_base = b"class C[T]:\n    pass\n" if sys.version_info < (3, 12) else b"def f(:\n"
     stages = _stage_list(("base", broken_base), ("p1", broken_base + b"x = 1\n"))
@@ -798,9 +792,8 @@ def _drive_patcher(llama_cpp, tmp_path, monkeypatch, source, name = "convert_hf_
 @pytest.mark.parametrize("indent", [12, 16])
 @pytest.mark.parametrize("trailer", [b"", b"  # inline"])
 def test_end_to_end_monolith_patch_is_written_and_parses(tmp_path, monkeypatch, indent, trailer):
-    """Drive the whole patcher over a monolith converter whose target sits at a
-    depth the old hardcoded replacement could not produce. The file that lands on
-    disk must parse and must carry the alias patch."""
+    """Drive the whole patcher over a monolith whose target sits at a depth the old
+    hardcoded replacement could not produce: the written file parses and is patched."""
     import ast
 
     llama_cpp = _load_llama_cpp_module()
@@ -851,8 +844,8 @@ def test_end_to_end_writes_the_original_when_every_patch_stage_is_broken(tmp_pat
 
 @pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf"])
 def test_end_to_end_crlf_and_bom_monolith(tmp_path, monkeypatch, prefix):
-    """A Windows checkout: CRLF throughout, optionally with a utf-8 BOM. The
-    written converter must parse and must not gain a lone LF."""
+    """CRLF throughout, optionally with a utf-8 BOM: the written converter must parse
+    and must not gain a lone LF."""
     import ast
 
     llama_cpp = _load_llama_cpp_module()
@@ -870,8 +863,8 @@ def test_end_to_end_crlf_and_bom_monolith(tmp_path, monkeypatch, prefix):
 
 @pytest.fixture
 def real_monolith_converter(tmp_path):
-    """The real pre-package convert_hf_to_gguf.py from a pinned llama.cpp tag.
-    b4600 is a monolith whose two Qwen MoE sites use the patched spelling."""
+    """The real pre-package convert_hf_to_gguf.py from llama.cpp b4600, a monolith
+    whose two Qwen MoE sites use the patch target's spelling."""
     requests = pytest.importorskip("requests")
     url = "https://raw.githubusercontent.com/ggml-org/llama.cpp/b4600/convert_hf_to_gguf.py"
     try:
@@ -936,8 +929,7 @@ def test_dominant_newline(content, expected):
 
 
 def test_branding_patch_on_a_crlf_base_py_stays_crlf(tmp_path):
-    """conversion/base.py in a Windows checkout is CRLF. The branding lines we
-    insert must use the same ending, not a bare LF."""
+    """The branding lines inserted into a CRLF base.py must use CRLF, not a bare LF."""
     module = _load_llama_cpp_module()
     base_py = tmp_path / "base.py"
     base_py.write_bytes(_PACKAGE_BASE_PY.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
@@ -963,10 +955,8 @@ def test_gguf_attribute_patch_keeps_the_blank_lines_after_the_import(tmp_path, m
 def test_patching_an_already_patched_monolith_converges(tmp_path, monkeypatch, indent):
     """Patching the patcher's own output must be a no-op, not a second insertion.
 
-    The monolith branding patch has no marker inside the file it edits, so before
-    the guard it matched `Metadata.load(...)` again and appended another copy of the
-    three branding lines every time. Reachable for anyone who copies a patched
-    script back over `convert_hf_to_gguf.py`, and it grows on every conversion."""
+    The monolith branding patch has no marker inside the file it edits, so before the
+    guard it matched `Metadata.load(...)` again and appended another copy every time."""
     import ast
 
     llama_cpp = _load_llama_cpp_module()
@@ -982,8 +972,7 @@ def test_patching_an_already_patched_monolith_converges(tmp_path, monkeypatch, i
     assert once.count(b"self.metadata.quantized_by = 'Unsloth'") == 1
     assert twice.count(b"self.metadata.quantized_by = 'Unsloth'") == 1
     assert twice.count(b"num_local_experts") == once.count(b"num_local_experts")
-    # The gguf attribute guards are the other patch with no marker of its own: the
-    # arch scan finds the `gguf.X` names inside the guards it inserted last time.
+    # Same for the gguf guards: the arch scan finds the `gguf.X` names inside them.
     guards = once.count(b"except AttributeError: gguf.")
     assert guards > 0, "fixture did not exercise the gguf attribute guard patch"
     assert twice.count(b"except AttributeError: gguf.") == guards
@@ -1006,11 +995,9 @@ def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
 ):
     """One pre-existing guard must not suppress guarding for every other name.
 
-    The convergence guard keyed on a single substring: seeing `except AttributeError: gguf.`
-    anywhere meant "this patch is complete". A converter that has been through the patcher
-    once and is then updated to reference a new `gguf` enum therefore kept that enum
-    unguarded, which is the exact AttributeError on an older `gguf` that this patch exists to
-    prevent, and it is now silent because the file looks patched.
+    The old convergence guard keyed on a single substring, so a converter patched once
+    and then updated to reference a new `gguf` enum kept that enum unguarded, which is
+    the exact AttributeError this patch exists to prevent.
     """
     import ast
 
@@ -1022,8 +1009,7 @@ def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
     assert b"except AttributeError: gguf." in once, "fixture did not reach the guard patch"
     assert b"gguf.LATER_ENUM" not in once
 
-    # The update: the same patched converter, now referencing an enum that did not exist
-    # when it was patched. Placed in a body line, the way a real converter reference is.
+    # The update: the same patched converter, now referencing a new enum from a body line.
     updated = once.replace(
         b"        return n_experts\n",
         b"        _later = gguf.LATER_ENUM\n        return n_experts\n",
@@ -1036,13 +1022,11 @@ def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
     assert b"except AttributeError: gguf.LATER_ENUM = None" in twice, (
         "the new reference was left unguarded because the file already held a guard"
     )
-    # And only that one is added: the names already covered are not guarded twice, so the
-    # converter still converges rather than growing a copy of the block per patch.
+    # And only that one is added: names already covered are not guarded twice.
     assert twice.count(b"except AttributeError: gguf.MODEL_ARCH.LLAMA = None") == 1
     assert twice.count(b"except AttributeError: gguf.LATER_ENUM = None") == 1
 
-    # A third pass over that output changes nothing, which is the property the blunt
-    # substring check was bought with and the one this must not give up.
+    # A third pass changes nothing: the convergence the substring check bought survives.
     third = tmp_path / "third"
     third.mkdir()
     thrice, _ = _drive_patcher(llama_cpp, third, monkeypatch, twice)
@@ -1050,11 +1034,8 @@ def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
 
 
 def test_a_converter_with_nothing_new_is_still_byte_identical(tmp_path, monkeypatch):
-    """The convergence property the old guard bought has to survive the change.
-
-    Per-attribute detection is only safe if re-patching a file whose references are all
-    covered writes the same bytes: otherwise every conversion grows the converter.
-    """
+    """Per-attribute detection is only safe if re-patching a fully covered file writes
+    the same bytes; otherwise every conversion grows the converter."""
     llama_cpp = _load_llama_cpp_module()
     first, second = tmp_path / "first", tmp_path / "second"
     first.mkdir(); second.mkdir()
@@ -1064,13 +1045,9 @@ def test_a_converter_with_nothing_new_is_still_byte_identical(tmp_path, monkeypa
 
 
 def test_an_unterminated_final_target_keeps_the_files_line_ending():
-    """A converter whose LAST line is the match carries no terminator to reuse.
-
-    `\\n` as the fallback leaves a CRLF checkout with mixed endings. It still parses, which
-    is why it is easy to miss, but the line-ending guarantee this patch makes stops holding
-    on exactly the file that is hardest to notice it on, and a Windows diff shows the seam.
-    The file's own dominant ending is what the rest of it uses.
-    """
+    """A converter whose LAST line is the match carries no terminator to reuse, so it
+    must inherit the file's dominant ending. A `\\n` fallback would leave a CRLF
+    checkout with mixed endings, which still parses and so is easy to miss."""
     llama_cpp = _load_llama_cpp_module()
     crlf = (
         b"class M:\r\n"
