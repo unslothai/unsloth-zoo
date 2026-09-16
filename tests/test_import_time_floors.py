@@ -277,3 +277,51 @@ def test_fused_linear_cross_entropy_needs_the_symbol_the_gate_skips():
     assert "HAS_CUT_CROSS_ENTROPY" not in body, (
         "fused_linear_cross_entropy now checks the flag itself; retarget this test"
     )
+
+
+def _sm75_warning_text():
+    import inspect
+    import re
+
+    source = inspect.getsource(importlib.import_module("unsloth_zoo.loss_utils"))
+    match = re.search(r"miscompiles the cut cross entropy.*?\"\n\s*\)", source, re.S)
+    assert match, "the sm75 CCE warning is no longer recognisable"
+    return match.group(0)
+
+
+def test_the_sm75_warning_does_not_recommend_a_torch_that_still_disables_cce():
+    """The remedy has to clear BOTH gates, not just the triton one.
+
+    triton 3.4.0 ships with torch 2.8.0 and compiles the kernel, but unsloth_zoo/__init__.py
+    sets UNSLOTH_ENABLE_CCE=0 for torch >= 2.8 over a separate shared-memory failure, and
+    the generated branches require that flag as well as HAS_CUT_CROSS_ENTROPY. So a user
+    who followed "upgrade to torch 2.8" paid for the upgrade and still got the standard
+    loss. torch 2.6.0 carries triton 3.2.0, which is outside the broken range and below
+    the flag's cutoff, so it is the configuration that actually restores CCE.
+    """
+    text = _sm75_warning_text()
+    assert "torch 2.6.0" in text
+    assert "UNSLOTH_ENABLE_CCE=0" in text, (
+        "the warning names torch 2.8 without saying that the flag keeps CCE off there"
+    )
+    for claim in ("2.8.0 or later, which carries triton 3.4.0, restores it",):
+        assert claim not in text, f"the warning still promises {claim!r}"
+
+
+def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
+    """NEGATIVE CONTROL for the sentence above: read the gate rather than trusting the
+    prose. If __init__ ever stops force-disabling CCE on torch 2.8, this fails and the
+    warning can go back to recommending it."""
+    import inspect
+    import re
+
+    source = inspect.getsource(importlib.import_module("unsloth_zoo"))
+    gate = re.search(
+        r"if \(major_torch >= 2 and minor_torch >= 8\) or \(major_torch > 2\):\s*\n"
+        r"\s*os\.environ\[\"UNSLOTH_ENABLE_CCE\"\] = \"0\"",
+        source,
+    )
+    assert gate, (
+        "unsloth_zoo no longer force-disables UNSLOTH_ENABLE_CCE for torch >= 2.8; the "
+        "sm75 warning's advice depends on this and has to be revisited"
+    )

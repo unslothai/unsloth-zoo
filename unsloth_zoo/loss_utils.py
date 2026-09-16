@@ -92,10 +92,13 @@ elif DEVICE_TYPE == "cuda":
         logger.warning(
             f"Unsloth: triton=={triton_version} miscompiles the cut cross entropy "
             f"kernel for compute capability {major}.{minor}, so it is disabled and "
-            f"the standard loss is used instead, at a higher memory cost. Upgrading "
-            f"to torch 2.8.0 or later, which carries triton 3.4.0, restores it; so "
-            f"does torch 2.6.0, which carries triton 3.2.0. Leaving it enabled aborts "
-            f"the process with 'LLVM ERROR: Unsupported rounding mode for conversion'."
+            f"the standard loss is used instead, at a higher memory cost. torch 2.6.0, "
+            f"which carries triton 3.2.0, restores it. torch 2.8.0 and later carry a "
+            f"triton that compiles the kernel, but do NOT restore it here: unsloth_zoo "
+            f"sets UNSLOTH_ENABLE_CCE=0 for torch 2.8 and above over a separate shared "
+            f"memory failure, and both compiled branches require that flag as well as "
+            f"HAS_CUT_CROSS_ENTROPY. Leaving it enabled aborts the process with "
+            f"'LLVM ERROR: Unsupported rounding mode for conversion'."
         )
     pass
 elif DEVICE_TYPE == "hip":
