@@ -498,7 +498,7 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    from .moe_utils import _should_use_separated_lora
+    from .moe_utils import _should_use_separated_lora, combine_permuted_moe_outputs
     use_separated_lora = _should_use_separated_lora()
     model_type = getattr(self, "_unsloth_model_type", None)
 
@@ -563,12 +563,15 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
     flat_weights = top_k_weights.view(-1)
     permuted_weights = flat_weights[sorted_indices]
     mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=input_dtype,
-        device=hidden_states.device,
+    # Same duplicate-index atomicAdd reduction as the bf16/native path; see
+    # combine_permuted_moe_outputs for why this is not an index_add_.
+    final_hidden_states = combine_permuted_moe_outputs(
+        mm2_out,
+        sorted_indices,
+        batch_size * sequence_length,
+        top_k_index.shape[-1],
+        out_dtype = input_dtype,
     )
-    final_hidden_states.index_add_(0, token_indices, mm2_out.to(input_dtype))
     if is_2d_input:
         return final_hidden_states
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
