@@ -659,6 +659,87 @@ def _incomplete_partial_names(
     return names
 
 
+def _blobs_with_a_live_writer() -> Optional[set]:
+    """Basenames of every ``*.incomplete`` blob some LIVE process currently holds open, or ``None``
+    when that cannot be answered on this host.
+
+    ``_child_open_incomplete_blobs`` asks this of one pid. This asks it of every process the current
+    user can see, because the question at the unscoped purge below is not "is this ours" but "is
+    anybody still writing it", and age cannot answer that: a partial can be older than any grace and
+    still belong to a sibling that is paused, blocked on a slow connection or waiting on a retry.
+    Deleting it wastes its transfer and makes its final rename fail.
+
+    ``None`` is the honest answer wherever the question cannot be put -- no psutil, or a platform
+    that refuses the open-file table -- and the caller then declines the unscoped pass rather than
+    guessing. A process the current user may not inspect raises per process and is skipped, so the
+    set is a LOWER bound on live writers; that only matters for another user's download into a cache
+    this user also writes, which is recorded rather than claimed closed.
+
+    Run once, on the Xet to HTTP transition, immediately before the alternative is a repo-wide
+    re-download of every completed shard, so a full process walk is the cheap side of that trade.
+    """
+    try:
+        import psutil  # type: ignore
+    except ImportError:
+        return None
+    open_blobs: set = set()
+    try:
+        for proc in psutil.process_iter():
+            try:
+                for handle in proc.open_files():
+                    if handle.path.endswith(INCOMPLETE_SUFFIX):
+                        open_blobs.add(os.path.basename(handle.path))
+            except Exception:
+                # Denied, gone, or a platform that will not list this process's files. One
+                # unreadable process is not a reason to abandon the rest.
+                continue
+    except Exception:
+        return None
+    return open_blobs
+
+
+def _unowned_partials_safe_to_clear(
+    repo_type: str,
+    repo_id: str,
+    cache_dir: Optional[str],
+    active_grace: float,
+    owned_incomplete_blobs: Optional[set],
+) -> Optional[set]:
+    """The partials outside the ownership set that may be removed, or ``None`` for "do not".
+
+    Two conditions, both required. Older than *active_grace*, which is the patient HTTP grace this
+    transition already applies, and not open by any live process, which is the part age cannot
+    establish. When the open-file table cannot be read at all the answer is ``None`` and the caller
+    skips the pass entirely, so a host without psutil never widens the purge beyond the ownership
+    set on age alone.
+    """
+    live_writers = _blobs_with_a_live_writer()
+    if live_writers is None:
+        return None
+    owned = owned_incomplete_blobs or set()
+    now = time.time()
+    clearable: set = set()
+    try:
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+            blobs_dir = entry / "blobs"
+            if not blobs_dir.is_dir():
+                continue
+            for blob in blobs_dir.iterdir():
+                try:
+                    if not (blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX)):
+                        continue
+                    if blob.name in owned or blob.name in live_writers:
+                        continue
+                    if now - blob.stat().st_mtime < active_grace:
+                        continue
+                except OSError:
+                    continue
+                clearable.add(blob.name)
+    except Exception:
+        return None
+    return clearable
+
+
 def _clear_unsafe_partials_for_http(
     repo_type: str,
     repo_id: str,
@@ -687,22 +768,36 @@ def _clear_unsafe_partials_for_http(
 
     * ours -- the ``.incomplete`` basenames the killed child held open, exempt from the grace
       because a partial our own dead child wrote has no live writer;
-    * anything older than *active_grace* -- the patient HTTP grace ``_default_prepare_for_http``
-      already applies on this same transition.
+    * a partial outside that set which is BOTH older than *active_grace* and open by no live
+      process. The second pass is what the purge above cannot do: that one skips every blob outside
+      the ownership set whatever its age, so a partial left by an EARLIER crashed attempt survives
+      indefinitely and holds the repo-wide force. An injected (Unsloth) ``prepare_for_http_fn``
+      leaves the same gap, since it judges provenance by its own markers and never sees the
+      ownership set.
 
-    The second pass is what the purge above cannot do: it drops the ownership SET over the grace and
-    then skips every blob outside that set whatever its age, so a partial left by an EARLIER crashed
-    attempt survives indefinitely and holds the force. An injected (Unsloth) ``prepare_for_http_fn``
-    leaves the same gap, since it judges provenance by its own markers and never sees the ownership
-    set. A partial YOUNGER than the grace with no ownership evidence may belong to a live sibling and
-    is still left alone, so the caller forces exactly as it did before.
+    AGE IS NOT PROOF THAT A WRITER EXITED, which is why the second condition is there. A partial
+    can be older than any grace and still belong to a sibling that is paused, blocked on a slow
+    connection or waiting on a retry, and deleting it wastes that transfer and fails its rename.
+    ``_unowned_partials_safe_to_clear`` asks the open-file table instead, and returns ``None``
+    wherever that table cannot be read, in which case this pass does not run at all: on such a host
+    the caller forces exactly as it did before rather than widening the purge on age alone.
+
+    The result is passed to ``_clear_partials`` AS its ownership set, so the deletion is an explicit
+    whitelist rather than a grace: every condition has already been checked here.
     """
     if owned_incomplete_blobs:
         _clear_partials(
             repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace,
             owned_incomplete_blobs = owned_incomplete_blobs,
         )
-    _clear_partials(repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace)
+    clearable = _unowned_partials_safe_to_clear(
+        repo_type, repo_id, cache_dir, active_grace, owned_incomplete_blobs,
+    )
+    if clearable:
+        _clear_partials(
+            repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace,
+            owned_incomplete_blobs = clearable,
+        )
     return _incomplete_partial_names(repo_type, repo_id, cache_dir)
 
 

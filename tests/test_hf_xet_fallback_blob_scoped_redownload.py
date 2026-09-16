@@ -537,9 +537,84 @@ def test_the_snapshot_watchdog_still_measures_the_whole_repo(monkeypatch, tmp_pa
     }
 
 
-def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(tmp_path):
+def test_an_aged_partial_a_live_process_still_holds_open_is_not_cleared(monkeypatch, tmp_path):
+    """AGE IS NOT PROOF THAT A WRITER EXITED.
+
+    A sibling downloader that is paused, blocked on a slow connection or waiting on a retry leaves a
+    partial older than any grace and is still going to finish it. Deleting it wastes the transfer
+    and makes its final rename fail, and on POSIX it can be deleted out from under an open handle
+    without the writer noticing. The unscoped pass therefore asks the open-file table, and a blob
+    that is open stays whatever its age, so the caller forces exactly as it did before.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: {stranger})
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert survivors == {stranger}, "an aged partial with a live writer was deleted"
+    assert (tmp_path / REPO_DIR / "blobs" / stranger).exists()
+
+
+def test_an_unreadable_open_file_table_declines_the_unscoped_pass(monkeypatch, tmp_path):
+    """No psutil, or a platform that will not list open files. The question cannot be put, so the
+    purge is not widened on age alone: the partial survives and the caller forces, which is what it
+    did before this pass existed. Failing the other way would make the least inspectable hosts the
+    most destructive ones."""
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert survivors == {stranger}
+    assert (tmp_path / REPO_DIR / "blobs" / stranger).exists()
+
+
+def test_our_own_partial_is_cleared_even_with_the_table_unreadable(monkeypatch, tmp_path):
+    """The ownership set is separate evidence and does not depend on the table: our own dead child
+    wrote it, so there is no live writer to protect. #9094 is fixed by THIS pass, and the unscoped
+    one only reaches an earlier crashed attempt's leftovers."""
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {mine},
+    )
+    assert survivors == set()
+    assert not (tmp_path / REPO_DIR / "blobs" / mine).exists()
+
+
+def test_the_live_writer_probe_finds_this_processs_own_open_partial(tmp_path):
+    """The probe itself, unfaked, against a real open file descriptor on this host.
+
+    Skipped where the open-file table cannot be read, which is the same condition the caller
+    declines on, so a host that skips this is a host the pass never runs on.
+    """
+    blob = tmp_path / ("deadbeef" + xf.INCOMPLETE_SUFFIX)
+    blob.write_bytes(b"x")
+    with blob.open("ab") as handle:
+        handle.write(b"y")
+        handle.flush()
+        seen = xf._blobs_with_a_live_writer()
+        if seen is None:
+            pytest.skip("this host cannot read the open-file table")
+        assert blob.name in seen, "an open partial was not seen as having a live writer"
+    # closed: nothing holds it now
+    after = xf._blobs_with_a_live_writer()
+    assert after is not None and blob.name not in after
+
+
+def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(monkeypatch, tmp_path):
     """The helper's contract, directly: ours goes whatever its age, a stranger goes only once past
-    the grace, and the return value names what SURVIVED (``None`` for an unreadable cache)."""
+    the grace AND with no live writer, and the return value names what SURVIVED (``None`` for an
+    unreadable cache). The open-file table is pinned to empty so the case is about the grace rather
+    than about whatever else this host happens to be downloading."""
+    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: set())
     _build_cache(tmp_path, partial_age_s = 5.0, extra_partial = "vocab.json")
     blobs = tmp_path / REPO_DIR / "blobs"
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
@@ -551,7 +626,7 @@ def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(tmp
     assert survivors == {stranger}, "ours is cleared even fresh; a fresh stranger is spared"
     assert not (blobs / mine).exists()
     assert (blobs / stranger).exists()
-    # Age the stranger past the grace: now it is provably nobody's live writer.
+    # Age the stranger past the grace, with no process holding it open: now it is clearable.
     os.utime(blobs / stranger, (time.time() - 1800.0, time.time() - 1800.0))
     assert xf._clear_unsafe_partials_for_http(
         "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
