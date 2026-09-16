@@ -235,28 +235,26 @@ def add_new_tokens(
 pass
 
 
-# datasets' own default for Dataset.map(batched=True), so the fallback below and the
-# .map path it stands in for allocate the same size transient.
+# datasets' own default for Dataset.map(batched=True), so the fallback below and the .map
+# path it stands in for allocate the same size transient.
 _COUNT_INPUT_IDS_BATCH_SIZE = 1000
 
 
 def _count_input_ids(train_dataset, mapping):
     """Apply `mapping` over the dataset's input_ids in batches.
 
-    Everything else in fix_untrained_tokens only needs len() and [j], so a plain list of
-    rows gets this far; only .map is datasets specific. Fall back to a direct batched call
-    instead of raising AttributeError. Same row convention as the checks above: a row
-    without an "input_ids" key is skipped."""
+    Everything else in fix_untrained_tokens needs only len() and [j], so a plain list of rows
+    gets this far and only .map is datasets specific. Same row convention as the checks
+    above: a row without an "input_ids" key is skipped."""
     # All Unsloth Zoo code licensed under LGPLv3
     if hasattr(train_dataset, "map"):
         train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
         return
     pass
-    # Same batch size as the .map path above, for the same reason. `mapping` flattens the
-    # batch it is given into one array of every token in it, so handing it the whole
-    # dataset at once is an O(total tokens) transient allocation where .map is bounded.
-    # It accumulates into a counter rather than returning anything, which is what makes
-    # chunking exactly equivalent -- .map(batched=True) already calls it once per batch.
+    # `mapping` flattens the batch into one array of every token in it, so the whole dataset
+    # at once is an O(total tokens) transient where .map is bounded. It accumulates into a
+    # counter rather than returning anything, which is what makes chunking exactly
+    # equivalent: .map(batched=True) already calls it once per batch.
     batch = []
     for row in train_dataset:
         if "input_ids" not in row: continue

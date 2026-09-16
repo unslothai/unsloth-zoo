@@ -4,18 +4,15 @@
 """fix_untrained_tokens must accept any indexable train_dataset, not only a
 datasets.Dataset (unsloth#2953).
 
-Every other train_dataset use in that function needs only len() and [j]; the
-untrained-token count was the single line that required .map, so a plain list of
-rows reached it and died with AttributeError. TRL 1.x rejects a list before the
-trainer is built, but TRL 0.22.x does not, so this guard is the only protection on
-the older line.
+Every other train_dataset use in that function needs only len() and [j], so a plain list of
+rows reached the one line that required .map and died with AttributeError. TRL 1.x rejects a
+list before the trainer is built, but TRL 0.22.x does not, so this guard is the only
+protection on the older line.
 
-The second half of this file pins the decorator. `fix_untrained_tokens` writes the
-corrected rows back with `embedding_matrix[where_untrained] = ...`, an in-place
-write to a leaf weight that requires grad, which torch refuses outside inference
-mode. Introducing the helper above the function is therefore only safe if the
-helper is defined above the `@_maybe_inference_mode` line rather than between the
-decorator and the function it decorates.
+The second half pins the decorator: `fix_untrained_tokens` writes rows back with an in-place
+write to a leaf weight that requires grad, which torch refuses outside inference mode, so the
+new helper has to be defined ABOVE the `@_maybe_inference_mode` line, not between the
+decorator and the function.
 """
 
 import itertools
@@ -84,9 +81,6 @@ def test_count_input_ids_works_on_a_real_dataset():
     assert final_counts.tolist() == [0, 1, 3, 0, 0, 0, 0, 0]
 
 
-# ---------------------------------------------------------------------------
-# The decorator must still land on fix_untrained_tokens
-# ---------------------------------------------------------------------------
 
 class _Tokenizer:
     chat_template = "<|extra_0|> in the template"
@@ -178,9 +172,8 @@ def test_fix_untrained_tokens_end_to_end_on_a_list_dataset():
 
 
 def test_the_undecorated_function_cannot_write_the_rows_back():
-    """Proof that the decorator is load-bearing and not cosmetic. Run outside
-    inference mode the same body fails on a trainable weight: first on
-    lm_head_bad.numpy(), and if that is detached, on the in-place write back."""
+    """The decorator is load-bearing, not cosmetic: outside inference mode the same body
+    fails on a trainable weight, first on .numpy() and then on the write back."""
     model = _untrained_model()
 
     with pytest.raises(RuntimeError, match = "requires grad|in-place operation"):
@@ -190,9 +183,8 @@ def test_the_undecorated_function_cannot_write_the_rows_back():
 
 
 def test_count_input_ids_accepts_rows_whose_ids_are_arrays():
-    """A row read back from a collator or a torch dataset holds a tensor or an
-    ndarray, not a list. The counting path only chains and counts, so both work,
-    and pinning it keeps the fallback honest about what it accepts."""
+    """A row read back from a collator or a torch dataset holds a tensor or an ndarray, not
+    a list; the counting path only chains and counts, so both work."""
     final_counts, mapping = _counter()
 
     tokenizer_utils._count_input_ids(
@@ -217,11 +209,10 @@ def test_count_input_ids_on_an_empty_list_never_calls_the_mapping():
 
 
 def test_the_plain_list_fallback_counts_in_bounded_batches():
-    """`mapping` flattens whatever batch it is handed into one array of every token in
-    it, so one call with the whole dataset is an O(total tokens) transient where the
-    `.map` path it stands in for is bounded at 1000 rows. The counts must be identical
-    either way, which is what makes chunking safe: `mapping` accumulates rather than
-    returning, exactly as `.map(batched=True)` already requires."""
+    """`mapping` flattens whatever batch it is handed into one array of every token in it, so
+    one call with the whole dataset is an O(total tokens) transient where `.map` is bounded.
+    Chunking is safe because `mapping` accumulates rather than returning, which
+    `.map(batched=True)` already requires."""
     final_counts, mapping = _counter()
     sizes = []
 

@@ -2271,17 +2271,16 @@ pass
 
 
 def _normalize_role_alias(role):
-    """Role names arrive with stray case and whitespace ("User ", "USER", "user"),
-    so aliases are compared in one normalized form. Module level, not a closure:
-    `_standardize_dataset` is sent through `dataset.map(num_proc = ...)`."""
+    """Role names arrive with stray case and whitespace, so aliases are compared in one
+    normalized form. Module level, not a closure: `_standardize_dataset` is sent through
+    `dataset.map(num_proc = ...)`."""
     # All Unsloth Zoo code licensed under LGPLv3
     return role.strip().lower()
 pass
 
 
-# The two conventional spellings of the role column: ShareGPT writes `from`/`value`, ChatML
-# writes `role`/`content`. Used only to break a tie no value can break, never to decide a
-# case the values already answer, so an unconventional pair of names is unaffected.
+# ShareGPT writes `from`/`value`, ChatML writes `role`/`content`. Used only to break a tie no
+# value can break, so an unconventional pair of names is unaffected.
 _ROLE_KEY_NAMES = ("role", "from")
 
 
@@ -2331,21 +2330,17 @@ def standardize_data_formats(
         for alias in (aliases_for_system + aliases_for_user + aliases_for_assistant)
     )
 
-    # Prefer the column whose values are all known role aliases. The cardinality
-    # heuristic below cannot break a tie, and a tie is common on small datasets
-    # (two rows, or one row of one user turn and one assistant turn), where it picks
-    # the content column and the alias check then rejects the user's own text.
+    # Prefer the column whose values are all known role aliases: the cardinality heuristic
+    # below cannot break a tie, and a tie is common on small datasets, where it picks the
+    # content column and the alias check then rejects the user's own text.
     alias_keys = [
         key for key in keys
         if set(_normalize_role_alias(value) for value in uniques[key]) <= all_aliases
     ]
 
-    # Both columns alias-only is a real shape, not a degenerate one: a one-turn record
-    # such as {"role": "user", "content": "assistant"} puts a role word in the content
-    # column, both sides have one unique value, and the cardinality heuristic below then
-    # takes keys[1] and emits {"role": "assistant", "content": "user"} with the two
-    # swapped and no error anywhere. The conventional key NAMES break that tie, and they
-    # are the same pair the format inference elsewhere keys on.
+    # Both columns alias-only is a real shape: {"role": "user", "content": "assistant"} puts
+    # a role word in the content column, so the cardinality heuristic emits the two swapped
+    # with no error anywhere. The conventional key NAMES break that tie.
     named_role_keys = [key for key in keys if str(key).strip().lower() in _ROLE_KEY_NAMES]
 
     if len(alias_keys) == 1:
@@ -2377,13 +2372,11 @@ def standardize_data_formats(
         )
     pass
 
-    # Mapping for aliases. Normalization is what makes the lookup case and whitespace
-    # insensitive, and it is also what can collapse two aliases the caller meant to keep
-    # apart: "Human" for user and "human" for assistant become one key, the later
-    # assignment wins, and every such message is silently relabelled. Before
-    # normalization those two were distinct and both worked, so this has to be refused
-    # rather than resolved. The defaults are disjoint, so nobody who passes nothing sees
-    # it.
+    # Normalization is what makes the lookup case and whitespace insensitive, and it is also
+    # what can collapse two aliases the caller meant to keep apart ("Human" for user and
+    # "human" for assistant): the later assignment would win and every such message would be
+    # silently relabelled, where before normalization both worked. So refuse rather than
+    # resolve. The defaults are disjoint, so nobody who passes nothing sees this.
     aliases_mapping = {}
     for group, role in (
         (aliases_for_system, "system"),
@@ -2402,12 +2395,10 @@ def standardize_data_formats(
                 )
             aliases_mapping[key] = role
 
-    # Normalising every message would cost a call plus two string allocations per message
-    # (measured: 34 ns/message on main, 79 ns with an unconditional strip().lower()).
-    # The overwhelmingly common case is a role already spelled exactly like an alias, so
-    # look that up first and only normalise on a miss, memoising the spelling this dataset
-    # actually uses. The memo is bounded because a role vocabulary is tiny, and the cap
-    # keeps a pathological dataset from growing the dict without limit.
+    # Normalising every message costs a call plus two string allocations per message, and
+    # the common case is a role already spelled exactly like an alias, so look that up first
+    # and normalise only on a miss, memoising the spelling this dataset uses. Capped so a
+    # pathological dataset cannot grow the dict without limit.
     _ALIAS_MEMO_LIMIT = 64
 
     def _standardize_dataset(examples):

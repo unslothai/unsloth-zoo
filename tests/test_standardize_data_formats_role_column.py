@@ -83,9 +83,8 @@ def test_many_row_dataset_still_resolves():
 
 
 def test_mixed_case_roles_resolve_on_a_large_dataset():
-    """No cardinality tie here: the role column already wins on unique count. What used
-    to fail is the alias check, which compared "Human" against the lowercase alias list
-    and raised TypeError."""
+    """No cardinality tie here; what used to fail is the alias check, which compared
+    "Human" against the lowercase alias list and raised TypeError."""
     rows = [
         {"conversations": [{"from": "Human", "value": f"q{i}"}, {"from": "GPT", "value": f"a{i}"}]}
         for i in range(20)
@@ -127,11 +126,9 @@ def test_a_non_sharegpt_dataset_is_returned_untouched():
 
 @pytest.mark.parametrize("start_method", ["fork", "spawn"])
 def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
-    """`_standardize_dataset` is handed to `Dataset.map(num_proc = ...)`, so the
-    role and content columns it closed over have to reach the workers. datasets
-    pools through `multiprocess`, whose default context is its own; Windows has no
-    fork at all, so the spawn case is what runs there and it is the one where a
-    closure over a module-level helper can fail to arrive."""
+    """`_standardize_dataset` is handed to `Dataset.map(num_proc = ...)`, so what it closed
+    over has to reach the workers. Windows has no fork, so spawn is what runs there and it is
+    where a closure over a module-level helper can fail to arrive."""
     multiprocess = pytest.importorskip("multiprocess")
 
     previous = multiprocess.get_start_method(allow_none = True)
@@ -149,11 +146,9 @@ def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
         assert out[0]["conversations"][0]["content"] == "Braund, Mr. Owen Harris"
     finally:
         # `previous is None` is the normal state of a fresh test process, and leaving the
-        # parametrised method pinned makes every later test order-dependent: the probe test
-        # in tests/test_dataset_num_proc.py skips outright when it sees a pinned method, so
-        # this one would quietly switch that one off. `set_start_method(None, force = True)`
-        # is multiprocess's own reset, which clears `_actual_context` and restores the
-        # unpinned state rather than choosing a method.
+        # parametrised method pinned makes every later test order-dependent.
+        # `set_start_method(None, force = True)` is multiprocess's own reset: it clears
+        # `_actual_context` rather than choosing a method.
         multiprocess.set_start_method(previous, force = True)
 
 
@@ -182,9 +177,8 @@ def test_a_role_padded_with_a_non_breaking_space_resolves():
 
 
 def test_many_spellings_of_one_role_all_resolve():
-    """The map memoises each raw spelling it sees so the common already-normal role costs
-    a single dict hit. The memo is capped, so a dataset carrying more distinct spellings
-    than the cap must still resolve every one of them, cap or no cap."""
+    """The map memoises each raw spelling it sees, and the memo is capped, so a dataset with
+    more distinct spellings than the cap must still resolve every one of them."""
     spellings = ["human", "Human", "HUMAN", " human", "human ", "  HuMaN  "]
     spellings += [" " * n + "human" for n in range(2, 90)]
     rows = [
@@ -219,12 +213,10 @@ def test_an_unknown_role_beyond_the_sampled_rows_still_raises():
 
 
 def test_aliases_that_normalize_into_each_other_are_refused():
-    """Normalization is what makes the lookup case and whitespace insensitive, and it is
-    also what can collapse two aliases the caller meant to keep apart. Before it,
-    "Human" for user and "human" for assistant were distinct keys and both worked;
-    after it they are one key, the later assignment wins, and every such message is
-    silently relabelled assistant. Silently mislabelled training data is worse than a
-    refusal, so this raises with the pair named."""
+    """Normalization can collapse two aliases the caller meant to keep apart: "Human" for
+    user and "human" for assistant were distinct keys and both worked, and afterwards the
+    later assignment wins and every such message is silently relabelled. Mislabelled training
+    data is worse than a refusal, so this raises with the pair named."""
     rows = [
         {"conversations": [{"from": "Human", "value": "hi"},
                            {"from": "gpt", "value": "yo"}]},
@@ -269,14 +261,10 @@ def test_the_default_alias_lists_are_disjoint():
 
 
 def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
-    """The regression the fixture above exists to avoid.
-
-    A fresh test process has no start method pinned, so restoring only a non-None
-    `previous` left the parametrised method globally selected and every later test ran in
-    a different process-creation regime than it was written for. One of them,
-    `test_start_method_probe_matches_the_pool_multiprocess_would_build`, skips as soon as
-    it sees a pinned method, so the leak silently switched a real assertion off.
-    """
+    """The regression the fixture above exists to avoid: a fresh test process has no start
+    method pinned, so restoring only a non-None `previous` leaves the parametrised method
+    globally selected, and `test_start_method_probe_matches_the_pool_multiprocess_would_build`
+    skips as soon as it sees one, silently switching a real assertion off."""
     multiprocess = pytest.importorskip("multiprocess")
 
     before = multiprocess.get_start_method(allow_none = True)
@@ -294,9 +282,8 @@ def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
 # --- both columns alias-only, which no value can disambiguate --------------
 
 _BOTH_ALIAS_CASES = {
-    # A one-turn record whose CONTENT happens to be a role word. Both columns are
-    # alias-only and both have one unique value, so the cardinality heuristic has nothing
-    # to work with and used to take the second key, swapping roles and contents.
+    # A one-turn record whose CONTENT is a role word: both columns are alias-only with one
+    # unique value, so the cardinality heuristic used to take the second key and swap them.
     "role_content_one_turn": (
         [{"conversations": [{"role": "user", "content": "assistant"}]}],
         [("user", "assistant")],
