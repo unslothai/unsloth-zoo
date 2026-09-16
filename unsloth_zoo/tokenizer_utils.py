@@ -235,6 +235,11 @@ def add_new_tokens(
 pass
 
 
+# datasets' own default for Dataset.map(batched=True), so the fallback below and the
+# .map path it stands in for allocate the same size transient.
+_COUNT_INPUT_IDS_BATCH_SIZE = 1000
+
+
 def _count_input_ids(train_dataset, mapping):
     """Apply `mapping` over the dataset's input_ids in batches.
 
@@ -247,9 +252,21 @@ def _count_input_ids(train_dataset, mapping):
         train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
         return
     pass
-    rows = [row["input_ids"] for row in train_dataset if "input_ids" in row]
-    if len(rows) == 0: return
-    mapping({"input_ids" : rows})
+    # Same batch size as the .map path above, for the same reason. `mapping` flattens the
+    # batch it is given into one array of every token in it, so handing it the whole
+    # dataset at once is an O(total tokens) transient allocation where .map is bounded.
+    # It accumulates into a counter rather than returning anything, which is what makes
+    # chunking exactly equivalent -- .map(batched=True) already calls it once per batch.
+    batch = []
+    for row in train_dataset:
+        if "input_ids" not in row: continue
+        batch.append(row["input_ids"])
+        if len(batch) >= _COUNT_INPUT_IDS_BATCH_SIZE:
+            mapping({"input_ids" : batch})
+            batch = []
+        pass
+    pass
+    if batch: mapping({"input_ids" : batch})
 pass
 
 

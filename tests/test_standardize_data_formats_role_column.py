@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """standardize_data_formats must pick the role column by alias membership, not by a
 unique-value cardinality tie, and must match aliases without regard to case or
 surrounding whitespace (unsloth#1766)."""
@@ -195,3 +211,53 @@ def test_an_unknown_role_beyond_the_sampled_rows_still_raises():
     rows.append({"conversations": [{"from": "moderator", "value": "stop"}]})
     with pytest.raises(Exception):
         standardize_data_formats(Dataset.from_list(rows), num_proc = 1)
+
+
+def test_aliases_that_normalize_into_each_other_are_refused():
+    """Normalization is what makes the lookup case and whitespace insensitive, and it is
+    also what can collapse two aliases the caller meant to keep apart. Before it,
+    "Human" for user and "human" for assistant were distinct keys and both worked;
+    after it they are one key, the later assignment wins, and every such message is
+    silently relabelled assistant. Silently mislabelled training data is worse than a
+    refusal, so this raises with the pair named."""
+    rows = [
+        {"conversations": [{"from": "Human", "value": "hi"},
+                           {"from": "gpt", "value": "yo"}]},
+    ]
+    with pytest.raises(TypeError, match = "cannot also mean"):
+        standardize_data_formats(
+            Dataset.from_list(rows),
+            aliases_for_user      = ["Human"],
+            aliases_for_assistant = ["human", "gpt"],
+        )
+
+
+def test_a_repeated_alias_within_one_role_is_fine():
+    """Only a collision ACROSS roles is ambiguous; listing a spelling twice for the same
+    role says nothing contradictory."""
+    rows = [
+        {"conversations": [{"from": "Human", "value": "hi"},
+                           {"from": "gpt", "value": "yo"}]},
+    ]
+    out = standardize_data_formats(
+        Dataset.from_list(rows),
+        aliases_for_user      = ["human", "Human", " HUMAN "],
+        aliases_for_assistant = ["gpt"],
+    )
+    assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
+
+
+def test_the_default_alias_lists_are_disjoint():
+    """Nobody who passes nothing may ever see the refusal above."""
+    import inspect
+
+    from unsloth_zoo.dataset_utils import _normalize_role_alias
+
+    defaults = inspect.signature(standardize_data_formats).parameters
+    groups = [
+        {_normalize_role_alias(alias) for alias in defaults[name].default}
+        for name in ("aliases_for_system", "aliases_for_user", "aliases_for_assistant")
+    ]
+    for i, first in enumerate(groups):
+        for second in groups[i + 1:]:
+            assert not (first & second), (first, second)

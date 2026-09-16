@@ -214,3 +214,49 @@ def test_count_input_ids_on_an_empty_list_never_calls_the_mapping():
     called = []
     tokenizer_utils._count_input_ids([], lambda examples: called.append(examples))
     assert called == []
+
+
+def test_the_plain_list_fallback_counts_in_bounded_batches():
+    """`mapping` flattens whatever batch it is handed into one array of every token in
+    it, so one call with the whole dataset is an O(total tokens) transient where the
+    `.map` path it stands in for is bounded at 1000 rows. The counts must be identical
+    either way, which is what makes chunking safe: `mapping` accumulates rather than
+    returning, exactly as `.map(batched=True)` already requires."""
+    final_counts, mapping = _counter()
+    sizes = []
+
+    def spy(examples):
+        sizes.append(len(examples["input_ids"]))
+        return mapping(examples)
+
+    rows = [{"input_ids" : [1, 2]} for _ in range(2500)]
+    tokenizer_utils._count_input_ids(rows, spy)
+
+    assert max(sizes) <= tokenizer_utils._COUNT_INPUT_IDS_BATCH_SIZE, sizes
+    assert sum(sizes) == 2500, sizes
+    assert final_counts.tolist() == [0, 2500, 2500, 0, 0, 0, 0, 0]
+
+
+def test_the_batched_fallback_agrees_with_one_big_call():
+    """The equivalence, asserted rather than argued."""
+    batched_counts, batched = _counter()
+    rows = [{"input_ids" : [i % 8]} for i in range(3333)]
+    tokenizer_utils._count_input_ids(rows, batched)
+
+    single_counts, single = _counter()
+    single({"input_ids" : [row["input_ids"] for row in rows]})
+
+    assert batched_counts.tolist() == single_counts.tolist()
+
+
+def test_a_short_list_is_still_one_call():
+    """Nothing changes for the ordinary small dataset."""
+    _final_counts, mapping = _counter()
+    calls = []
+
+    def spy(examples):
+        calls.append(len(examples["input_ids"]))
+        return mapping(examples)
+
+    tokenizer_utils._count_input_ids([{"input_ids" : [1]}, {"input_ids" : [2]}], spy)
+    assert calls == [2]

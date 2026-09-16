@@ -2360,11 +2360,30 @@ def standardize_data_formats(
         )
     pass
 
-    # Mapping for aliases
+    # Mapping for aliases. Normalization is what makes the lookup case and whitespace
+    # insensitive, and it is also what can collapse two aliases the caller meant to keep
+    # apart: "Human" for user and "human" for assistant become one key, the later
+    # assignment wins, and every such message is silently relabelled. Before
+    # normalization those two were distinct and both worked, so this has to be refused
+    # rather than resolved. The defaults are disjoint, so nobody who passes nothing sees
+    # it.
     aliases_mapping = {}
-    for x in aliases_for_system:    aliases_mapping[_normalize_role_alias(x)] = "system"
-    for x in aliases_for_user:      aliases_mapping[_normalize_role_alias(x)] = "user"
-    for x in aliases_for_assistant: aliases_mapping[_normalize_role_alias(x)] = "assistant"
+    for group, role in (
+        (aliases_for_system, "system"),
+        (aliases_for_user, "user"),
+        (aliases_for_assistant, "assistant"),
+    ):
+        for x in group:
+            key = _normalize_role_alias(x)
+            previous = aliases_mapping.get(key)
+            if previous is not None and previous != role:
+                raise TypeError(
+                    f"Unsloth: the alias {x!r} normalizes to {key!r}, which is already "
+                    f"mapped to {previous!r}, so it cannot also mean {role!r}. Alias "
+                    f"lists are compared case insensitively and without surrounding "
+                    f"whitespace; give each role aliases that differ by more than that."
+                )
+            aliases_mapping[key] = role
 
     # Normalising every message would cost a call plus two string allocations per message
     # (measured: 34 ns/message on main, 79 ns with an unconditional strip().lower()).
