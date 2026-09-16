@@ -4400,12 +4400,6 @@ def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
             f"`{GGUF_ARCHITECTURE_KEY}` is missing, so llama.cpp cannot choose "
             f"a model loader for this file"
         ]
-    if architecture in GGUF_METADATA_EXEMPT_ARCHITECTURES:
-        # Multimodal projector. llama.cpp returns from load_hparams before
-        # reading any of the keys below, so requiring them would reject every
-        # mmproj file Unsloth produces.
-        return []
-
     tensor_names = []
     unreadable_shards = []
     for path, shard_reader in readers:
@@ -4418,6 +4412,12 @@ def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
             continue
         tensor_names.extend(tensor.name for tensor in shard_reader.tensors)
 
+    # BEFORE the architecture exemption, not after it. A shard that cannot be read is a
+    # structural fault, and the exemption is about which metadata KEYS a loader reads: a
+    # projector whose second shard is corrupt is as unloadable as any other model with a
+    # corrupt shard, and returning [] on the exemption first told a caller of the exported
+    # API that an unloadable projector was fine. Same for the missing-shard and unreadable
+    # first-shard answers above, which already run before it.
     if unreadable_shards and report_structural:
         # A later shard that cannot be read is exactly as unloadable as a missing one, and
         # this function's documented empty list is what a caller uses to ACCEPT a downloaded
@@ -4429,6 +4429,12 @@ def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
             f"{len(unreadable_shards)} of this split model's shards could not be read "
             f"({listed}), so llama.cpp cannot load it"
         ]
+
+    if architecture in GGUF_METADATA_EXEMPT_ARCHITECTURES:
+        # Multimodal projector. llama.cpp returns from load_hparams before
+        # reading any of the keys below, so requiring them would reject every
+        # mmproj file Unsloth produces.
+        return []
 
     if not any(name.startswith("blk.") for name in tensor_names):
         # No transformer blocks: a vocabulary-only or otherwise non-model GGUF.

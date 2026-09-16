@@ -1099,3 +1099,26 @@ def test_the_name_map_is_sized_by_the_blocks_not_the_parameters(
     model, readers = _many_parameter_model(llama_cpp, tmp_path, block_count_key)
     assert llama_cpp._gguf_shape_problems(model, readers, sample_size = 8) == []
     assert _RecordingNameMap.calls == [2], _RecordingNameMap.calls
+
+
+def test_a_corrupt_shard_is_reported_for_a_projector_too(llama_cpp, tmp_path):
+    """The architecture exemption is about which metadata KEYS a loader reads.
+
+    A projector whose second shard is corrupt is as unloadable as any other model with a
+    corrupt shard, and returning the empty list on the exemption first told a caller of the
+    exported API that an unloadable projector was fine.
+    """
+    first = write_gguf(tmp_path / "p-00001-of-00002.gguf", architecture = "clip", keys = {},
+                       tensors = {"blk.0.attn_q.weight": None, "mm.0.weight": None})
+    (tmp_path / "p-00002-of-00002.gguf").write_bytes(b"not a gguf at all")
+
+    problems = llama_cpp.gguf_metadata_problems(first)
+    assert any("p-00002-of-00002.gguf" in problem for problem in problems), problems
+    assert any("could not be read" in problem for problem in problems), problems
+
+    # An intact projector is still exempt, which is the whole reason the exemption exists.
+    ok_first = write_gguf(tmp_path / "q-00001-of-00002.gguf", architecture = "clip", keys = {},
+                          tensors = {"blk.0.attn_q.weight": None, "mm.0.weight": None})
+    write_gguf(tmp_path / "q-00002-of-00002.gguf", architecture = "clip", keys = {},
+               tensors = {"mm.1.weight": None})
+    assert llama_cpp.gguf_metadata_problems(ok_first) == []
