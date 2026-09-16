@@ -4665,6 +4665,7 @@ def _gguf_holds_only_float_tensors(readers):
 
 def _verify_converted_gguf(
     output_files, quantization_type = None, print_output = False, gguf_py_dir = None,
+    _writer_tree_known = False,
 ):
     """The gate `convert_to_gguf` runs on what it just wrote.
 
@@ -4677,7 +4678,9 @@ def _verify_converted_gguf(
     `gguf_py_dir` is the tree the converter child was pinned to. Reading the
     file back with the same `gguf` that wrote it is what keeps the checks from
     degrading into the "could not read it, so it was not verified" warning
-    whenever the parent's `gguf` is the older of the two.
+    whenever the parent's `gguf` is the older of the two. It also decides what an
+    unreadable file MEANS, which is why `_writer_tree_known` is carried into the
+    recursion below rather than re-derived there.
     """
     if not _gguf_verify_enabled():
         logger.info("Unsloth: UNSLOTH_GGUF_VERIFY is off; skipping GGUF verification.")
@@ -4688,6 +4691,7 @@ def _verify_converted_gguf(
         with use_local_gguf(gguf_py_dir):
             return _verify_converted_gguf(
                 output_files, quantization_type, print_output = print_output,
+                _writer_tree_known = True,
             )
     # One entry per split set, so a 40 shard export is checked once.
     checked = set()
@@ -4718,14 +4722,37 @@ def _verify_converted_gguf(
         checked.add(shards[0])
         readers = _gguf_open_shards(output_file)
         if any(reader is None for _, reader in readers):
+            unreadable = ", ".join(
+                os.path.basename(path) for path, reader in readers if reader is None
+            )
+            if _writer_tree_known:
+                # The one reason this is a warning is version skew: an installed `gguf`
+                # older than the converter that wrote the file fails on an export that is
+                # perfectly good. That reason is gone here. This IS the tree the converter
+                # child ran with, so a file its own writer cannot reopen is a malformed or
+                # truncated output, and the checks above it are existence and shard
+                # numbering only -- a converter that exits zero after writing a broken GGUF
+                # would otherwise have it published with nothing but a warning.
+                detail = ""
+                for path, reader in readers:
+                    if reader is not None: continue
+                    try:
+                        _open_gguf_reader(path)
+                    except Exception as error:
+                        detail = f" ({type(error).__name__}: {error})"
+                    break
+                raise RuntimeError(
+                    f"Unsloth: the GGUF converter wrote {unreadable}, and the same `gguf` "
+                    f"package that wrote it cannot read it back{detail}. The file is "
+                    f"malformed rather than merely newer than the reader, so it is not "
+                    f"being published. Re-run the conversion, and set "
+                    f"UNSLOTH_GGUF_VERIFY=0 if you need to keep the file anyway."
+                )
             # Warn rather than refuse. The installed `gguf` can be older than
             # the converter that wrote this file, in which case the reader
             # fails on an export that is perfectly good, and refusing here
             # would break conversions that work today. `convert_to_gguf`
             # already rejects a missing or truncated output above.
-            unreadable = ", ".join(
-                os.path.basename(path) for path, reader in readers if reader is None
-            )
             logger.warning(
                 f"Unsloth: could not read {unreadable} with the installed gguf "
                 f"package, so it was not verified. Upgrade `gguf` if you want "

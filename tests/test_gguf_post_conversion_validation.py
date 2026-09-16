@@ -672,6 +672,48 @@ def test_an_unreadable_output_warns_rather_than_refusing(llama_cpp, tmp_path, ca
     assert any("was not verified" in record.message for record in caplog.records), caplog.text
 
 
+def test_an_unreadable_output_is_refused_when_its_own_writer_cannot_reopen_it(
+    llama_cpp, tmp_path, monkeypatch
+):
+    """Version skew is the ONLY reason the failure above is a warning.
+
+    When the converter child's own `gguf` tree is the one doing the reading, that reason is
+    gone: a file its writer cannot reopen is malformed or truncated, and the checks before
+    this one are existence and shard numbering only. A converter that exits zero after
+    writing a broken GGUF would otherwise be published with nothing but a warning.
+    """
+    import contextlib
+    path = tmp_path / "stub.gguf"
+    path.write_bytes(b"not a gguf")
+
+    @contextlib.contextmanager
+    def _pinned(directory):
+        yield
+
+    monkeypatch.setattr(llama_cpp, "use_local_gguf", _pinned)
+    with pytest.raises(RuntimeError, match = "cannot read it back"):
+        llama_cpp._verify_converted_gguf([str(path)], gguf_py_dir = str(tmp_path))
+
+
+def test_the_refusal_names_the_file_and_the_way_out(llama_cpp, tmp_path, monkeypatch):
+    """A user holding a file this refuses needs to know which one it was, why it is not
+    skew, and that the gate can be turned off if they want the artifact anyway."""
+    import contextlib
+    path = tmp_path / "broken-model.gguf"
+    path.write_bytes(b"not a gguf")
+
+    @contextlib.contextmanager
+    def _pinned(directory):
+        yield
+
+    monkeypatch.setattr(llama_cpp, "use_local_gguf", _pinned)
+    with pytest.raises(RuntimeError) as raised:
+        llama_cpp._verify_converted_gguf([str(path)], gguf_py_dir = str(tmp_path))
+    message = str(raised.value)
+    assert "broken-model.gguf" in message, message
+    assert "UNSLOTH_GGUF_VERIFY=0" in message, message
+
+
 def test_a_split_set_missing_its_first_shard_says_so(llama_cpp, tmp_path):
     """Only shard 1 carries the KV metadata, so without it every required key
     reads as missing. The report has to name the absent file instead."""
