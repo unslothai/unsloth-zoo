@@ -218,12 +218,9 @@ pass
 
 def _merge_lora(W, lora_stats, name, use_dequant_base = False):
     if lora_stats.lora_A is None or lora_stats.lora_B is None: return W
-    # A 2-D LoRA delta cannot fold into a tensor that is not a matrix. Reached when a
-    # model adapts a Conv2d whose name it shares with a linear (`proj` is both a vision
-    # patch embedding and an attention output projection on several composite models),
-    # and the per-expert MoE paths do not come through here. Without this, `addmm_`
-    # below raises `mat1 must be a matrix, got 4-D tensor` from inside a merge loop,
-    # naming nothing the caller can act on.
+    # Reached when a model adapts a Conv2d sharing its name with a linear (`proj` is both a
+    # vision patch embedding and an attention output projection). Without this, `addmm_` raises
+    # `mat1 must be a matrix, got 4-D tensor` naming nothing the caller can act on.
     if W.ndim != 2:
         raise ValueError(
             f"Unsloth: cannot merge a LoRA adapter into `{name}`, whose weight has shape "
@@ -2996,17 +2993,10 @@ def merge_and_overwrite_lora(
     # All Unsloth Zoo code licensed under LGPLv3
     # Directly downloads 16bit original weights and merges LoRA
 
-    # "lora" means "do not merge", so it has no meaning here: it matches none of the
-    # `save_method ==` branches below and falls through to a plain 16bit merge, so a
-    # caller asking for an adapter receives a full-size checkpoint with no
-    # adapter_config.json. Observed on a real push_to_hub_merged(save_method = "lora"),
-    # which uploaded 2.47 GB of merged weights.
-    #
-    # Say so rather than refuse. The mistake is upstream, in a caller that still both
-    # documents this value and defaults to it, so raising here would turn a call that
-    # completes today into an uncaught error with no working substitute shipped
-    # alongside. The merge proceeds exactly as before, and the message names the call
-    # that does what was asked.
+    # "lora" matches no `save_method ==` branch below and falls through to a plain 16bit merge,
+    # so a caller asking for an adapter gets a full-size checkpoint with no adapter_config.json.
+    # Warn rather than raise: the caller upstream still documents and defaults to this value, so
+    # refusing would break calls that complete today with no substitute shipped alongside.
     if isinstance(save_method, str) and save_method.strip().lower() == "lora":
         warnings.warn(
             "Unsloth: `save_method = \"lora\"` asks for the adapter, but this is the merge "
@@ -3586,27 +3576,14 @@ def merge_and_overwrite_lora(
         )
 
     # Native mxfp4 save preserves _blocks/_scales instead of merging, so a LoRA on a packed
-    # tensor is not written; don't treat it as backed there. Shared with the Step-7 count.
-    #
-    # Read BEFORE the FP8 pre-rewrite below, which clears base_model_is_quantized and
-    # quant_type. Same value either way: that rewrite only runs for quant_type "fp8" and this
-    # is only False for "mxfp4", so the two branches are mutually exclusive.
+    # tensor is not written; don't treat it as backed there. Read BEFORE the FP8 pre-rewrite,
+    # which clears quant_type; same value either way, the two branches are mutually exclusive.
     _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
 
-    # Refuse a silently partial merge before this function mutates a single staged shard.
-    # Ahead of the FP8 MoE pre-rewrite below as well as of the seeding and the merge loop:
-    # that pre-rewrite dequantizes EVERY staged shard, so a refusal after it would have
-    # rewritten the whole checkpoint before saying no. Nothing is lost by checking first --
-    # a seeded tensor is a `modules_to_save` weight with no adapter, which the accounting
-    # excludes either way, and the pre-rewrite changes dtypes rather than key names, so the
-    # resolution this reads is the same on both sides of it.
-    #
-    # It still cannot precede Step 2's `upload_items()`, which replaces config.json and the
-    # tokenizer on the remote: `final_safetensors_list` is only built after that upload, so
-    # moving the check above it means enumerating the staged shards earlier. A push that
-    # refuses here therefore leaves those two files already updated on the remote, and the
-    # weights untouched. That is a smaller gap than the one this move closes, and it is
-    # written down rather than implied by a docstring that claimed nothing had been touched.
+    # Refuse a silently partial merge before any staged shard is mutated: the FP8 pre-rewrite
+    # below dequantizes EVERY shard, so refusing after it rewrites the whole checkpoint first.
+    # It cannot precede Step 2's `upload_items()` though, so a refusal here leaves config.json
+    # and the tokenizer already updated on the remote beside untouched weights.
     _check_lora_merge_is_complete(
         save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
         tie_word_embeddings = _merge_tie_word_embeddings,
@@ -3644,16 +3621,9 @@ def merge_and_overwrite_lora(
     _fp8_prerewrite_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list) if _fp8_post_cleanup else set()
     _defer_low_disk = low_disk_space_usage and push_to_hub and _fp8_post_cleanup
 
-    # A LoRA target the key resolution cannot place is excluded from BOTH sides of the
-    # Step-7 count, so an under-merge writes base weights and still reports success
-    # (#5290). Account for it here and refuse rather than hand back a checkpoint that
-    # looks trained and is not.
-    #
-    # Ahead of the seeding below, not just ahead of the merge loop. Seeding rewrites the
-    # smallest shard through a temp copy and, when pushing, re-uploads config.json and the
-    # index, so a refusal after it would already have mutated the staging directory and the
-    # remote. Nothing is lost by checking first: a seeded tensor is a `modules_to_save`
-    # weight with no adapter, which the accounting excludes either way.
+    # A LoRA target the key resolution cannot place is excluded from BOTH sides of the Step-7
+    # count, so an under-merge writes base weights and reports success (#5290). Ahead of the
+    # seeding, which rewrites a shard and re-uploads config.json before the merge loop runs.
     # A trained head the base checkpoint never had is invisible to the in-place shard rewrite,
     # so put it on disk before the loop. Scoped to merged_16bit: the mxfp4 and native-quant
     # paths preserve packed base tensors, so a seeded 16bit head there would not reload.
@@ -4254,14 +4224,8 @@ def get_original_model_id(local_path: str):
 pass
 
 def _renamings_to_conversion_mapping(transforms):
-    """`{source pattern : target pattern}` for the plain renamings in a Transformers
-    conversion list, in list order.
-
-    Only one-to-one renamings are taken. A converter that splits, concatenates or
-    permutes a tensor has no meaning as a key substitution, and a target carrying a
-    regex backreference cannot survive the literal-prefix substitution the callers
-    do, so both are dropped rather than half-applied.
-    """
+    """`{source pattern : target pattern}` for the plain one-to-one renamings, in list order. A
+    converter that splits, concatenates or permutes has no meaning as a key substitution."""
     mapping = {}
     for transform in transforms or ():
         sources = getattr(transform, "source_patterns", None)
@@ -4280,15 +4244,9 @@ pass
 
 
 def _registry_checkpoint_conversion_mapping(model_class_name):
-    """The renaming half of the conversion mapping Transformers 5 keeps in its registry.
-
-    Transformers 4 carried it as `<ModelClass>._checkpoint_conversion_mapping`;
-    Transformers 5 moved the same information into `transformers.conversion_mapping`,
-    keyed by class name with a `model_type` fallback, and dropped the class attribute.
-    Nothing here is version-gated: the registry is probed, and an install without it
-    (or without an entry for this class) yields `{}`, which is what the class-attribute
-    lookup already returned.
-    """
+    """The renaming half of the Transformers 5 conversion registry, keyed by class name with a
+    `model_type` fallback. Not version-gated: a missing registry or entry yields `{}`, which is
+    what the Transformers 4 class attribute already returned."""
     try:
         from transformers.conversion_mapping import get_checkpoint_conversion_mapping
     except Exception:
@@ -4315,15 +4273,9 @@ pass
 
 
 def _get_checkpoint_conversion_mapping(model_class_name):
-    """Get a model class's _checkpoint_conversion_mapping ({} if absent).
-
-    Falls back to the Transformers 5 conversion registry, which holds the same
-    disk-key-to-runtime-key renamings the class attribute used to. Without that
-    fallback a composite model whose checkpoint is in the pre-5 flat layout loses
-    the bridge between its runtime LoRA names (`model.language_model.layers.N...`)
-    and its on-disk weights (`model.layers.N...`), and every adapter on that tower
-    silently fails to merge (#5290).
-    """
+    """A model class's _checkpoint_conversion_mapping ({} if absent), falling back to the
+    Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
+    checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
     try:
         module = __import__('transformers', fromlist=[model_class_name])
         model_class = getattr(module, model_class_name)
@@ -4636,10 +4588,8 @@ def _convert_lora_keys_to_safetensor_format(
             return remapped
         return defaultdict(lora_weights.default_factory, lora_weights)
 
-    # target -> every source that renames onto it, in mapping order. A dict keyed by
-    # target would drop all but the last: `hunyuan_vl` registers `^model\.vit` AND
-    # `^vit` onto `model.vision_tower`, and keeping only one of them reverses the
-    # vision tower onto a prefix its checkpoint does not use.
+    # target -> EVERY source renaming onto it: `hunyuan_vl` registers `^model\.vit` and `^vit`
+    # onto `model.vision_tower`, and keeping only one reverses onto a prefix nothing uses.
     reverse_mapping = collections.OrderedDict()
     for pattern, replacement in forward_mapping.items():
         literal = _pattern_literal_prefix(pattern)
@@ -4651,8 +4601,6 @@ def _convert_lora_keys_to_safetensor_format(
     converted_lora_weights_output = defaultdict(lora_weights.default_factory)
     conversion_applied_count = 0
     mapped_from_original = {}
-    # Built once for the whole shard, not per key: the reverse loop and the splice both
-    # ask the same question of the same key set.
     shard_key_set = {key for key in safetensor_keys if isinstance(key, str)}
     shard_valid_prefixes = _build_valid_prefixes(shard_key_set)
 
@@ -4665,11 +4613,9 @@ def _convert_lora_keys_to_safetensor_format(
         applied_conversion_for_this_key = False
 
         if lora_key_format_assumed == "new" and shard_key_format == "old":
-            # New LoRA keys, old shard -> convert LoRA key to old via reverse mapping.
-            # Where a target has several sources, prefer one whose result a shard can
-            # actually back, and only fall back to the first that matched at all. Taking
-            # the first match blind is how a model with two renamings onto one target
-            # reversed onto the prefix its checkpoint does not use.
+            # New LoRA keys, old shard. Where a target has several sources, prefer one whose
+            # result the shard can back: taking the first match blind reverses a two-renaming
+            # model onto a prefix its checkpoint does not use.
             fallback_key = None
             for pattern, literals in reverse_mapping.items():
                 for literal in literals:
@@ -4711,24 +4657,9 @@ pass
 def _pattern_literal_prefix(pattern):
     """The literal text a regex matches at its start, or `''` if it has none.
 
-    Used to turn one side of a conversion mapping back into a substitution: a mapping
-    entry is a regex on one side and a literal prefix on the other, so reversing it
-    means recovering the regex's literal head.
-
-    Two things are handled that the inline expression this replaces could not, and both
-    are load bearing on real Transformers patterns.
-
-    Leading anchors and zero-width groups are dropped. Transformers 5.4 and 5.5 write
-    Qwen2.5-VL's language rename as `(?<!_)model(?!\\.(language_model|visual))`, where
-    the literal `model` sits behind a lookbehind; the old expression assumed the literal
-    came first, matched nothing, and substituted the regex source into a tensor key.
-
-    An escaped character contributes the character it escapes. Transformers spells a
-    literal separator `\\.`, as in `^backbone\\.` and `^language_model\\.model\\.`, so
-    stopping at the backslash would yield `backbone` and rewrite
-    `model.encoder.layer.0...` to `backboneencoder.layer.0...`, which backs nothing and
-    silently drops the adapter. `\\d`, `\\w` and friends are classes rather than
-    literals, so the scan stops there instead of taking the letter.
+    Zero-width groups are dropped (Qwen2.5-VL renames via a literal behind a lookbehind on
+    Transformers 5.4/5.5), and an escape contributes its character: `^backbone\\.` must yield
+    `backbone.`, or `model.encoder...` becomes `backboneencoder...` and the adapter is lost.
     """
     if not isinstance(pattern, str): return ""
     text = pattern.lstrip("^")
@@ -4745,8 +4676,7 @@ def _pattern_literal_prefix(pattern):
                     break
         if closed_at < 0: return ""     # unbalanced: refuse to guess at it
         text = text[closed_at + 1 :]
-    # A bare `.` stays literal: these patterns use it where a real dot is meant, and
-    # treating it as "any character" would only shorten the prefix for no gain.
+    # A bare `.` stays literal: these patterns use it where a real dot is meant.
     literal, index = [], 0
     while index < len(text):
         char = text[index]
@@ -4767,17 +4697,9 @@ def _splice_unbacked_with_inference(converted, mapped_from_original, lora_weight
                                     safetensor_keys, key_set = None, valid_prefixes = None):
     """Let the prefix inference answer for the keys the conversion mapping did not place.
 
-    A mapping is authoritative only where it lands, and for one model it has landed
-    differently in almost every Transformers release: Qwen2.5-VL carried both of its
-    renamings on the class through 5.2, then only the language one in the registry on
-    5.5, then both under the model type, then both under the class name. Gemma 3's
-    class-level mapping reaches nothing at all, because the remaining hop lives on a
-    nested sub-model. Taking the mapping whole loses the vision tower on 5.5; taking
-    the inference whole loses the language tower. So splice per key: keep every mapped
-    key a shard can back, and re-resolve only the rest.
-
-    Never worsens a key. A replacement is accepted only when it has backing, and only
-    when it does not take a tensor another module already claimed.
+    Qwen2.5-VL's mapping has moved almost every Transformers release: taking the mapping whole
+    loses the vision tower on 5.5, taking the inference whole loses the language tower. A
+    replacement needs backing and must not take a tensor another module claimed.
     """
     if key_set is None:
         key_set = {key for key in safetensor_keys if isinstance(key, str)}
@@ -4800,8 +4722,7 @@ def _splice_unbacked_with_inference(converted, mapped_from_original, lora_weight
     )
     if inferred is None: return converted
 
-    # `_infer_prefix_and_remap` keeps the LoraStats objects, so identity recovers which
-    # original each inferred key came from without re-deriving the rename.
+    # `_infer_prefix_and_remap` keeps the LoraStats objects, so identity recovers the original.
     original_of_stats = {id(stats) : original for original, stats in unplaced.items()}
     for inferred_key, stats in inferred.items():
         original = original_of_stats.get(id(stats))
@@ -4865,24 +4786,16 @@ pass
 
 
 class PartialLoraMergeError(RuntimeError):
-    """A merge would leave LoRA-bearing modules unmerged, so the export is refused.
-
-    Distinct from the `RuntimeError` the count check raises: that one fires when the
-    merge wrote a different number of tensors than it resolved, while this one fires
-    when a target was never resolved at all and so cancels out of both sides of that
-    count. See `_unresolved_lora_targets`.
-    """
+    """A merge would leave LoRA-bearing modules unmerged, so the export is refused. Distinct
+    from the count check's `RuntimeError`: a target never resolved at all cancels out of both
+    sides of that count. See `_unresolved_lora_targets`."""
 pass
 
 
 def _lora_target_logical_shape(lora_stats):
-    """`(out_features, in_features)` of the weight a LoRA module wraps, or None.
-
-    Read from the wrapped layer's feature counts rather than `weight.shape`, because a
-    quantized base layer stores a packed weight whose shape says nothing about the
-    tensor the merge writes, and comparing a packed shape would silently disable the
-    accounting below on every 4-bit merge.
-    """
+    """`(out_features, in_features)` of the weight a LoRA module wraps, or None. From the
+    feature counts, not `weight.shape`: a quantized layer's packed shape would silently disable
+    the accounting below on every 4-bit merge."""
     module = getattr(lora_stats, "module", None)
     if module is None: return None
     out_features = getattr(module, "out_features", None)
@@ -4897,14 +4810,9 @@ pass
 
 
 def _prefix_deletion_candidates(key):
-    """`(candidate, lora_prefix, disk_prefix)` for every module path reachable from `key`
-    by deleting one contiguous run of components from its prefix.
-
-    `model.language_model.layers.0.self_attn.q_proj` yields, among others,
-    `model.layers.0.self_attn.q_proj` with prefixes `model.language_model.` and `model.`.
-    The last two components are never deleted: they are what identifies the layer
-    (`self_attn.q_proj`), so deleting them would let an unrelated tensor match.
-    """
+    """`(candidate, lora_prefix, disk_prefix)` for every module path reachable from `key` by
+    deleting one contiguous run of prefix components. The last two are never deleted: they
+    identify the layer (`self_attn.q_proj`), so deleting them would let anything match."""
     parts = key.split(".")
     limit = max(len(parts) - 2, 0)
     for i in range(limit):
@@ -4919,15 +4827,9 @@ pass
 def _disk_module_shapes(save_directory, safetensors_list):
     """`(every key in the staged shards, {module path : shape} for the `.weight` ones)`.
 
-    Header-only reads through `safe_open`, so this costs a few kilobytes per shard and no
-    tensor data. Module paths come from `_safetensor_module_key`, so a Gemma4
-    `.linear.weight` is keyed like the plain linear the LoRA wraps. The raw key set is
-    returned alongside because the backing test needs the names as written: reconstructing
-    them from module paths would drop every bias and every mxfp4 `_blocks` / `_scales`
-    pair, and a LoRA on a packed tensor would then look unbacked when it is not.
-
-    Reads EVERY shard, not the one being merged. A module whose weight lives in shard 2
-    must not look unplaced while shard 1 is being rewritten.
+    The raw key set comes back too because the backing test needs names as written: rebuilding
+    them from module paths drops every bias and mxfp4 `_blocks`/`_scales` pair. Reads EVERY
+    shard, or a weight living in shard 2 looks unplaced while shard 1 is rewritten.
     """
     keys, shapes = set(), {}
     for filename in safetensors_list or ():
@@ -4940,24 +4842,10 @@ def _disk_module_shapes(save_directory, safetensors_list):
                     keys.add(key)
                     module_key = _safetensor_module_key(key)
                     if module_key is None:
-                        # An mxfp4 target is stored as `<module>_blocks` + `<module>_scales`
-                        # and has no `.weight`, so it reached here with no shape at all and
-                        # `_unresolved_lora_targets` skipped it at `disk_shape is None`. The
-                        # merge's own count cannot see that omission either -- it resolves
-                        # both sides the same way, so the target drops out of the expected
-                        # AND the written count and the mismatch cancels -- which is the
-                        # #5290 shape, silently reporting success over base weights.
-                        #
-                        # `_blocks` is `(*out, G, B)` with two 4-bit values per byte, so the
-                        # dequantized width is `G * B * 2`; `_choose_mxfp4_processing_strategy`
-                        # unpacks the same `*prefix, G, B` and sizes its output at `B * 2`.
-                        # Only the rank-3 case is recorded, because
-                        # `_lora_target_logical_shape` is always `(out_features,
-                        # in_features)` and a 3D MoE stack could never equal it.
-                        #
-                        # Safe if the packing convention is ever different: a wrong shape
-                        # simply fails the equality test and the candidate is skipped, which
-                        # is exactly today's behaviour. It cannot manufacture a refusal.
+                        # An mxfp4 target has no `.weight`, so it was skipped at `disk_shape is
+                        # None` -- the #5290 shape again. `_blocks` is `(*out, G, B)` at two 4-bit
+                        # values per byte, so the logical width is `G * B * 2`; only rank 3, since
+                        # a 3D MoE stack could never equal an `(out_features, in_features)`.
                         if key.endswith("_blocks") and (key[: -len("_blocks")] + "_scales") in file_keys:
                             packed_key = key[: -len("_blocks")]
                             try:
@@ -4981,26 +4869,15 @@ pass
 
 def _unresolved_lora_targets(lora_weights, disk_keys, disk_module_shapes, model_class_name,
                              tie_word_embeddings = False, count_packed_mxfp4 = True):
-    """LoRA-bearing modules the merge cannot place even though this export holds their
-    weight under a different prefix.
+    """LoRA-bearing modules the merge cannot place even though this export holds their weight
+    under a different prefix, as `{(lora prefix, disk prefix) : {lora key : disk key}}`. The
+    merge's count check resolves both its sides the same way, so an unplaceable target drops out
+    of both and the mismatch cancels (#5290).
 
-    The count check at the end of the merge cannot see this. It resolves both of its
-    sides with the same key resolution, so a target the resolver fails to place is
-    dropped from the expected count AND from the written count, the mismatch cancels,
-    and the merge reports success over a checkpoint whose weights are byte-for-byte the
-    base ones (#5290: 434 of 434 language-tower tensors identical to base, no error).
-
-    A target with no counterpart in the export at all is deliberately NOT reported: an
-    export may legitimately omit a whole tower, and there is nothing to merge onto.
-    Evidence for a resolution failure is stricter, and all four parts are required: the
-    export must hold a tensor at a pure prefix deletion of the LoRA module path; that
-    tensor's shape must equal the shape of the weight the LoRA wraps; the tensor must
-    not already be the merge target of a module that did resolve; and the one prefix
-    rewrite must land every module it claims on a tensor of its own. A vision tower
-    missing from the base fails the second part when its hidden size differs from the
-    text tower, and the third when it does not.
-
-    Returns `{(lora prefix, disk prefix) : {lora module key : disk module key}}`.
+    A target with no counterpart in the export at all is NOT reported: an export may legitimately
+    omit a tower. All four parts are required instead: a tensor at a pure prefix deletion of the
+    LoRA path, of the shape the LoRA wraps, not already a resolved module's target, and the one
+    rewrite must land every module it claims on a tensor of its own.
     """
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, disk_keys, model_class_name = model_class_name,
@@ -5010,8 +4887,7 @@ def _unresolved_lora_targets(lora_weights, disk_keys, disk_module_shapes, model_
     groups = defaultdict(dict)
     for key, lora_stats in converted.items():
         if not isinstance(key, str) or key in backed: continue
-        # LoRA-bearing only. A `modules_to_save` weight with no adapter is the seeding
-        # pass's job, and reporting it here would refuse exports that pass today.
+        # LoRA-bearing only: a `modules_to_save` weight with no adapter is the seeding pass's job.
         if getattr(lora_stats, "lora_A", None) is None: continue
         if getattr(lora_stats, "lora_B", None) is None: continue
         shape = _lora_target_logical_shape(lora_stats)
@@ -5019,13 +4895,11 @@ def _unresolved_lora_targets(lora_weights, disk_keys, disk_module_shapes, model_
         for candidate, lora_prefix, disk_prefix in _prefix_deletion_candidates(key):
             disk_shape = disk_module_shapes.get(candidate)
             if disk_shape is None or tuple(disk_shape) != shape: continue
-            # Already the merge target of a module that DID resolve, so this match is a
-            # dimension coincidence between two towers, not a missed bridge.
+            # Already a resolved module's target: a dimension coincidence, not a missed bridge.
             if candidate in backed: continue
             groups[(lora_prefix, disk_prefix)][key] = candidate
             break       # one vote per module, at its smallest deletion
-    # Drop any rewrite that would alias two modules onto one tensor: that is a coincidence,
-    # not the prefix bridge the resolver missed.
+    # A rewrite aliasing two modules onto one tensor is a coincidence, not a missed bridge.
     return {
         prefixes : claimed for prefixes, claimed in groups.items()
         if len(set(claimed.values())) == len(claimed)
@@ -5067,21 +4941,11 @@ pass
 def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights,
                                   model_class_name, tie_word_embeddings = False,
                                   count_packed_mxfp4 = True):
-    """Refuse a silently partial merge before any staged shard is touched.
+    """Refuse a silently partial merge before any staged shard is touched, returning what it
+    found (empty means every LoRA-bearing module can be placed).
 
-    Deliberately ahead of the FP8 MoE pre-rewrite, the trained-head seeding and the merge
-    loop: the pre-rewrite dequantizes every staged shard, seeding rewrites a shard and
-    re-uploads config.json, and the loop overwrites shards in place, so raising after any
-    of them would leave a mutated staging directory for the caller to clean up.
-
-    NOT ahead of everything, and the docstring used to say otherwise. On a push, Step 2 has
-    already uploaded config.json and the tokenizer by the time this can run, because
-    `final_safetensors_list` is built after that upload. A refusal therefore leaves those
-    two files updated on the remote beside untouched weights. Closing that needs the staged
-    shards enumerated before the first upload.
-
-    Returns what it found, so a caller can report it; an empty result means the merge can
-    place every LoRA-bearing module.
+    NOT ahead of everything: on a push, Step 2 has already uploaded config.json and the
+    tokenizer, since `final_safetensors_list` is built after that upload.
     """
     disk_keys, disk_module_shapes = _disk_module_shapes(save_directory, safetensors_list)
     unresolved = _unresolved_lora_targets(
@@ -5094,12 +4958,8 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
     )
     if not unresolved: return unresolved
 
-    # Every report refuses, whatever its size. A size threshold was tried and dropped:
-    # it would downgrade a genuine 14-module under-merge on a text encoder to a notice,
-    # and the false positive it guards against needs a tower the export omits whose
-    # hidden size exactly equals the text tower's, which no shipping checkpoint has (the
-    # shape test is what rules them out). The env var is the escape hatch for the case
-    # that is nonetheless someone's model.
+    # Every report refuses, whatever its size: a size threshold would downgrade a genuine
+    # 14-module under-merge on a text encoder to a notice. The env var is the escape hatch.
     total_lora_modules = sum(
         1 for key, stats in lora_weights.items()
         if isinstance(key, str)

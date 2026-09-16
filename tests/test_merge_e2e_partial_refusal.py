@@ -16,19 +16,11 @@
 
 """A composite vision-language merge must either merge every tower or refuse (#5290).
 
-A Qwen2.5-VL checkpoint is written in the pre-5 flat layout (`model.layers.N...`,
-`visual...`) while the runtime module paths PEFT adapts are the composite ones
-(`model.language_model.layers.N...`, `model.visual...`). The bridge between the two
-used to come from `<ModelClass>._checkpoint_conversion_mapping`, which Transformers 5
-moved into a registry and removed from the class, and without it every language-tower
-adapter resolved to nothing: the merge wrote the base weights back unchanged and
-reported success, because a target that resolves to nothing is dropped from BOTH sides
-of the merge's count check and the mismatch cancels out.
-
-Two things are asserted here. The language tower merges, and when the bridge is
-unavailable for any reason the merge refuses instead of writing a checkpoint that looks
-trained and is not. A tiny (roughly 100k parameter) real Qwen2.5-VL is used, so the
-whole file is CPU-only and needs no network.
+A Qwen2.5-VL checkpoint is flat (`model.layers.N...`) while the paths PEFT adapts are
+composite (`model.language_model.layers.N...`). The bridge came from
+`<ModelClass>._checkpoint_conversion_mapping`, which Transformers 5 moved into a registry, and
+without it every language adapter resolved to nothing and dropped out of both sides of the
+merge's count check, so the base weights were written back and reported as success.
 """
 
 from __future__ import annotations
@@ -63,13 +55,8 @@ def _skip_unless_vl_available():
 
 
 def _build_tiny_vl(base_dir, dtype=torch.float32):
-    """A tiny real Qwen2.5-VL, saved to `base_dir`. Returns the model.
-
-    Whether `save_pretrained` writes the flat layout or the composite one is
-    Transformers' business, not this test's: the point of the test is that the merge
-    copes with whatever it wrote, so the layout is read back and asserted on rather
-    than assumed.
-    """
+    """A tiny real Qwen2.5-VL. Which layout `save_pretrained` writes is Transformers'
+    business: the tests read it back rather than assume it."""
     import transformers as T
 
     cfg = T.AutoConfig.for_model(_VL_FAMILY)
@@ -108,7 +95,6 @@ def _attach_vl_lora(model):
 
 
 def _stage_tiny_vl(work_dir):
-    """`(base_dir, out_dir, base_tensors, peft_model, adapted)` ready for a merge."""
     H.set_offline_cpu_env()
     base_dir = os.path.join(work_dir, "base")
     out_dir  = os.path.join(work_dir, "merged")
@@ -119,11 +105,8 @@ def _stage_tiny_vl(work_dir):
     return base_dir, out_dir, base_tensors, peft_model, adapted
 
 
-# The bridge this test asserts on, spelled out rather than rediscovered: Qwen2.5-VL
-# adapts `model.language_model.*` and `model.visual.*` while the checkpoint is written
-# flat. Stated here so the reference is independent of the resolution under test, and
-# tried after the identity so a Transformers release that writes the composite layout
-# on disk needs no change.
+# Spelled out so the reference is independent of the resolution under test, and tried after
+# the identity so a release that writes the composite layout on disk needs no change.
 _EXPECTED_DISK_RENAMES = (
     ("model.language_model.", "model."),
     ("model.visual.",        "visual."),
@@ -131,7 +114,6 @@ _EXPECTED_DISK_RENAMES = (
 
 
 def _resolve_composite_key(adapted_key, base_keys):
-    """The on-disk key an adapted module path refers to, or None if there is none."""
     if adapted_key in base_keys: return adapted_key
     for lora_prefix, disk_prefix in _EXPECTED_DISK_RENAMES:
         if not adapted_key.startswith(lora_prefix): continue
@@ -141,11 +123,7 @@ def _resolve_composite_key(adapted_key, base_keys):
 
 
 def _assert_merge_values(base_tensors, merged, adapted):
-    """Every adapted tensor equals base + scale * (B @ A); every other one is unchanged.
-
-    An independent reference in float64, not a re-run of the merge's own arithmetic.
-    Returns (adapted checked, pass-through checked).
-    """
+    """An independent float64 reference, not a re-run of the merge's own arithmetic."""
     base_keys = set(base_tensors)
     resolved = {}
     for adapted_key, record in adapted.items():
@@ -185,22 +163,9 @@ def _language_weight_keys(base_tensors):
     )
 
 
-# --------------------------------------------------------------------------------------
-# The bridge itself
-
-
 def test_conversion_mapping_available_for_composite_vl():
-    """The disk-to-runtime renamings must be reachable however Transformers holds them.
-
-    Transformers 4 kept them on the class, Transformers 5 in its conversion registry,
-    keyed by model type in the early 5.x releases and by class name from 5.10. An empty
-    mapping here is the root cause of #5290, so it is asserted directly.
-
-    Only the language rename is required. The vision one is genuinely absent from the
-    registry on some releases (5.5 ships the language rename alone), and the vision
-    tower is reachable by prefix inference anyway; the language tower is not, which is
-    why its absence was the silent half of the bug.
-    """
+    """An empty mapping here is the root cause of #5290. Only the language rename is required:
+    5.5 ships it alone, and prefix inference reaches the vision tower but not the language one."""
     _skip_unless_vl_available()
     mapping = _get_checkpoint_conversion_mapping(_VL_CLASS)
     assert mapping, (
@@ -212,14 +177,9 @@ def test_conversion_mapping_available_for_composite_vl():
 
 
 def test_partial_mapping_does_not_shadow_prefix_inference():
-    """A mapping that reaches nothing must lose to the inference that reads the layout.
-
-    Gemma 3 is the case: it is written as `language_model.model.layers...` while the
-    renamings registered at its class only say `^language_model -> model.language_model`,
-    because the remaining hop lives on a nested sub-model. Taking that mapping literally
-    resolves the adapter to `language_model.layers...`, which is in no shard, so the
-    conversion has to fall back rather than trust a mapping that lands nowhere.
-    """
+    """Gemma 3 is written `language_model.model.layers...` while its class registers only
+    `^language_model -> model.language_model`, the remaining hop living on a nested sub-model.
+    Taken literally that resolves to `language_model.layers...`, which is in no shard."""
     if not H.family_available("gemma3"):
         pytest.skip("gemma3 unavailable in this transformers")
     lora_keys = [f"model.language_model.layers.{i}.self_attn.q_proj" for i in range(2)]
@@ -242,16 +202,14 @@ def test_partial_mapping_does_not_shadow_prefix_inference():
     (r"^visual",                                        "visual"),
     (r"^model(?!\.(language_model|visual))",            "model"),
     (r"(?<!_)model(?!\.(language_model|visual))",       "model"),
-    # An escaped separator is a separator. Losing it rewrites
-    # `model.encoder.layer.0...` to `backboneencoder.layer.0...`, which backs nothing.
+    # Losing the escaped separator rewrites `model.encoder...` to `backboneencoder...`.
     (r"^backbone\.",                                    "backbone."),
     (r"^language_model\.model\.",                       "language_model.model."),
     (r"^embed_out\.",                                   "embed_out."),
     (r"\.ln1\.",                                        ".ln1."),
-    # A capture or a class ends the literal; it is not text to substitute.
+    # A capture or a class ends the literal.
     (r"blocks\.(\d+)\.",                               "blocks."),
     (r"^model\.(?:(?!language_model\.))(.+)$",           "model."),
-    # Nothing literal at all.
     (r"(?!x)",                                          ""),
     (r"(?<!_)",                                         ""),
     ("",                                                ""),
@@ -262,13 +220,8 @@ def test_pattern_literal_prefix(pattern, literal):
 
 
 def test_escaped_separator_in_a_rename_still_resolves(monkeypatch):
-    r"""`^backbone\.` to `model.` must reverse to `backbone.`, separator included.
-
-    Truncating at the backslash yields `backbone` and concatenates the adapter's own
-    next component onto it, producing a key no shard holds. That is #5290's failure mode
-    reached by a different route, and it is reachable on more models now that these
-    mappings resolve at all.
-    """
+    r"""`^backbone\.` must reverse to `backbone.`, separator included: truncating at the
+    backslash concatenates the adapter's next component onto it and holds no shard's key."""
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping",
                         lambda name: {r"^backbone\.": "model."})
     disk_keys = [f"backbone.encoder.layer.{i}.attention.query.weight" for i in range(2)]
@@ -284,13 +237,9 @@ def test_escaped_separator_in_a_rename_still_resolves(monkeypatch):
 
 
 def test_two_renames_onto_one_target_pick_the_one_with_backing(monkeypatch):
-    r"""A target reached by several sources must reverse onto the prefix the shards use.
-
-    `hunyuan_vl` registers both `^model\.vit` and `^vit` onto `model.vision_tower`.
-    Keying the reverse map by target keeps one of them, and taking the first match
-    without asking whether it lands reverses the vision tower onto a prefix the
-    checkpoint does not have, which merges nothing and says nothing.
-    """
+    r"""`hunyuan_vl` registers both `^model\.vit` and `^vit` onto `model.vision_tower`, so
+    keying the reverse map by target, or taking the first match blind, reverses the vision tower
+    onto a prefix the checkpoint does not have."""
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {
         r"^model(?!\.(language_model|vit|vision_tower))" : "model.language_model",
         r"^model\.vit"                                    : "model.vision_tower",
@@ -308,10 +257,6 @@ def test_two_renames_onto_one_target_pick_the_one_with_backing(monkeypatch):
         assert disk_key[: -len(".weight")] in converted, sorted(
             key for key in converted if isinstance(key, str)
         )
-
-
-# --------------------------------------------------------------------------------------
-# End to end: every tower merges
 
 
 def test_vl_merge_covers_language_and_vision_towers(tmp_path):
@@ -338,23 +283,13 @@ def test_vl_merge_covers_language_and_vision_towers(tmp_path):
     if vision_keys:
         assert any(not torch.equal(merged[k], base_tensors[k]) for k in vision_keys)
 
-    # Value check, not just "something changed": every adapted tensor equals
-    # base + scale * (B @ A) and every other tensor is byte-identical.
     n_adapted, n_passthrough = _assert_merge_values(base_tensors, merged, adapted)
     assert n_adapted >= len(language_keys) // 2 and n_passthrough >= 1
 
 
-# --------------------------------------------------------------------------------------
-# End to end: refusal when the bridge is gone
-
-
 def test_vl_merge_refuses_when_the_bridge_is_unavailable(tmp_path, monkeypatch):
-    """With no conversion mapping the merge must refuse, not write base weights.
-
-    The mapping is removed rather than mocked away at a lower level, because that is
-    exactly the state a Transformers release can put Unsloth in: the whole defect is
-    one lookup returning nothing.
-    """
+    """The mapping is removed, not mocked lower down: that is the state a Transformers release
+    can put Unsloth in."""
     _skip_unless_vl_available()
     base_dir, out_dir, base_tensors, peft_model, _ = _stage_tiny_vl(str(tmp_path))
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
@@ -368,9 +303,8 @@ def test_vl_merge_refuses_when_the_bridge_is_unavailable(tmp_path, monkeypatch):
     assert "Refusing to write a partially merged model" in message, message
     assert "UNSLOTH_ALLOW_PARTIAL_LORA_MERGE" in message, message
 
-    # Refused BEFORE the first shard was rewritten: whatever is staged is still the
-    # base checkpoint, byte for byte. A refusal that fired after the loop would leave
-    # a half-merged export behind, which is the failure mode being fixed.
+    # Refused BEFORE the first shard was rewritten: a refusal after the loop leaves a
+    # half-merged export behind.
     if os.path.isdir(out_dir):
         staged = H.read_safetensors_dir(out_dir)
         for key, tensor in staged.items():
@@ -381,7 +315,6 @@ def test_vl_merge_refuses_when_the_bridge_is_unavailable(tmp_path, monkeypatch):
 
 
 def test_partial_merge_escape_hatch_downgrades_the_refusal(tmp_path, monkeypatch):
-    """A user who understands the consequence can still get the checkpoint out."""
     _skip_unless_vl_available()
     base_dir, out_dir, base_tensors, peft_model, _ = _stage_tiny_vl(str(tmp_path))
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
@@ -390,13 +323,9 @@ def test_partial_merge_escape_hatch_downgrades_the_refusal(tmp_path, monkeypatch
     H.run_merge(peft_model, base_dir, out_dir, save_dtype = torch.float32)
     merged = H.read_safetensors_dir(out_dir)
     assert merged
-    # Unmerged, as advertised by the message: this is the old behaviour, opted into.
+    # Unmerged, as the message advertises: the old behaviour, opted into.
     language_keys = _language_weight_keys(base_tensors)
     assert all(torch.equal(merged[k], base_tensors[k]) for k in language_keys)
-
-
-# --------------------------------------------------------------------------------------
-# The accounting's own edges: what it must NOT report
 
 
 class _FakeLinear(torch.nn.Module):
@@ -437,8 +366,7 @@ def test_accounting_reports_a_missed_prefix_bridge(monkeypatch):
 
 
 def test_accounting_ignores_a_tower_absent_from_the_export(monkeypatch):
-    """A tower the export does not contain has nothing to merge onto, and its hidden
-    size does not match the text tower, so there is no bridge to report."""
+    """A tower the export omits has nothing to merge onto, and its hidden size differs."""
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
     keys = [f"model.vision_tower.vision_model.encoder.layers.{i}.self_attn.q_proj"
             for i in range(4)]
@@ -449,8 +377,7 @@ def test_accounting_ignores_a_tower_absent_from_the_export(monkeypatch):
 
 
 def test_accounting_ignores_a_shape_coincidence_on_a_merged_tensor(monkeypatch):
-    """Same shapes as the text tower, but those tensors are already merge targets of
-    adapters that DID resolve, so the match is a coincidence rather than a miss."""
+    """Those tensors are already merge targets of adapters that DID resolve."""
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
     vision_keys = [f"model.vision_tower.vision_model.encoder.layers.{i}.self_attn.q_proj"
                    for i in range(4)]
@@ -461,7 +388,6 @@ def test_accounting_ignores_a_shape_coincidence_on_a_merged_tensor(monkeypatch):
 
 
 def test_accounting_ignores_modules_to_save_without_an_adapter(monkeypatch):
-    """A trained head with no LoRA delta is the seeding pass's job, not a partial merge."""
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
     weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
     weights["model.language_model.layers.0.self_attn.q_proj"] = LoraStats(
@@ -471,15 +397,7 @@ def test_accounting_ignores_modules_to_save_without_an_adapter(monkeypatch):
 
 
 def test_even_one_unplaced_module_refuses_and_states_its_share(tmp_path, monkeypatch):
-    """Every report refuses, whatever its size, and the message says how big it is.
-
-    A size threshold was tried and dropped. It would downgrade a genuine under-merge of a
-    text encoder to a printed notice, and the false positive it guards against needs a
-    component the export omits whose hidden size exactly equals the text tower's, which no
-    shipping checkpoint has: the shape test is what rules those out. The env var is the
-    escape hatch for the case that is nonetheless someone's model, and it is exercised
-    separately above.
-    """
+    """A size threshold would downgrade a genuine text-encoder under-merge to a notice."""
     if not H.family_available("llama"):
         pytest.skip("llama unavailable in this transformers")
     H.set_offline_cpu_env()
@@ -489,8 +407,7 @@ def test_even_one_unplaced_module_refuses_and_states_its_share(tmp_path, monkeyp
     model = H.build_and_save_base(spec, base_dir)
     peft_model = H.attach_lora(model, spec, "full")
 
-    # One extra module beside an otherwise fully resolved adapter, named so that deleting
-    # `extra.` lands on a real tensor of the same shape that nothing else claims.
+    # Named so deleting `extra.` lands on a real tensor of the same shape nothing else claims.
     lora_weights, _ = SU.create_lora_statistics(peft_model, merge_into_original = True)
     placed = sum(1 for key, stats in lora_weights.items()
                  if isinstance(key, str) and stats.lora_A is not None)
@@ -504,8 +421,7 @@ def test_even_one_unplaced_module_refuses_and_states_its_share(tmp_path, monkeyp
         lora_B = torch.zeros(hidden, 8),
         alpha  = 1.0,
     )
-    # Free that tensor up so the extra module is the only claimant, which is what makes
-    # the accounting report it at all.
+    # Free that tensor so the extra module is the only claimant.
     lora_weights.pop(target, None)
 
     with pytest.raises(PartialLoraMergeError) as excinfo:
@@ -520,14 +436,9 @@ def test_even_one_unplaced_module_refuses_and_states_its_share(tmp_path, monkeyp
 
 
 def test_a_convolution_target_is_named_instead_of_crashing_the_matmul():
-    """A LoRA on a 4-D weight must be reported by name, not by `mat1 must be a matrix`.
-
-    Reachable because `proj` is both a vision patch-embedding Conv2d and an attention
-    output projection on several composite models, so a name-based `target_modules`
-    adapts both. The merge then folds a matrix delta into a 4-D tensor. The arithmetic
-    cannot work either way; what changes is whether the caller learns which module to
-    exclude.
-    """
+    """Reachable because `proj` is both a vision patch-embedding Conv2d and an attention output
+    projection, so a name-based `target_modules` adapts both. The arithmetic cannot work either
+    way; what changes is whether the caller learns which module to exclude."""
     stats = LoraStats(
         module = _FakeLinear(32, 3), lora_A = torch.zeros(8, 3),
         lora_B = torch.zeros(32, 8), alpha = 1.0,
@@ -545,23 +456,11 @@ def test_a_convolution_target_is_named_instead_of_crashing_the_matmul():
     torch.testing.assert_close(merged.cpu().float(), weight + 2.0, atol = 0, rtol = 0)
 
 
-# --------------------------------------------------------------------------------------
-# save_method="lora" is not a merge
-
-
 def test_save_method_lora_warns_that_it_is_not_an_adapter_save(tmp_path):
-    """Asking the merge for an adapter must say so, and must not change what it writes.
-
-    `save_method = "lora"` matches none of the `save_method ==` branches in the merge, so
-    it falls through to a plain 16bit merge: the caller who asked for an adapter gets a
-    full-size checkpoint with no adapter_config.json. Observed on a real
-    `push_to_hub_merged(save_method = "lora")`, which uploaded 2.47 GB of merged weights.
-
-    A warning, not a refusal, and the test pins that on purpose. The caller still both
-    documents this value and defaults to it (`unsloth/save.py`'s `unsloth_generic_save`
-    declares `save_method = "lora"`), so refusing here would turn a call that completes
-    today into an uncaught error with no substitute shipped beside it.
-    """
+    """`save_method = "lora"` matches no `save_method ==` branch and falls through to a plain
+    16bit merge, so the caller gets a full-size checkpoint with no adapter_config.json. A
+    warning, not a refusal: `unsloth/save.py`'s `unsloth_generic_save` still defaults to this
+    value, so raising would break calls that complete today."""
     if not H.family_available("llama"):
         pytest.skip("llama unavailable in this transformers")
     H.set_offline_cpu_env()
@@ -583,33 +482,19 @@ def test_save_method_lora_warns_that_it_is_not_an_adapter_save(tmp_path):
             output_dtype = torch.float32,
             push_to_hub = False,
         )
-    # Unchanged behaviour: still a merge, and still a correct one.
     merged = H.read_safetensors_dir(out_dir)
     assert merged
     n_adapted, n_passthrough = _assert_merge_values(base_tensors, merged, adapted)
     assert n_adapted >= 1 and n_passthrough >= 1
 
 
-# --------------------------------------------------------------------------------------
-# The exact-merge case must stay exactly as it was
-
-
 @pytest.mark.parametrize("family", ["llama", "qwen3"])
 def test_exact_merge_is_unchanged_by_the_accounting(family, tmp_path):
-    """A merge that resolves every target must still be bit-exact and must not refuse.
-
-    The accounting runs on every merge, so a false refusal or a perturbed write would
-    show up here: untargeted tensors byte-identical, adapted tensors equal to
-    base + scale * (B @ A).
-    """
+    """The accounting runs on every merge, so a false refusal shows up here."""
     if not H.family_available(family):
         pytest.skip(f"{family} unavailable in this transformers")
     n_adapted, n_passthrough = H.run_case(family, "full", str(tmp_path))
     assert n_adapted >= 1 and n_passthrough >= 1
-
-
-# --------------------------------------------------------------------------------------
-# Verification pass: shapes the guard must never refuse, and what the escape hatch takes
 
 
 def _tiny_llama(base_dir, *, tie_word_embeddings = False):
@@ -653,9 +538,7 @@ _ATTENTION_AND_MLP = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_p
     ids = ["text_only", "tied_embeddings", "tied_plus_modules_to_save", "embedding_and_head"],
 )
 def test_a_text_only_merge_is_never_refused(tmp_path, tie, targets, kwargs):
-    """The refusal exists for a composite model whose towers live under another prefix.
-    A plain text model has no such prefix, so none of these shapes may raise, tied
-    embeddings and an adapted head included."""
+    """The refusal exists for towers under another prefix; a plain text model has none."""
     H.set_offline_cpu_env()
     base_dir = str(tmp_path / "base")
     out_dir  = str(tmp_path / "merged")
@@ -687,9 +570,7 @@ def _one_unplaced_lora(hidden = _H):
     [("1", False), ("0", True), ("", True), ("true", True), ("yes", True)],
 )
 def test_only_an_exact_1_opens_the_escape_hatch(tmp_path, monkeypatch, value, refuses):
-    """The env var is an exact `1`, like the other UNSLOTH_ALLOW_* switches. Anything
-    else, including a truthy-looking word, must still refuse: a typo must not quietly
-    hand back a checkpoint that is not trained."""
+    """Exact `1`, like the other UNSLOTH_ALLOW_* switches: a truthy typo must still refuse."""
     from safetensors.torch import save_file
 
     shard = tmp_path / "model.safetensors"
@@ -707,17 +588,15 @@ def test_only_an_exact_1_opens_the_escape_hatch(tmp_path, monkeypatch, value, re
 
 
 def test_the_guard_is_a_noop_when_no_shard_is_staged_yet(tmp_path):
-    """Header reads skip a shard that is not on disk. A staging directory without its
-    shards must therefore produce no report at all rather than refuse everything."""
+    """Header reads skip a shard that is not on disk, so no shards means no report."""
     assert SU._check_lora_merge_is_complete(
         str(tmp_path), ["absent.safetensors"], _one_unplaced_lora(), "LlamaForCausalLM",
     ) == {}
 
 
 def test_a_quantized_module_is_measured_by_its_feature_counts():
-    """A 4-bit base layer stores a packed weight whose shape says nothing about the
-    tensor the merge writes. The accounting must read the feature counts, or it silently
-    stops working on every 4-bit merge."""
+    """A 4-bit layer's packed shape says nothing about the tensor the merge writes, so the
+    accounting reads the feature counts or silently dies on every 4-bit merge."""
     class _Packed(torch.nn.Module):
         in_features, out_features = _H, 2 * _H
         def __init__(self):
@@ -738,7 +617,7 @@ def test_a_quantized_module_is_measured_by_its_feature_counts():
         lora_weights, {"model.layers.0.self_attn.q_proj.weight"},
         {"model.layers.0.self_attn.q_proj": (2 * _H, _H)}, "LlamaForCausalLM",
     )
-    # The packed shape is not the module's shape, so it is not a match and not a report.
+    # A packed shape is not the module's shape, so no match and no report.
     assert _unresolved_lora_targets(
         lora_weights, {"model.layers.0.self_attn.q_proj.weight"},
         {"model.layers.0.self_attn.q_proj": (_H * 2 * _H // 2, 1)}, "LlamaForCausalLM",
@@ -746,9 +625,7 @@ def test_a_quantized_module_is_measured_by_its_feature_counts():
 
 
 def test_the_guard_stays_cheap_on_a_large_adapter():
-    """Every unplaced module walks its own prefix deletions, so the cost of the worst
-    case (nothing resolves) is worth pinning: a 1000 module adapter against an 8000 key
-    export must not turn a merge into a coffee break."""
+    """Every unplaced module walks its own prefix deletions, so pin the worst case."""
     import time
 
     lora_weights = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
@@ -774,24 +651,11 @@ def test_the_guard_stays_cheap_on_a_large_adapter():
     assert elapsed < 60, f"the guard took {elapsed:.1f}s on 1000 modules"
 
 
-# ---------------------------------------------------------------------------
-# Packed (mxfp4) targets carry no `.weight`
-# ---------------------------------------------------------------------------
-
 def test_a_packed_target_gets_a_logical_shape_so_the_bridge_is_still_reported(tmp_path, monkeypatch):
-    """An mxfp4 target is `<module>_blocks` + `<module>_scales` and has no `.weight`.
-
-    `_safetensor_module_key` answers None for both, so the module had no entry in
-    `disk_module_shapes` at all and `_unresolved_lora_targets` dropped it at
-    `disk_shape is None`. The merge's own count cannot catch that either: it resolves both
-    sides with the same key resolution, so the target leaves the expected count AND the
-    written count and the mismatch cancels. Both the detector and the count then omit the
-    same adapter and the export reports success over base weights, which is the #5290 shape
-    this refusal exists to prevent.
-
-    `_blocks` is `(out, G, B)` with two 4-bit values per byte, so the dequantized width is
-    `G * B * 2`: 32 x 32 x 2 = 2048 here.
-    """
+    """An mxfp4 target is `<module>_blocks` + `<module>_scales` with no `.weight`, so it had no
+    entry in `disk_module_shapes` and was dropped at `disk_shape is None` -- and the merge's own
+    count cancels the same omission out of both its sides, the #5290 shape. `_blocks` is
+    `(out, G, B)` at two 4-bit values per byte, so the width is `G * B * 2` = 2048 here."""
     from safetensors.torch import save_file
 
     monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
@@ -809,10 +673,9 @@ def test_a_packed_target_gets_a_logical_shape_so_the_bridge_is_still_reported(tm
     # The raw names are still reported as written, which is what the backing test reads.
     assert "model.layers.0.self_attn.q_proj_blocks" in disk_keys
     assert "model.layers.0.self_attn.q_proj_scales" in disk_keys
-    # And the module now has a logical shape, which it did not before.
     assert disk_shapes.get("model.layers.0.self_attn.q_proj") == (2048, 2048)
 
-    # So a LoRA sitting under a different prefix is reported rather than silently skipped.
+    # So a LoRA under a different prefix is reported rather than silently skipped.
     keys = [f"model.language_model.layers.{i}.self_attn.q_proj" for i in range(4)]
     unresolved = _unresolved_lora_targets(
         _fake_lora_weights(keys, (2048, 2048)), disk_keys, disk_shapes, _VL_CLASS,
@@ -822,12 +685,7 @@ def test_a_packed_target_gets_a_logical_shape_so_the_bridge_is_still_reported(tm
 
 
 def test_a_packed_moe_stack_is_not_given_a_two_dimensional_shape(tmp_path):
-    """Only the rank-3 `_blocks` case is recorded.
-
-    `_lora_target_logical_shape` is always `(out_features, in_features)`, so a 3D expert
-    stack could never equal it, and inventing a 2-tuple for one would be a claim the
-    comparison is not entitled to make.
-    """
+    """`_lora_target_logical_shape` is always 2-D, so a 3D expert stack could never equal it."""
     from safetensors.torch import save_file
 
     shard = "model-00001-of-00001.safetensors"
@@ -846,7 +704,6 @@ def test_a_packed_moe_stack_is_not_given_a_two_dimensional_shape(tmp_path):
 
 
 def test_a_blocks_tensor_with_no_scales_partner_is_not_given_a_shape(tmp_path):
-    """The pair is the evidence; a lone `_blocks` is not an mxfp4 target."""
     from safetensors.torch import save_file
 
     shard = "model-00001-of-00001.safetensors"
