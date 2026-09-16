@@ -107,6 +107,9 @@ def test_unrecoverable_packed_weight_fails_with_a_named_error(monkeypatch):
         module.forward(x)
     message = str(excinfo.value)
     assert "packed uint8 weight" in message
+    # Actionable, not just named: the recovery that works on the reported checkpoints
+    # (quantize the base model at load) is in the message itself.
+    assert "load_in_4bit = True" in message
     assert "quant_state" in message
     assert "mat1" not in message
 

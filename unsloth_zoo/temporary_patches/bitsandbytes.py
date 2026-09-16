@@ -79,11 +79,17 @@ def patch_bitsandbytes_linear4bit_forward():
             fix_4bit_weight_quant_state_from_module(self)
             quant_state = getattr(self.weight, "quant_state", None)
             if quant_state is None:
+                # Named so the user can act: every confirmed case so far was a pre-quantized checkpoint
+                # saved without the state (unsloth#10276), and quantizing the base model at load time
+                # trains end to end in the same environment.
                 raise RuntimeError(
                     f"Unsloth: a 4-bit layer holds a packed uint8 weight of shape "
                     f"{tuple(self.weight.shape)} with no quant_state, so it cannot "
-                    "be dequantized or matmul'd. Please report the model and layer "
-                    "at https://github.com/unslothai/unsloth/issues"
+                    "be dequantized or matmul'd. This usually means the pre-quantized "
+                    "checkpoint was saved without it. Load the base (unquantized) model "
+                    "with load_in_4bit = True instead so bitsandbytes quantizes at load "
+                    "time, and please report the model and layer at "
+                    "https://github.com/unslothai/unsloth/issues"
                 )
         if quant_state is None:
             bias = None if self.bias is None else self.bias
