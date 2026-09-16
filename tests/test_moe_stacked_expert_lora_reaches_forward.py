@@ -881,3 +881,57 @@ def test_the_static_answer_recognises_a_stash_reading_forward():
 
     # NEGATIVE CONTROL: nothing to read is "unknown", not "reads it".
     assert MU._forward_statically_reads_stash(object()) is None
+
+
+def test_the_static_answer_follows_a_delegating_forward():
+    """The installed Qwen MoE forward is a dispatcher, so the scan has to follow the call.
+
+    `_make_qwen_moe_experts_forward` installs `forward_moe_backend`, whose own code object
+    names only `forward_native_grouped_mm`, `forward_triton_grouped_gemm` and
+    `forward_native_moe_loop`. Each of those reads the stash, so stopping at the
+    dispatcher calls these supported families stash-ignorant and sends their first
+    compiled call into PEFT's parametrization path, which is the fullgraph failure this
+    patch exists to remove.
+    """
+    from unsloth_zoo.temporary_patches.qwen3_moe import _make_qwen_moe_experts_forward
+
+    class _Dispatching:
+        forward = staticmethod(_make_qwen_moe_experts_forward())
+
+    assert MU._forward_statically_reads_stash(_Dispatching()) is True
+
+
+def test_the_static_answer_does_not_follow_a_call_into_an_unrelated_helper():
+    """NEGATIVE CONTROL: following calls must not turn every forward into a stash reader.
+    A forward that delegates to a helper which never reaches the stash is still False."""
+
+    def _unrelated_helper(hidden_states):
+        return hidden_states * 2
+
+    def _delegating_forward(self, hidden_states, *args, **kwargs):
+        return _unrelated_helper(hidden_states)
+
+    class _Delegating:
+        forward = _delegating_forward
+
+    assert MU._forward_statically_reads_stash(_Delegating()) is False
+
+
+def test_the_scan_terminates_on_a_recursive_call_graph():
+    """A helper that calls itself, and a pair that call each other, must not loop."""
+
+    def _self_recursive(hidden_states):
+        return _self_recursive(hidden_states)
+
+    def _ping(hidden_states):
+        return _pong(hidden_states)
+
+    def _pong(hidden_states):
+        return _ping(hidden_states)
+
+    class _Recursive:
+        def forward(self, hidden_states, *args, **kwargs):
+            _self_recursive(hidden_states)
+            return _ping(hidden_states)
+
+    assert MU._forward_statically_reads_stash(_Recursive()) is False

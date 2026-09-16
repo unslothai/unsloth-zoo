@@ -1606,36 +1606,70 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
 
 _STASH_READ_MARKERS = frozenset(("take_moe_lora_stash", "moe_lora_stash_name"))
 
+# How far the scan follows a call before giving up. The installed forwards delegate at most
+# twice (dispatcher -> backend -> helper), and a bound keeps a pathological import graph
+# from turning a cold start into a walk of the whole module tree.
+_STASH_SCAN_MAX_DEPTH = 4
+
 
 def _forward_statically_reads_stash(experts_module):
-    """Does this experts forward reference the stash API at all, read from its bytecode?
+    """Does this experts forward reach the stash API at all, read from its bytecode?
 
     A static answer, which is the only kind available while Dynamo is tracing: the probe
     cannot run inside a captured graph without being captured with it. Every forward that
-    applies Unsloth's separated expert LoRA calls `take_moe_lora_stash`, so the name
-    appearing in the function's code object (or a nested one) is what distinguishes an
-    Unsloth-installed forward from transformers' own. Cheap and side-effect free: no call
-    is made, only names are read.
+    applies Unsloth's separated expert LoRA reaches `take_moe_lora_stash`, so that name
+    appearing anywhere the forward can call is what distinguishes an Unsloth-installed
+    forward from transformers' own. Cheap and side-effect free: no call is made, only
+    names are read.
+
+    The reach matters. The forward installed for the Qwen MoE families IS
+    `forward_moe_backend`, a dispatcher that names only `forward_native_grouped_mm`,
+    `forward_triton_grouped_gemm` and `forward_native_moe_loop`, each of which reads the
+    stash. Scanning the dispatcher's own code object alone calls those supported families
+    stash-ignorant, which routes the first compiled call through PEFT's dynamic
+    parametrization and brings back the `fullgraph=True` failure this patch exists to
+    avoid. So a global name that resolves to a Python function is followed too, bounded by
+    `_STASH_SCAN_MAX_DEPTH` and by the visited set.
+
+    Only module globals are resolvable: a name imported inside the function body, or
+    reached through an instance attribute, is not bound anywhere this can read. That makes
+    the answer one-sided, True is certain and False is only "no route found", which is why
+    the caller treats False as a reason to log rather than a guarantee.
 
     Returns True, False, or None when there is no code object to read.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
     forward = getattr(experts_module, "forward", None)
-    code = getattr(getattr(forward, "__func__", forward), "__code__", None)
+    forward = getattr(forward, "__func__", forward)
+    code = getattr(forward, "__code__", None)
     if code is None:
         return None
-    seen, pending, names = set(), [code], set()
+
+    seen_code, seen_functions = set(), {id(forward)}
+    pending = [(code, getattr(forward, "__globals__", {}), 0)]
     while pending:
-        current = pending.pop()
-        if id(current) in seen:
+        current, namespace, depth = pending.pop()
+        if id(current) in seen_code:
             continue
-        seen.add(id(current))
-        names.update(getattr(current, "co_names", ()))
+        seen_code.add(id(current))
+        names = set(getattr(current, "co_names", ()))
+        if names & _STASH_READ_MARKERS:
+            return True
         for constant in getattr(current, "co_consts", ()):
             if hasattr(constant, "co_names"):
-                pending.append(constant)
-    return bool(names & _STASH_READ_MARKERS)
+                pending.append((constant, namespace, depth))
+        if depth >= _STASH_SCAN_MAX_DEPTH:
+            continue
+        for name in names:
+            called = namespace.get(name)
+            called = getattr(called, "__func__", called)
+            called_code = getattr(called, "__code__", None)
+            if called_code is None or id(called) in seen_functions:
+                continue
+            seen_functions.add(id(called))
+            pending.append((called_code, getattr(called, "__globals__", namespace), depth + 1))
+    return False
 
 
 @contextlib.contextmanager
