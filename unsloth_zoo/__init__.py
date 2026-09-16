@@ -281,14 +281,10 @@ if not _SKIP_GPU_INIT:
     # expandable_segments is unsupported on Windows/WSL.
     IS_WSL_OR_WINDOWS = bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or os.name == "nt"
 
-    # It is also not usable on an NVIDIA Tegra SoC board (Jetson), where the CUDA
-    # virtual memory management calls it is built on fail: a 1MiB buffer dies with
-    # `RuntimeError: CUDA driver error: out of memory` on a board with 50GB free
-    # (unslothai/unsloth#2401). Torch's own "not supported on this platform" guard
-    # is a compile-time #if, so an aarch64 CUDA wheel never hits it.
-    # Filesystem-only detection, on purpose: it runs here, before torch is imported,
-    # and asking the driver for cudaDeviceProp::integrated would create a CUDA
-    # context at import. See unsloth_zoo/integrated_device.py.
+    # Nor on an NVIDIA Tegra board, where the CUDA VMM calls it is built on fail: a 1MiB
+    # buffer dies with `RuntimeError: CUDA driver error: out of memory` on a board with 50GB
+    # free (unslothai/unsloth#2401). Detection is filesystem only because this runs before
+    # torch is imported; see unsloth_zoo/integrated_device.py.
     from .integrated_device import expandable_segments_unsupported
     EXPANDABLE_SEGMENTS_UNSUPPORTED = expandable_segments_unsupported()
 
@@ -368,11 +364,9 @@ if not _SKIP_GPU_INIT:
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
-    # IMPORTANT: same ordering rule as the ROCm cleanup below. Strips
-    # expandable_segments out of an explicit user value exactly as the WSL branch
-    # does, and adds nothing back: a unified-memory board has no separate VRAM pool
-    # for roundup_power2_divisions to defragment, and rounding every block up would
-    # waste the system RAM the model is competing for.
+    # IMPORTANT: same ordering rule as the ROCm cleanup below. Adds nothing back, unlike the
+    # WSL branch: a unified-memory board has no separate VRAM pool to defragment, and rounding
+    # every block up would waste the system RAM the model is competing for.
     if EXPANDABLE_SEGMENTS_UNSUPPORTED:
         remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")

@@ -16,39 +16,16 @@
 
 """Which board this is, for the two decisions that depend on unified memory.
 
-Both questions used to be answered from different places with the same driver
-probe, and one of them cannot afford that probe:
+``expandable_segments_unsupported()`` is read BEFORE ``import torch`` (the allocator reads its
+configuration during torch initialization), so it is filesystem only. ``_any_device_integrated()``
+costs a CUDA context -- ``get_device_properties`` flips ``is_initialized`` True where
+``device_count`` does not -- so only ``gradient_checkpointing.py`` calls it, never at import.
 
-* ``expandable_segments_unsupported()`` is read by ``unsloth_zoo/__init__.py``
-  inside the import-time allocator block, which runs BEFORE ``import torch``
-  because the allocator reads its configuration during torch initialization.
-  So this one is filesystem only: no torch, no CUDA context, no subprocess.
-* ``_any_device_integrated()`` is the driver's own answer and costs a CUDA
-  context (measured: ``torch.cuda.is_available()`` and
-  ``torch.cuda.device_count()`` leave ``torch.cuda.is_initialized()`` False,
-  ``torch.cuda.get_device_properties()`` flips it True). It moved here from
-  ``gradient_checkpointing.py`` so one module owns the topic, and it is still
-  called from there, on the first gradient-checkpointing init, after the caller
-  has picked its device. It is NOT called at import.
-
-Why the allocator needs any of this: ``expandable_segments:True`` does not go
-through ``cudaMalloc``. It reserves a virtual range and backs it with the CUDA
-virtual memory management driver calls (``cuMemAddressReserve``,
-``cuMemCreate``, ``cuMemMap``, ``cuMemSetAccess``), each wrapped in
-``C10_CUDA_DRIVER_CHECK``, which is the only thing in the caching allocator
-that raises ``RuntimeError: CUDA driver error: ...``. A cudaMalloc shortage
-raises ``torch.OutOfMemoryError`` with "CUDA out of memory. Tried to allocate"
-instead, so the two are distinguishable from a traceback alone. Torch's own
-"expandable_segments not supported on this platform" guard in
-``c10/cuda/CUDAAllocatorConfig.h`` is a compile-time ``#if`` on
-``PYTORCH_C10_DRIVER_API_SUPPORTED``, not a runtime device-capability query, so
-a Linux aarch64 CUDA build (what the JetPack wheels are) enables the mode and
-only finds out at allocation time.
-
-Deliberately scoped to Tegra, not to every integrated device. On NVIDIA GB10
-(DGX Spark) expandable segments is reported upstream as the mitigation that
-makes a long prefill survive (vllm-project/vllm#55569), so taking it away there
-would be the regression, and those boards are excluded by name.
+Torch's own "expandable_segments not supported on this platform" guard in
+``c10/cuda/CUDAAllocatorConfig.h`` is a compile-time ``#if``, not a device query, so an aarch64
+CUDA build enables the mode and its VMM driver calls fail only at allocation time (as
+``RuntimeError: CUDA driver error``, never ``torch.OutOfMemoryError``). Scoped to Tegra, not every
+integrated device: on GB10 expandable segments is the upstream mitigation (vllm-project/vllm#55569).
 """
 
 import os
@@ -65,13 +42,10 @@ __all__ = [
 _ENV_TRUE  = ("1", "true", "yes", "on")
 _ENV_FALSE = ("0", "false", "no", "off")
 
-# Set to 1 to keep the old behaviour on a board this module excludes, or to 0 to
-# force the exclusion on a board it did not recognise. Same tri-state shape as
-# UNSLOTH_DISABLE_DOUBLE_BUFFER and UNSLOTH_FORCE_UMA.
+# 1 keeps the old behaviour on an excluded board, 0 forces the exclusion on an unrecognised one.
 FORCE_ENV = "UNSLOTH_FORCE_EXPANDABLE_SEGMENTS"
 
-# Read as bytes, not text: /proc/device-tree/compatible is a NUL separated list
-# of strings and /proc/device-tree/model is NUL terminated. The DMI pair is here
+# Bytes, not text: /proc/device-tree/compatible is a NUL separated list. The DMI pair is here
 # because ARM boards that boot via ACPI have no /proc/device-tree at all.
 BOARD_IDENTITY_FILES = (
     "/etc/nv_tegra_release",
@@ -83,23 +57,17 @@ BOARD_IDENTITY_FILES = (
     "/sys/class/dmi/id/board_name",
 )
 
-# "nvidia,tegra" is the device-tree compatible family (nvidia,tegra234 on Orin).
-# "tegra" on its own also catches the /etc/nv_tegra_release file NAME, which is
-# what L4T ships and what makes the existence of that file a signal by itself.
+# Bare "tegra" also catches the /etc/nv_tegra_release file NAME, so its existence is a signal.
 _TEGRA_MARKERS = ("nvidia,tegra", "tegra", "jetson")
 
-# Checked BEFORE the Tegra markers and wins over them. GB10 is Tegra lineage and
-# its device tree can say so, but expandable segments works there (see module
-# docstring), so a Spark must keep it.
+# Checked BEFORE the Tegra markers and wins: GB10 is Tegra lineage but works.
 _VMM_CAPABLE_MARKERS = ("dgx spark", "dgx-spark", "dgx_spark", "gb10")
 
-# Tegra is ARM only, so an x86_64 host answers with one string compare and never
-# stats a path. This is also what makes a stray file on a normal host harmless.
+# Tegra is ARM only, so an x86_64 host answers with one compare and a stray file is harmless.
 _ARM_MACHINES = ("aarch64", "arm64", "armv8b", "armv8l", "armv7l")
 
 
 def _env_tristate(name):
-    """True, False, or None when the variable is unset or not a known word."""
     value = os.environ.get(name, "").strip().lower()
     if value in _ENV_TRUE:  return True
     if value in _ENV_FALSE: return False
@@ -107,30 +75,23 @@ def _env_tristate(name):
 
 
 def read_board_identity(paths = None):
-    """Lowercased `name=contents` of every readable board identity file.
-
-    Empty string when none of them can be read, which is the normal answer on
-    x86_64, on macOS and on Windows. The file name is part of the text on
-    purpose: it is the only signal /etc/nv_tegra_release carries reliably.
-    """
+    """Lowercased `name=contents` of every readable board identity file. The file NAME is part
+    of the text: it is the only signal /etc/nv_tegra_release carries reliably."""
     if paths is None: paths = BOARD_IDENTITY_FILES
     chunks = []
     for path in paths:
         try:
             with open(path, "rb") as file:
-                raw = file.read(4096) # these are small; never read an unbounded file
+                raw = file.read(4096) # never read an unbounded file
         except OSError:
-            continue # missing, a directory, or not readable by this user
+            continue
         text = raw.replace(b"\x00", b" ").decode("utf-8", errors = "ignore")
         chunks.append(f"{os.path.basename(path)}={' '.join(text.lower().split())}")
     return " ".join(chunks)
 
 
 def is_tegra_board(identity = None):
-    """True on an NVIDIA Tegra SoC board (Jetson), False everywhere else.
-
-    ``identity`` is only for tests; production reads the files.
-    """
+    """True on an NVIDIA Tegra SoC board (Jetson). ``identity`` is only for tests."""
     if platform.machine().strip().lower() not in _ARM_MACHINES:
         return False
     if identity is None:
@@ -143,11 +104,7 @@ def is_tegra_board(identity = None):
 
 
 def _cuda_context_exists():
-    """True only when torch is already imported AND its CUDA context is up.
-
-    ``sys.modules``, not ``import torch``: this must never be the thing that
-    imports torch, and importing it is what the caller is avoiding.
-    """
+    """``sys.modules``, not ``import torch``: this must never be what imports torch."""
     torch = sys.modules.get("torch")
     if torch is None:
         return False
@@ -158,13 +115,8 @@ def _cuda_context_exists():
 
 
 def _any_device_integrated():
-    # True if ANY visible CUDA/HIP device is integrated (unified memory). A single
-    # static check on purpose: an integrated device anywhere makes double buffering
-    # pure overhead, and a mixed integrated + discrete box is rare.
-    #
-    # Moved here from gradient_checkpointing.py, which still imports it under this
-    # name. torch is imported inside the function so this module stays importable
-    # before torch is, which is the whole reason it exists.
+    # ANY integrated device makes double buffering pure overhead, and a mixed box is rare.
+    # torch is imported inside the function so this module stays importable before torch is.
     try:
         import torch
         return any(
@@ -176,13 +128,8 @@ def _any_device_integrated():
 
 
 def _tegra_device_visible_for_free():
-    """The driver's opinion, but only when reading it costs nothing.
-
-    A container can hide the board files (/proc/device-tree is not bind-mounted
-    into the default namespace), so this is the second opinion for that case. It
-    returns False rather than probing whenever no CUDA context exists yet, so
-    ``import unsloth_zoo`` never initializes CUDA on its account.
-    """
+    """The driver's opinion, for the container case where the board files are hidden; False
+    rather than a probe when no CUDA context exists, so import never initializes CUDA."""
     if not _cuda_context_exists():
         return False
     if not _any_device_integrated():
@@ -201,12 +148,8 @@ def _tegra_device_visible_for_free():
 
 
 def expandable_segments_unsupported():
-    """Should PYTORCH_ALLOC_CONF's ``expandable_segments:True`` be kept off here?
-
-    Answered without importing torch and without creating a CUDA context, so it
-    is safe to call from the import-time allocator block. ``UNSLOTH_FORCE_EXPANDABLE_SEGMENTS``
-    forces either answer (1 keeps expandable segments, 0 removes them).
-    """
+    """Should ``expandable_segments:True`` be kept off here? Answered without importing torch
+    or creating a CUDA context, so it is safe in the import-time allocator block."""
     forced = _env_tristate(FORCE_ENV)
     if forced is not None:
         return not forced

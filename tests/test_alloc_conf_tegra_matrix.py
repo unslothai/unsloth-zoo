@@ -1,33 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""What ``import unsloth_zoo`` leaves in the allocator variables on a Tegra board.
+"""What ``import unsloth_zoo`` leaves in the allocator variables on a Tegra board
+(unslothai/unsloth#2401: the CUDA VMM calls behind ``expandable_segments:True`` fail on a
+Jetson AGX Orin, so a 1MiB buffer died with ``CUDA driver error: out of memory`` on a board
+with ~50GB free).
 
-Companion to ``test_alloc_conf_platform_matrix.py``, which covers the torch
-version boundary and the Windows/WSL fallback, and to
-``test_tegra_expandable_segments.py``, which covers the detector in isolation.
-The case here is unslothai/unsloth#2401: ``expandable_segments:True`` is backed by
-the CUDA virtual memory management driver calls, not by ``cudaMalloc``, and on a
-Jetson AGX Orin those fail, so a 1MiB gradient-checkpointing buffer died with
-``RuntimeError: CUDA driver error: out of memory`` on a board with ~50GB free.
+Each case imports in a FRESH SUBPROCESS: the allocator block is process-global and cannot be
+re-run in-process. The child loads the real detector standalone and points it at a temporary
+Jetson device tree, so nothing in the product is stubbed and no Tegra hardware is needed.
 
-Each case runs ``import unsloth_zoo`` in a **fresh subprocess**, because the
-import-time allocator block is process-global and cannot be re-run cleanly
-in-process. The child loads the real detector
-(``unsloth_zoo/integrated_device.py``) standalone, points its board-identity file
-list at a temporary Jetson device tree and makes ``platform.machine`` answer
-"aarch64". Nothing in the product is stubbed, and no Tegra hardware is needed:
-what is measured is the decision, not the driver.
-
-This file deliberately imports nothing from the module under test, so it still
-collects against a checkout that predates it and fails there on the behaviour
-rather than on an ImportError.
-
-Linux only, and measured to be: the child fakes a Linux CUDA host, so on Windows
-``os.name == "nt"`` sends the same import down the WSL/Windows branch instead, and
-unsloth-zoo declares no torch on Apple Silicon, where the allocator block therefore
-never runs. ``test_tegra_expandable_segments.py`` covers the detector itself and is
-platform neutral, so the decision is still checked on every OS.
+Imports nothing from the module under test, so it still collects against a checkout that
+predates it and fails on the behaviour rather than on an ImportError. Linux only: on Windows
+the same import takes the WSL branch, and unsloth-zoo declares no torch on Apple Silicon.
 """
 
 from __future__ import annotations
@@ -51,17 +36,14 @@ _ALLOC_KEYS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALL
 _WIPE = _ALLOC_KEYS + (
     "WSL_DISTRO_NAME", "WSL_INTEROP", "UNSLOTH_VLLM_STANDBY",
     "UNSLOTH_DISABLE_ALLOC_FALLBACK", "UNSLOTH_FORCE_EXPANDABLE_SEGMENTS",
-    # See tests/security/test_no_module_scope_env_leaks.py: inheriting this makes the
-    # whole allocator block a no-op and every case below report a vacuous pass.
+    # Inheriting this makes the allocator block a no-op and every case a vacuous pass.
     "UNSLOTH_ZOO_DISABLE_GPU_INIT",
 )
 
-# Repo root (.../unsloth_zoo), so the child's `import unsloth_zoo` resolves to this
-# checkout rather than a namespace-package shadow on a crowded sys.path.
+# So the child's `import unsloth_zoo` resolves to this checkout, not a namespace-package shadow.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# A Jetson AGX Orin as L4T publishes it: /proc/device-tree/model is NUL terminated
-# and /proc/device-tree/compatible is a NUL separated list of strings.
+# A Jetson AGX Orin as L4T publishes it, NUL terminators and all.
 JETSON_MODEL = "NVIDIA Jetson AGX Orin Developer Kit\x00"
 JETSON_COMPATIBLE = "nvidia,p3701-0000\x00nvidia,p3737-0000\x00nvidia,tegra234\x00"
 JETSON_RELEASE = "# R36 (release), REVISION: 3.0, GCID: 1, BOARD: generic\n"
@@ -166,7 +148,6 @@ _CHILD = textwrap.dedent(
 
 
 def _conf(*, torch_version, jetson, tmp_path = None, preset = None, force = None):
-    """Import unsloth_zoo in a fresh child and return what it left behind."""
     env = {k: v for k, v in os.environ.items() if k not in _WIPE}
     env["_ZOO_ROOT"] = _REPO_ROOT
     env["_FAKE_TORCH_VERSION"] = torch_version
@@ -212,9 +193,6 @@ class TestTegraGetsNothing:
             assert "roundup" not in (value or ""), (key, value)
 
     def test_detection_neither_imports_torch_nor_initializes_cuda(self, tmp_path):
-        # Measured around the detector call itself, because `import unsloth_zoo` on a
-        # real CUDA host already initializes CUDA further down, on main exactly as
-        # much as here, so the whole-import state answers a different question.
         result = _conf(torch_version = "2.14.0", jetson = True, tmp_path = tmp_path)
         if not result["detector_present"]:
             pytest.skip("this checkout has no unsloth_zoo/integrated_device.py")
@@ -247,8 +225,7 @@ class TestUserPrecedenceOnTegra:
         assert result["env"]["PYTORCH_ALLOC_CONF"] == "max_split_size_mb:128", result
 
     def test_legacy_promotion_does_not_re_add_expandable(self, tmp_path):
-        # torch >= 2.10 promotes a legacy user value into the unified var; that step
-        # must not put back what the Tegra branch removed.
+        # The >= 2.10 legacy-to-unified promotion must not put back what Tegra removed.
         result = _conf(
             torch_version = "2.14.0", jetson = True, tmp_path = tmp_path,
             preset = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:128"},
@@ -263,8 +240,7 @@ class TestUserPrecedenceOnTegra:
         assert result["env"]["PYTORCH_ALLOC_CONF"] is None, result
 
     def test_explicit_empty_is_preserved(self, tmp_path):
-        # An explicit empty value is a user opt-out that gradient_checkpointing.py
-        # advises by name; do not delete it.
+        # An explicit empty value is a user opt-out gradient_checkpointing.py advises by name.
         result = _conf(
             torch_version = "2.14.0", jetson = True, tmp_path = tmp_path,
             preset = {"PYTORCH_ALLOC_CONF": ""},
@@ -294,8 +270,7 @@ class TestEscapeHatch:
 
 class TestStandbyStillWins:
     def test_standby_on_a_tegra_board(self, tmp_path):
-        # UNSLOTH_VLLM_STANDBY=1 already refuses expandable segments; the Tegra
-        # branch must not resurrect them or add a roundup fallback.
+        # Standby already refuses expandable segments; Tegra must not resurrect them.
         result = _conf(
             torch_version = "2.14.0", jetson = True, tmp_path = tmp_path,
             preset = {"UNSLOTH_VLLM_STANDBY": "1"},

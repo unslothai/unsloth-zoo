@@ -25,9 +25,8 @@ import warnings
 import gc
 import threading
 from .utils import _get_dtype, Version
-# _any_device_integrated lives in integrated_device.py so the import-time allocator
-# block in __init__.py can share the topic without importing torch. Re-exported
-# under this name because that is where it was defined and where it is read from.
+# Re-exported under its old name: it lives in integrated_device.py so the import-time
+# allocator block can share the topic without importing torch.
 from .integrated_device import _any_device_integrated
 from .device_type import (
     is_hip,
