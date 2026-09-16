@@ -606,6 +606,42 @@ def _active_incomplete_blob_sizes(
     return sizes
 
 
+def _baseline_incomplete_blob_names(
+    repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
+) -> Optional[set]:
+    """Partial names present BEFORE the child is spawned, or ``None`` when that cannot be read.
+
+    Separate from ``_active_incomplete_blob_sizes`` purely because of what a failure means HERE.
+    That one answers "how many bytes are in flight", where an unreadable cache and an empty cache
+    are both honestly zero. This one seeds an OWNERSHIP baseline, and there the two are opposites:
+    the post-baseline diff at the kill site is ``current - baseline``, so a scan that failed and
+    returned an empty set claims every partial in the repo -- including a live sibling's -- as this
+    child's, and blobs in the ownership set are exempt from the patient grace, which is what makes
+    that claim a deletion rather than a miscount.
+
+    ``None`` is already the vocabulary for "unknown" at that site: it skips the diff and leaves the
+    purge unscoped, where the mtime and active-partner guards still clear genuinely stale state
+    while sparing a sibling. So an unreadable cache degrades to the coarser guard instead of to a
+    confident wrong answer.
+    """
+    try:
+        names = set()
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+            blobs_dir = entry / "blobs"
+            if not blobs_dir.is_dir():
+                continue
+            # Per-entry, as the sizes scan does: one unreadable blob is not a failed scan.
+            for blob in blobs_dir.iterdir():
+                try:
+                    if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
+                        names.add(blob.name)
+                except OSError:
+                    pass
+        return names
+    except Exception:
+        return None
+
+
 def _incomplete_partial_names(
     repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
 ) -> Optional[set]:
@@ -1643,8 +1679,12 @@ def _run_download_attempt(
     # shard (issue #9094). Safe for a snapshot for the reason the diff is taken at all: the snapshot
     # watchdog measures the WHOLE repo cache, so a fired stall is itself evidence that nothing --
     # ours or a sibling's -- grew in this repo for a full stall_timeout.
-    baseline_partials: Optional[set] = set(
-        _active_incomplete_blob_sizes(repo_type, repo_id, params.get("cache_dir"))
+    # None, not an empty set, when the scan could not be done: the diff below is
+    # ``current - baseline``, so a failure that read as "nothing was here" would claim a live
+    # sibling's partial as this child's, and the ownership set is exactly what exempts a blob
+    # from the patient grace.
+    baseline_partials: Optional[set] = _baseline_incomplete_blob_names(
+        repo_type, repo_id, params.get("cache_dir")
     )
     result_queue: Any = _CTX.Queue()
     proc = _CTX.Process(

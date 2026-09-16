@@ -634,3 +634,38 @@ def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(mon
     assert xf._clear_unsafe_partials_for_http(
         "model", REPO, cache_dir = str(tmp_path / "gone"), active_grace = 180.0,
     ) is None, "an unreadable cache reports None, never an empty set"
+
+
+def test_a_baseline_scan_that_failed_is_unknown_rather_than_empty(tmp_path, monkeypatch):
+    """An ownership baseline has to tell "nothing was here" from "could not look".
+
+    The kill site derives ownership as ``current - baseline``, and a blob in the ownership
+    set is exempt from the patient grace -- that exemption is the whole point of scoping the
+    purge. So a scan that failed and returned an empty set does not merely miscount: it
+    claims every partial in the repo, including a live same-repo sibling's, as this child's,
+    and the HTTP prep then unlinks it while it is still being written.
+
+    ``None`` is already the vocabulary for "unknown" at that site: it skips the diff and
+    leaves the purge unscoped, where the mtime and active-partner guards still clear stale
+    state while sparing a sibling.
+    """
+    _build_cache(tmp_path, partial_age_s = 5.0)
+
+    present = xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path))
+    assert isinstance(present, set) and present, "a readable cache reports the names it has"
+
+    # A cache that is not there is a genuinely empty baseline, not a failure.
+    assert xf._baseline_incomplete_blob_names(
+        "model", REPO, cache_dir = str(tmp_path / "no-such-cache"),
+    ) == set()
+
+    # A scan that raises is UNKNOWN. This is the case the empty set used to swallow.
+    def _boom(*args, **kwargs):
+        raise OSError("cache temporarily unreadable")
+
+    monkeypatch.setattr(xf, "iter_active_repo_cache_dirs", _boom)
+    assert xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path)) is None, (
+        "a failed baseline scan must be unknown, not an empty ownership baseline"
+    )
+    # The sizes scan keeps its own meaning: bytes in flight, where unreadable is honestly zero.
+    assert xf._active_incomplete_blob_sizes("model", REPO, cache_dir = str(tmp_path)) == {}
