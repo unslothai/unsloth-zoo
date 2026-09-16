@@ -222,3 +222,58 @@ def test_the_gate_reaches_has_cut_cross_entropy(monkeypatch, version, expected):
         # Leave sys.modules holding a loss_utils built from the real versions.
         monkeypatch.undo()
         importlib.reload(module)
+
+
+def _causal_lm_templates():
+    """The two generated causal-LM branches, read out of the compiler's own source."""
+    import re
+
+    from pathlib import Path
+
+    source = (
+        Path(importlib.import_module("unsloth_zoo.compiler").__file__)
+    ).read_text(encoding = "utf-8")
+    branches = re.findall(r"^elif .*fused_linear_cross_entropy.*?$", source, re.M)
+    if not branches:
+        branches = [
+            line
+            for line in source.splitlines()
+            if line.startswith("elif ") and "UNSLOTH_ENABLE_CCE" in line
+        ]
+    return source, branches
+
+
+def test_the_compiled_branch_consults_has_cut_cross_entropy():
+    """Disabling CCE has to reach the compiled forward, not just the import.
+
+    The sm75 gate above only makes HAS_CUT_CROSS_ENTROPY false and skips
+    `from cut_cross_entropy import linear_cross_entropy`. UNSLOTH_ENABLE_CCE is a separate
+    env flag defaulting to "1" that unsloth_zoo/__init__.py force-disables only for torch
+    >= 2.8 and for HIP -- so on torch 2.7, which pins exactly the triton 3.3.x the kernel
+    miscompiles under, the flag stayed on and the generated branch called
+    fused_linear_cross_entropy, which references the symbol that was never imported and
+    raises NameError. The warning promises "the standard loss is used instead", and the
+    elif below the branch is that standard loss.
+    """
+    source, branches = _causal_lm_templates()
+    assert branches, "the generated causal-LM CCE branch is no longer recognisable"
+    for branch in branches:
+        assert "UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY" in branch, branch
+    assert "    HAS_CUT_CROSS_ENTROPY,\n" in source, (
+        "the generated preamble must import HAS_CUT_CROSS_ENTROPY alongside "
+        "fused_linear_cross_entropy, or the branch above is a NameError of its own"
+    )
+
+
+def test_fused_linear_cross_entropy_needs_the_symbol_the_gate_skips():
+    """The premise: with the gate false the symbol genuinely is not there, so a branch
+    that ignores the gate cannot work. Guards against the test above passing while the
+    two flags have quietly stopped being independent."""
+    import inspect
+
+    loss_utils = importlib.import_module("unsloth_zoo.loss_utils")
+    body = inspect.getsource(loss_utils.fused_linear_cross_entropy)
+    assert "linear_cross_entropy(" in body
+    assert "HAS_CUT_CROSS_ENTROPY" not in body, (
+        "fused_linear_cross_entropy now checks the flag itself; retarget this test"
+    )

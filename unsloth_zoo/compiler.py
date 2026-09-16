@@ -268,9 +268,17 @@ from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 """
 )
 
+# HAS_CUT_CROSS_ENTROPY travels with fused_linear_cross_entropy because the generated
+# causal-LM branch has to consult it. UNSLOTH_ENABLE_CCE is an env flag that defaults on
+# and knows nothing about whether loss_utils could import `linear_cross_entropy`, so on
+# any host where that import is refused -- a compute-capability gate, a Triton the kernel
+# miscompiles on, or simply no cut_cross_entropy installed -- the flag alone still routed
+# into fused_linear_cross_entropy and raised NameError on the unimported symbol. The
+# elif below it computes the standard loss, which is exactly the documented fallback.
 _disabled_sdpa_code = f"""{_license_header}
 
 from unsloth_zoo.loss_utils import (
+    HAS_CUT_CROSS_ENTROPY,
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
@@ -2593,7 +2601,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -2685,7 +2693,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
