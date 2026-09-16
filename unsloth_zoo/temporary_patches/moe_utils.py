@@ -1644,8 +1644,8 @@ def _cast_delta_weight_like_param(delta_weight, param):
         from peft.tuners.lora.layer import ALLOWED_COMPUTE_DTYPES
         allowed = param.dtype in ALLOWED_COMPUTE_DTYPES
     except Exception:
-        # PEFT 0.18 / 0.19 have no such set and cast unconditionally; every dtype they
-        # accept for a 3D expert parameter is an ordinary floating point one.
+        # PEFT 0.18 has no such set and casts unconditionally, 0.19.0 onwards do; every dtype
+        # 0.18 accepts for a 3D expert parameter is an ordinary floating point one.
         allowed = param.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
     if allowed:
         return delta_weight.to(param.device, param.dtype)
