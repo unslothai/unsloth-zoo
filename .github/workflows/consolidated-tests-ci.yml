@@ -904,13 +904,10 @@ jobs:
                 # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
                 # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
                 # cannot turn these lanes red.
-                # test_merge_e2e_partial_refusal belongs to these lanes for the same
-                # reason. The bridge between a composite model's runtime LoRA names and
-                # its on-disk weights lives on the model class in transformers 4 and in
-                # a registry in transformers 5, so a single pin cannot show that the
-                # merge finds it either way, and losing it merges nothing and says
-                # nothing. It builds a roughly 100k parameter Qwen2.5-VL, so it is
-                # CPU-pure and sub-second.
+                # test_merge_e2e_partial_refusal is here for the same reason: the bridge
+                # to a composite model's on-disk weights is a class attribute in
+                # transformers 4 and a registry in 5, and losing it merges nothing
+                # silently, so one pinned version cannot show the merge finds it.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
