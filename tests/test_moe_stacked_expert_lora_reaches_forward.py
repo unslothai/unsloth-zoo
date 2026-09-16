@@ -813,6 +813,7 @@ def test_a_compiled_first_call_routes_to_peft_instead_of_the_unread_stash(
         model(_inputs())
 
     assert calls, "a compiled cold start left the call on a stash path nothing reads"
+    assert MU._forward_statically_reads_stash(experts) is False
     # Nothing recorded, so the first eager call still measures and every later compile
     # uses the real verdict rather than this assumption.
     assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None
@@ -850,3 +851,33 @@ def test_a_compiled_first_call_keeps_the_stash_path_for_a_stash_reading_family(
     with torch.no_grad():
         model(_inputs())
     assert calls == [], "a recorded verdict was overridden by the tracing assumption"
+
+
+def test_the_static_answer_recognises_a_stash_reading_forward():
+    """The thing the compiled cold start is decided on, on its own.
+
+    Every forward that applies the separated expert LoRA calls take_moe_lora_stash, so the
+    name in its code object is what tells an Unsloth-installed forward from transformers'
+    own. Both wrong answers are costly, which is why the decision is not a fixed
+    assumption: assuming unread sends a supported family into PEFT's ParamWrapper.forward,
+    which registers a parametrization while tracing and hard-fails under fullgraph;
+    assuming read leaves the LoRA out of every output on a family that ignores the stash.
+    """
+    assert MU._forward_statically_reads_stash(_StashReadingExperts(4, 8, 4)) is True
+    assert MU._forward_statically_reads_stash(_StashIgnoringExperts(4, 8, 4)) is False
+
+    class _ReadsInAHelper(_StashIgnoringExperts):
+        """Nested code objects count too: a comprehension or an inner function is where a
+        real forward often makes the call."""
+
+        def forward(self, hidden_states):
+            def _inner():
+                return MU.take_moe_lora_stash(self, "gate_up_proj")
+
+            _inner()
+            return super().forward(hidden_states)
+
+    assert MU._forward_statically_reads_stash(_ReadsInAHelper(4, 8, 4)) is True
+
+    # NEGATIVE CONTROL: nothing to read is "unknown", not "reads it".
+    assert MU._forward_statically_reads_stash(object()) is None

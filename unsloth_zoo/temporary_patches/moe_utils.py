@@ -1604,6 +1604,40 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
     )
 
 
+_STASH_READ_MARKERS = frozenset(("take_moe_lora_stash", "moe_lora_stash_name"))
+
+
+def _forward_statically_reads_stash(experts_module):
+    """Does this experts forward reference the stash API at all, read from its bytecode?
+
+    A static answer, which is the only kind available while Dynamo is tracing: the probe
+    cannot run inside a captured graph without being captured with it. Every forward that
+    applies Unsloth's separated expert LoRA calls `take_moe_lora_stash`, so the name
+    appearing in the function's code object (or a nested one) is what distinguishes an
+    Unsloth-installed forward from transformers' own. Cheap and side-effect free: no call
+    is made, only names are read.
+
+    Returns True, False, or None when there is no code object to read.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    forward = getattr(experts_module, "forward", None)
+    code = getattr(getattr(forward, "__func__", forward), "__code__", None)
+    if code is None:
+        return None
+    seen, pending, names = set(), [code], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        names.update(getattr(current, "co_names", ()))
+        for constant in getattr(current, "co_consts", ()):
+            if hasattr(constant, "co_names"):
+                pending.append(constant)
+    return bool(names & _STASH_READ_MARKERS)
+
+
 @contextlib.contextmanager
 def _preserved_rng_for_probe(x):
     """Run the probe forward without advancing any generator the real forward will read.
@@ -1812,18 +1846,24 @@ def _patched_param_wrapper_forward(
         # counts always runs exactly one experts forward on the path the verdict names.
         applies_stash = moe_lora_forward_applies_stash(experts_module, param_name)
         if applies_stash is None and torch.compiler.is_compiling():
-            # First invocation is a compiled one, so there is no verdict and no way to get
-            # one: the probe cannot run inside a captured graph without being captured with
-            # it and re-run on every call. Leaving it inconclusive would take the stash
-            # path, and on a family whose experts forward ignores the stash Dynamo would
-            # then reuse that graph forever with the expert LoRA absent from every output
-            # and gradient. PEFT's own path is the reference implementation and always
-            # applies it, so assume the stash is unread while tracing: below, that hands
-            # the wrapper back to PEFT wherever the parameter can be folded, and a
-            # quantized parameter, which cannot, keeps the stash path exactly as before.
-            # Nothing is recorded, so the first eager call still measures and every later
-            # compile uses the real verdict.
-            applies_stash = False
+            # First invocation is a compiled one, so there is no verdict and no way to
+            # measure one: the probe cannot run inside a captured graph without being
+            # captured with it and re-run on every call. Answer statically instead, from
+            # whether the forward references the stash API at all.
+            #
+            # Both wrong answers are costly, which is why this is not a fixed assumption.
+            # Assuming unread sends a supported stash-reading family into PEFT's own
+            # ParamWrapper.forward, which registers and removes a parametrization while
+            # tracing and hard-fails under fullgraph with "Getting an inplace view on a
+            # graph input is not supported". Assuming read leaves the expert LoRA out of
+            # every output and gradient on a family that ignores the stash, silently and
+            # for the life of the captured graph. The bytecode says which family this is.
+            #
+            # Nothing is recorded either way, so the first eager call still measures and
+            # every later compile follows the real verdict.
+            applies_stash = _forward_statically_reads_stash(experts_module)
+            if applies_stash is False:
+                _log_moe_lora_stash_unread_once(experts_module, param_name)
         elif applies_stash is None:
             applies_stash = _measure_moe_lora_stash_read(
                 self, experts_module, param_name, x, args, kwargs
