@@ -3640,11 +3640,32 @@ pass
 # Qwen MoE's dense `shared_expert` out of both.
 _MOE_EXPERT_LORA_SEGMENTS = ("experts", "moe")
 
+# Some families name the stacked expert tensor something that is a perfectly ordinary dense
+# module elsewhere, so the name only means "expert" when qualified by its parent. GraniteMoE
+# is the live case: on transformers 4.57 through 5.0 the experts are
+# `block_sparse_moe.input_linear` / `.output_linear` (GraniteMoeParallelExperts, one stacked
+# weight per layer), and only from 5.x onwards were they refactored to
+# `block_sparse_moe.experts.*`, which the bare segments above already catch. The same two
+# names are simultaneously a DENSE nn.Linear pair in granitemoeshared / granitemoe_swa /
+# granitemoehybrid (`shared_mlp.input_linear`) and in granite_speech's audio projector, and
+# those adapters are servable, so matching "input_linear" on its own would reject working
+# cases. Keyed on (parent segment, child segment); extend here for new layouts.
+_MOE_EXPERT_LORA_QUALIFIED_SEGMENTS = (
+    ("block_sparse_moe", "input_linear"),
+    ("block_sparse_moe", "output_linear"),
+)
+
 
 def _is_moe_expert_lora_key(key):
     """True when an adapter key sits on a stacked MoE expert tensor."""
     # All Unsloth Zoo code licensed under LGPLv3
-    return any(part in _MOE_EXPERT_LORA_SEGMENTS for part in key.split("."))
+    parts = key.split(".")
+    if any(part in _MOE_EXPERT_LORA_SEGMENTS for part in parts):
+        return True
+    return any(
+        (parent, child) in _MOE_EXPERT_LORA_QUALIFIED_SEGMENTS
+        for parent, child in zip(parts, parts[1:])
+    )
 
 
 def _saved_adapter_expert_lora_keys(save_directory):

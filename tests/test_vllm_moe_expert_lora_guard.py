@@ -154,6 +154,64 @@ def test_moe_spelling_is_still_segment_matched():
     assert not _is_moe_expert_lora_key("base_model.model.model.layers.0.mlp.shared_expert.up_proj.lora_A.weight")
 
 
+# --- parent-qualified expert names (GraniteMoE) ---------------------------------------
+#
+# On transformers 4.57 through 5.0 GraniteMoE's stacked experts are
+# `block_sparse_moe.input_linear` / `.output_linear` (GraniteMoeParallelExperts); only later
+# 5.x refactors them to `block_sparse_moe.experts.*`. Neither old-layout name contains
+# "experts" or "moe" as a segment. They cannot be matched bare either: the very same two
+# names are a DENSE nn.Linear pair under `shared_mlp` in granitemoeshared / granitemoe_swa /
+# granitemoehybrid, and a dense projector in granite_speech. Hence (parent, child) matching.
+
+GRANITE_EXPERT_KEYS = [
+    "base_model.model.model.layers.0.block_sparse_moe.input_linear.lora_A.default.weight",
+    "base_model.model.model.layers.0.block_sparse_moe.output_linear.lora_B.default.weight",
+    "model.layers.9.block_sparse_moe.input_linear.lora_A.weight",
+]
+
+GRANITE_DENSE_KEYS = [
+    # granitemoeshared / granitemoe_swa / granitemoehybrid dense shared MLP: servable.
+    "base_model.model.model.layers.0.shared_mlp.input_linear.lora_A.weight",
+    "base_model.model.model.layers.0.shared_mlp.output_linear.lora_B.weight",
+    # granite_speech audio projector: servable.
+    "base_model.model.model.encoder.input_linear.lora_A.weight",
+]
+
+
+@pytest.mark.parametrize("key", GRANITE_EXPERT_KEYS)
+def test_granitemoe_stacked_experts_are_detected(key):
+    assert _is_moe_expert_lora_key(key), key
+
+
+@pytest.mark.parametrize("key", GRANITE_DENSE_KEYS)
+def test_granite_dense_linears_are_not_detected(key):
+    assert not _is_moe_expert_lora_key(key), key
+
+
+def test_qualified_match_requires_the_parent_segment():
+    """input_linear alone must not match, or every granitemoeshared adapter breaks."""
+    assert not _is_moe_expert_lora_key("a.b.input_linear.lora_A.weight")
+    assert not _is_moe_expert_lora_key("input_linear.output_linear.lora_A.weight")
+    # and the parent has to be the IMMEDIATE parent
+    assert not _is_moe_expert_lora_key("a.block_sparse_moe.x.input_linear.lora_A.weight")
+
+
+def test_granitemoe_new_layout_still_caught_by_bare_segment():
+    # transformers 5.x refactor; the "experts" segment covers it with no extra rule.
+    assert _is_moe_expert_lora_key(
+        "base_model.model.model.layers.0.block_sparse_moe.experts.gate_up_proj.lora_A.weight"
+    )
+
+
+def test_granitemoe_old_layout_is_caught_on_disk(tmp_path):
+    _write_safetensors(str(tmp_path / "adapter_model.safetensors"), [
+        "base_model.model.model.layers.0.block_sparse_moe.input_linear.lora_A.default.weight",
+        "base_model.model.model.layers.0.shared_mlp.input_linear.lora_A.default.weight",
+    ])
+    got = _saved_adapter_expert_lora_keys(str(tmp_path))
+    assert len(got) == 1 and "block_sparse_moe" in got[0]
+
+
 def test_moe_spelling_is_caught_on_disk(tmp_path):
     _write_safetensors(str(tmp_path / "adapter_model.safetensors"), [
         "base_model.model.model.layers.0.moe.gate_up_proj.lora_A.weight",
