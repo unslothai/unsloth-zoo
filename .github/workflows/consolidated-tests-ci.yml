@@ -415,6 +415,9 @@ jobs:
           python -m pytest tests/test_mlx_save_export_edge_cases.py -v
           python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
 
+      - name: Token initialization regressions
+        run: python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
+
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
         # session-scoped network_blocker autouse fixture that would otherwise block
@@ -909,6 +912,10 @@ jobs:
                 # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
                 # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
                 # cannot turn these lanes red.
+                # test_merge_e2e_partial_refusal is here for the same reason: the bridge
+                # to a composite model's on-disk weights is a class attribute in
+                # transformers 4 and a registry in 5, and losing it merges nothing
+                # silently, so one pinned version cannot show the merge finds it.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -933,6 +940,7 @@ jobs:
                   tests/test_transformers_moe_structure_drift.py \
                   tests/test_moe_merge_e2e_cpu.py \
                   tests/test_merge_e2e_hub_unreachable.py \
+                  tests/test_merge_e2e_partial_refusal.py \
                   tests/test_gemma4_dtype_drift_guards.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else
