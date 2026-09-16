@@ -3628,28 +3628,17 @@ def return_lora_modules(
 pass
 
 
-# Parameter-name segments that mark a stacked MoE expert tensor. Matched as a dotted
-# segment ("...mlp.experts.gate_up_proj.lora_A.weight") rather than as a substring, so a
-# dense projection that merely contains the word is not caught. Qwen3 MoE, Qwen3.5/3.6
-# MoE and gpt-oss expose their stacked experts under ".experts.".
-#
-# ".moe." is the second spelling and it is not hypothetical: saving_utils.py keys its own
-# expert-shard mapping off `".experts" in lora_key or ".moe" in lora_key` and then remaps
-# ".moe" -> ".experts" for the Gemma 4 layout, so an adapter saved from that layout carries
-# ".moe." and is just as unservable by vLLM as an ".experts." one. Segment matching keeps
-# Qwen MoE's dense `shared_expert` out of both.
+# Dotted segments marking a stacked MoE expert tensor, matched as whole segments rather
+# than substrings so Qwen MoE's dense `shared_expert` stays servable. "experts" covers
+# Qwen3 MoE / Qwen3.5 / 3.6 / gpt-oss; ".moe" is the Gemma 4 spelling that saving_utils.py
+# remaps to ".experts", and is just as unservable by vLLM.
 _MOE_EXPERT_LORA_SEGMENTS = ("experts", "moe")
 
-# Some families name the stacked expert tensor something that is a perfectly ordinary dense
-# module elsewhere, so the name only means "expert" when qualified by its parent. GraniteMoE
-# is the live case: on transformers 4.57 through 5.0 the experts are
-# `block_sparse_moe.input_linear` / `.output_linear` (GraniteMoeParallelExperts, one stacked
-# weight per layer), and only from 5.x onwards were they refactored to
-# `block_sparse_moe.experts.*`, which the bare segments above already catch. The same two
-# names are simultaneously a DENSE nn.Linear pair in granitemoeshared / granitemoe_swa /
-# granitemoehybrid (`shared_mlp.input_linear`) and in granite_speech's audio projector, and
-# those adapters are servable, so matching "input_linear" on its own would reject working
-# cases. Keyed on (parent segment, child segment); extend here for new layouts.
+# Names that only mean "expert" when qualified by their parent. GraniteMoE's experts are
+# `block_sparse_moe.input_linear` / `.output_linear` on transformers 4.57 through 5.0 (later
+# 5.x moves them to `block_sparse_moe.experts.*`, already covered above), but that same pair
+# is a DENSE nn.Linear under `shared_mlp` in granitemoeshared / _swa / hybrid and in
+# granite_speech, which must stay servable. Extend here for new layouts.
 _MOE_EXPERT_LORA_QUALIFIED_SEGMENTS = (
     ("block_sparse_moe", "input_linear"),
     ("block_sparse_moe", "output_linear"),
@@ -3752,15 +3741,12 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
-        # MoE expert adapters must not be shipped to vLLM. Unsloth keeps them stacked
-        # over the whole expert tensor (lora_A (E*r, H), lora_B (2I, E*r)) while vLLM
-        # wants per-expert weights against w13_weight / w2_weight, and nothing here
-        # converts between the two. The filter above matches on ".lora_A." / ".lora_B."
-        # alone, so expert keys sail through it and the shape validation downstream is
-        # bypassed, which means they are accepted and then ignored. The failure is
-        # silent and it is the worst kind: rollouts come from the BASE experts while the
-        # trainer keeps updating the expert adapters, so GRPO scores off-policy samples
-        # and nothing raises. Refuse instead, and say why.
+        # Unsloth stacks expert adapters over the whole expert tensor (lora_A (E*r, H),
+        # lora_B (2I, E*r)); vLLM wants per-expert w13_weight / w2_weight and converts
+        # nothing. The ".lora_A." / ".lora_B." filter above lets them past its shape
+        # validation, so they are accepted and then ignored: rollouts come from the BASE
+        # experts while the trainer keeps updating the adapters, so GRPO scores off-policy
+        # samples and nothing raises. Refuse instead, and say why.
         _expert_lora_keys = [k for k in state_dict if _is_moe_expert_lora_key(k)]
         if len(_expert_lora_keys) != 0:
             _raise_moe_expert_lora_unsupported(_expert_lora_keys, "the training model")
@@ -3776,10 +3762,8 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
-        # Same refusal for the default path-based branch. vLLM's local-checkpoint loader
-        # skips expert keys it cannot place, so without this an ordinary
-        # load_lora(model, adapter_dir) would return a request that generates from the
-        # base experts, which is the silent failure this guard exists to prevent.
+        # Same refusal on the default path-based branch: vLLM's local-checkpoint loader
+        # skips expert keys it cannot place, giving the same silent base-experts rollouts.
         _expert_lora_keys = _saved_adapter_expert_lora_keys(save_directory)
         if len(_expert_lora_keys) != 0:
             _raise_moe_expert_lora_unsupported(_expert_lora_keys, save_directory)
