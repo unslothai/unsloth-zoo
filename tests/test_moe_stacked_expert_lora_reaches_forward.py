@@ -926,6 +926,75 @@ def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper)
         assert parameter_name not in experts.__dict__
 
 
+def _install_peft_main_delta_factors(model):
+    """PEFT main's `get_delta_factors` on this model's wrappers, for a PEFT without it.
+
+    The installed peft predates the factored API, so the route that matters for memory
+    cannot be exercised through it. This is upstream's implementation verbatim.
+    """
+    import types
+
+    def get_delta_factors(self, adapter_name):
+        weight_A = self.lora_A[adapter_name].weight
+        weight_B = self.lora_B[adapter_name].weight
+        weight_A = weight_A.reshape(self.num_experts, -1, weight_A.shape[-1])
+        weight_B = weight_B.reshape(weight_B.shape[0], -1, self.num_experts).permute(2, 0, 1)
+        if not self._did_swap_in_out_features:
+            lhs, rhs = weight_A.transpose(-2, -1), weight_B.transpose(-2, -1)
+        else:
+            lhs, rhs = weight_B, weight_A
+        param = self.get_param()
+        return lhs.to(param.dtype), rhs.to(param.dtype), self.scaling[adapter_name]
+
+    wrappers = [m for m in model.modules() if type(m).__name__ == "ParamWrapper"]
+    assert wrappers, "the model has no ParamWrapper to give the factored API to"
+    for wrapper in wrappers:
+        wrapper.get_delta_factors = types.MethodType(get_delta_factors, wrapper)
+    return wrappers
+
+
+def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_wrapper):
+    """PEFT keeps the low-rank factors for this case, and so must this fold.
+
+    `get_delta_weight` materialises a delta the size of the whole expert stack, and the
+    add then allocates a second one. On OlmoE that is 64 experts of dense weight twice per
+    projection per layer, which is what a single `baddbmm` over the factors avoids. The
+    result has to be the same weight either way.
+    """
+    assert MU.patch_param_wrapper_for_moe()
+    model = _build(_StashIgnoringExperts)
+    wrappers = _install_peft_main_delta_factors(model)
+
+    for wrapper in wrappers:
+        param = wrapper.get_param()
+        active = list(wrapper.active_adapters)
+        dense = param + wrapper.get_delta_weight(active[0])
+        factored = MU._moe_lora_folded_weight(wrapper, param, active)
+        assert torch.allclose(dense, factored, atol = 1e-6), wrapper.parameter_name
+
+    expected = model(_inputs())
+    compiled = torch.compile(model, fullgraph = True, dynamic = False)
+    assert torch.allclose(compiled(_inputs()), expected, atol = 1e-5)
+
+
+def test_a_peft_without_the_factored_api_still_folds(restore_param_wrapper):
+    """NEGATIVE CONTROL: `get_delta_factors` is newer than the oldest PEFT that has
+    `target_parameters`, so its absence must fall back to the dense delta, not to
+    nothing."""
+    assert MU.patch_param_wrapper_for_moe()
+    model = _build(_StashIgnoringExperts)
+    wrapper = next(m for m in model.modules() if type(m).__name__ == "ParamWrapper")
+    assert not hasattr(wrapper, "get_delta_factors"), (
+        "this peft has the factored API, so this control measures nothing"
+    )
+
+    param = wrapper.get_param()
+    active = list(wrapper.active_adapters)
+    folded = MU._moe_lora_folded_weight(wrapper, param, active)
+    assert folded is not None
+    assert torch.allclose(folded, param + wrapper.get_delta_weight(active[0]), atol = 1e-6)
+
+
 def test_the_eager_path_still_goes_through_peft(restore_param_wrapper, monkeypatch):
     """NEGATIVE CONTROL: the parametrization-free fold is for the compiled path only.
     Eagerly PEFT stays in charge, so nothing it does inside `_activate_lora` is bypassed

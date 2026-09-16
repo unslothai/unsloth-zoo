@@ -1787,14 +1787,50 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     return was_read
 
 
+def _moe_lora_folded_weight(self, param, active):
+    """`W` with the active adapters folded in, by the cheaper of PEFT's two routes.
+
+    PEFT's own choice, mirrored: with ONE active adapter over many experts it keeps the
+    low-rank factors and folds with a single `baddbmm`, and only otherwise materialises a
+    `get_delta_weight` the size of the whole expert stack. The difference is real on the
+    families this path exists for, OlmoE having 64 experts: the dense route allocates a
+    delta as large as the parameter and then a second tensor for the sum, so mirroring the
+    factored route halves the peak of every fold. `get_delta_factors` is newer than the
+    oldest PEFT with `target_parameters`, so it is asked for rather than assumed.
+
+    The autocast is disabled around the fold for PEFT's reason: a parametrization may not
+    change the dtype of the parameter, so the arithmetic stays in W's dtype. Float8 never
+    arrives here, since `_can_fold_moe_lora_through_peft` refuses it, so PEFT's low
+    precision add has no counterpart.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    factors = getattr(self, "get_delta_factors", None)
+    if factors is not None and len(active) == 1 and getattr(self, "num_experts", 1) > 1:
+        try:
+            lhs, rhs, scaling = factors(active[0])
+            with torch.autocast(device_type = param.device.type, enabled = False):
+                return torch.baddbmm(param, lhs, rhs, alpha = scaling)
+        except Exception:
+            pass
+    delta = None
+    try:
+        for name in active:
+            contribution = self.get_delta_weight(name)
+            delta = contribution if delta is None else delta + contribution
+    except Exception:
+        return None
+    return None if delta is None else param + delta
+
+
 def _fold_moe_lora_without_parametrization(
     self, immediate_base_layer, experts_module, parameter_name, x, args, kwargs
 ):
     """PEFT's fold, arithmetically, with the parametrization left out. None if not doable.
 
-    Same delta PEFT would add, from PEFT's own `get_delta_weight`, summed over the active
-    adapters exactly as `_activate_lora` sums it. The difference is only how the base
-    forward gets to see it: PEFT registers a parametrization on the stored parameter,
+    Same folded weight PEFT would produce, by the same route it would choose (see
+    `_moe_lora_folded_weight`). The difference is only how the base forward gets to see
+    it: PEFT registers a parametrization on the stored parameter,
     whose `set_` Dynamo rejects as a graph-input mutation, while this swaps the attribute
     for `W + delta` for the duration of the call and puts the parameter back after.
     Autograd is unaffected, since the sum is an ordinary op on both tensors.
@@ -1817,24 +1853,20 @@ def _fold_moe_lora_without_parametrization(
         return None
     if not active:
         return None
-    delta = None
-    try:
-        for name in active:
-            contribution = self.get_delta_weight(name)
-            delta = contribution if delta is None else delta + contribution
-    except Exception:
-        return None
-    if delta is None:
-        return None
 
     parameters = getattr(experts_module, "_parameters", None)
     if not isinstance(parameters, dict) or parameter_name not in parameters:
         return None
-    original = parameters.pop(parameter_name)
+    original = parameters[parameter_name]
+    folded = _moe_lora_folded_weight(self, original, active)
+    if folded is None:
+        return None
+
+    parameters.pop(parameter_name)
     try:
         # Through __dict__, since the module's __setattr__ would reject a plain tensor
         # where a Parameter was registered.
-        experts_module.__dict__[parameter_name] = original + delta
+        experts_module.__dict__[parameter_name] = folded
         return immediate_base_layer(x, *args, **kwargs)
     finally:
         experts_module.__dict__.pop(parameter_name, None)
