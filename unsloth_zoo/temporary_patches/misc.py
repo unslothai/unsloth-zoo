@@ -153,12 +153,12 @@ def patch_merge_quantization_configs():
         "if quantization_config_from_args is not None and quantization_config.__class__.__name__ != quantization_config_from_args.__class__.__name__:",
     )
 
-    # `from x import ()` is a SyntaxError, and the join below is empty whenever no
-    # name in the module happens to occur in the source being rewritten, which is
-    # what transformers 4.55.0 did. SyntaxError subclasses neither ValueError nor
-    # TypeError, the two exceptions the caller in unsloth tolerates, so it escaped
-    # this function and ended `import unsloth` outright. Guard the empty list, and
-    # report a failed import through raise_error like every other step here.
+    # `from x import ()` is a SyntaxError, and the join below is empty whenever no name in
+    # the module happens to occur in the source being rewritten. SyntaxError subclasses
+    # neither ValueError nor TypeError, the two the caller in unsloth tolerates, so it
+    # escapes this function and ends `import unsloth` outright. No published transformers
+    # reaches it: the list is non-empty on every version from 4.49.0 to 5.17.0, 12 names on
+    # 4.55.0. Kept anyway for a patched or future quantizers.auto, and cheap.
     used = [x for x in items if x in source]
     if used:
         try:
