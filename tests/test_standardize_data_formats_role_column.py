@@ -148,8 +148,13 @@ def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
         assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
         assert out[0]["conversations"][0]["content"] == "Braund, Mr. Owen Harris"
     finally:
-        if previous is not None:
-            multiprocess.set_start_method(previous, force = True)
+        # `previous is None` is the normal state of a fresh test process, and leaving the
+        # parametrised method pinned makes every later test order-dependent: the probe test
+        # in tests/test_dataset_num_proc.py skips outright when it sees a pinned method, so
+        # this one would quietly switch that one off. `set_start_method(None, force = True)`
+        # is multiprocess's own reset, which clears `_actual_context` and restores the
+        # unpinned state rather than choosing a method.
+        multiprocess.set_start_method(previous, force = True)
 
 
 def test_an_explicit_num_proc_still_resolves_the_columns():
@@ -261,3 +266,26 @@ def test_the_default_alias_lists_are_disjoint():
     for i, first in enumerate(groups):
         for second in groups[i + 1:]:
             assert not (first & second), (first, second)
+
+
+def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
+    """The regression the fixture above exists to avoid.
+
+    A fresh test process has no start method pinned, so restoring only a non-None
+    `previous` left the parametrised method globally selected and every later test ran in
+    a different process-creation regime than it was written for. One of them,
+    `test_start_method_probe_matches_the_pool_multiprocess_would_build`, skips as soon as
+    it sees a pinned method, so the leak silently switched a real assertion off.
+    """
+    multiprocess = pytest.importorskip("multiprocess")
+
+    before = multiprocess.get_start_method(allow_none = True)
+    multiprocess.set_start_method(None, force = True)
+    assert multiprocess.get_start_method(allow_none = True) is None
+    try:
+        test_the_resolved_columns_survive_a_multiprocess_map("spawn")
+        assert multiprocess.get_start_method(allow_none = True) is None, (
+            "the multiprocess map test pinned a start method and did not give it back"
+        )
+    finally:
+        multiprocess.set_start_method(before, force = True)
