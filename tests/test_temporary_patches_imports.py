@@ -22,8 +22,28 @@ Runs under the GPU-free harness in tests/conftest.py; no GPU required.
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
+
+
+# The switch `__init__.py:179` reads into _SKIP_GPU_INIT, which the device-capacity tests
+# below are entirely about: with it on, the import skips device detection and DEVICE_TYPE
+# becomes "cpu", so gpt_oss takes its `else` branch and device_memory is 0 rather than the
+# stubbed card's capacity. A child that inherits it therefore fails on a real GPU-less
+# machine and on a machine with a card, for a reason that is neither.
+#
+# It is inheritable in an ordinary run: hf_xet_fallback sets it on the PARENT process
+# around a download spawn (hf_xet_fallback.py:1520). So strip it here rather than assume
+# nothing in the session ever turns it on.
+_GPU_INIT_GATE = "UNSLOTH_ZOO_DISABLE_GPU_INIT"
+
+
+def _child_env(**overrides: str) -> dict:
+    """This process's environment minus the switch that would skip what is under test."""
+    env = {k: v for k, v in os.environ.items() if k != _GPU_INIT_GATE}
+    env.update(overrides)
+    return env
 
 
 # Per-submodule import smoke. Explicit (not a glob) so a silent drop or rename
@@ -127,16 +147,14 @@ def test_gpt_oss_imports_without_visible_gpus():
     """gpt_oss.py computes device_memory at import; with UNSLOTH_ALLOW_CPU=1
     DEVICE_TYPE stays "cuda" on GPU-less hosts, so the capacity lookup must be
     guarded. Subprocess so conftest's mem_get_info stub cannot mask it."""
-    import os
     import subprocess
     import sys
 
-    env = {
-        **os.environ,
-        "UNSLOTH_ALLOW_CPU": "1",
-        "CUDA_VISIBLE_DEVICES": "",
-        "HIP_VISIBLE_DEVICES": "",
-    }
+    env = _child_env(
+        UNSLOTH_ALLOW_CPU = "1",
+        CUDA_VISIBLE_DEVICES = "",
+        HIP_VISIBLE_DEVICES = "",
+    )
     result = subprocess.run(
         [sys.executable, "-c",
          "import unsloth_zoo.temporary_patches.gpt_oss; print('IMPORT_OK')"],
@@ -152,7 +170,6 @@ def test_xet_submodule_import_does_not_query_free_device_memory():
     gpt_oss only needs total capacity to select combo-kernel options. Device
     properties provide that without the context-creating mem_get_info call.
     """
-    import os
     import subprocess
     import sys
 
@@ -183,11 +200,7 @@ assert gpt_oss.device_memory == Props.total_memory
 assert gpt_oss.use_combo_kernels is True
 print("IMPORT_OK")
 '''
-    env = {
-        **os.environ,
-        "UNSLOTH_IS_PRESENT": "1",
-        "UNSLOTH_ALLOW_CPU": "1",
-    }
+    env = _child_env(UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1")
     result = subprocess.run(
         [sys.executable, "-c", script],
         env=env, capture_output=True, text=True, timeout=600,
@@ -203,7 +216,6 @@ def test_flex_attention_import_does_not_query_free_device_memory():
     mem_get_info() here would put back the context the gpt_oss fix removes for anyone
     who reaches the flex-attention path.
     """
-    import os
     import subprocess
     import sys
 
@@ -233,11 +245,7 @@ from unsloth_zoo.flex_attention import utils
 assert utils.kernel_options is None, utils.kernel_options
 print("IMPORT_OK")
 '''
-    env = {
-        **os.environ,
-        "UNSLOTH_IS_PRESENT": "1",
-        "UNSLOTH_ALLOW_CPU": "1",
-    }
+    env = _child_env(UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1")
     result = subprocess.run(
         [sys.executable, "-c", script],
         env=env, capture_output=True, text=True, timeout=600,

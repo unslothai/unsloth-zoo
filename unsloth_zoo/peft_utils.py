@@ -14,10 +14,11 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+# merge_and_overwrite_lora and merge_and_dequantize_lora were listed here after they had
+# already moved to saving_utils, which made `from unsloth_zoo.peft_utils import *` raise
+# AttributeError rather than import anything.
 __all__ = [
     "get_peft_regex",
-    "merge_and_overwrite_lora",
-    "merge_and_dequantize_lora",
     "SKIP_QUANTIZATION_MODULES",
     "get_lora_layer_modules",
     "requires_grad_for_gradient_checkpointing",

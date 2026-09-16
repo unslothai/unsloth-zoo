@@ -19,6 +19,7 @@ from .utils import Version
 import os
 import math
 import functools
+from collections.abc import Mapping
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
@@ -229,6 +230,45 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
+# Heads whose labels are not shifted next-token targets, so the counter below cannot
+# describe them. Matched on the top level class name, since the walk below descends
+# into the backbone and would judge the head by the decoder it sits on.
+NON_CAUSAL_HEADS = (
+    "ForSequenceClassification",
+    "ForTokenClassification",
+    "ForQuestionAnswering",
+    "ForMultipleChoice",
+)
+
+# The loss_types that shift labels, snapshotted AT IMPORT: patch_loss_functions() above
+# swaps every causal entry for UnslothForCausalLMLoss, so testing against the live
+# mapping would read False for every causal model once unsloth has loaded.
+try:
+    from transformers.loss.loss_utils import LOSS_MAPPING as _LOSS_MAPPING, ForCausalLMLoss
+    CAUSAL_LOSS_TYPES = frozenset(
+        key for key, fn in _LOSS_MAPPING.items() if fn is ForCausalLMLoss
+    )
+except Exception:
+    CAUSAL_LOSS_TYPES = frozenset()
+
+
+def _loss_shifts_labels(trainer, model, is_encoder_decoder):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Does this model's loss shift labels, so labels[..., 1:] is the right count?
+
+    A positive signal, not a list of excluded suffixes: a name cannot tell
+    BertForMaskedLM (2D token aligned labels, column 0 supervised) from a causal LM.
+    5.x already computed this on the Trainer; older ones get the same answer from the
+    loss_type every PreTrainedModel derives from its class name. A hand written
+    nn.Module has neither, and stays out: without a signal we decline rather than
+    guess, which is today's behaviour for it anyway.
+    """
+    shifts = getattr(trainer, "_loss_shifts_labels", None)
+    if isinstance(shifts, bool): return shifts
+    return getattr(model, "loss_type", None) in CAUSAL_LOSS_TYPES \
+        and not is_encoder_decoder
+pass
+
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
@@ -293,6 +333,15 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
     model_name = m.__class__.__name__
+
+    # Read off the top level model, before the walk below reassigns m: unsloth patches
+    # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into
+    # .model, matches "_fast_forward" and never consults the head it trains. Not
+    # cached, since is_encoder_decoder belongs to the instance, not the class name.
+    top_model = m
+    is_encoder_decoder = bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False))
+    is_non_causal_head = any(head in model_name for head in NON_CAUSAL_HEADS)
+
     global ALLOWED_NUM_ITEMS_IN_BATCH
     if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
 
@@ -339,22 +388,60 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             break
     pass
 
-    # Get num_items_in_batch
-    if has_kwargs and len(batch_samples) > 0 and "labels" in batch_samples[0]:
+    # Get num_items_in_batch. Two questions, as in stock transformers:
+    #   has a consumer: `model_accepts_loss_kwargs or compute_loss_func is not None`,
+    #     same on 4.57.6 and 5.17.0. has_kwargs is our first half, #1217 the second.
+    #   is countable: everything below counts SHIFTED CAUSAL targets (stock 5.17.0's
+    #     self._loss_shifts_labels). This lives on the base Trainer class, so
+    #     classification and seq2seq subclasses inherit it and their labels mean
+    #     something else: they raise here, or come back quietly short.
+    # The guards differ in width on purpose. is_non_causal_head gates both routes; the
+    # new route also demands a POSITIVE shifted-label signal, so Whisper and Florence2
+    # keep today's count rather than being rescaled here. A sample has to be a Mapping
+    # before "labels" can be read off it, and then have a .ndim before any tensor op
+    # touches it: TRL's GRPO collator is the identity, so a sample is a LIST of dicts
+    # and `.get` on it raises. Both used to kill a run stock trains through, which is
+    # why the pre-#1217 spelling asked `"labels" in batch_samples[0]`.
+    labels_are_countable = getattr(
+        batch_samples[0].get("labels") if len(batch_samples) > 0
+        and isinstance(batch_samples[0], Mapping) else None, "ndim", None,
+    ) is not None
+    if (not is_non_causal_head) and labels_are_countable \
+            and (has_kwargs or (getattr(self, "compute_loss_func", None) is not None
+                                and _loss_shifts_labels(self, top_model, is_encoder_decoder))):
         try:
             token_counts = []
+            # Shape only, so no device sync and still traceable. Acted on after the
+            # collectives below, never by breaking out: skipping accelerator.gather on
+            # one rank alone would hang the others.
+            degenerate = False
+            # One column leaves labels[..., 1:] empty. Only fatal when EVERY microbatch
+            # is short, since then the total is 0 and a sum/count loss divides by it. A
+            # short member of a mixed group just contributes 0, and voiding the group
+            # for it would lose GA invariance.
+            all_short = True
             for x in batch_samples:
                 labels = x["labels"]
+                if labels.shape[-1] >= 2: all_short = False
                 token_count = (labels[..., 1:] != -100)
                 if "input_ids" in x:
                     input_ids = x["input_ids"]
                     mark_static (input_ids, 0)
                     mark_dynamic(input_ids, 1)
+                    # One label per row against 2D input_ids is a classification
+                    # batch, whatever the class is called.
+                    if labels.ndim != input_ids.ndim: degenerate = True
                 if "attention_mask" in x:
                     attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)
                     mark_dynamic(attention_mask, 1)
-                    token_count &= (attention_mask[..., 1:] != 0)
+                    # Only AND a mask describing these same targets: a seq2seq mask is
+                    # the encoder's, a different length from the decoder labels, which
+                    # used to raise. Causal shapes always match, so nothing changes.
+                    if attention_mask.shape != labels.shape:
+                        degenerate = True
+                    else:
+                        token_count &= (attention_mask[..., 1:] != 0)
                 if "token_type_ids" in x:
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
@@ -403,7 +490,23 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             num_items_in_batch = sum(token_counts)
 
             if self.args.average_tokens_across_devices:
-                num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
+                if getattr(self.args, "world_size", 1) > 1:
+                    # One collective, not two: the two rank-local fallback flags ride
+                    # along with the count, so this path keeps exactly the single
+                    # gather it has always had. ANY degenerate rank means the layout
+                    # is uncountable everywhere; only an ALL-short world has a truly
+                    # zero total, since a short rank beside healthy ones has simply
+                    # contributed 0 to a total that is still its right divisor.
+                    count = torch.as_tensor(num_items_in_batch).reshape(()).to(torch.int64)
+                    flags = torch.tensor([int(degenerate), int(all_short)],
+                                         dtype = torch.int64, device = count.device)
+                    packed = torch.cat([count.reshape(1), flags])
+                    packed = self.accelerator.gather(packed).reshape(-1, 3)
+                    num_items_in_batch = packed[:, 0].sum()
+                    degenerate = bool(packed[:, 1].any())
+                    all_short  = bool(packed[:, 2].all())
+                else:
+                    num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
             if torch.is_tensor(num_items_in_batch):
                 if device is not None:
                     num_items_in_batch = num_items_in_batch.to(device)
@@ -411,6 +514,10 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Uses DataParallel scatter gather
                     # So we have to scatter num_items_in_batch to each GPU
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
+            # Discard a count these labels could not support. Last, so every collective
+            # above ran on every rank, and reduced above so no rank drops a divisor its
+            # peers keep.
+            if degenerate or all_short: num_items_in_batch = None
         except Exception as exception:
             raise RuntimeError(exception)
     pass

@@ -25,6 +25,9 @@ import warnings
 import gc
 import threading
 from .utils import _get_dtype, Version
+# Re-exported under its old name: it lives in integrated_device.py so the import-time
+# allocator block can share the topic without importing torch.
+from .integrated_device import _any_device_integrated
 from .device_type import (
     is_hip,
     get_device_type,
@@ -57,19 +60,6 @@ INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
-
-
-def _any_device_integrated():
-    # True if ANY visible CUDA/HIP device is integrated (unified memory). A single
-    # static check on purpose: an integrated device anywhere makes double buffering
-    # pure overhead, and a mixed integrated + discrete box is rare.
-    try:
-        return any(
-            bool(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0))
-            for i in range(torch.cuda.device_count())
-        )
-    except Exception:
-        return False
 
 
 @functools.cache
@@ -1291,10 +1281,13 @@ pass
 @torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     global CPU_BUFFERS
-    if len(CPU_BUFFERS) == 0:
+    # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
+    # to None, which is the state this shim normally starts from, and len(None) raises.
+    if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
+    preserve = kwargs.pop("preserve_rng_state", True)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
-    return UnslothCheckpointFunction.apply(function, *args, *tensor_args)
+    return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

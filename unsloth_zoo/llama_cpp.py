@@ -29,6 +29,7 @@ __all__ = [
     "IS_WINDOWS",
 ]
 
+import errno
 import subprocess
 import sys
 import os
@@ -284,8 +285,35 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
+_AUTO_INSTALL_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+
+
+def _auto_install_enabled() -> bool:
+    """Read at the attempt, not at import, so setting it after `import unsloth` works."""
+    return os.environ.get("UNSLOTH_AUTO_INSTALL", "1").strip().upper() \
+        in _AUTO_INSTALL_TRUE_VALUES
+
+
+def _stdin_is_usable() -> bool:
+    """Whether sys.stdin still refers to a live descriptor we could have read from."""
+    try:
+        os.fstat(sys.stdin.fileno())
+    except Exception:
+        # None, closed, detached, or a wrapper with no real fd. All mean no one to ask.
+        return False
+    return True
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
+
+    # Checked before the platform branch. The Windows arm returns early and the Colab
+    # and Kaggle paths skip the prompt, so an opt out placed any lower would miss them.
+    if not _auto_install_enabled():
+        raise RuntimeError(
+            f"Unsloth: Installation of `{package}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
 
     if IS_WINDOWS:
         # Per-package winget config aligned with setup.ps1
@@ -346,7 +374,54 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        # input() raises in non-interactive contexts. Under `docker run` without -i, or with
+        # stdin from /dev/null, this used to propagate through save_pretrained_gguf as
+        # `RuntimeError: Unsloth: GGUF conversion failed: EOF when reading a line`.
+        try:
+            acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        except (EOFError, RuntimeError, ValueError, OSError) as exception:
+            # A stdin closed AFTER interpreter start raises neither EOFError nor
+            # RuntimeError. Measured on CPython 3.13:
+            #   sys.stdin.close()  -> ValueError: I/O operation on closed file.
+            #   os.close(0)        -> OSError: [Errno 9] Bad file descriptor
+            #   sys.stdin = None   -> RuntimeError: lost sys.stdin
+            #   stdin=/dev/null    -> EOFError
+            # Daemon and process wrappers close fd 0, so without the first two a headless
+            # export still dies on the input() call this whole branch exists to survive.
+            # All four mean the same thing: there is no one to ask. The terminal check
+            # below still distinguishes Ctrl-D, and it holds for these too, since a closed
+            # sys.stdin makes isatty() raise and a closed fd 0 makes it return False.
+            #
+            # Each type is accepted only in the exact state that means "stdin is gone".
+            # An unrelated I/O error on a live stdin is not consent: EIO from a serial
+            # console, or a ValueError out of a custom stdin wrapper, must still propagate.
+            # CPython raises RuntimeError for a lost stdout or stderr too.
+            if isinstance(exception, RuntimeError) and sys.stdin is not None:
+                raise
+            # EBADF on its own is not enough. input() writes the prompt to stdout before
+            # it reads, so a closed fd 1 raises EBADF while fd 0 is open, non-tty and
+            # holding an unread answer. Reproduced on CPython: `python -u` with fd 1
+            # closed gives OSError(9) with sys.stdin.closed and isatty() both False.
+            # So ask stdin itself, not the errno.
+            if isinstance(exception, OSError) and (
+                exception.errno != errno.EBADF or _stdin_is_usable()
+            ):
+                raise
+            if isinstance(exception, ValueError) and not getattr(sys.stdin, "closed", False):
+                raise
+            # EOFError on a terminal is Ctrl-D and still cancels. EOFError with no terminal
+            # means there was never anyone to ask, which is the same implicit ENTER the
+            # prompt already documents. A stdin whose isatty() raises counts as no terminal.
+            try:
+                _stdin_is_a_tty = sys.stdin is not None and sys.stdin.isatty()
+            except Exception:
+                _stdin_is_a_tty = False
+            if _stdin_is_a_tty:
+                raise RuntimeError(
+                    f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
+                    "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
+            acceptance = ""
         if "no" in str(acceptance).lower():
             raise RuntimeError(
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
@@ -1217,6 +1292,7 @@ def install_llama_cpp(
 
     needs_clone = False
     needs_build = False
+    needs_wipe  = False
 
     # Ensure ~/.unsloth/ exists before we try to use it
     os.makedirs(UNSLOTH_HOME, exist_ok=True)
@@ -1246,14 +1322,11 @@ def install_llama_cpp(
         is_prebuilt_install = os.path.isfile(os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME))
         if not (is_source_checkout or is_prebuilt_install):
             print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
-            # C4: Only delete if the path is safe
-            if _is_safe_to_delete(llama_cpp_folder):
-                shutil.rmtree(llama_cpp_folder)
-            else:
-                raise RuntimeError(
-                    f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
-                    f"Please manually remove or fix it."
-                )
+            # Deleting is part of installing, so it waits for the opt-out check below.
+            # `llama_cpp_folder` can be a custom path holding the user's own files, and
+            # wiping it only to then report that installation was declined would be the
+            # worst of both outcomes.
+            needs_wipe = True
             needs_clone = True
             needs_build = True
         else:
@@ -1270,6 +1343,29 @@ def install_llama_cpp(
         needs_clone = True
         needs_build = True
     pass
+
+    # Everything below this point installs something: the prebuilt download, the clone, and
+    # do_we_need_sudo, which probes by RUNNING `apt-get update -y` / `pacman -Sy` / a yum
+    # check-update and then retrying under sudo. Checking the opt-out only inside
+    # install_package left all of that reachable, so UNSLOTH_AUTO_INSTALL=0 still fetched and
+    # activated a prebuilt llama.cpp, and still ran a package-manager update as root.
+    # An existing install is unaffected: that returns above without reaching here.
+    if (needs_build or needs_clone) and not _auto_install_enabled():
+        raise RuntimeError(
+            "Unsloth: llama.cpp is not installed and automatic installation was declined "
+            "(UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
+
+    if needs_wipe:
+        # C4: Only delete if the path is safe
+        if _is_safe_to_delete(llama_cpp_folder):
+            shutil.rmtree(llama_cpp_folder)
+        else:
+            raise RuntimeError(
+                f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
+                f"Please manually remove or fix it."
+            )
 
     # Prefer official prebuilt binaries before any source-build work
     # (no system package installs, no clone, no compile).
@@ -2778,7 +2874,13 @@ def convert_to_gguf(
 
                 # Self-heal: reinstall the converter deps (command[0] = its
                 # interpreter) and retry once instead of failing.
-                if not attempted_repair and _looks_like_converter_dep_error(captured):
+                # `_auto_install_enabled` gates this too: the repair runs pip with
+                # --upgrade --force-reinstall, so it mutates the environment just as much
+                # as the installer does. An existing checkout returns out of
+                # install_llama_cpp before its gate, so this is the one remaining way a
+                # refusal could still reach pip.
+                if (not attempted_repair and _auto_install_enabled()
+                        and _looks_like_converter_dep_error(captured)):
                     attempted_repair = True
                     try:
                         repair = _reinstall_converter_deps(command[0], print_output = print_output)

@@ -262,13 +262,18 @@ def test_network_bound_installs_are_retried() -> None:
     pip's `--retries` only covers establishing a connection, so a body truncated
     mid-download (ProtocolError / IncompleteRead) is not retried and the install
     dies. The lanes wrap those installs in retry().
+
+    The pip bootstrap used to be excluded here. It is network-bound like the
+    rest, and it runs before anything else in the lane, so a blip there costs the
+    whole lane: `retry` around `pip install -e .[core]` demonstrably saved a lane
+    from an IncompleteRead on 2026-09-09, and there was no reason the line above
+    it should have been the one left unprotected.
     """
     for workflow, job, name, run in _lane_steps():
         for body in _capture_groups(run):
             installs = [
                 stmt for stmt in _statements(body)
                 if "pip" in stmt and " install " in stmt
-                and "--upgrade pip" not in stmt
                 and "--no-deps" not in stmt      # deliberately `|| true`
             ]
             for stmt in installs:

@@ -164,6 +164,11 @@ def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
             raise ValueError("body")
 
 def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
+    for name in (
+        "mlx_lm.generate", "mlx_vlm.generate", "mlx_vlm.generate.dispatch",
+        "mlx_vlm.generate.ar", "mlx_vlm.speculative.common",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.SimpleNamespace())
     events = []
     monkeypatch.setattr(
         "mlx.core.synchronize",
@@ -1531,3 +1536,20 @@ def test_a_prefill_batch_charges_each_row_its_own_prompt_and_not_the_padded_widt
     mask = types.SimpleNamespace(sum = lambda axis: {-1: types.SimpleNamespace(tolist = lambda: [1.0, 11.0])}[axis])  # noqa: E501
     results = _results(adapter._drive(generator, [0, 1], [0, 1], {}, prompt_token_counts = _unpadded_lengths(mask)))  # noqa: E501
     assert [r.prompt_token_count for r in results] == [1, 11]
+
+
+def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
+    # generation_mode enters both inference fusions for any model it is handed, and
+    # these tests hand it plain stand-ins. The decode scope reads a module's own dict
+    # entries, which only an mlx Module has, so a non-Module must be skipped rather
+    # than raising TypeError out of the generation path.
+    from unsloth_zoo.mlx.inference import fused_decode_conv_silu, fused_moe_gate_up
+    # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
+    # so a scope that reads it before deciding the entry is a candidate raises instead.
+    for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
+        model = types.SimpleNamespace(
+            training = False,
+            named_modules = lambda: [("plain", stub)],
+        )
+        with fused_moe_gate_up(model), fused_decode_conv_silu(model):
+            pass

@@ -52,6 +52,12 @@ def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
     # Windows thread count = 1. See https://github.com/unslothai/unsloth-zoo/pull/187
     if sys.platform == "win32": return 1
+    # get_torch_compile_options feeds this into the Inductor options dict, which outranks
+    # TORCHINDUCTOR_COMPILE_THREADS, so returning the cpu count would undo _gpu_init's forcing.
+    # Gated on our sentinel and NOT on TORCHINDUCTOR_COMPILE_THREADS: vLLM sets that to "1"
+    # unconditionally at import (vllm/env_override.py), which would drop every vLLM user to
+    # a single compile worker.
+    if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1": return 1
     cpu_count = os.cpu_count()
     return min(32, max(4, cpu_count))
 pass
