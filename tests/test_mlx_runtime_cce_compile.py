@@ -646,3 +646,46 @@ def test_runtime_cce_backward_peak_memory(quantized, budget_mib):
     peak = mx.get_peak_memory() - resident
     assert mx.isfinite(result[0]).item()
     assert peak < budget_mib * 1024**2, f"CCE backward used {peak / 1024**2:.2f} MiB"
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 5.0])
+def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, softcap):
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    mx.random.seed(5)
+    hidden = mx.random.normal((67, 64)) * 0.5
+    weight = mx.random.normal((4099, 64)) * 0.3
+    # Targets in every chunk, ignored rows, and one out-of-range label.
+    targets = mx.where(mx.arange(67) % 11 == 7, -100, (mx.arange(67) * 613) % 4099)
+    targets = mx.where(mx.arange(67) == 30, 4099, targets)
+    cotangent = mx.linspace(-0.7, 0.9, 67)
+    if quantized:
+        head = mx.quantize(weight, group_size=64, bits=4)
+        weight = mx.dequantize(*head, group_size=64, bits=4)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            quantized=True, group_size=64, bits=4, chunk_size=1024, logit_softcap=softcap,
+            precompute_hidden_gradient=True)[0]
+    else:
+        head = (weight,)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            weight_is_frozen=True, chunk_size=1024, logit_softcap=softcap, precompute_hidden_gradient=True)[0]
+    reference = runtime_cce.make_chunked_cross_entropy_loss(chunk_size=1024, logit_softcap=softcap)[0]
+
+    def run(fn, h, y, g, *args):
+        return mx.value_and_grad(lambda x: (fn(x, *args, y) * g).sum())(h)
+
+    calls, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(runtime_cce, "_forward_with_hidden_gradient",
+                        lambda *args, **kwargs: (calls.append(1), forward(*args, **kwargs))[1])
+    actual = run(loss, hidden, targets, cotangent, *head)
+    mx.eval(actual)
+    assert calls == [1]
+    compiled = mx.compile(lambda *args: run(loss, *args))(hidden, targets, cotangent, *head)
+    expected = run(reference, hidden, targets, cotangent, mx.stop_gradient(weight))
+    mx.eval(compiled, expected)
+    assert mx.array_equal(loss(hidden, *head, targets), reference(hidden, weight, targets), equal_nan=True).item()
+    for got in (actual, compiled):
+        assert mx.all(mx.isnan(got[1][30])).item()
+        assert mx.allclose(got[1], expected[1], atol=2e-6, rtol=0, equal_nan=True).item()

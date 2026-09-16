@@ -2019,6 +2019,16 @@ def _is_lm_head_trainable(model):
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
+def _runtime_cce_by_mode(**kwargs):
+    loss_only = _get_runtime_cce(**kwargs)
+    if not (kwargs.get("quantized") or kwargs.get("weight_is_frozen")):
+        return lambda model: loss_only
+    # Training builds a frozen head's hidden gradient in the forward, which would
+    # double the cost of evaluation, where nothing is differentiated.
+    training = _get_runtime_cce(**kwargs, precompute_hidden_gradient=True)
+    return lambda model: training if model.training else loss_only
+
+
 def make_cce_loss_fn(model, label_smoothing=0.0):
     """Create a chunked cross-entropy (CCE) loss function.
 
@@ -2104,7 +2114,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         )
         _has_biases = hasattr(lm_layer, "biases")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -2149,7 +2159,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             hidden_flat, targets_flat = _compact_cce_inputs(
                 hidden_flat, targets_flat, cce_indices,
             )
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
@@ -2157,7 +2167,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         if _skip_weight_grad:
             print("Unsloth: CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             label_smoothing=label_smoothing,
@@ -2193,7 +2203,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             hidden_flat, targets_flat = _compact_cce_inputs(
                 hidden_flat, targets_flat, cce_indices,
             )
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
@@ -4237,7 +4247,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         bits = getattr(lm_layer, "bits", 4)
         quant_mode = getattr(lm_layer, "mode", "affine")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -4271,16 +4281,17 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = indices[:, 0] * masked_targets.shape[1] + columns
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
         if _skip_weight_grad:
             print("Unsloth: VLM CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
+            weight_is_frozen=_skip_weight_grad,
         )
 
         def loss_fn(model, batch_dict):
@@ -4301,7 +4312,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = indices[:, 0] * masked_targets.shape[1] + columns
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
