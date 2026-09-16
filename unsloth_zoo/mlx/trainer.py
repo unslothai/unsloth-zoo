@@ -5484,7 +5484,7 @@ class MLXTrainer:
                 objective = resolve_preference_objective("orpo", beta=args.beta)
                 loss_fn = (make_orpo_cce_loss_fn(model, objective)
                            if args.use_cce else make_orpo_loss_fn(objective))
-                use_cce = getattr(loss_fn, "_unsloth_cce_compaction", False)
+                use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
                 self._preference_reference_provenance = {
                     "kind": "orpo_no_reference"
                 }
@@ -5514,7 +5514,7 @@ class MLXTrainer:
                 _sampling_reference = reference_policy
                 loss_fn = (make_dpo_cce_loss_fn(model, objective, reference_policy=reference_policy)
                            if args.use_cce else make_dpo_loss_fn(objective, reference_policy=reference_policy))
-                use_cce = getattr(loss_fn, "_unsloth_cce_compaction", False)
+                use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
                 _main_print(
                     f"Unsloth: Using DPO loss (beta={args.beta}, "
                     f"loss_type={list(objective.loss_types)})."
