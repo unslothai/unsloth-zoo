@@ -147,6 +147,27 @@ except ImportError:
     _is_colab_environment = _disk_utils.is_colab_environment
     _is_kaggle_environment = _disk_utils.is_kaggle_environment
 
+# Static scan of the converter we download and execute. Vendored inside the
+# package rather than left in scripts/, which pyproject excludes from the wheel.
+try:
+    from .converter_scan import (
+        RE_ARGPARSE_DEFAULT,
+        ConverterScanError,
+        warn_on_suspicious_converter,
+    )
+except ImportError:
+    # Standalone file load with no package context, as above.
+    import importlib.util as _importlib_util
+    _converter_scan_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_converter_scan",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "converter_scan.py"),
+    )
+    _converter_scan = _importlib_util.module_from_spec(_converter_scan_spec)
+    _converter_scan_spec.loader.exec_module(_converter_scan)
+    RE_ARGPARSE_DEFAULT = _converter_scan.RE_ARGPARSE_DEFAULT
+    ConverterScanError = _converter_scan.ConverterScanError
+    warn_on_suspicious_converter = _converter_scan.warn_on_suspicious_converter
+
 IS_COLAB_ENVIRONMENT  = _is_colab_environment()
 IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
 IS_WINDOWS = sys.platform == "win32"
@@ -1911,6 +1932,18 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
             if original_content is None:
                 raise _last_err  # type: ignore[misc]
 
+        # 1b. Scan the bytes we are about to patch, eval defaults out of, write
+        # to disk and run. Deliberately before every one of those steps. Warns
+        # by default (see converter_scan for why it does not block), and raises
+        # ConverterScanError only under UNSLOTH_CONVERTER_SCAN_STRICT=1 on
+        # downloaded bytes.
+        warn_on_suspicious_converter(
+            original_content,
+            _local_script if _local_script is not None else LLAMA_CPP_CONVERT_FILE,
+            is_local_copy = _local_script is not None,
+            log = logger,
+        )
+
         # 2. Detect layout BEFORE importing: the package entrypoint does
         # `from conversion import ...`, which a temp-file import resolves
         # against LLAMA_CPP_DEFAULT_DIR; with a different
@@ -1957,6 +1990,10 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                 f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
             )
 
+    except ConverterScanError:
+        # A deliberate refusal under UNSLOTH_CONVERTER_SCAN_STRICT=1. Propagate it
+        # with its own message instead of relabelling it an introspection failure.
+        raise
     except Exception as e:
          logger.error(f"Unsloth: Error during loading or introspecting the original script: {e}", exc_info=True)
          raise RuntimeError(f"Failed during loading/introspection of original script: {e}") from e
@@ -2068,7 +2105,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         logger.info("Unsloth: Parsing arguments from patched script...")
         flags = re.findall(rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"]", patched_content)
         if not flags: raise RuntimeError(f"Unsloth: Failed parsing {patched_filename} - no arguments found.")
-        defaults = re.findall(rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"][^\)]*(?:action=|default=)[\s]*([^,\s\)]+)", patched_content)
+        # The same compiled regex converter_scan vets these tokens with, so the
+        # two cannot drift apart. The scan reads the pre-patch bytes; the patches
+        # above only insert Unsloth-authored lines and never an add_argument call,
+        # so both see the same set of defaults.
+        defaults = RE_ARGPARSE_DEFAULT.findall(patched_content)
         all_flags = {}
         for flag_bytes, default_bytes in defaults:
             flag = flag_bytes.decode("utf-8").lstrip('-').replace("-", "_")
