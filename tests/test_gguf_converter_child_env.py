@@ -844,3 +844,62 @@ def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tm
     monkeypatch.setattr(mod, "_probe_child_gguf",
                         lambda *a, **kw: {"location": str(tmp_path / "nothing" / "gguf" / "__init__.py")})
     assert mod._installed_gguf_tree(sys.executable) is None
+
+
+def test_signature_expressions_are_certain(mod):
+    """A default, a decorator and an annotation are evaluated while the module is IMPORTED.
+
+    `def convert(kind = gguf.NEW_KIND)` fails on import exactly like a module-level
+    expression would, so classifying it as advisory let `_resolve_converter_and_gguf` keep a
+    baseline package that cannot run the converter at all.
+    """
+    source = (
+        b"import gguf\n"
+        b"@gguf.register\n"
+        b"def convert(kind = gguf.NEW_KIND, *, mode = gguf.MODE.FAST) -> gguf.Result:\n"
+        b"    return gguf.MODEL_ARCH.MAYBE\n"
+    )
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.register" in certain
+    assert "gguf.NEW_KIND" in certain
+    assert "gguf.MODE.FAST" in certain
+    assert "gguf.Result" in certain
+    # The body is still advisory: it may never run.
+    assert "gguf.MODEL_ARCH.MAYBE" in advisory
+    assert "gguf.MODEL_ARCH.MAYBE" not in certain
+
+
+def test_a_lambda_default_is_certain_and_its_body_is_not(mod):
+    source = b"import gguf\nf = lambda kind = gguf.KIND: gguf.LATER.value\n"
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.KIND" in certain
+    assert "gguf.LATER.value" in advisory
+
+
+def test_postponed_annotations_are_not_evaluated(mod):
+    """PEP 563 makes every annotation a string, so an annotation naming a symbol that is
+    not there costs nothing at import time. A default still does."""
+    source = (
+        b"from __future__ import annotations\n"
+        b"import gguf\n"
+        b"def convert(kind = gguf.NEW_KIND) -> gguf.Result:\n"
+        b"    return None\n"
+    )
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.NEW_KIND" in certain
+    assert "gguf.Result" not in certain
+
+
+def test_a_signature_under_a_try_is_still_advisory(mod):
+    """The try is the guard, and it covers what is inside it, signature included."""
+    source = (
+        b"import gguf\n"
+        b"try:\n"
+        b"    def convert(kind = gguf.NEW_KIND):\n"
+        b"        return None\n"
+        b"except AttributeError:\n"
+        b"    convert = None\n"
+    )
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.NEW_KIND" in advisory
+    assert "gguf.NEW_KIND" not in certain

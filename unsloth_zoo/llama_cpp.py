@@ -2747,6 +2747,47 @@ def _gguf_requirements_from_source(source_bytes):
             return "gguf." + ".".join(reversed(parts))
         return None
 
+    # PEP 563: with `from __future__ import annotations` every annotation is a string and
+    # nothing in it is evaluated at import time, so an annotation naming a missing symbol
+    # costs nothing. Without it, an annotation is an ordinary expression in the signature.
+    annotations_eager = not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in getattr(tree, "body", [])
+    )
+
+    def _eagerly_evaluated_signature(function, annotations_eager):
+        """The expressions in a function's signature that run when the module is imported."""
+        pieces = []
+        pieces.extend(getattr(function, "decorator_list", []) or [])
+        arguments = getattr(function, "args", None)
+        if arguments is not None:
+            pieces.extend(arguments.defaults or [])
+            pieces.extend([item for item in (arguments.kw_defaults or []) if item is not None])
+            if annotations_eager:
+                if getattr(function, "returns", None) is not None:
+                    pieces.append(function.returns)
+                for group in ("posonlyargs", "args", "kwonlyargs"):
+                    for argument in getattr(arguments, group, []) or []:
+                        if argument.annotation is not None:
+                            pieces.append(argument.annotation)
+                for single in (arguments.vararg, arguments.kwarg):
+                    if single is not None and single.annotation is not None:
+                        pieces.append(single.annotation)
+        return pieces
+
+    def visit_expression(expression, eager):
+        """Run the walk over one expression, as if it stood on its own at this level."""
+        visit(ast.Module(body = [ast.Expr(value = expression)], type_ignores = []), eager)
+
+    def visit_body(function, eager):
+        """The statements of a function, without its signature."""
+        for statement in function.body if isinstance(function.body, list) else [
+            ast.Expr(value = function.body)
+        ]:
+            visit(ast.Module(body = [statement], type_ignores = []), eager)
+
     def visit(node, eager):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.ImportFrom):
@@ -2771,7 +2812,14 @@ def _gguf_requirements_from_source(source_bytes):
             # A function body may never run, and a try body may be guarding for
             # a missing symbol on purpose. Both demote to advisory.
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                visit(child, False)
+                # The SIGNATURE is not the body. `@gguf.register` and
+                # `def convert(kind = gguf.NEW_KIND)` are evaluated while the module is
+                # imported, exactly like a module-level expression, so a symbol missing
+                # from either one makes the import fail however the body is written. Only
+                # the body keeps the demotion.
+                for piece in _eagerly_evaluated_signature(child, annotations_eager):
+                    visit_expression(piece, eager)
+                visit_body(child, False)
             elif isinstance(child, ast.Try):
                 visit(child, False)
             else:
