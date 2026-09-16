@@ -4098,6 +4098,28 @@ def _gguf_shard_siblings(path):
     return shards or [path]
 
 
+def _gguf_missing_shards(path):
+    """Basenames the split set declares but does not have on disk, in order.
+
+    `_gguf_shard_siblings` drops an absent shard silently, which is right for building
+    the union of tensor names but means an incomplete set is indistinguishable from a
+    complete smaller one: the count is only in the filename. Without this, shard 1 being
+    present was enough for every check below to run on whatever survived and pass, so a
+    split model missing its middle was reported ready to publish or quantize.
+    """
+    match = _GGUF_SHARD_PATTERN.match(os.path.basename(path))
+    if match is None:
+        return []
+    directory = os.path.dirname(path) or "."
+    stem, total = match.group("stem"), int(match.group("total"))
+    missing = []
+    for index in range(1, total + 1):
+        name = f"{stem}-{index:05d}-of-{total:05d}.gguf"
+        if not os.path.isfile(os.path.join(directory, name)):
+            missing.append(name)
+    return missing
+
+
 def _gguf_field_text(reader, key):
     """A string KV value, or None when absent or not readable as one."""
     field = reader.fields.get(key)
@@ -4183,6 +4205,20 @@ def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
             f"shard 1 of {total} (`{first.group('stem')}-00001-of-{total:05d}.gguf`) "
             f"is not present, and it is the only shard that carries the model's "
             f"metadata"
+        ]
+
+    # Shard 1 is here, so the metadata reads fine and every check below would run happily
+    # on the shards that remain. A later shard being absent is just as unloadable, and the
+    # only record of how many there should be is the `-of-NNNNN` in the name.
+    absent = _gguf_missing_shards(readers[0][0])
+    if absent:
+        if not report_structural:
+            return []
+        total = int(first.group("total"))
+        listed = ", ".join(f"`{name}`" for name in absent)
+        return [
+            f"{len(absent)} of the {total} shards this split model declares are not "
+            f"present ({listed}), so it is incomplete and llama.cpp cannot load it"
         ]
 
     architecture = _gguf_field_text(reader, GGUF_ARCHITECTURE_KEY)
@@ -4742,7 +4778,17 @@ def assert_correct_gguf(model_name, model, tokenizer, sample_size = None):
     # All Unsloth Zoo code licensed under LGPLv3
     if type(model_name) not in (list, tuple,):
         model_name = [model_name,]
+    # One entry per split set, as `_verify_converted_gguf` already does. `convert_to_gguf`
+    # returns the shard LIST, so handing that straight back to this function made every
+    # shard resolve to the same complete set and revalidate it: a 40 shard model was
+    # reopened and reparsed 40 times, and almost all of that cost is GGUFReader parsing
+    # shard 1's vocabulary, which is 15 s on its own at 262k entries.
+    checked = set()
     for name in model_name:
+        shards = _gguf_shard_siblings(name)
+        if shards[0] in checked:
+            continue
+        checked.add(shards[0])
         _assert_correct_gguf(name, model, tokenizer, sample_size = sample_size)
 
 

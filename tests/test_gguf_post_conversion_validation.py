@@ -279,6 +279,80 @@ def test_a_lone_file_is_its_own_shard_set(llama_cpp, tmp_path):
     assert llama_cpp._gguf_shard_siblings(path) == [path]
 
 
+def test_a_missing_middle_shard_is_reported(llama_cpp, tmp_path):
+    """Shard 1 present is not the same as the set being complete.
+
+    The missing-shard check only looked at whether the FIRST shard was absent, because
+    that is the one carrying the metadata. With shard 1 on disk every check runs happily
+    on whatever survived and finds nothing wrong, so an incomplete split model, which
+    llama.cpp cannot load, was reported ready to publish or quantize. The declared count
+    lives only in the `-of-NNNNN` of the filename.
+    """
+    first = write_gguf(tmp_path / "m-00001-of-00003.gguf", keys = UNIVERSAL,
+                       tensors = {"blk.0.attn_q.weight": None})
+    write_gguf(tmp_path / "m-00003-of-00003.gguf", architecture = "llama",
+               keys = {}, tensors = {"blk.2.attn_q.weight": None})
+    # Shard 2 was never written.
+
+    assert llama_cpp._gguf_missing_shards(first) == ["m-00002-of-00003.gguf"]
+    problems = llama_cpp.gguf_metadata_problems(first)
+    assert any("m-00002-of-00003.gguf" in problem for problem in problems), problems
+    assert any("incomplete" in problem for problem in problems), problems
+    # Reported from any member of the set, not only from shard 1.
+    third = tmp_path / "m-00003-of-00003.gguf"
+    assert any(
+        "m-00002-of-00003.gguf" in problem
+        for problem in llama_cpp.gguf_metadata_problems(str(third))
+    )
+
+
+def test_a_complete_shard_set_reports_nothing_missing(llama_cpp, tmp_path):
+    """The control: the check must not fire on a set that is all there."""
+    first = write_gguf(tmp_path / "c-00001-of-00002.gguf", keys = UNIVERSAL,
+                       tensors = {"blk.0.attn_q.weight": None})
+    write_gguf(tmp_path / "c-00002-of-00002.gguf", architecture = "llama",
+               keys = {}, tensors = {"blk.1.attn_q.weight": None})
+
+    assert llama_cpp._gguf_missing_shards(first) == []
+    assert llama_cpp.gguf_metadata_problems(first) == []
+    # A file that is not part of a split set has no declared count to be short of.
+    solo = write_gguf(tmp_path / "solo2.gguf", keys = UNIVERSAL,
+                      tensors = {"blk.0.attn_q.weight": None})
+    assert llama_cpp._gguf_missing_shards(solo) == []
+
+
+def test_assert_correct_gguf_checks_each_split_set_once(llama_cpp, tmp_path, monkeypatch):
+    """`convert_to_gguf` returns the shard LIST, and that list is what a caller hands back.
+
+    Every member then resolved to the same complete set and revalidated it, so a 40 shard
+    model was reopened and reparsed 40 times. Almost all of that cost is GGUFReader
+    parsing shard 1's vocabulary, which is seconds on its own, so the redundancy is the
+    whole wait rather than a rounding error. `_verify_converted_gguf` already dedupes.
+    """
+    shards = [
+        str(write_gguf(tmp_path / f"m-{index:05d}-of-00004.gguf",
+                       keys = UNIVERSAL if index == 1 else {},
+                       tensors = {f"blk.{index - 1}.attn_q.weight": None}))
+        for index in range(1, 5)
+    ]
+    seen = []
+    monkeypatch.setattr(
+        llama_cpp, "_assert_correct_gguf",
+        lambda name, *args, **kwargs: seen.append(name),
+    )
+
+    llama_cpp.assert_correct_gguf(shards, model = None, tokenizer = None)
+
+    assert seen == [shards[0]], seen
+
+    # Two genuinely different models are still both checked.
+    other = str(write_gguf(tmp_path / "other.gguf", keys = UNIVERSAL,
+                           tensors = {"blk.0.attn_q.weight": None}))
+    seen.clear()
+    llama_cpp.assert_correct_gguf(shards + [other], model = None, tokenizer = None)
+    assert seen == [shards[0], other], seen
+
+
 # ---------------------------------------------------------------------------
 # Tensor sanity (unsloth#6056)
 # ---------------------------------------------------------------------------
