@@ -503,7 +503,7 @@ def test_the_measurement_happens_once_and_costs_one_forward_afterwards(restore_p
             type(experts).forward = underlying
 
 
-def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold():
+def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold(monkeypatch):
     """PEFT folds by adding a delta to the stored parameter, which needs a real float.
 
     A stacked expert weight held as `Params4bit`, MXFP4 blocks or FP8 is not one, so the
@@ -512,7 +512,14 @@ def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold():
     resolves to None against PEFT's `target_parameters` layout, so nothing records a read
     and the verdict for that forward is False.
     """
-    MU._original_param_wrapper_forward = MU._original_param_wrapper_forward or (lambda *a: None)
+    # Through monkeypatch: a saved forward left behind here is the one every later test
+    # ends up calling, and a stand-in that returns None would make those look like a model
+    # producing no output at all.
+    monkeypatch.setattr(
+        MU,
+        "_original_param_wrapper_forward",
+        MU._original_param_wrapper_forward or (lambda *a: None),
+    )
 
     experts = _StashIgnoringExperts()
     assert MU._can_fold_moe_lora_through_peft(experts, "gate_up_proj") is True
@@ -782,7 +789,7 @@ def test_the_rng_guard_is_inert_while_tracing(monkeypatch):
     assert called["n"] == 1, "the eager path must still preserve the RNG"
 
 
-def test_a_compiled_first_call_routes_to_peft_instead_of_the_unread_stash(
+def test_a_compiled_first_call_applies_the_lora_instead_of_the_unread_stash(
     restore_param_wrapper, monkeypatch
 ):
     """A model whose FIRST invocation is compiled has no verdict and no way to get one.
@@ -790,29 +797,26 @@ def test_a_compiled_first_call_routes_to_peft_instead_of_the_unread_stash(
     The probe cannot run inside a captured graph without being captured with it and re-run
     on every call. Leaving the call inconclusive took the separated stash path, and on a
     family whose experts forward ignores the stash Dynamo would reuse that graph forever
-    with the expert LoRA absent from every output and gradient. PEFT's own path always
-    applies it, so it is the safe assumption while tracing.
+    with the expert LoRA absent from every output and gradient. The fold has to happen
+    instead, and while tracing it happens without PEFT's parametrization.
     """
     assert MU.patch_param_wrapper_for_moe()
-    calls = []
+    x = _inputs()
+    # The reference runs on its own copy, so the subject's FIRST call is the compiled one
+    # and no verdict has been measured for it.
+    with torch.no_grad():
+        folded = _build(_StashIgnoringExperts)(x)
 
-    def recording_original(self, x, *args, **kwargs):
-        calls.append(getattr(self, "parameter_name", None))
-        return self.base_layer(x, *args, **kwargs)
-
-    # PEFT's real ParamWrapper.forward is not importable in this environment, and the
-    # decision under test is which path is taken rather than PEFT's own arithmetic. Set on
-    # every copy of the module, since the installed forward reads its own globals.
-    for module in _moe_utils_copies():
-        module._original_param_wrapper_forward = recording_original
     model = _build(_StashIgnoringExperts)
     experts = model.base_model.model.experts.get_base_layer()
-
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     with torch.no_grad():
-        model(_inputs())
+        traced = model(x)
 
-    assert calls, "a compiled cold start left the call on a stash path nothing reads"
+    assert torch.allclose(traced, folded, atol = 1e-6), (
+        "a compiled cold start left the call on a stash path nothing reads, so the "
+        "expert LoRA is absent from the output"
+    )
     assert MU._forward_statically_reads_stash(experts) is False
     # Nothing recorded, so the first eager call still measures and every later compile
     # uses the real verdict rather than this assumption.
@@ -881,6 +885,66 @@ def test_the_static_answer_recognises_a_stash_reading_forward():
 
     # NEGATIVE CONTROL: nothing to read is "unknown", not "reads it".
     assert MU._forward_statically_reads_stash(object()) is None
+
+
+def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper):
+    """The reroute must not cost these families full-graph compilation.
+
+    PEFT's `_activate_lora` registers a parametrization for the call, and the `set_` that
+    performs on the stored parameter is a graph-input mutation Dynamo refuses with
+    "Getting an inplace view on a graph input is not supported", which is a hard error
+    under fullgraph. Folding the same delta ourselves has to give PEFT's numbers, PEFT's
+    gradients, and a model that still compiles.
+    """
+    assert MU.patch_param_wrapper_for_moe()
+    model = _build(_StashIgnoringExperts)
+    x = _inputs()
+
+    expected = model(x)
+    expected.sum().backward()
+    expected_grads = {
+        name: param.grad.clone() for name, param in model.named_parameters() if param.grad is not None
+    }
+    assert expected_grads, "the eager reference produced no gradients to compare against"
+    model.zero_grad(set_to_none = True)
+
+    compiled = torch.compile(model, fullgraph = True, dynamic = False)
+    out = compiled(x)
+    assert torch.allclose(out, expected, atol = 1e-5), (
+        "the compiled fold does not match what PEFT's parametrization computes"
+    )
+    out.sum().backward()
+    for name, param in model.named_parameters():
+        if name in expected_grads:
+            assert torch.allclose(param.grad, expected_grads[name], atol = 1e-5), name
+
+    experts = model.base_model.model.experts.get_base_layer()
+    for parameter_name in ("gate_up_proj", "down_proj"):
+        assert isinstance(experts._parameters[parameter_name], torch.nn.Parameter), (
+            "the swapped-in tensor outlived the call"
+        )
+        assert parameter_name not in experts.__dict__
+
+
+def test_the_eager_path_still_goes_through_peft(restore_param_wrapper, monkeypatch):
+    """NEGATIVE CONTROL: the parametrization-free fold is for the compiled path only.
+    Eagerly PEFT stays in charge, so nothing it does inside `_activate_lora` is bypassed
+    on a path where it runs perfectly well."""
+    assert MU.patch_param_wrapper_for_moe()
+    calls = []
+
+    def recording_original(self, x, *args, **kwargs):
+        calls.append(getattr(self, "parameter_name", None))
+        return self.base_layer(x, *args, **kwargs)
+
+    for module in _moe_utils_copies():
+        module._original_param_wrapper_forward = recording_original
+    model = _build(_StashIgnoringExperts)
+    with torch.no_grad():
+        model(_inputs())
+        model(_inputs())
+
+    assert calls, "an eager call on a stash-ignoring family bypassed PEFT's own forward"
 
 
 def test_the_static_answer_follows_a_delegating_forward():

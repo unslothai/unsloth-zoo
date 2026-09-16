@@ -1787,6 +1787,60 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     return was_read
 
 
+def _fold_moe_lora_without_parametrization(
+    self, immediate_base_layer, experts_module, parameter_name, x, args, kwargs
+):
+    """PEFT's fold, arithmetically, with the parametrization left out. None if not doable.
+
+    Same delta PEFT would add, from PEFT's own `get_delta_weight`, summed over the active
+    adapters exactly as `_activate_lora` sums it. The difference is only how the base
+    forward gets to see it: PEFT registers a parametrization on the stored parameter,
+    whose `set_` Dynamo rejects as a graph-input mutation, while this swaps the attribute
+    for `W + delta` for the duration of the call and puts the parameter back after.
+    Autograd is unaffected, since the sum is an ordinary op on both tensors.
+
+    Only for the compiled path. Eagerly PEFT's own forward stays in charge, so adapter
+    bookkeeping this does not reproduce (variants, merge state, anything future PEFT does
+    inside `_activate_lora`) is only ever bypassed where the alternative is not running at
+    all. Returns None whenever anything is missing, and the caller then falls through to
+    the stash path rather than losing the call.
+
+    Nested wrappers compose: the wrapper chain is down_proj -> gate_up_proj -> experts and
+    each level folds and restores its own parameter around the next, so both are folded
+    for the innermost forward.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        active = [name for name in self.active_adapters if name in self.lora_A]
+    except Exception:
+        return None
+    if not active:
+        return None
+    delta = None
+    try:
+        for name in active:
+            contribution = self.get_delta_weight(name)
+            delta = contribution if delta is None else delta + contribution
+    except Exception:
+        return None
+    if delta is None:
+        return None
+
+    parameters = getattr(experts_module, "_parameters", None)
+    if not isinstance(parameters, dict) or parameter_name not in parameters:
+        return None
+    original = parameters.pop(parameter_name)
+    try:
+        # Through __dict__, since the module's __setattr__ would reject a plain tensor
+        # where a Parameter was registered.
+        experts_module.__dict__[parameter_name] = original + delta
+        return immediate_base_layer(x, *args, **kwargs)
+    finally:
+        experts_module.__dict__.pop(parameter_name, None)
+        parameters[parameter_name] = original
+
+
 def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool:
     """Whether handing this parameter back to PEFT would fold a delta into a real weight.
 
@@ -1905,7 +1959,21 @@ def _patched_param_wrapper_forward(
             if applies_stash is False:
                 _log_moe_lora_stash_unread_once(experts_module, param_name)
         if applies_stash is False and _can_fold_moe_lora_through_peft(experts_module, param_name):
-            return _original_param_wrapper_forward(self, x, *args, **kwargs)
+            if torch.compiler.is_compiling():
+                # PEFT's own fold cannot be traced. `_activate_lora` registers a
+                # parametrization for the call and removes it after, and the `set_` that
+                # registration performs on the stored parameter is a graph-input mutation,
+                # so Dynamo refuses it: "Getting an inplace view on a graph input is not
+                # supported". Under fullgraph that is a hard error, which would mean these
+                # families cannot compile at all. Folding the same delta ourselves keeps
+                # the arithmetic and drops the parametrization, and traces.
+                folded = _fold_moe_lora_without_parametrization(
+                    self, immediate_base_layer, experts_module, param_name, x, args, kwargs
+                )
+                if folded is not None:
+                    return folded
+            else:
+                return _original_param_wrapper_forward(self, x, *args, **kwargs)
 
         # Extract LoRA for this parameter and stash on the experts module
         # (not base_layer): _unsloth_lora_gate_up_proj / _unsloth_lora_down_proj.
