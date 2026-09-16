@@ -31,7 +31,14 @@ UNSLOTH_COMPILE_LOCATION = os.environ.get(
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
-    HAS_BNB = True
+    # unsloth_zoo installs a permissive bitsandbytes stub wherever the real package is
+    # absent, macOS arm64 among others, and every attribute of that stub resolves to a
+    # placeholder object rather than a class. `isinstance(x, Params4bit)` against one
+    # raises TypeError: isinstance() arg 2 must be a type, so a non-class Params4bit has
+    # to count as no bitsandbytes at all. On a real install this is just True.
+    HAS_BNB = isinstance(Params4bit, type)
+    if not HAS_BNB:
+        Params4bit = None
 except Exception:
     # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
     HAS_BNB = False
@@ -1050,18 +1057,24 @@ def _get_base_weight(param, target_dtype=None):
 
 
 def _get_lora_wrapper_for_param(experts_module, param_name):
-    """Get the PEFT ParamWrapper for gate_up_proj or down_proj; does not lazily set up wrappers."""
+    """Get the PEFT ParamWrapper for gate_up_proj or down_proj; does not lazily set up wrappers.
+
+    A forward that asks for the wrapper applies that parameter's LoRA itself rather than
+    reading the stash, so finding one counts as a read (see `mark_moe_lora_stash_read`).
+    """
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    wrapper = None
     if hasattr(experts_module, f"{param_name}_lora_wrapper"):
-        return getattr(experts_module, f"{param_name}_lora_wrapper")
-
-    if hasattr(experts_module, param_name):
+        wrapper = getattr(experts_module, f"{param_name}_lora_wrapper")
+    elif hasattr(experts_module, param_name):
         attr = getattr(experts_module, param_name)
         if hasattr(attr, "lora_A"):  # ParamWrapper
-            return attr
+            wrapper = attr
 
-    return None
+    if wrapper is not None:
+        mark_moe_lora_stash_read(experts_module, param_name)
+    return wrapper
 
 
 def native_moe_grouped_mm(
@@ -1431,6 +1444,166 @@ def _is_moe_experts_module(module) -> bool:
 _get_moe_lora_weights = _extract_lora_from_wrapper
 
 
+# Did the experts forward actually read the LoRA that ParamWrapper.forward handed it?
+#
+# `_patched_param_wrapper_forward` deliberately does not let PEFT fold the expert LoRA into
+# the stacked expert weight. It stashes the factors on the experts module as
+# `_unsloth_lora_<parameter_name>` and lets the experts forward apply them as a separate
+# grouped GEMM, which is cheaper and keeps the base weight quantized. That is only correct
+# when the forward that runs is one that reads the stash. Unsloth installs such a forward for
+# the MoE families it patches. For a stacked-expert family it does not patch, transformers'
+# own experts forward runs, the stash is written and then deleted unread, and the expert LoRA
+# has no effect on the output at all while requires_grad and the optimizer still report a
+# healthy adapter. `_forward_native_fp8_expert_loop` already refuses rather than train an
+# adapter that nothing reads; this does the same job without having to enumerate the
+# families, by recording the read and asking afterwards.
+#
+# Every stash read goes through `take_moe_lora_stash`, which records the read on the experts
+# module. The wrapper resets the record, calls the base layer, and checks it: an unread stash
+# means this forward does not apply the expert LoRA, so the wrapper redoes the call through
+# PEFT's own `ParamWrapper.forward`, which folds the delta into the weight. The verdict is
+# cached per parameter name against the forward it was measured with, so the double call
+# happens at most once per experts module and never for a family whose forward does read it.
+
+_MOE_LORA_STASH_READ_ATTR = "_unsloth_moe_lora_stash_read"
+_MOE_LORA_STASH_VERDICT_ATTR = "_unsloth_moe_lora_forward_applies"
+
+
+def moe_lora_stash_name(parameter_name: str) -> str:
+    """Attribute name `_patched_param_wrapper_forward` stashes `parameter_name`'s LoRA under."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    return f"_unsloth_lora_{parameter_name}"
+
+
+def _moe_module_dict(module, attr):
+    """Per-module bookkeeping dict for `attr`, created on first use.
+
+    Read through `__dict__` and written with `setattr`: these are plain dicts, so
+    `nn.Module.__setattr__` stores them in the instance `__dict__`, and going straight to
+    `__dict__` on the read path skips `nn.Module.__getattr__` for a value that is never a
+    parameter, buffer or submodule.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        store = module.__dict__.get(attr)
+    except AttributeError:
+        return None
+    if store is None:
+        store = {}
+        try:
+            setattr(module, attr, store)
+        except Exception:
+            return None
+    return store
+
+
+def mark_moe_lora_stash_read(experts_module, parameter_name: str) -> None:
+    """Record that this experts forward applies `parameter_name`'s expert LoRA itself.
+
+    Called by `take_moe_lora_stash` for every stash read, and by
+    `_get_lora_wrapper_for_param` for the forwards that reach past the stash and pull the
+    LoRA straight off the PEFT wrapper (the MXFP4 GPT-OSS experts forward does that).
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    store = _moe_module_dict(experts_module, _MOE_LORA_STASH_READ_ATTR)
+    if store is not None:
+        store[parameter_name] = True
+
+
+def take_moe_lora_stash(experts_module, parameter_name: str):
+    """The stashed LoRA for `parameter_name`, or None, recording that this forward read it.
+
+    Records the read whatever the value is: an attempted read is what proves the forward
+    knows about the stash, and the stash is legitimately absent when no adapter is attached.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    mark_moe_lora_stash_read(experts_module, parameter_name)
+    return getattr(experts_module, moe_lora_stash_name(parameter_name), None)
+
+
+def _resolve_experts_forward(experts_module):
+    """The function object that `experts_module(...)` will run, or None."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    forward = getattr(experts_module, "forward", None)
+    return getattr(forward, "__func__", forward)
+
+
+def moe_lora_forward_applies_stash(experts_module, parameter_name: str):
+    """Cached verdict: does this experts forward apply the stashed expert LoRA itself?
+
+    True or False once measured, None when it has not been measured for the forward that is
+    currently installed. Re-patching the forward invalidates the verdict.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        cache = experts_module.__dict__.get(_MOE_LORA_STASH_VERDICT_ATTR)
+    except AttributeError:
+        return None
+    if not cache:
+        return None
+    entry = cache.get(parameter_name)
+    if entry is None:
+        return None
+    forward, verdict = entry
+    if forward is not _resolve_experts_forward(experts_module):
+        return None
+    return verdict
+
+
+def _record_moe_lora_forward_verdict(experts_module, parameter_name: str, verdict) -> None:
+    """Remember `verdict` for `parameter_name` against the forward currently installed."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    store = _moe_module_dict(experts_module, _MOE_LORA_STASH_VERDICT_ATTR)
+    if store is not None:
+        store[parameter_name] = (_resolve_experts_forward(experts_module), bool(verdict))
+
+
+def _reset_moe_lora_stash_read(experts_module, parameter_name: str) -> None:
+    """Clear the read record for `parameter_name` before calling the experts forward."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    store = _moe_module_dict(experts_module, _MOE_LORA_STASH_READ_ATTR)
+    if store is not None:
+        store[parameter_name] = False
+
+
+def _moe_lora_stash_was_read(experts_module, parameter_name: str) -> bool:
+    """Whether the experts forward read `parameter_name`'s stash since the last reset."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        store = experts_module.__dict__.get(_MOE_LORA_STASH_READ_ATTR)
+    except AttributeError:
+        return False
+    return bool(store and store.get(parameter_name))
+
+
+_MOE_LORA_STASH_UNREAD_LOGGED = set()
+
+
+def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None:
+    """One message per experts class and parameter, the first time the stash goes unread."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    key = (type(experts_module).__name__, parameter_name)
+    if key in _MOE_LORA_STASH_UNREAD_LOGGED:
+        return
+    _MOE_LORA_STASH_UNREAD_LOGGED.add(key)
+    _log_info(
+        f"Unsloth: {key[0]}.forward does not apply Unsloth's separated expert LoRA for "
+        f"{parameter_name}, so the {parameter_name} adapter is applied through PEFT's "
+        "parameter path instead."
+    )
+
+
+
 # Store original ParamWrapper.forward for fallback
 _original_param_wrapper_forward = None
 
@@ -1479,22 +1652,42 @@ def _patched_param_wrapper_forward(
                 if hasattr(p, "shape") and len(p.shape) >= 1:
                     self.num_experts = p.shape[0]
 
+        # An experts forward that does not read the stash never sees this LoRA, so hand the
+        # wrapper back to PEFT, which folds the delta into the weight instead. Checked before
+        # the call so only the very first call on an experts module pays for measuring it.
+        applies_stash = moe_lora_forward_applies_stash(experts_module, param_name)
+        if applies_stash is False and _original_param_wrapper_forward is not None:
+            return _original_param_wrapper_forward(self, x, *args, **kwargs)
+
         # Extract LoRA for this parameter and stash on the experts module
         # (not base_layer): _unsloth_lora_gate_up_proj / _unsloth_lora_down_proj.
         lora_data = _extract_lora_from_wrapper(self)
 
         if lora_data is not None and param_name:
-            lora_attr = f"_unsloth_lora_{param_name}"
+            lora_attr = moe_lora_stash_name(param_name)
             setattr(experts_module, lora_attr, lora_data)
+
+        if applies_stash is None:
+            _reset_moe_lora_stash_read(experts_module, param_name)
 
         try:
             # Immediate base_layer preserves the wrapper chain.
             result = immediate_base_layer(x, *args, **kwargs)
         finally:
             if param_name:
-                lora_attr = f"_unsloth_lora_{param_name}"
+                lora_attr = moe_lora_stash_name(param_name)
                 if hasattr(experts_module, lora_attr):
                     delattr(experts_module, lora_attr)
+
+        if applies_stash is None:
+            was_read = _moe_lora_stash_was_read(experts_module, param_name)
+            _record_moe_lora_forward_verdict(experts_module, param_name, was_read)
+            if not was_read:
+                # This result has no expert LoRA in it. Redo the call PEFT's way and return
+                # that; the verdict just recorded keeps every later call on the short path.
+                _log_moe_lora_stash_unread_once(experts_module, param_name)
+                if _original_param_wrapper_forward is not None:
+                    return _original_param_wrapper_forward(self, x, *args, **kwargs)
 
         return result
 
@@ -1639,8 +1832,9 @@ def forward_native_grouped_mm(
     gate_up_lora = None
 
     # Prefer LoRA injected by the patched ParamWrapper; fall back to the parameter.
-    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
-        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]  # (first, second, scaling)
+    _stashed_gate_up_lora = take_moe_lora_stash(self, "gate_up_proj")
+    if _stashed_gate_up_lora is not None:
+        gate_up_lora = _stashed_gate_up_lora[:3]  # (first, second, scaling)
     elif (
         use_separated_lora
         and hasattr(self, "gate_up_proj")
@@ -1814,8 +2008,9 @@ def forward_native_grouped_mm(
     down_lora = None
 
     # Prefer LoRA injected by the patched ParamWrapper; fall back to the parameter.
-    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
-        down_lora = self._unsloth_lora_down_proj[:3]  # (first, second, scaling)
+    _stashed_down_lora = take_moe_lora_stash(self, "down_proj")
+    if _stashed_down_lora is not None:
+        down_lora = _stashed_down_lora[:3]  # (first, second, scaling)
     elif (
         use_separated_lora
         and hasattr(self, "down_proj")
@@ -1927,8 +2122,9 @@ def forward_triton_grouped_gemm(
 
     # gate_up LoRA from the patched ParamWrapper (mirrors the down block below).
     gate_up_lora = None
-    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
-        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]
+    _stashed_gate_up_lora = take_moe_lora_stash(self, "gate_up_proj")
+    if _stashed_gate_up_lora is not None:
+        gate_up_lora = _stashed_gate_up_lora[:3]
     elif (
         use_separated_lora
         and hasattr(self, "gate_up_proj")
@@ -2035,8 +2231,9 @@ def forward_triton_grouped_gemm(
 
     # Grouped GEMM 2: down projection.
     down_lora = None
-    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
-        down_lora = self._unsloth_lora_down_proj[:3]
+    _stashed_down_lora = take_moe_lora_stash(self, "down_proj")
+    if _stashed_down_lora is not None:
+        down_lora = _stashed_down_lora[:3]
     elif (
         use_separated_lora
         and hasattr(self, "down_proj")
@@ -2117,7 +2314,7 @@ def forward_native_moe_loop(
     final_hidden_states = torch.zeros_like(hidden_states)
     use_separated_lora = _should_use_separated_lora()
 
-    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None)
+    gate_up_lora = take_moe_lora_stash(self, "gate_up_proj")
     if gate_up_lora is not None:
         gate_up_lora = gate_up_lora[:3]
     elif (
@@ -2138,7 +2335,7 @@ def forward_native_moe_loop(
             _gate_up_scaling,
         )
 
-    down_lora = getattr(self, "_unsloth_lora_down_proj", None)
+    down_lora = take_moe_lora_stash(self, "down_proj")
     if down_lora is not None:
         down_lora = down_lora[:3]
     elif (

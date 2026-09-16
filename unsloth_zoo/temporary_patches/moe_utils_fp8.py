@@ -498,7 +498,7 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    from .moe_utils import _should_use_separated_lora
+    from .moe_utils import _should_use_separated_lora, take_moe_lora_stash
     use_separated_lora = _should_use_separated_lora()
     model_type = getattr(self, "_unsloth_model_type", None)
 
@@ -521,7 +521,7 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         use_fast_accum=True,
     )
 
-    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None) if use_separated_lora else None
+    gate_up_lora = take_moe_lora_stash(self, "gate_up_proj") if use_separated_lora else None
     gate_up_delta = _moe_separated_lora_delta(gate_up_lora, permuted_input, offsets, mm1_out.dtype)
     if gate_up_delta is not None:
         mm1_out = mm1_out + gate_up_delta
@@ -552,7 +552,7 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         use_fast_accum=True,
     )
 
-    down_lora = getattr(self, "_unsloth_lora_down_proj", None) if use_separated_lora else None
+    down_lora = take_moe_lora_stash(self, "down_proj") if use_separated_lora else None
     down_delta = _moe_separated_lora_delta(down_lora, inter, offsets, mm2_out.dtype)
     if down_delta is not None:
         mm2_out = mm2_out + down_delta
@@ -634,10 +634,13 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     # attributes that `patch_param_wrapper_for_moe` injects, so reaching this
     # path while LoRA is active would silently train without the adapter.
     # Refuse rather than corrupt: the user can disable LoRA or fix the
-    # missing kernel before retrying.
+    # missing kernel before retrying. The reads are recorded so the refusal stays in charge:
+    # `_patched_param_wrapper_forward` must not reroute a quantized parameter through PEFT
+    # on the grounds that this path ignored the stash.
+    from .moe_utils import take_moe_lora_stash
     if (
-        getattr(self, "_unsloth_lora_gate_up_proj", None) is not None
-        or getattr(self, "_unsloth_lora_down_proj", None) is not None
+        take_moe_lora_stash(self, "gate_up_proj") is not None
+        or take_moe_lora_stash(self, "down_proj") is not None
     ):
         raise RuntimeError(
             "Unsloth: MoE FP8 fell through to the per-expert fp8_linear "
