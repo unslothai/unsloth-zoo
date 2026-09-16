@@ -523,14 +523,19 @@ def test_a_punycoded_hostname_is_still_pinned(server, resolver, connects):
     """requests punycodes a non-ASCII host before it builds the connection, so a
     pin held only under the unicode spelling would never match and the fetch
     would resolve the name for itself again. One accented letter in a dataset
-    row must not be a way back to the old behaviour."""
+    row must not be a way back to the old behaviour.
+
+    The two spellings are answered differently here, which is the whole hazard:
+    the guard has to resolve the one that will be dialled. It refuses this URL
+    outright rather than pinning the unicode answer, because the spelling
+    requests sends is the loopback one.
+    """
     port = server.server_address[1]
     resolver.answers("rébind.invalid", PUBLIC_IP)
     resolver.answers("xn--rbind-bsa.invalid", "127.0.0.1")
 
-    assert vision_utils._check_fetchable_url(f"http://rébind.invalid:{port}/x.png") == (
-        ("rébind.invalid", "xn--rbind-bsa.invalid"), (PUBLIC_IP,)
-    )
+    with pytest.raises(ValueError, match = "loopback, private, link-local"):
+        vision_utils._check_fetchable_url(f"http://rébind.invalid:{port}/x.png")
 
     with pytest.raises(Exception):
         vision_utils.fetch_image({"image": f"http://rébind.invalid:{port}/x.png"})

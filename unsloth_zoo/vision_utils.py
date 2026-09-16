@@ -250,23 +250,42 @@ def _host_forms(host: str) -> tuple:
     """
     # urllib3 1.x hands the connection an IPv6 literal still in its brackets
     # while 2.x strips them, and a pin has to match either spelling.
-    host = host.rstrip(".").strip("[]").lower()
-    forms = [host]
-    encoders = []
+    host = _normalize_host(host)
+    wire = _wire_host(host)
+    return (host,) if wire == host else (host, wire)
+
+
+def _normalize_host(host: str) -> str:
+    # urllib3 1.x hands the connection an IPv6 literal still in its brackets
+    # while 2.x strips them, and a pin has to match either spelling.
+    return host.rstrip(".").strip("[]").lower()
+
+
+def _wire_host(host: str) -> str:
+    """The spelling requests will actually put on the connection.
+
+    This is the one that must be resolved, not the unicode spelling. The two are
+    not always the same domain: socket.getaddrinfo applies Python's builtin IDNA,
+    which maps `fass.de` onto `fa\u00df.de`, while requests applies UTS-46 and
+    sends `xn--fa-hia.de`. Resolving the unicode form and pinning both spellings
+    let the fetch reach one domain on another domain's checked address.
+    """
     try:
-        import idna
-        # uts46 is how requests itself encodes, see requests.models.prepare_url
-        encoders.append(lambda name: idna.encode(name, uts46 = True).decode("ascii"))
-    except Exception:
+        host.encode("ascii")
+        return host
+    except UnicodeEncodeError:
         pass
-    encoders.append(lambda name: name.encode("idna").decode("ascii"))
-    for encode in encoders:
+    try:
+        # uts46 is how requests itself encodes, see requests.models.prepare_url.
+        import idna
+        return idna.encode(host, uts46 = True).decode("ascii").lower()
+    except Exception:
+        # Without the idna package requests falls back to the builtin encoding,
+        # so matching it here keeps the pin on whatever it will send.
         try:
-            encoded = encode(host).lower()
+            return host.encode("idna").decode("ascii").lower()
         except Exception:
-            continue
-        if encoded and encoded not in forms: forms.append(encoded)
-    return tuple(forms)
+            return host
 
 
 def _check_fetchable_url(url: str):
@@ -308,7 +327,8 @@ def _check_fetchable_url(url: str):
     # Resolve exactly once and hand the answer back to the caller: resolving again
     # for the connection is the whole DNS rebinding hole, see _PinnedConnectionMixin.
     blocked_name = _is_blocked_hostname(host)
-    addresses = None if blocked_name else _resolve_host(host)
+    # Resolve the spelling that will be dialled, not the one that was typed.
+    addresses = None if blocked_name else _resolve_host(_wire_host(_normalize_host(host)))
     if blocked_name or _is_blocked_resolution(addresses):
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{host}` since it resolves to a "
