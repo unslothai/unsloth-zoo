@@ -309,6 +309,24 @@ def get_model(model):
 pass
 
 
+def _execution_device_for_meta_layer(module):
+    """Where accelerate will actually run a layer whose weights are still on meta.
+
+    `module._hf_hook.execution_device` is accelerate's own answer to that question and is
+    what it sends the layer's inputs to. It is typed `int | str | torch.device | None` and
+    accelerate itself checks for a literal "meta" there while a model is being built, so
+    every one of those shapes is handled and only a real device is returned.
+    """
+    execution_device = getattr(getattr(module, "_hf_hook", None), "execution_device", None)
+    if execution_device is None:
+        return None
+    try:
+        device = torch.device(execution_device)
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    return None if device.type == "meta" else device
+
+
 def verify_and_set_device(module,):
     """
     Verify that all parameters of a module are on the same device, and record that
@@ -329,11 +347,30 @@ def verify_and_set_device(module,):
     index, publish the device type instead: `move_to_device` accepts it as a
     string and it resolves to the layer's own device, where the obvious `or 0`
     would silently resolve to cuda:0 and move the activations off the layer.
+
+    meta is the one placement that is never published. It satisfies every type check
+    the readers make and is still not somewhere an activation may go: `tensor.to("meta")`
+    succeeds and discards the data, and `torch.matmul(meta, cuda)` returns a meta tensor
+    rather than raising, so a whole decode would run and produce nothing. accelerate
+    already answers this properly -- its `AlignDevicesHook` moves the layer's own inputs
+    with `send_to_device(args, self.execution_device)` in `pre_forward` -- so for a layer
+    parked on meta the hook's execution device is published instead. With no hook to ask,
+    nothing is published at all, which leaves each reader on its historical
+    `getattr(layer, ..., 0)` default rather than on a target that destroys the tensor.
     """
     set_of_devices = set(x.device for x in module.parameters())
     if len(set_of_devices) > 1:
         raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
     device = set_of_devices.pop()
+    if device.type == "meta":
+        device = _execution_device_for_meta_layer(module)
+        if device is None:
+            # Publish nothing rather than meta. Clear a stale pair from an earlier call
+            # too, so a layer that was materialised and then moved back cannot leave a
+            # device behind that no longer describes it.
+            for name in ("_per_layer_device", "_per_layer_device_index"):
+                module.__dict__.pop(name, None)
+            return
     module._per_layer_device = device
     module._per_layer_device_index = (
         device.index if device.index is not None else device.type

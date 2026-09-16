@@ -61,7 +61,6 @@ CASES = {
     "cuda zero": ("cuda:0", 0),
     "xpu indexed": ("xpu:1", 1),
     "cpu offloaded": ("cpu", "cpu"),
-    "meta not materialised": ("meta", "meta"),
 }
 
 
@@ -134,3 +133,74 @@ def test_real_module_on_cuda():
 
     assert layer._per_layer_device.type == "cuda"
     assert layer._per_layer_device_index == torch.cuda.current_device()
+
+
+
+def test_a_meta_layer_publishes_nothing_rather_than_meta():
+    """meta satisfies every type check the readers make and is still fatal.
+
+    `tensor.to("meta")` succeeds and discards the data, and mixing the result with a real
+    tensor propagates meta instead of raising, so publishing meta would turn the #3538
+    ValueError into a decode that runs to completion and returns nothing. With no
+    accelerate hook to ask, the attributes are left unset and each reader keeps its
+    historical `getattr(layer, ..., 0)` default.
+    """
+    activation = torch.ones(2, 4)
+    assert activation.to("meta").device.type == "meta"
+    assert torch.matmul(activation.to("meta"), torch.ones(4, 4)).device.type == "meta"
+
+    layer = _FakeLayer("meta")
+    verify_and_set_device(layer)
+
+    assert not hasattr(layer, "_per_layer_device")
+    assert not hasattr(layer, "_per_layer_device_index")
+
+
+def test_a_meta_layer_publishes_the_accelerate_execution_device():
+    """accelerate's AlignDevicesHook sends the layer's own inputs to `execution_device`
+    in pre_forward, so that is where this layer's activations belong."""
+    layer = _FakeLayer("meta")
+    layer._hf_hook = SimpleNamespace(execution_device = "cpu")
+    verify_and_set_device(layer)
+
+    assert layer._per_layer_device == torch.device("cpu")
+    assert layer._per_layer_device_index == "cpu"
+
+    layer = _FakeLayer("meta")
+    layer._hf_hook = SimpleNamespace(execution_device = 2)
+    verify_and_set_device(layer)
+
+    assert layer._per_layer_device == torch.device(2)
+    assert layer._per_layer_device_index == 2
+
+
+@pytest.mark.parametrize("execution_device", [None, "meta", "not-a-device", object()])
+def test_a_hook_that_cannot_name_a_device_publishes_nothing(execution_device):
+    """accelerate sets execution_device to meta while a model is still being built and
+    the field is optional, so neither is an answer."""
+    layer = _FakeLayer("meta")
+    layer._hf_hook = SimpleNamespace(execution_device = execution_device)
+    verify_and_set_device(layer)
+
+    assert not hasattr(layer, "_per_layer_device")
+
+
+def test_a_stale_pair_is_cleared_when_the_layer_goes_back_to_meta():
+    """A layer materialised and then released must not keep describing where it was."""
+    layer = _FakeLayer("cpu")
+    verify_and_set_device(layer)
+    assert layer._per_layer_device == torch.device("cpu")
+
+    layer._devices = ("meta",)
+    verify_and_set_device(layer)
+    assert not hasattr(layer, "_per_layer_device")
+    assert not hasattr(layer, "_per_layer_device_index")
+
+
+def test_the_non_meta_placements_are_untouched():
+    """The control: nothing above may change an ordinary layer."""
+    for device_string, expected in (("cuda:3", 3), ("cpu", "cpu"), ("xpu:1", 1)):
+        layer = _FakeLayer(device_string)
+        verify_and_set_device(layer)
+        assert layer._per_layer_device == torch.device(device_string)
+        assert layer._per_layer_device_index == expected
