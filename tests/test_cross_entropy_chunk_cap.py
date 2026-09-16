@@ -114,6 +114,92 @@ def test_cap_bounds_target_independent_of_free(monkeypatch):
     assert m_120 == pytest.approx(m_320), (m_120, m_320)
 
 
+def _no_device_pool(monkeypatch, device_type):
+    """The module with no free-memory figure available, as on CPU, MLX or a CUDA-less torch.
+
+    Only `mem_get_info` is replaced, not the whole `torch.cuda` namespace: `torch.manual_seed`
+    reaches `torch.cuda._is_in_bad_fork`, so a stand-in namespace breaks seeding rather than
+    the thing under test.
+    """
+    ce = importlib.import_module("unsloth_zoo.fused_losses.cross_entropy_loss")
+    monkeypatch.setattr(ce, "DEVICE_TYPE", device_type, raising = False)
+
+    def refuse(index = 0):
+        raise AssertionError("Torch not compiled with CUDA enabled")
+
+    for namespace in ("cuda", "xpu"):
+        target = getattr(ce.torch, namespace, None)
+        if target is not None:
+            monkeypatch.setattr(target, "mem_get_info", refuse, raising = False)
+    ce._get_chunk_multiplier.cache_clear()
+    return ce
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "mlx", "cuda"])
+def test_a_machine_with_no_gpu_still_gets_a_chunk_size(monkeypatch, device_type):
+    """`mem_get_info` does not return a number on a torch built without CUDA, it raises.
+
+    Reached through the ordinary forward, so a CPU or Apple Silicon run died inside a memory
+    query rather than on anything it was computing. "cuda" is in the list because a device
+    type naming a GPU on a torch that has none is the same situation.
+    """
+    ce = _no_device_pool(monkeypatch, device_type)
+    assert ce._free_target_gb() == ce._CE_TARGET_GB_CAP
+    assert ce.get_chunk_size(1, 8, 32_000) >= 1
+
+
+def test_the_no_gpu_budget_matches_what_a_large_gpu_lands_on(monkeypatch):
+    """Not a number invented for CPU: the same cap any device with 8 GiB free reaches."""
+    ce = _load_module(monkeypatch, 180 * 1024 ** 3)
+    with_gpu = ce._get_chunk_multiplier(256_000)
+    ce = _no_device_pool(monkeypatch, "cpu")
+    without = ce._get_chunk_multiplier(256_000)
+    assert with_gpu == pytest.approx(without), (with_gpu, without)
+
+
+def test_a_gpu_that_answers_is_still_measured_not_capped_blindly(monkeypatch):
+    """The fallback must not swallow the real query: a small pool still sizes smaller chunks."""
+    ce = _load_module(monkeypatch, 2 * 1024 ** 3)  # 2 GiB free -> 1 GiB target, under the cap
+    assert ce._free_target_gb() == pytest.approx(1.0)
+    assert ce._free_target_gb() < ce._CE_TARGET_GB_CAP
+
+
+def test_the_fused_loss_runs_on_cpu_and_matches_plain_cross_entropy(monkeypatch):
+    """End to end past the memory query, because a number is not the point: the loss is.
+
+    The kernel is ordinary torch, so it computes on CPU once nothing asks a GPU how much
+    memory it has. Checked against `F.cross_entropy` over the same shift, so a fallback that
+    let it run but produced a different loss would fail here rather than pass quietly.
+    """
+    torch = pytest.importorskip("torch")
+    ce = _no_device_pool(monkeypatch, "cpu")
+
+    torch.manual_seed(0)
+    hidden_size, vocab_size, bsz, qlen = 16, 64, 2, 6
+    hidden = torch.randn(bsz, qlen, hidden_size, dtype = torch.float32, requires_grad = True)
+    weight = torch.randn(vocab_size, hidden_size, dtype = torch.float32, requires_grad = True)
+    labels = torch.randint(0, vocab_size, (bsz, qlen))
+
+    loss = ce.unsloth_fused_ce_loss(
+        trainer = None,
+        hidden_states = hidden,
+        lm_head_weight = weight,
+        lm_head_bias = None,
+        labels = labels,
+        n_items = None,
+        shift_labels = True,
+    )
+    assert torch.isfinite(loss), loss
+    loss.backward()
+    assert torch.isfinite(hidden.grad).all() and torch.isfinite(weight.grad).all()
+
+    logits = (hidden.detach() @ weight.detach().T).float()
+    reference = torch.nn.functional.cross_entropy(
+        logits[:, :-1].reshape(-1, vocab_size), labels[:, 1:].reshape(-1)
+    )
+    assert torch.allclose(loss.detach(), reference, atol = 1e-4), (loss, reference)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

@@ -141,17 +141,43 @@ pass
 # 4 counted the logits alone.
 _CE_BYTES_PER_LOGIT = 16.0
 
+# What to size the chunk against when there is no device pool to ask. This is the value the
+# GPU path already lands on for any device with 8 GB or more free, so a machine without one
+# behaves like the common GPU case rather than under a number invented for it.
+_CE_TARGET_GB_CAP = 4.0
+
+
+def _free_target_gb():
+    """Half the free device memory, capped, or the cap where nothing can be asked.
+
+    `DEVICE_TYPE` is legitimately "cpu" or "mlx", and torch itself may be built without CUDA,
+    in which case `mem_get_info` does not return a number: it raises "Torch not compiled with
+    CUDA enabled". Reached through the ordinary forward, so a CPU or Apple Silicon run died on
+    a memory query rather than on anything it was computing. Chunking is still wanted there,
+    since the transient it bounds is float32 logits and host RAM is finite too.
+    """
+
+    try:
+        if DEVICE_TYPE == "xpu":
+            free, _total = torch.xpu.mem_get_info(0)
+        elif DEVICE_TYPE in ("cpu", "mlx"):
+            return _CE_TARGET_GB_CAP
+        else:
+            free, _total = torch.cuda.mem_get_info(0)
+    except Exception:
+        # A device type that claims a GPU on a torch that has none, and any other refusal to
+        # answer. No free-memory figure is not a reason to fail a loss that can be computed.
+        return _CE_TARGET_GB_CAP
+    # Cap per-chunk target: on very large GPUs half the free pool rounds to a
+    # single chunk, materializing full float32 logits and dominating peak memory.
+    return min(free / 1024 / 1024 / 1024 * 0.5, _CE_TARGET_GB_CAP)
+
+
 @functools.cache
 def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Find current VRAM left in the GPU, and use 50% or less of it
-        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
-        free_gb = free / 1024 / 1024 / 1024
-        free_gb = free_gb * 0.5
-        # Cap per-chunk target: on very large GPUs half the free pool rounds to a
-        # single chunk, materializing full float32 logits and dominating peak memory.
-        target_gb = min(free_gb, 4.0)
+        target_gb = _free_target_gb()
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
