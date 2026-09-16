@@ -1862,6 +1862,70 @@ def _qwen_already_handles_expert_aliases(conv_qwen_path):
 pass
 
 
+# Enough to cover the package a converter imports without walking a tree an
+# attacker chooses the size of.
+MAX_CONVERSION_PACKAGE_FILES = 64
+
+
+def _scan_conversion_package(llama_cpp_dir):
+    """Scan the conversion/ package beside an unverified converter.
+
+    Same warn-or-raise contract as the entrypoint: these files are imported and
+    executed by it, so leaving them unscanned let a clean entrypoint front a
+    payload in conversion/__init__.py.
+    """
+    if not llama_cpp_dir:
+        return
+    conversion_dir = os.path.join(llama_cpp_dir, "conversion")
+    if not os.path.isdir(conversion_dir):
+        return
+    try:
+        names = sorted(
+            name for name in os.listdir(conversion_dir) if name.endswith(".py")
+        )[:MAX_CONVERSION_PACKAGE_FILES]
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(conversion_dir, name)
+        try:
+            with open(path, "rb") as handle:
+                content = handle.read()
+        except OSError:
+            continue
+        warn_on_suspicious_converter(
+            content, path, is_local_copy = False, log = logger,
+        )
+
+
+def _converter_is_trusted_local(script_path):
+    """Whether a local converter was pinned deliberately or verified on arrival.
+
+    The strict-mode exemption means "you chose this file", so it cannot cover
+    every local path. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is an explicit pin, and a
+    prebuilt bundle carries UNSLOTH_PREBUILT_INFO.json, written only after that
+    asset's sha256 was checked. When no prebuilt is available install_llama_cpp
+    falls back to an unpinned `git clone` of upstream master, which leaves
+    neither, and _resolve_bundle_convert_script accepts that checkout on the
+    strength of a conversion/ package alone. A converter fetched automatically
+    from upstream is not a converter the user pinned, so it gets no exemption.
+    """
+    if not script_path:
+        return False
+    script_path = os.path.abspath(script_path)
+    scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+    if scripts_dir:
+        scripts_dir = os.path.abspath(scripts_dir)
+        try:
+            if os.path.commonpath([scripts_dir, script_path]) == scripts_dir:
+                return True
+        except ValueError:
+            pass
+    marker = os.path.join(
+        os.path.dirname(script_path), UNSLOTH_PREBUILT_INFO_FILENAME,
+    )
+    return os.path.isfile(marker)
+
+
 def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # Resolve env vars + sibling mtimes each call; both feed the @lru_cache key
     # so re-pulled checkouts re-run the patcher. Anchor conversion/ to the
@@ -1954,12 +2018,20 @@ def _download_convert_hf_to_gguf_cached(
         # by default (see converter_scan for why it does not block), and raises
         # ConverterScanError only under UNSLOTH_CONVERTER_SCAN_STRICT=1 on
         # downloaded bytes.
+        _trusted_local = _converter_is_trusted_local(_local_script)
         warn_on_suspicious_converter(
             original_content,
             _local_script if _local_script is not None else LLAMA_CPP_CONVERT_FILE,
-            is_local_copy = _local_script is not None,
+            is_local_copy = _trusted_local,
             log = logger,
         )
+        # The package entrypoint runs `from conversion import ...` on import, so
+        # those files execute too. When they came from a verified bundle they are
+        # covered by that asset's sha256; from an unpinned `git clone` they are
+        # not, and a payload can sit in conversion/__init__.py behind a clean
+        # entrypoint.
+        if not _trusted_local:
+            _scan_conversion_package(_llama_cpp_dir)
 
         # 2. Detect layout BEFORE importing: the package entrypoint does
         # `from conversion import ...`, which a temp-file import resolves

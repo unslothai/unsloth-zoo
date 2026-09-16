@@ -612,7 +612,10 @@ def test_export_scans_before_writing_the_patched_script(llama_cpp, tmp_path, mon
     )
     assert seen["content"] == _MINIMAL_CONVERTER, "scan saw patched or truncated bytes"
     assert seen["patched_exists"] is False, "patched script existed before the scan ran"
-    assert seen["is_local_copy"] is True
+    # A converter sitting in the llama.cpp directory with no prebuilt marker and
+    # no UNSLOTH_LLAMA_CPP_SCRIPTS_DIR pin is not one the user chose, so it does
+    # not get the strict-mode exemption. See the trusted-local tests below.
+    assert seen["is_local_copy"] is False
     assert seen["source"].endswith("convert_hf_to_gguf.py")
     assert os.path.isfile(patched)
 
@@ -725,3 +728,39 @@ def test_export_warns_but_completes_on_a_flagged_local_converter(
     assert "suspicious pattern" in caplog.text
     assert "Reverse shell" in caplog.text
     assert os.path.isfile(patched), "a warning must not block the export"
+
+
+def test_only_a_pinned_or_verified_converter_is_exempt_from_strict_mode(tmp_path, monkeypatch):
+    """The exemption means "you chose this file", not "this file is on disk".
+
+    When no prebuilt is available install_llama_cpp falls back to an unpinned
+    git clone of upstream master, and _resolve_bundle_convert_script accepts that
+    checkout on the strength of a conversion/ package alone. Treating it as a
+    local copy let a suspicious converter fetched automatically from upstream be
+    warned about but never refused, even under strict mode.
+    """
+    llama_cpp = _load("llama_cpp_trust_probe", "unsloth_zoo/llama_cpp.py")
+
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    script = clone / "convert_hf_to_gguf.py"
+    script.write_text("# converter\n")
+
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+    assert llama_cpp._converter_is_trusted_local(str(script)) is False, (
+        "a bare checkout must not be exempt"
+    )
+
+    marker = clone / llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME
+    marker.write_text("{}")
+    assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
+        "a prebuilt bundle is sha256 verified on arrival"
+    )
+    marker.unlink()
+
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(clone))
+    assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
+        "an explicit pin is a deliberate user choice"
+    )
+
+    assert llama_cpp._converter_is_trusted_local(None) is False
