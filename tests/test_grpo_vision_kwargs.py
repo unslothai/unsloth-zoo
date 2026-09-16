@@ -600,3 +600,51 @@ def test_a_companion_that_shares_the_chunker_keeps_the_pixels(monkeypatch, tmp_p
     assert shared["pixel_values"] == "PIXELS"
     assert shared["spatial_shapes"] == "SHAPES"
     assert shared["num_tiles"] == "TILES"
+
+
+def test_a_padded_image_tensor_stays_on_the_sample_axis():
+    """SmolVLM and Idefics pad to the widest sample instead of flattening by image.
+
+    `num_images = [2, 0]` over two samples makes the two readings numerically identical --
+    two image rows, two samples -- and the length comparison alone then sliced a padded
+    tensor by image: with one sample per chunk both of the first sample's rows went to the
+    first chunk and an empty tensor to the second, which is a batch-shape failure at best and
+    pixels attached to the wrong sample at worst. The layouts differ in RANK, which is what
+    the counts cannot express.
+    """
+    padded = torch.arange(2 * 2 * 3 * 4 * 4).reshape(2, 2, 3, 4, 4)
+    sizes = torch.arange(2 * 2 * 2).reshape(2, 2, 2)
+    chunks = grpo_vision_chunks(
+        {
+            "pixel_values": padded,
+            "image_sizes": sizes,
+            "num_images": [2, 0],
+        },
+        2,
+        1,
+    )
+    assert len(chunks) == 2
+    assert torch.equal(chunks[0]["pixel_values"], padded[0:1])
+    assert torch.equal(chunks[1]["pixel_values"], padded[1:2])
+    assert torch.equal(chunks[0]["image_sizes"], sizes[0:1])
+    assert torch.equal(chunks[1]["image_sizes"], sizes[1:2])
+
+
+def test_a_flattened_image_tensor_is_still_sliced_by_image():
+    """The control. One row per image, [N, C, H, W], with the same counts: here the image
+    axis really is the first one, and slicing by sample would hand the second sample rows
+    that belong to the first."""
+    flat = torch.arange(2 * 3 * 4 * 4).reshape(2, 3, 4, 4)
+    sizes = torch.arange(2 * 2).reshape(2, 2)
+    chunks = grpo_vision_chunks(
+        {
+            "pixel_values": flat,
+            "image_sizes": sizes,
+            "num_images": [2, 0],
+        },
+        2,
+        1,
+    )
+    assert torch.equal(chunks[0]["pixel_values"], flat[0:2])
+    assert chunks[1]["pixel_values"].shape[0] == 0
+    assert torch.equal(chunks[0]["image_sizes"], sizes[0:2])

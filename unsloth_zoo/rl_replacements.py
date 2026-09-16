@@ -1138,12 +1138,34 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         ).cpu()
 
     total_images = None if num_images is None else sum(num_images)
-    _image_sizes_n = _first_dim_len(image_sizes)
+
+    def _row_axis_is_images(value, flat_ndim):
+        """Whether this tensor's first dimension counts IMAGES rather than samples.
+
+        Equal lengths are not enough on their own. A model that pads its image tensors to the
+        widest sample -- SmolVLM, Idefics -- keeps the sample axis first, and a batch whose
+        image counts happen to sum to the number of samples (``num_images = [2, 0]`` over two
+        samples) makes the two readings numerically identical. Slicing such a batch by image
+        sends both of the first sample's rows to one chunk and an empty tensor to the next.
+
+        The layouts differ in RANK, which the counts cannot express: the padded one carries an
+        explicit per-sample image axis (``[B, max_images, C, H, W]`` for pixels,
+        ``[B, max_images, 2]`` for image sizes), one dimension more than the flattened form
+        this branch is for.
+        """
+        if value is None or total_images is None:
+            return False
+        if _first_dim_len(value) != total_images:
+            return False
+        ndim = getattr(value, "ndim", None)
+        if isinstance(ndim, int) and ndim > flat_ndim:
+            return False
+        return True
 
     def _image_sizes_slice(start, end, img_start, img_end):
         if image_sizes is None:
             return None
-        if img_start is not None and _image_sizes_n == total_images:
+        if img_start is not None and _row_axis_is_images(image_sizes, 2):
             return image_sizes[img_start:img_end]
         return image_sizes[start:end]
 
@@ -1237,7 +1259,10 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
         else:
-            if img_start is not None and _first_dim_len(pixel_values) == total_images:
+            # Not a bare length comparison: see _row_axis_is_images. A flattened image tensor
+            # is one row per image, [N, C, H, W]; a padded one keeps the sample axis in front
+            # of it and must be sliced by sample like everything else in this chunk.
+            if img_start is not None and _row_axis_is_images(pixel_values, 4):
                 chunk["pixel_values"] = pixel_values[img_start:img_end]
             else:
                 chunk["pixel_values"] = pixel_values[start:end]
