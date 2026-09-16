@@ -1873,7 +1873,7 @@ _NUM_EXPERTS_PATTERN = re.compile(
 )
 
 
-def _patch_num_experts(content):
+def _patch_num_experts(content, eol_fallback = None):
     """Rewrite `n_experts = self.hparams["num_experts"]` to also accept
     num_local_experts, preserving whatever indentation the converter uses.
 
@@ -1881,11 +1881,18 @@ def _patch_num_experts(content):
     replacement has to reuse the captured indent instead of hardcoding one,
     and it reuses the captured line ending so a CRLF checkout stays CRLF.
     Returns (new_content, applied)."""
+    # A converter whose last line IS the match carries no terminator to reuse, and a bare
+    # LF there leaves a CRLF checkout with mixed endings: the file still parses, but the
+    # guarantee this function makes about line endings stops holding on exactly the file
+    # that is hardest to notice it on. The file's own dominant ending is what the rest of
+    # it uses, so it is the right thing to inherit.
+    fallback = eol_fallback or _dominant_newline(content)
+
     def _replace(match):
         indent, trailer, newline = match.group(1), match.group(3), match.group(4)
         # A match on the last line of a file with no trailing newline still needs
         # one between the comment and the statement.
-        eol = newline or b"\n"
+        eol = newline or fallback
         # `trailer` is the trailing spaces or inline comment that followed the
         # statement. The old unanchored regex left it in place, so keep it: a
         # checkout that carries one still gets patched instead of silently not.

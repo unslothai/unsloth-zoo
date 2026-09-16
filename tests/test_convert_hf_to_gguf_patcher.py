@@ -1061,3 +1061,45 @@ def test_a_converter_with_nothing_new_is_still_byte_identical(tmp_path, monkeypa
     once, _ = _drive_patcher(llama_cpp, first, monkeypatch, _monolith_with_num_experts(12))
     twice, _ = _drive_patcher(llama_cpp, second, monkeypatch, once)
     assert twice == once
+
+
+def test_an_unterminated_final_target_keeps_the_files_line_ending():
+    """A converter whose LAST line is the match carries no terminator to reuse.
+
+    `\\n` as the fallback leaves a CRLF checkout with mixed endings. It still parses, which
+    is why it is easy to miss, but the line-ending guarantee this patch makes stops holding
+    on exactly the file that is hardest to notice it on, and a Windows diff shows the seam.
+    The file's own dominant ending is what the rest of it uses.
+    """
+    llama_cpp = _load_llama_cpp_module()
+    crlf = (
+        b"class M:\r\n"
+        b"    def modify_tensors(self):\r\n"
+        b"        n_experts = self.hparams[\"num_experts\"]"
+    )
+    patched, applied = llama_cpp._patch_num_experts(crlf)
+    assert applied is True
+    assert b"num_local_experts" in patched
+    # Every ending in the result is CRLF: no bare LF anywhere.
+    assert patched.replace(b"\r\n", b"") .count(b"\n") == 0, patched
+
+    # And an LF file is untouched by the change: its dominant ending is LF.
+    lf = crlf.replace(b"\r\n", b"\n")
+    patched_lf, applied_lf = llama_cpp._patch_num_experts(lf)
+    assert applied_lf is True
+    assert b"\r" not in patched_lf, patched_lf
+
+
+def test_a_terminated_target_still_reuses_its_own_ending():
+    """The fallback must only apply where there is nothing to reuse. A line that HAS a
+    terminator keeps it, even in a file whose dominant ending is the other one."""
+    llama_cpp = _load_llama_cpp_module()
+    mostly_lf = (
+        b"class M:\n"
+        b"    def modify_tensors(self):\n"
+        b"        n_experts = self.hparams[\"num_experts\"]\r\n"
+        b"        return n_experts\n"
+    )
+    patched, applied = llama_cpp._patch_num_experts(mostly_lf)
+    assert applied is True
+    assert b"num_local_experts')\r\n" in patched, patched
