@@ -76,6 +76,81 @@ def _double_buffer_disabled():
     return _any_device_integrated()
 
 
+# Pinned (page-locked) host memory is a separate, much smaller budget than either
+# VRAM or system RAM, and running out of it raises cudaErrorMemoryAllocation, which
+# torch surfaces as a bare "CUDA error: out of memory" with no allocator summary.
+# That is why these reports show a mostly empty GPU: WSL2 caps a process at roughly
+# 1-2GB of pinned memory and refuses single pinned allocations over a few MB
+# (https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications),
+# so offloading an activation that VRAM had plenty of room for still dies.
+# See unslothai/unsloth issues 338, 1552, 1744 and 1797.
+#
+# Pageable host memory works for every one of these copies; it is only slower,
+# because a pageable transfer cannot overlap with compute. Degrading to it beats
+# aborting the run. UNSLOTH_DISABLE_PINNED_MEMORY=1 skips pinning up front.
+PINNED_MEMORY_AVAILABLE = True
+_WARNED_ABOUT_PINNED_MEMORY = False
+
+
+def _pinned_memory_disabled():
+    return os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1"
+
+
+def _is_host_alloc_oom(exception):
+    # torch >= 2.9 raises torch.AcceleratorError, older torch a plain RuntimeError;
+    # both subclass RuntimeError, so the caller catches RuntimeError and we only
+    # have to tell an out-of-memory failure from an unrelated CUDA error here.
+    text = str(exception).lower()
+    return ("out of memory" in text) or ("cudaerrormemoryallocation" in text)
+
+
+def _warn_pinned_unavailable(detail):
+    global PINNED_MEMORY_AVAILABLE, _WARNED_ABOUT_PINNED_MEMORY
+    PINNED_MEMORY_AVAILABLE = False
+    if _WARNED_ABOUT_PINNED_MEMORY: return
+    _WARNED_ABOUT_PINNED_MEMORY = True
+    print(
+        "Unsloth: Could not allocate pinned (page-locked) host memory for gradient "
+        "checkpointing offload, so pageable host memory will be used instead. "
+        "Training continues and results are unchanged, but the offload copies no "
+        "longer overlap with compute, so each step is somewhat slower.\n"
+        f"Unsloth: The allocator reported: {detail}\n"
+        "Unsloth: This is normal under WSL2, which caps pinned memory per process. "
+        "Set UNSLOTH_DISABLE_PINNED_MEMORY=1 to skip pinning from the start."
+    )
+
+
+def _new_host_buffer(numel, dtype):
+    """Host staging buffer, pinned when the platform allows it and pageable when not."""
+    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled()):
+        return torch.empty(numel, dtype = dtype, device = "cpu")
+    try:
+        return torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True)
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e): raise
+        _warn_pinned_unavailable(e)
+        return torch.empty(numel, dtype = dtype, device = "cpu")
+
+
+def _grow_host_buffer(buffer, new_size):
+    """Grow a host staging buffer, returning the buffer to use.
+
+    resize_ reallocates through the tensor's own allocator, so growing a pinned
+    buffer issues a fresh, larger cudaHostAlloc. That is the call that fails once
+    the activation outgrows the platform's per-allocation pinned limit, and it is
+    the exact line the reporters bisected to. On failure, hand back a pageable
+    buffer of the requested size rather than letting the run die.
+    """
+    if new_size <= buffer.numel(): return buffer
+    try:
+        buffer.resize_(new_size)
+        return buffer
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+        _warn_pinned_unavailable(e)
+        return torch.empty(new_size, dtype = buffer.dtype, device = "cpu")
+
+
 @contextmanager
 def _no_inference_mode():
     # Allocate GC buffers outside inference_mode (but in no_grad) so a later
@@ -628,9 +703,13 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
+    # Re-probe pinning on every init: a previous model in the same process may have
+    # tripped the fallback under a load this one never reaches.
+    global PINNED_MEMORY_AVAILABLE
+    PINNED_MEMORY_AVAILABLE = True
     with _no_inference_mode():
-        for i in range(200):
-            x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
+        for i in range(INITIAL_CPU_BUFFER_COUNT):
+            x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
             CPU_BUFFERS.append(x)
     pass
 
@@ -801,13 +880,19 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
-                                x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
+                                x = _new_host_buffer(new_size, arg.dtype)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
                         shape = arg.shape
-                        if new_size > x.numel(): x.resize_(new_size)
+                        if new_size > x.numel():
+                            with _no_inference_mode():
+                                x = _grow_host_buffer(x, new_size)
+                            # Store back: _grow_host_buffer returns a replacement
+                            # buffer when the pinned resize failed, and backward
+                            # reads this slot by index.
+                            CPU_BUFFERS[CPU_INDEX] = x
                         if new_size > GPU_BUFFER.numel():
                             try:
                                 GPU_BUFFER.resize_(new_size)
@@ -845,7 +930,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
-                            x.copy_(arg, non_blocking = True)
+                            # Only a pinned destination can take a genuinely async
+                            # copy; asking for one into pageable memory just hides
+                            # a synchronising transfer behind a misleading flag.
+                            x.copy_(arg, non_blocking = x.is_pinned())
 
                         global NEXT_BUFFER_SLOT
                         buffer_slot = NEXT_BUFFER_SLOT[device_index]
@@ -925,7 +1013,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
             with torch_gpu_stream(EXTRA_STREAM):
-                buffer.copy_(x, non_blocking = True)
+                buffer.copy_(x, non_blocking = x.is_pinned())
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
