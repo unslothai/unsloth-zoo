@@ -1811,7 +1811,20 @@ def _patched_param_wrapper_forward(
         # per experts module and parameter, before the call that counts, so the call that
         # counts always runs exactly one experts forward on the path the verdict names.
         applies_stash = moe_lora_forward_applies_stash(experts_module, param_name)
-        if applies_stash is None:
+        if applies_stash is None and torch.compiler.is_compiling():
+            # First invocation is a compiled one, so there is no verdict and no way to get
+            # one: the probe cannot run inside a captured graph without being captured with
+            # it and re-run on every call. Leaving it inconclusive would take the stash
+            # path, and on a family whose experts forward ignores the stash Dynamo would
+            # then reuse that graph forever with the expert LoRA absent from every output
+            # and gradient. PEFT's own path is the reference implementation and always
+            # applies it, so assume the stash is unread while tracing: below, that hands
+            # the wrapper back to PEFT wherever the parameter can be folded, and a
+            # quantized parameter, which cannot, keeps the stash path exactly as before.
+            # Nothing is recorded, so the first eager call still measures and every later
+            # compile uses the real verdict.
+            applies_stash = False
+        elif applies_stash is None:
             applies_stash = _measure_moe_lora_stash_read(
                 self, experts_module, param_name, x, args, kwargs
             )

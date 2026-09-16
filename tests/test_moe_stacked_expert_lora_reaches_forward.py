@@ -780,3 +780,73 @@ def test_the_rng_guard_is_inert_while_tracing(monkeypatch):
     with MU._preserved_rng_for_probe(torch.ones(2, 2)):
         pass
     assert called["n"] == 1, "the eager path must still preserve the RNG"
+
+
+def test_a_compiled_first_call_routes_to_peft_instead_of_the_unread_stash(
+    restore_param_wrapper, monkeypatch
+):
+    """A model whose FIRST invocation is compiled has no verdict and no way to get one.
+
+    The probe cannot run inside a captured graph without being captured with it and re-run
+    on every call. Leaving the call inconclusive took the separated stash path, and on a
+    family whose experts forward ignores the stash Dynamo would reuse that graph forever
+    with the expert LoRA absent from every output and gradient. PEFT's own path always
+    applies it, so it is the safe assumption while tracing.
+    """
+    assert MU.patch_param_wrapper_for_moe()
+    calls = []
+
+    def recording_original(self, x, *args, **kwargs):
+        calls.append(getattr(self, "parameter_name", None))
+        return self.base_layer(x, *args, **kwargs)
+
+    # PEFT's real ParamWrapper.forward is not importable in this environment, and the
+    # decision under test is which path is taken rather than PEFT's own arithmetic. Set on
+    # every copy of the module, since the installed forward reads its own globals.
+    for module in _moe_utils_copies():
+        module._original_param_wrapper_forward = recording_original
+    model = _build(_StashIgnoringExperts)
+    experts = model.base_model.model.experts.get_base_layer()
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    with torch.no_grad():
+        model(_inputs())
+
+    assert calls, "a compiled cold start left the call on a stash path nothing reads"
+    # Nothing recorded, so the first eager call still measures and every later compile
+    # uses the real verdict rather than this assumption.
+    assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    with torch.no_grad():
+        model(_inputs())
+    assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is False
+
+
+def test_a_compiled_first_call_keeps_the_stash_path_for_a_stash_reading_family(
+    restore_param_wrapper, monkeypatch
+):
+    """NEGATIVE CONTROL: the assumption must not cost the supported families their fast
+    path when a verdict already exists. Once measured eagerly, a compiled call follows the
+    recorded verdict, not the tracing assumption."""
+    assert MU.patch_param_wrapper_for_moe()
+    calls = []
+
+    def recording_original(self, x, *args, **kwargs):
+        calls.append(getattr(self, "parameter_name", None))
+        return self.base_layer(x, *args, **kwargs)
+
+    for module in _moe_utils_copies():
+        module._original_param_wrapper_forward = recording_original
+    model = _build(_StashReadingExperts)
+    experts = model.base_model.model.experts.get_base_layer()
+
+    with torch.no_grad():
+        model(_inputs())
+    assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is True
+    assert calls == []
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    with torch.no_grad():
+        model(_inputs())
+    assert calls == [], "a recorded verdict was overridden by the tracing assumption"
