@@ -264,10 +264,8 @@ jobs:
         # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
         # + cache-completeness gate (CPU-pure; collect-only would let it
         # regress silently), and test_hf_xet_fallback_blob_scoped_redownload
-        # pins that the same transition clears the blob at fault rather than
-        # forcing a repo-wide clean re-download of every completed shard
-        # (#9094), against a real temporary cache.
-        # test_train_on_responses_list_labels pins the
+        # pins that the same transition clears the blob at fault instead of
+        # every completed shard (#9094). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
         # no weights). The preference suite pins token boundaries, scheduling,
         # objective normalization, and reference lifecycle without model weights.
