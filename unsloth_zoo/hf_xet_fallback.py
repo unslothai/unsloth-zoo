@@ -798,11 +798,57 @@ def _cache_is_private_to_this_user(cache_dir: Optional[str] = None) -> bool:
         return False
 
 
-def _blobs_with_a_live_writer() -> Optional[set]:
-    """Basenames of every ``*.incomplete`` blob some LIVE process holds open, or ``None`` when this
-    host cannot answer (no psutil, no open-file table) and the caller must decline. Walks every
-    visible process, unlike ``_child_open_incomplete_blobs``; an uninspectable one is skipped, so
-    the set is a LOWER bound -- and `_live_writer_walk_was_complete` records whether it is one."""
+def _normalized_partial_key(path) -> str:
+    """One comparable spelling of a partial's location: symlinks resolved, case folded on the
+    platforms where the filesystem folds it. Used so a live writer is matched by WHERE it writes."""
+    text = str(path)
+    try:
+        text = os.path.realpath(text)
+    except Exception:
+        pass
+    return os.path.normcase(text)
+
+
+def _live_writer_names_for_repo(
+    live_paths: set, repo_type: str, repo_id: str, cache_dir: Optional[str],
+) -> set:
+    """The basenames, among *live_paths*, that live inside THIS repo's blobs directories.
+
+    The callers that still work in basenames (the stall-path ownership inference, which compares
+    against a repo-scoped listing) get a repo-scoped projection rather than the host-wide set, so
+    a partial held open under some other repo cannot speak about this one.
+
+    A cache that cannot be enumerated falls back to the whole set, which is the conservative
+    direction: more names counted as live means fewer claimed as ours.
+    """
+    roots = []
+    try:
+        for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
+            roots.append(_normalized_partial_key(entry / "blobs") + os.sep)
+    except Exception:
+        return {os.path.basename(path) for path in live_paths}
+    if not roots:
+        return {os.path.basename(path) for path in live_paths}
+    return {
+        os.path.basename(path)
+        for path in live_paths
+        if any(path.startswith(root) for root in roots)
+    }
+
+
+def _partial_paths_with_a_live_writer() -> Optional[set]:
+    """Normalized PATHS of every ``*.incomplete`` blob some LIVE process holds open, or ``None``
+    when this host cannot answer (no psutil, no open-file table) and the caller must decline.
+
+    Paths, not basenames. ``process_iter`` scans the whole host, and hub names a partial after the
+    file's etag, which identical files share across repositories: on a basename the partial repo A
+    is writing right now marks repo B's long-dead partial of the same file as live, so the scoped
+    clearance spares it, the guard keeps reading "active" and repo B falls back to the repo-wide
+    ``force_download`` this whole path exists to avoid.
+
+    Walks every visible process, unlike ``_child_open_incomplete_blobs``; an uninspectable one is
+    skipped, so the set is a LOWER bound -- and `_live_writer_walk_was_complete` records whether
+    it is one."""
     _LIVE_WRITER_WALK.complete = True
     try:
         import psutil  # type: ignore
@@ -814,7 +860,7 @@ def _blobs_with_a_live_writer() -> Optional[set]:
             try:
                 for handle in proc.open_files():
                     if handle.path.endswith(INCOMPLETE_SUFFIX):
-                        open_blobs.add(os.path.basename(handle.path))
+                        open_blobs.add(_normalized_partial_key(handle.path))
             except (psutil.NoSuchProcess, psutil.ZombieProcess):
                 # Gone between the listing and the read, so it holds nothing: not a gap.
                 continue
@@ -837,7 +883,7 @@ def _unowned_partials_safe_to_clear(
 ) -> Optional[set]:
     """The partials outside the ownership set that may be removed, or ``None`` for "do not". Both
     required: older than *active_grace*, and open by no live process, which age cannot establish."""
-    live_writers = _blobs_with_a_live_writer()
+    live_writers = _partial_paths_with_a_live_writer()
     if live_writers is None:
         return None
     if not _live_writer_walk_was_complete() and not _cache_is_private_to_this_user(cache_dir):
@@ -859,7 +905,9 @@ def _unowned_partials_safe_to_clear(
                 try:
                     if not (blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX)):
                         continue
-                    if blob.name in owned or blob.name in live_writers:
+                    # Ownership is this repo's own naming, so it stays a name; the live-writer
+                    # test is about the exact file on disk, so it compares paths.
+                    if blob.name in owned or _normalized_partial_key(blob) in live_writers:
                         continue
                     if now - blob.stat().st_mtime < active_grace:
                         continue
@@ -1983,14 +2031,20 @@ def _run_download_attempt(
                     # open are dropped -- all but our own child's, which is the one being
                     # killed -- and the walk that says so has to have been able to read every
                     # process, or the cache has to be one nobody else can write into.
-                    writers = _blobs_with_a_live_writer()
-                    trustworthy = writers is not None and (
+                    writer_paths = _partial_paths_with_a_live_writer()
+                    trustworthy = writer_paths is not None and (
                         _live_writer_walk_was_complete()
                         or _cache_is_private_to_this_user(params.get("cache_dir"))
                     )
                     if not trustworthy:
                         inferred = set()
                     else:
+                        # `inferred` names partials inside THIS repo's cache, so the host-wide
+                        # walk is projected onto it: a writer busy in another repo says nothing
+                        # about a same-etag partial here.
+                        writers = _live_writer_names_for_repo(
+                            writer_paths, repo_type, repo_id, params.get("cache_dir"),
+                        )
                         inferred -= writers - (
                             _child_open_incomplete_blobs(proc.pid) or set() if proc.pid else set()
                         )

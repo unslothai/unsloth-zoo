@@ -116,6 +116,11 @@ def _build_cache(root: Path, *, partial_age_s: float, extra_partial: str = None)
     return snap
 
 
+def _held(root: Path, name: str, repo_dir: str = REPO_DIR) -> str:
+    """What the live-writer walk reports for a partial: where it is, not what it is called."""
+    return xf._normalized_partial_key(root / repo_dir / "blobs" / name)
+
+
 def _identity(root: Path) -> dict:
     blobs = root / REPO_DIR / "blobs"
     out = {}
@@ -491,7 +496,9 @@ def test_an_aged_partial_a_live_process_still_holds_open_is_not_cleared(monkeypa
     than any grace and will still finish it, so the open-file table decides, not the mtime."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: {stranger})
+    monkeypatch.setattr(
+        xf, "_partial_paths_with_a_live_writer", lambda: {_held(tmp_path, stranger)}
+    )
 
     survivors = xf._clear_unsafe_partials_for_http(
         "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
@@ -505,7 +512,7 @@ def test_an_unreadable_open_file_table_declines_the_unscoped_pass(monkeypatch, t
     least inspectable hosts the most destructive."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: None)
 
     survivors = xf._clear_unsafe_partials_for_http(
         "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
@@ -519,7 +526,7 @@ def test_our_own_partial_is_cleared_even_with_the_table_unreadable(monkeypatch, 
     writer to protect. #9094 is fixed by THIS pass."""
     _build_cache(tmp_path, partial_age_s = 5.0)
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: None)
 
     survivors = xf._clear_unsafe_partials_for_http(
         "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
@@ -529,24 +536,68 @@ def test_our_own_partial_is_cleared_even_with_the_table_unreadable(monkeypatch, 
     assert not (tmp_path / REPO_DIR / "blobs" / mine).exists()
 
 
+def test_a_writer_busy_in_another_repo_does_not_shield_this_one(monkeypatch, tmp_path):
+    """`process_iter` walks the whole host, and hub names a partial after the file's etag, which
+    identical files share across repositories. On a bare name, the partial repo A is downloading
+    right now marked repo B's long-dead partial of the same file as live: the scoped clearance
+    spared it, `has_active_incomplete_blobs` kept reading active, and repo B fell back to the
+    repo-wide `force_download` that re-fetches every verified shard -- the exact outcome this
+    whole path exists to avoid."""
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    stale = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    # The same etag, in a different repo's cache, with a live writer on it.
+    elsewhere = tmp_path / "models--acme--twin" / "blobs"
+    elsewhere.mkdir(parents = True)
+    (elsewhere / stale).write_bytes(b"\xa5" * 64)
+    monkeypatch.setattr(
+        xf,
+        "_partial_paths_with_a_live_writer",
+        lambda: {_held(tmp_path, stale, repo_dir = "models--acme--twin")},
+    )
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert survivors == set(), survivors
+    assert not (tmp_path / REPO_DIR / "blobs" / stale).exists(), (
+        "a stale partial was spared because an unrelated repo was writing the same etag"
+    )
+    assert (elsewhere / stale).exists(), "the other repo's live partial was touched"
+
+
+def test_the_stall_paths_writer_set_is_projected_onto_this_repo(tmp_path):
+    """The ownership inference still compares names, because the listing it subtracts from is
+    this repo's own. So the host-wide walk is projected onto this repo's blobs directories
+    first: a writer busy elsewhere must not remove a name from what the killed child owns."""
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    name = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    here = _held(tmp_path, name)
+    there = _held(tmp_path, name, repo_dir = "models--acme--twin")
+
+    assert xf._live_writer_names_for_repo({here}, "model", REPO, str(tmp_path)) == {name}
+    assert xf._live_writer_names_for_repo({there}, "model", REPO, str(tmp_path)) == set()
+
+
 def test_the_live_writer_probe_finds_this_processs_own_open_partial(tmp_path):
     blob = tmp_path / ("deadbeef" + xf.INCOMPLETE_SUFFIX)
     blob.write_bytes(b"x")
     with blob.open("ab") as handle:
         handle.write(b"y")
         handle.flush()
-        seen = xf._blobs_with_a_live_writer()
+        seen = xf._partial_paths_with_a_live_writer()
         if seen is None:
             pytest.skip("this host cannot read the open-file table")
-        assert blob.name in seen, "an open partial was not seen as having a live writer"
-    after = xf._blobs_with_a_live_writer()
-    assert after is not None and blob.name not in after
+        key = xf._normalized_partial_key(blob)
+        assert key in seen, "an open partial was not seen as having a live writer"
+        assert blob.name not in seen, "the walk reported a bare name, which two repos can share"
+    after = xf._partial_paths_with_a_live_writer()
+    assert after is not None and key not in after
 
 
 def test_clear_unsafe_partials_reports_survivors_and_spares_a_fresh_stranger(monkeypatch, tmp_path):
     """Ours goes at any age, a stranger only past the grace AND with no live writer; the return
     names what SURVIVED. The table is pinned empty so the case is about the grace."""
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     _build_cache(tmp_path, partial_age_s = 5.0, extra_partial = "vocab.json")
     blobs = tmp_path / REPO_DIR / "blobs"
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
@@ -624,7 +675,7 @@ def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
     fell back to the repo-wide `force_download` that re-fetches every verified shard (#9094),
     for a symlink pointing at nothing.
     """
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     snap = _build_cache(tmp_path, partial_age_s = 5.0)
     blobs = tmp_path / REPO_DIR / "blobs"
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
@@ -661,7 +712,9 @@ def test_a_dangling_link_whose_partial_is_still_being_written_is_kept(monkeypatc
     force is the right answer anyway.
     """
     stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: {stranger})
+    monkeypatch.setattr(
+        xf, "_partial_paths_with_a_live_writer", lambda: {_held(tmp_path, stranger)}
+    )
     snap = _build_cache(tmp_path, partial_age_s = 1800.0)
     link = snap / IN_FLIGHT
     assert link.is_symlink() and not link.exists()
@@ -677,7 +730,7 @@ def test_a_dangling_link_whose_partial_is_still_being_written_is_kept(monkeypatc
 def test_an_unremovable_orphan_link_is_reported_as_a_survivor(monkeypatch, tmp_path):
     """Absence is the only evidence the caller accepts, so a link this pass could not remove has
     to be named rather than silently omitted."""
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     snap = _build_cache(tmp_path, partial_age_s = 5.0)
     blobs = tmp_path / REPO_DIR / "blobs"
     (blobs / (_blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX)).unlink()
@@ -725,7 +778,7 @@ def test_a_process_we_cannot_read_stops_the_unowned_purge_on_a_shared_cache(
     # Shared: another user can write into this cache, so the process we could not read is a
     # possible writer here.
     monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None: False)
-    assert xf._blobs_with_a_live_writer() == set()
+    assert xf._partial_paths_with_a_live_writer() == set()
     assert xf._live_writer_walk_was_complete() is False
     assert xf._unowned_partials_safe_to_clear(
         "model", REPO, str(tmp_path), 180.0, None,
@@ -746,7 +799,7 @@ def test_a_process_we_cannot_read_stops_the_unowned_purge_on_a_shared_cache(
             raise _FakePsutil.NoSuchProcess("gone")
 
     monkeypatch.setattr(_FakePsutil, "process_iter", staticmethod(lambda: [_Gone()]))
-    assert xf._blobs_with_a_live_writer() == set()
+    assert xf._partial_paths_with_a_live_writer() == set()
     assert xf._live_writer_walk_was_complete() is True
 
 
@@ -818,7 +871,9 @@ def test_a_siblings_new_partial_is_not_claimed_by_the_stalled_child(monkeypatch,
     monkeypatch.setattr(xf, "_terminate_process_group", lambda proc, grace: None)
     # The child's own table cannot be read -- Windows, and the case the subtraction exists for.
     monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: None)
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: {theirs})
+    monkeypatch.setattr(
+        xf, "_partial_paths_with_a_live_writer", lambda: {_held(tmp_path, theirs)}
+    )
     params = {"repo_id": REPO, "revision": REV, "cache_dir": str(tmp_path)}
     kind_result, _ = xf._run_download_attempt(
         REPO, kind = "snapshot", params = params, token = None, repo_type = "model",
@@ -832,7 +887,7 @@ def test_a_siblings_new_partial_is_not_claimed_by_the_stalled_child(monkeypatch,
 
     # And with the writer walk unusable, nothing is claimed by subtraction at all: the purge
     # falls back to unscoped, where the age and live-writer guards still apply.
-    monkeypatch.setattr(xf, "_blobs_with_a_live_writer", lambda: None)
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: None)
     params = {"repo_id": REPO, "revision": REV, "cache_dir": str(tmp_path)}
     xf._run_download_attempt(
         REPO, kind = "snapshot", params = params, token = None, repo_type = "model",
@@ -872,14 +927,14 @@ def test_the_walk_completeness_is_per_thread(monkeypatch):
             return cls.visible
 
     monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
-    xf._blobs_with_a_live_writer()
+    xf._partial_paths_with_a_live_writer()
     assert xf._live_writer_walk_was_complete() is False
 
     seen = {}
 
     def _other_thread():
         _FakePsutil.visible = [_Open()]
-        xf._blobs_with_a_live_writer()
+        xf._partial_paths_with_a_live_writer()
         seen["theirs"] = xf._live_writer_walk_was_complete()
 
     thread = threading.Thread(target = _other_thread)
