@@ -312,9 +312,12 @@ jobs:
         # shipped broken for the same reason this comment keeps repeating -- the
         # file was in NO job, so `--collect-only` proved only that it imports while
         # the count double-removed every document boundary a collator had already
-        # masked, inflating loss and every gradient. `.[core]` resolves trl 0.24.0
-        # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
-        # so this job exercises the regressed regime on every pull request.
+        # masked, inflating loss and every gradient. `.[core]` resolves a trl that
+        # masks the document boundary itself (trl added that in 0.23.1 and every
+        # release since keeps it), so this job exercises the regressed regime on
+        # every pull request. Stated as the mechanism rather than as a version
+        # number, because the number moves with the cap and a stale one here reads
+        # like a guarantee that the lane no longer provides.
         #
         # test_hip_bf16_offload_dtype pins that the HIP branch ASKS whether bf16 is
         # supported rather than hardcoding True, which is what kills an RDNA 1/2 card
