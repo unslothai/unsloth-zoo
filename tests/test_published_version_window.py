@@ -146,9 +146,16 @@ def _live(reqs: list[Requirement], environment: dict[str, str]) -> list[Requirem
 
 
 def _ceiling(spec: SpecifierSet) -> Version:
-    tops = [Version(str(s.version)) for s in spec if s.operator in ("<=", "<")]
+    """The version this specifier actually stops at.
+
+    The TIGHTEST upper bound, not the loosest: bounds intersect, so `<=5.17.0,<5.16.0`
+    admits nothing above 5.16.0 and `max` would report 5.17 as the ceiling of a window
+    that excludes the tested release. Ties are broken by exclusivity, since `<5.16.0` is
+    tighter than `<=5.16.0`.
+    """
+    tops = [(Version(str(s.version)), s.operator == "<") for s in spec if s.operator in ("<=", "<")]
     assert tops, f"no upper bound declared: {spec}"
-    return max(tops)
+    return min(tops, key = lambda pair: (pair[0], pair[1]))[0]
 
 
 def _transformers_lists() -> dict[str, list[Requirement]]:
@@ -176,8 +183,21 @@ def test_every_list_that_names_transformers_carries_both_halves() -> None:
 
 def test_the_two_halves_are_where_they_are_supposed_to_be() -> None:
     for where, reqs in _transformers_lists().items():
-        general = _ceiling(_live(reqs, LINUX_X86)[0].specifier)
-        apple = _ceiling(_live(reqs, DARWIN_ARM)[0].specifier)
+        general_spec = _live(reqs, LINUX_X86)[0].specifier
+        apple_spec = _live(reqs, DARWIN_ARM)[0].specifier
+        general = _ceiling(general_spec)
+        apple = _ceiling(apple_spec)
+        # Admission as well as the ceiling number, because a second upper bound, or an
+        # exclusion naming the tested release, can shut it out while the ceiling still
+        # reads right.
+        assert TESTED_CEILING in general_spec, (
+            f"{where} declares {general_spec} off darwin, which does not admit the "
+            f"{TESTED_CEILING} the matrix was run against."
+        )
+        assert MLX_CEILING in apple_spec, (
+            f"{where} declares {apple_spec} on darwin + arm64, which does not admit the "
+            f"{MLX_CEILING} the MLX stack holds."
+        )
         assert general == TESTED_CEILING, (
             f"{where} caps transformers at {general} off darwin; the matrix was run "
             f"against {TESTED_CEILING}. Moving the cap means running the sweep first and "
@@ -239,6 +259,16 @@ def test_the_torch_ceiling_admits_what_the_matrix_ran() -> None:
             f"pyproject.toml bounds torch as {req.specifier}, which excludes the "
             f"{TESTED_TORCH} the matrix was run against."
         )
+        # The EXACT bound, not merely one that admits 2.14.0. Widening <2.15.0 to <2.16.0
+        # still admits the tested release, so an admission-only check would let the package
+        # publish support for a torch 2.15.x nobody ran, with this file still declaring
+        # TORCH_BOUND as <2.15.0.
+        assert _ceiling(req.specifier) == _ceiling(SpecifierSet(TORCH_BOUND)), (
+            f"pyproject.toml bounds torch as {req.specifier}, not the {TORCH_BOUND} this "
+            f"file declares. Moving the bound means running the matrix on the newly "
+            f"admitted releases and moving TESTED_TORCH and TORCH_BOUND here in the same "
+            f"commit."
+        )
 
 
 def _workflow_runs() -> list[tuple[str, str]]:
@@ -280,6 +310,18 @@ def test_no_workflow_mirror_of_the_torch_bound_drifted() -> None:
         assert not drifted, (
             f"{name} installs {drifted}, which excludes the {TESTED_TORCH} pyproject now "
             f"admits, so the lane tests a torch users do not get."
+        )
+        # A mirror is a copy of the published bound, so it has to stop where the published
+        # bound stops. Admitting 2.14.0 is not the same claim: a lane widened to <2.16.0
+        # would install an untested 2.15.x and still pass the check above.
+        widened = sorted(
+            raw
+            for raw in mirrors[name]
+            if _ceiling(Requirement(raw).specifier) != _ceiling(SpecifierSet(TORCH_BOUND))
+        )
+        assert not widened, (
+            f"{name} installs {widened}, which does not stop where the published "
+            f"{TORCH_BOUND} stops, so the mirror is no longer a mirror."
         )
 
     unexplained = sorted(
@@ -512,3 +554,33 @@ def test_this_file_runs_in_an_executing_ci_step():
         f"{name} is not named in any executing pytest step; it is collected but never "
         f"run, so every assertion in it is inert in CI"
     )
+
+
+def test_the_ceiling_helper_reports_the_tightest_upper_bound() -> None:
+    """NEGATIVE CONTROL for `_ceiling`.
+
+    Upper bounds intersect, so the effective ceiling is the tightest one. Taking the
+    loosest reported 5.17 for `<=5.17.0,<5.16.0`, a window that excludes the tested
+    release, and the shape comparison next door strips every upper bound, so nothing else
+    in this file would have caught it.
+    """
+    assert _ceiling(SpecifierSet("<=5.17.0")) == Version("5.17.0")
+    assert _ceiling(SpecifierSet(">=4.51.3,<=5.17.0")) == Version("5.17.0")
+    assert _ceiling(SpecifierSet("<=5.17.0,<5.16.0")) == Version("5.16.0")
+    assert _ceiling(SpecifierSet("<5.16.0,<=5.17.0")) == Version("5.16.0")
+    # A tie on the number is broken by exclusivity: `<5.16.0` admits strictly less.
+    assert _ceiling(SpecifierSet("<5.16.0,<=5.16.0")) == Version("5.16.0")
+    assert Version("5.17.0") not in SpecifierSet("<=5.17.0,<5.16.0")
+
+
+def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_release() -> None:
+    """NEGATIVE CONTROL for the exact-bound assertions.
+
+    `<2.16.0` still contains the 2.14.0 the matrix ran, so the admission check passes on
+    it. That is the drift this file exists to catch: it would publish support for a torch
+    2.15.x nobody tested while TORCH_BOUND still said <2.15.0.
+    """
+    widened = SpecifierSet(">=2.4.0,<2.16.0")
+    assert TESTED_TORCH in widened, "the premise: an admission-only check cannot see this"
+    assert _ceiling(widened) != _ceiling(SpecifierSet(TORCH_BOUND))
+    assert _ceiling(SpecifierSet(f">=2.4.0,{TORCH_BOUND}")) == _ceiling(SpecifierSet(TORCH_BOUND))
