@@ -3429,8 +3429,15 @@ def merge_and_overwrite_lora(
         if is_local_path:
             os.makedirs(save_directory, exist_ok = True)
             # Copy from local
+            local_index_path = os.path.join(model_name, "model.safetensors.index.json")
+            # Validate before the copy decision, not inside it. When the export is
+            # in place (save_directory == model_name) and the filtered list leaves
+            # a single shard, safe_tensor_index_files is empty and no copy happens,
+            # yet the unsafe index is already sitting in the output directory for
+            # the next from_pretrained to follow.
+            if os.path.exists(local_index_path):
+                _reject_unsafe_shard_index(local_index_path)
             if safe_tensor_index_files:
-                local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
                     # Filtering the in-memory shard list is not enough on its own: the
                     # index itself is what a later from_pretrained reads, and
