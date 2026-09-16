@@ -204,3 +204,76 @@ def test_the_non_meta_placements_are_untouched():
         verify_and_set_device(layer)
         assert layer._per_layer_device == torch.device(device_string)
         assert layer._per_layer_device_index == expected
+
+
+def test_a_chained_hook_is_unwrapped_to_the_alignment_device():
+    """accelerate chains hooks, it does not replace them.
+
+    `add_hook_to_module(module, hook, append=True)` stores `SequentialHook(old, new)`, and
+    `attach_align_device_hook` appends the `AlignDevicesHook` exactly that way on every
+    offloaded submodule. `SequentialHook` keeps the chain in `.hooks` and defines no
+    `execution_device`, so reading the attribute off the outer hook answered None for the
+    offloaded, meta-resident layers this lookup exists for, and the readers fell back to
+    device 0 -- the wrong GPU whenever the nested hook names another one.
+    """
+    outer = SimpleNamespace(
+        hooks = (
+            SimpleNamespace(),                              # a hook with no device to give
+            SimpleNamespace(execution_device = 1),          # the AlignDevicesHook
+        )
+    )
+    layer = _FakeLayer("meta")
+    layer._hf_hook = outer
+    verify_and_set_device(layer)
+
+    assert layer._per_layer_device == torch.device(1)
+    assert layer._per_layer_device_index == 1
+
+
+def test_a_nested_chain_is_followed_and_the_outermost_real_device_wins():
+    """Chains nest: appending twice gives SequentialHook(SequentialHook(a, b), c). The
+    first hook that names a real device is the answer, and a meta one is skipped rather
+    than ending the search."""
+    layer = _FakeLayer("meta")
+    layer._hf_hook = SimpleNamespace(
+        hooks = (
+            SimpleNamespace(
+                hooks = (
+                    SimpleNamespace(execution_device = "meta"),
+                    SimpleNamespace(execution_device = "cpu"),
+                )
+            ),
+            SimpleNamespace(execution_device = 3),
+        )
+    )
+    verify_and_set_device(layer)
+
+    assert layer._per_layer_device == torch.device("cpu")
+
+
+def test_a_chain_that_names_no_device_still_publishes_nothing():
+    """NEGATIVE CONTROL: unwrapping must not invent an answer. A chain of hooks with no
+    usable execution_device leaves the attributes unset, as an absent hook does."""
+    layer = _FakeLayer("meta")
+    layer._hf_hook = SimpleNamespace(
+        hooks = (
+            SimpleNamespace(execution_device = "meta"),
+            SimpleNamespace(execution_device = None),
+            SimpleNamespace(),
+        )
+    )
+    verify_and_set_device(layer)
+
+    assert not hasattr(layer, "_per_layer_device")
+    assert not hasattr(layer, "_per_layer_device_index")
+
+
+def test_a_self_referential_hook_chain_terminates():
+    """The chain is data from another library; nothing here needs to trust it."""
+    loop = SimpleNamespace()
+    loop.hooks = (loop,)
+    layer = _FakeLayer("meta")
+    layer._hf_hook = loop
+
+    verify_and_set_device(layer)
+    assert not hasattr(layer, "_per_layer_device")

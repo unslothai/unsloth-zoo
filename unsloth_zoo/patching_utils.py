@@ -317,14 +317,36 @@ def _execution_device_for_meta_layer(module):
     accelerate itself checks for a literal "meta" there while a model is being built, so
     every one of those shapes is handled and only a real device is returned.
     """
-    execution_device = getattr(getattr(module, "_hf_hook", None), "execution_device", None)
-    if execution_device is None:
-        return None
-    try:
-        device = torch.device(execution_device)
-    except (RuntimeError, TypeError, ValueError):
-        return None
-    return None if device.type == "meta" else device
+    for hook in _iter_accelerate_hooks(getattr(module, "_hf_hook", None)):
+        execution_device = getattr(hook, "execution_device", None)
+        if execution_device is None:
+            continue
+        try:
+            device = torch.device(execution_device)
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        if device.type != "meta":
+            return device
+    return None
+
+
+def _iter_accelerate_hooks(hook, _depth = 0):
+    """`hook` and every hook nested inside it, outermost first.
+
+    accelerate chains rather than replaces: `add_hook_to_module(module, hook, append=True)`
+    stores `SequentialHook(old_hook, new_hook)`, and `attach_align_device_hook` appends the
+    `AlignDevicesHook` that way on every offloaded submodule. `SequentialHook` holds the
+    chain in `.hooks` and defines no `execution_device` of its own, so reading the attribute
+    off the outer hook answers None for exactly the offloaded, meta-resident layers this
+    lookup exists to serve, and `verify_and_set_device` then publishes nothing and leaves
+    the readers on their historical device-0 default. Depth-limited because a hook chain is
+    data from another library and nothing here needs to trust it to be acyclic.
+    """
+    if hook is None or _depth > 8:
+        return
+    yield hook
+    for nested in getattr(hook, "hooks", ()) or ():
+        yield from _iter_accelerate_hooks(nested, _depth + 1)
 
 
 def verify_and_set_device(module,):
