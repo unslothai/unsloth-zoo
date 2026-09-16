@@ -646,7 +646,7 @@ def grpo_compute_loss(
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return completion_length, x.mean()
             else:
-                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward
+                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward.clamp(min=1.0)
                 mean_kl = mean_kl_per_reward.mean()
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
