@@ -3008,6 +3008,28 @@ def _mtp_config_containers(config):
     return containers
 
 
+def _config_is_writable(config_path) -> bool:
+    """Whether this config may be rewritten, asking the MODE as well as the access check.
+
+    `os.access(..., W_OK)` answers "may this process write it", and as root the answer is
+    yes for a file whose mode is `0444`. Containers and hosted notebooks run as root by
+    default, which is where an export most often runs, so the access check alone let a
+    replacement land on a config the operator had explicitly marked read-only -- the exact
+    thing the check exists to refuse. The mode is the operator's statement of intent and the
+    access check is the filesystem's; a write needs both.
+
+    A mode that cannot be read is not a refusal: an unreadable stat is "cannot tell", and
+    falling back to the access check leaves the behaviour as it was for every ordinary user.
+    """
+    if not os.access(config_path, os.W_OK):
+        return False
+    try:
+        mode = stat.S_IMODE(os.stat(config_path).st_mode)
+    except OSError:
+        return True
+    return bool(mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
 def reconcile_mtp_config(save_directory, tensor_names = None):
     """Make an exported config.json's MTP declaration agree with its weights.
 
@@ -3050,7 +3072,7 @@ def reconcile_mtp_config(save_directory, tensor_names = None):
         # "unknown" and lets the save continue. A repair that cannot succeed has to leave
         # the valid file it found, and `os.replace` is atomic on the same filesystem.
         directory = os.path.dirname(config_path) or "."
-        if not os.access(config_path, os.W_OK):
+        if not _config_is_writable(config_path):
             # Asked before anything is staged, because `os.replace` only needs the
             # DIRECTORY to be writable: without this, a config.json the user marked
             # read-only would be replaced anyway, where the previous open("w") reported

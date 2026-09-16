@@ -466,3 +466,58 @@ def test_the_repaired_config_keeps_the_mode_it_had(tmp_path):
     config_path.chmod(0o644)
     assert reconcile_mtp_config(tmp_path) == "stripped"
     assert stat.S_IMODE(config_path.stat().st_mode) == 0o644
+
+
+def test_a_read_only_config_is_left_alone_even_as_root(tmp_path, monkeypatch):
+    """`os.access(..., W_OK)` answers "may this process write it", and as root that is yes
+    for a `0444` file.
+
+    Containers and hosted notebooks run as root by default, which is where an export most
+    often runs, so the access check alone let a replacement land on a config the operator had
+    explicitly marked read-only -- the exact thing the check exists to refuse. Root is
+    simulated here rather than required, so the case is covered on an ordinary CI user too.
+    """
+    if os.name == "nt":
+        pytest.skip("read-only file permissions are not enforced the same way on Windows")
+
+    _write_config(tmp_path)
+    _write_checkpoint(tmp_path, BODY_NAMES)
+    config_path = tmp_path / "config.json"
+    before = config_path.read_text(encoding = "utf-8")
+    config_path.chmod(0o444)
+    # What root sees: the access check says yes whatever the mode says.
+    monkeypatch.setattr(os, "access", lambda path, mode: True)
+    try:
+        assert reconcile_mtp_config(tmp_path) == "unknown"
+        assert config_path.read_text(encoding = "utf-8") == before
+        assert MTP_CONFIG_KEY in before
+        # And nothing staged is left beside it.
+        assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("config.json.")) == []
+    finally:
+        config_path.chmod(0o644)
+
+
+def test_a_writable_config_is_still_rewritten(tmp_path, monkeypatch):
+    """The other half: the mode check must not refuse an ordinary file, and a mode that
+    cannot be read at all is "cannot tell" rather than a refusal."""
+    _write_config(tmp_path)
+    _write_checkpoint(tmp_path, BODY_NAMES)
+    assert reconcile_mtp_config(tmp_path) == "stripped"
+    assert MTP_CONFIG_KEY not in json.dumps(_saved(tmp_path))
+
+    # And a mode that cannot be read at all is "cannot tell", which falls back to the access
+    # check rather than refusing: an unreadable stat must not turn every export into a
+    # warning. Asked of the predicate directly, since `reconcile_mtp_config` stats the path
+    # for other reasons too.
+    from unsloth_zoo.saving_utils import _config_is_writable
+
+    config_path = tmp_path / "config.json"
+    assert _config_is_writable(config_path) is True
+    real_stat = os.stat
+    monkeypatch.setattr(
+        os, "stat",
+        lambda path, *a, **k: (_ for _ in ()).throw(OSError("stat is not available here"))
+        if str(path) == str(config_path)
+        else real_stat(path, *a, **k),
+    )
+    assert _config_is_writable(config_path) is True
