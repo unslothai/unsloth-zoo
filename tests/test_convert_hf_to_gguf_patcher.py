@@ -957,3 +957,45 @@ def test_gguf_attribute_patch_keeps_the_blank_lines_after_the_import(tmp_path, m
     written, _ = _drive_patcher(module, tmp_path, monkeypatch, source)
     assert b"try: gguf.MODEL_ARCH" in written
     assert b"\n\n\nlogger = None" in written
+
+
+@pytest.mark.parametrize("indent", [12, 16])
+def test_patching_an_already_patched_monolith_converges(tmp_path, monkeypatch, indent):
+    """Patching the patcher's own output must be a no-op, not a second insertion.
+
+    The monolith branding patch has no marker inside the file it edits, so before
+    the guard it matched `Metadata.load(...)` again and appended another copy of the
+    three branding lines every time. Reachable for anyone who copies a patched
+    script back over `convert_hf_to_gguf.py`, and it grows on every conversion."""
+    import ast
+
+    llama_cpp = _load_llama_cpp_module()
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(); second.mkdir()
+    once, _ = _drive_patcher(
+        llama_cpp, first, monkeypatch, _monolith_with_num_experts(indent)
+    )
+    twice, _ = _drive_patcher(llama_cpp, second, monkeypatch, once)
+
+    ast.parse(twice)
+    assert twice == once, "patching an already patched converter changed it"
+    assert once.count(b"self.metadata.quantized_by = 'Unsloth'") == 1
+    assert twice.count(b"self.metadata.quantized_by = 'Unsloth'") == 1
+    assert twice.count(b"num_local_experts") == once.count(b"num_local_experts")
+    # The gguf attribute guards are the other patch with no marker of its own: the
+    # arch scan finds the `gguf.X` names inside the guards it inserted last time.
+    guards = once.count(b"except AttributeError: gguf.")
+    assert guards > 0, "fixture did not exercise the gguf attribute guard patch"
+    assert twice.count(b"except AttributeError: gguf.") == guards
+
+
+def test_a_pristine_converter_is_still_branded(tmp_path, monkeypatch):
+    """The idempotency guard keys on a line upstream never ships, so a fresh
+    checkout is branded exactly as before."""
+    llama_cpp = _load_llama_cpp_module()
+    source = _monolith_with_num_experts(12)
+    assert b"quantized_by" not in source
+    written, _ = _drive_patcher(llama_cpp, tmp_path, monkeypatch, source)
+    assert written.count(b"self.metadata.quantized_by = 'Unsloth'") == 1
+    assert b"self.metadata.repo_url = 'https://huggingface.co/unsloth'" in written
+    assert b"self.metadata.tags = ['unsloth', 'llama.cpp']" in written

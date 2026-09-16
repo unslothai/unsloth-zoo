@@ -1704,6 +1704,17 @@ pass
 
 
 _UNSLOTH_BRANDING_MARKER = b"# UNSLOTH_BRANDING_APPLIED"
+
+# The line the monolith branding patch inserts. Used as that patch's own
+# idempotency marker, since unlike the package-layout patch it edits the
+# in-memory entrypoint rather than conversion/base.py and has nowhere to put a
+# comment marker without changing the bytes users already have.
+_UNSLOTH_BRANDING_LINE = b"self.metadata.quantized_by = 'Unsloth'"
+
+# The shape the gguf attribute guard patch inserts, used as that patch's own
+# idempotency marker for the same reason: it edits the in-memory entrypoint
+# and has no marker comment of its own.
+_GGUF_GUARD_LINE = b"except AttributeError: gguf."
 _BRANDING_PATTERN = re.compile(
     rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
     flags = re.MULTILINE,
@@ -2078,7 +2089,17 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         try:
             archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", patched_content)))
             archs = [x.decode("utf-8") for x in archs if not x.startswith(b"_")]
-            if archs:
+            if _GGUF_GUARD_LINE in patched_content:
+                # Already guarded. Without this the scan finds the `gguf.X` names
+                # inside the guards it inserted last time and inserts the whole block
+                # again, so the converter grows one copy per patch. Harmless (the
+                # guards are idempotent assignments) but it is not convergence, and
+                # upstream never ships this line, so a pristine checkout is unaffected.
+                logger.info(
+                    "Unsloth: gguf attribute guards already present in the converter "
+                    "(idempotent skip)."
+                )
+            elif archs:
                 _eol = _dominant_newline(patched_content)
                 _eol_text = _eol.decode("utf-8")
                 all_edits = _eol_text.join(
@@ -2110,6 +2131,20 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                         f"Unsloth: Metadata branding patch target not found in {conv_base_py}. "
                         f"Upstream may have refactored Metadata.load again."
                     )
+            elif _UNSLOTH_BRANDING_LINE in patched_content:
+                # The monolith branding patch has no marker of its own, so running it
+                # over content that already carries it inserted a second copy: the
+                # regex matches `Metadata.load(...)` again and the lines it inserted
+                # last time do not stop it. Harmless (the assignments are idempotent
+                # and the file still parses) but it is not convergence, and a checkout
+                # where a previously patched script was copied back over
+                # convert_hf_to_gguf.py grows another copy on every conversion.
+                # The upstream converter never contains this string, so a pristine
+                # checkout is unaffected.
+                logger.info(
+                    "Unsloth: Metadata branding patch already present in the converter "
+                    "(idempotent skip)."
+                )
             else:
                 metadata_patch_applied = False
                 _eol = _dominant_newline(patched_content)
