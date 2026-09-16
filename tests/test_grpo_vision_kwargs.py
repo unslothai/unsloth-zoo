@@ -324,7 +324,13 @@ def test_a_no_grad_pass_this_reader_cannot_parse_does_not_turn_vision_off(
     monkeypatch, tmp_path
 ):
     """Fail open: a rewritten replacement that names no keys must not be read as naming none
-    of them, which would drop pixel_values and train on the text alone."""
+    of them, which would drop pixel_values and train on the text alone.
+
+    The source here is READABLE and merely unrecognised, which is the opposite case to
+    test_a_companion_whose_source_cannot_be_read_falls_back_to_the_released_keys: there the
+    text cannot be obtained at all, so there is nothing to conclude and the released set is
+    assumed. Here the companion is visibly doing something this reader does not model, and
+    narrowing on that would turn vision off on a guess."""
     _install_companion(
         monkeypatch,
         tmp_path,
@@ -390,7 +396,16 @@ def test_the_companion_probe_reads_the_really_installed_unsloth():
     keys = _rl.grpo_companion_vision_keys()
     patcher = getattr(installed, "grpo_trainer__get_per_token_logps_and_entropies", None)
     assert patcher is not None, "unsloth no longer exposes the no-grad replacement to probe"
-    shares = "grpo_get_vision_inputs" in inspect.getsource(patcher)
+    # The gate's own marker list, not a copy of it. Either name means the companion reads this
+    # module's tuple, and unslothai/unsloth#11031 is chunker-only: it collects the keys in a
+    # module level helper and names only grpo_vision_chunks inside the replacement. Naming one
+    # marker here meant that once that companion was installed production returned all eleven
+    # keys while this test asserted a strict subset, so the integration test failed against
+    # the exact companion it exists to validate. Reusing the constant is right for THIS test,
+    # whose job is only to classify whatever package is installed; the four mock tests above
+    # pin each shape with literal source text, so a wrong constant is still caught there.
+    installed_source = inspect.getsource(patcher)
+    shares = any(marker in installed_source for marker in _rl.GRPO_SHARED_HELPER_MARKERS)
     if shares:
         assert keys == _rl.GRPO_VISION_KEYS
     else:

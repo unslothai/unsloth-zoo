@@ -921,6 +921,13 @@ GRPO_RELEASED_VISION_KEYS = (
     "mm_token_type_ids",
 )
 
+# The names whose presence in the installed unsloth's no-grad replacement means it reads THIS
+# module's key tuple rather than a list of its own. Either one is enough: unslothai/unsloth#11031
+# collects the keys in a module level helper and names only the chunker inside the replacement.
+# One constant rather than two literals per site, because the integration test has to ask the
+# same question the gate asks and a second copy of the answer drifts.
+GRPO_SHARED_HELPER_MARKERS = ("grpo_get_vision_inputs", "grpo_vision_chunks")
+
 # Memo for grpo_companion_vision_keys. Set once per process; tests reset it to None.
 _GRPO_COMPANION_VISION_KEYS = None
 
@@ -965,8 +972,8 @@ def grpo_companion_vision_keys():
             # about the process, so a later call gets to look again.
             source = None
             unreadable = True
-    shares = source is not None and (
-        "grpo_get_vision_inputs" in source or "grpo_vision_chunks" in source
+    shares = source is not None and any(
+        marker in source for marker in GRPO_SHARED_HELPER_MARKERS
     )
     if source is not None and not shares:
         named = tuple(
