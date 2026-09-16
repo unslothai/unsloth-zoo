@@ -3628,6 +3628,19 @@ def return_lora_modules(
 pass
 
 
+# Parameter-name segments that mark a stacked MoE expert tensor. Matched as a dotted
+# segment ("...mlp.experts.gate_up_proj.lora_A.weight") rather than as a substring, so a
+# dense projection that merely contains the word is not caught. Qwen3 MoE, Qwen3.5/3.6
+# MoE, Gemma 4 MoE and gpt-oss all expose their stacked experts under ".experts.".
+_MOE_EXPERT_LORA_SEGMENTS = ("experts",)
+
+
+def _is_moe_expert_lora_key(key):
+    """True when an adapter key sits on a stacked MoE expert tensor."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return any(part in _MOE_EXPERT_LORA_SEGMENTS for part in key.split("."))
+
+
 @torch.inference_mode
 def load_lora(model, save_directory, load_tensors = False, lora_request_id = None):
     # vllm_lora_already_loaded(model)
@@ -3664,6 +3677,27 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         state_dict = model.state_dict()
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
+
+        # MoE expert adapters must not be shipped to vLLM. Unsloth keeps them stacked
+        # over the whole expert tensor (lora_A (E*r, H), lora_B (2I, E*r)) while vLLM
+        # wants per-expert weights against w13_weight / w2_weight, and nothing here
+        # converts between the two. The filter above matches on ".lora_A." / ".lora_B."
+        # alone, so expert keys sail through it and the shape validation downstream is
+        # bypassed, which means they are accepted and then ignored. The failure is
+        # silent and it is the worst kind: rollouts come from the BASE experts while the
+        # trainer keeps updating the expert adapters, so GRPO scores off-policy samples
+        # and nothing raises. Refuse instead, and say why.
+        _expert_lora_keys = [k for k in state_dict if _is_moe_expert_lora_key(k)]
+        if len(_expert_lora_keys) != 0:
+            raise NotImplementedError(
+                "Unsloth: fast_inference=True does not support LoRA on MoE expert "
+                f"weights yet ({len(_expert_lora_keys)} adapter tensors, e.g. "
+                f"'{_expert_lora_keys[0]}').\n"
+                "vLLM would silently generate from the base experts while training "
+                "updates the adapters, so rollouts would not match the policy.\n"
+                "Use fast_inference=False, or target only the attention and dense MLP "
+                "projections."
+            )
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
