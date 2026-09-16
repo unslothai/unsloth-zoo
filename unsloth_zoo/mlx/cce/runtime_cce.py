@@ -477,12 +477,12 @@ def _build_dlogits_kernel() -> Callable:
             // before the ignore_index check so wide invalid labels that
             // narrow to ignore_index still get NaN, not zero.
             if (isnan(lse[row])) {
-                d_logits[elem] = 0.0f / 0.0f;
+                d_logits[elem] = static_cast<O>(0.0f / 0.0f);
                 continue;
             }
 
             if (target == ignore_index) {
-                d_logits[elem] = 0.0f;
+                d_logits[elem] = static_cast<O>(0.0f);
                 continue;
             }
 
@@ -499,7 +499,7 @@ def _build_dlogits_kernel() -> Callable:
                 float t = fast::tanh(raw / softcap);
                 grad *= (1.0f - t * t);
             }
-            d_logits[elem] = grad;
+            d_logits[elem] = static_cast<O>(grad);
         }
     """
 
@@ -938,6 +938,7 @@ def make_runtime_cce_loss_fused_finalize(
                         ],
                         output_shapes=[logits.shape],
                         output_dtypes=[dlogits_out_dtype],
+                        template=[("O", dlogits_out_dtype)],
                         grid=(total_threads, 1, 1),
                         threadgroup=(256, 1, 1),
                     )[0]
@@ -1064,6 +1065,7 @@ def make_runtime_cce_loss_fused_finalize(
                     ],
                     output_shapes=[logits.shape],
                     output_dtypes=[dlogits_out_dtype],
+                    template=[("O", dlogits_out_dtype)],
                     grid=(total_threads, 1, 1),
                     threadgroup=(256, 1, 1),
                 )[0]
