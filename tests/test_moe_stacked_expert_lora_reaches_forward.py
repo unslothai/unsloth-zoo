@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Expert LoRA must reach the forward for a stacked-expert MoE, whatever forward runs.
 
 `_patched_param_wrapper_forward` does not let PEFT fold an expert LoRA into the stacked
@@ -13,6 +29,7 @@ and a forward that ignores the stash gets handed back to PEFT so the LoRA is app
 
 from __future__ import annotations
 
+import textwrap
 import re
 import sys
 from pathlib import Path
@@ -516,3 +533,94 @@ def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold():
     packed.quant_state = object()
     experts.gate_up_proj = packed
     assert MU._can_fold_moe_lora_through_peft(experts, "gate_up_proj") is False
+
+
+def test_the_probe_retains_no_autograd_graph_for_the_second_forward():
+    """The probe must not keep a graph alive while PEFT's forward allocates its own.
+
+    An earlier shape of this code ran the probe in-band and held its output in a local
+    across the fallback call, so that forward's expert activations stayed resident, by way
+    of the result's grad_fn, while the second forward built its own set. MoE training sits
+    near the memory limit and this happens once per newly probed layer on the FIRST step,
+    so the doubling reads as a first-step OOM that later steps never reproduce.
+
+    `_measure_moe_lora_stash_read` answers it structurally rather than by releasing
+    afterwards: the probe runs under `torch.no_grad()` and its return value is not bound at
+    all, so there is no graph to retain. Both halves are asserted, because either one alone
+    can be lost in a refactor and neither is visible in a passing functional test.
+    """
+    import ast
+    import inspect
+
+    source = textwrap.dedent(inspect.getsource(MU._measure_moe_lora_stash_read))
+    tree = ast.parse(source)
+
+    no_grad_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and getattr(item.context_expr.func, "attr", None) == "no_grad"
+            for item in node.items
+        )
+    ]
+    assert no_grad_calls, "the probe forward is no longer under torch.no_grad()"
+
+    probe_calls = [
+        node
+        for with_node in no_grad_calls
+        for node in ast.walk(with_node)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "base_layer"
+    ]
+    assert probe_calls, "the probe no longer calls wrapper.base_layer under no_grad"
+
+    bound = [
+        node
+        for with_node in no_grad_calls
+        for node in ast.walk(with_node)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+    ]
+    assert not bound, (
+        "the probe forward's output is bound to a name inside the no_grad block; it must "
+        f"stay unbound so nothing survives into the fallback call: {ast.dump(bound[0])}"
+    )
+
+
+def test_the_probe_result_never_reaches_the_peft_fallback():
+    """The same property from the outside: when PEFT's forward runs, no local in the
+    patched forward is holding a tensor that carries a grad_fn."""
+    import inspect
+
+    assert MU.patch_param_wrapper_for_moe()
+    active = MU._load_cached_moe_utils_module() or MU
+    original = active._original_param_wrapper_forward
+    assert original is not None, "nothing recorded PEFT's original forward"
+    retained = []
+
+    def watching_original(self, x, *args, **kwargs):
+        frame = inspect.currentframe().f_back
+        if frame.f_code.co_name == "_patched_param_wrapper_forward":
+            retained.append(
+                sorted(
+                    name
+                    for name, value in frame.f_locals.items()
+                    if isinstance(value, torch.Tensor) and value.grad_fn is not None
+                )
+            )
+        return original(self, x, *args, **kwargs)
+
+    active._original_param_wrapper_forward = watching_original
+    try:
+        model = _build(_StashIgnoringExperts)
+        model(_inputs()).sum().backward()
+    finally:
+        active._original_param_wrapper_forward = original
+
+    assert retained, "PEFT's forward was never reached, so this asserts nothing"
+    for names in retained:
+        assert names == [], (
+            f"the patched forward still holds graph-carrying tensors while PEFT's forward "
+            f"runs, so both forwards' activations are resident at once: {names}"
+        )
