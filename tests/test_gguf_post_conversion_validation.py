@@ -323,6 +323,27 @@ def test_a_missing_middle_shard_is_reported(llama_cpp, tmp_path):
     )
 
 
+def test_a_corrupt_later_shard_is_reported_as_a_problem(llama_cpp, tmp_path):
+    """Present but unreadable is exactly as unloadable as absent.
+
+    Shard 1 is fine, so every metadata check passes and the declared count is satisfied; the
+    corrupt shard was only logged, and the documented empty list is what a caller uses to
+    ACCEPT a downloaded split model. That caller was being told the set was fine.
+    """
+    first = write_gguf(tmp_path / "b-00001-of-00002.gguf", keys = UNIVERSAL,
+                       tensors = {"blk.0.attn_q.weight": None})
+    corrupt = tmp_path / "b-00002-of-00002.gguf"
+    corrupt.write_bytes(b"not a gguf at all")
+
+    problems = llama_cpp.gguf_metadata_problems(first)
+    assert any("b-00002-of-00002.gguf" in problem for problem in problems), problems
+    assert any("could not be read" in problem for problem in problems), problems
+
+    # The advisory pass stays quiet: this is a structural fault and the fatal pass has it, so
+    # reporting it twice would read like two separate faults.
+    assert llama_cpp.gguf_metadata_warnings(first) == []
+
+
 def test_a_complete_shard_set_reports_nothing_missing(llama_cpp, tmp_path):
     """The control: the check must not fire on a set that is all there."""
     first = write_gguf(tmp_path / "c-00001-of-00002.gguf", keys = UNIVERSAL,

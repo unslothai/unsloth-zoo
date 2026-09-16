@@ -188,6 +188,45 @@ def test_try_guarded_requirements_are_advisory(mod):
     assert not certain
 
 
+def test_type_checking_imports_are_advisory(mod):
+    """`if TYPE_CHECKING: from gguf... import X` is the documented way to import a name for
+    annotations only, and the branch is False at run time: the import never executes, so a
+    gguf without X still imports the module. Counting it as certain made a working converter
+    look unusable and could repin or abandon it over a symbol nothing reads."""
+    source = (
+        b"from typing import TYPE_CHECKING\n"
+        b"if TYPE_CHECKING:\n"
+        b"    from gguf.future import TypeOnly\n"
+    )
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.future.TypeOnly" in advisory
+    assert not certain
+
+    # Every spelling the converters use, plus the literal that means the same thing.
+    for test in (b"typing.TYPE_CHECKING", b"t.TYPE_CHECKING", b"False"):
+        certain, advisory = mod._gguf_requirements_from_source(
+            b"if " + test + b":\n    from gguf.future import TypeOnly\n"
+        )
+        assert "gguf.future.TypeOnly" in advisory, test
+        assert not certain, test
+
+    # The ELSE branch is the one that really runs, so it stays certain.
+    source = (
+        b"if TYPE_CHECKING:\n"
+        b"    from gguf.future import TypeOnly\n"
+        b"else:\n"
+        b"    from gguf.vocab import Real\n"
+    )
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.vocab.Real" in certain
+    assert "gguf.future.TypeOnly" in advisory
+
+    # An `if` this cannot prove false keeps its eager reading: nothing else is claimed.
+    source = b"import os\nif os.environ.get('X'):\n    from gguf.vocab import Real\n"
+    certain, _ = mod._gguf_requirements_from_source(source)
+    assert "gguf.vocab.Real" in certain
+
+
 def test_unrelated_names_are_ignored(mod):
     source = b"import numpy\nother = notgguf.MODEL_ARCH.X\nfrom ggufextra import Y\n"
     certain, advisory = mod._gguf_requirements_from_source(source)

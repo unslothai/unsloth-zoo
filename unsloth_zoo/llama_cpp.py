@@ -2822,11 +2822,39 @@ def _gguf_requirements_from_source(source_bytes):
                 visit_body(child, False)
             elif isinstance(child, ast.Try):
                 visit(child, False)
+            elif isinstance(child, ast.If) and _is_type_checking_test(child.test):
+                # `if TYPE_CHECKING: from gguf... import X` is the documented way to import a
+                # name for annotations only, and the branch is FALSE at run time, so the
+                # import never executes and a `gguf` without X still imports this module
+                # fine. Counting it as certain made a working converter look unusable and
+                # could repin or abandon it for a symbol nothing reads. Advisory, like a try
+                # body. The else branch is the one that really runs, so it keeps `eager`.
+                for statement in child.body:
+                    visit(ast.Module(body = [statement], type_ignores = []), False)
+                for statement in child.orelse:
+                    visit(ast.Module(body = [statement], type_ignores = []), eager)
             else:
                 visit(child, eager)
 
     visit(tree, True)
     return certain, advisory - certain
+
+
+def _is_type_checking_test(test):
+    """True for an `if` whose body cannot run at import time.
+
+    `TYPE_CHECKING` is False at run time by definition, under any of the spellings the
+    converters use -- the bare name, `typing.TYPE_CHECKING`, `t.TYPE_CHECKING` -- and so is a
+    literal `if False:`. Nothing else is claimed: an `if` this cannot prove false keeps its
+    eager reading, which is the conservative direction.
+    """
+    if isinstance(test, ast.Constant):
+        return test.value is False
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    if isinstance(test, ast.Attribute):
+        return test.attr == "TYPE_CHECKING"
+    return False
 
 
 def _extract_dict_values_from_conversion_init(conv_init_path, dict_name):
@@ -4379,14 +4407,28 @@ def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
         return []
 
     tensor_names = []
+    unreadable_shards = []
     for path, shard_reader in readers:
         if shard_reader is None:
+            unreadable_shards.append(os.path.basename(path))
             logger.warning(
                 f"Unsloth: could not read shard {path} while checking GGUF "
                 f"metadata; its tensors are not part of the check."
             )
             continue
         tensor_names.extend(tensor.name for tensor in shard_reader.tensors)
+
+    if unreadable_shards and report_structural:
+        # A later shard that cannot be read is exactly as unloadable as a missing one, and
+        # this function's documented empty list is what a caller uses to ACCEPT a downloaded
+        # split model. Logging it and returning [] told that caller the shard set was fine.
+        # Fatal pass only, like every other structural answer here: the advisory pass would
+        # otherwise report the same fault twice.
+        listed = ", ".join(f"`{name}`" for name in unreadable_shards)
+        return [
+            f"{len(unreadable_shards)} of this split model's shards could not be read "
+            f"({listed}), so llama.cpp cannot load it"
+        ]
 
     if not any(name.startswith("blk.") for name in tensor_names):
         # No transformer blocks: a vocabulary-only or otherwise non-model GGUF.
