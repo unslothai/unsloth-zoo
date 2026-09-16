@@ -151,15 +151,13 @@ def test_trainer_source_pins_resolution_rule():
     assert 'return 0.0, 0.0, 1.0, "leaf_norm"' in src
 
 
-def test_source_distinguishes_leaf_norm_from_elementwise_value_clip():
-    """Pin the API split: value is elementwise, leaf_norm is proportional."""
-    import inspect
-    from unsloth_zoo.mlx import trainer as T
+def test_leaf_norm_and_value_clipping_have_distinct_results():
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_by_value
 
-    value_src = inspect.getsource(T._clip_grad_by_value)
-    leaf_src = inspect.getsource(T._clip_grad_by_leaf_norm)
-
-    assert "mx.clip" in value_src
-    assert "mx.sqrt(mx.sum" in leaf_src
-    assert "return g * scale.astype(g.dtype)" in leaf_src
-    assert "mx.clip" not in leaf_src
+    grad = {"weight": mx.array([3.0, 4.0])}
+    value_clipped = _clip_grad_by_value(grad, 2.0)
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, 2.5)
+    np.testing.assert_allclose(np.array(value_clipped["weight"]), [2.0, 2.0])
+    np.testing.assert_allclose(np.array(leaf_clipped["weight"]), [1.5, 2.0], rtol=1e-6)
