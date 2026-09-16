@@ -772,3 +772,88 @@ def test_the_guard_stays_cheap_on_a_large_adapter():
 
     assert unresolved, "a wholly unplaced adapter must be reported"
     assert elapsed < 60, f"the guard took {elapsed:.1f}s on 1000 modules"
+
+
+# ---------------------------------------------------------------------------
+# Packed (mxfp4) targets carry no `.weight`
+# ---------------------------------------------------------------------------
+
+def test_a_packed_target_gets_a_logical_shape_so_the_bridge_is_still_reported(tmp_path, monkeypatch):
+    """An mxfp4 target is `<module>_blocks` + `<module>_scales` and has no `.weight`.
+
+    `_safetensor_module_key` answers None for both, so the module had no entry in
+    `disk_module_shapes` at all and `_unresolved_lora_targets` dropped it at
+    `disk_shape is None`. The merge's own count cannot catch that either: it resolves both
+    sides with the same key resolution, so the target leaves the expected count AND the
+    written count and the mismatch cancels. Both the detector and the count then omit the
+    same adapter and the export reports success over base weights, which is the #5290 shape
+    this refusal exists to prevent.
+
+    `_blocks` is `(out, G, B)` with two 4-bit values per byte, so the dequantized width is
+    `G * B * 2`: 32 x 32 x 2 = 2048 here.
+    """
+    from safetensors.torch import save_file
+
+    monkeypatch.setattr(SU, "_get_checkpoint_conversion_mapping", lambda name: {})
+
+    shard = "model-00001-of-00001.safetensors"
+    tensors = {}
+    for i in range(4):
+        module = f"model.layers.{i}.self_attn.q_proj"
+        tensors[f"{module}_blocks"] = torch.zeros(2048, 32, 32, dtype = torch.uint8)
+        tensors[f"{module}_scales"] = torch.zeros(2048, 32, dtype = torch.uint8)
+    save_file(tensors, os.path.join(str(tmp_path), shard))
+
+    disk_keys, disk_shapes = SU._disk_module_shapes(str(tmp_path), [shard])
+
+    # The raw names are still reported as written, which is what the backing test reads.
+    assert "model.layers.0.self_attn.q_proj_blocks" in disk_keys
+    assert "model.layers.0.self_attn.q_proj_scales" in disk_keys
+    # And the module now has a logical shape, which it did not before.
+    assert disk_shapes.get("model.layers.0.self_attn.q_proj") == (2048, 2048)
+
+    # So a LoRA sitting under a different prefix is reported rather than silently skipped.
+    keys = [f"model.language_model.layers.{i}.self_attn.q_proj" for i in range(4)]
+    unresolved = _unresolved_lora_targets(
+        _fake_lora_weights(keys, (2048, 2048)), disk_keys, disk_shapes, _VL_CLASS,
+    )
+    assert list(unresolved) == [("model.language_model.", "model.")]
+    assert len(unresolved[("model.language_model.", "model.")]) == 4
+
+
+def test_a_packed_moe_stack_is_not_given_a_two_dimensional_shape(tmp_path):
+    """Only the rank-3 `_blocks` case is recorded.
+
+    `_lora_target_logical_shape` is always `(out_features, in_features)`, so a 3D expert
+    stack could never equal it, and inventing a 2-tuple for one would be a claim the
+    comparison is not entitled to make.
+    """
+    from safetensors.torch import save_file
+
+    shard = "model-00001-of-00001.safetensors"
+    save_file(
+        {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks":
+                torch.zeros(4, 512, 16, 16, dtype = torch.uint8),
+            "model.layers.0.mlp.experts.gate_up_proj_scales":
+                torch.zeros(4, 512, 16, dtype = torch.uint8),
+        },
+        os.path.join(str(tmp_path), shard),
+    )
+
+    _, disk_shapes = SU._disk_module_shapes(str(tmp_path), [shard])
+    assert "model.layers.0.mlp.experts.gate_up_proj" not in disk_shapes
+
+
+def test_a_blocks_tensor_with_no_scales_partner_is_not_given_a_shape(tmp_path):
+    """The pair is the evidence; a lone `_blocks` is not an mxfp4 target."""
+    from safetensors.torch import save_file
+
+    shard = "model-00001-of-00001.safetensors"
+    save_file(
+        {"model.layers.0.self_attn.q_proj_blocks": torch.zeros(2048, 32, 32, dtype = torch.uint8)},
+        os.path.join(str(tmp_path), shard),
+    )
+
+    _, disk_shapes = SU._disk_module_shapes(str(tmp_path), [shard])
+    assert "model.layers.0.self_attn.q_proj" not in disk_shapes

@@ -3585,6 +3585,34 @@ def merge_and_overwrite_lora(
             f"for model_type={getattr(getattr(_merge_base_model, 'config', None), 'model_type', '?')}."
         )
 
+    # Native mxfp4 save preserves _blocks/_scales instead of merging, so a LoRA on a packed
+    # tensor is not written; don't treat it as backed there. Shared with the Step-7 count.
+    #
+    # Read BEFORE the FP8 pre-rewrite below, which clears base_model_is_quantized and
+    # quant_type. Same value either way: that rewrite only runs for quant_type "fp8" and this
+    # is only False for "mxfp4", so the two branches are mutually exclusive.
+    _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
+
+    # Refuse a silently partial merge before this function mutates a single staged shard.
+    # Ahead of the FP8 MoE pre-rewrite below as well as of the seeding and the merge loop:
+    # that pre-rewrite dequantizes EVERY staged shard, so a refusal after it would have
+    # rewritten the whole checkpoint before saying no. Nothing is lost by checking first --
+    # a seeded tensor is a `modules_to_save` weight with no adapter, which the accounting
+    # excludes either way, and the pre-rewrite changes dtypes rather than key names, so the
+    # resolution this reads is the same on both sides of it.
+    #
+    # It still cannot precede Step 2's `upload_items()`, which replaces config.json and the
+    # tokenizer on the remote: `final_safetensors_list` is only built after that upload, so
+    # moving the check above it means enumerating the staged shards earlier. A push that
+    # refuses here therefore leaves those two files already updated on the remote, and the
+    # weights untouched. That is a smaller gap than the one this move closes, and it is
+    # written down rather than implied by a docstring that claimed nothing had been touched.
+    _check_lora_merge_is_complete(
+        save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
+        tie_word_embeddings = _merge_tie_word_embeddings,
+        count_packed_mxfp4 = _count_packed_mxfp4,
+    )
+
     # FP8 MoE-expert LoRA + merged_16bit: the dense FP8 rewrite cannot fuse per-expert
     # adapters, so dequantize the whole model to 16bit first (dense rewrite with no LoRA +
     # cross-shard scale cleanup), then merge the expert adapters with the standard 16bit MoE
@@ -3616,10 +3644,6 @@ def merge_and_overwrite_lora(
     _fp8_prerewrite_keys = _collect_fp8_weight_keys(save_directory, final_safetensors_list) if _fp8_post_cleanup else set()
     _defer_low_disk = low_disk_space_usage and push_to_hub and _fp8_post_cleanup
 
-    # Native mxfp4 save preserves _blocks/_scales instead of merging, so a LoRA on a packed
-    # tensor is not written; don't treat it as backed there. Shared with the Step-7 count.
-    _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
-
     # A LoRA target the key resolution cannot place is excluded from BOTH sides of the
     # Step-7 count, so an under-merge writes base weights and still reports success
     # (#5290). Account for it here and refuse rather than hand back a checkpoint that
@@ -3630,12 +3654,6 @@ def merge_and_overwrite_lora(
     # index, so a refusal after it would already have mutated the staging directory and the
     # remote. Nothing is lost by checking first: a seeded tensor is a `modules_to_save`
     # weight with no adapter, which the accounting excludes either way.
-    _check_lora_merge_is_complete(
-        save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
-        tie_word_embeddings = _merge_tie_word_embeddings,
-        count_packed_mxfp4 = _count_packed_mxfp4,
-    )
-
     # A trained head the base checkpoint never had is invisible to the in-place shard rewrite,
     # so put it on disk before the loop. Scoped to merged_16bit: the mxfp4 and native-quant
     # paths preserve packed base tensors, so a seeded 16bit head there would not reload.
@@ -4917,10 +4935,40 @@ def _disk_module_shapes(save_directory, safetensors_list):
         if not os.path.exists(path): continue
         try:
             with safe_open(path, framework = "pt", device = "cpu") as f:
-                for key in f.keys():
+                file_keys = set(f.keys())
+                for key in file_keys:
                     keys.add(key)
                     module_key = _safetensor_module_key(key)
-                    if module_key is None: continue
+                    if module_key is None:
+                        # An mxfp4 target is stored as `<module>_blocks` + `<module>_scales`
+                        # and has no `.weight`, so it reached here with no shape at all and
+                        # `_unresolved_lora_targets` skipped it at `disk_shape is None`. The
+                        # merge's own count cannot see that omission either -- it resolves
+                        # both sides the same way, so the target drops out of the expected
+                        # AND the written count and the mismatch cancels -- which is the
+                        # #5290 shape, silently reporting success over base weights.
+                        #
+                        # `_blocks` is `(*out, G, B)` with two 4-bit values per byte, so the
+                        # dequantized width is `G * B * 2`; `_choose_mxfp4_processing_strategy`
+                        # unpacks the same `*prefix, G, B` and sizes its output at `B * 2`.
+                        # Only the rank-3 case is recorded, because
+                        # `_lora_target_logical_shape` is always `(out_features,
+                        # in_features)` and a 3D MoE stack could never equal it.
+                        #
+                        # Safe if the packing convention is ever different: a wrong shape
+                        # simply fails the equality test and the candidate is skipped, which
+                        # is exactly today's behaviour. It cannot manufacture a refusal.
+                        if key.endswith("_blocks") and (key[: -len("_blocks")] + "_scales") in file_keys:
+                            packed_key = key[: -len("_blocks")]
+                            try:
+                                blocks_shape = tuple(f.get_slice(key).get_shape())
+                            except Exception:
+                                blocks_shape = None
+                            if blocks_shape is not None and len(blocks_shape) == 3:
+                                shapes[packed_key] = (
+                                    blocks_shape[0], blocks_shape[1] * blocks_shape[2] * 2,
+                                )
+                        continue
                     try:
                         shapes[module_key] = tuple(f.get_slice(key).get_shape())
                     except Exception:
@@ -5019,12 +5067,18 @@ pass
 def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights,
                                   model_class_name, tie_word_embeddings = False,
                                   count_packed_mxfp4 = True):
-    """Refuse a silently partial merge before anything in the staging directory is touched.
+    """Refuse a silently partial merge before any staged shard is touched.
 
-    Deliberately ahead of both the trained-head seeding and the merge loop: seeding
-    rewrites a shard and re-uploads config.json, and the loop overwrites shards in place,
-    so raising after either would leave a mutated staging directory (and, when pushing, a
-    mutated remote) for the caller to clean up.
+    Deliberately ahead of the FP8 MoE pre-rewrite, the trained-head seeding and the merge
+    loop: the pre-rewrite dequantizes every staged shard, seeding rewrites a shard and
+    re-uploads config.json, and the loop overwrites shards in place, so raising after any
+    of them would leave a mutated staging directory for the caller to clean up.
+
+    NOT ahead of everything, and the docstring used to say otherwise. On a push, Step 2 has
+    already uploaded config.json and the tokenizer by the time this can run, because
+    `final_safetensors_list` is built after that upload. A refusal therefore leaves those
+    two files updated on the remote beside untouched weights. Closing that needs the staged
+    shards enumerated before the first upload.
 
     Returns what it found, so a caller can report it; an empty result means the merge can
     place every LoRA-bearing module.
