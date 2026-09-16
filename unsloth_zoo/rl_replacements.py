@@ -873,13 +873,9 @@ pass
 RL_REPLACEMENTS["_warn_deprecated_n_chunks"] = _warn_deprecated_n_chunks
 
 
-# The multimodal keys TRL's GRPO trainer stores in the inputs dict it hands to
-# compute_loss, and forwards into its own per-token logprob helper. Both Unsloth GRPO
-# logprob paths read this one tuple: the no-grad old/reference pass in
-# unsloth.models.rl_replacements._get_per_token_logps_and_entropies and the gradient
-# pass in grpo_accumulated_loss below. A key added here therefore reaches both, which
-# is the point: the two paths must forward the same inputs or the importance ratio
-# compares two different policies. See unslothai/unsloth#6960.
+# The multimodal keys TRL's GRPO trainer puts in the inputs dict. Both Unsloth logprob
+# paths read this one tuple: they must forward the same inputs, or the importance ratio
+# compares two different policies. unslothai/unsloth#6960.
 GRPO_VISION_KEYS = (
     "pixel_values",
     "image_grid_thw",
@@ -887,10 +883,8 @@ GRPO_VISION_KEYS = (
     "image_sizes",
     "spatial_shapes",
     "num_tiles",
-    # The same Gemma 4 metadata under both names TRL has given it: `pixel_position_ids`
-    # in TRL 1.0.x, renamed `image_position_ids` in 1.1.0. Both are read, because the key
-    # tuple has to cover every TRL an installed Unsloth can be sitting next to, and only
-    # one of the two is ever present in a given inputs dict.
+    # One Gemma 4 field under both TRL names: pixel_position_ids in 1.0.x, renamed in
+    # 1.1.0. Only ever one of the two is present.
     "image_position_ids",
     "pixel_position_ids",
     "num_images",
@@ -912,28 +906,20 @@ RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
 
 
 def grpo_vision_chunks(vision, total_samples, batch_size):
-    """Slice the GRPO multimodal inputs into per-chunk forward kwargs.
+    """Slice the GRPO multimodal inputs into per-chunk forward kwargs, one dict per chunk.
 
-    One implementation for both Unsloth GRPO logprob paths, so the no-grad pass and the
-    gradient pass cannot index the same tensors differently. The indexing mirrors TRL's
-    own ``_get_per_token_logps_and_entropies``:
+    One implementation for both logprob paths, so they cannot index the same tensors
+    differently. The axis per family mirrors TRL's own ``_get_per_token_logps_and_entropies``:
 
-    * ``image_grid_thw`` models (Qwen2-VL and relatives) index ``pixel_values`` by patch
-      row and ``image_grid_thw`` by image.
-    * ``image_position_ids`` models (Gemma 4) index ``pixel_values`` and
-      ``image_position_ids`` by image. ``pixel_position_ids``, the TRL 1.0.x name for the
-      same thing, is read and forwarded under its own name.
-    * ``spatial_shapes`` models (LFM2-VL) index ``pixel_values``,
-      ``pixel_attention_mask`` and ``spatial_shapes`` by tile, with ``num_tiles`` giving
-      the tiles per sample.
-    * ``num_tiles`` alone (InternVL) indexes ``pixel_values`` by tile.
-    * anything else indexes ``pixel_values`` by image when there is one row per image,
-      and by sample otherwise.
+    * ``image_grid_thw`` (Qwen2-VL): ``pixel_values`` by patch row, the grid by image.
+    * ``image_position_ids`` (Gemma 4): both by image.
+    * ``spatial_shapes`` (LFM2-VL): ``pixel_values``, ``pixel_attention_mask`` and
+      ``spatial_shapes`` by tile, with ``num_tiles`` giving the tiles per sample.
+    * ``num_tiles`` alone (InternVL): ``pixel_values`` by tile.
+    * anything else: by image when there is one row per image, else by sample.
 
-    Returns one dict per chunk holding only the keys that are actually present, ready to
-    splat into the model call. A model whose metadata keys are not recognised still gets
-    its ``pixel_values``, which is what stock TRL does; dropping them silently recomputes
-    the reference logprobs from the text alone.
+    An unrecognised model still gets its ``pixel_values``, as stock TRL does; dropping
+    them silently recomputes the reference logprobs from the text alone.
     """
     import torch
 
@@ -962,9 +948,8 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
     pixel_attention_mask = vision.get("pixel_attention_mask", None)
     image_sizes = vision.get("image_sizes", None)
     spatial_shapes = vision.get("spatial_shapes", None)
-    # One local for both spellings: TRL 1.0.x called it pixel_position_ids and 1.1.0
-    # renamed it image_position_ids, and the model kwarg is named the same as the inputs
-    # key, so the name it arrived under is the name it has to leave under.
+    # One local for both spellings, but it must leave under the name it arrived with:
+    # the model kwarg is named the same as the inputs key.
     image_position_ids = vision.get("image_position_ids", None)
     position_ids_key = "image_position_ids"
     if image_position_ids is None:
@@ -989,8 +974,7 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         rows_per_image = image_grid_thw.prod(dim = -1)
         rows_per_sample = torch.split(rows_per_image, num_images)
         rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
-        # Indexed with .item() inside the loop, so keep it on CPU: otherwise every chunk
-        # pays a GPU to CPU sync.
+        # .item() in the loop below, so keep it on CPU or every chunk pays a sync.
         cum_rows = torch.cat(
             [
                 torch.tensor([0], device = rows_per_sample.device),
@@ -1023,7 +1007,6 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             img_start, img_end = int(cum_imgs[start]), int(cum_imgs[end])
 
         if pixel_values is None:
-            # Text-only rows: only image_sizes can still be present, indexed per sample.
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
             chunks.append(chunk)
@@ -1055,7 +1038,6 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
         elif image_position_ids is not None:
-            # Gemma 4: pixel_values and the position ids are both indexed by image.
             if img_start is None:
                 chunk["pixel_values"] = pixel_values[start:end]
                 chunk[position_ids_key] = image_position_ids[start:end]
@@ -1067,8 +1049,6 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
         elif spatial_shapes is not None:
-            # LFM2-VL: pixel_values, pixel_attention_mask and spatial_shapes are all tile
-            # indexed, and num_tiles carries the tiles per sample.
             if cum_tiles is not None:
                 tile_start, tile_end = int(cum_tiles[start]), int(cum_tiles[end])
             elif img_start is not None and _first_dim_len(spatial_shapes) == total_images:
@@ -1082,7 +1062,6 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
         elif cum_tiles is not None:
-            # InternVL: pixel_values alone is tile indexed.
             tile_start, tile_end = int(cum_tiles[start]), int(cum_tiles[end])
             chunk["pixel_values"] = pixel_values[tile_start:tile_end]
             if pixel_attention_mask is not None:
@@ -1090,7 +1069,6 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             if image_sizes is not None:
                 chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
         else:
-            # One row of pixel_values per image (Gemma 3, SmolVLM), else one per sample.
             if img_start is not None and _first_dim_len(pixel_values) == total_images:
                 chunk["pixel_values"] = pixel_values[img_start:img_end]
             else:
@@ -1126,10 +1104,7 @@ def grpo_accumulated_loss(
     except Exception:
         pass
 
-    # One shared key tuple with unsloth.models.rl_replacements, so the no-grad logprob
-    # pass there and this gradient pass forward the same multimodal inputs. Body-local
-    # import for the same reason as the call above: this function's source is copied into
-    # the generated UnslothGRPOTrainer cache without unsloth_zoo's module imports.
+    # Body-local: this source is copied into the generated trainer without its imports.
     from unsloth_zoo.rl_replacements import (
         grpo_get_vision_inputs as _grpo_get_vision_inputs,
         grpo_vision_chunks as _grpo_vision_chunks,
@@ -1275,9 +1250,7 @@ def grpo_accumulated_loss(
         attention_mask_chunks.append(attention_mask[start:end])
         completion_ids_chunks.append(completion_input_ids[start:end])
 
-    # Shared with the no-grad logprob pass, so the two never slice the same tensors
-    # differently, and so a model whose metadata key is not image_grid_thw still gets its
-    # pixel_values forwarded instead of silently dropped (unslothai/unsloth#6960).
+    # Shared with the no-grad pass, so the two cannot slice the same tensors differently.
     vision_chunks = _grpo_vision_chunks(vision_inputs, total_samples, batch_size)
 
     zipped_inputs = zip(
