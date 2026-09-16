@@ -325,3 +325,64 @@ def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
         "unsloth_zoo no longer force-disables UNSLOTH_ENABLE_CCE for torch >= 2.8; the "
         "sm75 warning's advice depends on this and has to be revisited"
     )
+
+
+@pytest.mark.parametrize(
+    "capabilities, affected_indices",
+    [
+        # The heterogeneous host from the report: device 0 is an A100 and the current
+        # device at import, while a device_map can put lm_head on the T4 at index 1.
+        ([(8, 0), (7, 5)], [1]),
+        ([(7, 5), (8, 0)], [0]),
+        ([(7, 5), (7, 5)], [0, 1]),
+        # NEGATIVE CONTROLS: a homogeneous host that is not sm_75 is untouched, and so is
+        # a host with no devices at all.
+        ([(8, 0), (9, 0)], []),
+        ([], []),
+    ],
+)
+def test_every_visible_device_is_asked_not_just_the_current_one(
+    monkeypatch, capabilities, affected_indices
+):
+    """`torch.cuda.get_device_capability()` with no argument describes the CURRENT device,
+    but a supported device_map can place lm_head on another GPU. Guessing wrong is not a
+    slow path: the kernel aborts the process with an LLVM error nothing can catch."""
+    import torch
+
+    loss_utils = importlib.import_module("unsloth_zoo.loss_utils")
+    monkeypatch.setattr(loss_utils, "triton_version", "3.3.1")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: len(capabilities))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = 0: capabilities[index])
+
+    affected = loss_utils._triton_miscompiles_cce_on_any_visible_device()
+    assert [index for index, _major, _minor in affected] == affected_indices
+
+
+def test_a_working_triton_leaves_every_device_alone(monkeypatch):
+    """The other control: sm_75 is only a problem on the two broken triton releases, so a
+    T4 host on triton 3.4.0 must come back empty and keep CCE."""
+    import torch
+
+    loss_utils = importlib.import_module("unsloth_zoo.loss_utils")
+    monkeypatch.setattr(loss_utils, "triton_version", "3.4.0")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = 0: (7, 5))
+
+    assert loss_utils._triton_miscompiles_cce_on_any_visible_device() == []
+
+
+def test_a_device_that_cannot_be_queried_is_skipped_not_fatal(monkeypatch):
+    """Import-time code on a partly broken driver must not take the import down with it."""
+    import torch
+
+    loss_utils = importlib.import_module("unsloth_zoo.loss_utils")
+    monkeypatch.setattr(loss_utils, "triton_version", "3.3.0")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+
+    def _capability(index = 0):
+        if index == 0:
+            raise RuntimeError("device 0 is unavailable")
+        return (7, 5)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", _capability)
+    assert [i for i, _, _ in loss_utils._triton_miscompiles_cce_on_any_visible_device()] == [1]

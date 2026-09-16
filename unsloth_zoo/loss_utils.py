@@ -68,6 +68,35 @@ def _triton_miscompiles_cce_on_sm75(major, minor, version = triton_version):
 pass
 
 
+def _triton_miscompiles_cce_on_any_visible_device():
+    """Every visible CUDA device this triton would miscompile the CCE kernel for, as
+    [(index, major, minor), ...].
+
+    Asked of all of them because `torch.cuda.get_device_capability()` with no argument
+    describes the CURRENT device, while a `device_map` can place `lm_head` anywhere. On a
+    heterogeneous host that turns the import-time reading into a guess about the wrong GPU,
+    and the consequence of guessing wrong is not a slow path: the kernel aborts the process
+    with `LLVM ERROR: Unsupported rounding mode for conversion`, which nothing can catch.
+    A host with no affected device is unchanged, since the list is then empty.
+    """
+    affected = []
+    try:
+        count = torch.cuda.device_count()
+    except Exception:
+        return affected
+    for index in range(count):
+        try:
+            device_major, device_minor = torch.cuda.get_device_capability(index)
+        except Exception:
+            continue
+        # `triton_version` passed rather than left to the default, which binds at
+        # definition time and so cannot be substituted by a caller or a test.
+        if _triton_miscompiles_cce_on_sm75(device_major, device_minor, triton_version):
+            affected.append((index, device_major, device_minor))
+    return affected
+pass
+
+
 if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
     # whether a device is present before asking what it can do. Cut cross
@@ -76,10 +105,16 @@ if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
+    # Every VISIBLE device, not just the current one. A supported device_map can place
+    # lm_head on another GPU, so on a heterogeneous host the kernel can execute on an
+    # sm_75 while device 0 is an sm_80 and the import-time reading said it was safe. The
+    # failure is `LLVM ERROR: Unsupported rounding mode for conversion`, which aborts the
+    # process rather than raising, so the conservative answer is the only usable one.
+    _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
         (not (Version(triton_version) < Version("3.0.0"))) and \
-        (not _triton_miscompiles_cce_on_sm75(major, minor)):
+        (not _miscompiling_devices):
         try:
             from cut_cross_entropy import linear_cross_entropy
             HAS_CUT_CROSS_ENTROPY = True
@@ -88,10 +123,14 @@ elif DEVICE_TYPE == "cuda":
     else:
         HAS_CUT_CROSS_ENTROPY = False
     pass
-    if _triton_miscompiles_cce_on_sm75(major, minor):
+    if _miscompiling_devices:
+        _affected = ", ".join(
+            f"cuda:{index} (sm_{device_major}{device_minor})"
+            for index, device_major, device_minor in _miscompiling_devices
+        )
         logger.warning(
             f"Unsloth: triton=={triton_version} miscompiles the cut cross entropy "
-            f"kernel for compute capability {major}.{minor}, so it is disabled and "
+            f"kernel for {_affected}, so it is disabled and "
             f"the standard loss is used instead, at a higher memory cost. torch 2.6.0, "
             f"which carries triton 3.2.0, restores it. torch 2.8.0 and later carry a "
             f"triton that compiles the kernel, but do NOT restore it here: unsloth_zoo "
