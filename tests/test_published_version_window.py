@@ -329,6 +329,18 @@ def _sentinel_resolver_source() -> str:
     return textwrap.dedent(match.group(1))
 
 
+# The resolver is stdlib-only but not stdlib-ANY: it imports `tomllib`, which arrived in
+# CPython 3.11. The job that runs it pins 3.12, so the workflow is fine, and
+# `test_the_sentinel_resolver_runs_on_a_python_that_has_tomllib` below is what keeps that
+# true. The tests here run under whatever interpreter pytest was started with, though, and
+# this repository supports 3.10: under it the subprocess died with
+# `ModuleNotFoundError: No module named 'tomllib'` and both tests failed for a reason that
+# had nothing to do with what they assert. Worse, the negative control still entered its
+# `pytest.raises(AssertionError)` and then failed on the message, which is the shape of a
+# test that has quietly stopped testing.
+_RESOLVER_NEEDS = (3, 11)
+
+
 def _resolve_sentinel(pyproject_text: str, tmp_path: Path) -> list[str]:
     """Run the workflow's own resolver against `pyproject_text`, as the job does."""
     workdir = tmp_path / "repo"
@@ -349,6 +361,57 @@ def _resolve_sentinel(pyproject_text: str, tmp_path: Path) -> list[str]:
     return finished.stdout.strip().splitlines()
 
 
+requires_tomllib = pytest.mark.skipif(
+    sys.version_info < _RESOLVER_NEEDS,
+    reason = (
+        "the core-drift resolver imports tomllib, added in CPython 3.11, and these tests run "
+        "it under the ambient interpreter; the job itself pins 3.12, which "
+        "test_the_sentinel_resolver_runs_on_a_python_that_has_tomllib asserts statically on "
+        "every interpreter, so this skip cannot hide the resolver losing its python"
+    ),
+)
+
+
+def test_the_sentinel_resolver_runs_on_a_python_that_has_tomllib() -> None:
+    """The job carrying the resolver must pin a python new enough to import `tomllib`.
+
+    Static, so it holds on 3.10 as well, which is where the two tests below cannot run.
+    Without this the skip above would be a hole: someone could drop the job's
+    `python-version` to 3.10 and the only tests that execute the resolver would skip
+    rather than fail.
+    """
+    source = _sentinel_resolver_source()
+    if "tomllib" not in source:
+        pytest.skip("the resolver no longer imports tomllib, so there is no floor to hold")
+
+    document = yaml.safe_load(CONSOLIDATED_CI.read_text(encoding = "utf-8"))
+    owners = [
+        name for name, job in (document.get("jobs") or {}).items()
+        if "__from_pyproject__" in yaml.safe_dump(job)
+    ]
+    assert owners, (
+        "no job in consolidated-tests-ci.yml carries the __from_pyproject__ sentinel any "
+        "more; retarget this test or restore the step"
+    )
+    for name in owners:
+        job = document["jobs"][name]
+        pinned = [
+            str(step.get("with", {}).get("python-version"))
+            for step in (job.get("steps") or [])
+            if str(step.get("uses", "")).startswith("actions/setup-python")
+            and (step.get("with") or {}).get("python-version") is not None
+        ]
+        assert pinned, f"job {name} runs the tomllib resolver without pinning a python"
+        for version in pinned:
+            parts = tuple(int(part) for part in version.split(".")[:2])
+            assert parts >= _RESOLVER_NEEDS, (
+                f"job {name} pins python {version} and its resolver imports tomllib, which "
+                f"needs {'.'.join(str(p) for p in _RESOLVER_NEEDS)} or newer; the lane would "
+                f"die on ModuleNotFoundError before resolving the cap"
+            )
+
+
+@requires_tomllib
 def test_the_ci_sentinel_resolves_to_the_off_darwin_half(tmp_path) -> None:
     """The core-drift lane is Linux, so it has to install the Linux half of the cap.
 
@@ -381,6 +444,7 @@ def test_the_ci_sentinel_resolves_to_the_off_darwin_half(tmp_path) -> None:
         assert ";" not in spec
 
 
+@requires_tomllib
 def test_the_ci_sentinel_refuses_two_different_off_darwin_specs(tmp_path) -> None:
     """Negative control, so the test above cannot pass by the resolver doing nothing.
 
