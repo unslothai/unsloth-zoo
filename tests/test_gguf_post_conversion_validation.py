@@ -28,6 +28,7 @@ network, no model and no llama.cpp build.
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -696,7 +697,43 @@ def test_the_read_back_announces_itself_and_reports_its_cost(llama_cpp, tmp_path
     assert "Reading the GGUF back" in out
     assert "UNSLOTH_GGUF_VERIFY=0" in out, "the opt-out must be named where the cost is paid"
     assert "does not grow with the model" in out
-    assert "Verified 1 GGUF file(s) in " in out and "s." in out
+    # Not "Verified 1": this file could not be read, so no metadata or tensor check ran on
+    # it. Reporting it as verified told the user a gate had passed that never executed.
+    assert "Verified" not in out, out
+    assert "No GGUF file could be read back, so none was verified." in out
+
+
+def test_a_file_that_was_really_checked_is_the_one_counted(llama_cpp, tmp_path, capsys):
+    """The other half. A readable, correct export still reports its count and its cost, so
+    the change is about honesty rather than about going quiet."""
+    path = write_gguf(tmp_path / "ok.gguf", keys = UNIVERSAL,
+                      tensors = {"blk.0.attn_q.weight": None})
+    llama_cpp._verify_converted_gguf([path], "bf16", print_output = True)
+    out = capsys.readouterr().out
+    assert "Verified 1 GGUF file(s) in " in out and "s." in out, out
+
+
+def test_an_unreadable_shard_is_not_counted_alongside_a_readable_file(
+    llama_cpp, tmp_path, capsys, monkeypatch
+):
+    """Two exports, one readable and one not: the count is one, not two."""
+    good = write_gguf(tmp_path / "good.gguf", keys = UNIVERSAL,
+                      tensors = {"blk.0.attn_q.weight": None})
+    bad = tmp_path / "bad.gguf"
+    bad.write_bytes(b"not a gguf")
+
+    real_open = llama_cpp._gguf_open_shards
+
+    def _open(target):
+        if os.path.basename(str(target)) == "bad.gguf":
+            return [(str(target), None)]
+        return real_open(target)
+
+    monkeypatch.setattr(llama_cpp, "_gguf_open_shards", _open)
+    llama_cpp._verify_converted_gguf([good, str(bad)], "bf16", print_output = True)
+    out = capsys.readouterr().out
+    assert "Verified 1 GGUF file(s) in " in out, out
+    assert "Verified 2" not in out, out
 
 
 def test_the_announcement_is_not_printed_when_verification_is_off(llama_cpp, tmp_path, capsys,
@@ -828,76 +865,43 @@ def test_a_location_outside_a_gguf_package_is_refused(llama_cpp, tmp_path):
     assert llama_cpp._gguf_tree_of_location(str(moved / "__init__.py")) is None
 
 
-@pytest.mark.parametrize(
-    "value, expected",
-    [
-        ("0.17.1", (0, 17, 1)),
-        ("0.9.0", (0, 9, 0)),
-        # A suffix stops the parse at the last numeric component rather than failing it.
-        ("0.18.0.dev0", (0, 18, 0)),
-        ("1.0", (1, 0)),
-        ("", None),
-        (None, None),
-        ("not-a-version", None),
-    ],
-)
-def test_the_version_parse_orders_what_it_can_and_refuses_the_rest(llama_cpp, value, expected):
-    assert llama_cpp._gguf_version_tuple(value) == expected
-    if expected is not None:
-        assert llama_cpp._gguf_version_tuple("0.9.0") < llama_cpp._gguf_version_tuple("0.17.1")
+def test_the_readback_always_uses_the_tree_that_wrote_the_file(llama_cpp, tmp_path):
+    """No version comparison. Which package wrote the bytes is the only thing actually
+    known, and it is what the file has to be read with.
 
-
-def test_an_older_parent_reads_back_with_the_childs_tree(llama_cpp, tmp_path, monkeypatch):
-    """The whole point. Candidate zero pins nothing, so the read-back used to run against
-    the parent's `gguf`; where that is older than the converter's, every reader comes back
-    None and the gate -- metadata, tensor sanity and the missing-shard check -- degrades
-    into a warning and the file is published unverified."""
+    Version ordering cannot establish compatibility here: llama.cpp's vendored `gguf-py`
+    and the PyPI wheel both report their own numbers, a fork and a release can report the
+    SAME number with different contents, and a parent that omits `__version__` says nothing
+    at all. Every one of those used to fall back to the parent's package, which is the
+    degradation this helper exists to prevent.
+    """
     tree, location = _fake_gguf_tree(tmp_path)
     import sys as _sys
-    monkeypatch.setitem(
-        _sys.modules, "gguf", __import__("types").SimpleNamespace(__version__ = "0.9.0"),
-    )
-    report = {"location": location, "version": "0.17.1"}
-    assert llama_cpp._gguf_readback_tree(report) == tree
+    import types as _types
+    for parent_version in ("0.9.0", "0.17.1", "0.99.0", None):
+        _sys.modules["gguf"] = _types.SimpleNamespace(__version__ = parent_version)
+        try:
+            assert llama_cpp._gguf_readback_tree(
+                {"location": location, "version": "0.17.1"},
+            ) == tree, parent_version
+        finally:
+            _sys.modules.pop("gguf", None)
+
+    # And with no version reported by the child either, since the child's report is only
+    # ever consulted for `location` now.
+    _sys.modules["gguf"] = _types.SimpleNamespace(__version__ = "0.17.1")
+    try:
+        assert llama_cpp._gguf_readback_tree({"location": location}) == tree
+    finally:
+        _sys.modules.pop("gguf", None)
 
 
-def test_an_equal_or_newer_parent_keeps_reading_with_itself(llama_cpp, tmp_path, monkeypatch):
-    """The healthy install must see no change, and no foreign tree goes on sys.path for
-    nothing."""
-    _tree, location = _fake_gguf_tree(tmp_path)
-    import sys as _sys
-    monkeypatch.setitem(
-        _sys.modules, "gguf", __import__("types").SimpleNamespace(__version__ = "0.17.1"),
-    )
-    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.17.1"}) is None
-    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.9.0"}) is None
-
-
-def test_an_unknowable_version_leaves_the_parent_alone(llama_cpp, tmp_path, monkeypatch):
-    """Cannot establish which is newer, so do not move the parent's resolution."""
-    _tree, location = _fake_gguf_tree(tmp_path)
-    import sys as _sys
-    monkeypatch.setitem(
-        _sys.modules, "gguf", __import__("types").SimpleNamespace(__version__ = None),
-    )
-    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.17.1"}) is None
-
-
-def test_no_gguf_in_the_parent_takes_the_childs_tree(llama_cpp, tmp_path, monkeypatch):
-    """There is nothing to read with, so the child's tree cannot be worse than the warning."""
-    tree, location = _fake_gguf_tree(tmp_path)
-    import builtins
-    real_import = builtins.__import__
-
-    def _no_gguf(name, *args, **kwargs):
-        if name == "gguf":
-            raise ImportError("no module named gguf")
-        return real_import(name, *args, **kwargs)
-
-    import sys as _sys
-    monkeypatch.delitem(_sys.modules, "gguf", raising = False)
-    monkeypatch.setattr(builtins, "__import__", _no_gguf)
-    assert llama_cpp._gguf_readback_tree({"location": location, "version": "0.17.1"}) == tree
+def test_a_report_with_no_usable_location_still_changes_nothing(llama_cpp, tmp_path):
+    """The one refusal that stays: a location that is not a `gguf` package directory would
+    put the wrong tree on the parent's sys.path, which is worse than the warning."""
+    assert llama_cpp._gguf_readback_tree(None) is None
+    assert llama_cpp._gguf_readback_tree({}) is None
+    assert llama_cpp._gguf_readback_tree({"location": "/nowhere/gguf/__init__.py"}) is None
 
 
 def test_the_conversion_passes_the_derived_tree_to_the_verifier(llama_cpp):
@@ -906,3 +910,52 @@ def test_the_conversion_passes_the_derived_tree_to_the_verifier(llama_cpp):
     read the file back with the parent's gguf exactly as before."""
     source = Path(llama_cpp.__file__).read_text()
     assert "gguf_py_dir = _gguf_py_pin or _gguf_readback_tree(_gguf_report)," in source
+
+
+# ---------------------------------------------------------------------------
+# A projector has no vocabulary, and that is not a defect
+# ---------------------------------------------------------------------------
+
+class _BareTokenizer:
+    bos_token_id = 1
+    eos_token_id = 2
+    pad_token_id = None
+    unk_token_id = None
+
+
+def test_a_projector_gguf_is_not_rejected_for_having_no_vocabulary(llama_cpp, tmp_path):
+    """A VLM conversion returns the text model AND the `clip` mmproj, and callers hand that
+    whole list to `assert_correct_gguf`.
+
+    An mmproj holds a vision encoder, not a vocabulary, so it legitimately carries no
+    `tokenizer.ggml.tokens`. Running the tokenizer pass over it reported a missing
+    vocabulary and rejected every otherwise valid multimodal conversion. The metadata pass
+    already exempts `clip` for the same reason.
+    """
+    path = write_gguf(
+        tmp_path / "model.F16-mmproj.gguf", architecture = "clip",
+        tensors = {"v.blk.0.attn_q.weight": None},
+    )
+    # No raise: this is the whole assertion.
+    llama_cpp.assert_correct_gguf(path, _FakeModel({}), _BareTokenizer(), sample_size = 4)
+
+
+def test_the_text_model_still_has_its_vocabulary_checked(llama_cpp, tmp_path):
+    """The exemption must not become a hole. A text GGUF with no vocabulary is still a
+    defect, which is what the tokenizer pass is for."""
+    path = write_gguf(
+        tmp_path / "text.gguf", architecture = "llama", keys = UNIVERSAL,
+        tensors = {"blk.0.attn_q.weight": None},
+    )
+    with pytest.raises(RuntimeError) as raised:
+        llama_cpp.assert_correct_gguf(path, _FakeModel({}), _BareTokenizer(), sample_size = 4)
+    assert "tokenizer" in str(raised.value).lower(), raised.value
+
+
+def test_the_exemption_is_read_from_the_metadata_pass_constant(llama_cpp):
+    """Spelled once. A second copy of "clip" would drift the moment another dummy
+    architecture is added to the metadata exemption."""
+    source = Path(llama_cpp.__file__).read_text()
+    body = source[source.index("def _assert_correct_gguf("):source.index("def assert_correct_gguf(")]
+    assert "GGUF_METADATA_EXEMPT_ARCHITECTURES" in body
+    assert '"clip"' not in body, "the architecture name is re-spelled instead of imported"

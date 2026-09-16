@@ -3117,56 +3117,33 @@ def _gguf_tree_of_location(location):
     return os.path.dirname(package)
 
 
-def _gguf_version_tuple(value):
-    """A dotted version as a tuple of ints, ignoring any suffix. None when unusable."""
-    if not isinstance(value, str) or not value.strip():
-        return None
-    parts = []
-    for chunk in value.strip().split("."):
-        digits = ""
-        for character in chunk:
-            if not character.isdigit():
-                break
-            digits += character
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts) or None
-
-
 def _gguf_readback_tree(report):
-    """The tree to read a fresh GGUF back with, when the parent's own `gguf` is behind it.
+    """The tree to read a fresh GGUF back with: the one the converter child used.
 
     Candidate zero -- the requested converter with the environment untouched -- is the
     common path and deliberately pins nothing, because changing a working child's
     environment is the one thing this resolver must not do. But the pin was also what told
     `_verify_converted_gguf` which `gguf` wrote the file, so on that path the read-back ran
-    against whatever the PARENT happens to have. Where the parent has an older wheel, or no
-    `gguf` at all, every reader comes back None and the whole gate -- the required metadata,
-    the tensor sanity pass and the missing-shard check this PR adds -- degrades into one
-    warning and the file is published unverified.
+    against whatever the PARENT happens to have. Where the parent has a different package,
+    every reader comes back None and the whole gate -- the required metadata, the tensor
+    sanity pass and the missing-shard check -- degrades into one warning and the file is
+    published unverified.
 
     The probe report already names the package the child resolved, so the read-back tree is
-    derivable without touching the child at all. Returned only when it would be an
-    improvement: no `gguf` in the parent, or a strictly older one. Equal or newer parents
-    keep reading with themselves, so the healthy install sees no change and no foreign tree
-    is put on sys.path for nothing.
+    derivable without touching the child at all.
+
+    Returned whenever it is derivable, with no version comparison. Version ordering cannot
+    establish compatibility here: llama.cpp's vendored `gguf-py` and the PyPI `gguf` wheel
+    both report their own numbers, a fork and a release can report the SAME number with
+    different contents, and a parent that omits `__version__` says nothing at all. The only
+    thing that is actually known is which package wrote the bytes, and that is what the
+    file has to be read with. It is also what the pinned path already does unconditionally,
+    so the two paths now agree rather than applying different rules to the same question.
+
+    `use_local_gguf` snapshots and restores `sys.path` and every `gguf` module, so this
+    scopes the pin to the read-back and leaves an outer caller's resolution alone.
     """
-    tree = _gguf_tree_of_location((report or {}).get("location"))
-    if not tree:
-        return None
-    try:
-        import gguf as _parent_gguf  # type: ignore
-    except Exception:
-        # Nothing in the parent to read with, so the child's tree is the only option there
-        # is and using it cannot be worse than the warning.
-        return tree
-    child = _gguf_version_tuple((report or {}).get("version"))
-    parent = _gguf_version_tuple(getattr(_parent_gguf, "__version__", None))
-    if child is None or parent is None:
-        # Cannot establish which is newer. Leave the parent's resolution alone.
-        return None
-    return tree if child > parent else None
+    return _gguf_tree_of_location((report or {}).get("location"))
 
 
 def _resolve_converter_and_gguf(converter_location, python_exe, architecture = None):
@@ -4622,6 +4599,9 @@ def _verify_converted_gguf(
             )
     # One entry per split set, so a 40 shard export is checked once.
     checked = set()
+    # Separate from `checked`, which is only there to stop a 40 shard export being reopened
+    # 40 times. This one is what the closing message counts.
+    verified = set()
     started = time.perf_counter()
     for output_file in output_files:
         shards = _gguf_shard_siblings(output_file)
@@ -4660,6 +4640,10 @@ def _verify_converted_gguf(
                 f"GGUF exports checked before they are published."
             )
             continue
+        # Counted here, after the unreadable check, not when the set was first seen: a set
+        # that could not be read had no metadata or tensor check run on it, and reporting
+        # it as verified tells the user a gate passed that never executed.
+        verified.add(shards[0])
         problems = gguf_metadata_problems(output_file, readers = readers)
         if _gguf_holds_only_float_tensors(readers):
             problems = problems + gguf_tensor_problems(output_file, readers = readers)
@@ -4679,9 +4663,14 @@ def _verify_converted_gguf(
             f"https://github.com/unslothai/unsloth/issues, and set "
             f"UNSLOTH_GGUF_VERIFY=0 if you need the file anyway."
         )
-    if print_output and checked:
-        print(f"Unsloth: Verified {len(checked)} GGUF file(s) in "
+    if print_output and verified:
+        print(f"Unsloth: Verified {len(verified)} GGUF file(s) in "
               f"{time.perf_counter() - started:.1f}s.")
+    elif print_output and checked:
+        # Every set was skipped, so there is nothing to report as verified and saying
+        # nothing at all would read as "it passed". The per-file warning above already
+        # named which ones and why.
+        print("Unsloth: No GGUF file could be read back, so none was verified.")
 
 
 # GGUF special token id key -> the tokenizer attribute holding the same id.
@@ -4841,7 +4830,14 @@ def _assert_correct_gguf(model_name, model, tokenizer, sample_size = None):
         )
 
     problems = list(gguf_metadata_problems(model_name, readers = readers))
-    problems += _gguf_tokenizer_problems(tokenizer, reader)
+    # Not on a projector. A VLM conversion returns the text model AND the `clip` mmproj,
+    # and callers hand that whole list straight to this function. An mmproj legitimately
+    # carries no `tokenizer.ggml.tokens` -- it holds a vision encoder, not a vocabulary --
+    # so the tokenizer pass reported a missing vocabulary and every otherwise valid
+    # multimodal conversion was rejected. Same exemption the metadata pass already applies,
+    # read from the same constant rather than re-spelled, so the two cannot drift.
+    if _gguf_field_text(reader, GGUF_ARCHITECTURE_KEY) not in GGUF_METADATA_EXEMPT_ARCHITECTURES:
+        problems += _gguf_tokenizer_problems(tokenizer, reader)
     problems += _gguf_shape_problems(model, readers, sample_size)
     problems += gguf_tensor_problems(model_name, sample_size = sample_size, readers = readers)
 
