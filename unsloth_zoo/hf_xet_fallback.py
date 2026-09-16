@@ -695,13 +695,15 @@ def _baseline_incomplete_blob_names(
             blobs_dir = entry / "blobs"
             if not blobs_dir.is_dir():
                 continue
-            # Per-blob, as the sizes scan does: one unreadable blob is not a failed scan.
+            # NOT per-blob, unlike the sizes scan: a name this scan misses is a name the
+            # ownership subtraction then credits to our child. A transient FUSE or permission
+            # failure on one entry that clears before the stall-time scan made a pre-existing
+            # sibling partial appear in `current - baseline`, exempt from the age and
+            # live-writer guards, and it was unlinked mid-write. An entry that cannot be
+            # inspected makes the whole baseline unknown, which is what None is for.
             for blob in blobs_dir.iterdir():
-                try:
-                    if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
-                        names.add(blob.name)
-                except OSError:
-                    pass
+                if blob.is_file() and blob.name.endswith(INCOMPLETE_SUFFIX):
+                    names.add(blob.name)
         return names
     except Exception:
         return None
@@ -746,11 +748,50 @@ def _incomplete_partial_names(
     return names
 
 
+# Whether the LAST walk below could read every process it listed. A process whose open files
+# are unreadable -- a sibling downloader running under another UID on a shared cache, which is
+# what `psutil.AccessDenied` means here -- is invisible to the probe, so the set it returns is
+# a lower bound and "no live writer" is not a fact. The caller weighs that against who can
+# write into the cache at all; see `_cache_is_private_to_this_user`. Module level rather than a
+# second return value so a caller (or a test) that holds the existing one-value contract is
+# unaffected.
+_LIVE_WRITER_WALK_WAS_COMPLETE = True
+
+
+def _cache_is_private_to_this_user(cache_dir: Optional[str] = None) -> bool:
+    """Whether only THIS user can write partials into the cache.
+
+    It decides whether a process the probe could not read matters: a downloader under another
+    UID can only be writing here if another UID can write here at all. On POSIX that is the
+    ownership and the group/other write bits of the cache root itself. Where there is no uid to
+    compare -- Windows -- containment in this user's home stands in for it, which is where the
+    default cache lives; anything else is treated as shared, i.e. not private.
+
+    False whenever it cannot be established, so the uncertain answer is the careful one.
+    """
+    try:
+        root = hf_cache_root(cache_dir = cache_dir)
+        if root is None:
+            return False
+        info = os.stat(root)
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is not None:
+            if info.st_uid != geteuid():
+                return False
+            return not bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+        home = Path.home().resolve()
+        return home in Path(root).resolve().parents or Path(root).resolve() == home
+    except Exception:
+        return False
+
+
 def _blobs_with_a_live_writer() -> Optional[set]:
     """Basenames of every ``*.incomplete`` blob some LIVE process holds open, or ``None`` when this
     host cannot answer (no psutil, no open-file table) and the caller must decline. Walks every
     visible process, unlike ``_child_open_incomplete_blobs``; an uninspectable one is skipped, so
-    the set is a LOWER bound."""
+    the set is a LOWER bound -- and `_LIVE_WRITER_WALK_WAS_COMPLETE` records whether it is one."""
+    global _LIVE_WRITER_WALK_WAS_COMPLETE
+    _LIVE_WRITER_WALK_WAS_COMPLETE = True
     try:
         import psutil  # type: ignore
     except ImportError:
@@ -762,8 +803,14 @@ def _blobs_with_a_live_writer() -> Optional[set]:
                 for handle in proc.open_files():
                     if handle.path.endswith(INCOMPLETE_SUFFIX):
                         open_blobs.add(os.path.basename(handle.path))
+            except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                # Gone between the listing and the read, so it holds nothing: not a gap.
+                continue
             except Exception:
-                continue     # one unreadable process is not a reason to abandon the rest
+                # One unreadable process is not a reason to abandon the rest, but it IS a
+                # reason not to call the result proof of absence.
+                _LIVE_WRITER_WALK_WAS_COMPLETE = False
+                continue
     except Exception:
         return None
     return open_blobs
@@ -780,6 +827,13 @@ def _unowned_partials_safe_to_clear(
     required: older than *active_grace*, and open by no live process, which age cannot establish."""
     live_writers = _blobs_with_a_live_writer()
     if live_writers is None:
+        return None
+    if not _LIVE_WRITER_WALK_WAS_COMPLETE and not _cache_is_private_to_this_user(cache_dir):
+        # A process this host would not let us read is a possible writer, and on a cache
+        # another user can write into it is a LIKELY one: unlinking an aged partial there
+        # interrupts that sibling's download mid-write, which age alone can never rule out.
+        # Where nobody else can write into the cache, the processes we could not read cannot
+        # be writing here, so the lower bound is exact for this cache and the pass proceeds.
         return None
     owned = owned_incomplete_blobs or set()
     now = time.time()

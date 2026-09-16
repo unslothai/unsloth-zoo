@@ -635,9 +635,10 @@ def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
     orphan.symlink_to(os.path.relpath(blobs / _blob_name("tokenizer.model"), snap))
     assert orphan.is_symlink() and not orphan.exists()
 
-    from unsloth_zoo.hf_cache_state import has_active_incomplete_blobs
-
-    assert has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is True
+    # The module handle this file already loaded hermetically, not a package import: the real
+    # `unsloth_zoo/__init__` raises when the separate `unsloth` install is missing, and the CI
+    # job that runs this suite standalone installs it best-effort.
+    assert hcs.has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is True
     before = _identity(tmp_path)
 
     survivors = xf._clear_unsafe_partials_for_http(
@@ -645,7 +646,7 @@ def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
     )
     assert survivors == set(), survivors
     assert not orphan.is_symlink(), "the orphan link survived, so the caller still forces"
-    assert has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is False
+    assert hcs.has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is False
     # And nothing that was verified was touched: that is the whole point of staying blob-scoped.
     assert _identity(tmp_path) == before
     for name in INTACT:
@@ -690,3 +691,100 @@ def test_an_unremovable_orphan_link_is_reported_as_a_survivor(monkeypatch, tmp_p
     )
     assert survivors == {IN_FLIGHT}, survivors
     assert (snap / IN_FLIGHT).is_symlink()
+
+
+def test_a_process_we_cannot_read_stops_the_unowned_purge_on_a_shared_cache(
+    monkeypatch, tmp_path
+):
+    """The open-file walk is a LOWER bound, and it was being read as proof of absence.
+
+    A sibling downloader under another UID raises AccessDenied on `open_files()`, so its
+    partial looks writer-less; past the grace it was unlinked mid-write. Age cannot rule that
+    out -- a paused or retrying writer touches nothing for minutes -- which is why the probe
+    exists in the first place.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+
+    class _Denied(Exception):
+        pass
+
+    class _Proc:
+        def open_files(self):
+            raise _Denied("not yours")
+
+    class _FakePsutil:
+        NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+        ZombieProcess = type("ZombieProcess", (Exception,), {})
+
+        @staticmethod
+        def process_iter():
+            return [_Proc()]
+
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+    # Shared: another user can write into this cache, so the process we could not read is a
+    # possible writer here.
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None: False)
+    assert xf._blobs_with_a_live_writer() == set()
+    assert xf._LIVE_WRITER_WALK_WAS_COMPLETE is False
+    assert xf._unowned_partials_safe_to_clear(
+        "model", REPO, str(tmp_path), 180.0, None,
+    ) is None
+    assert (tmp_path / REPO_DIR / "blobs" / stranger).exists()
+
+    # Private: nobody else can write here, so the processes we could not read cannot be
+    # writing into THIS cache and the lower bound is exact for it.
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda _cache_dir = None: True)
+    assert xf._unowned_partials_safe_to_clear(
+        "model", REPO, str(tmp_path), 180.0, None,
+    ) == {stranger}
+
+    # A process that simply exited between the listing and the read holds nothing, so it does
+    # not make the walk incomplete.
+    class _Gone:
+        def open_files(self):
+            raise _FakePsutil.NoSuchProcess("gone")
+
+    monkeypatch.setattr(_FakePsutil, "process_iter", staticmethod(lambda: [_Gone()]))
+    assert xf._blobs_with_a_live_writer() == set()
+    assert xf._LIVE_WRITER_WALK_WAS_COMPLETE is True
+
+
+def test_the_private_cache_test_is_about_who_can_write_into_it(tmp_path):
+    """The predicate itself, since the case above pins it to a fixed answer."""
+    cache = tmp_path / "cache"
+    cache.mkdir(mode = 0o700)
+    if hasattr(os, "geteuid"):
+        assert xf._cache_is_private_to_this_user(str(cache)) is True
+        os.chmod(cache, 0o777)
+        assert xf._cache_is_private_to_this_user(str(cache)) is False, (
+            "a world-writable cache is one another user can put a partial in"
+        )
+        os.chmod(cache, 0o750)
+        assert xf._cache_is_private_to_this_user(str(cache)) is True
+        os.chmod(cache, 0o770)
+        assert xf._cache_is_private_to_this_user(str(cache)) is False
+    # A cache that is not there at all cannot be established as private.
+    assert xf._cache_is_private_to_this_user(str(tmp_path / "no-such-cache")) is False
+
+
+def test_a_baseline_entry_that_cannot_be_inspected_is_unknown(monkeypatch, tmp_path):
+    """Per-blob tolerance is wrong on THIS scan.
+
+    Ownership is `current - baseline`, so a name the baseline misses is a name credited to our
+    own child: exempt from the age and live-writer guards, and unlinked. A transient failure on
+    one entry that clears before the stall-time scan is exactly that, so an entry that cannot be
+    read makes the whole baseline unknown.
+    """
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    assert xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path))
+
+    real_is_file = Path.is_file
+
+    def _flaky(self):
+        if self.name.endswith(xf.INCOMPLETE_SUFFIX):
+            raise OSError("transport endpoint is not connected")
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", _flaky)
+    assert xf._baseline_incomplete_blob_names("model", REPO, cache_dir = str(tmp_path)) is None
