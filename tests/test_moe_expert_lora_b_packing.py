@@ -472,16 +472,46 @@ def test_the_grouped_mm_spelling_equals_the_unflatten_spelling(layout, monkeypat
 
 
 def test_the_grouped_mm_second_weight_is_materialised_once(monkeypatch):
-    """Pin the copy count itself, since equality alone would still pass if the second
-    copy came back. A one-copy result is contiguous and owns its storage at exactly the
-    element count of the operand."""
+    """Pin the number of COPIES, not just the final allocation.
+
+    The earlier version of this test checked only that the result was contiguous and
+    owned storage of the right size, which a two-copy path also satisfies: gathering into
+    expert-major order and then permuting to the operand shape allocates the whole tensor
+    twice, on every expert layer of every step. Counting allocating ops is what catches
+    that, so the copy is counted rather than inferred.
+    """
     monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
     E, r, out, in_dim = 4, 3, 7, 5
     weight_B = torch.randn(out, E * r)
     weight_A = torch.randn(E * r, in_dim)
-    _, second = _canonical_lora_weights_for_grouped_mm(weight_A, weight_B, E, r, in_dim, out)
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class _CountCopies(TorchDispatchMode):
+        def __init__(self):
+            self.copies = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            # Only lora_B-sized materialisations count. lora_A's own single copy and the
+            # tiny index tensor built by arange().t().reshape() are not what is being
+            # measured, and the shapes here are chosen so E*r*in and E*r*out differ.
+            name = str(func)
+            if any(op in name for op in ("index_select", "clone", "contiguous", "copy_")):
+                if isinstance(result, torch.Tensor) and result.numel() == E * r * out:
+                    self.copies += 1
+            return result
+
+    with _CountCopies() as counter:
+        _, second = _canonical_lora_weights_for_grouped_mm(
+            weight_A, weight_B, E, r, in_dim, out,
+        )
     assert second.is_contiguous()
     assert second.untyped_storage().size() // second.element_size() == E * r * out
+    assert counter.copies == 1, (
+        f"lora_B was materialised {counter.copies} times; the gather has to emit the "
+        "operand's own layout rather than being permuted afterwards"
+    )
 
 
 @pytest.mark.parametrize("num_experts, rank, out", [(4, 3, 7), (2, 2, 5), (1, 5, 4), (6, 1, 3)])

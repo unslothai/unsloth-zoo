@@ -1028,6 +1028,49 @@ def _moe_lora_b_column_permutation(num_experts, rank_per_expert, device, invert 
     return torch.arange(total, device = device).view(rows, columns).t().reshape(-1)
 
 
+class _ExpertMajorGroupedOperand(torch.autograd.Function):
+    """`(out, E*rank)` -> `(E, rank, out)` for the grouped GEMM, in ONE materialization.
+
+    Gathering into expert-major column order and then permuting to the operand's shape
+    copies the whole tensor twice per projection, on every expert layer of every step.
+    Transposing to `(E*rank, out)` first makes the gather itself produce the operand: the
+    rows land in expert-major order, `index_select` on dim 0 writes a contiguous result,
+    and the final reshape is free.
+
+    Still a real gather, which is the property the grouped GEMM needs: under rank-major
+    packing the expert axis has stride 1, so a pure view chain lets Inductor elide the
+    copy and hand `aten._grouped_mm` an operand that is neither row nor column major.
+    Still saves nothing for the backward either, since the permutation is recomputed from
+    two integers, which is what non-reentrant checkpointing requires."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, weight_B, num_experts, rank_per_expert, layout):
+        ctx.num_experts = num_experts
+        ctx.rank_per_expert = rank_per_expert
+        ctx.layout = layout
+        ctx.dim_B = weight_B.shape[0]
+        rows = weight_B.t()
+        if layout == LORA_B_LAYOUT_RANK_MAJOR:
+            columns = _moe_lora_b_column_permutation(
+                num_experts, rank_per_expert, weight_B.device,
+            )
+            rows = rows.index_select(0, columns)
+        else:
+            rows = rows.contiguous()
+        return rows.reshape(num_experts, rank_per_expert, ctx.dim_B)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rows = grad_output.reshape(ctx.num_experts * ctx.rank_per_expert, ctx.dim_B)
+        if ctx.layout == LORA_B_LAYOUT_RANK_MAJOR:
+            columns = _moe_lora_b_column_permutation(
+                ctx.num_experts, ctx.rank_per_expert, grad_output.device, invert = True,
+            )
+            rows = rows.index_select(0, columns)
+        return rows.t(), None, None, None
+
+
 class _ExpertMajorColumns(torch.autograd.Function):
     """Reorder `lora_B`'s columns expert-major, saving nothing for the backward.
 
@@ -1152,9 +1195,9 @@ def _canonical_lora_weights_for_grouped_mm(
     # unflatten_moe_lora_b and transposing its result materialises the tensor twice, and
     # the extra saved tensor makes non-reentrant gradient checkpointing recompute a
     # different number of tensors than the forward saved.
-    second_weight = _moe_lora_b_columns_expert_major(
-        weight_B, num_experts, rank_per_expert, None,
-    ).reshape(dim_B, num_experts, rank_per_expert).permute(1, 2, 0).contiguous()
+    second_weight = _ExpertMajorGroupedOperand.apply(
+        weight_B, num_experts, rank_per_expert, _resolve_moe_lora_b_layout(None),
+    )
     return first_weight, second_weight
 
 
