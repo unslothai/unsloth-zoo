@@ -625,17 +625,7 @@ def test_import_rechecks_digest_while_holding_lock(
     monkeypatch.setattr(compiler, "get_lock", rewrite_on_import_lock)
 
     if load_path == "direct":
-        real_import = compiler.importlib.import_module
-        failed = False
-
-        def fail_initial_import(module_name, package=None):
-            nonlocal failed
-            if module_name == name and not failed:
-                failed = True
-                raise ImportError("force direct-load recovery")
-            return real_import(module_name, package)
-
-        monkeypatch.setattr(compiler.importlib, "import_module", fail_initial_import)
+        _force_by_name_path_to_fail(monkeypatch, compiler, name)
         with pytest.raises(RuntimeError, match="Direct module loading failed"):
             probe(name, "return x * 2")
         assert name not in sys.modules
@@ -700,7 +690,7 @@ def test_decision_still_hashes_without_process_group(
     """A process without a group takes the same decision, and still digests it.
 
     The digest is not only cross-rank agreement: it is what
-    _verify_cache_digest_under_lock() checks the file against just before the
+    _verified_cache_source() checks the file against just before the
     import, so a single process needs one too or the bytes on disk are executed
     unverified. See tests/test_compiled_cache_fail_closed.py.
     """
@@ -1127,15 +1117,7 @@ def test_remote_direct_load_failure_removes_successful_local_aliases(
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     name = "pr967_remote_direct_failure"
-    real_import = compiler.importlib.import_module
-    failed = False
-
-    def fail_initial_import(module_name, package=None):
-        nonlocal failed
-        if module_name == name and not failed:
-            failed = True
-            raise ImportError("force tempfile recovery")
-        return real_import(module_name, package)
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
 
     real_agreed_error = compiler._agreed_error
 
@@ -1145,7 +1127,6 @@ def test_remote_direct_load_failure_removes_successful_local_aliases(
             return RuntimeError("direct load failed on another rank")
         return real_agreed_error(local_error, operation)
 
-    monkeypatch.setattr(compiler.importlib, "import_module", fail_initial_import)
     monkeypatch.setattr(compiler, "_agreed_error", fail_direct_load_remotely)
 
     with pytest.raises(RuntimeError, match="another rank"):
@@ -1357,17 +1338,7 @@ def test_a_planted_cache_moe_utils_is_kept_off_the_recovery_search_path(
 
     previous_moe_utils = sys.modules.pop("moe_utils", None)
     name = "planted_moe_utils_probe"
-    real_import = compiler.importlib.import_module
-    failed = False
-
-    def fail_once(module_name, package = None):
-        nonlocal failed
-        if module_name == name and not failed:
-            failed = True
-            raise ImportError("force direct-load recovery")
-        return real_import(module_name, package)
-
-    monkeypatch.setattr(compiler.importlib, "import_module", fail_once)
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
     try:
         module = compiler.create_new_function(
             name,
@@ -1424,6 +1395,89 @@ def test_an_extension_module_cannot_shadow_the_verified_source(tmp_path, compile
         compiler._reject_shadowing_import_candidates(str(folder), "victim")
 
 
+
+
+def test_a_planted_pyc_beside_a_verbatim_copy_is_not_importable(tmp_path, compiler):
+    """Matching bytes are necessary and not sufficient.
+
+    A bare `from moe_utils import ...` prefers __pycache__/moe_utils.<tag>.pyc,
+    and an unchecked-hash pyc runs without CPython consulting the source beside
+    it, so an exact copy of the file with a planted pyc next to it would still
+    have executed foreign code. The permission check drops the pyc, and says no
+    when it cannot.
+    """
+    import importlib.util as _util
+
+    folder = tmp_path / "cache"
+    folder.mkdir()
+    copy = folder / "moe_utils.py"
+    shutil.copyfile(_real_moe_utils_path(), copy)
+
+    # Verbatim and with nothing beside it: importable.
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is True
+
+    planted = pathlib.Path(_util.cache_from_source(str(copy)))
+    planted.parent.mkdir(parents = True, exist_ok = True)
+    planted.write_bytes(b"not really a pyc")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is True, (
+        "the check should clear the pyc rather than refuse outright"
+    )
+    assert not planted.exists(), "the planted bytecode survived the check"
+
+    # A folder with no copy in it has nothing to import and nothing to refuse.
+    assert compiler._moe_utils_copy_is_importable(str(tmp_path / "empty")) is True
+
+
+def test_the_bytes_that_run_are_the_bytes_that_were_verified(tmp_path, compiler):
+    """Verifying one open and executing from a later one leaves a window.
+
+    The cache lock is cooperative, so it binds our own ranks and not whoever
+    planted the file: a replacement landing between the digest read and the
+    loader's own open executed without ever matching. _verified_cache_source
+    hands the caller the bytes it checked, and those are what run.
+    """
+    location = tmp_path / "swap_probe.py"
+    genuine = b"VALUE = 'genuine'\n"
+    location.write_bytes(genuine)
+    digest = hashlib.sha256(genuine).hexdigest()
+
+    source = compiler._verified_cache_source(str(location), digest)
+    assert source == genuine
+
+    # The swap the window used to allow, performed in full.
+    location.write_bytes(b"VALUE = 'planted'\n")
+    module = compiler._exec_verified_source(source, str(location), "swap_probe")
+    try:
+        assert module.VALUE == "genuine", (
+            "the loader read the file again instead of the verified bytes"
+        )
+        assert module.__file__ == str(location)
+    finally:
+        sys.modules.pop("swap_probe", None)
+
+
+def _force_by_name_path_to_fail(monkeypatch, compiler, name, once = True):
+    """Make create_new_function fall through to the direct load.
+
+    The seam is _reject_shadowing_import_candidates, which import_module() calls
+    and load_module_directly() does not. It used to be importlib.import_module,
+    but the by-name path no longer calls it: it executes the bytes it verified
+    rather than reopening the path for the loader, so patching that function
+    stopped forcing anything.
+    """
+    real = compiler._reject_shadowing_import_candidates
+    state = {"failed": False}
+
+    def refuse(compile_folder, candidate):
+        if candidate == name and not (once and state["failed"]):
+            state["failed"] = True
+            raise ImportError("force direct-load recovery")
+        return real(compile_folder, candidate)
+
+    monkeypatch.setattr(compiler, "_reject_shadowing_import_candidates", refuse)
+    return state
+
+
 def _real_moe_utils_path():
     """The packaged moe_utils.py, which is the only copy install_to_cache writes."""
     import unsloth_zoo.temporary_patches.moe_utils as _moe_utils
@@ -1458,17 +1512,7 @@ def test_direct_recovery_can_still_import_cache_helpers(
     previous_moe_utils = sys.modules.pop("moe_utils", None)
 
     name = "pr967_recovery_helper"
-    real_import = compiler.importlib.import_module
-    failed = False
-
-    def fail_once(module_name, package=None):
-        nonlocal failed
-        if module_name == name and not failed:
-            failed = True
-            raise ImportError("force direct-load recovery")
-        return real_import(module_name, package)
-
-    monkeypatch.setattr(compiler.importlib, "import_module", fail_once)
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
 
     try:
         module = compiler.create_new_function(
@@ -1515,17 +1559,7 @@ def test_recovered_module_keeps_an_importable_module_identity(
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
 
     name = "pr967_recovered_identity"
-    real_import = compiler.importlib.import_module
-    failed = False
-
-    def fail_once(module_name, package=None):
-        nonlocal failed
-        if module_name == name and not failed:
-            failed = True
-            raise ImportError("force direct-load recovery")
-        return real_import(module_name, package)
-
-    monkeypatch.setattr(compiler.importlib, "import_module", fail_once)
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
 
     try:
         module = compiler.create_new_function(

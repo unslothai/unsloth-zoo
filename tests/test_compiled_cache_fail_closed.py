@@ -226,7 +226,7 @@ def test_unlandable_rewrite_over_planted_bytes_is_not_imported(cache_dir, monkey
 def test_write_decision_carries_a_digest_without_a_process_group(cache_dir):
     """The digest gate has to be armed when no process group exists.
 
-    Without this, `_verify_cache_digest_under_lock` returns immediately and the
+    Without this, `_verified_cache_source` returns immediately and the
     bytes are imported unverified.
     """
     location = str(cache_dir / "UnslothFailClosedProbeDigest.py")
@@ -249,7 +249,7 @@ def test_digest_verification_rejects_bytes_we_did_not_write(cache_dir):
     location.write_text(_PLANTED_SOURCE)
 
     with pytest.raises(RuntimeError, match = "changed after"):
-        compiler._verify_cache_digest_under_lock(str(location), digest)
+        compiler._verified_cache_source(str(location), digest)
 
     assert not _planted_ran()
 

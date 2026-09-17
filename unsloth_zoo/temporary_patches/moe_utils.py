@@ -189,12 +189,11 @@ def _remove_cached_bytecode(source_file):
     return True
 
 
-def cached_copy_is_verbatim(directory) -> bool:
-    """Whether `directory/moe_utils.py` is byte-for-byte this file.
+def cached_copy_is_importable(directory) -> bool:
+    """Whether a generated module may be allowed to import moe_utils from here.
 
-    True when there is no copy there at all: nothing can be imported from it, so
-    nothing needs rejecting. False only for a copy whose bytes install_to_cache()
-    did not put there.
+    True when there is no copy in `directory` at all: nothing can be imported
+    from it, so nothing needs rejecting.
 
     Public because returning None from _load_cached_moe_utils_module() protects
     only its own callers. Generated MoE modules run a bare `from moe_utils import
@@ -202,6 +201,14 @@ def cached_copy_is_verbatim(directory) -> bool:
     sys.path so that import can resolve -- which handed the very copy rejected
     below straight to the import system, top-level payload and all. The caller
     there asks this first and leaves the directory off the path if it says no.
+
+    Matching bytes are necessary and NOT sufficient, which is why this does more
+    than compare and is named for the decision rather than for the comparison. A
+    bare import prefers __pycache__/moe_utils.<tag>.pyc, and an unchecked-hash
+    pyc executes without CPython ever consulting the source beside it, so an
+    exact copy of this file with a planted pyc next to it would still have run
+    foreign code. The pyc is dropped here, and a pyc that cannot be dropped means
+    no.
     """
     try:
         cache_file = os.path.abspath(os.path.join(directory, "moe_utils.py"))
@@ -211,7 +218,9 @@ def cached_copy_is_verbatim(directory) -> bool:
     if cache_file == current_file or not os.path.isfile(cache_file):
         return True
     cached_bytes = _read_file_bytes(cache_file)
-    return cached_bytes is not None and cached_bytes == _read_file_bytes(current_file)
+    if cached_bytes is None or cached_bytes != _read_file_bytes(current_file):
+        return False
+    return _remove_cached_bytecode(cache_file)
 
 
 def _load_cached_moe_utils_module():
