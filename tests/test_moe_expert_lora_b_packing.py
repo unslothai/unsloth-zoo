@@ -450,3 +450,75 @@ def test_both_valid_layouts_still_pass_through_explicitly():
         unflatten_moe_lora_b(weight_B, 2, 2, 6, layout=LORA_B_LAYOUT_RANK_MAJOR),
         unflatten_moe_lora_b(weight_B, 2, 2, 6, layout=LORA_B_LAYOUT_GROUPED_BY_EXPERT),
     )
+
+
+@pytest.mark.parametrize("layout", [LORA_B_LAYOUT_RANK_MAJOR,
+                                    LORA_B_LAYOUT_GROUPED_BY_EXPERT])
+def test_the_grouped_mm_spelling_equals_the_unflatten_spelling(layout, monkeypatch):
+    """The grouped-GEMM path builds (E, rank, out) in one copy instead of unflattening to
+    (E, out, rank) and transposing, because the second copy is an extra saved tensor and
+    breaks non-reentrant gradient checkpointing. One copy and two must still be the same
+    tensor, or the forward silently changes meaning while the tests watch the other one."""
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", layout)
+    E, r, out, in_dim = 4, 3, 7, 5
+    torch.manual_seed(0)
+    weight_B = torch.randn(out, E * r)
+    weight_A = torch.randn(E * r, in_dim)
+
+    _, second = _canonical_lora_weights_for_grouped_mm(weight_A, weight_B, E, r, in_dim, out)
+    expected = unflatten_moe_lora_b(weight_B, E, r, out, layout=layout).transpose(1, 2)
+    assert second.shape == (E, r, out)
+    assert torch.equal(second, expected)
+
+
+def test_the_grouped_mm_second_weight_is_materialised_once(monkeypatch):
+    """Pin the copy count itself, since equality alone would still pass if the second
+    copy came back. A one-copy result is contiguous and owns its storage at exactly the
+    element count of the operand."""
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
+    E, r, out, in_dim = 4, 3, 7, 5
+    weight_B = torch.randn(out, E * r)
+    weight_A = torch.randn(E * r, in_dim)
+    _, second = _canonical_lora_weights_for_grouped_mm(weight_A, weight_B, E, r, in_dim, out)
+    assert second.is_contiguous()
+    assert second.untyped_storage().size() // second.element_size() == E * r * out
+
+
+@pytest.mark.parametrize("num_experts, rank, out", [(4, 3, 7), (2, 2, 5), (1, 5, 4), (6, 1, 3)])
+def test_the_column_reorder_matches_index_select_in_both_directions(num_experts, rank, out):
+    """The reorder has a hand written backward, because index_select saves its index
+    tensor and torch.utils.checkpoint(use_reentrant=False) counts saved tensors. A wrong
+    backward here would be silent, so it is pinned against the spelling it replaced."""
+    from unsloth_zoo.temporary_patches.moe_utils import _ExpertMajorColumns
+
+    torch.manual_seed(0)
+    weight = torch.randn(out, num_experts * rank, dtype=torch.double, requires_grad=True)
+    reference_input = weight.detach().clone().requires_grad_(True)
+    columns = torch.arange(num_experts * rank).view(rank, num_experts).t().reshape(-1)
+
+    reference = reference_input.index_select(1, columns)
+    ours = _ExpertMajorColumns.apply(weight, num_experts, rank)
+    assert torch.equal(ours, reference)
+
+    upstream = torch.randn_like(reference)
+    reference.backward(upstream)
+    ours.backward(upstream)
+    assert torch.equal(weight.grad, reference_input.grad)
+    assert torch.autograd.gradcheck(
+        lambda w: _ExpertMajorColumns.apply(w, num_experts, rank),
+        (torch.randn(out, num_experts * rank, dtype=torch.double, requires_grad=True),),
+    )
+
+
+def test_the_column_reorder_saves_nothing_for_backward():
+    """The whole reason for the custom Function: a saved tensor here is what made the
+    measuring call and its recompute disagree under non-reentrant checkpointing."""
+    from unsloth_zoo.temporary_patches.moe_utils import _ExpertMajorColumns
+
+    saved = []
+    with torch.autograd.graph.saved_tensors_hooks(
+        lambda t: (saved.append(t), t)[1], lambda t: t,
+    ):
+        weight = torch.randn(7, 4 * 3, requires_grad=True)
+        _ExpertMajorColumns.apply(weight, 4, 3).sum().backward()
+    assert saved == [], f"the reorder saved {len(saved)} tensor(s) for backward"

@@ -992,6 +992,72 @@ def _resolve_moe_lora_b_layout(layout) -> str:
     return layout
 
 
+def _moe_lora_b_column_permutation(num_experts, rank_per_expert, device, invert = False):
+    """The column permutation between PEFT's rank-major packing and expert-major order.
+
+    Forward: `out[:, k] = weight_B[:, perm[k]]`. The inverse is the same construction with
+    the two axes swapped, so neither direction needs the other's indices kept around."""
+    total = num_experts * rank_per_expert
+    rows, columns = (num_experts, rank_per_expert) if invert else (rank_per_expert, num_experts)
+    return torch.arange(total, device = device).view(rows, columns).t().reshape(-1)
+
+
+class _ExpertMajorColumns(torch.autograd.Function):
+    """Reorder `lora_B`'s columns expert-major, saving nothing for the backward.
+
+    `index_select` would do this in one line, but it saves its index tensor, and
+    `torch.utils.checkpoint(use_reentrant = False)` counts every saved tensor and refuses
+    when the recompute saves a different number than the forward. The measuring call in
+    `_patched_param_wrapper_forward` already runs the experts forward a different number
+    of times than the recompute does, so one more saved tensor on the default path is
+    enough to turn that into `CheckpointError`, which is transformers 5's default
+    configuration and Unsloth's own distributed vision path.
+
+    The permutation is fully determined by two integers, so the backward rebuilds the
+    inverse from `ctx` rather than from a saved tensor: nothing is saved, the count is
+    unchanged from the pure-view spelling, and the gradient still reaches `lora_B`.
+    A real gather is also what Inductor cannot fold back into a strided view of the
+    source, which is the other half of why this is not a plain `permute`."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, weight_B, num_experts, rank_per_expert):
+        ctx.num_experts = num_experts
+        ctx.rank_per_expert = rank_per_expert
+        columns = _moe_lora_b_column_permutation(
+            num_experts, rank_per_expert, weight_B.device,
+        )
+        return weight_B.index_select(1, columns)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        columns = _moe_lora_b_column_permutation(
+            ctx.num_experts, ctx.rank_per_expert, grad_output.device, invert = True,
+        )
+        return grad_output.index_select(1, columns), None, None
+
+
+def _moe_lora_b_columns_expert_major(weight_B, num_experts, rank_per_expert, layout):
+    """`lora_B`'s columns reordered so the expert index is slowest, without copying.
+
+    Shared by `unflatten_moe_lora_b` and the grouped-GEMM path so the two cannot disagree
+    about the column order, while each finishes with its OWN single permute into the shape
+    it wants. Doing the reorder here and the permute there is what keeps the copy count at
+    one: composing the two public shapes instead (unflatten, then transpose + contiguous)
+    materialises the tensor twice, which is an extra saved tensor and breaks non-reentrant
+    gradient checkpointing, whose recompute must save exactly what the forward did.
+
+    Returns `weight_B` untouched under grouped-by-expert, where the columns already are
+    expert-slowest."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layout = _resolve_moe_lora_b_layout(layout)
+    if layout != LORA_B_LAYOUT_RANK_MAJOR:
+        return weight_B
+    # PEFT packs expert index fastest: column j holds expert `j % num_experts`.
+    return _ExpertMajorColumns.apply(weight_B, num_experts, rank_per_expert)
+
+
 def unflatten_moe_lora_b(
     weight_B: torch.Tensor,
     num_experts: int,
@@ -1021,17 +1087,9 @@ def unflatten_moe_lora_b(
     cannot fold into a view, it keeps the gradient flowing to `lora_B`, and its indices are
     a permutation, so its `index_add` backward has no duplicate targets to reduce
     nondeterministically."""
-    layout = _resolve_moe_lora_b_layout(layout)
-    if layout == LORA_B_LAYOUT_RANK_MAJOR:
-        # PEFT packs expert index fastest: column j holds expert `j % num_experts`.
-        # Gather the columns into expert-major order, then read them the same way the
-        # grouped-by-expert branch below reads its own.
-        columns = torch.arange(
-            num_experts * rank_per_expert, device = weight_B.device,
-        ).view(rank_per_expert, num_experts).t().reshape(-1)
-        weight_B = weight_B.index_select(1, columns)
-    # Expert index slowest, either because it always was or because the gather above just
-    # made it so.
+    weight_B = _moe_lora_b_columns_expert_major(
+        weight_B, num_experts, rank_per_expert, layout,
+    )
     return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
 
 
@@ -1064,10 +1122,13 @@ def _canonical_lora_weights_for_grouped_mm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
     first_weight = first_weight.permute(0, 2, 1).contiguous()
-    # (num_experts, out, rank) -> (num_experts, rank, out) for X @ first @ second.
-    second_weight = unflatten_moe_lora_b(
-        weight_B, num_experts, rank_per_expert, dim_B,
-    ).transpose(1, 2).contiguous()
+    # (num_experts, rank, out) for X @ first @ second, in ONE copy. Going through
+    # unflatten_moe_lora_b and transposing its result materialises the tensor twice, and
+    # the extra saved tensor makes non-reentrant gradient checkpointing recompute a
+    # different number of tensors than the forward saved.
+    second_weight = _moe_lora_b_columns_expert_major(
+        weight_B, num_experts, rank_per_expert, None,
+    ).reshape(dim_B, num_experts, rank_per_expert).permute(1, 2, 0).contiguous()
     return first_weight, second_weight
 
 
