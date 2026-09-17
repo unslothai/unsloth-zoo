@@ -1844,6 +1844,16 @@ def _fold_moe_lora_without_parametrization(
     Nested wrappers compose: the wrapper chain is down_proj -> gate_up_proj -> experts and
     each level folds and restores its own parameter around the next, so both are folded
     for the innermost forward.
+
+    The swap is done inside `_parameters` and nowhere else. `nn.Module.__getattr__` reads
+    the value straight out of that dict, so a plain tensor placed there is what the forward
+    sees, and the module's `__setattr__`, which would reject a plain tensor where a
+    Parameter is registered, is never involved. The obvious alternative, shadowing the
+    name in the instance `__dict__`, is what this used to do and it does not trace:
+    `experts_module.__dict__` is an unknown type to Dynamo, so removing the shadow in the
+    `finally` raises `Unsupported: Dynamo does not know how to trace method 'pop' of class
+    '<unknown type>'` on torch 2.10, the floor this package supports. That turned the
+    fullgraph compile this function exists to make possible back into a hard error.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
@@ -1857,19 +1867,19 @@ def _fold_moe_lora_without_parametrization(
     parameters = getattr(experts_module, "_parameters", None)
     if not isinstance(parameters, dict) or parameter_name not in parameters:
         return None
+    if parameter_name in experts_module.__dict__:
+        # Something already shadows the registered parameter, so swapping `_parameters`
+        # would not reach the forward. Refuse rather than fold into a value nothing reads.
+        return None
     original = parameters[parameter_name]
     folded = _moe_lora_folded_weight(self, original, active)
     if folded is None:
         return None
 
-    parameters.pop(parameter_name)
+    parameters[parameter_name] = folded
     try:
-        # Through __dict__, since the module's __setattr__ would reject a plain tensor
-        # where a Parameter was registered.
-        experts_module.__dict__[parameter_name] = folded
         return immediate_base_layer(x, *args, **kwargs)
     finally:
-        experts_module.__dict__.pop(parameter_name, None)
         parameters[parameter_name] = original
 
 

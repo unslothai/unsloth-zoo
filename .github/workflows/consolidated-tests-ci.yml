@@ -282,6 +282,17 @@ jobs:
         # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
         # neither was executed by any job before.
         #
+        # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
+        # the forward of a stacked-expert family Unsloth has no forward for, which is
+        # what stops an adapter that looks healthy in named_parameters from having no
+        # effect on the output. It belongs in a gate and not in collect-only because
+        # half of it is a fullgraph torch.compile of the fold that replaces PEFT's
+        # parametrization, and that fold is version-sensitive: the first version of it
+        # removed a shadowing entry with `experts_module.__dict__.pop`, which Dynamo
+        # refuses to trace on the torch floor this job installs (>=2.4, <2.11) while
+        # tracing it fine on 2.13. Collecting the file proves only that it imports, so
+        # the compile error was invisible on every check.
+        #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
         # model, which is what stops save_pretrained_merged from writing nothing
@@ -368,6 +379,7 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_moe_stacked_expert_lora_reaches_forward.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \

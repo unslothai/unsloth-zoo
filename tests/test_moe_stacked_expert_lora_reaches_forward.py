@@ -926,6 +926,63 @@ def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper)
         assert parameter_name not in experts.__dict__
 
 
+def test_the_fold_swaps_inside_parameters_and_never_shadows_through_dunder_dict(restore_param_wrapper):
+    """The swap has to be one Dynamo can trace, and `__dict__` is not one.
+
+    Shadowing the registered parameter with an entry in the instance `__dict__` reads
+    correctly and restores correctly, and it is still wrong here: `experts_module.__dict__`
+    is an unknown type to Dynamo, so taking the shadow back out raises `Unsupported:
+    Dynamo does not know how to trace method 'pop' of class '<unknown type>'` on torch
+    2.10, which is inside the range this package supports. Swapping the value inside
+    `_parameters`, which `nn.Module.__getattr__` reads, traces on the whole range.
+    """
+    assert MU.patch_param_wrapper_for_moe()
+    model = _build(_StashIgnoringExperts)
+    wrapper = next(
+        m for m in model.modules()
+        if type(m).__name__ == "ParamWrapper" and m.parameter_name == "gate_up_proj"
+    )
+    experts = wrapper.get_base_layer()
+    original = experts._parameters["gate_up_proj"]
+    seen = {}
+
+    def observe(x, *args, **kwargs):
+        seen["read"] = getattr(experts, "gate_up_proj")
+        seen["shadowed"] = "gate_up_proj" in experts.__dict__
+        return x
+
+    folded = MU._fold_moe_lora_without_parametrization(
+        wrapper, observe, experts, "gate_up_proj", torch.zeros(1), (), {}
+    )
+    assert folded is not None, "the fold refused a plain float parameter"
+    assert not seen["shadowed"], "the fold shadowed the parameter in the instance __dict__"
+    assert seen["read"] is not original, "the forward read the unfolded weight"
+    assert torch.allclose(
+        seen["read"], MU._moe_lora_folded_weight(wrapper, original, list(wrapper.active_adapters)),
+    )
+    assert experts._parameters["gate_up_proj"] is original, "the parameter was not put back"
+    assert "gate_up_proj" not in experts.__dict__
+
+
+def test_the_fold_refuses_a_parameter_something_else_already_shadows(restore_param_wrapper):
+    """NEGATIVE CONTROL: swapping `_parameters` under a shadow folds into a value nothing
+    reads, which is the silent no-op this whole file exists to rule out."""
+    assert MU.patch_param_wrapper_for_moe()
+    model = _build(_StashIgnoringExperts)
+    wrapper = next(
+        m for m in model.modules()
+        if type(m).__name__ == "ParamWrapper" and m.parameter_name == "gate_up_proj"
+    )
+    experts = wrapper.get_base_layer()
+    experts.__dict__["gate_up_proj"] = experts._parameters["gate_up_proj"].detach().clone()
+    try:
+        assert MU._fold_moe_lora_without_parametrization(
+            wrapper, lambda x, *a, **k: x, experts, "gate_up_proj", torch.zeros(1), (), {}
+        ) is None
+    finally:
+        experts.__dict__.pop("gate_up_proj", None)
+
+
 def _install_peft_main_delta_factors(model):
     """PEFT main's `get_delta_factors` on this model's wrappers, for a PEFT without it.
 
