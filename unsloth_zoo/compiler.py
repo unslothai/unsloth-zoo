@@ -2460,7 +2460,18 @@ def raise_logits_error(*args, **kwargs): raise NotImplementedError(LOGITS_ERROR_
 def return_none(*args, **kwargs): return None
 class EmptyLogits:
     def __init__(self): return
-    def raise_getattr_error(self, attr): return return_none if attr == "to" else raise_logits_error
+    def raise_getattr_error(self, attr):
+        if attr == "to": return return_none
+        # A catch-all __getattr__ makes hasattr() true for every name, dunders included, so the
+        # sentinel answers yes to protocol probes it cannot honour. torch.distributed's output cast
+        # tests `hasattr(x, "__dataclass_fields__")` and then calls `dataclasses.replace(x)` on
+        # whatever said yes, so with FSDP2 mixed precision every step died in
+        # `TypeError: replace() should be called on dataclass instances` (unsloth#409, reached
+        # through `_fsdp_state._cast_output_dtype`). Protocol probes get an honest AttributeError;
+        # ordinary attribute access still gets the callable that explains UNSLOTH_RETURN_LOGITS.
+        if len(attr) > 4 and attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {attr!r}")
+        return raise_logits_error
     __getitem__ = raise_logits_error
     __getattr__ = raise_getattr_error
     def __repr__(self): return LOGITS_ERROR_STRING
