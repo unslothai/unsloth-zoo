@@ -1128,3 +1128,35 @@ def test_the_scan_terminates_on_a_recursive_call_graph():
             return _ping(hidden_states)
 
     assert MU._forward_statically_reads_stash(_Recursive()) is False
+
+
+def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
+    """`param + delta` raises for all five float8 dtypes, not the two named originally.
+
+    Naming `float8_e4m3fn` and `float8_e5m2` by hand let the `fnuz` pair that ROCm uses
+    through, so the compiled fold was permitted on a weight it cannot fold, turning a
+    quantized path that used to be left alone into a hard failure. PEFT lists the whole set
+    in `UPCAST_DTYPES`; this pins that we track it rather than restate it.
+    """
+    import torch
+    from unsloth_zoo.temporary_patches.moe_utils import _FLOAT8_STORAGE_DTYPES
+
+    try:
+        from peft.utils import UPCAST_DTYPES
+    except Exception:
+        pytest.skip("this PEFT does not export UPCAST_DTYPES")
+
+    expected = tuple(
+        getattr(torch, name) for name in UPCAST_DTYPES
+        if isinstance(getattr(torch, name, None), torch.dtype)
+    )
+    assert _FLOAT8_STORAGE_DTYPES == expected, (
+        f"drifted from PEFT's UPCAST_DTYPES: {_FLOAT8_STORAGE_DTYPES} != {expected}"
+    )
+    assert len(_FLOAT8_STORAGE_DTYPES) >= 2
+
+    # The reason each one is excluded, rather than an appeal to the list.
+    for dtype in _FLOAT8_STORAGE_DTYPES:
+        assert dtype.is_floating_point, f"{dtype} would already be refused by the float check"
+        with pytest.raises(RuntimeError):
+            torch.zeros(2, 2, dtype=dtype) + torch.zeros(2, 2, dtype=torch.float32)

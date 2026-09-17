@@ -1883,6 +1883,32 @@ def _fold_moe_lora_without_parametrization(
         parameters[parameter_name] = original
 
 
+# PEFT names the float8 storage dtypes it must upcast in `peft.utils.UPCAST_DTYPES`. Track
+# that list rather than restating it, so a dtype PEFT adds later is excluded here too, and
+# fall back to resolving the names off torch for PEFT versions that do not export it. Every
+# one of these raises on `param + delta`, including the fnuz pair ROCm uses.
+def _resolve_float8_storage_dtypes():
+    names = None
+    try:
+        from peft.utils import UPCAST_DTYPES as names
+    except Exception:
+        names = (
+            "float8_e4m3fn", "float8_e4m3fnuz",
+            "float8_e5m2",   "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+        )
+    resolved = []
+    for name in names:
+        dtype = getattr(torch, name, None)
+        # Older torch does not define every float8 variant.
+        if isinstance(dtype, torch.dtype):
+            resolved.append(dtype)
+    return tuple(resolved)
+
+
+_FLOAT8_STORAGE_DTYPES = _resolve_float8_storage_dtypes()
+
+
 def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool:
     """Whether handing this parameter back to PEFT would fold a delta into a real weight.
 
@@ -1909,9 +1935,11 @@ def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool
         return False
     if not param.dtype.is_floating_point:
         return False
-    # `is_floating_point` is True for float8_e4m3fn and float8_e5m2, and PEFT's own
-    # `get_delta_weight` special-cases them precisely because the add is not defined there.
-    if param.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    # `is_floating_point` is True for every float8 storage dtype, and PEFT's own
+    # `get_delta_weight` special-cases them precisely because the add is not defined there:
+    # `param + delta` raises "Promotion for Float8 Types is not supported" for all five, and
+    # naming only the two CUDA ones let the fnuz pair that ROCm uses through.
+    if param.dtype in _FLOAT8_STORAGE_DTYPES:
         return False
     # bitsandbytes stores 4-bit weights in a float or uint8 tensor of the packed shape, and
     # marks them with `quant_state`. Neither the dtype nor the shape gives it away.
