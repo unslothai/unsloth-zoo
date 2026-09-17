@@ -529,3 +529,226 @@ def fused_decode_conv_silu(model):
             for name in ("_unsloth_decode_scopes", "_unsloth_decode_native",
                          "_unsloth_decode_patched"):
                 module.__dict__.pop(name, None)
+
+def _single_row(x):
+    # The fused kernel reduces one row per launch, so anything wider keeps the native path.
+    return x.size == x.shape[-1]
+
+@functools.cache
+def _residual_norm_kernel():
+    if not mx.metal.is_available():
+        return None
+    try:
+        return mx.fast.metal_kernel(
+            name='unsloth_norm_add', input_names=['x', 'w', 'residual', 'scale', 'epsilon'], output_names=['out'],
+            compile_options={'math_mode': 'safe'},
+            source='''
+            // The scope only replaces the native path because it reproduces mx.fast.rms_norm
+            // bit for bit, which pins the arithmetic: each thread folds a contiguous SPAN of
+            // the row, both reduction levels are simd_sum, and the squares accumulate through
+            // fma. Regrouping the spans already diverges on ordinary activations; dropping the
+            // fma needs a row spanning a wide dynamic range to show up.
+            #pragma clang fp contract(off) reassociate(off)
+            constexpr uint LANES = 32;
+            constexpr uint SPAN = 4;
+
+            const uint slot = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = simdgroup_index_in_threadgroup;
+            const uint row = threadgroup_position_in_grid.x * D;
+
+            threadgroup float staged[LANES];
+
+            float kept[SPAN];
+            float square = 0.0f;
+            for (uint i = 0; i < SPAN; ++i) {
+                const uint c = slot * SPAN + i;
+                kept[i] = c < D ? float(x[row + c]) : 0.0f;
+                square = metal::fma(kept[i], kept[i], square);
+            }
+            square = simd_sum(square);
+
+            // Live partials and padding have disjoint writers.
+            if (lane == 0) staged[group] = square;
+            if (slot >= (D + LANES * SPAN - 1) / (LANES * SPAN) && slot < LANES)
+                staged[slot] = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float total = simd_sum(staged[lane]);
+            const float inv = metal::precise::rsqrt(total / D + epsilon);
+
+            for (uint i = 0; i < SPAN; ++i) {
+                const uint c = slot * SPAN + i;
+                if (c < D) {
+                    const T weighted = T(w[c] * T(kept[i] * inv));
+                    const T merged = T(residual[row + c] + weighted);
+                    out[row + c] = SCALED ? T(merged * scale[0]) : merged;
+                }
+            }
+            ''')
+    except (TypeError, RuntimeError):
+        return None
+
+@functools.cache
+def _norm_epsilon(eps):
+    return mx.array(eps, mx.float32)
+
+@mx.compile
+def _norm_add_apply(x, weight, residual, scale, eps, scaled):
+    width = x.shape[-1]
+    group = ((width + 127) // 128) * 32
+    return _residual_norm_kernel()(
+        inputs = [x, weight, residual, scale.reshape(-1), eps],
+        template = [("T", x.dtype), ("D", width), ("SCALED", scaled)],
+        grid = (group, 1, 1), threadgroup = (group, 1, 1),
+        output_shapes = [x.shape], output_dtypes = [x.dtype],
+    )[0]
+
+def _residual_norm_add(norm, x, residual, scale = None):
+    weight = norm.weight if type(norm) is nn.RMSNorm else None
+    if (weight is not None and not norm.training and mx.default_device() == mx.gpu
+            and x.ndim > 0 and x.shape == residual.shape and _single_row(x)
+            and 0 < x.shape[-1] <= 4096 and weight.shape == (x.shape[-1],)
+            and x.dtype in (mx.float16, mx.bfloat16, mx.float32)
+            and x.dtype == weight.dtype == residual.dtype
+            and (scale is None or (isinstance(scale, mx.array) and scale.size == 1 and scale.ndim <= x.ndim
+                                   and scale.dtype == x.dtype))):
+        return _norm_add_apply(x, weight, residual, weight if scale is None else scale,
+                               _norm_epsilon(norm.eps), scale is not None)
+    out = residual + norm(x)
+    return out if scale is None else out * scale
+
+_RESIDUAL_NORM_CONTRACT = {
+    "mlx.nn": {"RMSNorm.__call__": "db2a29e3c13e7ef9"},
+    "mlx.core": {"fast.rms_norm": None},
+}
+
+@functools.cache
+def _residual_norm_class(base):
+    rms = mx.fast.rms_norm
+    if not (type(rms) is type(mx.add) and rms.__module__ == "mlx.core.fast" and rms.__name__ == "rms_norm"):
+        return None
+    call = getattr(base, "__call__", None)
+    if not isinstance(call, FunctionType) or call.__closure__ or hasattr(call, "__wrapped__"):
+        return None
+    try:
+        tree = copy.deepcopy(_function_ast(call))
+    except (OSError, TypeError, SyntaxError, AttributeError):
+        return None
+    names = set()
+    scale = None
+    tail_return = None
+    scale_branch = None
+    if len(tree.body) >= 3 and isinstance(tree.body[-1], ast.Return):
+        tail = tree.body[-2]
+        if (isinstance(tail, ast.If) and not tail.orelse and len(tail.body) == 1
+                and isinstance(tail.test, ast.Compare) and len(tail.test.ops) == 1
+                and isinstance(tail.test.ops[0], ast.IsNot)
+                and isinstance(tail.test.comparators[0], ast.Constant)
+                and tail.test.comparators[0].value is None):
+            product = tail.body[0]
+            if (isinstance(product, ast.Assign) and len(product.targets) == 1
+                    and isinstance(product.targets[0], ast.Name)
+                    and isinstance(product.value, ast.BinOp) and isinstance(product.value.op, ast.Mult)
+                    and _source_expression(product.value.left) == product.targets[0].id
+                    and _source_expression(product.value.right) == _source_expression(tail.test.left)
+                    and isinstance(tail.test.left, ast.Attribute)
+                    and isinstance(tail.test.left.value, ast.Name) and tail.test.left.value.id == "self"
+                    and isinstance(tree.body[-3], ast.If) and not tree.body[-3].orelse
+                    and isinstance(tree.body[-1].value, ast.Tuple)
+                    and all(isinstance(item, ast.Name) for item in tree.body[-1].value.elts)):
+                scale = (product.targets[0].id, tail.test.left)
+                tail_return, scale_branch = tree.body[-1], tree.body[-3]
+
+    def rewrite(body, owner):
+        index = 0
+        while index + 1 < len(body):
+            first, second = body[index:index + 2]
+            if (isinstance(first, ast.Assign) and len(first.targets) == 1
+                    and isinstance(first.targets[0], ast.Name) and isinstance(first.value, ast.Call)
+                    and len(first.value.args) == 1 and not first.value.keywords
+                    and isinstance(first.value.func, ast.Attribute)
+                    and isinstance(first.value.func.value, ast.Name) and first.value.func.value.id == "self"
+                    and isinstance(first.value.args[0], ast.Name)
+                    and first.value.args[0].id == first.targets[0].id
+                    and isinstance(second, ast.Assign) and len(second.targets) == 1
+                    and isinstance(second.targets[0], ast.Name) and isinstance(second.value, ast.BinOp)
+                    and isinstance(second.value.op, ast.Add) and isinstance(second.value.left, ast.Name)
+                    and isinstance(second.value.right, ast.Name)
+                    and second.value.right.id == first.targets[0].id
+                    and second.value.left.id != first.targets[0].id
+                    and (second.targets[0].id == first.targets[0].id
+                         or (owner is scale_branch and index + 2 == len(body)
+                             and all(item.id != first.targets[0].id for item in tail_return.value.elts)))):
+                names.add(first.value.func.attr)
+                args = [first.value.func, first.value.args[0], second.value.left]
+                fused_tail = (owner is scale_branch and index + 2 == len(body)
+                              and second.targets[0].id == scale[0])
+                if fused_tail:
+                    args.append(scale[1])
+                second.value = ast.Call(func = ast.Attribute(value = ast.Name(id = "self", ctx = ast.Load()),
+                    attr = "_unsloth_norm_add", ctx = ast.Load()), args = args, keywords = [])
+                body[index:index + 2] = [second]
+                if fused_tail:
+                    body.append(copy.deepcopy(tail_return))
+            index += 1
+        for statement in body:
+            for field in ("body", "orelse", "finalbody"):
+                nested = getattr(statement, field, None)
+                if isinstance(nested, list):
+                    rewrite(nested, statement)
+
+    rewrite(tree.body, tree)
+    if not names:
+        return None
+    fused = _function_from_ast(call, tree)
+    bindings = _resolved_bindings(_RESIDUAL_NORM_CONTRACT)
+    if bindings is None:
+        return None
+
+    def invoke(self, *args, **kwargs):
+        if self.training or base.__call__ is not call:
+            return base.__call__(self, *args, **kwargs)
+        return fused(self, *args, **kwargs)
+
+    def norm_add(norm, x, residual, scale = None):
+        if not _bindings_intact(bindings):
+            out = residual + norm(x)
+            return out if scale is None else out * scale
+        return _residual_norm_add(norm, x, residual, scale)
+
+    return type(f"_ResidualNorm{base.__name__}", (base,), {
+        "__call__": invoke, "_unsloth_norm_add": staticmethod(norm_add),
+        "_unsloth_residual_norm_base": base, "_unsloth_residual_norm_names": tuple(names),
+    })
+
+_RESIDUAL_NORM_LOCK = RLock()
+
+@contextmanager
+def fused_residual_norm(model):
+    """Fuse eligible single-row RMS normalization and residual additions during inference."""
+    patched = []
+    try:
+        with _RESIDUAL_NORM_LOCK:
+            if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and _residual_norm_kernel() is not None:
+                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                    base = type(module)
+                    # Type first, for the reason fused_decode_conv_silu gives: generation enters
+                    # this scope for whatever named_modules() yields, including plain stand-ins
+                    # that need not carry `training`, and reading it before the check raises out
+                    # of generation instead of skipping an ineligible entry.
+                    if not isinstance(module, dict) or module.training:
+                        continue
+                    if hasattr(base, "_unsloth_residual_norm_base"):
+                        continue
+                    fused = _residual_norm_class(base)
+                    if (fused is not None and all(type(getattr(module, name, None)) is nn.RMSNorm
+                                                 for name in fused._unsloth_residual_norm_names)):
+                        patched.append((module, base, fused))
+                        module.__class__ = fused
+        yield model
+    finally:
+        with _RESIDUAL_NORM_LOCK:
+            for module, base, fused in reversed(patched):
+                if type(module) is fused:
+                    module.__class__ = base
