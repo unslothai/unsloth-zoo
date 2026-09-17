@@ -734,6 +734,54 @@ def test_a_nonce_suffixed_partial_still_says_the_blob_is_being_written(monkeypat
     assert xf._broken_link_has_active_partner(orphan, active_grace = 180.0) is True
 
 
+def test_a_container_that_cannot_see_the_other_pods_processes_declines(monkeypatch, tmp_path):
+    """`process_iter` walks THIS PID namespace, not the host.
+
+    A sibling container or pod sharing the cache volume under the same numeric UID is simply
+    absent from the listing: no AccessDenied, no exception, nothing that makes the walk record
+    itself as incomplete, and the private-cache test does not help because a volume shared
+    only between containers running as the same UID looks owner-only to both. So the walk is
+    not proof there, and an aged partial that sibling is still writing was whitelisted and
+    unlinked, failing its eventual rename.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    stale = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_process_walk_sees_every_writer", lambda _cache_dir = None: False)
+
+    assert xf._unowned_partials_safe_to_clear("model", REPO, str(tmp_path), 180.0, None) is None
+    assert xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    ) == {stale}
+    assert (blobs / stale).exists()
+
+
+def test_the_namespace_test_reads_containerisation_and_where_the_cache_lives(monkeypatch, tmp_path):
+    """An ordinary host is unaffected; inside a container the cache's own mount decides.
+
+    On the container's root filesystem nobody outside can be writing into it. A separate
+    mount is the shared volume this case is about, and there the walk stops being proof.
+    """
+    if os.name == "nt" or not os.path.isdir("/proc"):
+        pytest.skip("POSIX containers only")
+
+    monkeypatch.setattr(xf, "_running_in_a_container", lambda: False)
+    assert xf._process_walk_sees_every_writer(str(tmp_path)) is True, (
+        "an ordinary host lost the purge it is entitled to"
+    )
+
+    monkeypatch.setattr(xf, "_running_in_a_container", lambda: True)
+    # The workspace lives on its own mount here, so this IS the shared-volume shape.
+    assert os.stat(tmp_path).st_dev != os.stat("/").st_dev, (
+        "this host cannot pose the case: the temp dir is on the root filesystem"
+    )
+    assert xf._process_walk_sees_every_writer(str(tmp_path)) is False
+    # And a cache on the container's own root filesystem still answers yes.
+    monkeypatch.setattr(xf, "hf_cache_root", lambda cache_dir = None: Path("/"))
+    assert xf._process_walk_sees_every_writer(str(tmp_path)) is True
+
+
 def test_a_deletion_time_walk_that_could_not_read_every_process_declines(monkeypatch, tmp_path):
     """The re-scan at the deletion has to answer to the same gate as the eligibility scan.
 

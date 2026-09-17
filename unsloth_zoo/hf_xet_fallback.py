@@ -564,6 +564,8 @@ def _clear_partials(
         # fact -- and on a cache another UID can write into, the process it could not read is
         # a likely writer. Re-scanning without the gate would have let the deletion overturn
         # the very decision the scan declined to make.
+        if rescanned_writers is not None and not _process_walk_sees_every_writer(cache_dir):
+            rescanned_writers = None
         if rescanned_writers is not None and not _live_writer_walk_was_complete():
             if not _cache_is_private_to_this_user(
                 cache_dir, repo_type = repo_type, repo_id = repo_id,
@@ -873,6 +875,54 @@ def _live_writer_walk_was_complete() -> bool:
     return bool(getattr(_LIVE_WRITER_WALK, "complete", True))
 
 
+def _process_walk_sees_every_writer(cache_dir: Optional[str] = None) -> bool:
+    """Whether `psutil.process_iter` can see every process that might be writing here.
+
+    It walks THIS PID namespace. Inside a container that is not the host: a sibling container
+    or pod sharing the cache volume, under the same numeric UID, is simply absent from the
+    listing -- no `AccessDenied`, no exception, nothing to make the walk record itself as
+    incomplete. The private-cache test does not cover it either, since a volume shared only
+    between containers running as the same UID looks owner-only to both.
+
+    So containerisation is read directly, and where it is found the answer depends on WHERE
+    the cache lives: on the container's own root filesystem nobody outside can be writing
+    into it, while a separate mount is the volume this case is about and the walk stops being
+    proof there. Anything that cannot be read answers False, which only costs a purge.
+    """
+    try:
+        if os.name == "nt" or not os.path.isdir("/proc"):
+            return True                      # no PID namespaces to hide a writer in
+        if not _running_in_a_container():
+            return True
+        root = hf_cache_root(cache_dir = cache_dir)
+        if root is None:
+            return False
+        # Same device as this container's own root: not a shared volume.
+        return os.stat(root).st_dev == os.stat("/").st_dev
+    except Exception:
+        return False
+
+
+def _running_in_a_container() -> bool:
+    """Whether this process is in a container, and so in its own PID namespace.
+
+    The markers Docker, Podman and Kubernetes leave, read in that order. False for anything
+    unreadable, which is the ordinary-host answer and the one that keeps the purge working
+    where nothing is shared.
+    """
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", "r", encoding = "utf-8", errors = "replace") as handle:
+            cgroup = handle.read()
+    except OSError:
+        return False
+    return any(
+        marker in cgroup
+        for marker in ("docker", "kubepods", "containerd", "lxc", "podman")
+    )
+
+
 def _group_is_private_to_this_user(gid: int) -> bool:
     """Whether *gid* is a group this user is alone in.
 
@@ -1065,6 +1115,10 @@ def _unowned_partials_safe_to_clear(
     required: older than *active_grace*, and open by no live process, which age cannot establish."""
     live_writers = _partial_paths_with_a_live_writer()
     if live_writers is None:
+        return None
+    if not _process_walk_sees_every_writer(cache_dir):
+        # A PID namespace hides a sibling container's downloader without raising, so the walk
+        # cannot even record itself as incomplete. Nothing here is proof; decline.
         return None
     if not _live_writer_walk_was_complete() and not _cache_is_private_to_this_user(
         cache_dir, repo_type = repo_type, repo_id = repo_id,
@@ -2227,7 +2281,9 @@ def _run_download_attempt(
                     # killed -- and the walk that says so has to have been able to read every
                     # process, or the cache has to be one nobody else can write into.
                     writer_paths = _partial_paths_with_a_live_writer()
-                    trustworthy = writer_paths is not None and (
+                    trustworthy = writer_paths is not None and _process_walk_sees_every_writer(
+                        params.get("cache_dir")
+                    ) and (
                         _live_writer_walk_was_complete()
                         or _cache_is_private_to_this_user(
                             params.get("cache_dir"),
