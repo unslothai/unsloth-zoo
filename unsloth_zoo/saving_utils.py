@@ -18,6 +18,7 @@ __all__ = [
     "create_huggingface_repo",
     "merge_and_dequantize_lora",
     "merge_and_overwrite_lora",
+    "normalize_safe_serialization",
     "PartialLoraMergeError",
 ]
 import warnings
@@ -4008,6 +4009,23 @@ def incremental_save_pretrained(
 pass
 
 
+def normalize_safe_serialization(safe_serialization):
+    """`None` means the safetensors default, and never a pickle.
+
+    Unsloth's own warning, and the troubleshooting page it points at, tell a caller to pass
+    `safe_serialization = None` to FORCE safetensors. `None` is falsy to peft and to
+    transformers, so a save that forwards it verbatim writes `adapter_model.bin` or
+    `pytorch_model.bin`: the advice produces the file it exists to avoid
+    (unslothai/unsloth#1792). Normalise the value at every save entry point instead, so
+    that older advice is harmless and `None` means what it says.
+
+    `True` and `False` pass through unchanged, so an explicit `safe_serialization = False`
+    still writes a pickle for a caller who wants one.
+    """
+    return True if safe_serialization is None else safe_serialization
+pass
+
+
 def merge_and_dequantize_lora(
     model,
     tokenizer            = None,
@@ -4025,6 +4043,12 @@ def merge_and_dequantize_lora(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantizes model to 16bit weights and merges LoRA
+
+    # Both writers below forward this straight to a `save_pretrained`, where `None` is
+    # falsy and selects a pickle, so the documented "pass None to force safetensors"
+    # produced a `.bin` (unslothai/unsloth#1792).
+    safe_serialization = normalize_safe_serialization(safe_serialization)
+
     inner_model = model.base_model.model if isinstance(model, PeftModelForCausalLM) else model
     inner_model = inner_model.base_model if hasattr(model, "base_model") else inner_model
 

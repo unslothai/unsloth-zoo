@@ -298,6 +298,10 @@ jobs:
         # raising requires-python relaxes it rather than making it lie.
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
+        # test_safe_serialization_none pins that `safe_serialization = None` means the
+        # safetensors default rather than a pickle, and carries a drift gate over the whole
+        # package for any future save entry point that forwards the argument unnormalised.
+        # CPU-pure and stdlib-only, so it belongs in a gate rather than in collect-only.
         #
         # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
         # eager fallback: still falls back on a first-call refusal, ends the step
@@ -337,6 +341,10 @@ jobs:
         # request. Collecting the drift file here proves it still imports under
         # a plain root, and the sweep is a stdlib-only grep that refuses the
         # pattern anywhere in the suite.
+        # The two vision URL files gate the SSRF guard for dataset-supplied media
+        # URLs: the static bypass forms and, in the rebinding file, that the fetch
+        # connects to the address the guard actually validated. Neither was executed
+        # by any job before, so the guard could regress while CI stayed green.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -373,6 +381,8 @@ jobs:
             tests/test_checkpoint_modes.py \
             tests/test_gc_rewriter_bound_keywords.py \
             tests/test_wheel_top_level_packages.py \
+            tests/test_vision_url_ssrf_guard.py \
+            tests/test_vision_url_dns_rebinding.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
@@ -387,6 +397,7 @@ jobs:
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
             tests/test_undefined_name_gate.py \
+            tests/test_safe_serialization_none.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
