@@ -181,3 +181,66 @@ class TestUnreadableDevice:
 
         monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *a, **k: _Bare())
         assert integrated_device.cuda_total_memory(0) == 0
+
+
+class TestFlexAttentionCallSite:
+    """The kernel-option probe must keep raising for a device it cannot describe.
+
+    `cuda_total_memory` answers 0 for an unreadable device, which is right for a caller
+    comparing budgets and wrong for this one: 0 GiB reads as "16GB or less", so flex
+    attention would stay ENABLED with 32x32 kernel options on a host where the probe
+    previously raised and turned it off. The call site therefore reads
+    `get_device_properties` itself and passes the result in.
+
+    The real assignment is lifted out of the module source and evaluated here, so this
+    tests the shipped expression rather than a copy of it, without importing the module
+    (whose import-time work needs a GPU).
+    """
+
+    @staticmethod
+    def _vram_expression():
+        import ast
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "unsloth_zoo" / "flex_attention" / "utils.py"
+        ).read_text(encoding = "utf-8")
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name) and target.id == "vram_of_gpu":
+                    return ast.get_source_segment(source, node.value)
+        raise AssertionError("vram_of_gpu is no longer assigned in flex_attention/utils.py")
+
+    @staticmethod
+    def _namespace(device_count, properties):
+        import types
+
+        cuda = types.SimpleNamespace(
+            device_count = lambda: device_count,
+            get_device_properties = properties,
+        )
+        return {
+            "torch": types.SimpleNamespace(cuda = cuda),
+            "cuda_total_memory": integrated_device.cuda_total_memory,
+        }
+
+    def test_an_unreadable_device_still_raises(self):
+        def _boom(index):
+            raise RuntimeError("no CUDA-capable device is detected")
+
+        with pytest.raises(RuntimeError):
+            eval(self._vram_expression(), self._namespace(1, _boom))
+
+    def test_no_devices_still_raises(self):
+        # What sends a GPU-less host into the except that sets HAS_FLEX_ATTENTION = False.
+        with pytest.raises(ValueError):
+            eval(self._vram_expression(), self._namespace(0, lambda index: None))
+
+    def test_a_readable_discrete_device_reports_its_properties_total(self, monkeypatch):
+        monkeypatch.setattr(integrated_device, "_is_hip_build", lambda: False)
+        props = _Props(80 * GIB, 0)
+        assert eval(
+            self._vram_expression(), self._namespace(1, lambda index: props)
+        ) == pytest.approx(80.0)

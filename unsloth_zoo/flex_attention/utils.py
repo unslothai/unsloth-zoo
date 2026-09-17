@@ -55,10 +55,16 @@ try:
     # context at import time and leave an otherwise idle process holding it. Integrated
     # parts are the one exception, where properties may report only the dedicated
     # carve-out and the driver total is the real budget; see cuda_total_memory.
-    # min() over no devices still raises, as it did before, so a GPU-less host keeps
-    # landing in the except below with HAS_FLEX_ATTENTION = False.
+    # Properties are read HERE rather than inside cuda_total_memory, which answers 0 for a
+    # device it cannot read: a host that reports devices but cannot describe them must keep
+    # raising into the except below, not land on a 0 that reads as "16GB or less" and leaves
+    # flex attention on with 32x32 kernel options. min() over no devices still raises too, so
+    # a GPU-less host is unchanged as well.
     from unsloth_zoo.integrated_device import cuda_total_memory
-    vram_of_gpu = min(cuda_total_memory(i)/1024/1024/1024 for i in range(torch.cuda.device_count()))
+    vram_of_gpu = min(
+        cuda_total_memory(i, props = torch.cuda.get_device_properties(i))/1024/1024/1024
+        for i in range(torch.cuda.device_count())
+    )
     kernel_options = None
     if vram_of_gpu <= 16:
         kernel_options = {
