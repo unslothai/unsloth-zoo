@@ -153,6 +153,8 @@ try:
     from .converter_scan import (
         RE_ARGPARSE_DEFAULT,
         ConverterScanError,
+        scan_is_disabled,
+        scan_is_strict,
         warn_on_suspicious_converter,
     )
 except ImportError:
@@ -166,6 +168,8 @@ except ImportError:
     _converter_scan_spec.loader.exec_module(_converter_scan)
     RE_ARGPARSE_DEFAULT = _converter_scan.RE_ARGPARSE_DEFAULT
     ConverterScanError = _converter_scan.ConverterScanError
+    scan_is_disabled = _converter_scan.scan_is_disabled
+    scan_is_strict = _converter_scan.scan_is_strict
     warn_on_suspicious_converter = _converter_scan.warn_on_suspicious_converter
 
 IS_COLAB_ENVIRONMENT  = _is_colab_environment()
@@ -1741,14 +1745,27 @@ def _get_llama_cpp_dir(local_script_info):
 pass
 
 
+# Enough to cover the package a converter imports without walking a tree an
+# attacker chooses the size of.
+MAX_CONVERSION_PACKAGE_FILES = 64
+
+
 def _conversion_sibling_info(llama_cpp_dir):
-    """Hashable (path, mtime, size) tuples for conversion/{__init__,base,qwen}.py,
-    folded into the patcher cache key so re-pulled checkouts re-patch. None on
-    the monolithic layout."""
+    """Hashable (path, mtime, size) tuples for EVERY module in conversion/,
+    folded into the patcher cache key so re-pulled checkouts re-patch and
+    re-scan. None on the monolithic layout.
+
+    Every module, not the three the patcher edits. The key also decides whether
+    _scan_conversion_package runs again, and that reads the whole directory: with
+    only __init__.py, base.py and qwen.py in the key, changing any other module
+    in a long-lived process left the key identical, so the next export returned
+    the cached converter without rescanning and then executed the changed file.
+    The same MAX_CONVERSION_PACKAGE_FILES cap applies, for the same reason it
+    applies there, and the count travels in the key so crossing the cap is itself
+    a change."""
     conv_dir = os.path.join(llama_cpp_dir, "conversion")
     init_py  = os.path.join(conv_dir, "__init__.py")
     base_py  = os.path.join(conv_dir, "base.py")
-    qwen_py  = os.path.join(conv_dir, "qwen.py")
     if not (os.path.isfile(init_py) and os.path.isfile(base_py)):
         return None
     def _stat(p):
@@ -1757,10 +1774,12 @@ def _conversion_sibling_info(llama_cpp_dir):
             return (p, s.st_mtime_ns, s.st_size)
         except OSError:
             return (p, 0, 0)
-    return (
-        _stat(init_py),
-        _stat(base_py),
-        _stat(qwen_py) if os.path.isfile(qwen_py) else None,
+    names = _conversion_package_modules(conv_dir)
+    if names is None:
+        names = ["__init__.py", "base.py"]
+    return (len(names),) + tuple(
+        _stat(os.path.join(conv_dir, *name.split("/")))
+        for name in names[:MAX_CONVERSION_PACKAGE_FILES]
     )
 pass
 
@@ -1862,9 +1881,54 @@ def _qwen_already_handles_expert_aliases(conv_qwen_path):
 pass
 
 
-# Enough to cover the package a converter imports without walking a tree an
-# attacker chooses the size of.
-MAX_CONVERSION_PACKAGE_FILES = 64
+def _refuse_unscannable_conversion_package(conversion_dir, count):
+    """Warn, or under strict mode refuse, a conversion/ package too big to read.
+
+    Mirrors warn_on_suspicious_converter's contract, but cannot go through it:
+    this is a fact about the DIRECTORY and that function takes the bytes it
+    scans. Silent when the scan is switched off entirely, as everything here is.
+    """
+    if scan_is_disabled():
+        return
+    message = (
+        f"Unsloth: The conversion/ package at {conversion_dir} holds {count} Python "
+        f"files, more than the {MAX_CONVERSION_PACKAGE_FILES} this scan reads, so some "
+        f"of the modules the converter imports have not been checked."
+    )
+    logger.warning(message)
+    if scan_is_strict():
+        raise ConverterScanError(
+            f"{message} Refusing to run it with UNSLOTH_CONVERTER_SCAN_STRICT=1. Pin a "
+            f"converter you have reviewed with UNSLOTH_LLAMA_CPP_SCRIPTS_DIR, or unset "
+            f"UNSLOTH_CONVERTER_SCAN_STRICT."
+        )
+
+
+def _conversion_package_modules(conversion_dir):
+    """Every .py under `conversion_dir`, nested packages included, or None.
+
+    Relative POSIX paths, sorted, so the caller's cap is stable across platforms.
+    None means the directory could not be walked, which the caller treats as
+    nothing to scan rather than as a clean package.
+
+    Recursive, because `os.listdir` saw immediate children only: a clean
+    `conversion/__init__.py` doing `from .nested import x` fronted
+    `conversion/nested/__init__.py`, which was neither scanned nor counted
+    against the cap, and Python imported and ran it all the same. Subdirectories
+    are walked whether or not they hold an `__init__.py`, since a namespace
+    package imports just as well.
+    """
+    found = []
+    try:
+        for root, _dirs, files in os.walk(conversion_dir):
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                full = os.path.join(root, name)
+                found.append(os.path.relpath(full, conversion_dir).replace(os.sep, "/"))
+    except OSError:
+        return None
+    return sorted(found)
 
 
 def _scan_conversion_package(llama_cpp_dir):
@@ -1872,21 +1936,26 @@ def _scan_conversion_package(llama_cpp_dir):
 
     Same warn-or-raise contract as the entrypoint: these files are imported and
     executed by it, so leaving them unscanned let a clean entrypoint front a
-    payload in conversion/__init__.py.
+    payload in conversion/__init__.py, or in a nested module below it.
     """
     if not llama_cpp_dir:
         return
     conversion_dir = os.path.join(llama_cpp_dir, "conversion")
     if not os.path.isdir(conversion_dir):
         return
-    try:
-        names = sorted(
-            name for name in os.listdir(conversion_dir) if name.endswith(".py")
-        )[:MAX_CONVERSION_PACKAGE_FILES]
-    except OSError:
+    names = _conversion_package_modules(conversion_dir)
+    if names is None:
         return
+    if len(names) > MAX_CONVERSION_PACKAGE_FILES:
+        # Truncating the list silently was the hole: a payload in a late-sorting
+        # module (z_payload.py) imported from an otherwise clean __init__.py went
+        # unscanned, and under strict mode ran with nothing reported. The cap
+        # stays, because an attacker must not get to choose how much work this
+        # does, so exceeding it becomes the finding rather than a quiet skip.
+        _refuse_unscannable_conversion_package(conversion_dir, len(names))
+        names = names[:MAX_CONVERSION_PACKAGE_FILES]
     for name in names:
-        path = os.path.join(conversion_dir, name)
+        path = os.path.join(conversion_dir, *name.split("/"))
         try:
             with open(path, "rb") as handle:
                 content = handle.read()
@@ -1898,32 +1967,40 @@ def _scan_conversion_package(llama_cpp_dir):
 
 
 def _converter_is_trusted_local(script_path):
-    """Whether a local converter was pinned deliberately or verified on arrival.
+    """Whether a local converter was pinned deliberately by the user.
 
     The strict-mode exemption means "you chose this file", so it cannot cover
-    every local path. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is an explicit pin, and a
-    prebuilt bundle carries UNSLOTH_PREBUILT_INFO.json, written only after that
-    asset's sha256 was checked. When no prebuilt is available install_llama_cpp
-    falls back to an unpinned `git clone` of upstream master, which leaves
-    neither, and _resolve_bundle_convert_script accepts that checkout on the
-    strength of a conversion/ package alone. A converter fetched automatically
-    from upstream is not a converter the user pinned, so it gets no exemption.
+    every local path. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is an explicit pin and is the
+    only thing that is. When no prebuilt is available install_llama_cpp falls
+    back to an unpinned `git clone` of upstream master, and
+    _resolve_bundle_convert_script accepts that checkout on the strength of a
+    conversion/ package alone. A converter fetched automatically from upstream is
+    not a converter the user pinned, so it gets no exemption.
+
+    UNSLOTH_PREBUILT_INFO.json is NOT accepted, though it used to be. The marker
+    reads like proof that these bytes were verified and it is not: _stage_prebuilt
+    _install checks a sha256 for the BINARY asset only, and even that only when
+    the release published one, while _hydrate_converter_sources downloads the
+    source tarball separately with no digest at all and the marker is written
+    afterwards. So a replaced source tarball wore a "verified" marker, took the
+    exemption, and skipped the conversion/ scan with it. The converter from a
+    prebuilt bundle is now scanned like any other download, which is what it is.
     """
     if not script_path:
         return False
-    script_path = os.path.abspath(script_path)
+    script_path = os.path.abspath(os.path.expanduser(script_path))
     scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-    if scripts_dir:
-        scripts_dir = os.path.abspath(scripts_dir)
-        try:
-            if os.path.commonpath([scripts_dir, script_path]) == scripts_dir:
-                return True
-        except ValueError:
-            pass
-    marker = os.path.join(
-        os.path.dirname(script_path), UNSLOTH_PREBUILT_INFO_FILENAME,
-    )
-    return os.path.isfile(marker)
+    if not scripts_dir:
+        return False
+    # expanduser to match _resolve_local_convert_script, which accepts the pin
+    # after expanding it. Comparing an unexpanded "~/llama.cpp" against the
+    # expanded script path made a deliberate pin fail this test and be refused
+    # under strict mode as though it had been downloaded.
+    scripts_dir = os.path.abspath(os.path.expanduser(scripts_dir))
+    try:
+        return os.path.commonpath([scripts_dir, script_path]) == scripts_dir
+    except ValueError:
+        return False
 
 
 def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
