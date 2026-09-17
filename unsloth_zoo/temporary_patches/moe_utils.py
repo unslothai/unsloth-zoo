@@ -949,6 +949,24 @@ class MoELoRABLayoutError(ValueError):
     """
 
 
+def _read_moe_lora_b_layout_from_env() -> str:
+    """`UNSLOTH_MOE_LORA_B_LAYOUT`, validated. Split out so the value can be refreshed into
+    a module global on every eager call, which is what makes the switch visible to a
+    compiled graph."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
+    if layout not in _LORA_B_LAYOUTS:
+        raise MoELoRABLayoutError(
+            f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_LORA_B_LAYOUTS}, got "
+            f"{layout!r}."
+        )
+    return layout
+
+
+_MOE_LORA_B_LAYOUT = _read_moe_lora_b_layout_from_env()
+
+
 def moe_lora_b_layout() -> str:
     """Which packing to read a fused expert `lora_B` with.
 
@@ -963,13 +981,17 @@ def moe_lora_b_layout() -> str:
     the layout back off the adapter itself needs the `adapter_config.json` marker, which is
     the migration path, not this switch.
     """
-    layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
-    if layout not in _LORA_B_LAYOUTS:
-        raise MoELoRABLayoutError(
-            f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_LORA_B_LAYOUTS}, got "
-            f"{layout!r}."
-        )
-    return layout
+    global _MOE_LORA_B_LAYOUT
+    if torch.compiler.is_compiling():
+        # Read the module global rather than the environment. Dynamo installs a guard on
+        # an `os.environ.get` only when the key is already set at trace time, so on the
+        # default path there is no guard at all: setting the variable after the first
+        # compiled call changed nothing, and a misspelled value was never validated
+        # either, both silently and for the life of the captured graph. A module global
+        # IS guarded, so the eager refresh below triggers a recompile instead.
+        return _MOE_LORA_B_LAYOUT
+    _MOE_LORA_B_LAYOUT = _read_moe_lora_b_layout_from_env()
+    return _MOE_LORA_B_LAYOUT
 
 
 def _resolve_moe_lora_b_layout(layout) -> str:

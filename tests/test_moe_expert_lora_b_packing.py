@@ -615,3 +615,52 @@ def test_every_merge_helper_lets_a_layout_error_escape(monkeypatch):
     assert recorded == [], (
         f"a layout error was recorded as a merged-unchanged expert: {recorded}"
     )
+
+
+def test_an_invalid_layout_is_refused_at_import_not_at_first_use():
+    """The switch is a process-wide mode set before any MoE work, so a typo has to fail
+    before training starts rather than at whichever call happens to read it first.
+
+    Under `torch.compile` that distinction is the whole point. Dynamo installs a guard on
+    an `os.environ.get` only when the key is already set at trace time, so on the default
+    path a per-call read is never re-evaluated inside a captured graph: a typo introduced
+    after the first compiled call is silently ignored for the life of that graph. Reading
+    and validating once at import cannot be skipped that way.
+    """
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import unsloth_zoo.temporary_patches.moe_utils"],
+        env={**os.environ, "UNSLOTH_MOE_LORA_B_LAYOUT": "typo-here",
+             "UNSLOTH_IS_PRESENT": "1"},
+        capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode != 0, "a misspelled layout imported cleanly"
+    assert "MoELoRABLayoutError" in result.stderr
+    assert "typo-here" in result.stderr
+
+
+def test_a_valid_override_set_before_import_survives_compilation():
+    """The supported usage: set it before the process does any MoE work. That must reach
+    a compiled graph, or the escape hatch is decorative for exactly the MoE training runs
+    it exists to serve."""
+    import subprocess
+    import sys
+
+    program = (
+        "import torch, unsloth_zoo.temporary_patches.moe_utils as MU\n"
+        "def f(x):\n"
+        "    return x + (1.0 if MU.moe_lora_b_layout() == MU.LORA_B_LAYOUT_RANK_MAJOR else 2.0)\n"
+        "print(torch.compile(f, fullgraph=False)(torch.zeros(1)).tolist()[0])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        env={**os.environ, "UNSLOTH_MOE_LORA_B_LAYOUT": "grouped_by_expert",
+             "UNSLOTH_IS_PRESENT": "1"},
+        capture_output=True, text=True, timeout=900,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip().splitlines()[-1] == "2.0", (
+        f"the override did not reach the compiled graph: {result.stdout[-500:]}"
+    )
