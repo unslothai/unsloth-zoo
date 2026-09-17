@@ -4579,8 +4579,18 @@ def _open_gguf_reader(path):
     export the plain reader takes 6.69 s and 736 MB peak RSS against the
     rewritten one's 7.48 s and the same 736 MB, because all of the cost is
     `_build_fields` parsing a 262k entry vocabulary while `_build_tensors`
-    only creates lazy memmap views. Sampling eight of those views costs
-    0.000 s and no extra memory. The rewrite also raised
+    only creates lazy memmap views.
+
+    Neither the time nor the memory is free, and both are the vocabulary's
+    rather than the model's. Reading a file back costs the parent 0.8 GB of
+    anonymous heap on a 262k vocabulary and 1.5 GB on a vocab-only file of
+    15.8 MB, none of it reclaimable, and that spike lands in the parent, which
+    has no OOM retry, unlike the converter child. The tensor sample itself is
+    file-backed and reclaimable: the windowed pass touches about 16 KB per
+    tensor, flat, but a tensor in the deep sample is read whole up to
+    GGUF_VERIFY_DEEP_MAX_ELEMENTS, so the sample can fault in a gigabyte, and a
+    tensor ABOVE that cap is skipped entirely. The effect is non monotonic: a
+    model whose tensors all cross the cap gets no deep check at all. The rewrite also raised
     `RuntimeError: Reader has no self._build_tensors(offs, tensors_fields`
     whenever gguf-py refactored that one line.
     """
