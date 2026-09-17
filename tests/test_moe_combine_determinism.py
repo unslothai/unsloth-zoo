@@ -19,15 +19,20 @@
 `forward_native_grouped_mm` used to finish with
 `zeros(num_tokens, hidden).index_add_(0, sorted_indices // top_k, permuted)`.
 Each token index appears `top_k` times in that single call, so on CUDA it takes
-index_add_'s atomicAdd path, which fixes no accumulation order; in bf16 the
-run-to-run drift was large enough to move a Gemma-4-26B-A4B forward loss by
-0.44 nats between two identical forwards on one loaded model.
+index_add_'s atomicAdd path, which fixes no accumulation order; in bf16 that was
+enough to give 40 distinct losses, spread over 0.0284 nats, from 40 repeats of one
+identical Gemma-4 MoE forward on one loaded model with no optimizer step.
 
-Two things are asserted here, because either alone is easy to pass by accident:
+Three things are asserted here, because any one alone is easy to pass by accident:
   1. equivalence - the replacement computes the same sum as the index_add_ form
      (checked in float64, where both are exact);
   2. reproducibility - repeated calls on identical input are bitwise identical
-     in bf16, with a duplicate-heavy index pattern.
+     in bf16, with a duplicate-heavy index pattern;
+  3. cast placement - `out_dtype` is applied after the reduction, not before it.
+     That only has an observable effect when the routed slots arrive wider than
+     `out_dtype`, so it needs a case built specifically for it: every other test
+     here feeds `permuted` already in `out_dtype`, where the cast is a no-op and
+     could be moved anywhere without a single assertion noticing.
 """
 
 import pytest
@@ -102,6 +107,70 @@ def test_combine_covers_every_slot_exactly_once():
         ones, sorted_indices, num_tokens, top_k, out_dtype = torch.float64,
     )
     assert torch.equal(got, torch.full_like(got, float(top_k)))
+
+
+def _inverse_permutation(sorted_indices):
+    inverse = torch.empty_like(sorted_indices)
+    inverse[sorted_indices] = torch.arange(
+        sorted_indices.numel(), device = sorted_indices.device, dtype = sorted_indices.dtype,
+    )
+    return inverse
+
+
+def test_combine_casts_to_out_dtype_after_the_sum_not_before():
+    """fp32 summands, bf16 output: the one shape where cast placement is visible.
+
+    An fp32 router (Gemma 4, DeepSeek V3) promotes the routing-weight multiply, so the
+    routed slots reach the combine in fp32 while the model runs in bf16. Casting first
+    rounds each of the top_k summands to bf16 and adds them in bf16; casting last adds
+    in fp32 and rounds once, which is what transformers' own grouped_mm path does. The
+    second assertion below exists so this test cannot quietly stop discriminating.
+    """
+    num_tokens, top_k, hidden, num_experts = 512, 4, 64, 16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sorted_indices, permuted = _make_case(
+        num_tokens, top_k, hidden, num_experts, torch.float32, device,
+    )
+    got = combine_permuted_moe_outputs(
+        permuted, sorted_indices, num_tokens, top_k, out_dtype = torch.bfloat16,
+    )
+    assert got.dtype == torch.bfloat16
+
+    inverse = _inverse_permutation(sorted_indices)
+    cast_last = (
+        permuted[inverse].view(num_tokens, top_k, hidden).sum(dim = 1).to(torch.bfloat16)
+    )
+    cast_first = (
+        permuted.to(torch.bfloat16)[inverse].view(num_tokens, top_k, hidden).sum(dim = 1)
+    )
+    assert torch.equal(got, cast_last), (
+        "combine rounded the summands before adding them; max diff "
+        f"{(got.float() - cast_last.float()).abs().max().item():.3e}"
+    )
+    differing = (cast_first != cast_last).float().mean().item()
+    assert differing > 0.05, (
+        "this case no longer separates the two cast placements "
+        f"(only {differing:.1%} of elements differ), so it would not catch a regression"
+    )
+
+
+def test_combine_rejects_a_non_permutation():
+    """The slot-count guard must be a raised exception, not a bare `assert`.
+
+    `python -O` strips `assert`, and a build with the guard stripped is precisely the
+    one where a short `sorted_indices` would silently read the wrong rows. Requiring
+    ValueError also fails this test if the guard is reverted to an assert, which would
+    raise AssertionError instead.
+    """
+    num_tokens, top_k, hidden, num_experts = 32, 4, 8, 7
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    sorted_indices, permuted = _make_case(
+        num_tokens, top_k, hidden, num_experts, torch.float32, device,
+    )
+    with pytest.raises(ValueError):
+        combine_permuted_moe_outputs(
+            permuted[:-1], sorted_indices, num_tokens, top_k, out_dtype = torch.float32,
+        )
 
 
 def test_combine_gradient_matches_the_index_add_form():

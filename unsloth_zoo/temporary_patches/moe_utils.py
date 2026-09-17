@@ -776,34 +776,59 @@ def combine_permuted_moe_outputs(
     with ``token_indices = sorted_indices // top_k``. Because every token index
     appears ``top_k`` times in one call, that lands in ``index_add_``'s CUDA
     atomicAdd path, and atomicAdd fixes no accumulation order. Float addition is
-    not associative, so the result moves from run to run: repeating a single
-    identical Gemma-4-26B-A4B forward on one already-loaded model moved the loss
-    across 20.49 / 20.35 / 20.17 / 20.05, and the reported grad norm across
-    74.9 / 103.1 / 121.1 / 63.3, while stock transformers repeated bit-for-bit.
+    not associative, so the result moves from run to run: repeating one identical
+    forward 40 times on a single already-loaded Gemma-4 MoE, with no optimizer
+    step and no data change, gave 40 distinct losses spread over 0.0284 nats,
+    while the same 40 repeats through the reduction below returned one value.
 
     ``sorted_indices`` is ``argsort`` of the flat expert assignment, so it is a
     permutation of ``range(num_tokens * top_k)`` - every slot exactly once. That
-    means the permutation can simply be undone (a scatter with UNIQUE indices,
-    no accumulation and so no atomics) and the ``top_k`` axis reduced with an
-    ordinary ``sum``, which has a fixed reduction order. Same arithmetic, same
-    values up to that ordering, reproducible.
+    means the permutation can simply be undone (a gather through the inverse
+    permutation: unique indices, no accumulation and so no atomics) and the
+    ``top_k`` axis reduced with an ordinary ``sum``, which has a fixed reduction
+    order. Same arithmetic, same values up to that ordering, reproducible.
+
+    ``out_dtype`` is applied AFTER the reduction, not before it. When the routed
+    slots arrive wider than ``out_dtype`` - the fp32-router case, where the
+    routing-weight multiply promotes the expert output to fp32 - casting first
+    would round every one of the ``top_k`` summands to bf16 and only then add
+    them. Summing first and rounding once is what ``transformers``
+    (``integrations/moe.py``) does, and it is measurably closer to an fp64
+    reference. With a bf16 router the two orders are bit-identical.
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    if out_dtype is not None:
-        permuted_output = permuted_output.to(out_dtype)
-    # index_copy_ in place, into new_empty rather than new_zeros: the out-of-place spelling
-    # holds a second [num_tokens * top_k, hidden] buffer live alongside the first, which at
-    # long context is hundreds of MiB for nothing. Both are safe only because sorted_indices
-    # is an argsort, so the indices are unique and, given the count below matches, cover
-    # every row: nothing is left unwritten and no element is accumulated twice.
-    assert sorted_indices.numel() == permuted_output.shape[0], (
-        f"Unsloth: expected a full permutation of {permuted_output.shape[0]} routed slots, "
-        f"got {sorted_indices.numel()} indices"
+    # The gather below is safe only because sorted_indices is an argsort, so the indices
+    # are unique and, given the count check here matches, cover every row: nothing is left
+    # unread and no slot is counted twice. A bare `assert` would vanish under `python -O`,
+    # which is exactly the build where a silently wrong reduction is hardest to notice.
+    if sorted_indices.numel() != permuted_output.shape[0]:
+        raise ValueError(
+            f"Unsloth: expected a full permutation of {permuted_output.shape[0]} routed slots, "
+            f"got {sorted_indices.numel()} indices"
+        )
+    # inverse_indices[sorted_indices[i]] = i, i.e. "which routed slot holds original row j".
+    # Gathering with it is one [num_tokens * top_k, hidden] buffer, in the incoming dtype;
+    # the narrowing cast then only ever touches the small [num_tokens, hidden] result.
+    inverse_indices = torch.empty_like(sorted_indices)
+    inverse_indices.scatter_(
+        0,
+        sorted_indices,
+        torch.arange(
+            sorted_indices.numel(),
+            device = sorted_indices.device,
+            dtype = sorted_indices.dtype,
+        ),
     )
-    unpermuted = permuted_output.new_empty(permuted_output.shape)
-    unpermuted.index_copy_(0, sorted_indices, permuted_output)
-    return unpermuted.view(num_tokens, top_k, permuted_output.shape[-1]).sum(dim = 1)
+    combined = (
+        permuted_output
+        .index_select(0, inverse_indices)
+        .view(num_tokens, top_k, permuted_output.shape[-1])
+        .sum(dim = 1)
+    )
+    if out_dtype is not None:
+        combined = combined.to(out_dtype)
+    return combined
 
 
 def _silu_and_mul(x):
