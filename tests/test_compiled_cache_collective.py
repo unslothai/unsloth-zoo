@@ -1917,3 +1917,40 @@ def test_generated_module_co_filename_is_absolute(compiler, monkeypatch, cache_d
         assert os.path.isabs(got), f"co_filename is relative: {got}"
     finally:
         sys.modules.pop("co_filename_probe", None)
+
+
+def test_a_zip_archive_cannot_serve_as_the_cache_directory(compiler, tmp_path):
+    """The trust gate asks the filesystem; the import asks the import machinery.
+
+    zipimport is a default sys.path hook, so a ZIP ARCHIVE named
+    unsloth_compiled_cache is a perfectly good sys.path entry -- while isdir()
+    says no directory and isfile(dir/"moe_utils.py") says no file, so every check
+    reported nothing to reject and `from moe_utils import ...` then resolved out
+    of the archive and ran the attacker's top level. One planted file in the
+    working directory, no environment variable needed.
+    """
+    import zipfile
+
+    archive = tmp_path / "unsloth_compiled_cache"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("moe_utils.py", "PLANTED = 1\n")
+
+    assert archive.is_file() and not archive.is_dir()
+    assert compiler._moe_utils_copy_is_importable(str(archive)) is False, (
+        "a zip archive was trusted as a cache directory"
+    )
+    with pytest.raises(RuntimeError, match = "is not a directory"):
+        compiler._reject_shadowing_import_candidates(str(archive), "moe_utils")
+
+    # It really is importable through zipimport, which is what makes it matter.
+    entry = list(sys.path)
+    previous = sys.modules.pop("moe_utils", None)
+    try:
+        sys.path.insert(0, str(archive))
+        import moe_utils as planted
+        assert planted.PLANTED == 1, "the archive is not importable, so this proves nothing"
+    finally:
+        sys.path[:] = entry
+        sys.modules.pop("moe_utils", None)
+        if previous is not None:
+            sys.modules["moe_utils"] = previous

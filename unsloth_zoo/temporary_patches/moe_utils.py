@@ -192,6 +192,17 @@ def _remove_cached_bytecode(source_file):
 def cached_copy_is_importable(directory) -> bool:
     """Whether a generated module may be allowed to import moe_utils from here.
 
+    A path that is not a real directory is never trusted. Every check here and in
+    _reject_shadowing_import_candidates asks the FILESYSTEM (os.path.isfile /
+    isdir), but the import that eventually runs is resolved by the whole import
+    machinery, and zipimport is a default sys.path hook: a ZIP ARCHIVE named
+    `unsloth_compiled_cache` in the working directory is not a dir and holds no
+    file called moe_utils.py, so every one of those checks said "nothing here to
+    reject" -- and then `from moe_utils import ...` resolved straight out of the
+    archive and ran the attacker's top level. One planted file, no env var
+    needed, reproduced end to end. Demanding a real directory is what puts the
+    filesystem question and the import question back in agreement.
+
     True when there is no copy in `directory` at all. That is not the same as
     "nothing is importable from it" -- a sourceless moe_utils.pyc beside it would
     be, and a moe_utils/ or moe_utils.so outranks the source even when one is
@@ -215,6 +226,11 @@ def cached_copy_is_importable(directory) -> bool:
     no.
     """
     try:
+        # Exists but is not a directory, not merely "is not a directory": a path
+        # that does not exist yet imports nothing and stays trusted, which is
+        # what a cache folder looks like before it is created.
+        if os.path.exists(directory) and not os.path.isdir(directory):
+            return False
         cache_file = os.path.abspath(os.path.join(directory, "moe_utils.py"))
     except Exception:
         return False

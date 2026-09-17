@@ -1411,6 +1411,18 @@ def _reject_shadowing_import_candidates(compile_folder, name):
     this stays right on Windows (.pyd) and on a free-threaded or differently
     tagged build.
     """
+    # A cache location that is not a real directory is refused outright. Every
+    # check below asks the filesystem, but the import is resolved by the whole
+    # import machinery, and zipimport claims any sys.path entry that is a ZIP
+    # archive. A file named `unsloth_compiled_cache` that is really a zip passes
+    # every isdir/isfile check here and still serves `moe_utils` out of the
+    # archive. See cached_copy_is_importable for the reproduction.
+    if os.path.exists(compile_folder) and not os.path.isdir(compile_folder):
+        raise RuntimeError(
+            f"Unsloth: Refusing to import {name} because {compile_folder} exists "
+            f"and is not a directory, so what the import system resolves there is "
+            f"not what was verified here."
+        )
     candidate = os.path.join(compile_folder, name)
     if os.path.isdir(candidate):
         raise RuntimeError(
