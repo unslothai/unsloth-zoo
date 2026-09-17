@@ -1,15 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""``props.total_memory`` on a unified-memory NVIDIA host can be the dedicated carve-out
-while the CUDA runtime's own total spans the shared pool (measured on an RTX Spark N1X:
-NVML/carve-out 8128MiB against a 46477MiB CUDA budget, 5.72x, and a 12GiB allocation that
-the carve-out says is impossible succeeds).
-
-``cuda_total_memory`` therefore applies the rule the ROCm path already follows: compare,
-and adopt only a LARGER driver total, never adopt it outright. The tests below pin every
-branch of that rule, above all the ones that must NOT change anything, since a discrete
-card is the overwhelmingly common case and its two figures always agree.
+"""``props.total_memory`` on a unified-memory NVIDIA host can be the dedicated carve-out while
+the runtime's own total spans the shared pool, so ``cuda_total_memory`` applies the rule the ROCm
+path already follows: compare, and adopt only a LARGER driver total. The tests below pin every
+branch of it, above all the ones that must NOT change anything, since a discrete card is the
+common case and its two figures always agree.
 """
 
 from __future__ import annotations
@@ -23,8 +19,8 @@ GIB = 1024 ** 3
 
 
 class _Props:
-    """Only the fields the probe reads. ``is_integrated`` is omitted when None, so a
-    wheel that does not publish the field at all is a case the suite covers."""
+    """Only the fields the probe reads. ``is_integrated`` is omitted when None, so a wheel that
+    does not publish the field is covered too."""
 
     def __init__(self, total_memory, is_integrated = None):
         self.name = "stub"
@@ -34,9 +30,8 @@ class _Props:
 
 
 def _install(monkeypatch, props, driver_total = None, hip = None):
-    """Point the probe at ``props`` and, optionally, a driver total. ``driver_total`` of
-    None makes ``mem_get_info`` an assertion failure, which is how the tests prove a path
-    never pays for the primary context that call pins."""
+    """``driver_total`` of None makes ``mem_get_info`` an assertion failure, which is how the
+    tests prove a path never pays for the primary context that call pins."""
     torch = pytest.importorskip("torch")
     calls = []
 
@@ -135,8 +130,7 @@ class TestTotalMemoryRule:
 
 
 class TestDiscreteIsUntouched:
-    """There is no discrete card on the machine this was developed on, so the guarantee
-    is pinned here instead: equal figures, and no driver call at all."""
+    """Equal figures, and no driver call at all."""
 
     def test_equal_totals_are_returned_unchanged(self, monkeypatch):
         # A discrete card: properties and driver agree, and the value must be untouched.
@@ -186,15 +180,10 @@ class TestUnreadableDevice:
 class TestFlexAttentionCallSite:
     """The kernel-option probe must keep raising for a device it cannot describe.
 
-    `cuda_total_memory` answers 0 for an unreadable device, which is right for a caller
-    comparing budgets and wrong for this one: 0 GiB reads as "16GB or less", so flex
-    attention would stay ENABLED with 32x32 kernel options on a host where the probe
-    previously raised and turned it off. The call site therefore reads
-    `get_device_properties` itself and passes the result in.
-
-    The real assignment is lifted out of the module source and evaluated here, so this
-    tests the shipped expression rather than a copy of it, without importing the module
-    (whose import-time work needs a GPU).
+    `cuda_total_memory` answers 0 there, which is right for a caller comparing budgets and wrong
+    for this one: 0 GiB reads as "16GB or less", so flex attention would stay ENABLED with 32x32
+    kernel options where the probe previously turned it off. The real assignment is lifted out of
+    the module source and evaluated here, so this tests the shipped expression, not a copy.
     """
 
     @staticmethod

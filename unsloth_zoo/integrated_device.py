@@ -150,8 +150,8 @@ def _tegra_device_visible_for_free():
 
 
 def _is_hip_build():
-    """True on a ROCm/HIP torch. ``torch.cuda`` is the HIP namespace there too, so every
-    CUDA-only probe below has to exclude HIP by name rather than by field presence."""
+    """True on a ROCm/HIP torch, where ``torch.cuda`` is the HIP namespace, so every CUDA-only
+    probe below has to exclude HIP by name rather than by field presence."""
     try:
         import torch
         return bool(getattr(torch.version, "hip", None))
@@ -162,13 +162,10 @@ def _is_hip_build():
 def cuda_props_are_integrated(props):
     """True when ``props`` describes an integrated NVIDIA part, whose VRAM is system RAM.
 
-    Jetson, DGX Spark and RTX Spark class parts set ``cudaDeviceProp::integrated``, which
-    torch publishes as ``is_integrated`` (plain ``integrated`` on some wheels, absent on
-    others, hence getattr rather than attribute access).
-
-    HIP is excluded BY NAME, not by trusting the field to be missing: clr left
-    ``integrated`` unassigned before ROCm 6.2, so a False there means "unknown", not
-    "discrete", and the ROCm total has its own handling that this must not disturb.
+    torch publishes ``cudaDeviceProp::integrated`` as ``is_integrated``, plain ``integrated`` on
+    some wheels and absent on others, hence getattr. HIP is excluded BY NAME rather than by
+    trusting the field to be missing: clr left it unassigned before ROCm 6.2, so False there means
+    "unknown", not "discrete".
     """
     if _is_hip_build():
         return False
@@ -182,9 +179,8 @@ def cuda_props_are_integrated(props):
 def _driver_total_memory(index):
     """The CUDA runtime's own total for ``index``, or None if it cannot be had.
 
-    ``mem_get_info`` pins a primary context for the life of the process (~700MB), so this
-    is only ever reached from a caller that has ALREADY read device properties, which
-    initializes CUDA by itself. It adds no context that the caller was not paying for.
+    ``mem_get_info`` pins a primary context for the life of the process, so this is only reached
+    from a caller that has ALREADY read device properties and so initialized CUDA itself.
     """
     try:
         import torch
@@ -201,16 +197,11 @@ def _driver_total_memory(index):
 def cuda_total_memory(index = 0, props = None):
     """Bytes of device memory torch can actually use on CUDA device ``index``.
 
-    ``props.total_memory`` MAY understate that on a unified-memory host, where it can be
-    the dedicated carve-out while the CUDA runtime's total spans the shared pool as well
-    (measured on an RTX Spark N1X: 8128MiB against 46477MiB, 5.72x). May, not does: on
-    torch 2.14 the two agree there, so the rule is the one the ROCm path already follows,
-    compare and adopt only a LARGER driver total, never adopt it outright. A driver total
-    that is equal, smaller, zero or unreadable leaves the properties figure untouched, so
-    a discrete card, where the two always agree, cannot change behaviour.
-
-    Only integrated parts pay the comparison: there is no context-free source for the
-    shared-pool total, and a discrete card has nothing to learn from asking.
+    ``props.total_memory`` MAY understate that on a unified-memory host, where it can be the
+    dedicated carve-out while the runtime's total spans the shared pool too. May, not does, so the
+    rule is the one the ROCm path already follows: compare, and adopt only a LARGER driver total.
+    Equal, smaller, zero or unreadable leaves the properties figure untouched, so a discrete card
+    cannot change behaviour, and only integrated parts pay for the comparison at all.
     """
     try:
         import torch
