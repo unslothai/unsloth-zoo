@@ -32,6 +32,7 @@ import torch
 import torch.nn as nn
 
 import unsloth_zoo.temporary_patches  # noqa: F401  side effect: register patches
+from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_expert_columns
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
 
 
@@ -240,7 +241,7 @@ def _parity_one(extractor, experts, name: str, in_dim: int, out_dim: int,
     x = torch.randn(5, in_dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]
-        Be = wB[:, e * R : (e + 1) * R]
+        Be = wB[:, moe_lora_b_expert_columns(e, E, R)]
         naive = (x @ Be @ Ae) if peft_swap else (x @ Ae.T @ Be.T)
         via = (x @ first[e]) @ second[e]
         if not torch.allclose(via, naive, atol=1e-4, rtol=1e-4):

@@ -5856,15 +5856,15 @@ def test_a_partial_appearing_after_a_release_re_arms_the_guard(tmp_path, monkeyp
     monkeypatch.setenv("UNSLOTH_HTTP_ATTEMPTS", "4")
     monkeypatch.setenv("UNSLOTH_HTTP_RETRY_BACKOFF", "0")
 
-    calls = {"n": 0}
     real = xf._incomplete_partial_names
 
     def _staged(*a, **k):
+        # Staged on the HTTP CHILD, not the probe: the transition probes the cache too.
         # Gone by the second HTTP child (the guard releases), then a sibling recreates it.
-        calls["n"] += 1
-        if calls["n"] == 1:
+        http_children = len([c for c in fake.calls if c.disable_xet])
+        if http_children == 1 and partial.exists():
             partial.unlink()
-        elif calls["n"] == 2:
+        elif http_children == 3 and not partial.exists():
             partial.write_bytes(b"y" * 16)
         return real(*a, **k)
 
