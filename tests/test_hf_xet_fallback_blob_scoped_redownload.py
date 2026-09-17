@@ -1430,3 +1430,71 @@ def test_the_stalled_child_is_killed_before_the_live_writer_walk(monkeypatch, tm
     assert kind_result == "stall"
     assert order[:2] == ["kill", "walk"], f"the walk must follow the kill, got {order}"
     assert params.get("_owned_incomplete_blobs") == {child_partial}
+
+
+def test_an_unreadable_process_of_our_own_stops_the_purge_where_there_is_no_fd_table(
+    monkeypatch, tmp_path,
+):
+    """Cache privacy only excludes OTHER uids, so it cannot cover a process running as us.
+
+    macOS denies `open_files()` for same-uid processes under TCC and the hardened runtime, and
+    has no `/proc` to ask instead. That downloader is absent from the lower bound while holding
+    the very partial the pass is about to whitelist, and a private cache says nothing about it.
+    Where the fd table DOES exist it is what answers for our own processes, so the same denial
+    there is not a gap -- that case is the one below.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+
+    class _Denied(Exception):
+        pass
+
+    class _Proc:
+        pid = 4242
+
+        def open_files(self):
+            raise _Denied("TCC")
+
+        def uids(self):
+            return os.stat_result(tuple(range(10)))  # placeholder, replaced below
+
+    class _OurProc(_Proc):
+        def uids(self):
+            return type("U", (), {"effective": os.geteuid() if hasattr(os, "geteuid") else 0})()
+
+    class _TheirProc(_Proc):
+        def uids(self):
+            return type("U", (), {"effective": -1})()
+
+    class _FakePsutil:
+        NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+        ZombieProcess = type("ZombieProcess", (Exception,), {})
+        procs = [_OurProc()]
+
+        @staticmethod
+        def process_iter():
+            return _FakePsutil.procs
+
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda *a, **k: True)
+    monkeypatch.setattr(xf, "_fd_table_is_available", lambda: False)
+
+    assert xf._unowned_partials_safe_to_clear("model", REPO, str(tmp_path), 180.0, None) is None
+    assert (tmp_path / REPO_DIR / "blobs" / stranger).exists(), (
+        "a partial a process of ours may hold must survive a private-cache purge"
+    )
+    assert xf._live_writer_walk_missed_our_own_uid() is True
+
+    # The same denial for somebody ELSE's process is what privacy does answer for.
+    _FakePsutil.procs = [_TheirProc()]
+    assert xf._unowned_partials_safe_to_clear(
+        "model", REPO, str(tmp_path), 180.0, None,
+    ) == {stranger}
+
+    # And with an fd table to ask instead, our own denied process is answered, not missed.
+    _FakePsutil.procs = [_OurProc()]
+    monkeypatch.setattr(xf, "_fd_table_is_available", lambda: True)
+    monkeypatch.setattr(xf, "_proc_fd_partial_paths", lambda pid: set())
+    assert xf._unowned_partials_safe_to_clear(
+        "model", REPO, str(tmp_path), 180.0, None,
+    ) == {stranger}

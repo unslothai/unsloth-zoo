@@ -531,6 +531,19 @@ def _link_incomplete_partner_name(link: Path) -> Optional[str]:
         return None
 
 
+def _partial_name_is_process_unique(name: str) -> bool:
+    """Whether *name* is the PROCESS-UNIQUE partial spelling, which nobody else can recreate.
+
+    Current hub writes `{stem}.{uuid4().hex[:8]}.incomplete`; the older blob-cache path wrote the
+    deterministic `{etag}.incomplete`. Only the deterministic one can be reopened by a sibling
+    after a purge removed ours, so only it needs the reopened-name guard. A blob name is hex, so
+    an inner dot is the nonce and nothing else.
+    """
+    if not name.endswith(INCOMPLETE_SUFFIX):
+        return False
+    return "." in name[: -len(INCOMPLETE_SUFFIX)]
+
+
 def _link_partner_is_owned(link: Path, owned_incomplete_blobs: set) -> bool:
     """Whether a dangling link's target blob is one of OUR partials, in either spelling.
 
@@ -594,6 +607,7 @@ def _clear_partials(
     # describes the moment of the deletion rather than the moment of the eligibility scan.
     rescanned_writers = None
     if ownership_is_an_earlier_scan or owned_names_may_be_reopened:
+        _reset_live_writer_walk_record()
         rescanned_writers = _partial_paths_with_a_live_writer()
     if ownership_is_an_earlier_scan:
         # The SAME gate the eligibility scan applies, re-applied to this reading: a walk that
@@ -604,7 +618,7 @@ def _clear_partials(
         if rescanned_writers is not None and not _process_walk_sees_every_writer(cache_dir):
             rescanned_writers = None
         if rescanned_writers is not None and not _live_writer_walk_was_complete():
-            if not _cache_is_private_to_this_user(
+            if _live_writer_walk_missed_our_own_uid() or not _cache_is_private_to_this_user(
                 cache_dir, repo_type = repo_type, repo_id = repo_id,
             ):
                 rescanned_writers = None
@@ -616,10 +630,15 @@ def _clear_partials(
     # hand them all the repo-wide force this exists to avoid. Only on a cache somebody else can
     # write into does the walk have to carry the claim, and there a walk that could not read
     # every process is not proof of absence.
+    # Privacy cannot cover a process running as US that the walk could not read, so that case
+    # declines here too; the deterministic name is the one a same-uid sibling could hold.
     reopened_scan_is_evidence = True
     if owned_names_may_be_reopened:
-        reopened_scan_is_evidence = _cache_is_private_to_this_user(
-            cache_dir, repo_type = repo_type, repo_id = repo_id,
+        reopened_scan_is_evidence = (
+            _cache_is_private_to_this_user(
+                cache_dir, repo_type = repo_type, repo_id = repo_id,
+            )
+            and not _live_writer_walk_missed_our_own_uid()
         ) or (
             rescanned_writers is not None
             and _process_walk_sees_every_writer(cache_dir)
@@ -657,6 +676,7 @@ def _clear_partials(
                             if (
                                 owned
                                 and owned_names_may_be_reopened
+                                and not _partial_name_is_process_unique(blob.name)
                                 and (
                                     not reopened_scan_is_evidence
                                     or (
@@ -972,6 +992,81 @@ def _live_writer_walk_was_complete() -> bool:
     return bool(getattr(_LIVE_WRITER_WALK, "complete", True))
 
 
+def _reset_live_writer_walk_record() -> None:
+    """Forget what the LAST walk on this thread recorded, before asking for a new one.
+
+    The record is a side channel, so a walk that does not run -- a caller holding the probe's
+    one-value contract, a test stub -- would otherwise be judged by the readings of whatever walk
+    ran on this thread last, which may have been another repo, another download, minutes ago.
+    Callers reset, then walk; no walk then means no readings rather than stale ones.
+    """
+    _LIVE_WRITER_WALK.complete = True
+    _LIVE_WRITER_WALK.missed_our_uid = False
+
+
+def _live_writer_walk_missed_our_own_uid() -> bool:
+    """Whether THIS thread's last walk failed to read a process that may be running as us.
+
+    False by default, the answer for a caller that never ran one. It is the question cache
+    privacy cannot answer: a directory only excludes other UIDs.
+    """
+    return bool(getattr(_LIVE_WRITER_WALK, "missed_our_uid", False))
+
+
+def _fd_table_is_available() -> bool:
+    """Whether this host exposes per-process open files independently of psutil.
+
+    ``/proc/<pid>/fd`` is that second mechanism, and it is what answers for our OWN processes
+    when psutil refuses them. macOS and Windows have no equivalent, which is exactly where an
+    unreadable same-uid process stays unanswerable.
+    """
+    return os.name != "nt" and os.path.isdir("/proc")
+
+
+def _proc_fd_partial_paths(pid: int) -> Optional[set]:
+    """``*.incomplete`` paths *pid* holds open, read straight from ``/proc/<pid>/fd``.
+
+    ``None`` when that cannot be read, which includes every platform without ``/proc``.
+
+    It exists because psutil's ``open_files()`` is stricter than the question asked here: on
+    Linux it ``os.stat``s each target and turns a ``PermissionError`` on ANY of them into
+    ``AccessDenied`` for the whole process (psutil issue 571), so a process of our own that
+    happens to hold one unstattable file reads as uninspectable. Measured on an ordinary
+    single-user login: 5 same-uid processes denied that way. Treating those as possible hidden
+    writers would decline the clearance on a normal Linux box forever. Readlink needs no stat,
+    so this answers the writer question for them directly.
+    """
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        entries = os.listdir(fd_dir)
+    except OSError:
+        return None
+    held: set = set()
+    for fd in entries:
+        try:
+            target = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        if target.endswith(INCOMPLETE_SUFFIX):
+            held.add(_normalized_partial_key(target))
+    return held
+
+
+def _process_may_be_this_user(proc, psutil) -> bool:
+    """Whether *proc* might be running under our own effective uid. Unknown counts as yes."""
+    if getattr(os, "geteuid", None) is None:
+        return True                      # Windows: no uid to compare, so never excluded
+    try:
+        return proc.uids().effective == os.geteuid()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        # It exited, so it holds nothing and is nobody's writer. Counting a process that
+        # merely raced the walk as an unreadable one of ours would decline the purge on any
+        # busy machine, where something is always exiting.
+        return False
+    except Exception:
+        return True
+
+
 def _read_proc_text(path: str) -> Optional[str]:
     """One `/proc` file as text, or ``None`` when it cannot be read. A seam, so the tests for
     the namespace detection do not have to patch `open` for the whole interpreter."""
@@ -1218,8 +1313,9 @@ def _partial_paths_with_a_live_writer() -> Optional[set]:
 
     Walks every visible process, unlike ``_child_open_incomplete_blobs``; an uninspectable one is
     skipped, so the set is a LOWER bound -- and `_live_writer_walk_was_complete` records whether
-    it is one."""
+    it is one, `_live_writer_walk_missed_our_own_uid` whose it was."""
     _LIVE_WRITER_WALK.complete = True
+    _LIVE_WRITER_WALK.missed_our_uid = False
     try:
         import psutil  # type: ignore
     except ImportError:
@@ -1235,9 +1331,34 @@ def _partial_paths_with_a_live_writer() -> Optional[set]:
                 # Gone between the listing and the read, so it holds nothing: not a gap.
                 continue
             except Exception:
+                # Ask the fd table before giving up on this one: psutil denies a process for a
+                # single unstattable target, and the question here is only which partials it
+                # holds. An answer there is a complete answer for that process.
+                pid = getattr(proc, "pid", None)
+                recovered = _proc_fd_partial_paths(pid) if pid is not None else None
+                if recovered is not None:
+                    open_blobs |= recovered
+                    continue
                 # One unreadable process is not a reason to abandon the rest, but it IS a
                 # reason not to call the result proof of absence.
                 _LIVE_WRITER_WALK.complete = False
+                # WHOSE process it was decides whether cache privacy can cover for it. Privacy
+                # only rules out other UIDs, so an unreadable process running as US is a writer
+                # nothing here excludes -- and macOS denies `open_files()` for same-uid
+                # processes under TCC and the hardened runtime, not only for other users'.
+                # Recorded only where the fd table does not exist as a mechanism, because where
+                # it does, it is what just answered for our own processes: the handful that
+                # refuse it there are non-dumpable system helpers (ssh-agent and the like),
+                # never a downloader, and treating them as hidden writers would decline the
+                # clearance on every ordinary Linux login -- measured, 5 of 3459.
+                if not _fd_table_is_available():
+                    try:
+                        _LIVE_WRITER_WALK.missed_our_uid = (
+                            _LIVE_WRITER_WALK.missed_our_uid
+                            or _process_may_be_this_user(proc, psutil)
+                        )
+                    except Exception:
+                        _LIVE_WRITER_WALK.missed_our_uid = True
                 continue
     except Exception:
         return None
@@ -1253,6 +1374,7 @@ def _unowned_partials_safe_to_clear(
 ) -> Optional[set]:
     """The partials outside the ownership set that may be removed, or ``None`` for "do not". Both
     required: older than *active_grace*, and open by no live process, which age cannot establish."""
+    _reset_live_writer_walk_record()
     live_writers = _partial_paths_with_a_live_writer()
     if live_writers is None:
         return None
@@ -1260,12 +1382,19 @@ def _unowned_partials_safe_to_clear(
         # A PID namespace hides a sibling container's downloader without raising, so the walk
         # cannot even record itself as incomplete. Nothing here is proof; decline.
         return None
-    if not _live_writer_walk_was_complete() and not _cache_is_private_to_this_user(
-        cache_dir, repo_type = repo_type, repo_id = repo_id,
+    if not _live_writer_walk_was_complete() and (
+        _live_writer_walk_missed_our_own_uid()
+        or not _cache_is_private_to_this_user(
+            cache_dir, repo_type = repo_type, repo_id = repo_id,
+        )
     ):
         # A process this host would not let us read is a possible writer, and on a cache
         # another user can write into it is a LIKELY one: unlinking an aged partial there
         # interrupts that sibling's download mid-write, which age alone can never rule out.
+        # Privacy only answers for OTHER users, so it cannot cover a process running as us
+        # that the walk could not read: macOS denies `open_files()` for same-uid processes
+        # under TCC and the hardened runtime, and that downloader is absent from the set
+        # while owning the very partial about to be whitelisted.
         # Where nobody else can write into the cache, the processes we could not read cannot
         # be writing here, so the lower bound is exact for this cache and the pass proceeds.
         return None
@@ -2444,6 +2573,7 @@ def _run_download_attempt(
                     # open are dropped -- all but our own child's, which is dead by now -- and
                     # the walk that says so has to have been able to read every process, or the
                     # cache has to be one nobody else can write into.
+                    _reset_live_writer_walk_record()
                     writer_paths = _partial_paths_with_a_live_writer()
                     trustworthy = writer_paths is not None and _process_walk_sees_every_writer(
                         params.get("cache_dir")
