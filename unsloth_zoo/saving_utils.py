@@ -91,6 +91,7 @@ from transformers.modeling_utils import PushToHubMixin
 import json
 import ntpath
 import os
+import posixpath
 from pathlib import Path
 from typing import Union, List, Optional
 import tempfile
@@ -2977,11 +2978,6 @@ def _carry_over_vocab_size(base_config, trained_config):
 pass
 
 
-# A path that exists nowhere, used only to ask whether a relative name would stay
-# under whatever directory it is joined onto.
-_SHARD_CONTAINMENT_ROOT = os.path.abspath(os.path.join(os.sep, "unsloth_shard_root"))
-
-
 def _shard_name_stays_inside(name):
     """Whether `name` resolves under the directory it is joined onto.
 
@@ -2989,13 +2985,26 @@ def _shard_name_stays_inside(name):
     a repo id supplies the index), and they reach both `os.path.join(model_name,
     name)` and `os.path.join(save_directory, name)`. Anything absolute, empty, or
     climbing out with `..` escapes.
+
+    Checked under POSIX and Windows rules both, because the index we are vouching
+    for gets exported and read back somewhere else: `..\\..\\x` is one ordinary
+    filename on POSIX and a traversal on Windows, so judging it only by the host
+    would bless an index that escapes on the machine that opens it. No real shard
+    name contains a separator either way.
     """
     if not isinstance(name, str) or not name:
         return False
-    if os.path.isabs(name) or ntpath.isabs(name):
+    if "\x00" in name:
+        # No filename holds one, and `os.path.exists` raises ValueError on it, which
+        # the shard-list branch swallows and turns into a bare assert 300 lines later.
         return False
-    joined = os.path.normpath(os.path.join(_SHARD_CONTAINMENT_ROOT, name))
-    return joined.startswith(_SHARD_CONTAINMENT_ROOT + os.sep)
+    for _module in (posixpath, ntpath):
+        if _module.isabs(name):
+            return False
+        root = _module.join(_module.sep, "unsloth_shard_root")
+        if not _module.normpath(_module.join(root, name)).startswith(root + _module.sep):
+            return False
+    return True
 
 
 def _reject_unsafe_shard_index(index_path):
@@ -3004,17 +3013,28 @@ def _reject_unsafe_shard_index(index_path):
     Raised rather than silently rewritten: an index naming a shard the merge
     refused to copy is inconsistent whatever we do with it, and a quiet rewrite
     would hand the user an export whose tensors no longer resolve.
+
+    Returns the bytes it vouched for, so the caller can export those instead of
+    opening the file a second time. Checking one read and exporting another leaves
+    a window in which the index can be swapped for a poisoned one.
     """
     try:
-        with open(index_path, "r", encoding = "utf-8") as file:
-            index_data = json.load(file)
+        with open(index_path, "rb") as file:
+            raw = file.read()
+        # Decoded permissively, not as strict UTF-8: transformers reads this file with
+        # `open(index_filename)`, so under a non-UTF-8 locale (cp1252 on Windows) it
+        # parses bytes that strict UTF-8 rejects. Refusing to decode here would wave
+        # such an index through to a reader that can still follow its traversal, and
+        # one stray byte in attacker-controlled metadata is enough to arrange that.
+        # Surrogateescape never fails and leaves the ASCII of a `../` prefix intact.
+        index_data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
     except Exception:
-        # An index we cannot read is not one we can vouch for, but it is also not
-        # the traversal being guarded against; leave it to the reader that needs it.
-        return
+        # An index we cannot parse at all is not one we can vouch for, but it is also
+        # not the traversal being guarded against; leave it to the reader that needs it.
+        return None
     weight_map = index_data.get("weight_map")
     if not isinstance(weight_map, dict):
-        return
+        return raw
     unsafe = sorted({
         str(value) for value in weight_map.values()
         if not _shard_name_stays_inside(value)
@@ -3025,6 +3045,7 @@ def _reject_unsafe_shard_index(index_path):
             f"{len(unsafe)} shard path(s) outside the model directory: "
             f"{', '.join(repr(name) for name in unsafe[:5])}."
         )
+    return raw
 
 
 @torch.inference_mode
@@ -3466,10 +3487,11 @@ def merge_and_overwrite_lora(
     # that branch is skipped entirely on a dequant or splitting export, and an in-place
     # merge (save_directory == model_name) then leaves the unsafe index in the output
     # directory, with regenerate_index false whenever one non-HF-named shard remains.
+    _validated_index_bytes = None
     if is_local_path:
         _local_index_path = os.path.join(model_name, "model.safetensors.index.json")
         if os.path.exists(_local_index_path):
-            _reject_unsafe_shard_index(_local_index_path)
+            _validated_index_bytes = _reject_unsafe_shard_index(_local_index_path)
     # ONLY download/copy the original index if we are NOT dequantizing a quantized model
     if not _is_quant_dequant and not needs_splitting:
         if is_local_path:
@@ -3478,8 +3500,20 @@ def merge_and_overwrite_lora(
             local_index_path = os.path.join(model_name, "model.safetensors.index.json")
             if safe_tensor_index_files:
                 if os.path.exists(local_index_path):
+                    _index_destination = os.path.join(save_directory, "model.safetensors.index.json")
                     try:
-                        shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                        if _validated_index_bytes is None:
+                            # Nothing was vouched for (unparseable index), so behave as before.
+                            shutil.copy2(local_index_path, _index_destination)
+                        elif os.path.exists(_index_destination) and \
+                                os.path.samefile(local_index_path, _index_destination):
+                            raise shutil.SameFileError
+                        else:
+                            # Export the bytes the guard read, never a second read of the
+                            # file: between the two, the index can be swapped for one that
+                            # traverses, and the export would carry the swapped copy.
+                            with open(_index_destination, "wb") as _index_file:
+                                _index_file.write(_validated_index_bytes)
                     except shutil.SameFileError:
                         pass
                     except Exception as e:

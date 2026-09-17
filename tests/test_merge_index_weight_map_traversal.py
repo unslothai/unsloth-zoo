@@ -434,3 +434,102 @@ def test_a_mixed_index_is_not_exported_verbatim(monkeypatch, tmp_path):
     with open(index_path, "w", encoding = "utf-8") as f:
         json.dump(index, f)
     saving_utils._reject_unsafe_shard_index(str(index_path))
+
+
+def test_an_index_that_is_not_valid_utf8_is_still_checked(tmp_path):
+    """The guard must read what the eventual consumer reads.
+
+    `transformers.utils.hub.get_checkpoint_shard_files` opens the index with a bare
+    `open(index_filename)`, so it decodes with the locale encoding. Under cp1252,
+    which is the Windows default, bytes that strict UTF-8 rejects still parse and the
+    traversal is still followed. A guard that gave up on those bytes would wave the
+    index through to a reader that does not.
+    """
+    index_path = tmp_path / "model.safetensors.index.json"
+    # One stray 0xff inside metadata the attacker controls; the entry stays ASCII.
+    index_path.write_bytes(
+        b'{"metadata": {"n": "\xff"}, "weight_map": {"a": "../../' +
+        PAYLOAD.encode() + b'"}}'
+    )
+    # The premise: strict UTF-8 cannot read this, cp1252 can.
+    with pytest.raises(UnicodeDecodeError):
+        index_path.read_text(encoding = "utf-8")
+    assert "../../" in json.loads(index_path.read_text(encoding = "cp1252"))["weight_map"]["a"]
+
+    with pytest.raises(RuntimeError, match = "outside the model directory"):
+        saving_utils._reject_unsafe_shard_index(str(index_path))
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("model-00001-of-00004.safetensors", True),
+    ("weights/model-00001-of-00002.safetensors", True),
+    ("..\\..\\escaped\\x.safetensors", False),   # one filename on POSIX, traversal on Windows
+    ("C:\\x.safetensors", False),
+    ("\\\\server\\share\\x.safetensors", False),
+    ("../x.safetensors", False),
+    ("/x.safetensors", False),
+    ("\x00evil.safetensors", False),
+])
+def test_containment_is_judged_under_both_path_flavours(name, expected):
+    """The index we vouch for is exported and read back somewhere else.
+
+    Judging a backslash name by the host alone blesses an index that traverses on
+    whichever machine opens it, so both rule sets have to agree before it is kept.
+    """
+    assert saving_utils._shard_name_stays_inside(name) is expected
+
+
+def test_the_exported_index_is_the_one_that_was_validated(monkeypatch, tmp_path):
+    """Validate one read and export another and the gap between them is exploitable.
+
+    The guard used to check the file and `shutil.copy2` then opened it again; an
+    index swapped in between was exported unchecked. Modelled deterministically by
+    swapping it the instant validation returns, which is the race, won every time.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    base_dir = os.path.join(str(tmp_path), "base")
+    model = H.build_and_save_base(spec, base_dir, max_shard_size = "40KB")
+    peft_model = H.attach_lora(model, spec, "full")
+    assert len([f for f in os.listdir(base_dir) if f.endswith(".safetensors")]) > 1
+
+    poisoned = {
+        "metadata": {"total_size": 8},
+        "weight_map": {"a.weight": f"../../escaped/{PAYLOAD}"},
+    }
+    index_path = os.path.join(base_dir, "model.safetensors.index.json")
+    real_guard = saving_utils._reject_unsafe_shard_index
+
+    def swap_after_validating(path):
+        validated = real_guard(path)
+        with open(path, "w", encoding = "utf-8") as f:
+            json.dump(poisoned, f)
+        return validated
+    monkeypatch.setattr(
+        saving_utils, "_reject_unsafe_shard_index", swap_after_validating, raising = True,
+    )
+    _stub_the_hub(monkeypatch)
+
+    save_directory = os.path.join(str(tmp_path), "exported")
+    try:
+        saving_utils.merge_and_overwrite_lora(
+            get_model_name  = lambda *a, **k: base_dir,
+            model           = peft_model,
+            tokenizer       = None,
+            save_directory  = save_directory,
+            save_method     = "merged_16bit",
+            push_to_hub     = False,
+        )
+    except Exception:
+        pass
+
+    exported = os.path.join(save_directory, "model.safetensors.index.json")
+    if os.path.exists(exported):
+        with open(exported, encoding = "utf-8") as f:
+            values = list(json.load(f)["weight_map"].values())
+        assert all(saving_utils._shard_name_stays_inside(v) for v in values), (
+            f"the swapped index reached the export: {values!r}"
+        )
