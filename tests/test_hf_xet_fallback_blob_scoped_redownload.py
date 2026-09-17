@@ -1412,6 +1412,40 @@ def test_a_reopened_owned_name_is_spared_when_the_walk_cannot_see_every_writer(
     assert mine in _partials(tmp_path), "a name another process may hold must not be unlinked"
 
 
+def test_a_sibling_container_on_a_shared_volume_keeps_its_reopened_name(monkeypatch, tmp_path):
+    """Privacy answers for UIDs, and a sibling container is the SAME uid in another namespace.
+
+    A cache volume mounted into two containers is owned by us and mode 0700 in both, so
+    `_cache_is_private_to_this_user` says yes and nothing in the walk can see the sibling's
+    downloader at all -- it is not an unreadable process of ours, it is structurally invisible.
+    Treating the empty writer set as evidence there unlinks the sibling's live partial.
+    """
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: False)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda *a, **k: True)
+    monkeypatch.setattr(xf, "_process_walk_sees_every_writer", lambda cache_dir = None: False)
+
+    xf._clear_partials(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {mine}, owned_names_may_be_reopened = True,
+    )
+    assert mine in _partials(tmp_path), (
+        "a volume shared with another namespace is not answered by file ownership"
+    )
+
+    # And where the walk DOES see every writer, privacy still carries it, so the fix costs
+    # the single-user host of #9094 nothing.
+    monkeypatch.setattr(xf, "_process_walk_sees_every_writer", lambda cache_dir = None: True)
+    xf._clear_partials(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {mine}, owned_names_may_be_reopened = True,
+    )
+    assert mine not in _partials(tmp_path), "an ordinary private cache still clears"
+
+
 def test_the_stalled_child_is_killed_before_the_live_writer_walk(monkeypatch, tmp_path):
     """A stalled child HOLDS its partial open, so asking first subtracted our own file.
 
@@ -1714,6 +1748,31 @@ def test_a_cache_confirmed_clean_still_skips_the_clearance(monkeypatch, tmp_path
     assert _http_force(attempt) is False
 
 
+class _NoMarkers:
+    """`os.path` for the container gate with every runtime marker absent, so the gate is read
+    for its cgroup logic rather than for whatever the machine running the tests happens to be."""
+
+    _SIMULATED = frozenset({
+        "/.dockerenv", "/run/.containerenv", "/run/systemd/container", "/run/host",
+        "/proc/vz", "/proc/bc",
+    })
+
+    @classmethod
+    def exists(cls, path):
+        if path in cls._SIMULATED:
+            return False
+        return os.path.exists(path)
+
+    @classmethod
+    def isdir(cls, path):
+        if path in cls._SIMULATED:
+            return False
+        return os.path.isdir(path)
+
+    def __getattr__(self, name):
+        return getattr(os.path, name)
+
+
 def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
     """systemd-nspawn runs systemd as PID 1, with `/init.scope` and no runtime marker.
 
@@ -1776,3 +1835,54 @@ def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
         "36 25 0:32 / / rw - overlay overlay rw\n41 36 8:1 /srv /cache rw - ext4 /dev/sda1 rw",
     )
     assert xf._process_walk_sees_every_writer(str(tmp_path)) is False
+
+
+def test_a_root_cgroup_under_a_non_systemd_init_is_still_the_host(monkeypatch, tmp_path):
+    """`0::/` is a container's shape, but it is not container-SPECIFIC.
+
+    Only systemd moves PID 1 into `/init.scope`. OpenRC, runit and busybox init leave it in
+    the root cgroup, so a perfectly ordinary host reads exactly the line a cgroup-v2 container
+    reads. Answering "container" there declines the clearance on every such host whose cache
+    is on its own mount, which is the repo-wide re-download this change exists to avoid.
+    """
+    if os.name == "nt" or not os.path.isdir("/proc"):
+        pytest.skip("POSIX containers only")
+
+    proc_text = {"/proc/1/cgroup": "0::/\n", "/proc/1/comm": "openrc-init\n"}
+    monkeypatch.setattr(xf, "_read_proc_text", lambda path: proc_text.get(path))
+
+    links = {"/proc/1/ns/cgroup": "cgroup:[4026531835]"}
+
+    class _NoMarkerOs:
+        path = _NoMarkers()
+
+        @staticmethod
+        def readlink(path):
+            return links[path]
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+    monkeypatch.setattr(xf, "os", _NoMarkerOs())
+    assert xf._running_in_a_container() is False, "a non-systemd host is not a container"
+
+    # An entrypoint that is not an init still reads as a container on the same line.
+    proc_text["/proc/1/comm"] = "python3\n"
+    assert xf._running_in_a_container() is True
+
+    # And so does a supported init whose cgroup namespace is NOT the initial one, which is
+    # what an unshared container looks like when it happens to run one.
+    proc_text["/proc/1/comm"] = "openrc-init\n"
+    links["/proc/1/ns/cgroup"] = "cgroup:[4026533112]"
+    assert xf._running_in_a_container() is True
+
+    # An unreadable link is not evidence of the host either.
+    links.clear()
+
+    class _DeniedLink(_NoMarkerOs):
+        @staticmethod
+        def readlink(path):
+            raise PermissionError(path)
+
+    monkeypatch.setattr(xf, "os", _DeniedLink())
+    assert xf._running_in_a_container() is True

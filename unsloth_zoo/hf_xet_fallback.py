@@ -668,6 +668,13 @@ def _clear_partials(
             _cache_is_private_to_this_user(
                 cache_dir, repo_type = repo_type, repo_id = repo_id,
             )
+            # Privacy is a question about UIDs, and a sibling CONTAINER sharing the cache
+            # volume runs as the same UID in a PID namespace of its own. Filesystem ownership
+            # cannot tell the two apart, so where the walk cannot see every writer the
+            # deterministic name may be held by a downloader we are structurally unable to
+            # observe, and unlinking it truncates a live download. The eligibility scan
+            # already asks this; the reopened-name arm has to ask it as well.
+            and _process_walk_sees_every_writer(cache_dir)
             # Privacy says no other UID can have reopened the name. It does not say that a
             # process of OUR OWN did not, and one we cannot describe is exactly the sibling
             # this guard is about. What keeps that from costing the fix is the spelling: only
@@ -1236,11 +1243,24 @@ def _running_in_a_container() -> bool:
     ):
         return True
     lines = [line for line in cgroup.splitlines() if line.strip()]
-    if lines == ["0::/"]:
-        # cgroup v2, PID 1 at the root of its own hierarchy: a container's shape. A host's
-        # PID 1 under systemd is in `/init.scope`.
-        return True
     pid_one = _read_proc_text("/proc/1/comm")
+    if lines == ["0::/"]:
+        # cgroup v2, PID 1 at the root of its cgroup namespace. That is a container's shape,
+        # but it is not container-SPECIFIC: only systemd moves PID 1 into `/init.scope`, so an
+        # OpenRC, runit or busybox-init host leaves PID 1 in the root cgroup and reads exactly
+        # the same line. Answering "container" there declines the clearance on every such host
+        # whose cache is on its own mount, which is the repo-wide re-download this exists to
+        # avoid. So the shape asks twice more before it is believed: PID 1 must be a supported
+        # init, AND the cgroup namespace must be the initial one. `4026531835` is the kernel's
+        # fixed inode for that namespace, and a container that unshared it reads anything else.
+        if pid_one is None or pid_one.strip() not in _HOST_INIT_NAMES:
+            return True
+        try:
+            if os.readlink("/proc/1/ns/cgroup") != "cgroup:[4026531835]":
+                return True
+        except OSError:
+            return True                  # cannot tell, so do not claim the host
+        return False
     if pid_one is None:
         return True
     return pid_one.strip() not in _HOST_INIT_NAMES
