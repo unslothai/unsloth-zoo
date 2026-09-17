@@ -792,9 +792,17 @@ def combine_permuted_moe_outputs(
 
     if out_dtype is not None:
         permuted_output = permuted_output.to(out_dtype)
-    unpermuted = permuted_output.new_zeros(permuted_output.shape).index_copy(
-        0, sorted_indices, permuted_output,
+    # index_copy_ in place, into new_empty rather than new_zeros: the out-of-place spelling
+    # holds a second [num_tokens * top_k, hidden] buffer live alongside the first, which at
+    # long context is hundreds of MiB for nothing. Both are safe only because sorted_indices
+    # is an argsort, so the indices are unique and, given the count below matches, cover
+    # every row: nothing is left unwritten and no element is accumulated twice.
+    assert sorted_indices.numel() == permuted_output.shape[0], (
+        f"Unsloth: expected a full permutation of {permuted_output.shape[0]} routed slots, "
+        f"got {sorted_indices.numel()} indices"
     )
+    unpermuted = permuted_output.new_empty(permuted_output.shape)
+    unpermuted.index_copy_(0, sorted_indices, permuted_output)
     return unpermuted.view(num_tokens, top_k, permuted_output.shape[-1]).sum(dim = 1)
 
 
