@@ -839,6 +839,88 @@ def _has_lora_adapters(param) -> bool:
     return len(param.lora_A) > 0
 
 
+# How the flat `num_experts * rank` axis of a fused expert `lora_B` is laid out.
+#
+# PEFT stores a fused MoE expert LoRA as two ordinary Linear weights, lora_A of shape
+# (num_experts * rank, in) and lora_B of shape (out, num_experts * rank), and the two are
+# NOT flattened the same way. lora_A is expert-slowest, `reshape(E, r, in)`. lora_B is
+# expert-FASTEST: `reshape(out, r, E)`, so column j belongs to expert `j % E`. That
+# asymmetry is easy to miss, and it is the whole of this constant's reason to exist.
+#
+# Expert-fastest is what PEFT's own forward (`ParamWrapper.get_delta_factors`) and its
+# merge (`ParamWrapper.get_delta_weight`) both do, unchanged across PEFT 0.18 to 0.21;
+# what vLLM's `_stack_moe_lora_weights` does when it serves the adapter; and what prime-rl
+# writes. It is the only reading any consumer of a saved adapter implements, so it is what
+# the separated forward has to train.
+LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
+
+# What Unsloth's separated forward read before this fix: expert-SLOWEST, a rank-wide
+# contiguous block of columns per expert. Self-consistent, and understood by nothing else.
+# Kept only so an adapter trained that way can still be read back, see
+# `moe_lora_b_layout()`.
+LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
+
+_LORA_B_LAYOUTS = (LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT)
+
+
+def moe_lora_b_layout() -> str:
+    """Which packing to read a fused expert `lora_B` with.
+
+    `rank_major` (PEFT's, and therefore everyone's) unless
+    `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` asks for the pre-fix reading, which is
+    what an adapter trained by an older Unsloth needs. Read per call rather than cached at
+    import so a caller can set it around a single load."""
+    layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
+    if layout not in _LORA_B_LAYOUTS:
+        raise ValueError(
+            f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_LORA_B_LAYOUTS}, got "
+            f"{layout!r}."
+        )
+    return layout
+
+
+def unflatten_moe_lora_b(
+    weight_B: torch.Tensor,
+    num_experts: int,
+    rank_per_expert: int,
+    dim_B: int,
+    layout: str = None,
+) -> torch.Tensor:
+    """`(out, num_experts * rank)` -> `(num_experts, out, rank)`.
+
+    The single place the expert axis of a fused `lora_B` is resolved, so the forward, the
+    merge and any converter cannot drift apart. Both layouts end in `.contiguous()` on a
+    permuted view, so neither is cheaper than the other and the choice is purely one of
+    which convention the stored tensor was written in."""
+    if layout is None:
+        layout = moe_lora_b_layout()
+    if layout == LORA_B_LAYOUT_RANK_MAJOR:
+        # PEFT: reshape(out, rank, num_experts), expert index fastest.
+        return weight_B.reshape(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
+    # Pre-fix Unsloth: view(out, num_experts, rank), expert index slowest.
+    return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
+
+
+def moe_lora_b_expert_columns(
+    expert_idx: int,
+    num_experts: int,
+    rank_per_expert: int,
+    layout: str = None,
+) -> slice:
+    """Which columns of a flat `(out, num_experts * rank)` `lora_B` belong to one expert.
+
+    A `slice`, so indexing with it stays a view. The companion of
+    `unflatten_moe_lora_b` for the merge paths that walk one expert at a time; the two
+    must agree, which is why both live here. `lora_A`'s rows for the same expert are
+    always `expert_idx * rank : (expert_idx + 1) * rank`, in both layouts, and the
+    resulting column order matches that rank order."""
+    if layout is None:
+        layout = moe_lora_b_layout()
+    if layout == LORA_B_LAYOUT_RANK_MAJOR:
+        return slice(expert_idx, num_experts * rank_per_expert, num_experts)
+    return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
+
+
 def _canonical_lora_weights_for_grouped_mm(
     weight_A: torch.Tensor,
     weight_B: torch.Tensor,
@@ -849,8 +931,10 @@ def _canonical_lora_weights_for_grouped_mm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
     first_weight = first_weight.permute(0, 2, 1).contiguous()
-    second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-    second_weight = second_weight.permute(1, 2, 0).contiguous()
+    # (num_experts, out, rank) -> (num_experts, rank, out) for X @ first @ second.
+    second_weight = unflatten_moe_lora_b(
+        weight_B, num_experts, rank_per_expert, dim_B,
+    ).transpose(1, 2).contiguous()
     return first_weight, second_weight
 
 
@@ -862,8 +946,7 @@ def _reversed_lora_weights_for_grouped_mm(
     dim_A: int,
     dim_B: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-    first_weight = first_weight.permute(1, 0, 2).contiguous()
+    first_weight = unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B)
     second_weight = weight_A.view(num_experts, rank_per_expert, dim_A).contiguous()
     return first_weight, second_weight
 

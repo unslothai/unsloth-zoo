@@ -1167,6 +1167,23 @@ except ImportError:
     _MOE_QUANT_UNSAFE = object()
 
 
+# How a fused expert lora_B packs its experts. Owned by the separated forward, because the
+# merge has to reproduce the forward that trained the adapter; imported rather than copied
+# so the two cannot drift. The fallback repeats PEFT's packing for an install where
+# temporary_patches is unavailable, which is the same answer the import gives.
+try:
+    from unsloth_zoo.temporary_patches.moe_utils import (
+        moe_lora_b_expert_columns as _moe_lora_b_expert_columns,
+        unflatten_moe_lora_b as _unflatten_moe_lora_b,
+    )
+except ImportError:
+    def _moe_lora_b_expert_columns(expert_idx, num_experts, rank_per_expert, layout = None):
+        return slice(expert_idx, num_experts * rank_per_expert, num_experts)
+
+    def _unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B, layout = None):
+        return weight_B.view(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
+
+
 def _merge_moe_expert_quant_aware(
     role: str,
     key: str,
@@ -1335,13 +1352,13 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             _record_moe_merge_fallback(role, expert_idx, "expert_idx out of range", lora_stats, (I, H))
             return W
 
-        # unsloth's MoE forward (temporary_patches/moe_utils.py
-        # `_canonical_lora_weights_for_grouped_mm`) views lora_B as
-        # (out, num_experts, r) — contiguous-r columns per expert. Must match
-        # here so the merged checkpoint reproduces the training-time forward.
-        # (unsloth bypasses PEFT's get_delta_weight via patch_param_wrapper_for_moe.)
+        # lora_A is grouped by expert, lora_B is not: PEFT packs its expert index
+        # fastest, so expert `e` owns columns `e::num_experts` rather than a
+        # contiguous block. `moe_lora_b_expert_columns` is the one place that is
+        # resolved, shared with the separated forward, so a merged checkpoint
+        # reproduces the forward that trained it.
         a_slice = lora_stats.lora_A[start:end, :]
-        b_slice = lora_stats.lora_B[:, start:end]
+        b_slice = lora_stats.lora_B[:, _moe_lora_b_expert_columns(expert_idx, num_experts, r)]
         device  = _active_merge_device()
         a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
         b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
@@ -1418,7 +1435,7 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
 
         # See _merge_moe_gate_or_up_expert for the slicing convention rationale.
         a_slice = lora_stats.lora_A[start:end, :]
-        b_slice = lora_stats.lora_B[:, start:end]
+        b_slice = lora_stats.lora_B[:, _moe_lora_b_expert_columns(expert_idx, num_experts, r)]
         device  = _active_merge_device()
         a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
         b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
@@ -1832,7 +1849,8 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
     def _loop():
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
-            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
+            columns = _moe_lora_b_expert_columns(expert_idx, num_experts, rank)
+            delta = lora_B_dev[:, columns] @ lora_A_dev[start:end, :]
             merged[expert_idx].add_(delta.T if use_transpose else delta, alpha=alpha)
         return merged
 
@@ -1841,7 +1859,7 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
 
     try:
         # (E, dim_B, rank) @ (E, rank, dim_A) -> (E, dim_B, dim_A) = per-expert delta.
-        B_exp = lora_B_dev.reshape(dim_B, num_experts, rank).permute(1, 0, 2).contiguous()
+        B_exp = _unflatten_moe_lora_b(lora_B_dev, num_experts, rank, dim_B)
         A_exp = lora_A_dev.reshape(num_experts, rank, dim_A).contiguous()
         delta = torch.bmm(B_exp, A_exp)
         merged.add_(delta.transpose(1, 2) if use_transpose else delta, alpha=alpha)
