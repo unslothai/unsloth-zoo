@@ -3043,7 +3043,7 @@ def _extract_dict_values_from_conversion_init(conv_init_path, dict_name):
     return mapping
 
 
-def _conversion_modules_for(conversion_dir, architecture):
+def _conversion_modules_for(conversion_dir, architecture, is_vlm = None):
     """The conversion/ modules this conversion will really import.
 
     Only these place a CERTAIN requirement on `gguf`. conversion/__init__.py
@@ -3054,6 +3054,11 @@ def _conversion_modules_for(conversion_dir, architecture):
     it as certain downgrades a working export to an older converter for nothing.
     An unknown architecture scopes to the two eager modules, which is the
     conservative direction: fewer certain names means fewer reasons to switch.
+
+    `is_vlm` is which halves this call converts. A text-only export never imports
+    the projector module, so counting its names as certain would let a symbol only
+    the projector needs move a working text conversion onto another converter.
+    None means both, which is the answer when the caller does not know.
     """
     eager = [os.path.join(conversion_dir, "__init__.py"),
              os.path.join(conversion_dir, "base.py")]
@@ -3062,7 +3067,7 @@ def _conversion_modules_for(conversion_dir, architecture):
         return modules
     conv_init = os.path.join(conversion_dir, "__init__.py")
     selected = set()
-    for dict_name in ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP"):
+    for dict_name in _conversion_maps_in_play(is_vlm):
         module = _extract_dict_values_from_conversion_init(conv_init, dict_name).get(architecture)
         if module:
             selected.add(module)
@@ -3073,7 +3078,16 @@ def _conversion_modules_for(conversion_dir, architecture):
     return modules
 
 
-def _converter_architecture_maps(script_path, architecture):
+def _conversion_maps_in_play(is_vlm):
+    """The conversion/__init__.py maps a call with this `is_vlm` really dispatches
+    through. Every export runs the text half; only a VLM export adds the projector.
+    None means the caller does not know, so both stand."""
+    if is_vlm is False:
+        return ("TEXT_MODEL_MAP",)
+    return ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP")
+
+
+def _converter_architecture_maps(script_path, architecture, is_vlm = None):
     """Which of a converter's maps name *architecture*, as a set of dict names.
 
     The pair is not interchangeable. ``TEXT_MODEL_MAP`` dispatches the text conversion, which
@@ -3100,7 +3114,7 @@ def _converter_architecture_maps(script_path, architecture):
         return set()
     return {
         dict_name
-        for dict_name in ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP")
+        for dict_name in _conversion_maps_in_play(is_vlm)
         if architecture in _extract_dict_values_from_conversion_init(conv_init, dict_name)
     }
 
@@ -3158,7 +3172,7 @@ def _converter_maps_architecture(script_path, architecture, required_maps = None
     return any(architecture in one for one in mapped.values())
 
 
-def _converter_gguf_requirements(script_path, architecture = None):
+def _converter_gguf_requirements(script_path, architecture = None, is_vlm = None):
     """Everything the entrypoint and the conversion/ modules this conversion will
     actually import need from `gguf`. Returns `(certain, advisory)` as sorted
     tuples so the result is hashable and stable for the probe cache.
@@ -3179,7 +3193,7 @@ def _converter_gguf_requirements(script_path, architecture = None):
     # structural signal _detect_converter_layout uses.
     conversion_dir = os.path.join(os.path.dirname(script_path) or ".", "conversion")
     if b"from conversion import" in entry_source and os.path.isdir(conversion_dir):
-        imported = _conversion_modules_for(conversion_dir, architecture)
+        imported = _conversion_modules_for(conversion_dir, architecture, is_vlm)
         sources.extend(imported)
         imported_set = {os.path.abspath(path) for path in imported}
         try:
@@ -3483,7 +3497,8 @@ def _gguf_readback_tree(report):
     return _gguf_tree_of_location((report or {}).get("location"))
 
 
-def _resolve_converter_and_gguf(converter_location, python_exe, architecture = None):
+def _resolve_converter_and_gguf(converter_location, python_exe, architecture = None,
+                                is_vlm = None):
     """Pick the (converter, gguf-py) pair whose `gguf` can satisfy the converter.
 
     Returns `(converter_location, gguf_py_dir, report)`.
@@ -3515,14 +3530,14 @@ def _resolve_converter_and_gguf(converter_location, python_exe, architecture = N
     tree instead of a merely plausible one.
     """
     requested_certain, requested_advisory = _converter_gguf_requirements(
-        converter_location, architecture,
+        converter_location, architecture, is_vlm,
     )
     if not requested_certain and not requested_advisory:
         return converter_location, None, None
 
     # Which halves of the conversion this architecture has, read off the converter that was
     # asked for. A fallback has to serve the same ones.
-    requested_maps = _converter_architecture_maps(converter_location, architecture)
+    requested_maps = _converter_architecture_maps(converter_location, architecture, is_vlm)
     candidates = _gguf_candidate_converters(converter_location)
     baseline_report = None
     baseline_blocking = ()
@@ -3537,7 +3552,7 @@ def _resolve_converter_and_gguf(converter_location, python_exe, architecture = N
             # empty requirement scan is exactly what makes it rank first.
             if not _converter_maps_architecture(candidate, architecture, requested_maps):
                 continue
-            certain, advisory = _converter_gguf_requirements(candidate, architecture)
+            certain, advisory = _converter_gguf_requirements(candidate, architecture, is_vlm)
         env = _converter_child_env(gguf_py)
         report = _probe_child_gguf(
             python_exe, env, tuple(certain) + tuple(advisory), candidate,
@@ -3685,6 +3700,19 @@ def convert_to_gguf(
             f"not dequantize it."
         )
 
+    # Decide text-only versus text-plus-projector BEFORE resolving the converter, so the
+    # resolution is scoped to the halves this call will really convert. Downgrading
+    # afterwards would leave the resolver having treated the projector module's `gguf`
+    # names as certain for a conversion that never imports it.
+    if is_vlm and supported_vision_archs is not None:
+        if "architectures" in config_file:
+            arch = config_file["architectures"][0]
+        else:
+            arch = None  # MLX-style config; skip mmproj arch check
+        if arch is not None and arch not in supported_vision_archs:
+                is_vlm = False
+                print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
+
     # Resolve, once, which converter and which `gguf` the child will run with.
     # Untouched when the install is consistent; see _resolve_converter_and_gguf.
     # The architecture goes in so that only the conversion/ module this export
@@ -3693,7 +3721,7 @@ def convert_to_gguf(
     _architectures = config_file.get("architectures") or ()
     _architecture = _architectures[0] if _architectures else None
     converter_location, _gguf_py_pin, _gguf_report = _resolve_converter_and_gguf(
-        converter_location, sys.executable, _architecture,
+        converter_location, sys.executable, _architecture, is_vlm,
     )
 
     # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
@@ -3751,15 +3779,6 @@ def convert_to_gguf(
                 f"converting model types of `{arch}`."
             )
     pass
-
-    if is_vlm and supported_vision_archs is not None:
-        if "architectures" in config_file:
-            arch = config_file["architectures"][0]
-        else:
-            arch = None  # MLX-style config; skip mmproj arch check
-        if arch is not None and arch not in supported_vision_archs:
-                is_vlm = False
-                print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
 
     all_output_files = []
     runs_to_do = []

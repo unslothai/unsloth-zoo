@@ -1146,3 +1146,97 @@ def test_the_required_halves_are_read_off_the_requested_converter(mod, tmp_path)
     assert mod._converter_architecture_maps(str(monolith), "Gemma3ForCausalLM") == set()
     # With nothing required, presence in either map still stands.
     assert mod._converter_maps_architecture(str(packaged), "Gemma3ForCausalLM") is True
+
+
+# ---------------------------------------------------------------------------
+# the conversion halves this call really runs
+# ---------------------------------------------------------------------------
+
+def _make_dual_mapped_tree(tmp_path):
+    """An architecture named by BOTH maps, whose projector module needs a symbol
+    the text module does not."""
+    conversion = tmp_path / "conversion"
+    conversion.mkdir()
+    (conversion / "__init__.py").write_text(textwrap.dedent("""
+        from .base import ModelBase
+        TEXT_MODEL_MAP: dict[str, str] = {"DualForConditionalGeneration": "dualtext"}
+        MMPROJ_MODEL_MAP: dict[str, str] = {"DualForConditionalGeneration": "dualproj"}
+    """))
+    (conversion / "base.py").write_text("import gguf\nBASE = gguf.Metadata\n")
+    (conversion / "dualtext.py").write_text(
+        "import gguf\n\nclass T:\n    model_arch = gguf.MODEL_ARCH.DUAL\n"
+    )
+    (conversion / "dualproj.py").write_text(
+        "import gguf\n\nclass P:\n    projector = gguf.OnlyTheProjectorNeedsThis\n"
+    )
+    entry = tmp_path / "unsloth_convert_hf_to_gguf.py"
+    entry.write_text("from conversion import get_model_class\nimport gguf\n")
+    return entry
+
+
+def test_a_text_only_export_does_not_require_the_projector_module(mod, tmp_path):
+    """A text-only conversion never imports the projector module, so a symbol only
+    that module names must not count as certain. Counting it let a projector-only
+    miss move a working text conversion onto a different converter."""
+    entry = _make_dual_mapped_tree(tmp_path)
+    arch = "DualForConditionalGeneration"
+
+    text_certain, text_advisory = mod._converter_gguf_requirements(str(entry), arch, False)
+    assert "gguf.MODEL_ARCH.DUAL" in text_certain
+    assert "gguf.OnlyTheProjectorNeedsThis" not in text_certain
+    assert "gguf.OnlyTheProjectorNeedsThis" in text_advisory
+
+    # A VLM export runs both halves, so there it IS certain.
+    vlm_certain, _ = mod._converter_gguf_requirements(str(entry), arch, True)
+    assert "gguf.OnlyTheProjectorNeedsThis" in vlm_certain
+    assert "gguf.MODEL_ARCH.DUAL" in vlm_certain
+
+    # Not knowing keeps today's answer: both count.
+    unknown_certain, _ = mod._converter_gguf_requirements(str(entry), arch)
+    assert unknown_certain == vlm_certain
+
+
+def test_a_text_only_fallback_is_not_rejected_for_lacking_a_projector_map(mod, tmp_path):
+    """`_converter_architecture_maps` says which halves a fallback must serve. For a
+    text-only call that is the text map alone, so a converter mapping the
+    architecture only there is a valid fallback rather than a discarded one."""
+    entry = _make_dual_mapped_tree(tmp_path)
+    arch = "DualForConditionalGeneration"
+
+    assert mod._converter_architecture_maps(str(entry), arch, False) == {"TEXT_MODEL_MAP"}
+    assert mod._converter_architecture_maps(str(entry), arch, True) == {
+        "TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP",
+    }
+
+    # A fallback that maps the architecture for text only.
+    fallback_dir = tmp_path / "fallback"
+    (fallback_dir / "conversion").mkdir(parents=True)
+    (fallback_dir / "conversion" / "__init__.py").write_text(
+        'TEXT_MODEL_MAP = {"DualForConditionalGeneration": "dualtext"}\n'
+        'MMPROJ_MODEL_MAP = {}\n'
+    )
+    fallback = fallback_dir / "unsloth_convert_hf_to_gguf.py"
+    fallback.write_text("from conversion import get_model_class\nimport gguf\n")
+
+    assert mod._converter_maps_architecture(str(fallback), arch, {"TEXT_MODEL_MAP"})
+    # and is correctly refused when the projector half is genuinely needed
+    assert not mod._converter_maps_architecture(
+        str(fallback), arch, {"TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP"},
+    )
+
+
+def test_the_conversion_is_resolved_after_the_vlm_downgrade(mod):
+    """The downgrade to text-only must happen BEFORE the resolver runs, or the
+    resolver scopes to halves the conversion will not convert."""
+    import ast, inspect
+    tree = ast.parse(inspect.getsource(mod.convert_to_gguf))
+    downgrade_line = resolve_line = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "_resolve_converter_and_gguf":
+            resolve_line = node.lineno
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and "not supported for MMPROJ conversion" in node.value:
+            downgrade_line = node.lineno
+    assert downgrade_line is not None and resolve_line is not None
+    assert downgrade_line < resolve_line, "is_vlm is downgraded after the resolver ran"
