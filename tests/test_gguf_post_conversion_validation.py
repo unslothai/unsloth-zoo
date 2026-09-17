@@ -442,6 +442,38 @@ def test_a_zero_bias_is_not_a_problem(llama_cpp, tmp_path):
     assert llama_cpp.gguf_tensor_problems(path) == []
 
 
+def test_a_zeroed_identity_projection_is_not_a_problem(llama_cpp, tmp_path):
+    """LLaMA Pro block expansion (arXiv 2401.02415) zero-initialises o_proj and
+    down_proj so a copied block is an exact identity, and a LoRA that does not
+    target them leaves the merged weight at exactly zero. llama.cpp loads that
+    file, so refusing it would break a real export."""
+    path = write_gguf(
+        tmp_path / "identity.gguf", keys = UNIVERSAL,
+        tensors = {
+            "blk.0.attn_q.weight":      np.ones((8, 8), dtype = np.float32),
+            "blk.3.attn_output.weight": np.zeros((8, 8), dtype = np.float32),
+            "blk.3.ffn_down.weight":    np.zeros((8, 8), dtype = np.float32),
+        },
+    )
+    assert llama_cpp.gguf_tensor_problems(path) == []
+
+
+def test_an_ordinary_zeroed_block_weight_is_still_refused(llama_cpp, tmp_path):
+    """The negative control for the exemption above: it must not turn the
+    all-zero check off for the tensors unsloth#6056's damage actually lands on."""
+    path = write_gguf(
+        tmp_path / "damaged.gguf", keys = UNIVERSAL,
+        tensors = {
+            "blk.0.attn_q.weight":   np.ones((8, 8), dtype = np.float32),
+            "blk.5.attn_q.weight":   np.zeros((8, 8), dtype = np.float32),
+            "blk.5.ffn_up.weight":   np.zeros((8, 8), dtype = np.float32),
+        },
+    )
+    problems = llama_cpp.gguf_tensor_problems(path)
+    assert any("blk.5.attn_q.weight" in problem for problem in problems), problems
+    assert any("blk.5.ffn_up.weight" in problem for problem in problems), problems
+
+
 def test_a_zeroed_f16_tensor_is_caught(llama_cpp, tmp_path):
     """gguf-py hands F16 and BF16 tensors back as raw bytes rather than as a
     numpy float dtype, so a plain `np.issubdtype(..., np.floating)` guard
@@ -714,6 +746,53 @@ def test_an_unreadable_output_is_refused_when_its_own_writer_cannot_reopen_it(
     monkeypatch.setattr(llama_cpp, "use_local_gguf", _pinned)
     with pytest.raises(RuntimeError, match = "cannot read it back"):
         llama_cpp._verify_converted_gguf([str(path)], gguf_py_dir = str(tmp_path))
+
+
+def test_a_writer_tree_that_cannot_be_imported_warns_rather_than_refusing(
+    llama_cpp, tmp_path, monkeypatch, caplog
+):
+    """An ImportError never reached the file's bytes, so it is not evidence the
+    file is malformed. The reader runs in the PARENT, and pinning the writer's
+    tree does not reproduce the child's PYTHONPATH or NO_LOCAL_GGUF, so a tree
+    that imports in the child can fail in the parent over a dependency the child
+    had. Refusing there rejects a healthy export and offers a re-run that cannot
+    help."""
+    import contextlib, logging
+    path = tmp_path / "fine.gguf"
+    # A real, readable GGUF: the only thing wrong is the reader.
+    write_gguf(path, keys = UNIVERSAL, tensors = {"blk.0.attn_q.weight": None})
+
+    @contextlib.contextmanager
+    def _pinned(directory):
+        yield
+
+    def _import_fails(_path):
+        raise ImportError("No module named 'sentencepiece'")
+
+    monkeypatch.setattr(llama_cpp, "use_local_gguf", _pinned)
+    monkeypatch.setattr(llama_cpp, "_open_gguf_reader", _import_fails)
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._verify_converted_gguf([str(path)], gguf_py_dir = str(tmp_path))
+    assert any("was not verified" in record.message for record in caplog.records), caplog.text
+    assert any("sentencepiece" in record.message for record in caplog.records), caplog.text
+
+
+def test_a_quantized_export_does_not_claim_its_values_were_checked(
+    llama_cpp, tmp_path, capsys
+):
+    """A quantized block format holds bytes rather than values, so the tensor
+    pass does not run. On a q4_k_m or MXFP4 export, which is what most people
+    publish, that is every file, and reporting a bare "Verified" told the user a
+    value check had happened when none had."""
+    path = write_gguf(
+        tmp_path / "quant.gguf", keys = UNIVERSAL,
+        tensors = {"blk.0.attn_q.weight": np.zeros((32, 32), dtype = np.float32)},
+        raw_dtype = GGMLQuantizationType.Q8_0,
+    )
+    llama_cpp._verify_converted_gguf([str(path)], print_output = True)
+    out = capsys.readouterr().out
+    assert "Verified 1 GGUF file(s)" in out, out
+    assert "metadata only" in out, out
 
 
 def test_the_refusal_names_the_file_and_the_way_out(llama_cpp, tmp_path, monkeypatch):

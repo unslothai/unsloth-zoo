@@ -40,7 +40,9 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -461,6 +463,39 @@ def test_probe_reports_the_tree_the_entrypoint_would_self_locate(mod, tmp_path):
     assert Path(report["location"]).parent == gguf_py / "gguf"
     assert report["missing"] == ["gguf.Absent"]
     assert report["version"] == "0.17.1"
+
+
+def test_probe_ignores_json_it_did_not_write(mod, tmp_path):
+    """The parent reads the last brace-line of the child's stdout. A converter's
+    imports can print JSON there, and a dict with no `missing` key would read as
+    "nothing missing" -- a perfect score for a candidate nothing ever probed."""
+    gguf_py = _make_gguf_py(tmp_path, symbols=("Present",))
+    entry = tmp_path / "convert_hf_to_gguf.py"
+    # The package prints a stray dict on import, AFTER the probe's own report is
+    # built but on the same stdout.
+    (gguf_py / "gguf" / "__init__.py").write_text(
+        'Present = object()\nprint("{}")\nprint(\'{"status": "ok"}\')\n'
+    )
+    entry.write_text("import gguf\n")
+
+    env = dict(os.environ)
+    env.pop("NO_LOCAL_GGUF", None)
+    env.pop("PYTHONPATH", None)
+    report = mod._probe_child_gguf(
+        sys.executable, env, ("gguf.Present", "gguf.Absent"), str(entry),
+    )
+    assert report is not None
+    assert report.get("unsloth_gguf_probe") == 1
+    # The real answer, not the stray line's silence.
+    assert report["missing"] == ["gguf.Absent"]
+
+
+def test_probe_returns_none_when_only_foreign_json_is_printed(mod):
+    """No report of ours means None, which the resolver treats as "could not be
+    asked" and leaves the requested converter alone."""
+    completed = types.SimpleNamespace(stdout = '{}\n{"missing": []}\n', returncode = 0)
+    with mock.patch.object(mod.subprocess, "run", return_value = completed):
+        assert mod._probe_child_gguf(sys.executable, dict(os.environ), ("gguf.X",)) is None
 
 
 def test_probe_reports_an_unimportable_gguf(mod, tmp_path):

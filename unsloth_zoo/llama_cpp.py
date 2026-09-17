@@ -3254,7 +3254,12 @@ def resolve(expression):
             return False
     return True
 
-report = {"missing": [], "location": None, "version": None}
+# The sentinel is what makes the report identifiable as ours. The parent reads the
+# last brace-line of stdout, and anything the converter's imports print there would
+# otherwise be parsed as a report: a dict with no "missing" key reads as "nothing
+# missing", which ranks an unprobed candidate as a perfect match and switches the
+# converter on the strength of a line we never wrote.
+report = {"unsloth_gguf_probe": 1, "missing": [], "location": None, "version": None}
 try:
     import gguf
     report["location"] = getattr(gguf, "__file__", None)
@@ -3309,9 +3314,15 @@ def _probe_child_gguf(python_exe, env, requirements, converter_location = None, 
         if not line.startswith("{"):
             continue
         try:
-            return json.loads(line)
+            parsed = json.loads(line)
         except Exception:
             continue
+        # Only our own report counts. Without the sentinel any JSON the converter's
+        # imports happen to print is read as a report, and one with no "missing" key
+        # scores a perfect zero, so a candidate nothing ever probed can be adopted
+        # and announced as matching.
+        if isinstance(parsed, dict) and parsed.get("unsloth_gguf_probe") == 1:
+            return parsed
     logger.debug(
         "Unsloth: gguf preflight probe returned no report (exit %s).", completed.returncode
     )
@@ -4366,7 +4377,8 @@ GGUF_UNIVERSAL_REQUIRED_KEYS = (
 #
 # Extending this: find the `ml.get_key(...)` calls for the new namespace in
 # `src/models/*.cpp`, drop any architecture that passes `false` into the exempt
-# set, and record the files you read. Verified against llama.cpp b10909.
+# set, and record the files you read. Verified against llama.cpp b49650a
+# (b49650adb31f2e49a0d76113aeb1792134fd8413).
 GGUF_CONDITIONAL_REQUIRED_KEYS = (
     (
         # `blk.N.indexer.*` and `blk.N.indexer_compressor_*`
@@ -4382,10 +4394,10 @@ GGUF_CONDITIONAL_REQUIRED_KEYS = (
         # a hy_v4 file without them loads (with the indexer off) rather than
         # failing. The arch string is src/llama-arch.cpp:126.
         frozenset(("hy_v4",)),
-        "DeepSeek sparse attention indexer tensors. Eight architectures define "
-        "them and seven read these three keys as required: deepseek32.cpp, "
-        "deepseek4.cpp, dots3note.cpp, glm-dsa.cpp, glm5next.cpp, "
-        "minimax-m3.cpp and qwen4exp.cpp. The eighth, hy-v4.cpp, reads them "
+        "DeepSeek sparse attention indexer tensors. Seven architectures define "
+        "them and six read these three keys as required: deepseek32.cpp, "
+        "deepseek4.cpp, dots3note.cpp, glm-dsa.cpp, minimax-m3.cpp and "
+        "qwen4exp.cpp. The seventh, hy-v4.cpp, reads them "
         "optionally and is exempt. The remaining indexer keys (block_size, "
         "local_blocks, kpool, types) are read by only some of the seven, so "
         "they are not required here.",
@@ -4780,6 +4792,13 @@ GGUF_VERIFY_WINDOW_DEFAULT = 4096
 # tensors always are.
 GGUF_VERIFY_DEEP_MAX_ELEMENTS = 64 * 1024 * 1024
 
+# The sublayer output projections, the only weights inside a block that a
+# published method deliberately sets to exactly zero. LLaMA Pro block expansion
+# (arXiv 2401.02415) zero-initialises o_proj and down_proj so that a copied block
+# computes the identity, and llama.cpp loads the result, so an all-zero one is not
+# evidence of a bad conversion. gguf-py's TensorNameMap spells them like this.
+GGUF_IDENTITY_INIT_SUFFIXES = (".attn_output.weight", ".ffn_down.weight")
+
 
 def _gguf_window_size():
     """`UNSLOTH_GGUF_VERIFY_ELEMENTS`, clamped to >= 1. Junk reads as the default."""
@@ -4922,8 +4941,15 @@ def gguf_tensor_problems(gguf_file, sample_size = None, readers = None):
             # outside it zero is a legitimate weight (BERT `token_types.weight`
             # on a single-segment model, projector padding). NaN and Inf are
             # still checked everywhere.
+            # The two sublayer output projections are excluded as well: LLaMA Pro
+            # block expansion (arXiv 2401.02415) zero-initialises o_proj and
+            # down_proj so a copied block is an exact identity, and a LoRA that
+            # does not target them leaves the merged weight at exactly zero. That
+            # file loads in llama.cpp, so refusing it would break a real export.
             check_zero = (
-                tensor.name.startswith("blk.") and not tensor.name.endswith(".bias")
+                tensor.name.startswith("blk.")
+                and not tensor.name.endswith(".bias")
+                and not tensor.name.endswith(GGUF_IDENTITY_INIT_SUFFIXES)
             )
             try:
                 problem = _gguf_degenerate_problem(
@@ -4997,6 +5023,8 @@ def _verify_converted_gguf(
     # Separate from `checked`, which is only there to stop a 40 shard export being reopened
     # 40 times. This one is what the closing message counts.
     verified = set()
+    # Sets whose tensor values could not be inspected, so the closing line can say so.
+    values_skipped = set()
     started = time.perf_counter()
     for output_file in output_files:
         shards = _gguf_shard_siblings(output_file)
@@ -5024,7 +5052,25 @@ def _verify_converted_gguf(
             unreadable = ", ".join(
                 os.path.basename(path) for path, reader in readers if reader is None
             )
-            if _writer_tree_known:
+            detail = ""
+            # An ImportError never reached the file's bytes, so it says nothing about
+            # the file. The reader runs in the PARENT, and `use_local_gguf` only puts
+            # the writer's directory on sys.path: it does not reproduce the child's
+            # PYTHONPATH or NO_LOCAL_GGUF, so that tree can import in the child and
+            # fail in the parent over a dependency the child had. Refusing there would
+            # reject a healthy export and offer a re-run that cannot help.
+            reader_unavailable = False
+            for path, reader in readers:
+                if reader is not None: continue
+                try:
+                    _open_gguf_reader(path)
+                except ImportError as error:
+                    reader_unavailable = True
+                    detail = f" ({type(error).__name__}: {error})"
+                except Exception as error:
+                    detail = f" ({type(error).__name__}: {error})"
+                break
+            if _writer_tree_known and not reader_unavailable:
                 # The one reason this is a warning is version skew: an installed `gguf`
                 # older than the converter that wrote the file fails on an export that is
                 # perfectly good. That reason is gone here. This IS the tree the converter
@@ -5032,14 +5078,6 @@ def _verify_converted_gguf(
                 # truncated output, and the checks above it are existence and shard
                 # numbering only -- a converter that exits zero after writing a broken GGUF
                 # would otherwise have it published with nothing but a warning.
-                detail = ""
-                for path, reader in readers:
-                    if reader is not None: continue
-                    try:
-                        _open_gguf_reader(path)
-                    except Exception as error:
-                        detail = f" ({type(error).__name__}: {error})"
-                    break
                 raise RuntimeError(
                     f"Unsloth: the GGUF converter wrote {unreadable}, and the same `gguf` "
                     f"package that wrote it cannot read it back{detail}. The file is "
@@ -5054,7 +5092,7 @@ def _verify_converted_gguf(
             # already rejects a missing or truncated output above.
             logger.warning(
                 f"Unsloth: could not read {unreadable} with the installed gguf "
-                f"package, so it was not verified. Upgrade `gguf` if you want "
+                f"package{detail}, so it was not verified. Upgrade `gguf` if you want "
                 f"GGUF exports checked before they are published."
             )
             continue
@@ -5065,6 +5103,13 @@ def _verify_converted_gguf(
         problems = gguf_metadata_problems(output_file, readers = readers)
         if _gguf_holds_only_float_tensors(readers):
             problems = problems + gguf_tensor_problems(output_file, readers = readers)
+        else:
+            # A quantized block format holds bytes rather than values, so the tensor
+            # pass does not run and this set got the metadata gate only. Counted so
+            # the closing line cannot report a value check that never happened: on a
+            # q4_k_m or MXFP4 export, which is what most people publish, that is
+            # every set.
+            values_skipped.add(shards[0])
         # llama.cpp loads these, so they never refuse the file.
         for advisory in gguf_metadata_warnings(output_file, readers = readers):
             logger.warning(
@@ -5082,7 +5127,11 @@ def _verify_converted_gguf(
             f"UNSLOTH_GGUF_VERIFY=0 if you need the file anyway."
         )
     if print_output and verified:
-        print(f"Unsloth: Verified {len(verified)} GGUF file(s) in "
+        scope = ""
+        if values_skipped:
+            scope = (f", metadata only for {len(values_skipped)} of them because a "
+                     f"quantized block format holds bytes rather than values")
+        print(f"Unsloth: Verified {len(verified)} GGUF file(s){scope} in "
               f"{time.perf_counter() - started:.1f}s.")
     elif print_output and checked:
         # Every set was skipped, so there is nothing to report as verified and saying
