@@ -1553,7 +1553,10 @@ if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
     # import time, leaving otherwise idle processes with persistent device memory.
     device_memory = torch.xpu.get_device_properties(0).total_memory
 elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-    device_memory = torch.cuda.get_device_properties(0).total_memory
+    # Integrated NVIDIA parts may report only the carve-out, so cuda_total_memory raises it to
+    # the driver total when that is larger. Discrete cards and HIP are unchanged.
+    from unsloth_zoo.integrated_device import cuda_total_memory
+    device_memory = cuda_total_memory(0)
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True

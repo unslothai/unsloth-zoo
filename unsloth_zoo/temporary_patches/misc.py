@@ -136,7 +136,13 @@ def patch_merge_quantization_configs():
     unique_name = _get_unique_storage_name(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs")
     if hasattr(transformers.quantizers.auto.AutoHfQuantizer, unique_name): return
 
-    source = inspect.getsource(f)
+    # Not every callable has readable source: one built by an earlier exec here,
+    # or shipped only as bytecode, raises OSError, which again is neither
+    # ValueError nor TypeError and so escaped into `import unsloth`.
+    try:
+        source = inspect.getsource(f)
+    except Exception as e:
+        return raise_error("merge_quantization_configs, whose source is unreadable", e)
     items = dir(transformers.quantizers.auto)
 
     # Fix as at 7th August 2025
@@ -147,7 +153,18 @@ def patch_merge_quantization_configs():
         "if quantization_config_from_args is not None and quantization_config.__class__.__name__ != quantization_config_from_args.__class__.__name__:",
     )
 
-    exec("from transformers.quantizers.auto import (" + ",".join(x for x in items if x in source) + ")", globals())
+    # `from x import ()` is a SyntaxError, and the join below is empty whenever no name in
+    # the module happens to occur in the source being rewritten. SyntaxError subclasses
+    # neither ValueError nor TypeError, the two the caller in unsloth tolerates, so it
+    # escapes this function and ends `import unsloth` outright. No published transformers
+    # reaches it: the list is non-empty on every version from 4.49.0 to 5.17.0, 12 names on
+    # 4.55.0. Kept anyway for a patched or future quantizers.auto, and cheap.
+    used = [x for x in items if x in source]
+    if used:
+        try:
+            exec("from transformers.quantizers.auto import (" + ",".join(used) + ")", globals())
+        except Exception as e:
+            return raise_error("transformers.quantizers.auto names " + ",".join(used), e)
     source = dedent(source)
     # Remove cls if classmethod
     is_classmethod = source.startswith("@classmethod")
@@ -162,8 +179,14 @@ def patch_merge_quantization_configs():
     except Exception as e:
         return raise_error("", e)
 
-    # Defined by the exec(source, globals()) in the try above.
-    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs)  # noqa: F821
+    # Defined by the exec(source, globals()) in the try above. Read it out of the
+    # module globals rather than by name: a rewritten source that exec'd cleanly but
+    # defined something else raised NameError here, straight out of a patch step
+    # whose whole contract is to be silent when it cannot apply.
+    merged = globals().get("merge_quantization_configs")
+    if not callable(merged):
+        return raise_error("merge_quantization_configs, which the rewritten source did not define")
+    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merged)
 pass
 TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 

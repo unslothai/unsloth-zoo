@@ -419,3 +419,208 @@ def test_a_penalised_row_answers_the_same_batched_and_alone():
             logits_processors = make_logits_processors(**penalty),
         ) if event.finish_reason != "stop"]
         assert result.token_ids == alone, prompt
+
+
+def _residual_equal(actual, expected):
+    assert bool(mx.array_equal(actual.view(mx.uint8), expected.view(mx.uint8)))
+
+
+class ResidualNormBlock(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.norm = nn.RMSNorm(width)
+        self.tail_norm = nn.RMSNorm(width)
+        self.layer_scalar = mx.array([0.75])
+
+    def __call__(self, h, tail = True):
+        residual = h
+        h = self.norm(h)
+        h = residual + h
+        if tail:
+            residual = h
+            gate = h * 0.5
+            gate = self.tail_norm(gate)
+            h = residual + gate
+        if self.layer_scalar is not None:
+            h = h * self.layer_scalar
+        return h, tail
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@metal_only
+def test_generation_mode_applies_residual_norm_and_restores(cancel):
+    from contextlib import nullcontext
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root.train()
+    models[1].eval()
+    flags = [module.training for module in root.modules()]
+    x = mx.random.normal((1, 1, 128))
+    expected = [model(x)[0] for model in models]
+    mx.eval(expected)
+    with pytest.raises(RuntimeError, match = "cancel") if cancel else nullcontext():
+        with generation_mode(root):
+            with generation_mode(root):
+                assert all(not module.training for module in root.modules())
+                for model, native in zip(models, expected):
+                    assert type(model) is not ResidualNormBlock
+                    _residual_equal(model(x)[0], native)
+            assert all(type(model) is not ResidualNormBlock for model in models)
+            if cancel:
+                raise RuntimeError("cancel")
+    assert all(type(model) is ResidualNormBlock for model in models)
+    assert [module.training for module in root.modules()] == flags
+
+
+@pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
+@pytest.mark.parametrize("cancel", [False, True], ids = ["complete", "cancel"])
+@metal_only
+def test_loader_generate_applies_residual_norm_and_restores(monkeypatch, vlm, cancel):
+    from contextlib import nullcontext
+    import mlx_lm
+    import mlx_vlm
+    from unsloth_zoo.mlx import loader
+
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
+    root._is_vlm_model = vlm
+    root.eval()
+    x = mx.random.normal((1, 1, 128))
+    expected = [model(x)[0] for model in models]
+    mx.eval(expected)
+
+    def stream(model, *args, **kwargs):
+        assert model is root
+        for index, (block, native) in enumerate(zip(models, expected)):
+            assert type(block) is not ResidualNormBlock
+            _residual_equal(block(x)[0], native)
+            yield types.SimpleNamespace(token = 7 + index)
+        if cancel:
+            raise RuntimeError("cancel")
+
+    monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
+    with pytest.raises(RuntimeError, match = "cancel") if cancel else nullcontext():
+        output = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 2)
+        assert output.tolist() == [[1, 2, 7, 8]]
+    assert all(type(model) is ResidualNormBlock for model in models)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@metal_only
+def test_residual_norm_matches_reduction_rounding_and_scale(dtype):
+    from unsloth_zoo.mlx import inference as decode
+    for width in (63, 127, 128, 129, 1536, 4095, 4096):
+        mx.random.seed(width)
+        norm = nn.RMSNorm(width, eps = 1e-6)
+        norm.weight = mx.random.normal((width,)).astype(dtype)
+        norm.eval()
+        # The last entry spreads magnitudes within the row rather than scaling the whole
+        # row. Uniform rows agree bitwise even if the squares accumulate without fma.
+        for magnitude in (0.01, 1., 10., None):
+            spread = mx.power(10., mx.random.uniform(-4, 4, (1, 1, width)))
+            x = (mx.random.normal((1, 1, width)) * (spread if magnitude is None else magnitude)).astype(dtype)
+            residual = mx.random.normal(x.shape).astype(dtype)
+            for scale in (None, mx.array(0.7, dtype), mx.array([1.5], dtype)):
+                expected = residual + norm(x)
+                if scale is not None:
+                    expected = expected * scale
+                _residual_equal(decode._residual_norm_add(norm, x, residual, scale), expected)
+
+
+@metal_only
+def test_residual_norm_scope_mutations_and_restore(monkeypatch):
+    from unsloth_zoo.mlx import inference as decode
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root.set_dtype(mx.bfloat16)
+    root.eval()
+    x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+    calls = []
+    apply = decode._norm_add_apply
+    def observed(*args):
+        calls.append(None)
+        return apply(*args)
+    monkeypatch.setattr(decode, "_norm_add_apply", observed)
+    with pytest.raises(RuntimeError, match = "cancel"):
+        with decode.fused_residual_norm(root):
+            assert all(type(m) is not ResidualNormBlock for m in models)
+            with decode.fused_residual_norm(root):
+                for model in models:
+                    for factor in (2., .25):
+                        model.norm.weight = model.norm.weight * factor
+                        model.tail_norm.weight = model.tail_norm.weight / factor
+                        for tail in (False, True):
+                            calls.clear()
+                            expected = ResidualNormBlock.__call__(model, x, tail)[0]
+                            _residual_equal(model(x, tail)[0], expected)
+                            assert len(calls) == 1 + int(tail)
+            original = nn.RMSNorm.__call__
+            monkeypatch.setattr(nn.RMSNorm, "__call__", lambda self, value: original(self, value) * 0.5)
+            for model in models:
+                calls.clear()
+                _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+                assert not calls
+            raise RuntimeError("cancel")
+    assert all(type(m) is ResidualNormBlock for m in models)
+
+
+@metal_only
+def test_residual_norm_fallbacks(monkeypatch):
+    from unsloth_zoo.mlx import inference as decode
+    model = ResidualNormBlock(128)
+    model.eval()
+    def unexpected(*args):
+        pytest.fail("unsupported input reached residual norm kernel")
+    monkeypatch.setattr(decode, "_norm_add_apply", unexpected)
+    with decode.fused_residual_norm(model):
+        for shape in ((2, 1, 128), (1, 3, 128)):
+            x = mx.random.normal(shape)
+            _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+        x = mx.random.normal((1, 1, 128))
+        model.train()
+        _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+        model.eval()
+        model.norm.train()
+        model.tail_norm.train()
+        _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+    monkeypatch.setattr(decode, "_residual_norm_kernel", lambda: None)
+    with decode.fused_residual_norm(model):
+        assert type(model) is ResidualNormBlock
+
+
+@metal_only
+def test_residual_norm_respects_an_existing_native_patch(monkeypatch):
+    from unsloth_zoo.mlx import inference as decode
+    class FreshBlock(ResidualNormBlock):
+        pass
+    model = FreshBlock(128)
+    model.eval()
+    original = mx.fast.rms_norm
+    monkeypatch.setattr(mx.fast, "rms_norm", lambda *args, **kwargs: original(*args, **kwargs) * 0.5)
+    x = mx.random.normal((1, 1, 128))
+    expected = model(x)[0]
+    with decode.fused_residual_norm(model):
+        _residual_equal(model(x)[0], expected)
+
+
+def test_residual_norm_scope_tolerates_a_stand_in_without_training(monkeypatch):
+    """named_modules() yields whatever the generation API was handed, including the plain
+    stand-ins it deliberately tolerates. Reading `.training` on one raises out of generation
+    instead of skipping it, which is why the decode-fusion scope checks the type first."""
+    from unsloth_zoo.mlx import inference as decode
+
+    class _StandIn:
+        pass
+
+    class _Root:
+        def named_modules(self):
+            return [("stand_in", _StandIn())]
+
+    # Off Metal the scope returns before the loop, so give it a kernel to get past that.
+    monkeypatch.setattr(decode, "_residual_norm_kernel", lambda: object())
+    root = _Root()
+    with decode.fused_residual_norm(root) as yielded:
+        assert yielded is root

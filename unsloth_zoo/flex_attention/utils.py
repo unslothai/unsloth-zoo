@@ -51,9 +51,16 @@ try:
     # InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton_tem_fused_0 Required: 65536 Hardware limit:65536 Reducing block sizes or `num_stages` may help.
     # See https://github.com/pytorch/pytorch/issues/133254#issuecomment-2408710459
     # https://github.com/pytorch/pytorch/issues/133254#issuecomment-2539969593
-    # Total capacity, like the gpt_oss probe: mem_get_info() would create a device
-    # context at import time and leave an otherwise idle process holding it.
-    vram_of_gpu = min(torch.cuda.get_device_properties(i).total_memory/1024/1024/1024 for i in range(torch.cuda.device_count()))
+    # Total capacity, like the gpt_oss probe: mem_get_info() would pin a device context at import
+    # time. Integrated parts are the exception, where properties may report only the carve-out.
+    # Properties are read HERE, not inside cuda_total_memory, which answers 0 for a device it
+    # cannot read: a 0 would read as "16GB or less" and leave flex attention on with 32x32 kernel
+    # options, where an unreadable device must keep raising into the except below.
+    from unsloth_zoo.integrated_device import cuda_total_memory
+    vram_of_gpu = min(
+        cuda_total_memory(i, props = torch.cuda.get_device_properties(i))/1024/1024/1024
+        for i in range(torch.cuda.device_count())
+    )
     kernel_options = None
     if vram_of_gpu <= 16:
         kernel_options = {

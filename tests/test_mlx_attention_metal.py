@@ -164,7 +164,7 @@ def test_matches_the_runtime_path_on_both_sides_of_the_threshold(runtime, mask, 
                                                                  last):
     """mlx-vlm runs batched, as its array masks are; those masks also drop every seventh key.
 
-    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<0.7.0` against
+    Both array masks carry a leading 1: `mlx_vlm<0.6.5` -- which is what `mlx-vlm<=0.7.1` against
     this repo's `transformers` cap resolves to -- broadcasts a `[B, 1, L, S]` mask against its own
     5-D grouped scores only when B is 1. A per-row batched mask above the tie is covered by
     `test_a_batched_mask_the_pinned_runtime_cannot_broadcast` below.
