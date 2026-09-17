@@ -1160,3 +1160,147 @@ def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
         assert dtype.is_floating_point, f"{dtype} would already be refused by the float check"
         with pytest.raises(RuntimeError):
             torch.zeros(2, 2, dtype=dtype) + torch.zeros(2, 2, dtype=torch.float32)
+
+
+def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
+    """The scan runs while Dynamo is tracing, which is the whole point of it, so nothing
+    in it may install a guard that cannot match.
+
+    `id(forward)` did: Dynamo guards the expression it tracked, `experts_module.forward`,
+    and a bound method is reallocated on every attribute access, so `___check_obj_id`
+    failed on the frame that created it. That is an AssertionError under BOTH fullgraph
+    settings with no eager fallback, so every MoE family whose verdict is unmeasured at
+    the first compiled call was unable to compile at all.
+    """
+    import torch
+
+    class _Experts(torch.nn.Module):
+        def forward(self, x):
+            return x * 2
+
+    experts = _Experts()
+    assert MU._forward_statically_reads_stash(experts) is False
+
+    def scan(x):
+        return x + (1.0 if MU._forward_statically_reads_stash(experts) else 0.0)
+
+    for fullgraph in (True, False):
+        torch._dynamo.reset()
+        compiled = torch.compile(scan, fullgraph=fullgraph)
+        # Two calls: the first creates the guards, the second has to match them.
+        first = compiled(torch.zeros(4))
+        second = compiled(torch.zeros(4))
+        assert torch.equal(first, second)
+
+
+def test_the_static_scan_takes_no_id_at_all():
+    """Pin the mechanism, because each spelling here breaks a different thing.
+
+    `id(forward)` wedged Dynamo: its argument traces to `experts_module.forward`, a bound
+    method reallocated on every access, so `___check_obj_id` failed on the frame that
+    created it. Keying on the code objects themselves instead collapsed equal-but-distinct
+    ones. Keying on `id(code)` fixed that but Dynamo rejects it on some torch versions
+    with "Unsupported: id() with unsupported args", which is a hard compile failure in the
+    branch whose whole purpose is to keep compilation working.
+
+    What survives all three is identity via `is`, so the scan must take no id() at all.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(MU._forward_statically_reads_stash)))
+    id_calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "id"
+    ]
+    assert not id_calls, (
+        "the scan runs while Dynamo traces, and id() is unsupported there on some torch "
+        "versions; compare code objects with `is` instead"
+    )
+
+
+def test_a_deep_visit_does_not_suppress_a_shallower_one():
+    """The scan must not depend on the hash seed.
+
+    A helper reachable both directly and through a chain can be popped first at the depth
+    limit, where its callees are not followed, and a plain visited set then discards the
+    later shallow entry. Measured before the fix: 5 of 14 PYTHONHASHSEED values returned
+    False for this forward, which does reach the stash, and a False there sends the
+    compiled cold start down the PEFT path that fails under fullgraph.
+
+    Built by exec so the call graph is exact rather than incidental to this file.
+    """
+    import torch.nn as nn
+
+    source = (
+        'def stash_reader(m): return take_moe_lora_stash(m, "gate_up_proj")\n'
+        "def helper(m): return stash_reader(m)\n"
+        "def h3(m): return helper(m)\n"
+        "def h2(m): return h3(m)\n"
+        "def h1(m): return h2(m)\n"
+        "def fwd(self, x):\n"
+        "    h1(self)\n"       # deep route: helper lands at the depth limit
+        "    helper(self)\n"   # shallow route: helper at depth 1, reaches the stash
+        "    return x\n"
+    )
+    namespace = {"take_moe_lora_stash": MU.take_moe_lora_stash}
+    exec(compile(source, "<depth-case>", "exec"), namespace)
+    experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
+
+    assert MU._forward_statically_reads_stash(experts) is True
+
+
+def test_the_scan_terminates_on_mutual_recursion():
+    """Revisiting at a shallower depth must not make the walk unbounded. The depth limit
+    caps how many times any one code object can be re-entered."""
+    import torch.nn as nn
+
+    source = (
+        "def a(m): return b(m)\n"
+        "def b(m): return a(m)\n"
+        "def fwd(self, x):\n"
+        "    a(self)\n"
+        "    return x\n"
+    )
+    namespace = {}
+    exec(compile(source, "<cycle>", "exec"), namespace)
+    experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
+    assert MU._forward_statically_reads_stash(experts) is False
+
+
+def test_equal_but_distinct_code_objects_are_both_scanned():
+    """The visited map is keyed by identity, not equality.
+
+    Two functions compiled from identical source at the same filename and name have code
+    objects that compare equal AND hash equal while being distinct objects carrying
+    different `__globals__`. Keyed by the code objects themselves, the second is skipped
+    as already seen, so a forward whose stash-reading route is the second one answers
+    False and its compiled cold start goes down the PEFT path that fails under fullgraph.
+    """
+    import torch.nn as nn
+
+    source = "def helper(m): return target(m)\n"
+    unrelated = {"target": lambda m: None}
+    reaches_stash = {"target": MU.take_moe_lora_stash}
+    exec(compile(source, "<same>", "exec"), unrelated)
+    exec(compile(source, "<same>", "exec"), reaches_stash)
+
+    first = unrelated["helper"].__code__
+    second = reaches_stash["helper"].__code__
+    assert first == second and hash(first) == hash(second), (
+        "the fixture needs code objects that compare and hash equal, or it proves nothing"
+    )
+    assert first is not second
+
+    namespace = {"h_unrelated": unrelated["helper"], "h_stash": reaches_stash["helper"]}
+    exec(
+        compile(
+            "def fwd(self, x):\n    h_unrelated(self)\n    h_stash(self)\n    return x\n",
+            "<fwd>", "exec",
+        ),
+        namespace,
+    )
+    experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
+    assert MU._forward_statically_reads_stash(experts) is True
