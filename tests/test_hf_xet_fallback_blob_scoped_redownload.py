@@ -1659,3 +1659,40 @@ def test_a_snapshot_claims_nothing_when_a_process_of_ours_cannot_be_described(
         "a partial we cannot prove is ours must not be claimed"
     )
     assert (blobs / sibling).exists()
+
+
+def test_an_unreadable_cache_at_the_transition_forces_rather_than_resuming(monkeypatch, tmp_path):
+    """`has_active_incomplete_blobs` answers False for a cache it could not read.
+
+    That is the one answer which skips the clearance and the confirmation together, so the first
+    HTTP child runs unforced and resumes whatever sparse Xet partial is still there, finalizing
+    it under its sha256 name with no error. The gate is the tri-state probe instead: only a
+    positive confirmation that the cache is clean may skip the block.
+    """
+    _build_cache(tmp_path, partial_age_s = 20.0)
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: True)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
+    # The shape of a permission flap: the walk yields nothing, the name probe cannot read.
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *a, **k: False)
+    monkeypatch.setattr(xf, "_incomplete_partial_names", lambda *a, **k: None)
+
+    attempt = _run_ladder(monkeypatch, tmp_path, owned = None)
+    assert _http_force(attempt) is True, (
+        "a cache that cannot be read is not a cache that is clean"
+    )
+
+
+def test_a_cache_confirmed_clean_still_skips_the_clearance(monkeypatch, tmp_path):
+    """The control: the common path must not start paying for the case above."""
+    _build_cache(tmp_path, partial_age_s = 20.0)
+    for name in _partials(tmp_path):
+        (tmp_path / REPO_DIR / "blobs" / name).unlink()
+    called: list = []
+    monkeypatch.setattr(
+        xf, "_clear_unsafe_partials_for_http",
+        lambda *a, **k: called.append(a) or set(),
+    )
+    attempt = _run_ladder(monkeypatch, tmp_path, owned = None)
+    assert called == [], "a confirmed-clean cache needs no clearance pass"
+    assert _http_force(attempt) is False

@@ -3580,7 +3580,14 @@ def _download_with_xet_fallback(
             # An unsafe partial that could not be cleared (locked / permission) would corrupt the blob
             # on an HTTP resume, and the force that avoids that is REPO-WIDE, so spend one more
             # BLOB-SCOPED attempt first: a spared partial cost every completed shard (#9094).
-            if has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir):
+            #
+            # The GATE is the tri-state, not `has_active_incomplete_blobs`, which walks
+            # `iter_active_repo_cache_dirs` and swallows OSError: a cache that has gone briefly
+            # unreadable answers False there, indistinguishable from a clean one, and False here
+            # skips the clearance AND the confirmation below, so an unforced HTTP child resumes
+            # whatever sparse partial is still on disk and finalizes it under its sha256 name.
+            # Only a POSITIVE confirmation that the cache is clean may skip this block.
+            if not _no_incomplete_blobs_confirmed(repo_type, repo_id, cache_dir):
                 survivors = _clear_unsafe_partials_for_http(
                     repo_type, repo_id, cache_dir = cache_dir,
                     active_grace = max(stall_timeout or 0.0, DEFAULT_HTTP_STALL_TIMEOUT),
