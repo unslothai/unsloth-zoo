@@ -664,3 +664,38 @@ def test_a_valid_override_set_before_import_survives_compilation():
     assert result.stdout.strip().splitlines()[-1] == "2.0", (
         f"the override did not reach the compiled graph: {result.stdout[-500:]}"
     )
+
+
+def test_the_layout_set_after_import_reaches_the_first_compiled_call():
+    """`import unsloth` runs this module's import long before the application sets the
+    variable, so an import-time value alone is stale for the normal case.
+
+    Gating the refresh on `not torch.compiler.is_compiling()` got this wrong: a run whose
+    first MoE call is already compiled never executes the eager branch, so tracing
+    returned the stale import-time default and a legacy adapter was read with the wrong
+    column packing. Subprocess, because the import has to happen with the variable unset.
+    """
+    import subprocess
+    import sys
+
+    program = (
+        "import os, torch\n"
+        "os.environ.pop('UNSLOTH_MOE_LORA_B_LAYOUT', None)\n"
+        "import unsloth_zoo.temporary_patches.moe_utils as MU\n"
+        "def f(x):\n"
+        "    return x + (1.0 if MU.moe_lora_b_layout() == MU.LORA_B_LAYOUT_RANK_MAJOR else 2.0)\n"
+        "c = torch.compile(f, fullgraph=False)\n"
+        "os.environ['UNSLOTH_MOE_LORA_B_LAYOUT'] = 'grouped_by_expert'\n"
+        "print(c(torch.zeros(1)).tolist()[0])\n"
+    )
+    environment = {k: v for k, v in os.environ.items()
+                   if k != "UNSLOTH_MOE_LORA_B_LAYOUT"}
+    environment["UNSLOTH_IS_PRESENT"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c", program], env=environment,
+        capture_output=True, text=True, timeout=900,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip().splitlines()[-1] == "2.0", (
+        "the compiled graph used the stale import-time layout: " + result.stdout[-500:]
+    )

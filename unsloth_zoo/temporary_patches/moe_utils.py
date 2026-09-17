@@ -982,14 +982,18 @@ def moe_lora_b_layout() -> str:
     the migration path, not this switch.
     """
     global _MOE_LORA_B_LAYOUT
-    if torch.compiler.is_compiling():
-        # Read the module global rather than the environment. Dynamo installs a guard on
-        # an `os.environ.get` only when the key is already set at trace time, so on the
-        # default path there is no guard at all: setting the variable after the first
-        # compiled call changed nothing, and a misspelled value was never validated
-        # either, both silently and for the life of the captured graph. A module global
-        # IS guarded, so the eager refresh below triggers a recompile instead.
-        return _MOE_LORA_B_LAYOUT
+    # Refreshed on every call, including while Dynamo traces. Reading the environment at
+    # trace time bakes the then-current value into the graph, which is what the supported
+    # usage needs: `import unsloth` runs this module's import long before the application
+    # sets the variable, so an import-time value alone would be stale for exactly the
+    # normal case of setting it before training starts. Gating the refresh on
+    # `not is_compiling()` got this wrong, because a run whose first MoE call is already
+    # compiled never executes the eager branch at all.
+    #
+    # What this still does not do is notice a change made AFTER the first compiled call:
+    # Dynamo installs a guard on an `os.environ.get` only when the key is set at trace
+    # time, so there is nothing to invalidate the graph. That is the documented contract,
+    # a process-wide mode set before the process does any MoE work.
     _MOE_LORA_B_LAYOUT = _read_moe_lora_b_layout_from_env()
     return _MOE_LORA_B_LAYOUT
 
