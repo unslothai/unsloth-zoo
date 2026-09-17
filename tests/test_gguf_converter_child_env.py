@@ -772,13 +772,23 @@ def test_failure_path_attaches_the_diagnosis(mod):
 # end to end, skipped unless the real toolchain is staged
 # ---------------------------------------------------------------------------
 
-_TOOLCHAIN = Path("/mnt/disks/unslothai/daniel2/workspace_2/temp/r2b_llamacpp")
-_MODEL = Path("/mnt/disks/unslothai/daniel2/workspace_2/temp/r2b_models/gemma-3-270m-it")
+_TOOLCHAIN = Path(os.environ.get("UNSLOTH_TEST_LLAMACPP_DIR") or os.devnull)
+_MODEL = Path(os.environ.get("UNSLOTH_TEST_GGUF_MODEL") or os.devnull)
+
+
+def _staged(root, name):
+    # Path.is_file() only swallows ENOENT/ENOTDIR/EBADF/ELOOP; an unreadable
+    # parent raises EACCES, which at module scope would fail collection of the
+    # whole file rather than skip this one test.
+    try:
+        return (root / name).is_file()
+    except OSError:
+        return False
 
 
 @pytest.mark.skipif(
-    not (_TOOLCHAIN / "convert_hf_to_gguf.py").is_file() or not (_MODEL / "config.json").is_file(),
-    reason="real llama.cpp converter toolchain or test model not staged",
+    not _staged(_TOOLCHAIN, "convert_hf_to_gguf.py") or not _staged(_MODEL, "config.json"),
+    reason="set UNSLOTH_TEST_LLAMACPP_DIR and UNSLOTH_TEST_GGUF_MODEL to run this",
 )
 def test_end_to_end_conversion_survives_a_stale_ambient_gguf(mod, tmp_path, monkeypatch):
     """A stale gguf on PYTHONPATH used to decide the child's import. With the
