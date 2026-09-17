@@ -777,6 +777,32 @@ def _blobs_dir_is_absent(blobs_dir) -> bool:
         return True
 
 
+def _no_incomplete_blobs_confirmed(
+    repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
+) -> bool:
+    """True only when the cache was READ and holds nothing unsafe for this repo.
+
+    ``has_active_incomplete_blobs`` walks ``iter_active_repo_cache_dirs``, which swallows
+    ``OSError``: a cache that has gone unreadable or been briefly unmounted yields no
+    directories and answers False, which is indistinguishable from a clean cache and is the
+    one answer that releases the force. A partial that is still there when the mount comes
+    back is then resumed over by HTTP, which verifies size and not content, so the corrupt
+    blob is finalized under its sha256 name with no error.
+
+    So the tri-state name probe decides it -- ``None`` is "could not read", not "nothing
+    there" -- and the broken snapshot link half of the original predicate is kept on top,
+    since a dangling link reads as active there and has no ``*.incomplete`` name to find.
+
+    Only asked where partials have already been SEEN, i.e. where the root existed a moment
+    ago. The strict probe treats an absent root as unreadable, which is right there and would
+    be wrong before the first download, where there is legitimately nothing yet.
+    """
+    names = _incomplete_partial_names(repo_type, repo_id, cache_dir)
+    if names is None or names:
+        return False
+    return not has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir)
+
+
 def _baseline_incomplete_blob_names(
     repo_type: Optional[str], repo_id: str, cache_dir: Optional[str] = None
 ) -> Optional[set]:
@@ -3275,10 +3301,13 @@ def _download_with_xet_fallback(
                 )
                 # ABSENCE is the only evidence accepted, as at the latch below: ``None`` is an
                 # unreadable cache, not a clear, and dangling snapshot links still read as active.
+                # Both halves of that are the confirmation probe's, so a cache that goes
+                # unreadable between the clear and this check keeps the force rather than
+                # reading as empty and letting HTTP resume over whatever is still there.
                 cleared = (
                     survivors is not None
                     and not survivors
-                    and not has_active_incomplete_blobs(repo_type, repo_id, cache_dir = cache_dir)
+                    and _no_incomplete_blobs_confirmed(repo_type, repo_id, cache_dir)
                 )
                 if cleared:
                     logger.info(

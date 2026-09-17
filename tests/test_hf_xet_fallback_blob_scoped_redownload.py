@@ -1239,3 +1239,43 @@ def test_the_walk_completeness_is_per_thread(monkeypatch):
     assert xf._live_writer_walk_was_complete() is False, (
         "another thread's complete walk overwrote this thread's incomplete verdict"
     )
+
+
+def _confirmation(monkeypatch, *, names, active):
+    monkeypatch.setattr(xf, "_incomplete_partial_names", lambda *_a, **_k: names)
+    monkeypatch.setattr(xf, "has_active_incomplete_blobs", lambda *_a, **_k: active)
+    return xf._no_incomplete_blobs_confirmed("model", "Qwen/Qwen3.5-9B", None)
+
+
+def test_a_cache_that_cannot_be_read_after_the_clear_does_not_release_the_force(monkeypatch):
+    """`has_active_incomplete_blobs` walks an iterator that swallows OSError, so a cache that
+    is unreadable or briefly unmounted yields no directories and answers False -- the same
+    answer a clean cache gives, and the one that releases the force. HTTP then resumes over a
+    partial that is still there when the mount returns and finalizes it under its sha256."""
+    assert _confirmation(monkeypatch, names = None, active = False) is False
+
+
+def test_a_confirmed_empty_cache_still_releases_the_force(monkeypatch):
+    assert _confirmation(monkeypatch, names = set(), active = False) is True
+
+
+def test_a_surviving_partial_holds_the_force(monkeypatch):
+    assert _confirmation(monkeypatch, names = {"abc.incomplete"}, active = False) is False
+
+
+def test_a_dangling_snapshot_link_holds_the_force_with_no_partial_to_find(monkeypatch):
+    """A broken link has no *.incomplete name, so the name probe alone would release on it."""
+    assert _confirmation(monkeypatch, names = set(), active = True) is False
+
+
+def test_the_release_after_the_scoped_clear_asks_the_confirmation_probe():
+    """Placement: the probe above proves only what it does once reached."""
+    import inspect
+
+    source = inspect.getsource(xf)
+    block = source.split("survivors = _clear_unsafe_partials_for_http(", 1)[1]
+    block = block.split("forced_clean_redownload = True", 1)[0]
+    assert "_no_incomplete_blobs_confirmed(" in block
+    assert "not has_active_incomplete_blobs(" not in block, (
+        "the release went back to the probe that answers False for an unreadable cache"
+    )
