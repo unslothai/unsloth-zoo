@@ -819,6 +819,75 @@ def _get_routing_indices(selected_experts, num_experts):
     return token_counts_by_expert, gather_indices
 
 
+def combine_permuted_moe_outputs(
+    permuted_output: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    out_dtype = None,
+) -> torch.Tensor:
+    """Sum the top_k expert outputs belonging to each token, in a fixed order.
+
+    The obvious spelling of this reduction is
+    ``zeros(num_tokens, hidden).index_add_(0, token_indices, permuted_output)``
+    with ``token_indices = sorted_indices // top_k``. Because every token index
+    appears ``top_k`` times in one call, that lands in ``index_add_``'s CUDA
+    atomicAdd path, and atomicAdd fixes no accumulation order. Float addition is
+    not associative, so the result moves from run to run: repeating one identical
+    forward 40 times on a single already-loaded Gemma-4 MoE, with no optimizer
+    step and no data change, gave 40 distinct losses spread over 0.0284 nats,
+    while the same 40 repeats through the reduction below returned one value.
+
+    ``sorted_indices`` is ``argsort`` of the flat expert assignment, so it is a
+    permutation of ``range(num_tokens * top_k)`` - every slot exactly once. That
+    means the permutation can simply be undone (a gather through the inverse
+    permutation: unique indices, no accumulation and so no atomics) and the
+    ``top_k`` axis reduced with an ordinary ``sum``, which has a fixed reduction
+    order. Same arithmetic, same values up to that ordering, reproducible.
+
+    ``out_dtype`` is applied AFTER the reduction, not before it. When the routed
+    slots arrive wider than ``out_dtype`` - the fp32-router case, where the
+    routing-weight multiply promotes the expert output to fp32 - casting first
+    would round every one of the ``top_k`` summands to bf16 and only then add
+    them. Summing first and rounding once is what ``transformers``
+    (``integrations/moe.py``) does, and it is measurably closer to an fp64
+    reference. With a bf16 router the two orders are bit-identical.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    # The gather below is safe only because sorted_indices is an argsort, so the indices
+    # are unique and, given the count check here matches, cover every row: nothing is left
+    # unread and no slot is counted twice. A bare `assert` would vanish under `python -O`,
+    # which is exactly the build where a silently wrong reduction is hardest to notice.
+    if sorted_indices.numel() != permuted_output.shape[0]:
+        raise ValueError(
+            f"Unsloth: expected a full permutation of {permuted_output.shape[0]} routed slots, "
+            f"got {sorted_indices.numel()} indices"
+        )
+    # inverse_indices[sorted_indices[i]] = i, i.e. "which routed slot holds original row j".
+    # Gathering with it is one [num_tokens * top_k, hidden] buffer, in the incoming dtype;
+    # the narrowing cast then only ever touches the small [num_tokens, hidden] result.
+    inverse_indices = torch.empty_like(sorted_indices)
+    inverse_indices.scatter_(
+        0,
+        sorted_indices,
+        torch.arange(
+            sorted_indices.numel(),
+            device = sorted_indices.device,
+            dtype = sorted_indices.dtype,
+        ),
+    )
+    combined = (
+        permuted_output
+        .index_select(0, inverse_indices)
+        .view(num_tokens, top_k, permuted_output.shape[-1])
+        .sum(dim = 1)
+    )
+    if out_dtype is not None:
+        combined = combined.to(out_dtype)
+    return combined
+
+
 def _silu_and_mul(x):
     """Fused SiLU + element-wise multiply for gate/up projections."""
     gate, up = x.chunk(2, dim=-1)
@@ -1958,13 +2027,13 @@ def forward_native_grouped_mm(
         permuted_weights = flat_weights[sorted_indices]
         mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    final_hidden_states = combine_permuted_moe_outputs(
+        mm2_out,
+        sorted_indices,
+        batch_size * sequence_length,
+        top_k_index.shape[-1],
+        out_dtype = hidden_states.dtype,
     )
-
-    final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
 
     if is_2d_input:
         return final_hidden_states
