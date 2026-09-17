@@ -399,6 +399,12 @@ def server_tls(tmp_path):
     ))
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    # PROTOCOL_TLS_SERVER negotiates the highest both ends offer, so in practice this
+    # server speaks 1.2 or 1.3 already. The floor is set anyway because the CONTEXT still
+    # permits 1.0 and 1.1, which is what a reader -- and CodeQL's py/insecure-protocol --
+    # sees, and a fixture that models a TLS attack should not be the one place in the repo
+    # accepting a protocol version the attack surface it models was retired over.
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(certificate_path), str(key_path))
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     httpd.seen = []
