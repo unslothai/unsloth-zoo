@@ -42,6 +42,7 @@ import logging
 import tempfile
 import sys
 import textwrap
+import threading
 import tokenize
 from .utils import (
     Version,
@@ -1281,6 +1282,15 @@ def _drop_untrusted_cache_from_sys_path(folders):
     By entry, not by string: the folder we refuse is usually the relative
     "unsloth_compiled_cache" while the entry on the path can be the absolute
     form, or the other way round, and either resolves to the same directory.
+
+    The working directory is never dropped, however it is spelled. With
+    UNSLOTH_COMPILE_LOCATION="." the cache IS the working directory, so "", "."
+    and its absolute form all resolve to the target and filtering would delete
+    the user's own import path for every unrelated local module, permanently and
+    for a cache they did not choose to put there. Losing the refusal here costs
+    nothing that matters: the name block in the caller is what actually stops
+    the planted helper from being imported, and the path filter only narrows the
+    surface around it.
     """
     targets = set()
     for folder in folders:
@@ -1288,6 +1298,10 @@ def _drop_untrusted_cache_from_sys_path(folders):
             targets.add(os.path.realpath(folder))
         except Exception:
             continue
+    try:
+        targets.discard(os.path.realpath(os.getcwd()))
+    except Exception:
+        pass
     if not targets:
         return
     kept = []
@@ -1299,6 +1313,10 @@ def _drop_untrusted_cache_from_sys_path(folders):
         if resolved is None or resolved not in targets:
             kept.append(entry)
     sys.path[:] = kept
+
+
+_MOE_UTILS_BLOCK_LOCK = threading.Lock()
+_MOE_UTILS_BLOCK = {"depth": 0, "previous": None, "was_present": False}
 
 
 @contextlib.contextmanager
@@ -1336,16 +1354,32 @@ def _untrusted_cache_kept_out_of_imports(*folders):
         yield
         return
     _drop_untrusted_cache_from_sys_path(untrusted)
-    missing = object()
-    previous = sys.modules.get("moe_utils", missing)
-    sys.modules["moe_utils"] = None
+    # Nest by depth under one lock, rather than each guard saving and restoring
+    # for itself. Two overlapping guards that each keep their own copy get this,
+    # measured on the real guard: the inner one saves the outer one's `None`, the
+    # outer exits and REMOVES the entry while the inner is still running, so the
+    # inner block is unprotected for the rest of its body, and then the inner
+    # exit restores that `None` permanently and every later legitimate
+    # `import moe_utils` in the process dies on it. Only the outermost guard
+    # touches sys.modules, so neither half can happen.
+    with _MOE_UTILS_BLOCK_LOCK:
+        if _MOE_UTILS_BLOCK["depth"] == 0:
+            _MOE_UTILS_BLOCK["was_present"] = "moe_utils" in sys.modules
+            _MOE_UTILS_BLOCK["previous"] = sys.modules.get("moe_utils")
+            sys.modules["moe_utils"] = None
+        _MOE_UTILS_BLOCK["depth"] += 1
     try:
         yield
     finally:
-        if previous is missing:
-            sys.modules.pop("moe_utils", None)
-        else:
-            sys.modules["moe_utils"] = previous
+        with _MOE_UTILS_BLOCK_LOCK:
+            _MOE_UTILS_BLOCK["depth"] -= 1
+            if _MOE_UTILS_BLOCK["depth"] == 0:
+                if _MOE_UTILS_BLOCK["was_present"]:
+                    sys.modules["moe_utils"] = _MOE_UTILS_BLOCK["previous"]
+                else:
+                    sys.modules.pop("moe_utils", None)
+                _MOE_UTILS_BLOCK["previous"] = None
+                _MOE_UTILS_BLOCK["was_present"] = False
         _drop_untrusted_cache_from_sys_path(untrusted)
 
 
@@ -1543,7 +1577,18 @@ def _exec_verified_source(source, file_location, module_name):
     The path is still handed to compile() and to the spec, so tracebacks, the
     module's __file__ and inspect.getsource all read normally; it is simply never
     the thing that gets read back.
+
+    Absolute, because the compile folder is relative by default
+    ("unsloth_compiled_cache") and co_filename is resolved against the working
+    directory at READ time, not at compile time. importlib.import_module used to
+    hand the loader an absolute path, so leaving it relative silently downgraded
+    every traceback and inspect.getsource to something that stops working the
+    moment the process chdirs.
     """
+    try:
+        file_location = os.path.abspath(file_location)
+    except Exception:
+        pass
     spec = importlib.util.spec_from_file_location(module_name, file_location)
     new_module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = new_module

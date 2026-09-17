@@ -1792,3 +1792,128 @@ def test_recovery_drops_a_successful_import_before_it_can_abort(
     finally:
         for alias in (name, f"unsloth_cache_{name}"):
             sys.modules.pop(alias, None)
+
+
+def test_the_working_directory_is_never_dropped_from_sys_path(compiler, tmp_path):
+    """UNSLOTH_COMPILE_LOCATION="." makes the cache the working directory.
+
+    Filtering by resolved path then deletes "", "." and the absolute cwd, which
+    is the user's import path for every unrelated local module, for a cache they
+    did not choose to put there. A separate directory is still dropped.
+    """
+    entry = list(sys.path)
+    try:
+        sys.path[:] = ["", ".", os.getcwd(), "/usr/lib/python-not-real"]
+        compiler._drop_untrusted_cache_from_sys_path(["."])
+        assert "" in sys.path and "." in sys.path, (
+            "the working directory was dropped from sys.path"
+        )
+        assert os.getcwd() in sys.path
+
+        other = tmp_path / "somewhere_else"
+        other.mkdir()
+        sys.path[:] = ["", str(other), os.path.join(str(other), "."), "/usr/lib/x"]
+        compiler._drop_untrusted_cache_from_sys_path([str(other)])
+        assert not [
+            p for p in sys.path
+            if os.path.realpath(p) == os.path.realpath(str(other))
+        ], "a genuinely separate untrusted cache directory survived"
+        assert "" in sys.path
+    finally:
+        sys.path[:] = entry
+
+
+def test_overlapping_guards_do_not_leak_a_blocked_moe_utils(compiler, tmp_path):
+    """Two guards that each save and restore for themselves corrupt the state.
+
+    The inner one saves the outer one's None; the outer exits and REMOVES the
+    entry while the inner is still running, leaving the inner body unprotected;
+    then the inner exit restores that None permanently, so every later
+    legitimate `import moe_utils` in the process dies on it.
+    """
+    folder = tmp_path / "untrusted"
+    folder.mkdir()
+    (folder / "moe_utils.py").write_text("PLANTED = 1\n", encoding = "utf-8")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is False
+
+    import threading
+
+    previous = sys.modules.pop("moe_utils", None)
+    a_in, b_in, a_out = threading.Event(), threading.Event(), threading.Event()
+    seen = {}
+    try:
+        def first():
+            with compiler._untrusted_cache_kept_out_of_imports(str(folder)):
+                a_in.set()
+                b_in.wait(10)
+            a_out.set()
+
+        def second():
+            a_in.wait(10)
+            with compiler._untrusted_cache_kept_out_of_imports(str(folder)):
+                b_in.set()
+                a_out.wait(10)
+                seen["inside_after_the_other_exited"] = sys.modules.get(
+                    "moe_utils", "absent",
+                )
+
+        threads = [threading.Thread(target = first), threading.Thread(target = second)]
+        for t in threads: t.start()
+        for t in threads: t.join(15)
+
+        assert seen.get("inside_after_the_other_exited", "absent") is None, (
+            "the second guard's body ran with moe_utils importable again"
+        )
+        assert "moe_utils" not in sys.modules, (
+            "a blocked moe_utils leaked past the last guard"
+        )
+    finally:
+        sys.modules.pop("moe_utils", None)
+        if previous is not None:
+            sys.modules["moe_utils"] = previous
+
+
+def test_nested_guards_restore_only_at_the_outermost_exit(compiler, tmp_path):
+    folder = tmp_path / "untrusted_nested"
+    folder.mkdir()
+    (folder / "moe_utils.py").write_text("PLANTED = 1\n", encoding = "utf-8")
+    sentinel = object()
+    previous = sys.modules.get("moe_utils")
+    sys.modules["moe_utils"] = sentinel
+    try:
+        with compiler._untrusted_cache_kept_out_of_imports(str(folder)):
+            with compiler._untrusted_cache_kept_out_of_imports(str(folder)):
+                assert sys.modules["moe_utils"] is None
+            assert sys.modules["moe_utils"] is None, (
+                "the inner exit released the block while the outer was still open"
+            )
+        assert sys.modules["moe_utils"] is sentinel
+    finally:
+        if previous is None:
+            sys.modules.pop("moe_utils", None)
+        else:
+            sys.modules["moe_utils"] = previous
+
+
+def test_generated_module_co_filename_is_absolute(compiler, monkeypatch, cache_dirs):
+    """A relative compile folder must not leak into co_filename.
+
+    importlib.import_module handed the loader an absolute path, so leaving it
+    relative downgrades every traceback and inspect.getsource to something
+    resolved against the working directory at read time.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    source = "def co_filename_probe_fn(x):\n    return x\n"
+    location = primary / "co_filename_probe.py"
+    location.write_text(source, encoding = "utf-8")
+    monkeypatch.chdir(primary.parent)
+    module = compiler._exec_verified_source(
+        source.encode("utf-8"), os.path.join(primary.name, "co_filename_probe.py"),
+        "co_filename_probe",
+    )
+    try:
+        got = module.co_filename_probe_fn.__code__.co_filename
+        assert os.path.isabs(got), f"co_filename is relative: {got}"
+    finally:
+        sys.modules.pop("co_filename_probe", None)
