@@ -1432,69 +1432,80 @@ def test_the_stalled_child_is_killed_before_the_live_writer_walk(monkeypatch, tm
     assert params.get("_owned_incomplete_blobs") == {child_partial}
 
 
-def test_an_unreadable_process_of_our_own_stops_the_purge_where_there_is_no_fd_table(
+def test_a_process_of_our_own_that_nothing_can_describe_raises_the_age_bar(
     monkeypatch, tmp_path,
 ):
-    """Cache privacy only excludes OTHER uids, so it cannot cover a process running as us.
+    """Cache privacy only excludes OTHER uids, so it cannot answer for a process running as us.
 
-    macOS denies `open_files()` for same-uid processes under TCC and the hardened runtime, and
-    has no `/proc` to ask instead. That downloader is absent from the lower bound while holding
-    the very partial the pass is about to whitelist, and a private cache says nothing about it.
-    Where the fd table DOES exist it is what answers for our own processes, so the same denial
-    there is not a gap -- that case is the one below.
+    macOS denies `open_files()` for same-uid processes under TCC and the hardened runtime, and a
+    non-dumpable process refuses `/proc/<pid>/fd` as well -- on this login that set included an
+    Unsloth Studio backend, which downloads from the Hub. Such a writer is absent from the lower
+    bound while holding the partial the pass is about to whitelist.
+
+    Declining outright is not the answer: a systemd login always has at least one process like
+    this, so the clearance would be off for every Linux user and #9094 would be unfixed there.
+    The age bar is raised instead -- 171s is the longest no-growth window a live Xet writer has
+    shown here, and a partial untouched for half an hour is not one.
     """
-    _build_cache(tmp_path, partial_age_s = 1800.0)
-    stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    _build_cache(tmp_path, partial_age_s = 200.0)
+    partial = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
 
     class _Denied(Exception):
         pass
 
     class _Proc:
         pid = 4242
+        uid = None
 
         def open_files(self):
-            raise _Denied("TCC")
+            raise _Denied("non-dumpable")
 
         def uids(self):
-            return os.stat_result(tuple(range(10)))  # placeholder, replaced below
+            return type("U", (), {"effective": self.uid})()
 
-    class _OurProc(_Proc):
-        def uids(self):
-            return type("U", (), {"effective": os.geteuid() if hasattr(os, "geteuid") else 0})()
-
-    class _TheirProc(_Proc):
-        def uids(self):
-            return type("U", (), {"effective": -1})()
+    ours = _Proc()
+    ours.uid = os.geteuid() if hasattr(os, "geteuid") else 0
+    theirs = _Proc()
+    theirs.uid = -1
 
     class _FakePsutil:
         NoSuchProcess = type("NoSuchProcess", (Exception,), {})
         ZombieProcess = type("ZombieProcess", (Exception,), {})
-        procs = [_OurProc()]
+        procs = [ours]
 
         @staticmethod
         def process_iter():
             return _FakePsutil.procs
 
     monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+    monkeypatch.setattr(xf, "_proc_fd_partial_paths", lambda pid: None)
     monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda *a, **k: True)
-    monkeypatch.setattr(xf, "_fd_table_is_available", lambda: False)
 
-    assert xf._unowned_partials_safe_to_clear("model", REPO, str(tmp_path), 180.0, None) is None
-    assert (tmp_path / REPO_DIR / "blobs" / stranger).exists(), (
-        "a partial a process of ours may hold must survive a private-cache purge"
-    )
+    # Past the ordinary grace, nowhere near the raised one: not clearable while that process
+    # could be the writer.
+    assert xf._unowned_partials_safe_to_clear("model", REPO, str(tmp_path), 180.0, None) == set()
     assert xf._live_writer_walk_missed_our_own_uid() is True
 
-    # The same denial for somebody ELSE's process is what privacy does answer for.
-    _FakePsutil.procs = [_TheirProc()]
+    # The same partial once it is genuinely stale clears, so the fix still works here.
+    blobs = tmp_path / REPO_DIR / "blobs"
+    old = time.time() - 4000.0
+    os.utime(blobs / partial, (old, old))
     assert xf._unowned_partials_safe_to_clear(
         "model", REPO, str(tmp_path), 180.0, None,
-    ) == {stranger}
+    ) == {partial}
 
-    # And with an fd table to ask instead, our own denied process is answered, not missed.
-    _FakePsutil.procs = [_OurProc()]
-    monkeypatch.setattr(xf, "_fd_table_is_available", lambda: True)
+    # Somebody ELSE's unreadable process is what privacy does answer for, at the normal grace.
+    _FakePsutil.procs = [theirs]
+    fresh = time.time() - 200.0
+    os.utime(blobs / partial, (fresh, fresh))
+    assert xf._unowned_partials_safe_to_clear(
+        "model", REPO, str(tmp_path), 180.0, None,
+    ) == {partial}
+
+    # And with an fd table that answers, our own denied process is not a miss at all.
+    _FakePsutil.procs = [ours]
     monkeypatch.setattr(xf, "_proc_fd_partial_paths", lambda pid: set())
     assert xf._unowned_partials_safe_to_clear(
         "model", REPO, str(tmp_path), 180.0, None,
-    ) == {stranger}
+    ) == {partial}
+    assert xf._live_writer_walk_missed_our_own_uid() is False

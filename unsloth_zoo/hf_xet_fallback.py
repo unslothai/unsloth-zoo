@@ -127,6 +127,11 @@ _CTX = mp.get_context("spawn")
 DEFAULT_STALL_TIMEOUT = 30.0
 DEFAULT_CONNECT_TIMEOUT = 90.0
 DEFAULT_HTTP_STALL_TIMEOUT = 180.0
+# Age a partial must reach before it may be cleared while some process of our own could not be
+# inspected at all (non-dumpable, so neither psutil nor /proc/<pid>/fd answers). The longest
+# no-growth window this module has measured for a LIVE Xet writer is 171s; half an hour is two
+# orders above it, and a partial left by a crash is hours or days old.
+_OPAQUE_WRITER_GRACE = 1800.0
 # How often the watchdog measures. Detection latency is up to one interval on top of the timeout,
 # so this has to be well under DEFAULT_STALL_TIMEOUT to honour it.
 DEFAULT_POLL_INTERVAL = 5.0
@@ -618,10 +623,16 @@ def _clear_partials(
         if rescanned_writers is not None and not _process_walk_sees_every_writer(cache_dir):
             rescanned_writers = None
         if rescanned_writers is not None and not _live_writer_walk_was_complete():
-            if _live_writer_walk_missed_our_own_uid() or not _cache_is_private_to_this_user(
+            if not _cache_is_private_to_this_user(
                 cache_dir, repo_type = repo_type, repo_id = repo_id,
             ):
                 rescanned_writers = None
+            elif _live_writer_walk_missed_our_own_uid():
+                # Mirrors the eligibility scan: a process of our own that nothing can describe
+                # is not answered by privacy, and declining would spare every blob on a
+                # systemd login. The scan raised the age bar for exactly this, so the re-check
+                # raises it too rather than overturning a decision on different terms.
+                active_grace = max(active_grace * 10.0, _OPAQUE_WRITER_GRACE)
     # The same question for the reopened-name pass, asked the other way round. There the walk is
     # not proof of ownership but proof that nobody ELSE holds a name we once owned, so a lower
     # bound reads as "free to unlink". PRIVACY decides it first: where no other UID can write
@@ -634,11 +645,8 @@ def _clear_partials(
     # declines here too; the deterministic name is the one a same-uid sibling could hold.
     reopened_scan_is_evidence = True
     if owned_names_may_be_reopened:
-        reopened_scan_is_evidence = (
-            _cache_is_private_to_this_user(
-                cache_dir, repo_type = repo_type, repo_id = repo_id,
-            )
-            and not _live_writer_walk_missed_our_own_uid()
+        reopened_scan_is_evidence = _cache_is_private_to_this_user(
+            cache_dir, repo_type = repo_type, repo_id = repo_id,
         ) or (
             rescanned_writers is not None
             and _process_walk_sees_every_writer(cache_dir)
@@ -1346,19 +1354,20 @@ def _partial_paths_with_a_live_writer() -> Optional[set]:
                 # only rules out other UIDs, so an unreadable process running as US is a writer
                 # nothing here excludes -- and macOS denies `open_files()` for same-uid
                 # processes under TCC and the hardened runtime, not only for other users'.
-                # Recorded only where the fd table does not exist as a mechanism, because where
-                # it does, it is what just answered for our own processes: the handful that
-                # refuse it there are non-dumpable system helpers (ssh-agent and the like),
-                # never a downloader, and treating them as hidden writers would decline the
-                # clearance on every ordinary Linux login -- measured, 5 of 3459.
-                if not _fd_table_is_available():
-                    try:
-                        _LIVE_WRITER_WALK.missed_our_uid = (
-                            _LIVE_WRITER_WALK.missed_our_uid
-                            or _process_may_be_this_user(proc, psutil)
-                        )
-                    except Exception:
-                        _LIVE_WRITER_WALK.missed_our_uid = True
+                # Recorded per process, not per platform: `/proc` existing says nothing about
+                # THIS process, whose fd table the read above just failed on. A non-dumpable
+                # same-uid process refuses both, and that is not only sd-pam -- an Unsloth
+                # Studio backend on the same login refuses both too, and Studio downloads from
+                # the Hub. What this costs is bounded below rather than by declining, since on
+                # an ordinary Linux login there is always at least one such process and
+                # declining outright would turn the clearance off for everyone.
+                try:
+                    _LIVE_WRITER_WALK.missed_our_uid = (
+                        _LIVE_WRITER_WALK.missed_our_uid
+                        or _process_may_be_this_user(proc, psutil)
+                    )
+                except Exception:
+                    _LIVE_WRITER_WALK.missed_our_uid = True
                 continue
     except Exception:
         return None
@@ -1382,11 +1391,17 @@ def _unowned_partials_safe_to_clear(
         # A PID namespace hides a sibling container's downloader without raising, so the walk
         # cannot even record itself as incomplete. Nothing here is proof; decline.
         return None
-    if not _live_writer_walk_was_complete() and (
-        _live_writer_walk_missed_our_own_uid()
-        or not _cache_is_private_to_this_user(
-            cache_dir, repo_type = repo_type, repo_id = repo_id,
-        )
+    # A process of OUR OWN that neither psutil nor the fd table would describe is a writer
+    # privacy cannot exclude, and on a systemd login there is always one. Declining there would
+    # turn this off for every Linux user, so the age bar is raised instead of the pass being
+    # abandoned: a partial nobody has touched for half an hour is not one a live writer is
+    # buffering, where the longest buffering this module has measured is 171 seconds. Stale
+    # partials are hours or days old, which is the case this exists for.
+    unreadable_writer_of_ours = _live_writer_walk_missed_our_own_uid()
+    if unreadable_writer_of_ours:
+        active_grace = max(active_grace * 10.0, _OPAQUE_WRITER_GRACE)
+    if not _live_writer_walk_was_complete() and not _cache_is_private_to_this_user(
+        cache_dir, repo_type = repo_type, repo_id = repo_id,
     ):
         # A process this host would not let us read is a possible writer, and on a cache
         # another user can write into it is a LIKELY one: unlinking an aged partial there
