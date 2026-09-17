@@ -1772,13 +1772,19 @@ def _forward_statically_reads_stash(experts_module):
     if code is None:
         return None
 
-    seen_code, seen_functions = set(), {id(forward)}
+    # Keyed on the code objects themselves, never on id(). Tracing id(forward) makes
+    # Dynamo guard the expression it tracked, `experts_module.forward`, a bound method
+    # CPython reallocates on every access, so ___check_obj_id can never match again and
+    # Dynamo raises "Guard failed on the same frame it was created" under both fullgraph
+    # settings with no eager fallback. Code objects are hashable, stable and 1:1 with the
+    # functions here, so they also make the separate function set redundant.
+    seen_code = set()
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
     while pending:
         current, namespace, depth = pending.pop()
-        if id(current) in seen_code:
+        if current in seen_code:
             continue
-        seen_code.add(id(current))
+        seen_code.add(current)
         names = set(getattr(current, "co_names", ()))
         if names & _STASH_READ_MARKERS:
             return True
@@ -1791,9 +1797,8 @@ def _forward_statically_reads_stash(experts_module):
             called = namespace.get(name)
             called = getattr(called, "__func__", called)
             called_code = getattr(called, "__code__", None)
-            if called_code is None or id(called) in seen_functions:
+            if called_code is None or called_code in seen_code:
                 continue
-            seen_functions.add(id(called))
             pending.append((called_code, getattr(called, "__globals__", namespace), depth + 1))
     return False
 
