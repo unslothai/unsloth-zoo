@@ -1193,20 +1193,32 @@ def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
         assert torch.equal(first, second)
 
 
-def test_the_static_scan_keys_on_code_objects_not_ids():
-    """Pin the mechanism, not just the symptom: a future edit reaching for id() again
-    would reintroduce a guard Dynamo cannot match, and the compile test above is slow
-    enough that it could plausibly be skipped."""
+def test_the_static_scan_never_takes_the_id_of_the_forward():
+    """Pin the mechanism, not just the symptom.
+
+    `id()` itself is fine and necessary here: the visited map must key on code-object
+    IDENTITY, because equal-but-distinct code objects exist. What wedged Dynamo was
+    `id(forward)` specifically, since `forward` traces back to `experts_module.forward`, a
+    bound method reallocated on every access, so `___check_obj_id` failed on the frame
+    that created it. So the invariant is narrow: id() may be taken of code objects, never
+    of the forward.
+    """
     import ast
     import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(MU._forward_statically_reads_stash)))
-    called = {
-        node.func.id for node in ast.walk(tree)
+    id_arguments = [
+        node.args[0] for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert "id" not in called, "the stash scan must not call id(); see the guard failure"
+        and node.func.id == "id" and node.args
+    ]
+    assert id_arguments, "expected the scan to key on identity via id()"
+    for argument in id_arguments:
+        name = getattr(argument, "id", None)
+        assert name != "forward", (
+            "id(forward) installs a Dynamo guard on a bound method that can never match"
+        )
 
 
 def test_a_deep_visit_does_not_suppress_a_shallower_one():
@@ -1256,3 +1268,39 @@ def test_the_scan_terminates_on_mutual_recursion():
     exec(compile(source, "<cycle>", "exec"), namespace)
     experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
     assert MU._forward_statically_reads_stash(experts) is False
+
+
+def test_equal_but_distinct_code_objects_are_both_scanned():
+    """The visited map is keyed by identity, not equality.
+
+    Two functions compiled from identical source at the same filename and name have code
+    objects that compare equal AND hash equal while being distinct objects carrying
+    different `__globals__`. Keyed by the code objects themselves, the second is skipped
+    as already seen, so a forward whose stash-reading route is the second one answers
+    False and its compiled cold start goes down the PEFT path that fails under fullgraph.
+    """
+    import torch.nn as nn
+
+    source = "def helper(m): return target(m)\n"
+    unrelated = {"target": lambda m: None}
+    reaches_stash = {"target": MU.take_moe_lora_stash}
+    exec(compile(source, "<same>", "exec"), unrelated)
+    exec(compile(source, "<same>", "exec"), reaches_stash)
+
+    first = unrelated["helper"].__code__
+    second = reaches_stash["helper"].__code__
+    assert first == second and hash(first) == hash(second), (
+        "the fixture needs code objects that compare and hash equal, or it proves nothing"
+    )
+    assert first is not second
+
+    namespace = {"h_unrelated": unrelated["helper"], "h_stash": reaches_stash["helper"]}
+    exec(
+        compile(
+            "def fwd(self, x):\n    h_unrelated(self)\n    h_stash(self)\n    return x\n",
+            "<fwd>", "exec",
+        ),
+        namespace,
+    )
+    experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
+    assert MU._forward_statically_reads_stash(experts) is True

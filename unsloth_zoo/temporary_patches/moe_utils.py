@@ -1786,12 +1786,22 @@ def _forward_statically_reads_stash(experts_module):
     # 5 of 14 PYTHONHASHSEED values returned False for a forward that does reach the
     # stash, which would send that compiled cold start down the failing PEFT path.
     seen_code = {}
+    alive = []
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
     while pending:
         current, namespace, depth = pending.pop()
-        if seen_code.get(current, _STASH_SCAN_MAX_DEPTH + 1) <= depth:
+        # Keyed by IDENTITY, not equality. Two functions compiled from identical source at
+        # the same filename and name have code objects that compare equal and hash equal
+        # while being distinct objects with different __globals__, so a dict keyed on the
+        # code objects themselves collapses them: if the first resolves its names to an
+        # unrelated helper and the second to take_moe_lora_stash, the second is skipped
+        # and the scan wrongly answers False. `alive` holds a reference to everything
+        # visited, so no id() can be recycled by the collector mid-walk.
+        key = id(current)
+        if seen_code.get(key, _STASH_SCAN_MAX_DEPTH + 1) <= depth:
             continue
-        seen_code[current] = depth
+        seen_code[key] = depth
+        alive.append(current)
         names = set(getattr(current, "co_names", ()))
         if names & _STASH_READ_MARKERS:
             return True
@@ -1806,7 +1816,7 @@ def _forward_statically_reads_stash(experts_module):
             called_code = getattr(called, "__code__", None)
             if called_code is None:
                 continue
-            if seen_code.get(called_code, _STASH_SCAN_MAX_DEPTH + 1) <= depth + 1:
+            if seen_code.get(id(called_code), _STASH_SCAN_MAX_DEPTH + 1) <= depth + 1:
                 continue
             pending.append((called_code, getattr(called, "__globals__", namespace), depth + 1))
     return False
