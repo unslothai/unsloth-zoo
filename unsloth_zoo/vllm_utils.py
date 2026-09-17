@@ -3729,6 +3729,35 @@ def _get_vllm_lora_manager(model, runner = None):
 pass
 
 
+def _vllm_mixed_moe_lora_enabled(model, runner = None, vllm_model = None):
+    """True when this engine forces vLLM's universal 2D expert wrapper, or None if unknown.
+
+    Read this off the LoRA stack, never off the model. `WorkerLoRAManager.__init__` always
+    stores `vllm_config.lora_config` as `self.lora_config`, and `LoRAModelManager.__init__`
+    resolves `is_moe and lora_config.enable_mixed_moe_lora_format` into
+    `_enable_mixed_moe_lora_format`, which is the exact bit `_create_merged_loras_inplace`
+    branches on. `vllm_model.vllm_config` is incidental by comparison: of the classes that
+    set `is_3d_moe_weight = True`, `Qwen3VLMoeForConditionalGeneration` and
+    `InternS1ProForConditionalGeneration` never assign it, so reading the mode there
+    answered "not mixed" for them and let a stacked adapter through into the 2D wrapper.
+    That path is silent: Unsloth's `LoRARequest` never sets `is_3d_lora_weight`, so vLLM
+    takes `_slice_moe_lora_ep` on a 3D adapter instead of `_convert_3d_to_2d_moe_lora`.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if runner is None: runner = _get_vllm_model_runner(model)
+    resolved = getattr(_get_vllm_lora_manager(model, runner), "_enable_mixed_moe_lora_format", None)
+    if isinstance(resolved, bool): return resolved
+    if vllm_model is None: vllm_model = _get_vllm_lora_model(model, runner)
+    for lora_config in (
+        getattr(getattr(runner, "lora_manager", None), "lora_config", None),
+        getattr(getattr(vllm_model, "vllm_config", None), "lora_config", None),
+    ):
+        if lora_config is None: continue
+        return getattr(lora_config, "enable_mixed_moe_lora_format", False) is True
+    return None
+pass
+
+
 def _vllm_lora_target_names(vllm_model, manager = None):
     """(full module names, bare embedding names) vLLM can bind a LoRA to, or None.
 
@@ -3883,7 +3912,8 @@ def _moe_expert_lora_refusal_reason(model, peft_config):
     patches it off.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    vllm_model = _get_vllm_lora_model(model)
+    runner = _get_vllm_model_runner(model)
+    vllm_model = _get_vllm_lora_model(model, runner)
     if vllm_model is None:
         return "the vLLM model could not be inspected, so 3D MoE LoRA support cannot be confirmed"
 
@@ -3893,8 +3923,7 @@ def _moe_expert_lora_refusal_reason(model, peft_config):
             "the 2D FusedMoEWithLoRA and drops Unsloth's stacked adapter (vllm-project/vllm#41754)"
         )
 
-    lora_config = getattr(getattr(vllm_model, "vllm_config", None), "lora_config", None)
-    if getattr(lora_config, "enable_mixed_moe_lora_format", False) is True:
+    if _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is True:
         return "enable_mixed_moe_lora_format forces vLLM's 2D expert wrapper, which cannot read a stacked adapter"
 
     if _is_bitsandbytes_quantized(model):
