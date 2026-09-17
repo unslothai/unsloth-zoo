@@ -217,8 +217,6 @@ def test_moe_spelling_is_caught_on_disk(tmp_path):
 import types
 
 import torch.nn as nn
-from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.fused_moe import MoERunner
 
 from unsloth_zoo.vllm_utils import (
     _check_lora_is_servable,
@@ -227,8 +225,24 @@ from unsloth_zoo.vllm_utils import (
     _resolve_lora_key_to_module,
     _saved_adapter_lora_keys,
     _unmatched_lora_keys,
+    _vllm_mixed_moe_lora_enabled,
     _vllm_lora_target_names,
 )
+
+# vLLM is an optional dependency: it is not in pyproject and no CPU CI lane installs it,
+# so importing it at module level made this whole file uncollectable there and took the
+# detector and saved-checkpoint tests above down with it. Skip only the tests that need a
+# real vLLM class, the way tests/test_upstream_signatures.py and friends already do.
+# `pytest.importorskip` is not usable here because it skips the ENTIRE module.
+try:
+    from vllm.model_executor.layers.linear import LinearBase
+    from vllm.model_executor.layers.fused_moe import MoERunner
+    HAS_VLLM = True
+except Exception:
+    LinearBase = MoERunner = nn.Module
+    HAS_VLLM = False
+
+requires_vllm = pytest.mark.skipif(not HAS_VLLM, reason = "vLLM is not installed")
 
 
 class _FakeLinear(LinearBase):
@@ -262,9 +276,30 @@ def _build_vllm_model(paths, is_3d_moe_weight = True, lora_config = None):
     return root
 
 
-def _fake_trainer(vllm_model, **attrs):
+def _fake_worker_lora_manager(enable_mixed_moe_lora_format = False, adapter_manager = True):
+    """`runner.lora_manager`, in the shape lora_model_runner_mixin.py builds it.
+
+    `WorkerLoRAManager.__init__` stores `vllm_config.lora_config` on itself, and
+    `create_lora_manager` hangs the `LoRAModelManager` off `_adapter_manager`, which is
+    where the resolved `_enable_mixed_moe_lora_format` lives.
+    """
+    manager = types.SimpleNamespace(
+        lora_config = types.SimpleNamespace(
+            enable_mixed_moe_lora_format = enable_mixed_moe_lora_format,
+        ),
+    )
+    if adapter_manager:
+        manager._adapter_manager = types.SimpleNamespace(
+            modules = {},
+            _enable_mixed_moe_lora_format = enable_mixed_moe_lora_format,
+        )
+    return manager
+
+
+def _fake_trainer(vllm_model, lora_manager = None, **attrs):
     """An HF-side model whose .vllm_engine reaches `vllm_model`, as load_lora expects."""
     runner = types.SimpleNamespace(model = vllm_model)
+    if lora_manager is not None: runner.lora_manager = lora_manager
     worker = types.SimpleNamespace(model_runner = runner)
     executor = types.SimpleNamespace(driver_worker = worker)
     engine = types.SimpleNamespace(model_executor = executor)
@@ -288,6 +323,7 @@ QWEN_EXPERT_KEYS = [
 ]
 
 
+@requires_vllm
 def test_target_names_include_packed_constituents():
     names, _ = _vllm_lora_target_names(_build_vllm_model(QWEN_PATHS))
     assert "model.layers.0.self_attn.qkv_proj" in names
@@ -297,6 +333,7 @@ def test_target_names_include_packed_constituents():
     assert "model.layers.0.mlp.experts" in names
 
 
+@requires_vllm
 def test_three_d_moe_expert_lora_is_allowed():
     """The whole point of narrowing: Qwen3.5/3.6 stacked expert LoRA must load."""
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS, is_3d_moe_weight = True))
@@ -304,6 +341,7 @@ def test_three_d_moe_expert_lora_is_allowed():
     _check_lora_is_servable(model, QWEN_EXPERT_KEYS, "the training model", {"r": 16})
 
 
+@requires_vllm
 def test_two_d_moe_expert_lora_is_refused():
     """Gemma 4 does not set is_3d_moe_weight, and its adapters are silently ignored."""
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS, is_3d_moe_weight = False))
@@ -313,6 +351,7 @@ def test_two_d_moe_expert_lora_is_refused():
         _check_lora_is_servable(model, QWEN_EXPERT_KEYS, "the training model", {"r": 16})
 
 
+@requires_vllm
 def test_rank_above_128_is_refused():
     """fused_moe_lora_op.py asserts rank <= 128, and max_lora_rank 256 passes config."""
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS))
@@ -322,6 +361,7 @@ def test_rank_above_128_is_refused():
     assert "128" in _moe_expert_lora_refusal_reason(model, {"r": 16, "rank_pattern": {"experts": 256}})
 
 
+@requires_vllm
 def test_bitsandbytes_is_refused():
     """vLLM does not support MoE LoRA on bnb weights, and Unsloth 4bit IS bnb."""
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS), is_loaded_in_4bit = True)
@@ -336,6 +376,7 @@ def test_bitsandbytes_is_refused():
     assert "bitsandbytes" in _moe_expert_lora_refusal_reason(quantized, {"r": 16})
 
 
+@requires_vllm
 def test_mixed_moe_lora_format_is_refused():
     """It forces the 2D wrapper, which cannot read a stacked adapter."""
     vllm_model = _build_vllm_model(
@@ -343,6 +384,44 @@ def test_mixed_moe_lora_format_is_refused():
     )
     reason = _moe_expert_lora_refusal_reason(_fake_trainer(vllm_model), {"r": 16})
     assert reason is not None and "mixed_moe_lora_format" in reason
+
+
+@requires_vllm
+def test_mixed_moe_mode_is_read_off_the_lora_manager_not_the_model():
+    """Qwen3VLMoe and InternS1Pro set is_3d_moe_weight and never assign self.vllm_config.
+
+    Reading the mode off the model therefore answered "not mixed" for exactly the two 3D
+    architectures that lack that incidental attribute, so the stacked adapter was allowed
+    into vLLM's 2D wrapper. Unsloth's LoRARequest never sets is_3d_lora_weight, so vLLM
+    then takes _slice_moe_lora_ep on a 3D adapter and the rollout silently decays to the
+    base experts. The engine's own LoRA manager always carries the config.
+    """
+    vllm_model = _build_vllm_model(QWEN_PATHS, is_3d_moe_weight = True)
+    assert not hasattr(vllm_model, "vllm_config")
+
+    model = _fake_trainer(vllm_model, lora_manager = _fake_worker_lora_manager(True))
+    assert _vllm_mixed_moe_lora_enabled(model) is True
+    reason = _moe_expert_lora_refusal_reason(model, {"r": 16})
+    assert reason is not None and "mixed_moe_lora_format" in reason
+    with pytest.raises(NotImplementedError, match = "mixed_moe_lora_format"):
+        _check_lora_is_servable(model, QWEN_EXPERT_KEYS, "the training model", {"r": 16})
+
+
+@requires_vllm
+def test_mixed_moe_mode_falls_back_to_the_worker_lora_config():
+    """Older vLLM has no _adapter_manager._enable_mixed_moe_lora_format; lora_config does."""
+    vllm_model = _build_vllm_model(QWEN_PATHS, is_3d_moe_weight = True)
+    manager = _fake_worker_lora_manager(True, adapter_manager = False)
+    assert _vllm_mixed_moe_lora_enabled(_fake_trainer(vllm_model, lora_manager = manager)) is True
+
+
+@requires_vllm
+def test_mixed_moe_mode_off_still_allows_a_stacked_adapter():
+    """The narrowing must survive the fix: a default engine still serves this adapter."""
+    vllm_model = _build_vllm_model(QWEN_PATHS, is_3d_moe_weight = True)
+    model = _fake_trainer(vllm_model, lora_manager = _fake_worker_lora_manager(False))
+    assert _vllm_mixed_moe_lora_enabled(model) is False
+    assert _moe_expert_lora_refusal_reason(model, {"r": 16}) is None
 
 
 def test_unreachable_engine_stays_conservative():
@@ -363,6 +442,7 @@ GEMMA_PATHS = {
 }
 
 
+@requires_vllm
 def test_parent_path_mismatch_is_caught_even_when_the_leaf_matches():
     model = _fake_trainer(_build_vllm_model(GEMMA_PATHS))
     # both end in "experts", so only the full name separates them
@@ -378,6 +458,7 @@ def test_parent_path_mismatch_is_caught_even_when_the_leaf_matches():
     assert matched == []
 
 
+@requires_vllm
 def test_check_raises_on_an_unresolvable_key():
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS))
     bad = "base_model.model.model.layers.0.self_attn.nonexistent_proj.lora_A.weight"
@@ -385,6 +466,7 @@ def test_check_raises_on_an_unresolvable_key():
         _check_lora_is_servable(model, [bad], "the training model", {"r": 16})
 
 
+@requires_vllm
 def test_dense_adapter_on_a_matching_engine_passes():
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS))
     _check_lora_is_servable(model, [
@@ -399,12 +481,14 @@ def test_name_check_is_skipped_when_the_engine_cannot_be_inspected():
     assert _unmatched_lora_keys(types.SimpleNamespace(), ["a.b.lora_A.weight"]) is None
 
 
+@requires_vllm
 def test_unparseable_keys_are_left_to_vllm():
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS))
     assert _unmatched_lora_keys(model, ["not_a_lora_tensor"]) == []
     assert _resolve_lora_key_to_module("not_a_lora_tensor", None) is None
 
 
+@requires_vllm
 def test_name_check_has_an_escape_hatch(monkeypatch):
     model = _fake_trainer(_build_vllm_model(QWEN_PATHS))
     bad = "base_model.model.model.layers.0.self_attn.nonexistent_proj.lora_A.weight"
@@ -443,6 +527,7 @@ WRAPPED_PATHS = {
 }
 
 
+@requires_vllm
 def test_wrapped_modules_resolve_to_the_adapter_name():
     names, _ = _vllm_lora_target_names(_build_vllm_model(WRAPPED_PATHS))
     assert "model.layers.0.self_attn.qkv_proj" in names
@@ -453,6 +538,7 @@ def test_wrapped_modules_resolve_to_the_adapter_name():
     assert _unmatched_lora_keys(model, QWEN_EXPERT_KEYS) == []
 
 
+@requires_vllm
 def test_manager_modules_are_preferred_over_the_module_walk():
     """activate_adapter walks the manager's dict, so a module vLLM declined to wrap is
     correctly absent from it even though named_modules still reports it."""
@@ -471,6 +557,7 @@ def test_manager_modules_are_preferred_over_the_module_walk():
     assert "model.layers.0.mlp.experts" not in names
 
 
+@requires_vllm
 def test_embedding_modules_are_matched_by_leaf_name():
     """lm_head is a ParallelLMHead, not a LinearBase, and the model declares it instead."""
     vllm_model = _build_vllm_model(QWEN_PATHS)
