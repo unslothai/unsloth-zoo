@@ -60,7 +60,8 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     lm_head_matrix   = model.get_output_embeddings().weight.clone()
 
     # Get untrained tokens
-    indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
@@ -235,6 +236,34 @@ def add_new_tokens(
 pass
 
 
+# datasets' own Dataset.map(batched=True) default, so both paths allocate the same size.
+_COUNT_INPUT_IDS_BATCH_SIZE = 1000
+
+
+def _count_input_ids(train_dataset, mapping):
+    """Only .map is datasets specific; a plain list of rows gets this far. A row with no
+    "input_ids" is skipped, as in the checks above."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if hasattr(train_dataset, "map"):
+        train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+        return
+    pass
+    # `mapping` flattens its batch into one array, so passing the whole dataset is an
+    # O(total tokens) transient. Chunking is exactly equivalent because it accumulates into
+    # a counter and .map(batched=True) already calls it once per batch.
+    batch = []
+    for row in train_dataset:
+        if "input_ids" not in row: continue
+        batch.append(row["input_ids"])
+        if len(batch) >= _COUNT_INPUT_IDS_BATCH_SIZE:
+            mapping({"input_ids" : batch})
+            batch = []
+        pass
+    pass
+    if batch: mapping({"input_ids" : batch})
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -264,11 +293,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix   = lm_head_matrix  [:min_size]
     
     # Get untrained tokens
-    indicator_untrained1 = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     # Check lm_head as well
 
     # Does NOT work for Llama 3.1!!
-    indicator_untrained2 = torch.amax(lm_head_matrix,   axis = 1) <= eps
+    indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
+        (torch.amin(lm_head_matrix, axis = 1) >= -eps)
 
     # We instead check for repeated vectors
     lm_head_where = torch.where(indicator_untrained1)[0]
@@ -458,7 +489,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+    _count_input_ids(train_dataset, mapping)
 
     # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
