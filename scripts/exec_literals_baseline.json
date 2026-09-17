@@ -379,7 +379,7 @@
     {
       "file": "unsloth_zoo/temporary_patches/misc.py",
       "sink": "exec",
-      "digest": "13fce184fe981cb2",
+      "digest": "4fa12b50b62060cd",
       "count": 1,
       "reason": "Re-imports a fixed set of transformers quantizer names, filtered against the installed source, plus source this file generated."
     },
