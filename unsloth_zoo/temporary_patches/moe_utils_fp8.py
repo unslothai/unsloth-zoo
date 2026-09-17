@@ -493,12 +493,17 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
     input_dtype = hidden_states.dtype
     hidden_states = hidden_states.view(-1, hidden_dim)
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    from .moe_utils import count_tokens_per_expert
+    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
     sorted_indices = torch.argsort(flat_top_k, stable=True)
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    from .moe_utils import _should_use_separated_lora
+    from .moe_utils import (
+        _should_use_separated_lora,
+        combine_permuted_moe_outputs,
+        take_moe_lora_stash,
+    )
     use_separated_lora = _should_use_separated_lora()
     model_type = getattr(self, "_unsloth_model_type", None)
 
@@ -521,7 +526,7 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         use_fast_accum=True,
     )
 
-    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None) if use_separated_lora else None
+    gate_up_lora = take_moe_lora_stash(self, "gate_up_proj") if use_separated_lora else None
     gate_up_delta = _moe_separated_lora_delta(gate_up_lora, permuted_input, offsets, mm1_out.dtype)
     if gate_up_delta is not None:
         mm1_out = mm1_out + gate_up_delta
@@ -552,7 +557,7 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         use_fast_accum=True,
     )
 
-    down_lora = getattr(self, "_unsloth_lora_down_proj", None) if use_separated_lora else None
+    down_lora = take_moe_lora_stash(self, "down_proj") if use_separated_lora else None
     down_delta = _moe_separated_lora_delta(down_lora, inter, offsets, mm2_out.dtype)
     if down_delta is not None:
         mm2_out = mm2_out + down_delta
@@ -563,12 +568,15 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
     flat_weights = top_k_weights.view(-1)
     permuted_weights = flat_weights[sorted_indices]
     mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=input_dtype,
-        device=hidden_states.device,
+    # Same duplicate-index atomicAdd reduction as the bf16/native path; see
+    # combine_permuted_moe_outputs for why this is not an index_add_.
+    final_hidden_states = combine_permuted_moe_outputs(
+        mm2_out,
+        sorted_indices,
+        batch_size * sequence_length,
+        top_k_index.shape[-1],
+        out_dtype = input_dtype,
     )
-    final_hidden_states.index_add_(0, token_indices, mm2_out.to(input_dtype))
     if is_2d_input:
         return final_hidden_states
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
@@ -634,10 +642,13 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     # attributes that `patch_param_wrapper_for_moe` injects, so reaching this
     # path while LoRA is active would silently train without the adapter.
     # Refuse rather than corrupt: the user can disable LoRA or fix the
-    # missing kernel before retrying.
+    # missing kernel before retrying. The reads are recorded so the refusal stays in charge:
+    # `_patched_param_wrapper_forward` must not reroute a quantized parameter through PEFT
+    # on the grounds that this path ignored the stash.
+    from .moe_utils import take_moe_lora_stash
     if (
-        getattr(self, "_unsloth_lora_gate_up_proj", None) is not None
-        or getattr(self, "_unsloth_lora_down_proj", None) is not None
+        take_moe_lora_stash(self, "gate_up_proj") is not None
+        or take_moe_lora_stash(self, "down_proj") is not None
     ):
         raise RuntimeError(
             "Unsloth: MoE FP8 fell through to the per-expert fp8_linear "

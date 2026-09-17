@@ -359,9 +359,15 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
     vlm_pkg.gated_delta = vlm_gd
     vlm_pkg.language = fake_mlx_lm.consumers["mlx_vlm.models.qwen3_5.language"]
     vlm_pkg.language.gated_delta_update = vlm_original
+    # The speculative verifier from-imports the same function; qwen4_exp reuses both.
+    verifier = types.ModuleType("mlx_vlm.models.qwen3_5.speculative_verifier")
+    verifier.gated_delta_update = vlm_original
     monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5", vlm_pkg)
     monkeypatch.setitem(
         sys.modules, "mlx_vlm.models.qwen3_5.gated_delta", vlm_gd,
+    )
+    monkeypatch.setitem(
+        sys.modules, "mlx_vlm.models.qwen3_5.speculative_verifier", verifier,
     )
 
     from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm
@@ -370,6 +376,7 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
     patched = vlm_gd.gated_delta_update
     assert patched is not vlm_original
     assert vlm_pkg.language.gated_delta_update is patched
+    assert verifier.gated_delta_update is patched
     assert vlm_gd._unsloth_gated_delta_patched
 
     # Inference (state provided) delegates to the original implementation.
@@ -378,6 +385,42 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
 
     # The sweep recognizes the sibling patch instead of warning "foreign".
     _patch()
+    assert vlm_pkg.language.gated_delta_update is patched
+
+
+def test_vlm_patch_rebinds_language_holding_a_stale_copy(fake_mlx_lm, monkeypatch):
+    """`language` from-imports the function at import time, so a later reload of
+    .gated_delta leaves it holding a different object than the one being replaced.
+    The identity sweep cannot see that; the patch must bind `language` by name or
+    qwen3_5 trains without the memory-efficient VJP."""
+    def _update(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True):
+        return "y", state
+
+    # Same source, distinct objects: exactly what importlib.reload produces.
+    stale = types.FunctionType(
+        _update.__code__, _update.__globals__, "gated_delta_update",
+        _update.__defaults__, _update.__closure__,
+    )
+    current = types.FunctionType(
+        _update.__code__, _update.__globals__, "gated_delta_update",
+        _update.__defaults__, _update.__closure__,
+    )
+    assert stale is not current
+
+    vlm_gd = types.ModuleType("mlx_vlm.models.qwen3_5.gated_delta")
+    vlm_gd.gated_delta_update = current
+    vlm_pkg = types.ModuleType("mlx_vlm.models.qwen3_5")
+    vlm_pkg.gated_delta = vlm_gd
+    vlm_pkg.language = fake_mlx_lm.consumers["mlx_vlm.models.qwen3_5.language"]
+    vlm_pkg.language.gated_delta_update = stale
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5", vlm_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.gated_delta", vlm_gd)
+
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm
+    patch_gated_delta_vlm()
+
+    patched = vlm_gd.gated_delta_update
+    assert patched is not current
     assert vlm_pkg.language.gated_delta_update is patched
 
 
@@ -755,6 +798,182 @@ def test_shared_patch_rebinds_consumers_and_forwards_lower_bound(shared_name, mo
     assert seen["bound"] == -5.0
 
 
+# mlx-vlm 0.7.1 gave the cache ownership of recurrent state: `gated_delta_update`
+# grew `cache`, `cache_index` and `state_steps`, and qwen3_5 / glm5_next pass
+# `cache=` on every call, cached or not. These pin the wrapper's half of that
+# contract without an installed mlx-vlm.
+def _cache_aware_upstream(seen):
+    def upstream(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
+                 use_kernel=True, lower_bound=None, state_steps=None,
+                 cache=None, cache_index=1):
+        seen.append({"state": state, "lower_bound": lower_bound,
+                     "state_steps": state_steps, "cache": cache,
+                     "cache_index": cache_index})
+        if state_steps is not None:
+            return "cached", state, "history"
+        return "cached", state
+    return upstream
+
+
+def _install_shared(monkeypatch, upstream):
+    shared = types.ModuleType("mlx_vlm.models.gated_delta")
+    models_pkg = types.ModuleType("mlx_vlm.models")
+    shared.gated_delta_update = upstream
+    shared.compute_g = lambda A_log, a, dt_bias: mx.zeros((1, 4, 2))
+    models_pkg.gated_delta = shared
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models", models_pkg)
+    monkeypatch.delitem(
+        sys.modules, "mlx_vlm.models.text_models.gated_delta", raising=False,
+    )
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.gated_delta", shared)
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm_shared
+    patch_gated_delta_vlm_shared()
+    return shared.gated_delta_update
+
+
+def _install_qwen35(monkeypatch, upstream, fake_mlx_lm):
+    vlm_gd = types.ModuleType("mlx_vlm.models.qwen3_5.gated_delta")
+    vlm_gd.gated_delta_update = upstream
+    vlm_pkg = types.ModuleType("mlx_vlm.models.qwen3_5")
+    vlm_pkg.gated_delta = vlm_gd
+    vlm_pkg.language = fake_mlx_lm.consumers["mlx_vlm.models.qwen3_5.language"]
+    vlm_pkg.language.gated_delta_update = upstream
+    fake_mlx_lm.gated_delta.compute_g = lambda A_log, a, dt_bias: mx.zeros((1, 4, 2))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5", vlm_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen3_5.gated_delta", vlm_gd)
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta_vlm
+    patch_gated_delta_vlm()
+    return vlm_gd.gated_delta_update
+
+
+# Both wrappers grew the same keyword-drift tolerance, so both must prove it: the
+# qwen3_5 copy is where the 0.7.1 `cache=` TypeError actually fired.
+@pytest.fixture(params=["shared", "qwen3_5"])
+def install_vlm_patch(request, monkeypatch, fake_mlx_lm):
+    if request.param == "shared":
+        return lambda upstream: _install_shared(monkeypatch, upstream)
+    return lambda upstream: _install_qwen35(monkeypatch, upstream, fake_mlx_lm)
+
+
+def test_cache_owned_calls_delegate_with_their_keywords_intact(
+    install_vlm_patch, monkeypatch,
+):
+    """A cache owns the recurrent state and the retained history, so neither
+    shape is a training call however wide the window is open. Forward the
+    keywords verbatim and preserve upstream's variable return arity."""
+    seen = []
+    patched = install_vlm_patch(_cache_aware_upstream(seen))
+
+    acquire_mlx_training_patches()
+    try:
+        assert patched(*[object()] * 7, use_kernel=False,
+                       cache="prompt-cache", cache_index=3) == ("cached", None)
+        assert seen[-1]["cache"] == "prompt-cache"
+        assert seen[-1]["cache_index"] == 3
+
+        # `state_steps` asks for per-step states; upstream answers with a triple.
+        # No `state`, so only the history rule can be what delegates this.
+        assert patched(*[object()] * 7, use_kernel=False,
+                       state_steps=2) == ("cached", None, "history")
+        assert seen[-1]["state_steps"] == 2
+    finally:
+        release_mlx_training_patches()
+
+    # An explicit `cache=None` is what every 0.7.1 call site passes when training,
+    # and it must still reach the memory-efficient VJP.
+    import unsloth_zoo.gated_delta_vjp as gv
+    monkeypatch.setattr(gv, "gated_delta_kernel_supported", lambda *a: False)
+    monkeypatch.setattr(gv, "gated_delta_ops_efficient", lambda *a: "vjp")
+    z = mx.zeros((1, 4, 2, 8))
+    before = len(seen)
+    assert patched(*[z] * 7, use_kernel=False, cache=None,
+                   state_steps=None, cache_index=1) == "vjp"
+    assert len(seen) == before, "a cache-free training call was delegated"
+
+
+def test_unrecognized_keyword_delegates_instead_of_being_dropped(
+    install_vlm_patch, monkeypatch, capsys,
+):
+    """The training branch recomputes the gate from its own inputs, so a keyword
+    it does not understand would be silently lost rather than raise. Delegate."""
+    seen = []
+
+    def upstream(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
+                 use_kernel=True, **kw):
+        seen.append(kw)
+        return "cached", state
+
+    import unsloth_zoo.gated_delta_vjp as gv
+    monkeypatch.setattr(gv, "_WARNED_UNKNOWN_GATED_DELTA_KWARGS", set())
+    patched = install_vlm_patch(upstream)
+    monkeypatch.setattr(gv, "gated_delta_ops_efficient",
+                        lambda *a: pytest.fail("unknown keyword was dropped"))
+    monkeypatch.setattr(gv, "gated_delta_kernel_efficient",
+                        lambda *a: pytest.fail("unknown keyword was dropped"))
+
+    z = mx.zeros((1, 4, 2, 8))
+    acquire_mlx_training_patches()
+    try:
+        assert patched(*[z] * 7, use_kernel=False, decay_floor=0.5) == ("cached", None)
+        assert seen[-1] == {"decay_floor": 0.5}
+        assert "decay_floor" in capsys.readouterr().out
+        # The warning names a keyword, not a call: it must not repeat per step.
+        assert patched(*[z] * 7, use_kernel=False, decay_floor=0.5)
+        assert "decay_floor" not in capsys.readouterr().out
+    finally:
+        release_mlx_training_patches()
+
+
+def test_pre_0_6_9_upstream_is_never_handed_a_keyword_it_lacks(monkeypatch):
+    """Backward compatibility: older mlx-vlm has none of these parameters, and
+    the wrapper must not invent one to pass along."""
+    seen = []
+
+    def old_upstream(q, k, v, a, b, A_log, dt_bias,
+                     state=None, mask=None, use_kernel=True):
+        seen.append((state, mask, use_kernel))
+        return "cached", state
+
+    patched = _install_shared(monkeypatch, old_upstream)
+    assert patched(*[object()] * 7, state="kv") == ("cached", "kv")
+    assert seen[-1] == ("kv", None, True)
+
+
+@requires_real_mlx
+def test_patched_wrappers_accept_every_keyword_the_installed_mlx_vlm_declares():
+    """Upstream adds keywords faster than this patch is revised -- 0.6.9 added
+    `lower_bound`, 0.7.1 added three more -- and each addition reached a training
+    step as a TypeError. Fail here instead, where the answer is a decision about
+    whether the training branch can honour the new parameter."""
+    pytest.importorskip("mlx_vlm")
+    import inspect
+
+    handled = {"state", "mask", "use_kernel", "lower_bound",
+               "cache", "cache_index", "state_steps"}
+    checked = []
+    for name in ("mlx_vlm.models.gated_delta",
+                 "mlx_vlm.models.qwen3_5.gated_delta"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        checked.append(name)
+        # A sibling test may already have patched this module in-process, and the
+        # wrapper's own signature hides every upstream keyword behind **kwargs.
+        upstream = getattr(module, "_unsloth_gated_delta_original",
+                           module.gated_delta_update)
+        optional = {
+            parameter
+            for parameter, spec in
+            inspect.signature(upstream).parameters.items()
+            if spec.default is not inspect.Parameter.empty
+        }
+        assert optional <= handled, (
+            f"{name}.gated_delta_update grew {sorted(optional - handled)}; decide "
+            "whether the training branch can honour it, then add it to `handled`"
+        )
+    assert checked, "no mlx-vlm gated-delta module was available to pin"
+
 
 class _FakeModel:
     def __init__(self, *modules):
@@ -829,10 +1048,18 @@ def test_unfused_projection_matches_the_fused_one():
     from mlx_vlm.models.glm5_next.config import TextConfig
     from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
 
+    import inspect
+
+    if "_fused_ready" not in inspect.getsource(Glm5NextLinearAttention):
+        # mlx-vlm 0.7.1 projects q, k and v through one weight, so there is no
+        # concatenated copy to disable and `_disable_fused_input_projections` finds nothing.
+        pytest.skip("mlx-vlm does not cache fused input projections")
+
     config = TextConfig(
         model_type="glm5_next_text", vocab_size=64, hidden_size=64, intermediate_size=128,
         moe_intermediate_size=64, num_hidden_layers=1, num_attention_heads=4,
-        num_key_value_heads=4, n_shared_experts=1, n_routed_experts=4, index_topk=8,
+        # index_topk has to stay a multiple of the default index_kpool
+        num_key_value_heads=4, n_shared_experts=1, n_routed_experts=4, index_topk=16,
         routed_scaling_factor=1.0, kv_lora_rank=16, q_lora_rank=32, qk_rope_head_dim=0,
         v_head_dim=32, qk_nope_head_dim=32, num_experts_per_tok=2, index_n_heads=2,
         first_k_dense_replace=0, max_position_embeddings=256, rms_norm_eps=1e-5,

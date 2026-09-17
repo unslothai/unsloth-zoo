@@ -1090,11 +1090,12 @@ class GptOssExpertsBnb4bit(nn.Module):
             sorted_idx = flat_experts.argsort(stable=True)
             sorted_tokens = token_ids[sorted_idx]
             sorted_experts = flat_experts[sorted_idx]
-            counts = torch.bincount(flat_experts, minlength=num_experts)
+            from unsloth_zoo.temporary_patches.moe_utils import count_tokens_per_expert
+            counts = count_tokens_per_expert(flat_experts, num_experts, torch.int64)
             offsets = counts.cumsum(0, dtype=torch.int32)
-            expert_ids = torch.repeat_interleave(
-                torch.arange(num_experts, device=device), counts
-            )
+            # repeat_interleave(arange(E), counts) D2H-syncs for its output size, and
+            # is by construction sorted_experts already.
+            expert_ids = sorted_experts
 
         recompute = _moe_recompute_default()
 
@@ -1191,6 +1192,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                 sorted_idx = flat_experts.argsort(stable=True)
                 sorted_tokens = token_ids[sorted_idx]
                 
+                # bincount on purpose: the .tolist() below already syncs.
                 counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
             
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
@@ -1942,9 +1944,10 @@ def forward_mxfp4_gpt_oss_with_lora(
 
                 # Offsets = cumsum of per-expert token counts
                 expert_ids = routing_data.exp_indx
-                num_tokens_per_expert = torch.bincount(
-                    expert_ids.int(), minlength=num_experts
-                ).int()
+                from .moe_utils import count_tokens_per_expert
+                num_tokens_per_expert = count_tokens_per_expert(
+                    expert_ids, num_experts, torch.int32
+                )
                 offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
                 lora_delta = _apply_lora_grouped_mm(
@@ -1981,9 +1984,10 @@ def forward_mxfp4_gpt_oss_with_lora(
                 lora_A, lora_B, scaling, num_experts = lora_data
 
                 expert_ids = routing_data.exp_indx
-                num_tokens_per_expert = torch.bincount(
-                    expert_ids.int(), minlength=num_experts
-                ).int()
+                from .moe_utils import count_tokens_per_expert
+                num_tokens_per_expert = count_tokens_per_expert(
+                    expert_ids, num_experts, torch.int32
+                )
                 offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
 
                 lora_delta = _apply_lora_grouped_mm(
@@ -2137,6 +2141,7 @@ def torch_native_forward(
             sorted_idx = flat_experts.argsort(stable=True)
             sorted_tokens = token_ids[sorted_idx]
             
+            # bincount on purpose: the .tolist() below already syncs.
             counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
         
         next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
