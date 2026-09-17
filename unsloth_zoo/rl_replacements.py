@@ -1165,6 +1165,15 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             return False
         if _first_dim_len(value) != total_images:
             return False
+        if total_images != total_samples:
+            # The length has already settled it. Rank can only add anything inside the region
+            # where the image axis and the sample axis are the same length; outside it a
+            # genuinely flattened tensor is free to outrank flat_ndim, and LLaVA-NeXT and
+            # LLaVA-OneVision do exactly that -- they pad on the PATCH axis and store
+            # [n_images, max_patches, C, H, W], one row per image with a rank of 5. Applying
+            # the rank test there sent each sample the rows of whichever sample shares its
+            # index, and dropped the surplus images entirely.
+            return True
         ndim = getattr(value, "ndim", None)
         if isinstance(ndim, int) and ndim > flat_ndim:
             return False
