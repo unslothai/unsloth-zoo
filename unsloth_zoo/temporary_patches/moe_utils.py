@@ -907,13 +907,35 @@ def unflatten_moe_lora_b(
     The single place the expert axis of a fused `lora_B` is resolved, so the forward, the
     merge and any converter cannot drift apart. Both layouts end in `.contiguous()` on a
     permuted view, so neither is cheaper than the other and the choice is purely one of
-    which convention the stored tensor was written in."""
+    which convention the stored tensor was written in.
+
+    The rank-major branch regroups the columns with `index_select` before it views them,
+    rather than permuting the expert axis out of a three-way view. The two spell the same
+    tensor, but only the first survives `torch.compile`. Under rank-major packing the
+    expert axis has stride 1 in `weight_B`, so every view that puts experts first leaves
+    BOTH remaining axes with a stride above 1, and `aten._grouped_mm` rejects a `mat_b`
+    that is neither row nor column major. Eager is fine because `.contiguous()` really
+    copies; Inductor folds the whole view chain into one strided read of `weight_B` and
+    picks the source layout, so the copy disappears and the consumer sees
+    `(1, num_experts, num_experts * rank)` and raises `Invalid strides/sizes`. Measured on
+    `gemma-4-26B-A4B-it` (E=128, rank=8, out=1408) and reproduced standalone; the
+    pre-existing grouped-by-expert spelling escaped only because eliding ITS copy happens
+    to leave a legal column-major operand. `index_select` is a real gather that Inductor
+    cannot fold into a view, it keeps the gradient flowing to `lora_B`, and its indices are
+    a permutation, so its `index_add` backward has no duplicate targets to reduce
+    nondeterministically."""
     if layout is None:
         layout = moe_lora_b_layout()
     if layout == LORA_B_LAYOUT_RANK_MAJOR:
-        # PEFT: reshape(out, rank, num_experts), expert index fastest.
-        return weight_B.reshape(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
-    # Pre-fix Unsloth: view(out, num_experts, rank), expert index slowest.
+        # PEFT packs expert index fastest: column j holds expert `j % num_experts`.
+        # Gather the columns into expert-major order, then read them the same way the
+        # grouped-by-expert branch below reads its own.
+        columns = torch.arange(
+            num_experts * rank_per_expert, device = weight_B.device,
+        ).view(rank_per_expert, num_experts).t().reshape(-1)
+        weight_B = weight_B.index_select(1, columns)
+    # Expert index slowest, either because it always was or because the gather above just
+    # made it so.
     return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
 
 
