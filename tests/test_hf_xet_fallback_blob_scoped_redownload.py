@@ -1279,3 +1279,70 @@ def test_the_release_after_the_scoped_clear_asks_the_confirmation_probe():
     assert "not has_active_incomplete_blobs(" not in block, (
         "the release went back to the probe that answers False for an unreadable cache"
     )
+
+
+def test_a_sibling_that_reopened_our_partials_name_is_not_unlinked(monkeypatch, tmp_path):
+    """The older hub writes the deterministic `<etag>.incomplete`, so once the first purge has
+    removed our killed child's file a sibling waiting on the blob lock can recreate and open
+    exactly that name. The captured basename then names someone else's open download."""
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    reopened = tmp_path / REPO_DIR / "blobs" / mine
+    monkeypatch.setattr(
+        xf, "_partial_paths_with_a_live_writer",
+        lambda: {xf._normalized_partial_key(reopened)},
+    )
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {mine},
+    )
+    assert reopened.exists(), "a sibling's open download was unlinked on a name we used to own"
+    assert mine in survivors, "and the survivor has to keep forcing"
+
+
+def test_our_own_partial_still_goes_when_nobody_holds_it(monkeypatch, tmp_path):
+    """The other half of the same guard: #9094 is this deletion, and it must still happen."""
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {mine},
+    )
+    assert survivors == set()
+    assert not (tmp_path / REPO_DIR / "blobs" / mine).exists()
+
+
+def test_a_partner_scan_that_could_not_read_the_blobs_dir_spares_the_link(monkeypatch, tmp_path):
+    """`_partial_partners_of` swallowing the error answered "no partner", which lists the
+    dangling link as an orphan and deletes the record of a blob a sibling is finishing. A link
+    under an older revision is not recreated by the current retry, so the finished blob would
+    be unreachable from that revision."""
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    snapshot = tmp_path / REPO_DIR / "snapshots" / REV
+    orphan = snapshot / "orphan.safetensors"
+    orphan.symlink_to(tmp_path / REPO_DIR / "blobs" / "deadbeef")
+
+    class _DeniedStat:
+        """Only this module's `os` lookups, and only `stat`: patching the real os.stat breaks
+        pytest's own reporting, which stats the files it is about to read back."""
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def stat(self, path, *_a, **_k):
+            if str(path).endswith(xf.INCOMPLETE_SUFFIX):
+                raise PermissionError(13, "denied")
+            return os.stat(path)
+
+    monkeypatch.setattr(xf, "os", _DeniedStat())
+    assert xf._partial_partners_of(tmp_path / REPO_DIR / "blobs" / "deadbeef") is None
+    assert xf._broken_link_has_active_partner(orphan, active_grace = 180.0) is True
+
+
+def test_a_partner_that_is_honestly_absent_is_still_absent(monkeypatch, tmp_path):
+    """Absence and unreadability are different answers; only the second one spares."""
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    assert xf._partial_partners_of(tmp_path / REPO_DIR / "blobs" / "deadbeef") == []

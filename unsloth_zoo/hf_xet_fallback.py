@@ -447,7 +447,7 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
-def _partial_partners_of(target: Path) -> "list":
+def _partial_partners_of(target: Path) -> "Optional[list]":
     """Every ``*.incomplete`` file that names *target*, in BOTH spellings hub has used.
 
     The blob-cache path wrote `<etag>.incomplete` (`file_download.py`, `blob_path +
@@ -461,10 +461,17 @@ def _partial_partners_of(target: Path) -> "list":
     partners = []
     exact = target.with_name(target.name + INCOMPLETE_SUFFIX)
     try:
-        if exact.is_file():
+        if stat.S_ISREG(os.stat(exact).st_mode):
             partners.append(exact)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         pass
+    except OSError:
+        # Not absence: a permission or FUSE flap on the blobs directory. Swallowing it
+        # answered "no partner", which is the answer that lists a dangling link as an orphan
+        # and deletes the record of a blob a sibling is writing right now. A link under an
+        # older revision is not recreated by the current retry, so the finished blob would be
+        # unreachable from that revision. Unknown propagates instead.
+        return None
     try:
         partners += [
             candidate
@@ -472,7 +479,7 @@ def _partial_partners_of(target: Path) -> "list":
             if candidate.is_file()
         ]
     except OSError:
-        pass
+        return None
     return partners
 
 
@@ -487,7 +494,11 @@ def _broken_link_has_active_partner(link: Path, *, active_grace: float) -> bool:
             target = link.parent / target
         # Either spelling, and the freshest of them: a sibling on the current hub writes
         # `<etag>.<nonce>.incomplete`, which the exact name alone never saw.
-        for partner in _partial_partners_of(target):
+        partners = _partial_partners_of(target)
+        if partners is None:
+            # Could not look. "No partner is writing this" is the answer that clears the link.
+            return True
+        for partner in partners:
             try:
                 if time.time() - partner.stat().st_mtime < active_grace:
                     return True
@@ -534,6 +545,7 @@ def _clear_partials(
     active_grace: float = DEFAULT_STALL_TIMEOUT,
     owned_incomplete_blobs: Optional[set] = None,
     ownership_is_an_earlier_scan: bool = False,
+    owned_names_may_be_reopened: bool = False,
 ) -> None:
     """Delete the repo's active ``*.incomplete`` blobs and the broken snapshot symlinks the detector
     counts as active (else the next attempt inherits stale state and re-trips).
@@ -552,13 +564,25 @@ def _clear_partials(
     that file in between and the whitelist would then unlink an active download. With this set,
     both guards are re-applied against fresh readings taken here, at the unlink.
 
+    *owned_names_may_be_reopened* is the weaker cousin, for a whitelist that IS our own dead
+    child's but has outlived a purge. The older hub writes the deterministic
+    `<etag>.incomplete`, so a sibling waiting on the blob lock can recreate and open exactly
+    that name once the earlier purge removed our file, and the basename alone no longer says
+    whose it is. Ownership still exempts the blob from the age guard -- our own child's
+    partial is only seconds old, which is the whole of #9094 -- but a LIVE WRITER on it now
+    spares it, since our child is dead and cannot be that writer. A writer table that cannot
+    be read leaves the purge as it was: ownership is separate evidence, and declining there
+    would hand every host whose processes cannot be enumerated the repo-wide force this exists
+    to avoid.
+
     Both retry directions need exactly this, for different reasons -- see the two wrappers below.
     """
     # Once per call rather than per blob: `process_iter` walks the whole host. Taken here so it
     # describes the moment of the deletion rather than the moment of the eligibility scan.
     rescanned_writers = None
-    if ownership_is_an_earlier_scan:
+    if ownership_is_an_earlier_scan or owned_names_may_be_reopened:
         rescanned_writers = _partial_paths_with_a_live_writer()
+    if ownership_is_an_earlier_scan:
         # The SAME gate the eligibility scan applies, re-applied to this reading: a walk that
         # could not inspect every process is a lower bound, so "no writer holds this" is not a
         # fact -- and on a cache another UID can write into, the process it could not read is
@@ -599,6 +623,17 @@ def _clear_partials(
                                 # A writer appeared between the scan and here, or the table
                                 # could not be read at all. Either way this is no longer a
                                 # partial nobody is writing, which is the whole claim.
+                                continue
+                            if (
+                                owned
+                                and owned_names_may_be_reopened
+                                and rescanned_writers is not None
+                                and _normalized_partial_key(blob) in rescanned_writers
+                            ):
+                                # Our child is dead, so a writer holding this name now is a
+                                # sibling that recreated the deterministic partial after the
+                                # earlier purge, and unlinking it would delete an open
+                                # download.
                                 continue
                             blob.unlink()
                         except OSError:
@@ -1250,7 +1285,10 @@ def _orphan_snapshot_links_safe_to_clear(
                         if not link.is_symlink() or link.exists():
                             continue
                         target = Path(os.path.realpath(link))
-                        if _partial_partners_of(target):
+                        partners = _partial_partners_of(target)
+                        # None is "could not read", which is not the same as "no partner" and
+                        # must not license the deletion.
+                        if partners is None or partners:
                             continue
                     except OSError:
                         continue
@@ -1283,7 +1321,8 @@ def _clear_orphan_snapshot_links(
             if not link.is_symlink() or link.exists():
                 continue
             target = Path(os.path.realpath(link))
-            if _partial_partners_of(target):
+            partners = _partial_partners_of(target)
+            if partners is None or partners:
                 continue
             link.unlink()
         except OSError:
@@ -1314,6 +1353,15 @@ def _clear_unsafe_partials_for_http(
         _clear_partials(
             repo_type, repo_id, cache_dir = cache_dir, active_grace = active_grace,
             owned_incomplete_blobs = owned_incomplete_blobs,
+            # These names were captured before `_default_prepare_for_http` ran, and on the
+            # older hub the partial is `<etag>.incomplete` -- a deterministic name that a
+            # sibling waiting on the blob lock recreates and opens as soon as that purge has
+            # removed our killed child's file. So the basename alone is no longer proof of
+            # ownership here, and a live writer on it spares it. Not the full earlier-scan
+            # treatment: the age guard would spare our own seconds-old partial, which is
+            # #9094 itself, and declining on an unreadable writer table would do the same on
+            # every host whose processes cannot be enumerated.
+            owned_names_may_be_reopened = True,
         )
     clearable = _unowned_partials_safe_to_clear(
         repo_type, repo_id, cache_dir, active_grace, owned_incomplete_blobs,
