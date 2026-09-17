@@ -685,3 +685,36 @@ def test_a_flattened_image_tensor_is_still_sliced_by_image():
     assert torch.equal(chunks[0]["pixel_values"], flat[0:2])
     assert chunks[1]["pixel_values"].shape[0] == 0
     assert torch.equal(chunks[0]["image_sizes"], sizes[0:2])
+
+
+def test_a_patch_padded_image_tensor_outranks_the_flat_form_and_is_still_sliced_by_image():
+    """LLaVA-NeXT and LLaVA-OneVision pad on the PATCH axis, not the sample axis, so their
+    flattened pixel_values is [n_images, max_patches, C, H, W] -- one row per image, rank 5.
+
+    The rank test exists to tell a padded SAMPLE axis from a flat image axis, and those two
+    are only confusable while the image count equals the sample count. Here three images span
+    two samples, so the length already decides it, and applying the rank test anyway gave the
+    first sample one of its two images, gave the second the image belonging to the first, and
+    never forwarded the third at all.
+    """
+    # Row i is filled with i, so a row landing on the wrong sample is visible rather than inferred.
+    flat = torch.stack([torch.full((5, 3, 2, 2), float(image)) for image in range(3)])
+    sizes = torch.stack([torch.full((2,), float(image)) for image in range(3)])
+    chunks = grpo_vision_chunks(
+        {
+            "pixel_values": flat,
+            "image_sizes": sizes,
+            "num_images": [2, 1],
+        },
+        2,
+        1,
+    )
+    assert len(chunks) == 2
+    assert [chunk["pixel_values"].flatten().unique().tolist() for chunk in chunks] == [
+        [0.0, 1.0],
+        [2.0],
+    ]
+    assert torch.equal(chunks[0]["pixel_values"], flat[0:2])
+    assert torch.equal(chunks[1]["pixel_values"], flat[2:3])
+    assert torch.equal(chunks[0]["image_sizes"], sizes[0:2])
+    assert torch.equal(chunks[1]["image_sizes"], sizes[2:3])
