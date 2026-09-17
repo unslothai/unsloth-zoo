@@ -29,6 +29,7 @@ network, no model and no llama.cpp build.
 
 import importlib.util
 import os
+import pathlib
 import sys
 from pathlib import Path
 
@@ -919,7 +920,15 @@ class _FakeModel:
 
 
 def _two_shard_readers(llama_cpp, tmp_path, second_shape):
-    """A two shard set holding one block each, the second sized by the caller."""
+    """A two shard set holding one block each, the second sized by the caller.
+
+    Give a test that builds two sets its own directory for the second. The readers
+    returned here hold the files open through a memmap, and Windows refuses to
+    rewrite a mapped file: building a second set over the same names raises
+    `OSError: [Errno 22] Invalid argument` there while POSIX allows it.
+    """
+    tmp_path = pathlib.Path(tmp_path)
+    tmp_path.mkdir(parents = True, exist_ok = True)
     shapes = {
         "model.layers.0.self_attn.q_proj.weight": (4, 4),
         "model.layers.1.self_attn.q_proj.weight": (4, 4),
@@ -969,8 +978,9 @@ def test_an_unreadable_later_shard_does_not_break_the_shape_pass(llama_cpp, tmp_
     assert llama_cpp._gguf_shape_problems(model, readers, sample_size = 8) == []
 
     # And with only the unreadable one left there is nothing to compare against, rather
-    # than an exception out of `reader.tensors` on None.
-    model, readers = _two_shard_readers(llama_cpp, tmp_path, (2, 2))
+    # than an exception out of `reader.tensors` on None. Its own directory: the readers
+    # above still hold the first set mapped.
+    model, readers = _two_shard_readers(llama_cpp, tmp_path / "second", (2, 2))
     assert llama_cpp._gguf_shape_problems(
         model, [(readers[0][0], None)], sample_size = 8,
     ) == []
