@@ -19,6 +19,7 @@ from .utils import Version
 import os
 import math
 import functools
+from collections.abc import Mapping
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
@@ -36,6 +37,63 @@ else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
 pass
 
+# unsloth #2491: triton 3.3.0 and 3.3.1 cannot lower cut_cross_entropy's
+# `_cce_lse_forward_kernel` for compute capability 7.5 (T4, RTX 2080 Ti). The TritonGPU to
+# LLVM pass gives up on a `tt.fp_to_fp` and aborts the process:
+#     error: Unsupported conversion from f16 to f16
+#     LLVM ERROR: Unsupported rounding mode for conversion.
+# (triton-lang/triton#6698, closed 2025-07-22.) The range is measured: the kernel was
+# compiled ahead of time for cuda:75 on every release from 3.1.0 to 3.8.0 and only these
+# two abort, for every block size, dot precision and accumulator dtype tried, while the
+# sm_80 control compiles on all of them.
+#
+# Not expressible as a floor: torch pins triton exactly and the oldest supported torch,
+# 2.6.0, requires `triton==3.2.0`.
+_TRITON_CCE_BROKEN_ON_SM75 = ("3.3.0", "3.4.0")
+
+
+def _triton_miscompiles_cce_on_sm75(major, minor, version = triton_version):
+    if (major, minor) != (7, 5):
+        return False
+    low, high = _TRITON_CCE_BROKEN_ON_SM75
+    try:
+        installed = Version(version)
+    except Exception:
+        # An unparseable version is not evidence of a defect.
+        return False
+    return Version(low) <= installed < Version(high)
+pass
+
+
+def _triton_miscompiles_cce_on_any_visible_device():
+    """Every visible CUDA device this triton would miscompile the CCE kernel for, as
+    [(index, major, minor), ...].
+
+    Asked of all of them because `torch.cuda.get_device_capability()` with no argument
+    describes the CURRENT device, while a `device_map` can place `lm_head` anywhere. On a
+    heterogeneous host that turns the import-time reading into a guess about the wrong GPU,
+    and the consequence of guessing wrong is not a slow path: the kernel aborts the process
+    with `LLVM ERROR: Unsupported rounding mode for conversion`, which nothing can catch.
+    A host with no affected device is unchanged, since the list is then empty.
+    """
+    affected = []
+    try:
+        count = torch.cuda.device_count()
+    except Exception:
+        return affected
+    for index in range(count):
+        try:
+            device_major, device_minor = torch.cuda.get_device_capability(index)
+        except Exception:
+            continue
+        # `triton_version` passed rather than left to the default, which binds at
+        # definition time and so cannot be substituted by a caller or a test.
+        if _triton_miscompiles_cce_on_sm75(device_major, device_minor, triton_version):
+            affected.append((index, device_major, device_minor))
+    return affected
+pass
+
+
 if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     # UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE "cuda" on driverless hosts, so ask
     # whether a device is present before asking what it can do. Cut cross
@@ -44,9 +102,14 @@ if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
+    # Every VISIBLE device, not just the current one: a device_map can place lm_head on
+    # another GPU, so the kernel can run on an sm_75 while device 0 is an sm_80. The
+    # failure aborts the process rather than raising, so be conservative.
+    _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
-        (not (Version(triton_version) < Version("3.0.0"))):
+        (not (Version(triton_version) < Version("3.0.0"))) and \
+        (not _miscompiling_devices):
         try:
             from cut_cross_entropy import linear_cross_entropy
             HAS_CUT_CROSS_ENTROPY = True
@@ -54,6 +117,23 @@ elif DEVICE_TYPE == "cuda":
             HAS_CUT_CROSS_ENTROPY = False
     else:
         HAS_CUT_CROSS_ENTROPY = False
+    pass
+    if _miscompiling_devices:
+        _affected = ", ".join(
+            f"cuda:{index} (sm_{device_major}{device_minor})"
+            for index, device_major, device_minor in _miscompiling_devices
+        )
+        logger.warning(
+            f"Unsloth: triton=={triton_version} miscompiles the cut cross entropy "
+            f"kernel for {_affected}, so it is disabled and "
+            f"the standard loss is used instead, at a higher memory cost. torch 2.6.0, "
+            f"which carries triton 3.2.0, restores it. torch 2.8.0 and later carry a "
+            f"triton that compiles the kernel, but do NOT restore it here: unsloth_zoo "
+            f"sets UNSLOTH_ENABLE_CCE=0 for torch 2.8 and above over a separate shared "
+            f"memory failure, and both compiled branches require that flag as well as "
+            f"HAS_CUT_CROSS_ENTROPY. Leaving it enabled aborts the process with "
+            f"'LLVM ERROR: Unsupported rounding mode for conversion'."
+        )
     pass
 elif DEVICE_TYPE == "hip":
     try:
@@ -396,10 +476,14 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     #     something else: they raise here, or come back quietly short.
     # The guards differ in width on purpose. is_non_causal_head gates both routes; the
     # new route also demands a POSITIVE shifted-label signal, so Whisper and Florence2
-    # keep today's count rather than being rescaled here. No .ndim means no tensor ops
-    # at all: a list would hit the except below and kill a run stock trains through.
+    # keep today's count rather than being rescaled here. A sample has to be a Mapping
+    # before "labels" can be read off it, and then have a .ndim before any tensor op
+    # touches it: TRL's GRPO collator is the identity, so a sample is a LIST of dicts
+    # and `.get` on it raises. Both used to kill a run stock trains through, which is
+    # why the pre-#1217 spelling asked `"labels" in batch_samples[0]`.
     labels_are_countable = getattr(
-        batch_samples[0].get("labels") if len(batch_samples) > 0 else None, "ndim", None,
+        batch_samples[0].get("labels") if len(batch_samples) > 0
+        and isinstance(batch_samples[0], Mapping) else None, "ndim", None,
     ) is not None
     if (not is_non_causal_head) and labels_are_countable \
             and (has_kwargs or (getattr(self, "compute_loss_func", None) is not None

@@ -309,6 +309,10 @@ jobs:
         # raising requires-python relaxes it rather than making it lie.
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
+        # test_safe_serialization_none pins that `safe_serialization = None` means the
+        # safetensors default rather than a pickle, and carries a drift gate over the whole
+        # package for any future save entry point that forwards the argument unnormalised.
+        # CPU-pure and stdlib-only, so it belongs in a gate rather than in collect-only.
         #
         # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
         # eager fallback: still falls back on a first-call refusal, ends the step
@@ -319,9 +323,12 @@ jobs:
         # shipped broken for the same reason this comment keeps repeating -- the
         # file was in NO job, so `--collect-only` proved only that it imports while
         # the count double-removed every document boundary a collator had already
-        # masked, inflating loss and every gradient. `.[core]` resolves trl 0.24.0
-        # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
-        # so this job exercises the regressed regime on every pull request.
+        # masked, inflating loss and every gradient. `.[core]` resolves a trl that
+        # masks the document boundary itself (trl added that in 0.23.1 and every
+        # release since keeps it), so this job exercises the regressed regime on
+        # every pull request. Stated as the mechanism rather than as a version
+        # number, because the number moves with the cap and a stale one here reads
+        # like a guarantee that the lane no longer provides.
         #
         # test_hip_bf16_offload_dtype pins that the HIP branch ASKS whether bf16 is
         # supported rather than hardcoding True, which is what kills an RDNA 1/2 card
@@ -348,6 +355,10 @@ jobs:
         # request. Collecting the drift file here proves it still imports under
         # a plain root, and the sweep is a stdlib-only grep that refuses the
         # pattern anywhere in the suite.
+        # The two vision URL files gate the SSRF guard for dataset-supplied media
+        # URLs: the static bypass forms and, in the rebinding file, that the fetch
+        # connects to the address the guard actually validated. Neither was executed
+        # by any job before, so the guard could regress while CI stayed green.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -385,6 +396,8 @@ jobs:
             tests/test_checkpoint_modes.py \
             tests/test_gc_rewriter_bound_keywords.py \
             tests/test_wheel_top_level_packages.py \
+            tests/test_vision_url_ssrf_guard.py \
+            tests/test_vision_url_dns_rebinding.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
@@ -399,6 +412,7 @@ jobs:
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
             tests/test_undefined_name_gate.py \
+            tests/test_safe_serialization_none.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -421,6 +435,9 @@ jobs:
           python -m pytest tests/test_mlx_save_export_regressions.py -v
           python -m pytest tests/test_mlx_save_export_edge_cases.py -v
           python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
+
+      - name: Token initialization regressions
+        run: python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
@@ -519,7 +536,7 @@ jobs:
           # on the newest mlx-vlm that fits, which is the 0.6.4 ceiling the audio
           # gate records.
           #
-          # The <0.7.0 bound is repeated here because pyproject's copy is marker-gated
+          # The <=0.7.1 bound is repeated here because pyproject's copy is marker-gated
           # to darwin + arm64 and so constrains nothing on this Linux lane. Without it
           # the lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
           # gating a combination pyproject forbids.
@@ -531,7 +548,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<0.7.0" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.1" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
@@ -916,6 +933,10 @@ jobs:
                 # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
                 # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
                 # cannot turn these lanes red.
+                # test_merge_e2e_partial_refusal is here for the same reason: the bridge
+                # to a composite model's on-disk weights is a class attribute in
+                # transformers 4 and a registry in 5, and losing it merges nothing
+                # silently, so one pinned version cannot show the merge finds it.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -940,6 +961,7 @@ jobs:
                   tests/test_transformers_moe_structure_drift.py \
                   tests/test_moe_merge_e2e_cpu.py \
                   tests/test_merge_e2e_hub_unreachable.py \
+                  tests/test_merge_e2e_partial_refusal.py \
                   tests/test_gemma4_dtype_drift_guards.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else

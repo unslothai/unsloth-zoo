@@ -751,6 +751,63 @@ def forward_moe_backend(
     return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
 
+# Test-only call counter, wired at import time and OFF by default: incrementing a
+# module global is a Dynamo side effect, and leaving it always-on re-traced the
+# compiled MoE block every step (3.6 ms -> 572 ms).
+_EXPERT_COUNT_CALLS = [0]
+_COUNT_DEBUG = os.environ.get("UNSLOTH_MOE_COUNT_DEBUG", "0") == "1"
+
+
+def _count_tokens_per_expert(
+    flat_experts: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype = torch.int32,
+) -> torch.Tensor:
+    """Per-expert token counts, WITHOUT synchronising the device.
+
+    Drop-in replacement for ``torch.bincount(flat_experts, minlength=num_experts)``
+    returning shape ``[num_experts]`` and the requested ``dtype``.
+
+    Why not bincount: on CUDA the output size of ``bincount`` depends on the data
+    (it must learn ``max(input)`` even when ``minlength`` is given), so the kernel
+    D2H-copies and blocks the host. Measured on B200, E=256 / 16384 routed rows:
+    2 sync warnings under ``torch.cuda.set_sync_debug_mode("warn")`` and ~58 us of
+    host time per call, versus 0 warnings and ~19 us here. With one MoE layer per
+    block that drain happens tens of times per step.
+
+    ``scatter_add_`` accumulates with atomics, so the ORDER of accumulation is
+    nondeterministic; integer addition is associative and commutative and every
+    addend is exactly 1, so the SUM is bit-exact and run-to-run deterministic
+    regardless of order. Verified bit-identical to ``bincount`` over random,
+    skewed, empty and single-token routings, and it does not trip
+    ``torch.use_deterministic_algorithms(True)``.
+
+    Caveat, same precondition as the caller already relies on: ``flat_experts``
+    must hold values in ``[0, num_experts)``. That holds for router ``topk``
+    output by construction. Out-of-range values make ``bincount`` silently return
+    a LONGER tensor (breaking the downstream ``offs=`` shape) whereas this writes
+    out of bounds, so neither is safe; the difference is only in how it fails.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if flat_experts.dim() != 1:
+        flat_experts = flat_experts.reshape(-1)
+    # scatter_add_ needs int64; router topk already gives one, so no copy.
+    index = flat_experts if flat_experts.dtype == torch.int64 else flat_experts.long()
+    counts = torch.zeros(num_experts, dtype=dtype, device=flat_experts.device)
+    counts.scatter_add_(0, index, torch.ones_like(index, dtype=dtype))
+    return counts
+
+
+if _COUNT_DEBUG:
+    def count_tokens_per_expert(flat_experts, num_experts, dtype=torch.int32):
+        _EXPERT_COUNT_CALLS[0] += 1
+        return _count_tokens_per_expert(flat_experts, num_experts, dtype)
+
+    count_tokens_per_expert.__doc__ = _count_tokens_per_expert.__doc__
+else:
+    count_tokens_per_expert = _count_tokens_per_expert
+
+
 @torch.no_grad()
 def _get_routing_indices(selected_experts, num_experts):
     """Compute token->expert mapping for grouped GEMM.
@@ -761,13 +818,82 @@ def _get_routing_indices(selected_experts, num_experts):
 
     flat_experts = selected_experts.view(-1)
 
-    # bincount avoids histc's float conversion overhead.
-    token_counts_by_expert = torch.bincount(flat_experts, minlength=num_experts).to(torch.int32)
+    # Sync-free; see count_tokens_per_expert.
+    token_counts_by_expert = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
 
     # stable=True preserves order within each expert.
     gather_indices = flat_experts.argsort(stable=True)
 
     return token_counts_by_expert, gather_indices
+
+
+def combine_permuted_moe_outputs(
+    permuted_output: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    out_dtype = None,
+) -> torch.Tensor:
+    """Sum the top_k expert outputs belonging to each token, in a fixed order.
+
+    The obvious spelling of this reduction is
+    ``zeros(num_tokens, hidden).index_add_(0, token_indices, permuted_output)``
+    with ``token_indices = sorted_indices // top_k``. Because every token index
+    appears ``top_k`` times in one call, that lands in ``index_add_``'s CUDA
+    atomicAdd path, and atomicAdd fixes no accumulation order. Float addition is
+    not associative, so the result moves from run to run: repeating one identical
+    forward 40 times on a single already-loaded Gemma-4 MoE, with no optimizer
+    step and no data change, gave 40 distinct losses spread over 0.0284 nats,
+    while the same 40 repeats through the reduction below returned one value.
+
+    ``sorted_indices`` is ``argsort`` of the flat expert assignment, so it is a
+    permutation of ``range(num_tokens * top_k)`` - every slot exactly once. That
+    means the permutation can simply be undone (a gather through the inverse
+    permutation: unique indices, no accumulation and so no atomics) and the
+    ``top_k`` axis reduced with an ordinary ``sum``, which has a fixed reduction
+    order. Same arithmetic, same values up to that ordering, reproducible.
+
+    ``out_dtype`` is applied AFTER the reduction, not before it. When the routed
+    slots arrive wider than ``out_dtype`` - the fp32-router case, where the
+    routing-weight multiply promotes the expert output to fp32 - casting first
+    would round every one of the ``top_k`` summands to bf16 and only then add
+    them. Summing first and rounding once is what ``transformers``
+    (``integrations/moe.py``) does, and it is measurably closer to an fp64
+    reference. With a bf16 router the two orders are bit-identical.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    # The gather below is safe only because sorted_indices is an argsort, so the indices
+    # are unique and, given the count check here matches, cover every row: nothing is left
+    # unread and no slot is counted twice. A bare `assert` would vanish under `python -O`,
+    # which is exactly the build where a silently wrong reduction is hardest to notice.
+    if sorted_indices.numel() != permuted_output.shape[0]:
+        raise ValueError(
+            f"Unsloth: expected a full permutation of {permuted_output.shape[0]} routed slots, "
+            f"got {sorted_indices.numel()} indices"
+        )
+    # inverse_indices[sorted_indices[i]] = i, i.e. "which routed slot holds original row j".
+    # Gathering with it is one [num_tokens * top_k, hidden] buffer, in the incoming dtype;
+    # the narrowing cast then only ever touches the small [num_tokens, hidden] result.
+    inverse_indices = torch.empty_like(sorted_indices)
+    inverse_indices.scatter_(
+        0,
+        sorted_indices,
+        torch.arange(
+            sorted_indices.numel(),
+            device = sorted_indices.device,
+            dtype = sorted_indices.dtype,
+        ),
+    )
+    combined = (
+        permuted_output
+        .index_select(0, inverse_indices)
+        .view(num_tokens, top_k, permuted_output.shape[-1])
+        .sum(dim = 1)
+    )
+    if out_dtype is not None:
+        combined = combined.to(out_dtype)
+    return combined
 
 
 def _silu_and_mul(x):
@@ -2194,7 +2320,7 @@ def forward_native_grouped_mm(
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
     sorted_indices = torch.argsort(flat_top_k, stable=True)
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
@@ -2277,8 +2403,13 @@ def forward_native_grouped_mm(
             mm1_out = mm1_out + lora_delta * scaling
 
         if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
-            num_repeats = num_tokens_per_expert.to(self.gate_up_proj_bias.device)
-            bias_expanded = self.gate_up_proj_bias.repeat_interleave(num_repeats, dim=0)
+            # repeat_interleave without output_size= D2H-syncs. sorted_indices is
+            # already in expert order, so gathering by expert id matches it, sync-free
+            # (74 us -> 8 us host at E=128 x 16384 rows).
+            sorted_expert_ids = flat_top_k[sorted_indices]
+            bias_expanded = self.gate_up_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.gate_up_proj_bias.device)
+            )
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
         if "GptOssExperts" in self.__class__.__name__:
@@ -2431,8 +2562,10 @@ def forward_native_grouped_mm(
             mm2_out = mm2_out + lora_delta * scaling
 
         if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
-            bias_expanded = self.down_proj_bias.repeat_interleave(
-                num_tokens_per_expert.to(self.down_proj_bias.device), dim=0
+            # Capture-safe gather; see gate_up_proj_bias above.
+            sorted_expert_ids = flat_top_k[sorted_indices]
+            bias_expanded = self.down_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.down_proj_bias.device)
             ).to(mm2_out.device)
             mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
 
@@ -2462,13 +2595,13 @@ def forward_native_grouped_mm(
         permuted_weights = flat_weights[sorted_indices]
         mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    final_hidden_states = combine_permuted_moe_outputs(
+        mm2_out,
+        sorted_indices,
+        batch_size * sequence_length,
+        top_k_index.shape[-1],
+        out_dtype = hidden_states.dtype,
     )
-
-    final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
 
     if is_2d_input:
         return final_hidden_states

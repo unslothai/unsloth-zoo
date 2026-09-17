@@ -359,6 +359,57 @@ def patch_gated_delta():
         )
 
 
+# mlx-vlm keeps growing `gated_delta_update` keywords -- 0.6.9 added
+# `lower_bound`, 0.7.1 added `cache`, `cache_index` and `state_steps` -- and its
+# call sites pass the new ones unconditionally, even when they are None. The
+# patches below therefore accept whatever arrives and splat it straight back when
+# they delegate: a keyword the caller supplied is one the installed mlx-vlm
+# accepts, which keeps a single wrapper correct from 0.4.x through 0.7.x without
+# sniffing versions.
+_VLM_CACHE_KWARGS = frozenset(("cache", "cache_index", "state_steps"))
+_WARNED_UNKNOWN_GATED_DELTA_KWARGS: set = set()
+
+
+def _vlm_must_delegate(kwargs, honored, where):
+    """Whether these keywords put the call outside what the training branch covers.
+
+    `cache` and `state_steps` give recurrent state and history retention to the
+    cache, which the custom VJP does not own. An unrecognized keyword delegates
+    as well: the training branch recomputes the gate from its own inputs, so
+    silently dropping a future gating modifier would return wrong numbers rather
+    than fail. Delegating is only slower -- the training call sites pass
+    `use_kernel=not self.training`, which lands on the differentiable ops path.
+    """
+    if kwargs.get("cache") is not None or kwargs.get("state_steps") is not None:
+        return True
+    unknown = sorted(set(kwargs) - _VLM_CACHE_KWARGS - set(honored))
+    if not unknown:
+        return False
+    fresh = [name for name in unknown
+             if (where, name) not in _WARNED_UNKNOWN_GATED_DELTA_KWARGS]
+    if fresh:
+        _WARNED_UNKNOWN_GATED_DELTA_KWARGS.update((where, name) for name in fresh)
+        print(
+            f"Unsloth: WARNING — {where} gated_delta_update was passed unrecognized "
+            f"{', '.join(fresh)}; that call trains without the memory-efficient "
+            "VJP (slow, and long sequences may exhaust Metal resources)."
+        )
+    return True
+
+
+def _rebind_vlm_gated_delta_consumers(original, patched):
+    """Rebind mlx-vlm modules that from-imported `original` at import time."""
+    import sys
+    rebound = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith("mlx_vlm.models"): continue
+        if getattr(module, "gated_delta_update", None) is original:
+            module.gated_delta_update = patched
+            rebound.append(name)
+    if rebound:
+        print(f"Unsloth: Rebound gated_delta_update in {', '.join(sorted(rebound))}.")
+
+
 def patch_gated_delta_vlm():
     """Patch mlx_vlm >= 0.6's own qwen3_5 gated_delta_update.
 
@@ -366,7 +417,7 @@ def patch_gated_delta_vlm():
     non-differentiable gated_delta_kernel directly), so it is a distinct
     object that patch_gated_delta()'s identity sweep deliberately leaves
     alone. Patch it with the same training dispatch (fused-kernel VJP,
-    ops fallback) in both namespaces that hold a reference. Older
+    ops fallback), then rebind every consumer holding a reference. Older
     mlx_vlm (0.4.x - 0.5.x) from-imports mlx_lm's function instead;
     the sweep in patch_gated_delta() already rebinds those.
     """
@@ -397,6 +448,8 @@ def patch_gated_delta_vlm():
             )
         return
     try:
+        # Also imported for its side effect: the rebind sweep below only reaches
+        # consumers that are already in sys.modules.
         from mlx_vlm.models.qwen3_5 import language as vlm_language
     except ImportError:
         vlm_language = None
@@ -414,12 +467,13 @@ def patch_gated_delta_vlm():
 
     def patched_vlm_gated_delta_update(
         q, k, v, a, b, A_log, dt_bias,
-        state=None, mask=None, use_kernel=True,
+        state=None, mask=None, use_kernel=True, **kwargs,
     ):
-        if not _is_training_call(state, use_kernel):
+        if (_vlm_must_delegate(kwargs, (), "mlx-vlm qwen3_5")
+                or not _is_training_call(state, use_kernel)):
             return original_update(
                 q, k, v, a, b, A_log, dt_bias,
-                state=state, mask=mask, use_kernel=use_kernel,
+                state=state, mask=mask, use_kernel=use_kernel, **kwargs,
             )
         beta = mx.sigmoid(b)
         g = gated_delta.compute_g(A_log, a, dt_bias)
@@ -431,9 +485,19 @@ def patch_gated_delta_vlm():
         return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
     vlm_gated_delta.gated_delta_update = patched_vlm_gated_delta_update
+    vlm_gated_delta._unsloth_gated_delta_original = original_update
+    vlm_gated_delta._unsloth_gated_delta_patched = True
+    # `language` is not the only consumer: qwen3_5's speculative verifier
+    # from-imports the same function, and qwen4_exp reuses both.
+    _rebind_vlm_gated_delta_consumers(
+        original_update, patched_vlm_gated_delta_update,
+    )
+    # The sweep matches on identity, so it misses a consumer holding a DIFFERENT copy of the
+    # function than the one just replaced -- which is what importlib.reload on .gated_delta
+    # leaves behind, and what tests/test_qwen35_vjp_metal.py does before calling this. `language`
+    # is the consumer that always exists and the one training runs through, so bind it by name.
     if vlm_language is not None:
         vlm_language.gated_delta_update = patched_vlm_gated_delta_update
-    vlm_gated_delta._unsloth_gated_delta_patched = True
     print("Unsloth: Patched mlx-vlm GatedDeltaNet with memory-efficient custom VJP.")
 
 
@@ -454,12 +518,15 @@ def patch_gated_delta_vlm_shared():
     original_update = vlm_gated_delta.gated_delta_update
 
     def patched_shared_gated_delta_update(q, k, v, a, b, A_log, dt_bias,
-            state=None, mask=None, use_kernel=True, lower_bound=None):
-        if not _is_training_call(state, use_kernel):
-            # Pre-0.6.9 mlx-vlm has no `lower_bound` here, and no caller passes one.
-            bound = {} if lower_bound is None else {"lower_bound": lower_bound}
+            state=None, mask=None, use_kernel=True, **kwargs):
+        if (_vlm_must_delegate(kwargs, ("lower_bound",), "mlx-vlm shared")
+                or not _is_training_call(state, use_kernel)):
+            # Forwarding only what arrived keeps pre-0.6.9 mlx-vlm, which has no
+            # `lower_bound` here, callable through the same wrapper.
             return original_update(q, k, v, a, b, A_log, dt_bias,
-                                   state=state, mask=mask, use_kernel=use_kernel, **bound)
+                                   state=state, mask=mask, use_kernel=use_kernel,
+                                   **kwargs)
+        lower_bound = kwargs.get("lower_bound")
         beta = mx.sigmoid(b)
         g = (vlm_gated_delta.compute_g(A_log, a, dt_bias) if lower_bound is None
              else vlm_gated_delta.compute_g_safe(A_log, a, dt_bias, lower_bound))
@@ -471,16 +538,11 @@ def patch_gated_delta_vlm_shared():
         return gated_delta_ops_efficient(q, k, v, g, beta, state, mask)
 
     vlm_gated_delta.gated_delta_update = patched_shared_gated_delta_update
+    vlm_gated_delta._unsloth_gated_delta_original = original_update
     vlm_gated_delta._unsloth_gated_delta_patched = True
-    # Consumers from-import the function; rebind their stale references.
-    rebound = []
-    for name, module in list(sys.modules.items()):
-        if module is None or not name.startswith("mlx_vlm.models"): continue
-        if getattr(module, "gated_delta_update", None) is original_update:
-            module.gated_delta_update = patched_shared_gated_delta_update
-            rebound.append(name)
-    if rebound:
-        print(f"Unsloth: Rebound gated_delta_update in {', '.join(sorted(rebound))}.")
+    _rebind_vlm_gated_delta_consumers(
+        original_update, patched_shared_gated_delta_update,
+    )
     print("Unsloth: Patched shared mlx-vlm GatedDeltaNet with custom VJP.")
 
 
