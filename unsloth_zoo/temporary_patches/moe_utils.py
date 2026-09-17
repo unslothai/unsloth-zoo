@@ -189,6 +189,31 @@ def _remove_cached_bytecode(source_file):
     return True
 
 
+def cached_copy_is_verbatim(directory) -> bool:
+    """Whether `directory/moe_utils.py` is byte-for-byte this file.
+
+    True when there is no copy there at all: nothing can be imported from it, so
+    nothing needs rejecting. False only for a copy whose bytes install_to_cache()
+    did not put there.
+
+    Public because returning None from _load_cached_moe_utils_module() protects
+    only its own callers. Generated MoE modules run a bare `from moe_utils import
+    ...`, and compiler.py's recovery path puts the persistent cache directory on
+    sys.path so that import can resolve -- which handed the very copy rejected
+    below straight to the import system, top-level payload and all. The caller
+    there asks this first and leaves the directory off the path if it says no.
+    """
+    try:
+        cache_file = os.path.abspath(os.path.join(directory, "moe_utils.py"))
+    except Exception:
+        return False
+    current_file = os.path.abspath(__file__)
+    if cache_file == current_file or not os.path.isfile(cache_file):
+        return True
+    cached_bytes = _read_file_bytes(cache_file)
+    return cached_bytes is not None and cached_bytes == _read_file_bytes(current_file)
+
+
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 

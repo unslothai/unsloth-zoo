@@ -29,6 +29,7 @@ import io
 import inspect
 import re
 import importlib
+import importlib.machinery
 import importlib.util
 import numpy as np
 import os
@@ -1238,15 +1239,44 @@ def _bytecode_would_be_used(function_location, bytecode_location):
     return mtime == int(source.st_mtime) & 0xFFFFFFFF and size == source.st_size & 0xFFFFFFFF
 pass
 
+def _moe_utils_copy_is_verbatim(folder):
+    """Whether it is safe to expose `folder` to a generated module's import.
+
+    Imported lazily and defensively: moe_utils lives under temporary_patches and
+    pulls in torch, so a hard import at module scope would reorder this file's
+    dependencies. A folder is only trusted when moe_utils itself vouches for the
+    copy in it, and an unreadable or unimportable helper means untrusted.
+    """
+    if not folder:
+        return False
+    try:
+        from .temporary_patches.moe_utils import cached_copy_is_verbatim
+    except Exception:
+        return False
+    try:
+        return bool(cached_copy_is_verbatim(folder))
+    except Exception:
+        return False
+
+
 def _reject_shadowing_import_candidates(compile_folder, name):
     """Refuse a cache entry that would win the import over the verified file.
 
     The digest is checked against `<name>.py`, but import_module() resolves by
-    name, and a regular package beats a module of the same name. A planted
-    `<name>/__init__.py` beside the verified source is therefore imported and
-    executed with the verification having passed, and it needs no race: the
-    directory can simply be sitting there. Nothing here ever creates one, so its
-    presence is reason enough to stop.
+    name, and two things beat a source module of that name. Both are planted, not
+    raced: the file can simply be sitting there, and nothing here ever creates
+    one, so its presence is reason enough to stop.
+
+    A directory is one: a regular package `<name>/__init__.py` is found first.
+
+    An extension module is the other, and it outranks even the package. FileFinder
+    is built with ExtensionFileLoader ahead of SourceFileLoader, so on this
+    interpreter `<name>.cpython-313-x86_64-linux-gnu.so`, `<name>.abi3.so` and
+    `<name>.so` are all tried before `<name>.py` -- and a shared library is loaded
+    and run by the dynamic linker, with no source for any digest to cover.
+    importlib.machinery.EXTENSION_SUFFIXES is read rather than hardcoded so this
+    stays right on Windows (.pyd) and on a free-threaded or differently-tagged
+    build.
     """
     candidate = os.path.join(compile_folder, name)
     if os.path.isdir(candidate):
@@ -1254,6 +1284,14 @@ def _reject_shadowing_import_candidates(compile_folder, name):
             f"Unsloth: Refusing to import {name} because {candidate} would be "
             f"imported instead of the verified source beside it."
         )
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        extension = os.path.join(compile_folder, name + suffix)
+        if os.path.isfile(extension):
+            raise RuntimeError(
+                f"Unsloth: Refusing to import {name} because {extension} is an "
+                f"extension module and would be loaded instead of the verified "
+                f"source beside it."
+            )
 
 
 def _remove_compiled_cache_bytecode(function_location):
@@ -1984,9 +2022,18 @@ def create_new_function(
         # `from moe_utils import ...`, so without this the load reports success
         # with every backend name undefined. Both folders: recovery switches to
         # node-local temp, but the helper sits next to the persistent cache.
-        search_paths = [compile_folder]
-        if UNSLOTH_COMPILE_LOCATION not in search_paths:
-            search_paths.append(UNSLOTH_COMPILE_LOCATION)
+        # A directory only goes on the path if the moe_utils.py sitting in it is
+        # this package's own file. `from moe_utils import ...` inside a generated
+        # module is a bare, unverified import wrapped in `except Exception: pass`,
+        # so a planted copy here would be imported and its top level executed with
+        # the failure swallowed -- the same copy _load_cached_moe_utils_module()
+        # already refuses to load for itself. Dropping the directory costs the
+        # backend names, which that import is written to survive losing.
+        search_paths = [
+            folder
+            for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
+            if _moe_utils_copy_is_verbatim(folder)
+        ]
         old_path = list(sys.path)
         sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
         try:
