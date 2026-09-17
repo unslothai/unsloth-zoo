@@ -743,12 +743,9 @@ def forward_moe_backend(
     return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
 
-# Call counter for tests and for proving the helper is actually reached.
-#
-# OFF by default and wired at import time, never per call. Incrementing a module
-# global inside the counter is a Python side effect that Dynamo cannot keep in the
-# graph: with it always-on, a compiled MoE block re-traced on every step and ran
-# 572 ms instead of 3.6 ms (0.008x). Read the flag once, branch never.
+# Test-only call counter, wired at import time and OFF by default: incrementing a
+# module global is a Dynamo side effect, and leaving it always-on re-traced the
+# compiled MoE block every step (3.6 ms -> 572 ms).
 _EXPERT_COUNT_CALLS = [0]
 _COUNT_DEBUG = os.environ.get("UNSLOTH_MOE_COUNT_DEBUG", "0") == "1"
 
@@ -786,8 +783,7 @@ def _count_tokens_per_expert(
     # This Unsloth Zoo code section is licensed under AGPL3
     if flat_experts.dim() != 1:
         flat_experts = flat_experts.reshape(-1)
-    # scatter_add_ requires an int64 index; router topk output already is one, so
-    # the common path does not copy.
+    # scatter_add_ needs int64; router topk already gives one, so no copy.
     index = flat_experts if flat_experts.dtype == torch.int64 else flat_experts.long()
     counts = torch.zeros(num_experts, dtype=dtype, device=flat_experts.device)
     counts.scatter_add_(0, index, torch.ones_like(index, dtype=dtype))
@@ -814,7 +810,7 @@ def _get_routing_indices(selected_experts, num_experts):
 
     flat_experts = selected_experts.view(-1)
 
-    # Sync-free counter; see count_tokens_per_expert for why not bincount/histc.
+    # Sync-free; see count_tokens_per_expert.
     token_counts_by_expert = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
 
     # stable=True preserves order within each expert.
@@ -1771,10 +1767,9 @@ def forward_native_grouped_mm(
             mm1_out = mm1_out + lora_delta * scaling
 
         if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
-            # repeat_interleave with tensor repeats and no output_size= D2H-syncs to
-            # learn the output rows. sorted_indices already permutes rows into expert
-            # order, so gathering the bias by each row's expert id is the same result
-            # with no sync (2 warnings -> 0, 74 us -> 8 us host at E=128 x 16384 rows).
+            # repeat_interleave without output_size= D2H-syncs. sorted_indices is
+            # already in expert order, so gathering by expert id matches it, sync-free
+            # (74 us -> 8 us host at E=128 x 16384 rows).
             sorted_expert_ids = flat_top_k[sorted_indices]
             bias_expanded = self.gate_up_proj_bias.index_select(
                 0, sorted_expert_ids.to(self.gate_up_proj_bias.device)
@@ -1930,7 +1925,7 @@ def forward_native_grouped_mm(
             mm2_out = mm2_out + lora_delta * scaling
 
         if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
-            # Capture-safe gather; see the gate_up_proj_bias comment above.
+            # Capture-safe gather; see gate_up_proj_bias above.
             sorted_expert_ids = flat_top_k[sorted_indices]
             bias_expanded = self.down_proj_bias.index_select(
                 0, sorted_expert_ids.to(self.down_proj_bias.device)

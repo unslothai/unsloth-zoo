@@ -241,7 +241,7 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     flat_w = rw.reshape(-1)
     tok_of_pair = torch.arange(T, device=dev).repeat_interleave(top_k)
     from .moe_utils import count_tokens_per_expert
-    # int64 keeps the dtype bincount returned here, so cumsum below is unchanged.
+    # int64 matches what bincount returned, so cumsum is unchanged.
     counts = count_tokens_per_expert(flat_e, num_experts, torch.int64)
     order = torch.argsort(flat_e, stable=True)
     sorted_tok = tok_of_pair[order]

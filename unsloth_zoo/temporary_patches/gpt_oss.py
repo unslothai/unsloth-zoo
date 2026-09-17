@@ -1093,9 +1093,8 @@ class GptOssExpertsBnb4bit(nn.Module):
             from unsloth_zoo.temporary_patches.moe_utils import count_tokens_per_expert
             counts = count_tokens_per_expert(flat_experts, num_experts, torch.int64)
             offsets = counts.cumsum(0, dtype=torch.int32)
-            # Was repeat_interleave(arange(num_experts), counts), which D2H-syncs to
-            # learn its output size. That expansion is by construction the expert id
-            # of each row in expert-sorted order, i.e. sorted_experts above.
+            # repeat_interleave(arange(E), counts) D2H-syncs for its output size, and
+            # is by construction sorted_experts already.
             expert_ids = sorted_experts
 
         recompute = _moe_recompute_default()
@@ -1193,9 +1192,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                 sorted_idx = flat_experts.argsort(stable=True)
                 sorted_tokens = token_ids[sorted_idx]
                 
-                # Deliberately left as bincount: the .tolist() is itself a D2H sync
-                # (the Python per-expert loop below needs host-side counts), so a
-                # sync-free counter would buy nothing here.
+                # bincount on purpose: the .tolist() below already syncs.
                 counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
             
             next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
@@ -2144,9 +2141,7 @@ def torch_native_forward(
             sorted_idx = flat_experts.argsort(stable=True)
             sorted_tokens = token_ids[sorted_idx]
             
-            # Deliberately left as bincount: the .tolist() is itself a D2H sync
-            # (the Python per-expert loop below needs host-side counts), so a
-            # sync-free counter would buy nothing here.
+            # bincount on purpose: the .tolist() below already syncs.
             counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
         
         next_states = torch.zeros_like(hidden_states, dtype=torch.float32, device=hidden_states.device)
