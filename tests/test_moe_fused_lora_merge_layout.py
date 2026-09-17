@@ -39,6 +39,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import stat
 import sys
 from unittest import mock
 
@@ -1152,3 +1153,29 @@ def test_the_atomic_rewrite_replaces_the_file_on_success(tmp_path):
     MU._atomic_write_text(str(path), payload)
     assert path.read_text(encoding="utf-8") == payload
     assert [p.name for p in tmp_path.iterdir()] == ["adapter_config.json"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+@pytest.mark.parametrize("mode", [0o644, 0o664, 0o600])
+def test_the_atomic_rewrite_keeps_the_config_permissions(tmp_path, mode):
+    """mkstemp creates its file 0600 and os.replace keeps the NEW inode's mode, so an
+    unguarded atomic write silently tightens adapter_config.json to 0600 on every save.
+    A checkpoint shared with another user or a serving process then stops being loadable
+    while its weight files stay readable, which is a confusing way to fail."""
+    path = tmp_path / "adapter_config.json"
+    path.write_text(json.dumps({"peft_type": "LORA"}), encoding="utf-8")
+    os.chmod(path, mode)
+
+    MU._atomic_write_text(str(path), json.dumps({"peft_type": "LORA", "r": 8}))
+
+    assert stat.S_IMODE(os.stat(path).st_mode) == mode
+    assert json.loads(path.read_text(encoding="utf-8"))["r"] == 8
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_a_config_that_does_not_exist_yet_is_not_given_a_laxer_mode(tmp_path):
+    """Nothing to carry over means no mode to invent: leaving mkstemp's private 0600 is
+    the safe direction, since the alternative is guessing a laxer one."""
+    path = tmp_path / "adapter_config.json"
+    MU._atomic_write_text(str(path), "{}")
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600

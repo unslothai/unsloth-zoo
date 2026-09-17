@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import sys
 import importlib
@@ -2666,6 +2667,16 @@ def _atomic_write_text(path, text):
         dir = directory, prefix = os.path.basename(path) + ".", suffix = ".tmp",
     )
     try:
+        # mkstemp creates the file 0600 and os.replace keeps the NEW inode's mode, so
+        # without this the config silently drops from (say) 0644 to 0600 on every save
+        # and a checkpoint shared with other users or a serving process stops being
+        # readable, while its weight files stay readable. Carry the existing mode over;
+        # for a config PEFT has not written yet there is nothing to carry, so leave
+        # mkstemp's private mode rather than inventing a laxer one.
+        try:
+            os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass
         with os.fdopen(handle, "w", encoding = "utf-8") as f:
             f.write(text)
             f.flush()
