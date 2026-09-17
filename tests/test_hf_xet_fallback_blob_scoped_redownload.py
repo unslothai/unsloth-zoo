@@ -202,6 +202,14 @@ def _run_ladder(
         owned = owned,
     )
     monkeypatch.setattr(xf, "_run_download_attempt", attempt)
+    # An authoritative walk, so the ladder cases assert the ladder rather than whatever
+    # processes happen to be running on the machine. A real walk here is not neutral: any
+    # non-dumpable process of this user -- sd-pam on every systemd login -- refuses both psutil
+    # and /proc/<pid>/fd, which raises the age bar and spares a deterministic partial. The
+    # cases that are ABOUT an undescribable writer stub it the other way and say so.
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: True)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
     hook_calls: list = []
     params = {
         "repo_id": REPO,
@@ -1509,3 +1517,38 @@ def test_a_process_of_our_own_that_nothing_can_describe_raises_the_age_bar(
         "model", REPO, str(tmp_path), 180.0, None,
     ) == {partial}
     assert xf._live_writer_walk_missed_our_own_uid() is False
+
+
+def test_the_studio_path_forces_when_a_writer_we_cannot_describe_could_hold_the_legacy_name(
+    monkeypatch, tmp_path,
+):
+    """An injected hook leaves the partial for the reopened-name pass, and there the spelling
+    decides.
+
+    The deterministic `<etag>.incomplete` of hub 0.36 is a name a same-uid sibling can recreate
+    the moment our purge removes it, and one we cannot describe is exactly the sibling that
+    would. So it is spared and the force stands. Current hub's nonce-spelled partial cannot be
+    recreated by anyone, so the same host keeps the scoped re-download.
+    """
+    snap = _build_cache(tmp_path, partial_age_s = 20.0)
+    legacy = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: False)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: True)
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda *a, **k: True)
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {legacy},
+    )
+    assert survivors == {legacy}, "a name that sibling could have reopened must survive"
+
+    # The same situation with current hub's spelling: nobody can have recreated it.
+    (tmp_path / REPO_DIR / "blobs" / legacy).unlink()
+    nonce = _blob_name(IN_FLIGHT) + ".a1b2c3d4" + xf.INCOMPLETE_SUFFIX
+    (tmp_path / REPO_DIR / "blobs" / nonce).write_bytes(b"\xa5" * 512)
+    assert xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {nonce},
+    ) == set()
+    assert snap.exists()

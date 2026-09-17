@@ -645,8 +645,16 @@ def _clear_partials(
     # declines here too; the deterministic name is the one a same-uid sibling could hold.
     reopened_scan_is_evidence = True
     if owned_names_may_be_reopened:
-        reopened_scan_is_evidence = _cache_is_private_to_this_user(
-            cache_dir, repo_type = repo_type, repo_id = repo_id,
+        reopened_scan_is_evidence = (
+            _cache_is_private_to_this_user(
+                cache_dir, repo_type = repo_type, repo_id = repo_id,
+            )
+            # Privacy says no other UID can have reopened the name. It does not say that a
+            # process of OUR OWN did not, and one we cannot describe is exactly the sibling
+            # this guard is about. What keeps that from costing the fix is the spelling: only
+            # the deterministic `<etag>.incomplete` can be reopened at all, so on current hub
+            # the guard is skipped per blob below and nothing here applies.
+            and not _live_writer_walk_missed_our_own_uid()
         ) or (
             rescanned_writers is not None
             and _process_walk_sees_every_writer(cache_dir)
