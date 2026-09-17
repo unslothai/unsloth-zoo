@@ -1160,3 +1160,50 @@ def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
         assert dtype.is_floating_point, f"{dtype} would already be refused by the float check"
         with pytest.raises(RuntimeError):
             torch.zeros(2, 2, dtype=dtype) + torch.zeros(2, 2, dtype=torch.float32)
+
+
+def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
+    """The scan runs while Dynamo is tracing, which is the whole point of it, so nothing
+    in it may install a guard that cannot match.
+
+    `id(forward)` did: Dynamo guards the expression it tracked, `experts_module.forward`,
+    and a bound method is reallocated on every attribute access, so `___check_obj_id`
+    failed on the frame that created it. That is an AssertionError under BOTH fullgraph
+    settings with no eager fallback, so every MoE family whose verdict is unmeasured at
+    the first compiled call was unable to compile at all.
+    """
+    import torch
+
+    class _Experts(torch.nn.Module):
+        def forward(self, x):
+            return x * 2
+
+    experts = _Experts()
+    assert MU._forward_statically_reads_stash(experts) is False
+
+    def scan(x):
+        return x + (1.0 if MU._forward_statically_reads_stash(experts) else 0.0)
+
+    for fullgraph in (True, False):
+        torch._dynamo.reset()
+        compiled = torch.compile(scan, fullgraph=fullgraph)
+        # Two calls: the first creates the guards, the second has to match them.
+        first = compiled(torch.zeros(4))
+        second = compiled(torch.zeros(4))
+        assert torch.equal(first, second)
+
+
+def test_the_static_scan_keys_on_code_objects_not_ids():
+    """Pin the mechanism, not just the symptom: a future edit reaching for id() again
+    would reintroduce a guard Dynamo cannot match, and the compile test above is slow
+    enough that it could plausibly be skipped."""
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(MU._forward_statically_reads_stash)))
+    called = {
+        node.func.id for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert "id" not in called, "the stash scan must not call id(); see the guard failure"
