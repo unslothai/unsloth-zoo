@@ -3896,6 +3896,57 @@ pass
 """
 
 
+# Both spellings PEFT uses for the LoRA input cast, as (statement, expression).
+# A rename of both no-ops every replacement, leaving PEFT's own cast, which is the safe
+# direction; test_lora_input_cast_rewrite.py fails loudly on that drift.
+_LORA_INPUT_CASTS = (
+    (
+        "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
+        "self._cast_input_dtype(x, lora_A.weight.dtype)",
+    ),
+    (
+        "x = x.to(lora_A.weight.dtype)",
+        "x.to(lora_A.weight.dtype)",
+    ),
+)
+
+
+def _patch_lora_input_cast(source, force_float32 = None):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Rewrites PEFT's LoRA input cast inside the active-adapter loop.
+
+    Without UNSLOTH_FORCE_FLOAT32: cast `result` and `x` when autocast is off, leaving a
+    forward that branches on autocast itself alone. With it: the vanilla branch becomes
+    the self-casting `lora_forward`, but variants keep PEFT's branch and take `x` directly,
+    so deleting the cast left float16 meeting float32 LoRA weights (unsloth#4127). Hence
+    the variant-gated cast, with `getattr` for layers that have no variant branch.
+    """
+    if force_float32 is None:
+        force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0"
+
+    if not force_float32:
+        if "torch.is_autocast_enabled()" in source:
+            return source
+        new = (
+            "if not torch.is_autocast_enabled(): "
+            "result, x = "
+            "result.to(lora_A.weight.dtype), "
+            "x.to(lora_A.weight.dtype)"
+        )
+        for statement, _ in _LORA_INPUT_CASTS:
+            source = source.replace(statement, new)
+        return source
+
+    for statement, expression in _LORA_INPUT_CASTS:
+        guarded = (
+            f"x = ({expression}) if active_adapter in "
+            'getattr(self, "lora_variant", {}) else x'
+        )
+        source = source.replace(statement, guarded)
+    return source
+pass
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -3955,24 +4006,7 @@ def patch_lora_forwards(torch_compile_options):
         #     source = source.replace(source[variant_found : variant_end], "")
 
         # Check failed upcasting
-        replacements = [
-            "x = x.to(lora_A.weight.dtype)",
-            "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
-        ]
-        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
-            if "torch.is_autocast_enabled()" not in source:
-                new = (
-                    "if not torch.is_autocast_enabled(): "
-                    "result, x = "
-                    "result.to(lora_A.weight.dtype), "
-                    "x.to(lora_A.weight.dtype)"
-                )
-                for replace in replacements:
-                    source = source.replace(replace, new)
-        else:
-            for replace in replacements:
-                source = source.replace(replace, "")
-        pass
+        source = _patch_lora_input_cast(source)
         source = source.replace(
             "self._check_forward_args(x, *args, **kwargs)",
             "",
