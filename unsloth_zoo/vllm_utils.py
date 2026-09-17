@@ -1350,12 +1350,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(layer.short_conv, name), slice_weights=False)
         pass
 
-        if hasattr(layer, "per_layer_input_gate"):
+        # Gemma-4 declares these attributes and assigns None when hidden_size_per_layer_input
+        # is 0, so hasattr is True while the module does not exist. Test the value.
+        if getattr(layer, "per_layer_input_gate", None) is not None:
             get_state_dict(
                 f"{vllm_text_model_prefix}.layers.{kk}.per_layer_input_gate",
                 0, state_dict, layer.per_layer_input_gate,
             )
-        if hasattr(layer, "per_layer_projection"):
+        if getattr(layer, "per_layer_projection", None) is not None:
             get_state_dict(
                 f"{vllm_text_model_prefix}.layers.{kk}.per_layer_projection",
                 0, state_dict, layer.per_layer_projection,
@@ -1428,6 +1430,18 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 f"Unsloth: fast_inference cannot rebuild layer {kk}'s {type(feed_forward).__name__} from vLLM; "
                 "set fast_inference = False."
             )
+
+        # Gemma-4 keeps a dense MLP and adds a MoE block beside it (layer.moe + layer.router)
+        # rather than replacing it, so this runs in addition to, not instead of, the MLP
+        # extraction below. Its HF names hang off the layer, with no .mlp. segment.
+        moe_block = getattr(layer, "moe", None)
+        if moe_block is not None and hasattr(moe_block, "experts"):
+            extract_moe_layers(
+                moe_block, f"{vllm_text_model_prefix}.layers.{kk}",
+                state_dict, quant_state_dict, get_state_dict,
+                router = getattr(layer, "router", None),
+            )
+
         if not hasattr(layer, "mlp"):
             continue
 
@@ -1734,6 +1748,13 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 else:
                     layer = torch.nn.Parameter(raw_value, requires_grad = False)
                     exec(f"new_model.{layer_name_br} = layer")
+                    # Assigning .weight in place keeps the parent module's CLASS, which is the
+                    # point for routers like Qwen3_5MoeTopKRouter that carry top_k. But when
+                    # the parent is a plain Linear it also keeps create_empty_model's
+                    # placeholder in_features / out_features of 1, so refresh them from the
+                    # real weight rather than leaving the module self-describing as 1x1.
+                    if attr_name == "weight" and isinstance(parent, Linear) and raw_value.ndim == 2:
+                        parent.out_features, parent.in_features = raw_value.shape
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:
@@ -1932,6 +1953,33 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
 pass
 
 
+def _config_get(config, name, default = None):
+    """getattr for configs that may be heterogeneous across layers.
+
+    Transformers raises AmbiguousGlobalPerLayerAttributeError, which is NOT an
+    AttributeError, for any attribute that varies per layer, so a plain getattr with a
+    default does not protect against it. Gemma-4 hits this on num_key_value_heads, because
+    its full-attention layers use a different KV head count from its sliding ones.
+
+    For a memory estimate the safe resolution is the largest value any layer uses, so this
+    takes the max over per_layer_config rather than guessing a single global.
+    """
+    try:
+        value = getattr(config, name)
+    except AttributeError:
+        return default
+    except Exception:
+        try:
+            per_layer = getattr(config, "per_layer_config", None)
+            per_layer = list(per_layer) if per_layer is not None else []
+            values = [v for v in (getattr(layer, name, None) for layer in per_layer) if v is not None]
+        except Exception:
+            values = []
+        return max(values) if values else default
+    return default if value is None else value
+pass
+
+
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
@@ -1959,16 +2007,16 @@ def approximate_vllm_memory_usage(
     context_length = config.max_position_embeddings
     # Sparse MoE configs (Qwen3.5 / 3.6 MoE, Qwen3-Next) carry no dense intermediate_size at
     # all, so reading it unguarded is an AttributeError before we ever reach the estimate.
-    n_experts   = getattr(config, "num_experts", None) or getattr(config, "num_local_experts", None) or 0
-    moe_size    = getattr(config, "moe_intermediate_size", None)
-    shared_size = getattr(config, "shared_expert_intermediate_size", None) or 0
+    n_experts   = _config_get(config, "num_experts") or _config_get(config, "num_local_experts") or 0
+    moe_size    = _config_get(config, "moe_intermediate_size")
+    shared_size = _config_get(config, "shared_expert_intermediate_size") or 0
     is_moe      = bool(n_experts) and moe_size is not None
 
-    mlp_size = getattr(config, "intermediate_size", None)
+    mlp_size = _config_get(config, "intermediate_size")
     if mlp_size is None: mlp_size = moe_size if moe_size is not None else hd
     n_layers = config.num_hidden_layers
-    n_kv_heads = getattr(config, "num_key_value_heads", 1)
-    n_heads    = getattr(config, "num_attention_heads", 1)
+    n_kv_heads = _config_get(config, "num_key_value_heads", 1)
+    n_heads    = _config_get(config, "num_attention_heads", 1)
     # Group Query Attention
     kv_size = hd // n_heads * n_kv_heads
 
@@ -1978,6 +2026,14 @@ def approximate_vllm_memory_usage(
     if is_moe:
         # gate_up (2) + down (1) per routed expert, plus the dense shared expert and router.
         mlp = n_experts * (hd * moe_size) * 3 + (hd * shared_size) * 3 + hd * n_experts
+        # Gemma-4 runs a full dense MLP in parallel with the MoE block rather than in place
+        # of it, so its intermediate_size is real and additive. Key this on enable_moe_block,
+        # which is the flag that adds the second FFN: Qwen3-MoE also carries a leftover dense
+        # intermediate_size in its config but never builds the dense MLP, so keying on the
+        # field's mere presence would double count it.
+        dense_size = _config_get(config, "intermediate_size")
+        if _config_get(config, "enable_moe_block", False) and dense_size is not None:
+            mlp += (hd * dense_size) * 3
     else:
         mlp  = (hd * mlp_size) * 3
     layernorms = 2 * hd
@@ -3295,6 +3351,17 @@ def load_vllm(
         approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
         approx_max_num_seqs = max(approx_max_num_seqs, 1)
 
+        # A prefill budget larger than max_num_seqs * max_model_len is unreachable: vLLM warns
+        # "max_num_batched_tokens (N) exceeds max_num_seqs * max_model_len (M)", then warms up
+        # on dummy batches sized to the budget rather than to anything the engine can schedule.
+        # On Gemma-4 / B200 that warmup dies with an illegal memory access inside the compiled
+        # graph, reproducible on plain vLLM with no Unsloth present by setting these three
+        # values alone. The vision branch above is how we get there: it pins seqs at 1 and
+        # raises the budget to 8192 in the same breath.
+        reachable_tokens = approx_max_num_seqs * max_seq_length
+        if max_num_batched_tokens > reachable_tokens:
+            max_num_batched_tokens = reachable_tokens
+
         # Check max RAM usage for vLLM (swap space) default is 4GB
         memory = psutil.virtual_memory()
         RAM_GB = memory.available / 1024 / 1024 / 1024
@@ -3503,7 +3570,10 @@ def load_vllm(
             # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
             if major_version >= 10:
                 _text_config = getattr(config, "text_config", config)
-                _head_dim = getattr(_text_config, "head_dim", None)
+                # Gemma-4 varies head_dim per layer (256 sliding, 512 global), so a plain
+                # getattr raises instead of returning. The largest head_dim decides whether
+                # the FlashInfer assertion can fire, which is what _config_get returns.
+                _head_dim = _config_get(_text_config, "head_dim")
                 if _head_dim is not None and _head_dim >= 256:
                     engine_args["block_size"] = 32
                     logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")

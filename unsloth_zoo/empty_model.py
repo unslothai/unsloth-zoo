@@ -328,10 +328,42 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     return new_model, original_meta_model, causal_config.num_hidden_layers
 
 def _set_config_attrs(config_obj, attrs_to_set):
-    """Helper to set multiple attributes on a config object if they exist."""
+    """Helper to set multiple attributes on a config object if they exist.
+
+    A heterogeneous config (Gemma-4, whose sliding and full-attention layers differ in
+    head_dim and KV head count) raises AmbiguousGlobalPerLayerAttributeError rather than
+    returning, and hasattr only swallows AttributeError, so the plain check propagates it.
+    Such an attribute IS present, just per-layer, so set it on the per-layer configs too:
+    this helper exists to shrink every dimension to 1 for the placeholder model, and
+    shrinking only the global value would leave the per-layer ones at full size.
+    """
+    def _per_layer_configs():
+        # Never test this for truthiness: the per-layer container's __len__ reads
+        # num_hidden_layers off its parent, which Qwen3.5's vision config does not have,
+        # so `or []` turns a missing attribute into an AttributeError for every caller.
+        try:
+            per_layer = getattr(config_obj, "per_layer_config", None)
+            return list(per_layer) if per_layer is not None else []
+        except Exception:
+            return []
+
     for attr, value in attrs_to_set.items():
-        if hasattr(config_obj, attr):
-            setattr(config_obj, attr, value)
+        try:
+            present = hasattr(config_obj, attr)
+        except Exception:
+            # Present, but per-layer rather than global. Shrink the per-layer copies too,
+            # otherwise the placeholder model is built at full size on those dimensions.
+            present = True
+            for layer_config in _per_layer_configs():
+                try:
+                    if hasattr(layer_config, attr): setattr(layer_config, attr, value)
+                except Exception:
+                    pass
+        if present:
+            try:
+                setattr(config_obj, attr, value)
+            except Exception:
+                pass
 pass
 
 def _get_model_device(model):
@@ -1097,7 +1129,7 @@ def get_model_layer_config(return_non_layered=True):
             # Sparse MoE blocks. experts.{gate_up,down}_proj are bare stacked Parameters
             # rather than Linears, which the assignment loop handles via its
             # "layer_name in quant_state_dict" branch (no ".weight" suffix).
-            "model.language_model.layers.{kk}.mlp.gate",
+            "model.language_model.layers.{kk}.mlp.gate.weight",
             "model.language_model.layers.{kk}.mlp.shared_expert_gate",
             "model.language_model.layers.{kk}.mlp.shared_expert.gate_proj",
             "model.language_model.layers.{kk}.mlp.shared_expert.up_proj",
@@ -1105,13 +1137,28 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.mlp.experts.gate_up_proj",
             "model.language_model.layers.{kk}.mlp.experts.down_proj",
 
-            "model.layers.{kk}.mlp.gate",
+            "model.layers.{kk}.mlp.gate.weight",
             "model.layers.{kk}.mlp.shared_expert_gate",
             "model.layers.{kk}.mlp.shared_expert.gate_proj",
             "model.layers.{kk}.mlp.shared_expert.up_proj",
             "model.layers.{kk}.mlp.shared_expert.down_proj",
             "model.layers.{kk}.mlp.experts.gate_up_proj",
             "model.layers.{kk}.mlp.experts.down_proj",
+
+            # Gemma-4 runs its MoE block alongside the dense MLP rather than in place of
+            # it, so the experts and the router are siblings of mlp, not children. Without
+            # these the assignment loop silently leaves every expert a 1-wide placeholder.
+            "model.language_model.layers.{kk}.experts.gate_up_proj",
+            "model.language_model.layers.{kk}.experts.down_proj",
+            "model.language_model.layers.{kk}.router.proj",
+            "model.language_model.layers.{kk}.router.scale",
+            "model.language_model.layers.{kk}.router.per_expert_scale",
+
+            "model.layers.{kk}.experts.gate_up_proj",
+            "model.layers.{kk}.experts.down_proj",
+            "model.layers.{kk}.router.proj",
+            "model.layers.{kk}.router.scale",
+            "model.layers.{kk}.router.per_expert_scale",
 
             # Gemma4 per-layer input modules
             "model.language_model.layers.{kk}.per_layer_input_gate",
@@ -1413,7 +1460,9 @@ def _get_nested_attr(obj, attr_path: str):
     return None
 
 
-def extract_moe_layers(mlp, prefix, state_dict, quant_state_dict, get_state_dict):
+def extract_moe_layers(
+    moe_block, prefix, state_dict, quant_state_dict, get_state_dict, router = None,
+):
     """Alias a vLLM sparse MoE block's weights onto their HF names.
 
     The routed experts are stacked 3-D Parameters rather than Linears, so get_state_dict,
@@ -1425,29 +1474,58 @@ def extract_moe_layers(mlp, prefix, state_dict, quant_state_dict, get_state_dict
     the experts into a (E, hidden/64, 2*inter, 64) block layout, which is a permute of the
     above and therefore cannot be viewed back; the ndim check below refuses it rather than
     silently materialising a second copy of the expert weights.
+
+    Two block shapes reach here. Qwen3.5 / 3.6 replace the dense MLP with the MoE block, so
+    prefix is "...layers.N.mlp" and the router is the block's own .gate. Gemma-4 instead
+    runs the MoE block ALONGSIDE a dense MLP, as layer.moe with a separate layer.router, so
+    prefix is the bare "...layers.N" and router is passed in. Pass whichever the model has.
     """
     def store(name, value):
         state_dict[name] = value
         quant_state_dict[name] = value
 
-    # Router and shared-expert gate are plain Linears, unsharded.
-    gate = getattr(mlp, "gate", None)
+    # The router is a plain Linear on vLLM's side, but NOT on HF's: Qwen3.5 / 3.6 make it a
+    # Qwen3_5MoeTopKRouter, an nn.Module holding a bare weight Parameter, which also carries
+    # top_k and performs the top-k renormalisation. Storing it under the bare name
+    # "...mlp.gate" makes the assignment loop rebuild it as an nn.Linear and overwrite the
+    # router, and the patched block forward then silently falls back to top_k = 2 (against
+    # num_experts_per_tok = 8) with no renormalisation. Store the WEIGHT instead, so the
+    # loop assigns it in place and the router class survives.
+    gate = getattr(moe_block, "gate", None)
     if gate is not None:
-        get_state_dict(f"{prefix}.gate", 0, state_dict, gate, slice_weights = False)
+        gate_weight = getattr(getattr(gate, "base_layer", gate), "weight", None)
+        if gate_weight is not None:
+            store(f"{prefix}.gate.weight", gate_weight.data)
 
-    shared_expert_gate = getattr(mlp, "shared_expert_gate", None)
+    shared_expert_gate = getattr(moe_block, "shared_expert_gate", None)
     if shared_expert_gate is not None:
         get_state_dict(f"{prefix}.shared_expert_gate", 0, state_dict, shared_expert_gate, slice_weights = False)
 
+    # Gemma-4's router is a sibling module, and vLLM splits it across two parents: the
+    # projection and its input scale stay on layer.router, but per_expert_scale is moved
+    # onto the MoE block so the fused routing kernel can read it. HF keeps all three under
+    # router, so per_expert_scale has to be picked up from the block, not from the router.
+    if router is not None:
+        if hasattr(router, "proj"):
+            get_state_dict(f"{prefix}.router.proj", 0, state_dict, router.proj, slice_weights = False)
+        router_scale = getattr(router, "scale", None)
+        if router_scale is not None:
+            store(f"{prefix}.router.scale", router_scale.data)
+        per_expert_scale = getattr(moe_block, "per_expert_scale", None)
+        if per_expert_scale is None:
+            per_expert_scale = getattr(router, "per_expert_scale", None)
+        if per_expert_scale is not None:
+            store(f"{prefix}.router.per_expert_scale", per_expert_scale.data)
+
     # The shared expert is dense. vLLM fuses gate+up into one tensor while HF keeps them
     # separate, so the two HF tensors are slice views of the single vLLM one.
-    shared_expert = getattr(mlp, "shared_expert", None)
+    shared_expert = getattr(moe_block, "shared_expert", None)
     if shared_expert is not None and hasattr(shared_expert, "gate_up_proj"):
         get_state_dict(f"{prefix}.shared_expert.gate_proj", 0, state_dict, shared_expert.gate_up_proj)
         get_state_dict(f"{prefix}.shared_expert.up_proj",   1, state_dict, shared_expert.gate_up_proj)
         get_state_dict(f"{prefix}.shared_expert.down_proj", 0, state_dict, shared_expert.down_proj, slice_weights = False)
 
-    experts = getattr(mlp, "experts", None)
+    experts = getattr(moe_block, "experts", None)
     if experts is None: return
     experts = getattr(experts, "base_layer", experts)
     experts = getattr(experts, "routed_experts", experts)
@@ -1464,6 +1542,19 @@ def extract_moe_layers(mlp, prefix, state_dict, quant_state_dict, get_state_dict
             f"Unsloth: vLLM stored the MoE experts for {prefix} in a {w13.ndim}-D kernel layout "
             f"({tuple(w13.shape)}), which is a permute of the HF layout and cannot be aliased. "
             "Weight sharing needs an untiled MoE backend."
+        )
+    # Quantized experts cannot be aliased. The dense path handles this via get_state_dict's
+    # bnb branch (qweight.bnb_quant_state / bnb_shard_offsets), but the routed experts skip
+    # get_state_dict entirely, so there is nowhere for a quant state to go. bitsandbytes
+    # stores them as a packed uint8 blob that is still 3-D, so the ndim check above passes
+    # and the blob would be stored under the HF float name with its quant state discarded:
+    # wrong weights, no error, first noticed at some later training step. Refuse loudly.
+    if w13.dtype != w2.dtype or w13.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise RuntimeError(
+            f"Unsloth: vLLM stored the MoE experts for {prefix} as {w13.dtype} / {w2.dtype}, "
+            "which is a quantized layout that cannot be shared with the training model. "
+            "Sparse MoE + fast_inference needs unquantized experts: use load_in_4bit = False "
+            "(16-bit LoRA). Upstream vLLM also does not support bitsandbytes MoE LoRA."
         )
     w13.requires_grad_(False)
     w2 .requires_grad_(False)

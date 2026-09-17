@@ -89,6 +89,20 @@ class _Gemma4KVSharedSafeProxy:
             )
         return getattr(self._real, name)
 
+    def __setattr__(self, name, value):
+        # The proxy has __slots__ and no instance dict, so without this any write lands
+        # nowhere and raises. vLLM writes through get_text_config() during engine setup
+        # (`hf_config.get_text_config().tie_word_embeddings = ...`), so a read-only proxy
+        # makes Gemma-4 unloadable under fast_inference. Forward writes to the real config
+        # so those settings take effect on the object everyone else reads.
+        if name == "_real":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_real"), name, value)
+
+    def __delattr__(self, name):
+        delattr(object.__getattribute__(self, "_real"), name)
+
     def get_text_config(self, decoder=None, encoder=None):
         # Return self so recursive get_text_config calls don't unwrap the proxy.
         return self
