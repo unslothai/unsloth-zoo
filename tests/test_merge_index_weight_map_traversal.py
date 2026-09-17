@@ -289,13 +289,14 @@ def test_an_absolute_entry_cannot_overwrite_an_existing_file_outside_the_output(
         )
 
 
-def test_a_nested_shard_name_is_preserved_not_collapsed(monkeypatch, tmp_path):
-    """An index may legitimately name a shard in a subdirectory.
+def test_a_nested_shard_name_is_collapsed_to_its_last_component(monkeypatch, tmp_path):
+    """A nested value is collapsed, not preserved.
 
-    Reducing such a value to its last component makes the size lookup check
-    `model_name/model-...` instead of the nested file that exists, so both size
-    counters stay zero and the merge aborts, and two shards sharing a basename
-    collapse onto each other. Containment has to keep this case working.
+    Nothing downstream creates the parent directory: the shard loop does
+    `shutil.copy2(..., os.path.join(save_directory, "weights/x.safetensors"))`, so
+    preserving the name only bought a FileNotFoundError. Collapsing matches the
+    three sibling listings in the same function and keeps a directory component
+    away from both join sites.
     """
     if not H.family_available(FAMILY):
         pytest.skip(f"{FAMILY} unavailable in this transformers")
@@ -308,8 +309,6 @@ def test_a_nested_shard_name_is_preserved_not_collapsed(monkeypatch, tmp_path):
     nested = os.path.join("weights", "model-00001-of-00002.safetensors")
     base_rel = _shadow_directory(tmp_path, nested)
 
-    # The nested shard has to exist, or the case cannot be told apart from the
-    # collapse it is guarding against.
     real_base = os.path.join(str(tmp_path), "real_base")
     shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
     planted = os.path.join(str(tmp_path), base_rel, nested)
@@ -319,6 +318,7 @@ def test_a_nested_shard_name_is_preserved_not_collapsed(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _stub_the_hub(monkeypatch)
     shard_names = _record_shard_names(monkeypatch)
+    destinations = _record_copies(monkeypatch)
 
     try:
         saving_utils.merge_and_overwrite_lora(
@@ -330,11 +330,75 @@ def test_a_nested_shard_name_is_preserved_not_collapsed(monkeypatch, tmp_path):
             push_to_hub     = False,
         )
     except Exception:
+        # A directory whose index names no readable shard cannot merge; the
+        # assertions below are about what the name became, not about success.
         pass
 
-    assert nested in shard_names, (
-        f"the nested shard name was not preserved; the merge saw {shard_names!r}"
+    assert nested not in shard_names, f"the nested name survived: {shard_names!r}"
+    for name in shard_names:
+        assert os.path.split(name)[-1] == name, f"{name!r} still carries a directory"
+    # And no copy was aimed at a directory the merge never created.
+    for destination in destinations:
+        assert os.path.isdir(os.path.dirname(destination) or os.curdir), destination
+
+
+@pytest.mark.parametrize("path", ["dequant", "splitting"])
+def test_an_unsafe_index_is_refused_on_the_dequant_and_splitting_paths(
+    monkeypatch, tmp_path, path,
+):
+    """The guard must not be conditional on the copy block running.
+
+    An MXFP4/FP8 dequant or a splitting save skips that block entirely, so an
+    in-place export left the hostile index sitting in the output directory, and
+    `regenerate_index` does not fire once a single non-HF-named shard remains.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    model = H.build_and_save_base(spec, os.path.join(str(tmp_path), "real_base"))
+    peft_model = H.attach_lora(model, spec, "full")
+
+    # A mixed index: one real shard so the merge gets as far as the index handling,
+    # plus the hostile entry. The real shard is deliberately not HF-sharded-named, so
+    # `safe_tensor_index_files` is empty and `regenerate_index` stays false -- the
+    # exact shape in which nothing else would touch the index.
+    base_rel = _shadow_directory(tmp_path, f"../../escaped/{PAYLOAD}")
+    shadow = os.path.join(str(tmp_path), base_rel)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
+    shutil.copy2(
+        os.path.join(real_base, shards[0]), os.path.join(shadow, "model.safetensors"),
     )
+    index_path = os.path.join(shadow, "model.safetensors.index.json")
+    with open(index_path, "r", encoding = "utf-8") as f:
+        index = json.load(f)
+    index["weight_map"]["model.norm.weight"] = "model.safetensors"
+    with open(index_path, "w", encoding = "utf-8") as f:
+        json.dump(index, f)
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+    if path == "splitting":
+        monkeypatch.setattr(
+            saving_utils, "should_split_shards", lambda *a, **k: True, raising = True,
+        )
+    else:
+        monkeypatch.setattr(
+            saving_utils, "check_model_quantization_status",
+            lambda *a, **k: (True, "mxfp4"), raising = True,
+        )
+
+    with pytest.raises(RuntimeError, match = "outside the model directory"):
+        saving_utils.merge_and_overwrite_lora(
+            get_model_name  = lambda *a, **k: base_rel,
+            model           = peft_model,
+            tokenizer       = None,
+            save_directory  = base_rel,   # in place: the index is already in the output
+            save_method     = "merged_16bit",
+            push_to_hub     = False,
+        )
 
 
 def test_a_mixed_index_is_not_exported_verbatim(monkeypatch, tmp_path):

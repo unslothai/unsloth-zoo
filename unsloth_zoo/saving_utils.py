@@ -2988,9 +2988,7 @@ def _shard_name_stays_inside(name):
     Index `weight_map` values are attacker-reachable (a local directory shadowing
     a repo id supplies the index), and they reach both `os.path.join(model_name,
     name)` and `os.path.join(save_directory, name)`. Anything absolute, empty, or
-    climbing out with `..` is dropped; an ordinary nested name like
-    `weights/model-00001-of-00002.safetensors` is kept, because collapsing it
-    would break the index it came from.
+    climbing out with `..` escapes.
     """
     if not isinstance(name, str) or not name:
         return False
@@ -3159,18 +3157,22 @@ def merge_and_overwrite_lora(
                         index_data = json.load(f)
                         # Extract file names from the index if available
                         if "weight_map" in index_data:
-                            # Keep the names that stay inside the directory they are
-                            # joined onto. These values are joined onto both `model_name`
-                            # (to size the shard) and `save_directory` (to copy it, and to
-                            # open it "r+b" for the in-place merge), so one that escapes
-                            # reads or writes outside the directory the user asked for.
-                            # Containment rather than a basename: an index may legitimately
-                            # name a shard in a subdirectory, and collapsing that to its
-                            # last component makes the size lookup miss the real file and
-                            # collides two shards that share a basename.
+                            # Keep only the last component, as the three sibling listings
+                            # do (`os.listdir` above, the Hub listing and the stale-shard
+                            # filter below). These values are joined onto both `model_name`
+                            # and `save_directory` and then copied, so `../../x` wrote
+                            # outside the directory the user asked to export to. A nested
+                            # name is collapsed rather than preserved: nothing downstream
+                            # creates its parent directory, so the copy raised
+                            # FileNotFoundError anyway. `.` and `..` survive a split and
+                            # still escape, so they are dropped.
                             indexed_files = {
-                                v for v in index_data["weight_map"].values()
-                                if _shard_name_stays_inside(v)
+                                _name for _name in (
+                                    os.path.split(v)[-1]
+                                    for v in index_data["weight_map"].values()
+                                    if isinstance(v, str)
+                                )
+                                if _name and _name not in (os.curdir, os.pardir)
                             }
                             # Only use these if we didn't find files directly
                             if not safetensors_list:
@@ -3457,27 +3459,25 @@ def merge_and_overwrite_lora(
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
     ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
+    # Refuse an unsafe index before any branch decides whether to copy it. Filtering
+    # the in-memory shard list is not enough on its own: the index is what a later
+    # from_pretrained reads, and get_checkpoint_shard_files joins its raw weight_map
+    # values onto the model directory. The check sits outside the branch below because
+    # that branch is skipped entirely on a dequant or splitting export, and an in-place
+    # merge (save_directory == model_name) then leaves the unsafe index in the output
+    # directory, with regenerate_index false whenever one non-HF-named shard remains.
+    if is_local_path:
+        _local_index_path = os.path.join(model_name, "model.safetensors.index.json")
+        if os.path.exists(_local_index_path):
+            _reject_unsafe_shard_index(_local_index_path)
     # ONLY download/copy the original index if we are NOT dequantizing a quantized model
     if not _is_quant_dequant and not needs_splitting:
         if is_local_path:
             os.makedirs(save_directory, exist_ok = True)
             # Copy from local
             local_index_path = os.path.join(model_name, "model.safetensors.index.json")
-            # Validate before the copy decision, not inside it. When the export is
-            # in place (save_directory == model_name) and the filtered list leaves
-            # a single shard, safe_tensor_index_files is empty and no copy happens,
-            # yet the unsafe index is already sitting in the output directory for
-            # the next from_pretrained to follow.
-            if os.path.exists(local_index_path):
-                _reject_unsafe_shard_index(local_index_path)
             if safe_tensor_index_files:
                 if os.path.exists(local_index_path):
-                    # Filtering the in-memory shard list is not enough on its own: the
-                    # index itself is what a later from_pretrained reads, and
-                    # get_checkpoint_shard_files joins its raw weight_map values onto
-                    # the model directory. Copying it verbatim would export a file that
-                    # still points outside the directory the user asked for.
-                    _reject_unsafe_shard_index(local_index_path)
                     try:
                         shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
                     except shutil.SameFileError:
