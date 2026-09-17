@@ -875,6 +875,25 @@ def _live_writer_walk_was_complete() -> bool:
     return bool(getattr(_LIVE_WRITER_WALK, "complete", True))
 
 
+def _read_proc_text(path: str) -> Optional[str]:
+    """One `/proc` file as text, or ``None`` when it cannot be read. A seam, so the tests for
+    the namespace detection do not have to patch `open` for the whole interpreter."""
+    try:
+        with open(path, "r", encoding = "utf-8", errors = "replace") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _device_of(path) -> Optional[int]:
+    """`st_dev` for *path*, or ``None`` when it cannot be stat'ed. A seam, for the same
+    reason: the mount topology of the machine running the tests is not the thing under test."""
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
 def _process_walk_sees_every_writer(cache_dir: Optional[str] = None) -> bool:
     """Whether `psutil.process_iter` can see every process that might be writing here.
 
@@ -898,29 +917,53 @@ def _process_walk_sees_every_writer(cache_dir: Optional[str] = None) -> bool:
         if root is None:
             return False
         # Same device as this container's own root: not a shared volume.
-        return os.stat(root).st_dev == os.stat("/").st_dev
+        cache_device, root_device = _device_of(root), _device_of("/")
+        if cache_device is None or root_device is None:
+            return False
+        return cache_device == root_device
     except Exception:
         return False
 
 
-def _running_in_a_container() -> bool:
-    """Whether this process is in a container, and so in its own PID namespace.
+# What PID 1 is called on a host that is not a container. A namespaced process walk is the
+# thing being detected, and PID 1 being an init system is the strongest available evidence
+# that this IS the host: a container's PID 1 is whatever its entrypoint runs.
+_HOST_INIT_NAMES = frozenset({
+    "systemd", "init", "launchd", "runit", "openrc-init", "s6-svscan", "upstart", "sysvinit",
+})
 
-    The markers Docker, Podman and Kubernetes leave, read in that order. False for anything
-    unreadable, which is the ordinary-host answer and the one that keeps the purge working
-    where nothing is shared.
+
+def _running_in_a_container() -> bool:
+    """Whether this process may be in its own PID namespace, so the walk cannot see the host.
+
+    Three readings, and UNCERTAIN answers yes, because the cost of a wrong yes is one purge
+    declined while the cost of a wrong no is a sibling's download unlinked mid-write.
+
+    The runtime markers Docker, Podman and Kubernetes leave are only the first: they are
+    optional, and a cgroup-v2 container has neither of the files and a `/proc/1/cgroup` that
+    reads exactly `0::/` -- no marker anywhere in it. So the cgroup path is read for the
+    markers AND for that bare v2 line, and failing both, PID 1's own name decides: on a host
+    it is an init system, and in a container it is the entrypoint.
     """
     if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
         return True
-    try:
-        with open("/proc/1/cgroup", "r", encoding = "utf-8", errors = "replace") as handle:
-            cgroup = handle.read()
-    except OSError:
-        return False
-    return any(
+    cgroup = _read_proc_text("/proc/1/cgroup")
+    if cgroup is None:
+        return True                      # cannot tell, so do not claim the host
+    if any(
         marker in cgroup
-        for marker in ("docker", "kubepods", "containerd", "lxc", "podman")
-    )
+        for marker in ("docker", "kubepods", "containerd", "lxc", "podman", "libpod", "crio")
+    ):
+        return True
+    lines = [line for line in cgroup.splitlines() if line.strip()]
+    if lines == ["0::/"]:
+        # cgroup v2, PID 1 at the root of its own hierarchy: a container's shape. A host's
+        # PID 1 under systemd is in `/init.scope`.
+        return True
+    pid_one = _read_proc_text("/proc/1/comm")
+    if pid_one is None:
+        return True
+    return pid_one.strip() not in _HOST_INIT_NAMES
 
 
 def _group_is_private_to_this_user(gid: int) -> bool:

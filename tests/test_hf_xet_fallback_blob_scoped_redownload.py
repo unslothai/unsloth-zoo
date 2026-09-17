@@ -762,24 +762,61 @@ def test_the_namespace_test_reads_containerisation_and_where_the_cache_lives(mon
 
     On the container's root filesystem nobody outside can be writing into it. A separate
     mount is the shared volume this case is about, and there the walk stops being proof.
+
+    The topology is stubbed rather than read off the runner: `tmp_path` and `/` are on the
+    same filesystem on an ordinary Linux runner, which would make this assert the runner's
+    mount layout instead of the helper.
     """
     if os.name == "nt" or not os.path.isdir("/proc"):
         pytest.skip("POSIX containers only")
+
+    monkeypatch.setattr(xf, "hf_cache_root", lambda cache_dir = None: Path("/cache"))
+    devices = {"/": 1, "/cache": 1}
+    monkeypatch.setattr(xf, "_device_of", lambda path: devices[str(path)])
 
     monkeypatch.setattr(xf, "_running_in_a_container", lambda: False)
     assert xf._process_walk_sees_every_writer(str(tmp_path)) is True, (
         "an ordinary host lost the purge it is entitled to"
     )
 
+    # Containerised, cache on the container's own root filesystem: nobody outside is here.
     monkeypatch.setattr(xf, "_running_in_a_container", lambda: True)
-    # The workspace lives on its own mount here, so this IS the shared-volume shape.
-    assert os.stat(tmp_path).st_dev != os.stat("/").st_dev, (
-        "this host cannot pose the case: the temp dir is on the root filesystem"
-    )
-    assert xf._process_walk_sees_every_writer(str(tmp_path)) is False
-    # And a cache on the container's own root filesystem still answers yes.
-    monkeypatch.setattr(xf, "hf_cache_root", lambda cache_dir = None: Path("/"))
     assert xf._process_walk_sees_every_writer(str(tmp_path)) is True
+
+    # Containerised, cache on a separate mount: the shared volume this is about.
+    devices["/cache"] = 2
+    assert xf._process_walk_sees_every_writer(str(tmp_path)) is False
+
+
+def test_containerisation_is_not_read_off_optional_markers_alone(monkeypatch, tmp_path):
+    """A cgroup-v2 container leaves neither marker file and a `/proc/1/cgroup` of `0::/`.
+
+    Reading only the markers called that host, so the namespaced walk was treated as
+    exhaustive. PID 1's own name is the last reading: an init system is the host, an
+    entrypoint is a container, and anything unreadable is not claimed as the host.
+    """
+    if os.name == "nt" or not os.path.isdir("/proc"):
+        pytest.skip("POSIX /proc only")
+
+    files = {"/proc/1/cgroup": "0::/init.scope\n", "/proc/1/comm": "systemd\n"}
+    monkeypatch.setattr(xf.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(xf, "_read_proc_text", lambda path: files.get(str(path)))
+
+    assert xf._running_in_a_container() is False, "an ordinary systemd host read as a container"
+
+    files["/proc/1/cgroup"] = "0::/\n"
+    assert xf._running_in_a_container() is True, "a cgroup-v2 container read as the host"
+
+    files["/proc/1/cgroup"] = "0::/init.scope\n"
+    files["/proc/1/comm"] = "python3\n"
+    assert xf._running_in_a_container() is True, "a container whose PID 1 is its entrypoint"
+
+    files["/proc/1/cgroup"] = "12:pids:/kubepods/burstable/pod123\n"
+    files["/proc/1/comm"] = "systemd\n"
+    assert xf._running_in_a_container() is True
+
+    del files["/proc/1/cgroup"]
+    assert xf._running_in_a_container() is True, "unreadable is not evidence of the host"
 
 
 def test_a_deletion_time_walk_that_could_not_read_every_process_declines(monkeypatch, tmp_path):
