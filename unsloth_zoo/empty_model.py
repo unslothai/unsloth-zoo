@@ -21,6 +21,7 @@ __all__ = [
     "patch_gemma4_vllm_lora_support",
     "patch_gemma4_vllm_k_eq_v_support",
     "extract_gdn_layers",
+    "extract_moe_layers",
     "extract_vision_layers",
     "get_model_layer_config",
     "compare_attributes",
@@ -1093,6 +1094,25 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.feed_forward.gate.weight",
             "model.layers.{kk}.feed_forward.expert_bias",
 
+            # Sparse MoE blocks. experts.{gate_up,down}_proj are bare stacked Parameters
+            # rather than Linears, which the assignment loop handles via its
+            # "layer_name in quant_state_dict" branch (no ".weight" suffix).
+            "model.language_model.layers.{kk}.mlp.gate",
+            "model.language_model.layers.{kk}.mlp.shared_expert_gate",
+            "model.language_model.layers.{kk}.mlp.shared_expert.gate_proj",
+            "model.language_model.layers.{kk}.mlp.shared_expert.up_proj",
+            "model.language_model.layers.{kk}.mlp.shared_expert.down_proj",
+            "model.language_model.layers.{kk}.mlp.experts.gate_up_proj",
+            "model.language_model.layers.{kk}.mlp.experts.down_proj",
+
+            "model.layers.{kk}.mlp.gate",
+            "model.layers.{kk}.mlp.shared_expert_gate",
+            "model.layers.{kk}.mlp.shared_expert.gate_proj",
+            "model.layers.{kk}.mlp.shared_expert.up_proj",
+            "model.layers.{kk}.mlp.shared_expert.down_proj",
+            "model.layers.{kk}.mlp.experts.gate_up_proj",
+            "model.layers.{kk}.mlp.experts.down_proj",
+
             # Gemma4 per-layer input modules
             "model.language_model.layers.{kk}.per_layer_input_gate",
             "model.language_model.layers.{kk}.per_layer_projection",
@@ -1391,6 +1411,66 @@ def _get_nested_attr(obj, attr_path: str):
     except (AttributeError, IndexError):
         return None
     return None
+
+
+def extract_moe_layers(mlp, prefix, state_dict, quant_state_dict, get_state_dict):
+    """Alias a vLLM sparse MoE block's weights onto their HF names.
+
+    The routed experts are stacked 3-D Parameters rather than Linears, so get_state_dict,
+    which reads proj.weight, cannot reach them. vLLM stores them as (E, 2*inter, hidden)
+    and (E, hidden, inter), which is exactly what the HF checkpoint holds, so both alias
+    with no reshape and no copy.
+
+    That equivalence only holds for the untiled MoE backends. FlashInfer TRT-LLM rewrites
+    the experts into a (E, hidden/64, 2*inter, 64) block layout, which is a permute of the
+    above and therefore cannot be viewed back; the ndim check below refuses it rather than
+    silently materialising a second copy of the expert weights.
+    """
+    def store(name, value):
+        state_dict[name] = value
+        quant_state_dict[name] = value
+
+    # Router and shared-expert gate are plain Linears, unsharded.
+    gate = getattr(mlp, "gate", None)
+    if gate is not None:
+        get_state_dict(f"{prefix}.gate", 0, state_dict, gate, slice_weights = False)
+
+    shared_expert_gate = getattr(mlp, "shared_expert_gate", None)
+    if shared_expert_gate is not None:
+        get_state_dict(f"{prefix}.shared_expert_gate", 0, state_dict, shared_expert_gate, slice_weights = False)
+
+    # The shared expert is dense. vLLM fuses gate+up into one tensor while HF keeps them
+    # separate, so the two HF tensors are slice views of the single vLLM one.
+    shared_expert = getattr(mlp, "shared_expert", None)
+    if shared_expert is not None and hasattr(shared_expert, "gate_up_proj"):
+        get_state_dict(f"{prefix}.shared_expert.gate_proj", 0, state_dict, shared_expert.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_expert.up_proj",   1, state_dict, shared_expert.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_expert.down_proj", 0, state_dict, shared_expert.down_proj, slice_weights = False)
+
+    experts = getattr(mlp, "experts", None)
+    if experts is None: return
+    experts = getattr(experts, "base_layer", experts)
+    experts = getattr(experts, "routed_experts", experts)
+
+    w13 = getattr(experts, "w13_weight", None)
+    w2  = getattr(experts, "w2_weight",  None)
+    if w13 is None or w2 is None:
+        raise RuntimeError(
+            f"Unsloth: could not find stacked expert weights (w13_weight / w2_weight) for {prefix}. "
+            f"vLLM exposed: {[n for n, _ in experts.named_parameters()]}"
+        )
+    if w13.ndim != 3 or w2.ndim != 3:
+        raise RuntimeError(
+            f"Unsloth: vLLM stored the MoE experts for {prefix} in a {w13.ndim}-D kernel layout "
+            f"({tuple(w13.shape)}), which is a permute of the HF layout and cannot be aliased. "
+            "Weight sharing needs an untiled MoE backend."
+        )
+    w13.requires_grad_(False)
+    w2 .requires_grad_(False)
+    # HF holds these as bare Parameters, so unlike every Linear above there is no ".weight".
+    store(f"{prefix}.experts.gate_up_proj", w13.data)
+    store(f"{prefix}.experts.down_proj",    w2 .data)
+pass
 
 
 def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_state_dict):

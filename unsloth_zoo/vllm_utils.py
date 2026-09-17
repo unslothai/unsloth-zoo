@@ -601,6 +601,33 @@ else:
     pass
 pass
 
+def patch_vllm_untiled_moe_experts():
+    """Keep vLLM's routed expert weights in a layout Unsloth can alias.
+
+    With LoRA enabled, vLLM's unquantized MoE oracle returns FlashInfer TRT-LLM before it
+    ever consults the user's --moe-backend, and that backend rewrites the experts into a
+    (E, hidden/64, 2*inter, 64) block layout. That is a permute of the HF layout, so it
+    cannot be viewed back, and weight sharing would degrade into a second full copy of the
+    expert weights, which for a 35B-A3B model is the entire cost we are trying to avoid.
+
+    Declining the TRT-LLM LoRA path drops the oracle to Triton, whose weights are plain
+    contiguous (E, 2*inter, hidden) / (E, hidden, inter), matching HF exactly. The trade is
+    a slower rollout MoE kernel for one shared copy of the expert weights.
+    """
+    try:
+        from vllm.model_executor.layers.fused_moe.oracle import unquantized as _unquantized
+    except Exception as e:
+        # Older vLLM has no such oracle, and therefore no tiled LoRA path to decline.
+        logger.info(f"Unsloth: no unquantized MoE oracle to patch: {e}")
+        return False
+    if not hasattr(_unquantized, "_trtllm_bf16_lora_supported"):
+        return False
+    _unquantized._trtllm_bf16_lora_supported = lambda moe_config: False
+    logger.info("Unsloth: Forcing an untiled MoE backend so expert weights stay shareable.")
+    return True
+pass
+
+
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
     try:
@@ -935,6 +962,11 @@ def patch_vllm(debug = True):
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
+    # Weight sharing is the whole point of fast_inference, and the tiled TRT-LLM expert
+    # layout defeats it, so decline it by default. Opt back in to trade a second copy of
+    # the expert weights for the faster rollout kernel.
+    if os.getenv("UNSLOTH_VLLM_TILED_MOE", "0") == "0":
+        patch_vllm_untiled_moe_experts()
     # Match load_vllm's standby check (!= "0") so any truthy value also installs
     # the sleep + cache-reset patches, not just "1".
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0":
@@ -1397,6 +1429,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 "set fast_inference = False."
             )
         if not hasattr(layer, "mlp"):
+            continue
+
+        mlp_prefix = f"{vllm_text_model_prefix}.layers.{kk}.mlp"
+        if not hasattr(layer.mlp, "gate_up_proj") and hasattr(layer.mlp, "experts"):
+            # Sparse MoE block: routed experts are stacked Parameters, not Linears.
+            extract_moe_layers(
+                layer.mlp, mlp_prefix, state_dict, quant_state_dict, get_state_dict,
+            )
             continue
 
         proj = layer.mlp.gate_up_proj
@@ -1917,7 +1957,15 @@ def approximate_vllm_memory_usage(
     vocab_size = config.vocab_size
     hd = config.hidden_size
     context_length = config.max_position_embeddings
-    mlp_size = config.intermediate_size
+    # Sparse MoE configs (Qwen3.5 / 3.6 MoE, Qwen3-Next) carry no dense intermediate_size at
+    # all, so reading it unguarded is an AttributeError before we ever reach the estimate.
+    n_experts   = getattr(config, "num_experts", None) or getattr(config, "num_local_experts", None) or 0
+    moe_size    = getattr(config, "moe_intermediate_size", None)
+    shared_size = getattr(config, "shared_expert_intermediate_size", None) or 0
+    is_moe      = bool(n_experts) and moe_size is not None
+
+    mlp_size = getattr(config, "intermediate_size", None)
+    if mlp_size is None: mlp_size = moe_size if moe_size is not None else hd
     n_layers = config.num_hidden_layers
     n_kv_heads = getattr(config, "num_key_value_heads", 1)
     n_heads    = getattr(config, "num_attention_heads", 1)
@@ -1927,7 +1975,11 @@ def approximate_vllm_memory_usage(
     # Modules
     qkvo = hd + kv_size + kv_size + hd
     qkvo = qkvo * hd
-    mlp  = (hd * mlp_size) * 3
+    if is_moe:
+        # gate_up (2) + down (1) per routed expert, plus the dense shared expert and router.
+        mlp = n_experts * (hd * moe_size) * 3 + (hd * shared_size) * 3 + hd * n_experts
+    else:
+        mlp  = (hd * mlp_size) * 3
     layernorms = 2 * hd
     embed_tokens = vocab_size * hd
     lm_head = 0 if getattr(config, "tie_word_embeddings", True) else vocab_size * hd
@@ -1937,6 +1989,11 @@ def approximate_vllm_memory_usage(
     qkvo_B = max_lora_rank * (hd + kv_size + kv_size + hd)
     mlp_A  = hd * max_lora_rank * 2 + mlp_size * max_lora_rank
     mlp_B  = max_lora_rank * (mlp_size + mlp_size) + max_lora_rank * hd
+    if is_moe:
+        # Expert adapters are stacked over experts, so they scale with the expert count,
+        # which at 256 experts dwarfs the dense terms rather than matching them.
+        mlp_A = n_experts * (hd * max_lora_rank * 2 + moe_size * max_lora_rank)
+        mlp_B = n_experts * (max_lora_rank * (moe_size + moe_size) + max_lora_rank * hd)
     lora_elements = qkvo_A + qkvo_B + mlp_A + mlp_B
     lora_elements = lora_elements * max_loras
     # 2 bytes = float16 for LoRA
