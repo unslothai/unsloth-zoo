@@ -52,6 +52,29 @@ def _ls(lora_A: torch.Tensor, lora_B: torch.Tensor, alpha: float) -> LoraStats:
     return LoraStats(module=None, lora_A=lora_A, lora_B=lora_B, alpha=alpha)
 
 
+# A fused MoE expert LoRA is two ordinary Linear weights, and PEFT does NOT flatten them the
+# same way. `lora_A` is `(num_experts * rank, in)` with the expert index SLOWEST, so expert `e`
+# is the contiguous row block `e*rank : (e+1)*rank`. `lora_B` is `(out, num_experts * rank)`
+# with the expert index FASTEST: `ParamWrapper.get_delta_factors` does
+# `lora_B.reshape(out, -1, num_experts).permute(2, 0, 1)`, so expert `e` is plane `e` of that
+# reshape, i.e. columns `e::num_experts`. Both are written out below rather than imported from
+# `unsloth_zoo.temporary_patches.moe_utils`: an expectation that called the helper the merge
+# calls would agree with any packing the helper happened to implement and could never fail.
+
+def _peft_expert_lora_b(lora_B: torch.Tensor, expert_idx: int, num_experts: int) -> torch.Tensor:
+    """Expert `expert_idx`'s `(out, rank)` block of a fused `lora_B`, as PEFT packs it."""
+    return lora_B.reshape(lora_B.shape[0], -1, num_experts)[:, :, expert_idx]
+
+
+def _expert_slowest_lora_b(lora_B: torch.Tensor, expert_idx: int, rank_per: int) -> torch.Tensor:
+    """The pre-fix reading: one contiguous rank-wide column block per expert.
+
+    Valid for every `(num_experts, rank)` since `num_experts * rank == rank * num_experts`, so
+    it never raises and the norm of the delta barely moves. Kept only so a test can assert the
+    merge does NOT produce it."""
+    return lora_B[:, expert_idx * rank_per:(expert_idx + 1) * rank_per]
+
+
 # 1. _active_merge_device — recent fix that replaced the W-based helper.
 
 def test_active_merge_device_returns_string_on_gpu():
@@ -158,14 +181,17 @@ def test_merge_lora_returns_W_when_lora_missing():
 def test_merge_moe_gate_expert():
     """gate_W shape (inter_dim, hidden_dim).  delta = (B @ gate_a).T."""
     torch.manual_seed(SEED)
-    num_experts, rank_per, inter_dim, hidden_dim = 4, 4, 8, 12
+    # num_experts != rank_per so a confusion of the two axes cannot pass unnoticed, and the
+    # factors are scaled so the delta is large against the atol below: at 0.05 the whole delta
+    # was smaller than the tolerance and this test passed under either lora_B packing.
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 3, 8, 12
     total_rank = num_experts * rank_per
     two_inter = 2 * inter_dim
     alpha = 8.0
 
     gate_W = torch.randn(inter_dim, hidden_dim, dtype=torch.bfloat16)
-    lora_A = torch.randn(total_rank, two_inter, dtype=torch.bfloat16) * 0.05
-    lora_B = torch.randn(hidden_dim, total_rank, dtype=torch.bfloat16) * 0.05
+    lora_A = torch.randn(total_rank, two_inter, dtype=torch.bfloat16) * 0.5
+    lora_B = torch.randn(hidden_dim, total_rank, dtype=torch.bfloat16) * 0.5
     expert_idx = 1
     out = _merge_moe_gate_expert(gate_W.clone(), _ls(lora_A, lora_B, alpha),
                                  expert_idx=expert_idx, num_experts=num_experts,
@@ -173,7 +199,7 @@ def test_merge_moe_gate_expert():
 
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
-    b_slice = lora_B[:, s:e].to(torch.float32)
+    b_slice = _peft_expert_lora_b(lora_B, expert_idx, num_experts).to(torch.float32)
     gate_a = a_slice[:, :inter_dim]
     gate_delta = b_slice @ gate_a  # (H, I)
     expected = gate_W.to(torch.float32) + alpha * gate_delta.T  # (I, H)
@@ -187,14 +213,16 @@ def test_merge_moe_gate_expert():
 
 def test_merge_moe_up_expert():
     torch.manual_seed(SEED)
-    num_experts, rank_per, inter_dim, hidden_dim = 4, 4, 8, 12
+    # See test_merge_moe_gate_expert for why num_experts != rank_per and why the factors are
+    # not scaled by 0.05 any more.
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 3, 8, 12
     total_rank = num_experts * rank_per
     two_inter = 2 * inter_dim
     alpha = 8.0
 
     up_W = torch.randn(inter_dim, hidden_dim, dtype=torch.bfloat16)
-    lora_A = torch.randn(total_rank, two_inter, dtype=torch.bfloat16) * 0.05
-    lora_B = torch.randn(hidden_dim, total_rank, dtype=torch.bfloat16) * 0.05
+    lora_A = torch.randn(total_rank, two_inter, dtype=torch.bfloat16) * 0.5
+    lora_B = torch.randn(hidden_dim, total_rank, dtype=torch.bfloat16) * 0.5
     expert_idx = 2
     out = _merge_moe_up_expert(up_W.clone(), _ls(lora_A, lora_B, alpha),
                                expert_idx=expert_idx, num_experts=num_experts,
@@ -202,7 +230,7 @@ def test_merge_moe_up_expert():
 
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
-    b_slice = lora_B[:, s:e].to(torch.float32)
+    b_slice = _peft_expert_lora_b(lora_B, expert_idx, num_experts).to(torch.float32)
     up_a = a_slice[:, inter_dim:]
     up_delta = b_slice @ up_a
     expected = up_W.to(torch.float32) + alpha * up_delta.T
@@ -215,14 +243,14 @@ def test_merge_moe_up_expert():
 def test_merge_moe_down_proj_expert():
     """down_W shape (H, I).  A: (total_rank, H).  B: (I, total_rank).  delta = (B @ A).T = (H, I)."""
     torch.manual_seed(SEED)
-    num_experts, rank_per = 4, 4
+    num_experts, rank_per = 4, 3
     total_rank = num_experts * rank_per
     H, I = 12, 8  # hidden_dim, intermediate_dim
     alpha = 8.0
 
     down_W = torch.randn(H, I, dtype=torch.bfloat16)
-    lora_A = torch.randn(total_rank, H, dtype=torch.bfloat16) * 0.05  # A.shape[1] = H = out_dim
-    lora_B = torch.randn(I, total_rank, dtype=torch.bfloat16) * 0.05  # B.shape[0] = I = in_dim
+    lora_A = torch.randn(total_rank, H, dtype=torch.bfloat16) * 0.5  # A.shape[1] = H = out_dim
+    lora_B = torch.randn(I, total_rank, dtype=torch.bfloat16) * 0.5  # B.shape[0] = I = in_dim
     expert_idx = 3
     out = _merge_moe_down_proj_expert(down_W.clone(), _ls(lora_A, lora_B, alpha),
                                       expert_idx=expert_idx, num_experts=num_experts,
@@ -230,7 +258,7 @@ def test_merge_moe_down_proj_expert():
 
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)         # (R, H)
-    b_slice = lora_B[:, s:e].to(torch.float32)      # (I, R)
+    b_slice = _peft_expert_lora_b(lora_B, expert_idx, num_experts).to(torch.float32)  # (I, R)
     delta = b_slice @ a_slice                       # (I, H)
     expected = down_W.to(torch.float32) + alpha * delta.T  # (H, I)
 
@@ -243,7 +271,7 @@ def test_merge_moe_down_proj_expert():
 def test_merge_moe_fused_gate_up_expert(is_transposed):
     """Both transposed (GPT-OSS) and standard (Gemma4) layouts."""
     torch.manual_seed(SEED)
-    num_experts, rank_per = 4, 4
+    num_experts, rank_per = 4, 3
     total_rank = num_experts * rank_per
     inter_dim, hidden_dim = 8, 12
     two_inter = 2 * inter_dim
@@ -267,7 +295,8 @@ def test_merge_moe_fused_gate_up_expert(is_transposed):
     expected = gate_up_W.to(torch.float32).clone()
     for ei in range(num_experts):
         s, e = ei * rank_per, (ei + 1) * rank_per
-        delta = lora_B[:, s:e].to(torch.float32) @ lora_A[s:e].to(torch.float32)
+        b_e = _peft_expert_lora_b(lora_B, ei, num_experts).to(torch.float32)
+        delta = b_e @ lora_A[s:e].to(torch.float32)
         expected[ei] = expected[ei] + alpha * (delta.T if is_transposed else delta)
 
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
@@ -287,7 +316,7 @@ def test_merge_moe_fused_down_proj_expert(is_transposed):
     Then merged[ei] += delta.T if use_transpose else delta.
     """
     torch.manual_seed(SEED)
-    num_experts, rank_per = 4, 4
+    num_experts, rank_per = 4, 3
     total_rank = num_experts * rank_per
     H, I = 12, 8
     alpha = 8.0
@@ -312,7 +341,8 @@ def test_merge_moe_fused_down_proj_expert(is_transposed):
     expected = down_W.to(torch.float32).clone()
     for ei in range(num_experts):
         s, e = ei * rank_per, (ei + 1) * rank_per
-        delta = lora_B[:, s:e].to(torch.float32) @ lora_A[s:e].to(torch.float32)
+        b_e = _peft_expert_lora_b(lora_B, ei, num_experts).to(torch.float32)
+        delta = b_e @ lora_A[s:e].to(torch.float32)
         expected[ei] = expected[ei] + alpha * (delta.T if is_transposed else delta)
 
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
@@ -322,13 +352,13 @@ def test_merge_moe_fused_down_proj_expert(is_transposed):
 
 def test_merge_moe_gate_expert_standard_layout():
     torch.manual_seed(SEED)
-    num_experts, rank_per, inter_dim, hidden_dim = 4, 4, 8, 12
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 3, 8, 12
     total_rank = num_experts * rank_per
     alpha = 8.0
 
     gate_W = torch.randn(inter_dim, hidden_dim, dtype=torch.bfloat16)
-    lora_A = torch.randn(total_rank, hidden_dim,  dtype=torch.bfloat16) * 0.05
-    lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.bfloat16) * 0.05
+    lora_A = torch.randn(total_rank, hidden_dim,  dtype=torch.bfloat16) * 0.5
+    lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.bfloat16) * 0.5
     expert_idx = 1
 
     out = _merge_moe_gate_expert(
@@ -338,7 +368,7 @@ def test_merge_moe_gate_expert_standard_layout():
     )
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
-    b_slice = lora_B[:, s:e].to(torch.float32)
+    b_slice = _peft_expert_lora_b(lora_B, expert_idx, num_experts).to(torch.float32)
     delta = b_slice[:inter_dim, :] @ a_slice
     expected = gate_W.to(torch.float32) + alpha * delta
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
@@ -346,13 +376,13 @@ def test_merge_moe_gate_expert_standard_layout():
 
 def test_merge_moe_up_expert_standard_layout():
     torch.manual_seed(SEED)
-    num_experts, rank_per, inter_dim, hidden_dim = 4, 4, 8, 12
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 3, 8, 12
     total_rank = num_experts * rank_per
     alpha = 8.0
 
     up_W = torch.randn(inter_dim, hidden_dim, dtype=torch.bfloat16)
-    lora_A = torch.randn(total_rank, hidden_dim,  dtype=torch.bfloat16) * 0.05
-    lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.bfloat16) * 0.05
+    lora_A = torch.randn(total_rank, hidden_dim,  dtype=torch.bfloat16) * 0.5
+    lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.bfloat16) * 0.5
     expert_idx = 2
 
     out = _merge_moe_up_expert(
@@ -362,7 +392,7 @@ def test_merge_moe_up_expert_standard_layout():
     )
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
-    b_slice = lora_B[:, s:e].to(torch.float32)
+    b_slice = _peft_expert_lora_b(lora_B, expert_idx, num_experts).to(torch.float32)
     delta = b_slice[inter_dim:, :] @ a_slice
     expected = up_W.to(torch.float32) + alpha * delta
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
@@ -370,14 +400,14 @@ def test_merge_moe_up_expert_standard_layout():
 
 def test_merge_moe_down_proj_expert_standard_layout():
     torch.manual_seed(SEED)
-    num_experts, rank_per = 4, 4
+    num_experts, rank_per = 4, 3
     total_rank = num_experts * rank_per
     H, I = 12, 8
     alpha = 8.0
 
     down_W = torch.randn(H, I, dtype=torch.bfloat16)
-    lora_A = torch.randn(total_rank, I, dtype=torch.bfloat16) * 0.05
-    lora_B = torch.randn(H, total_rank, dtype=torch.bfloat16) * 0.05
+    lora_A = torch.randn(total_rank, I, dtype=torch.bfloat16) * 0.5
+    lora_B = torch.randn(H, total_rank, dtype=torch.bfloat16) * 0.5
     expert_idx = 3
 
     out = _merge_moe_down_proj_expert(
@@ -387,10 +417,84 @@ def test_merge_moe_down_proj_expert_standard_layout():
     )
     s, e = expert_idx * rank_per, (expert_idx + 1) * rank_per
     a_slice = lora_A[s:e].to(torch.float32)
-    b_slice = lora_B[:, s:e].to(torch.float32)
+    b_slice = _peft_expert_lora_b(lora_B, expert_idx, num_experts).to(torch.float32)
     delta = b_slice @ a_slice
     expected = down_W.to(torch.float32) + alpha * delta
     torch.testing.assert_close(out.to(torch.float32).cpu(), expected, atol=1e-1, rtol=1e-1)
+
+
+# 8b. The packing itself: the merge must reproduce PEFT's reading and must NOT reproduce the
+#     pre-fix one, and the legacy override has to still reach an adapter trained before it.
+
+def test_moe_expert_merge_rejects_the_expert_slowest_reading():
+    """A merge that read lora_B expert-slowest would still produce a correctly shaped, similarly
+    sized delta, so only an explicit mismatch assertion catches a swap back. Run in float32 with
+    a tight tolerance so "matches PEFT" and "does not match the old reading" are both decided by
+    the packing and not by bf16 rounding."""
+    torch.manual_seed(SEED)
+    num_experts, rank_per = 4, 3
+    total_rank = num_experts * rank_per
+    inter_dim, hidden_dim = 8, 12
+    two_inter = 2 * inter_dim
+    alpha = 8.0
+
+    gate_up_W = torch.randn(num_experts, two_inter, hidden_dim, dtype=torch.float32)
+    lora_A = torch.randn(total_rank, hidden_dim, dtype=torch.float32) * 0.5
+    lora_B = torch.randn(two_inter, total_rank, dtype=torch.float32) * 0.5
+
+    out = _merge_moe_fused_gate_up_expert(
+        gate_up_W.clone(), _ls(lora_A, lora_B, alpha),
+        output_dtype=torch.float32, is_transposed=False,
+    ).to(torch.float32).cpu()
+
+    peft = gate_up_W.clone()
+    old  = gate_up_W.clone()
+    for ei in range(num_experts):
+        a_e = lora_A[ei * rank_per:(ei + 1) * rank_per]
+        peft[ei] += alpha * (_peft_expert_lora_b(lora_B, ei, num_experts) @ a_e)
+        old[ei]  += alpha * (_expert_slowest_lora_b(lora_B, ei, rank_per) @ a_e)
+
+    torch.testing.assert_close(out, peft, atol=1e-4, rtol=1e-4)
+
+    # The two readings must be far apart for this to mean anything: E and rank are both > 1, so
+    # they are, and the delta is large enough to see. Guard the fixture, then the merge.
+    separation = (peft - old).abs().max().item()
+    assert separation > 1.0, (
+        f"fixture is degenerate: the two lora_B readings differ by only {separation:.2e}, so "
+        "this test would pass under either of them"
+    )
+    assert (out - old).abs().max().item() > 1.0, (
+        "the merge reproduced the pre-fix expert-slowest reading of lora_B"
+    )
+
+
+@pytest.mark.parametrize("layout", ["rank_major", "grouped_by_expert"])
+def test_moe_expert_merge_follows_the_layout_override(monkeypatch, layout):
+    """`UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` is the only way to read back an adapter
+    trained by a pre-fix Unsloth, so the per-expert merge path has to honour it, not just the
+    fused one. Both values are covered here so neither reading can be dropped silently."""
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", layout)
+    torch.manual_seed(SEED)
+    num_experts, rank_per, inter_dim, hidden_dim = 4, 3, 8, 12
+    total_rank = num_experts * rank_per
+    alpha = 8.0
+
+    gate_W = torch.randn(inter_dim, hidden_dim, dtype=torch.float32)
+    lora_A = torch.randn(total_rank, hidden_dim, dtype=torch.float32) * 0.5
+    lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.float32) * 0.5
+    expert_idx = 1
+
+    out = _merge_moe_gate_expert(
+        gate_W.clone(), _ls(lora_A, lora_B, alpha),
+        expert_idx=expert_idx, num_experts=num_experts,
+        output_dtype=torch.float32,
+    ).to(torch.float32).cpu()
+
+    b_slice = (_peft_expert_lora_b(lora_B, expert_idx, num_experts) if layout == "rank_major"
+               else _expert_slowest_lora_b(lora_B, expert_idx, rank_per))
+    a_slice = lora_A[expert_idx * rank_per:(expert_idx + 1) * rank_per]
+    expected = gate_W + alpha * (b_slice[:inter_dim, :] @ a_slice)
+    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
 
 
 # 9. Layout detection + fallback (#5410).
