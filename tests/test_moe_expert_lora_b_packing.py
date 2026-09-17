@@ -38,6 +38,7 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 from unsloth_zoo.temporary_patches.moe_utils import (  # noqa: E402
     LORA_B_LAYOUT_GROUPED_BY_EXPERT,
     LORA_B_LAYOUT_RANK_MAJOR,
+    MoELoRABLayoutError,
     _canonical_lora_weights_for_grouped_mm,
     _reversed_lora_weights_for_grouped_mm,
     moe_lora_b_expert_columns,
@@ -421,3 +422,31 @@ def test_the_saving_utils_fallback_rejects_a_misspelled_layout(monkeypatch):
         _fallback_layout(None)
     with pytest.raises(ValueError):
         _fallback_layout("expert_major")
+
+
+def test_an_explicit_layout_is_validated_not_assumed_grouped():
+    """Both readers branch on "is this rank_major" and fall through to grouped_by_expert,
+    so an unvalidated typo in an explicit argument is not a no-op: it permutes the columns
+    of a standard adapter. A converter passing a layout in from a marker or a command line
+    is the likeliest source of one, and it is exactly the damage moe_lora_b_layout()
+    validates the environment variable to prevent."""
+    weight_B = torch.arange(6 * 4, dtype=torch.float32).reshape(6, 4)
+    for bad in ("rank-major", "grouped", "RANK_MAJOR", "", "expert_major"):
+        with pytest.raises(MoELoRABLayoutError):
+            unflatten_moe_lora_b(weight_B, 2, 2, 6, layout=bad)
+        with pytest.raises(MoELoRABLayoutError):
+            moe_lora_b_expert_columns(0, 2, 2, layout=bad)
+
+
+def test_both_valid_layouts_still_pass_through_explicitly():
+    """The validator must not reject the two real values, including when they are named
+    explicitly rather than resolved from the environment."""
+    weight_B = torch.arange(6 * 4, dtype=torch.float32).reshape(6, 4)
+    for good in (LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT):
+        assert unflatten_moe_lora_b(weight_B, 2, 2, 6, layout=good).shape == (2, 6, 2)
+        assert isinstance(moe_lora_b_expert_columns(0, 2, 2, layout=good), slice)
+    # and the two disagree, so the argument is load-bearing rather than decorative
+    assert not torch.equal(
+        unflatten_moe_lora_b(weight_B, 2, 2, 6, layout=LORA_B_LAYOUT_RANK_MAJOR),
+        unflatten_moe_lora_b(weight_B, 2, 2, 6, layout=LORA_B_LAYOUT_GROUPED_BY_EXPERT),
+    )

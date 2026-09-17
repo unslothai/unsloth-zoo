@@ -895,6 +895,26 @@ def moe_lora_b_layout() -> str:
     return layout
 
 
+def _resolve_moe_lora_b_layout(layout) -> str:
+    """The layout to use, whether the caller named one or left it to the environment.
+
+    A caller that names one still gets it validated. Both readers branch on "is this
+    rank_major" and fall through to grouped_by_expert otherwise, so an unvalidated typo
+    is not a no-op: it permutes the columns of a standard adapter, silently, which is the
+    exact damage `moe_lora_b_layout()` validates the environment variable to prevent. A
+    converter passing the layout in from a marker or a command line is the likeliest
+    source of one."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if layout is None:
+        return moe_lora_b_layout()
+    if layout not in _LORA_B_LAYOUTS:
+        raise MoELoRABLayoutError(
+            f"Unsloth: lora_B layout must be one of {_LORA_B_LAYOUTS}, got {layout!r}."
+        )
+    return layout
+
+
 def unflatten_moe_lora_b(
     weight_B: torch.Tensor,
     num_experts: int,
@@ -924,8 +944,7 @@ def unflatten_moe_lora_b(
     cannot fold into a view, it keeps the gradient flowing to `lora_B`, and its indices are
     a permutation, so its `index_add` backward has no duplicate targets to reduce
     nondeterministically."""
-    if layout is None:
-        layout = moe_lora_b_layout()
+    layout = _resolve_moe_lora_b_layout(layout)
     if layout == LORA_B_LAYOUT_RANK_MAJOR:
         # PEFT packs expert index fastest: column j holds expert `j % num_experts`.
         # Gather the columns into expert-major order, then read them the same way the
@@ -952,8 +971,7 @@ def moe_lora_b_expert_columns(
     must agree, which is why both live here. `lora_A`'s rows for the same expert are
     always `expert_idx * rank : (expert_idx + 1) * rank`, in both layouts, and the
     resulting column order matches that rank order."""
-    if layout is None:
-        layout = moe_lora_b_layout()
+    layout = _resolve_moe_lora_b_layout(layout)
     if layout == LORA_B_LAYOUT_RANK_MAJOR:
         return slice(expert_idx, num_experts * rank_per_expert, num_experts)
     return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
