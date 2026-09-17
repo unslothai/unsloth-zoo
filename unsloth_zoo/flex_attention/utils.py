@@ -52,8 +52,13 @@ try:
     # See https://github.com/pytorch/pytorch/issues/133254#issuecomment-2408710459
     # https://github.com/pytorch/pytorch/issues/133254#issuecomment-2539969593
     # Total capacity, like the gpt_oss probe: mem_get_info() would create a device
-    # context at import time and leave an otherwise idle process holding it.
-    vram_of_gpu = min(torch.cuda.get_device_properties(i).total_memory/1024/1024/1024 for i in range(torch.cuda.device_count()))
+    # context at import time and leave an otherwise idle process holding it. Integrated
+    # parts are the one exception, where properties may report only the dedicated
+    # carve-out and the driver total is the real budget; see cuda_total_memory.
+    # min() over no devices still raises, as it did before, so a GPU-less host keeps
+    # landing in the except below with HAS_FLEX_ATTENTION = False.
+    from unsloth_zoo.integrated_device import cuda_total_memory
+    vram_of_gpu = min(cuda_total_memory(i)/1024/1024/1024 for i in range(torch.cuda.device_count()))
     kernel_options = None
     if vram_of_gpu <= 16:
         kernel_options = {
