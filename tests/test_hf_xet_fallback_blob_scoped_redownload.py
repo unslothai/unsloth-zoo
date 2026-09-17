@@ -1744,12 +1744,14 @@ def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
         class path:
             @staticmethod
             def exists(path):
-                if path in simulated: return path in present
+                if path in simulated:
+                    return path in present
                 return os.path.exists(path)
 
             @staticmethod
             def isdir(path):
-                if path in simulated: return path in present
+                if path in simulated:
+                    return path in present
                 return os.path.isdir(path)
 
         def __getattr__(self, name):
