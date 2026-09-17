@@ -522,3 +522,49 @@ def test_the_column_reorder_saves_nothing_for_backward():
         weight = torch.randn(7, 4 * 3, requires_grad=True)
         _ExpertMajorColumns.apply(weight, 4, 3).sum().backward()
     assert saved == [], f"the reorder saved {len(saved)} tensor(s) for backward"
+
+
+def test_a_misspelled_layout_aborts_the_merge_before_anything_is_written(monkeypatch):
+    """A typo in UNSLOTH_MOE_LORA_B_LAYOUT is a configuration mistake, not an expert the
+    merge may skip.
+
+    The per-expert merge helpers wrap their body in `except Exception`, record a fallback
+    and return the base weight unchanged. `merge_and_overwrite_lora` writes, and can
+    upload, every shard before it consults `_MOE_MERGE_STATE["fallback"]`, so swallowing
+    this would publish a checkpoint with the expert deltas silently missing and only then
+    report failure. It has to escape instead."""
+    import unsloth_zoo.saving_utils as SU
+
+    num_experts, rank, I, H = 4, 2, 3, 5
+
+    _A = torch.zeros(num_experts * rank, H)
+    _B = torch.zeros(2 * I, num_experts * rank)
+
+    class _Stats:
+        lora_A = _A
+        lora_B = _B
+        alpha = 1.0
+        rank = 2
+        module = None
+
+    recorded = []
+    monkeypatch.setattr(
+        SU, "_record_moe_merge_fallback",
+        lambda *a, **k: recorded.append(a), raising=False,
+    )
+    W = torch.zeros(I, H)
+
+    # Sanity: with a VALID layout these shapes reach the merge rather than bailing out
+    # early, so the abort below is really the layout check and not a shape refusal.
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
+    SU._merge_moe_gate_expert(W, _Stats(), 0, num_experts, torch.float32)
+    assert recorded == [], f"the fixture bailed out before the layout call: {recorded}"
+
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", "rank-major")  # note the hyphen
+    for helper in (SU._merge_moe_gate_expert, SU._merge_moe_up_expert):
+        with pytest.raises(ValueError):
+            helper(W, _Stats(), 0, num_experts, torch.float32)
+    assert recorded == [], (
+        "a layout typo was recorded as a merged-unchanged expert instead of aborting: "
+        f"{recorded}"
+    )
