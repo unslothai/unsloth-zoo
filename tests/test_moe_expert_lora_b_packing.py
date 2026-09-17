@@ -568,3 +568,50 @@ def test_a_misspelled_layout_aborts_the_merge_before_anything_is_written(monkeyp
         "a layout typo was recorded as a merged-unchanged expert instead of aborting: "
         f"{recorded}"
     )
+
+
+def test_every_merge_helper_lets_a_layout_error_escape(monkeypatch):
+    """All four helpers, not just the two per-expert ones.
+
+    `_merge_moe_experts_file` writes whatever the fused helpers return, so a broad
+    `except Exception` there has the same consequence: a checkpoint written, and possibly
+    uploaded, with its expert deltas missing. The error is injected at a call inside each
+    helper's own `try`, which is precisely the ordering under test: the typed handler has
+    to come before the broad one.
+    """
+    import unsloth_zoo.saving_utils as SU
+
+    def _boom(*args, **kwargs):
+        raise SU._MoELoRABLayoutError("Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT is not a layout")
+
+    recorded = []
+    monkeypatch.setattr(
+        SU, "_record_moe_merge_fallback",
+        lambda *a, **k: recorded.append(a), raising=False,
+    )
+    monkeypatch.setattr(SU, "_refuse_dora_on_moe", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(SU, "_detect_moe_lora_layout", _boom, raising=False)
+    monkeypatch.setattr(SU, "_apply_fused_expert_lora_delta", _boom, raising=False)
+
+    class _Stats:
+        lora_A = torch.zeros(8, 5)
+        lora_B = torch.zeros(6, 8)
+        alpha = 1.0
+        rank = 2
+        module = None
+
+    per_expert = torch.zeros(3, 5)
+    fused = torch.zeros(4, 6, 5)
+    cases = (
+        (SU._merge_moe_gate_expert, (per_expert, _Stats(), 0, 4, torch.float32)),
+        (SU._merge_moe_up_expert, (per_expert, _Stats(), 0, 4, torch.float32)),
+        (SU._merge_moe_down_proj_expert, (per_expert, _Stats(), 0, 4, torch.float32)),
+        (SU._merge_moe_fused_gate_up_expert, (fused, _Stats(), torch.float32)),
+        (SU._merge_moe_fused_down_proj_expert, (fused, _Stats(), torch.float32)),
+    )
+    for helper, args in cases:
+        with pytest.raises(SU._MoELoRABLayoutError):
+            helper(*args)
+    assert recorded == [], (
+        f"a layout error was recorded as a merged-unchanged expert: {recorded}"
+    )

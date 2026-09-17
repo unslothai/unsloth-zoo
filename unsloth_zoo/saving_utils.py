@@ -2001,6 +2001,10 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
 
         _MOE_MERGE_STATE["applied"] += 1
         return gate_up_merged.to(output_dtype)
+    except _MoELoRABLayoutError:
+        # Same reasoning as the per-expert helpers: a misspelled layout is a configuration
+        # mistake, and _merge_moe_experts_file writes whatever this returns.
+        raise
     except Exception as exc:
         _record_moe_merge_fallback(
             "fused_gate_up", -1, repr(exc),
@@ -2079,6 +2083,10 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
 
         _MOE_MERGE_STATE["applied"] += 1
         return down_merged.to(output_dtype)
+    except _MoELoRABLayoutError:
+        # Same reasoning as the per-expert helpers: a misspelled layout is a configuration
+        # mistake, and _merge_moe_experts_file writes whatever this returns.
+        raise
     except Exception as exc:
         _record_moe_merge_fallback(
             "fused_down", -1, repr(exc),
