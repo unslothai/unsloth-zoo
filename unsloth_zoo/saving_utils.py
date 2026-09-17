@@ -1804,37 +1804,18 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
     return count
 
 
-LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
-LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
-
-
 def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, rank,
-                                   dim_A, dim_B, alpha, use_transpose,
-                                   lora_b_layout = LORA_B_LAYOUT_GROUPED_BY_EXPERT):
+                                   dim_A, dim_B, alpha, use_transpose):
     """In-place per-expert LoRA merge for a fused MoE weight: merged[e] += alpha * B_e @ A_e
     (transposed for GPT-OSS layouts). On an accelerator this batches all experts into one bmm; on
     CPU it loops. Both use a plain bmm/matmul + add_ (not baddbmm), so the result is
     bitwise-identical in fp32/bf16/fp16 (callers run fp32). The batched bmm allocates a full
     (E, dim_B, dim_A) fp32 delta (~8 GiB for a 128-expert 5760x2880 merge); on OOM we fall back to
-    the loop so the merge completes rather than the caller writing back an unmerged weight.
-
-    lora_A's rows are grouped by expert in both conventions. `lora_b_layout` says which
-    columns of lora_B belong to expert e: a contiguous rank-wide block for
-    `grouped_by_expert`, every num_experts-th column for PEFT's `rank_major`. Callers pass
-    nothing today, because the only thing this path holds is the experts module, which
-    cannot tell the two packings apart, and every Unsloth-trained fused MoE adapter is
-    grouped by expert. The adapter_config.json marker written on save is what a caller
-    would read to override it (unsloth#6930)."""
-    rank_major = (lora_b_layout == LORA_B_LAYOUT_RANK_MAJOR)
-
+    the loop so the merge completes rather than the caller writing back an unmerged weight."""
     def _loop():
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
-            if rank_major:
-                b_slice = lora_B_dev[:, expert_idx : num_experts * rank : num_experts]
-            else:
-                b_slice = lora_B_dev[:, start:end]
-            delta = b_slice @ lora_A_dev[start:end, :]
+            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
             merged[expert_idx].add_(delta.T if use_transpose else delta, alpha=alpha)
         return merged
 
@@ -1843,10 +1824,7 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
 
     try:
         # (E, dim_B, rank) @ (E, rank, dim_A) -> (E, dim_B, dim_A) = per-expert delta.
-        if rank_major:
-            B_exp = lora_B_dev.reshape(dim_B, rank, num_experts).permute(2, 0, 1).contiguous()
-        else:
-            B_exp = lora_B_dev.reshape(dim_B, num_experts, rank).permute(1, 0, 2).contiguous()
+        B_exp = lora_B_dev.reshape(dim_B, num_experts, rank).permute(1, 0, 2).contiguous()
         A_exp = lora_A_dev.reshape(num_experts, rank, dim_A).contiguous()
         delta = torch.bmm(B_exp, A_exp)
         merged.add_(delta.transpose(1, 2) if use_transpose else delta, alpha=alpha)

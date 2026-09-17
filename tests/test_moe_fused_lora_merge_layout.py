@@ -14,13 +14,24 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Fused MoE expert LoRA: lora_B packing, and the merge that has to honour it (#6930).
+"""Fused MoE expert LoRA: recording the lora_B packing, and the legacy merge (#6930).
 
 PEFT's ParamWrapper packs lora_A grouped by expert and lora_B rank-major, and pairs them
-that way in get_delta_weight. Unsloth does not use PEFT's forward for fused experts; the
-separated forward reads lora_B grouped by expert. Both are self-consistent, they disagree
-whenever num_experts and rank are both above one, and the merge has to reconstruct
-whichever one trained the adapter. CPU only, except for one GPU-gated equivalence check.
+that way in both get_delta_factors (its forward) and get_delta_weight (its merge). That is
+also what vLLM and every other consumer of a saved adapter reads, so it is the layout an
+Unsloth adapter has to be written in, and the separated MoE forward is being moved onto it
+(unsloth_zoo#1269).
+
+What is tested here is the other half: recording which packing an adapter was trained
+with, in adapter_config.json, since Unsloth stamps no version into that file and a
+marker-less adapter cannot be dated from its bytes; and the merge for an adapter the
+caller has explicitly declared legacy with UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert,
+where PEFT's own reconstruction would disagree with the forward that switch selects.
+
+Unset, that variable leaves PEFT's merge completely alone, which is what
+`test_get_delta_weight_is_pefts_own_unless_the_legacy_layout_is_declared` pins.
+
+CPU only.
 """
 
 from __future__ import annotations
@@ -66,6 +77,15 @@ requires_target_parameters = pytest.mark.skipif(
     reason="PEFT < 0.18 lacks target_parameters",
 )
 
+# The lora_B packing fix (unsloth_zoo#1269) is what makes rank_major the layout the
+# separated forward trains. Everything here works with or without it, except the two
+# tests that are about the DEFAULT layout specifically: without the fix the separated
+# forward is unconditionally grouped by expert, so there is no default to test.
+requires_packing_fix = pytest.mark.skipif(
+    not callable(getattr(MU, "moe_lora_b_layout", None)),
+    reason="needs the lora_B packing fix (unsloth_zoo#1269)",
+)
+
 
 # ---------------------------------------------------------------------------------------
 # Fixtures
@@ -89,6 +109,22 @@ def moe_param_wrapper_patch():
         yield
     finally:
         ParamWrapper.forward, ParamWrapper.get_delta_weight, PeftModel.save_pretrained = saved
+
+
+@pytest.fixture
+def legacy_lora_b_layout(monkeypatch):
+    """Declare that the fused expert adapters in this process are packed the pre-fix,
+    grouped-by-expert way. That declaration is the only thing that redirects PEFT's own
+    get_delta_weight, and it is also what makes the separated forward read them that way
+    once the packing fix is in, so with it set the forward and the merge agree whether or
+    not unsloth_zoo#1269 has landed."""
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT)
+
+
+@pytest.fixture
+def default_lora_b_layout(monkeypatch):
+    """No declaration: PEFT's rank_major, the layout every other consumer reads."""
+    monkeypatch.delenv("UNSLOTH_MOE_LORA_B_LAYOUT", raising=False)
 
 
 class _FusedExperts(nn.Module):
@@ -211,9 +247,11 @@ def _separated_forward_delta(wrapper, adapter_name="default"):
 
 @requires_target_parameters
 def test_peft_still_packs_lora_b_rank_major():
-    """The whole patch exists because PEFT reads lora_B's E*R axis as (out, R, E). If a
-    PEFT release ever switches to (out, E, R), the two stacks agree and the patch must be
-    dropped rather than left to invert a correct reconstruction."""
+    """PEFT reads lora_B's E*R axis as (out, R, E), unchanged in 0.18.0, 0.19.0, 0.19.1,
+    0.20.0 and 0.21.0, and that reading is what the separated forward is being aligned
+    onto. If a PEFT release ever switches to (out, E, R), rank_major stops being the
+    ecosystem layout and both the packing fix and the legacy merge below have to be
+    revisited rather than left inverting a correct reconstruction."""
     model, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     weight_B = _seed_lora_b(wrapper)
@@ -221,8 +259,9 @@ def test_peft_still_packs_lora_b_rank_major():
     scaling = wrapper.scaling["default"]
     got = _pristine_get_delta_weight()(wrapper, "default").float()
 
-    # PEFT 0.18 gives lora_A and lora_B the opposite roles from 0.19+, and picks the
-    # einsum accordingly, so read both from the wrapper rather than assuming either.
+    # PEFT #3165 (0.19.1) flipped which 3D axis counts as in_features, so which of the
+    # two einsums runs depends on the release. That is the in/out orientation only; the
+    # expert-vs-rank flatten order it does not touch. Read the flag off the wrapper.
     dim_B = weight_B.shape[0]
     subscript = "e o i" if getattr(wrapper, "_did_swap_in_out_features", False) else "e i o"
     A = weight_A.reshape(NUM_EXPERTS, RANK, -1).float()
@@ -237,6 +276,7 @@ def test_peft_still_packs_lora_b_rank_major():
 
     assert torch.allclose(got, rank_major, atol=1e-5), (
         f"PEFT {peft.__version__} no longer packs lora_B rank-major; revisit "
+        f"moe_utils.moe_lora_b_layout and "
         f"moe_utils._patched_param_wrapper_get_delta_weight (#6930)"
     )
     assert not torch.allclose(got, grouped, atol=1e-3), (
@@ -294,16 +334,53 @@ def test_a_bitsandbytes_without_the_params4bit_class_is_treated_as_absent():
 
 
 @requires_target_parameters
-def test_layout_of_a_fused_expert_wrapper_is_grouped_by_expert(moe_param_wrapper_patch):
+def test_layout_of_a_fused_expert_wrapper_follows_the_declared_layout(
+    moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     _, wrappers = _wrap(["experts.gate_up_proj"])
-    assert MU.moe_lora_b_layout(wrappers["gate_up_proj"]) == \
+    assert MU.moe_lora_b_layout_for_wrapper(wrappers["gate_up_proj"]) == \
         MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT
 
 
 @requires_target_parameters
-def test_get_delta_weight_reconstructs_the_separated_forward_delta(moe_param_wrapper_patch):
-    """The bug: PEFT's reconstruction pairs expert e's lora_A rows with the wrong lora_B
-    columns, so merge_and_unload, merge_adapter and unmerge all bake a scrambled delta."""
+@requires_packing_fix
+def test_layout_of_a_fused_expert_wrapper_is_rank_major_by_default(
+    moe_param_wrapper_patch, default_lora_b_layout,
+):
+    """With the packing fix in place and nothing declared, the separated forward packs
+    lora_B exactly as PEFT does, so a fused expert wrapper is rank_major like every other
+    wrapper and there is nothing for the marker or the merge to correct."""
+    _, wrappers = _wrap(["experts.gate_up_proj"])
+    assert MU.moe_lora_b_layout_for_wrapper(wrappers["gate_up_proj"]) == \
+        MU.LORA_B_LAYOUT_RANK_MAJOR
+
+
+@requires_target_parameters
+def test_get_delta_weight_is_pefts_own_unless_the_legacy_layout_is_declared(
+    moe_param_wrapper_patch, default_lora_b_layout,
+):
+    """The default has to be no patch at all. PEFT's reconstruction is the correct one for
+    every adapter packed the standard way, and a wrapper-routing test would redirect it
+    for any fused expert adapter merged inside an Unsloth process, including a genuinely
+    rank-major one that never came from Unsloth."""
+    _, wrappers = _wrap(["experts.gate_up_proj"])
+    wrapper = wrappers["gate_up_proj"]
+    _seed_lora_b(wrapper)
+
+    got = wrapper.get_delta_weight("default").float()
+    expected = _pristine_get_delta_weight()(wrapper, "default").float()
+    assert expected.abs().max().item() > 1e-3, "the fixture's delta is too small to test"
+    torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
+
+
+@requires_target_parameters
+def test_get_delta_weight_reconstructs_the_separated_forward_delta(
+    moe_param_wrapper_patch, legacy_lora_b_layout,
+):
+    """Declared legacy: the merge has to reconstruct the delta the forward that switch
+    selects applies. PEFT's own reconstruction pairs expert e's lora_A rows with the wrong
+    lora_B columns for such an adapter, so merge_and_unload, merge_adapter and unmerge
+    would all bake a scrambled delta."""
     _, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     _seed_lora_b(wrapper)
@@ -315,7 +392,9 @@ def test_get_delta_weight_reconstructs_the_separated_forward_delta(moe_param_wra
 
 
 @requires_target_parameters
-def test_merge_then_unmerge_round_trips_the_fused_parameter(moe_param_wrapper_patch):
+def test_merge_then_unmerge_round_trips_the_fused_parameter(
+    moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     _, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     _seed_lora_b(wrapper)
@@ -332,7 +411,9 @@ def test_merge_then_unmerge_round_trips_the_fused_parameter(moe_param_wrapper_pa
 
 
 @requires_target_parameters
-def test_merge_and_unload_writes_the_separated_forward_delta(moe_param_wrapper_patch):
+def test_merge_and_unload_writes_the_separated_forward_delta(
+    moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     """The user-facing path: `merge_and_unload` strips PEFT off and leaves one plain
     model, and the fused expert Parameter it leaves behind has to be the base weight plus
     exactly the delta the separated forward was applying."""
@@ -352,7 +433,9 @@ def test_merge_and_unload_writes_the_separated_forward_delta(moe_param_wrapper_p
 
 
 @requires_target_parameters
-def test_merge_adapter_and_unmerge_adapter_go_through_the_same_delta(moe_param_wrapper_patch):
+def test_merge_adapter_and_unmerge_adapter_go_through_the_same_delta(
+    moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     """`merge_adapter` and `unmerge_adapter` on the PeftModel itself, rather than the one
     wrapper: the same reconstruction has to reach them, and the round trip has to land
     back on the weight the model started with."""
@@ -377,7 +460,9 @@ def test_merge_adapter_and_unmerge_adapter_go_through_the_same_delta(moe_param_w
 
 @requires_target_parameters
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_the_delta_comes_back_in_the_parameters_dtype(dtype, moe_param_wrapper_patch):
+def test_the_delta_comes_back_in_the_parameters_dtype(
+    dtype, moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     """PEFT hands the merge a delta already cast to the base parameter, and merge adds it
     in place, so a reconstruction that returns float32 for a bf16 expert stack would
     either raise or silently upcast."""
@@ -402,7 +487,7 @@ def test_unfused_expert_parameters_keep_pefts_own_packing(moe_param_wrapper_patc
     _, wrappers = _wrap(["experts.up_proj", "experts.down_proj"],
                         experts_cls=_UnfusedExperts)
     for name, wrapper in wrappers.items():
-        assert MU.moe_lora_b_layout(wrapper) == MU.LORA_B_LAYOUT_RANK_MAJOR, name
+        assert MU.moe_lora_b_layout_for_wrapper(wrapper) == MU.LORA_B_LAYOUT_RANK_MAJOR, name
         _seed_lora_b(wrapper)
         original = _pristine_get_delta_weight()
         torch.testing.assert_close(
@@ -439,7 +524,9 @@ def test_the_patches_are_idempotent(moe_param_wrapper_patch):
 
 
 @requires_target_parameters
-def test_layout_marker_is_written_to_adapter_config(tmp_path, moe_param_wrapper_patch):
+def test_layout_marker_is_written_to_adapter_config(
+    tmp_path, moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     model, _ = _wrap(["experts.gate_up_proj"])
     model.save_pretrained(str(tmp_path))
 
@@ -449,6 +536,27 @@ def test_layout_marker_is_written_to_adapter_config(tmp_path, moe_param_wrapper_
     assert detail["lora_A_layout"] == "grouped_by_expert"
     assert detail["parameters"]["gate_up_proj"] == {
         "lora_B_layout": "grouped_by_expert",
+        "num_experts": NUM_EXPERTS,
+    }
+
+
+@requires_target_parameters
+@requires_packing_fix
+def test_the_marker_records_rank_major_for_an_adapter_trained_after_the_fix(
+    tmp_path, moe_param_wrapper_patch, default_lora_b_layout,
+):
+    """The marker is a record of how THIS adapter was trained, which is the whole of its
+    use as a migration vehicle: an adapter trained with the packing fix in place says
+    rank_major and needs no conversion, and one saved from a legacy run says
+    grouped_by_expert and is a column permutation away (flat column e*r + j becomes
+    j*E + e). A marker that always said grouped_by_expert would carry no information."""
+    model, _ = _wrap(["experts.gate_up_proj"])
+    model.save_pretrained(str(tmp_path))
+
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    assert config["lora_B_layout"] == "rank_major"
+    assert config["unsloth_fused_expert_lora"]["parameters"]["gate_up_proj"] == {
+        "lora_B_layout": "rank_major",
         "num_experts": NUM_EXPERTS,
     }
 
@@ -469,7 +577,9 @@ def test_the_marker_records_pefts_packing_when_peft_owns_the_wrapper(
 
 
 @requires_target_parameters
-def test_a_non_main_process_save_writes_no_marker(tmp_path, moe_param_wrapper_patch):
+def test_a_non_main_process_save_writes_no_marker(
+    tmp_path, moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     """is_main_process=False means another rank owns the files. PEFT takes it positionally
     as well as by keyword, so the marker has to read it the same way or every rank would
     rewrite the same adapter_config.json."""
@@ -520,7 +630,9 @@ def test_a_dense_adapter_gets_no_marker(tmp_path, moe_param_wrapper_patch):
 
 
 @requires_target_parameters
-def test_a_dense_adapter_beside_a_fused_one_gets_no_marker(tmp_path, moe_param_wrapper_patch):
+def test_a_dense_adapter_beside_a_fused_one_gets_no_marker(
+    tmp_path, moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     """A PeftModel can carry both. The layout scan used to walk the whole model with no
     notion of which adapter it was describing, so the fused adapter's expert packing was
     written into the DENSE adapter's adapter_config.json as well, where it describes
@@ -604,8 +716,9 @@ def test_a_save_leaves_a_dense_adapters_own_keys_alone(tmp_path, moe_param_wrapp
 
 
 @requires_target_parameters
-def test_the_flat_key_is_never_the_mixed_sentinel(tmp_path, monkeypatch,
-                                                  moe_param_wrapper_patch):
+def test_the_flat_key_is_never_the_mixed_sentinel(
+    tmp_path, monkeypatch, moe_param_wrapper_patch, legacy_lora_b_layout,
+):
     """`mixed` is a report, not a layout. Written as the flat `lora_B_layout` it reads as
     rank_major to any converter that branches on `== "grouped_by_expert"`, which is
     exactly the misleading answer the flat key exists to avoid. The stale flat key an
@@ -638,17 +751,17 @@ def test_the_flat_key_is_never_the_mixed_sentinel(tmp_path, monkeypatch,
 
 @requires_target_parameters
 def test_moe_lora_b_layout_claims_nothing_for_a_wrapper_with_no_adapters(
-    moe_param_wrapper_patch,
+    moe_param_wrapper_patch, legacy_lora_b_layout,
 ):
     """delete_adapter empties lora_A and leaves the wrapper on the model. There is no
     packing left to describe, so the unnamed form must not report one."""
     _, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
-    assert MU.moe_lora_b_layout(wrapper) == MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT
+    assert MU.moe_lora_b_layout_for_wrapper(wrapper) == MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT
 
     del wrapper.lora_A["default"]
-    assert MU.moe_lora_b_layout(wrapper) == MU.LORA_B_LAYOUT_RANK_MAJOR
-    assert MU.moe_lora_b_layout(wrapper, "default") == MU.LORA_B_LAYOUT_RANK_MAJOR
+    assert MU.moe_lora_b_layout_for_wrapper(wrapper) == MU.LORA_B_LAYOUT_RANK_MAJOR
+    assert MU.moe_lora_b_layout_for_wrapper(wrapper, "default") == MU.LORA_B_LAYOUT_RANK_MAJOR
 
 
 @requires_target_parameters
@@ -671,87 +784,8 @@ def test_a_save_that_writes_no_config_is_not_an_error(tmp_path, moe_param_wrappe
 
 
 # ---------------------------------------------------------------------------------------
-# The writer in saving_utils, which reconstructs the same delta from tensors on disk
+# The condition under which any of this matters
 # ---------------------------------------------------------------------------------------
-
-
-def _reference_delta(lora_A, lora_B, layout, num_experts, rank, alpha):
-    out = []
-    for expert_idx in range(num_experts):
-        rows = lora_A[expert_idx * rank : (expert_idx + 1) * rank, :]
-        if layout == "rank_major":
-            columns = lora_B[:, expert_idx :: num_experts]
-        else:
-            columns = lora_B[:, expert_idx * rank : (expert_idx + 1) * rank]
-        out.append(alpha * (columns @ rows))
-    return torch.stack(out, 0)
-
-
-@pytest.mark.parametrize("layout", ["grouped_by_expert", "rank_major"])
-def test_apply_fused_expert_lora_delta_honours_the_layout(layout):
-    from unsloth_zoo.saving_utils import _apply_fused_expert_lora_delta
-
-    torch.manual_seed(0)
-    dim_A, dim_B, alpha = HIDDEN, TWO_INTER, 2.0
-    base = torch.randn(NUM_EXPERTS, dim_B, dim_A)
-    lora_A = torch.randn(TOTAL_RANK, dim_A)
-    lora_B = torch.randn(dim_B, TOTAL_RANK)
-
-    got = _apply_fused_expert_lora_delta(
-        base.clone(), lora_A, lora_B, NUM_EXPERTS, RANK, dim_A, dim_B, alpha,
-        False, lora_b_layout=layout,
-    )
-    expected = base + _reference_delta(lora_A, lora_B, layout, NUM_EXPERTS, RANK, alpha)
-    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
-
-    other = "rank_major" if layout == "grouped_by_expert" else "grouped_by_expert"
-    assert not torch.allclose(
-        got, base + _reference_delta(lora_A, lora_B, other, NUM_EXPERTS, RANK, alpha),
-        atol=1e-3,
-    ), "the fixture cannot tell the two layouts apart"
-
-
-@pytest.mark.parametrize("use_transpose", [False, True])
-def test_apply_fused_expert_lora_delta_matches_the_separated_forward(use_transpose):
-    """The 4-bit expert merge in saving_utils reconstructs the same delta from tensors on
-    disk, with no wrapper to ask. Ground truth here is the separated forward's own
-    packing helper, `_canonical_lora_weights_for_grouped_mm`, not a hand-written slicing
-    of lora_B: the two ways of saying it have to agree or the merge is not the forward.
-
-    float64 throughout, so the comparison is exact rather than nearly exact. Both base
-    layouts, because gpt-oss keeps the fused weight transposed relative to Qwen3-MoE."""
-    from unsloth_zoo.saving_utils import _apply_fused_expert_lora_delta
-
-    torch.manual_seed(0)
-    dim_A, dim_B, alpha = HIDDEN, TWO_INTER, 2.0
-    lora_A = torch.randn(TOTAL_RANK, dim_A, dtype=torch.float64)
-    lora_B = torch.randn(dim_B, TOTAL_RANK, dtype=torch.float64)
-
-    # (E, dim_A, R) and (E, R, dim_B): exactly what the separated forward multiplies.
-    first, second = MU._canonical_lora_weights_for_grouped_mm(
-        lora_A, lora_B, NUM_EXPERTS, RANK, dim_A, dim_B,
-    )
-    forward_delta = alpha * torch.bmm(first, second)          # (E, dim_A, dim_B)
-    if not use_transpose:
-        forward_delta = forward_delta.transpose(1, 2)         # (E, dim_B, dim_A)
-
-    shape = (NUM_EXPERTS, dim_A, dim_B) if use_transpose else (NUM_EXPERTS, dim_B, dim_A)
-    base = torch.randn(*shape, dtype=torch.float64)
-    got = _apply_fused_expert_lora_delta(
-        base.clone(), lora_A, lora_B, NUM_EXPERTS, RANK, dim_A, dim_B, alpha,
-        use_transpose, lora_b_layout=MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT,
-    )
-    assert forward_delta.abs().max().item() > 1e-3
-    torch.testing.assert_close(got, base + forward_delta, atol=0.0, rtol=0.0)
-
-    # And PEFT's packing must not also pass, or the test says nothing about the packing.
-    other = _apply_fused_expert_lora_delta(
-        base.clone(), lora_A, lora_B, NUM_EXPERTS, RANK, dim_A, dim_B, alpha,
-        use_transpose, lora_b_layout=MU.LORA_B_LAYOUT_RANK_MAJOR,
-    )
-    assert not torch.allclose(other, base + forward_delta, atol=1e-3), (
-        "the fixture cannot tell the two packings apart"
-    )
 
 
 @pytest.mark.parametrize("num_experts,rank", [
@@ -791,40 +825,6 @@ def test_the_two_packings_differ_whenever_experts_and_rank_both_exceed_one(
         )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-@pytest.mark.parametrize("layout", ["grouped_by_expert", "rank_major"])
-@pytest.mark.parametrize("use_transpose", [False, True])
-def test_the_batched_and_looped_fused_merges_agree(layout, use_transpose):
-    """The batched bmm branch only runs on an accelerator, so CPU-only tests never
-    compare it against the loop it is meant to be equivalent to."""
-    from unsloth_zoo.saving_utils import _apply_fused_expert_lora_delta
-
-    torch.manual_seed(0)
-    dim_A, dim_B, alpha = HIDDEN, TWO_INTER, 2.0
-    shape = (NUM_EXPERTS, dim_A, dim_B) if use_transpose else (NUM_EXPERTS, dim_B, dim_A)
-    base = torch.randn(*shape)
-    lora_A = torch.randn(TOTAL_RANK, dim_A)
-    lora_B = torch.randn(dim_B, TOTAL_RANK)
-
-    def _run(device):
-        return _apply_fused_expert_lora_delta(
-            base.clone().to(device), lora_A.to(device), lora_B.to(device),
-            NUM_EXPERTS, RANK, dim_A, dim_B, alpha, use_transpose,
-            lora_b_layout=layout,
-        ).cpu()
-
-    torch.testing.assert_close(_run("cuda"), _run("cpu"), atol=1e-5, rtol=1e-5)
-
-
-def test_the_two_modules_agree_on_the_layout_names():
-    """saving_utils keeps its own copy of the names so it never has to import the patch
-    module at module scope. They have to stay the same two strings."""
-    from unsloth_zoo import saving_utils
-
-    assert saving_utils.LORA_B_LAYOUT_GROUPED_BY_EXPERT == MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT
-    assert saving_utils.LORA_B_LAYOUT_RANK_MAJOR == MU.LORA_B_LAYOUT_RANK_MAJOR
-
-
 # ---------------------------------------------------------------------------------------
 # End to end on a real architecture, with the separated forward actually running
 # ---------------------------------------------------------------------------------------
@@ -838,10 +838,26 @@ def _transformers_v5() -> bool:
 @requires_target_parameters
 @pytest.mark.skipif(not _transformers_v5(),
                     reason="the separated grouped_mm LoRA path is transformers 5 only")
-def test_merge_matches_the_adapter_forward_on_a_tiny_fused_moe(tmp_path, monkeypatch):
+@pytest.mark.parametrize("declared_layout", [
+    MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT,
+    pytest.param(None, marks=requires_packing_fix),
+])
+def test_merge_matches_the_adapter_forward_on_a_tiny_fused_moe(
+    tmp_path, monkeypatch, declared_layout,
+):
     """The reported symptom, end to end: a merged fused-MoE LoRA model must produce the
     logits the attached adapter produced. Uses gpt-oss because it is the fused MoE family
-    a tiny config can build offline on both transformers 4 and 5."""
+    a tiny config can build offline on both transformers 4 and 5.
+
+    Both ways round. Declared legacy, the forward reads grouped by expert and the patched
+    get_delta_weight has to follow it. Declared nothing, with the packing fix in place
+    both sides are PEFT's rank_major and the patch must stay out of the way; that arm is
+    the one that fails if the patch ever fires on routing rather than on the
+    declaration."""
+    if declared_layout is None:
+        monkeypatch.delenv("UNSLOTH_MOE_LORA_B_LAYOUT", raising=False)
+    else:
+        monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", declared_layout)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import _merge_e2e_helpers as H
 

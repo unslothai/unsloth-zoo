@@ -1485,25 +1485,60 @@ _get_moe_lora_weights = _extract_lora_from_wrapper
 #
 # PEFT's ParamWrapper builds lora_A as (E*R, in) and lora_B as (out, E*R) and pairs them
 # in get_delta_weight by reading A as (E, R, in) and B as (out, R, E): lora_A is grouped
-# by expert, lora_B is NOT, its expert index is the fastest axis. Unsloth does not use
-# PEFT's forward for fused MoE experts; the separated forward reads the same lora_B as
-# (out, E, R) (`_canonical_lora_weights_for_grouped_mm`), so a rank-contiguous block of
-# columns belongs to one expert. Both stacks are internally consistent, and both reshapes
-# always fit, since E*R == R*E, so nothing ever raises. They disagree with each other
-# whenever num_experts > 1 and rank > 1, which is every real MoE checkpoint. Equal
-# num_experts and rank does not make them agree: the two readings send flat column
-# r*E + e and flat column e*R + r to the same place, and those coincide for all (e, r)
-# only when E == 1 or R == 1.
+# by expert, lora_B is NOT, its expert index is the fastest axis. That reading is
+# unchanged in PEFT 0.18.0, 0.19.0, 0.19.1, 0.20.0 and 0.21.0, and it is what vLLM's
+# `_stack_moe_lora_weights` and every other consumer of a saved adapter implements, so it
+# is the only reading a stored fused expert lora_B can be expected to have.
 #
-# So the layout is a property of the forward that ran, not of the architecture, and every
-# consumer has to ask the same question of the same wrapper, for the same adapter. That is
-# what these helpers are for: the forward routing test below, and the layout name from it.
-# The name is also written into adapter_config.json on save (unsloth#6930), because a
-# downstream converter has no wrapper to ask.
+# Unsloth's separated forward read the same lora_B as (out, E, R) instead
+# (`_canonical_lora_weights_for_grouped_mm`), so a rank-contiguous block of columns
+# belonged to one expert. Both reshapes always fit, since E*R == R*E, so nothing ever
+# raises and the disagreement is always silent. They disagree whenever num_experts > 1
+# and rank > 1, which is every real MoE checkpoint: equal num_experts and rank does not
+# make them agree, because the two readings send flat column r*E + e and flat column
+# e*R + r to the same place and those coincide for all (e, r) only when E == 1 or R == 1.
+#
+# The separated forward is being moved onto PEFT's packing (the `lora_B` packing fix,
+# unsloth_zoo#1269), with `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` left as the
+# opt-in for reading an adapter an older Unsloth trained. What stays here is the
+# *recording* side: which packing the adapter on this model was trained with, written
+# into adapter_config.json on save (unsloth#6930), because a downstream converter has no
+# wrapper to ask and Unsloth stamps no version into the file either, so a marker-less
+# adapter cannot be dated from its bytes.
 # ---------------------------------------------------------------------------------------
 
+# Also defined next to the packing helpers by unsloth_zoo#1269; same strings, so the two
+# definitions are interchangeable and either branch can land first.
 LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
 LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
+
+
+def _process_lora_b_layout() -> str:
+    """Which packing the separated MoE forward uses in THIS process.
+
+    `moe_lora_b_layout()` (unsloth_zoo#1269) is the authority once that fix is in: it
+    reads `UNSLOTH_MOE_LORA_B_LAYOUT` and defaults to PEFT's `rank_major`. It is looked
+    up rather than imported because it lives in this same module, so the two can land in
+    either order. Without it the separated forward is unconditionally grouped by expert,
+    which is what a build predating the packing fix does, so that is the honest answer
+    there."""
+    resolver = globals().get("moe_lora_b_layout")
+    if callable(resolver):
+        return resolver()
+    return LORA_B_LAYOUT_GROUPED_BY_EXPERT
+
+
+def _legacy_lora_b_layout_requested() -> bool:
+    """Whether the caller has explicitly declared that the adapters in this process were
+    packed the pre-fix way, by setting `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert`.
+
+    Deliberately the raw environment variable and not `_process_lora_b_layout()`: this
+    gates a patch over PEFT's own `get_delta_weight`, and the packing of a *stored*
+    adapter is a property of the adapter, not of how this process happens to be routing
+    its forwards. Only an explicit statement about provenance may redirect PEFT's merge;
+    an unset variable leaves PEFT's reconstruction, which is the correct one for every
+    adapter trained with the packing fix in place, completely untouched."""
+    return os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") == LORA_B_LAYOUT_GROUPED_BY_EXPERT
 
 # The only parameter names the separated forward claims. Anything else on an experts
 # module (the unfused experts.gate_proj / experts.up_proj pair that NemotronH uses, for
@@ -1537,7 +1572,8 @@ def _wrapper_has_adapter(wrapper, adapter_name) -> bool:
     layout answer has to be scoped to one adapter or it describes the wrong one.
 
     `adapter_name = None` asks the weaker question "does this wrapper hold any adapter at
-    all", which is what the unnamed form of `moe_lora_b_layout` needs. Still a question:
+    all", which is what the unnamed form of `moe_lora_b_layout_for_wrapper` needs. Still
+    a question:
     `delete_adapter` empties lora_A and leaves the wrapper in place, and claiming a
     packing for weights that are gone is the same mistake in a smaller form."""
     lora_A = getattr(wrapper, "lora_A", None)
@@ -1551,12 +1587,19 @@ def _wrapper_has_adapter(wrapper, adapter_name) -> bool:
         return False
 
 
-def moe_lora_b_layout(wrapper, adapter_name = None) -> str:
-    """Which convention packs `wrapper`'s lora_B columns for `adapter_name`:
-    `grouped_by_expert` when the separated MoE forward owns the wrapper, else PEFT's
+def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
+    """Which convention packs `wrapper`'s lora_B columns for `adapter_name`.
+
+    A wrapper the separated MoE forward owns is packed the way that forward packs, which
+    is `_process_lora_b_layout()`: PEFT's `rank_major` with the packing fix in place,
+    `grouped_by_expert` under `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` or on a build
+    predating the fix. Every other wrapper is on PEFT's own forward and is therefore
     `rank_major`. A single expert (or a wrapper PEFT collapses to a plain Linear) has no
     packing to get wrong and is reported as rank_major, which is what PEFT's own
     reconstruction does for it.
+
+    Named for the wrapper on purpose: `moe_lora_b_layout()` is the process-wide setting
+    and takes no arguments, this one answers for one wrapper and one adapter.
 
     `adapter_name` defaults to "whichever adapter this wrapper holds", which is the old
     behaviour and is right for a model with one adapter. Name an adapter that has no LoRA
@@ -1573,7 +1616,7 @@ def moe_lora_b_layout(wrapper, adapter_name = None) -> str:
     if not _wrapper_has_adapter(wrapper, adapter_name):
         return LORA_B_LAYOUT_RANK_MAJOR
     if _wrapper_uses_separated_moe_lora(wrapper):
-        return LORA_B_LAYOUT_GROUPED_BY_EXPERT
+        return _process_lora_b_layout()
     return LORA_B_LAYOUT_RANK_MAJOR
 
 
@@ -1686,14 +1729,26 @@ def _cast_delta_weight_like_param(delta_weight, param):
 
 
 def _patched_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs):
-    """PEFT reconstructs a fused MoE expert delta with lora_B packed rank-major, which is
-    not how Unsloth's separated forward trained it, so PEFT's merge_and_unload,
-    merge_adapter and unmerge all bake a per-expert delta whose expert blocks are
-    scrambled (unsloth#6930). Reconstruct it the way the forward that ran packs it, and
-    leave every other wrapper on PEFT's own code."""
+    """PEFT's `get_delta_weight` for a legacy, grouped-by-expert fused MoE expert LoRA.
+
+    PEFT reconstructs a fused expert delta with lora_B packed rank-major, which is what
+    it trained and what every consumer reads, so by default this does nothing at all and
+    PEFT's own code runs. It only takes over when the caller has explicitly declared that
+    the adapters in this process were packed the pre-fix way, with
+    `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert`; that same variable is what makes the
+    separated forward read them that way (unsloth_zoo#1269), and without this patch the
+    forward and PEFT's `merge_and_unload` / `merge_adapter` / `unmerge` would disagree for
+    exactly the checkpoints that switch exists to support (unsloth#6930).
+
+    Gating on the declaration rather than on "is this wrapper routed to the separated
+    forward" is the point: the packing of a stored adapter is a property of the adapter,
+    and reading it off this process's routing would scramble a correctly packed adapter
+    merged inside an Unsloth process."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    if moe_lora_b_layout(self, adapter_name) != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
+    if not _legacy_lora_b_layout_requested():
+        return _original_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
+    if moe_lora_b_layout_for_wrapper(self, adapter_name) != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
         return _original_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
 
     delta_weight = _grouped_by_expert_delta_weight(self, adapter_name)
@@ -1771,7 +1826,7 @@ def fused_expert_lora_layout(peft_model, adapter_name = None) -> Optional[dict]:
         if num_experts <= 1:
             # Not a fused expert stack, so there is no expert axis to pack.
             continue
-        layout = moe_lora_b_layout(module, adapter_name)
+        layout = moe_lora_b_layout_for_wrapper(module, adapter_name)
         entry = parameters.get(parameter_name)
         if entry is None:
             parameters[parameter_name] = {
