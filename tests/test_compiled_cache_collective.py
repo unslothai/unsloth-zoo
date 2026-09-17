@@ -99,15 +99,17 @@ def probe(compiler):
     """Compile generated probes and always remove both module aliases."""
     names = []
 
-    def create(name, body="return x", *, overwrite=True):
+    def create(name, body="return x", *, overwrite=True, prepend=None):
         names.append(name)
         indented_body = "\n".join(f"    {line}" for line in body.splitlines())
+        extra = {} if prepend is None else {"prepend": prepend}
         return compiler.create_new_function(
             name,
             f"def {name}_fn(x):\n{indented_body}\n",
             "pr967",
             {},
             overwrite=overwrite,
+            **extra,
         )
 
     yield create
@@ -1454,6 +1456,82 @@ def test_the_bytes_that_run_are_the_bytes_that_were_verified(tmp_path, compiler)
         assert module.__file__ == str(location)
     finally:
         sys.modules.pop("swap_probe", None)
+
+
+
+def test_a_package_shadowing_moe_utils_keeps_the_folder_off_the_path(tmp_path, compiler):
+    """A verbatim moe_utils.py does not settle it: the import resolves BY NAME.
+
+    A planted moe_utils/ package, or a moe_utils extension module, beside the
+    genuine copy is what Python picks, exactly as for a generated module. Same
+    check, one name over.
+    """
+    import importlib.machinery as _machinery
+
+    folder = tmp_path / "cache"
+    folder.mkdir()
+    shutil.copyfile(_real_moe_utils_path(), folder / "moe_utils.py")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is True
+
+    package = folder / "moe_utils"
+    package.mkdir()
+    (package / "__init__.py").write_text("PAYLOAD = 1\n", encoding = "utf-8")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is False, (
+        "a package shadowing the verified helper was treated as importable"
+    )
+    shutil.rmtree(package)
+
+    planted = folder / f"moe_utils{_machinery.EXTENSION_SUFFIXES[0]}"
+    planted.write_bytes(b"\x7fELF not really\n")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is False, (
+        "an extension module shadowing the verified helper was treated as importable"
+    )
+
+
+def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
+    monkeypatch, compiler, probe, cache_dirs,
+):
+    """The recovery path had this check and the ordinary one did not.
+
+    compile_folder goes first on sys.path so the generated module's bare
+    `from moe_utils import ...` resolves, and that import is wrapped in
+    `except Exception: pass`. An installation that could not replace a foreign
+    copy, or a shared-cache writer that changed it afterwards, therefore got its
+    top level executed on the ordinary path with the failure swallowed.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    marker = primary / "NORMAL_PATH_PLANTED_RAN"
+    (primary / "moe_utils.py").write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+        "select_moe_backend = 'planted'\n",
+        encoding = "utf-8",
+    )
+
+    previous_moe_utils = sys.modules.pop("moe_utils", None)
+    name = "normal_path_moe_utils_probe"
+    try:
+        module = probe(
+            name,
+            "return x * 2",
+            prepend = (
+                "try:\n"
+                "    from moe_utils import select_moe_backend\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+        )
+        assert getattr(module, f"{name}_fn")(21) == 42
+        assert getattr(module, "select_moe_backend", None) != "planted", (
+            "the planted helper was importable on the normal path"
+        )
+        assert not marker.exists(), "the planted helper's top level ran"
+    finally:
+        for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
+            sys.modules.pop(alias, None)
+        if previous_moe_utils is not None:
+            sys.modules["moe_utils"] = previous_moe_utils
 
 
 def _force_by_name_path_to_fail(monkeypatch, compiler, name, once = True):

@@ -1251,6 +1251,14 @@ def _moe_utils_copy_is_importable(folder):
     """
     if not folder:
         return False
+    # A verbatim moe_utils.py does not settle it: `from moe_utils import ...`
+    # resolves BY NAME, so a planted moe_utils/ package or moe_utils.so in the
+    # same directory is what Python picks, exactly as for a generated module.
+    # Same check, same reasoning, one name over.
+    try:
+        _reject_shadowing_import_candidates(folder, "moe_utils")
+    except Exception:
+        return False
     try:
         from .temporary_patches.moe_utils import cached_copy_is_importable
     except Exception:
@@ -2014,8 +2022,17 @@ def create_new_function(
         old_path = None
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
-        # Put the verified cache first even when it already appears later.
-        if not sys.path or sys.path[0] != compile_folder:
+        # Put the verified cache first even when it already appears later, but
+        # only once the moe_utils sitting in it is this package's own file. The
+        # generated module's `from moe_utils import ...` resolves off this entry,
+        # and it is a bare import inside `except Exception: pass`, so an
+        # installation that could not replace a foreign copy -- or a shared-cache
+        # writer that changed it afterwards -- otherwise got its top level
+        # executed here, on the ordinary path, with the failure swallowed. The
+        # recovery path below had this check; this one did not.
+        if _moe_utils_copy_is_importable(compile_folder) and (
+            not sys.path or sys.path[0] != compile_folder
+        ):
             old_path = list(sys.path)
             sys.path[:] = [path for path in sys.path if path != compile_folder]
             sys.path.insert(0, compile_folder)

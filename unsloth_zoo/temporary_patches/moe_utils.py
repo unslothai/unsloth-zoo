@@ -250,11 +250,21 @@ def _load_cached_moe_utils_module():
             return None
 
         spec = importlib.util.spec_from_file_location(module_name, cache_file)
-        if spec is None or spec.loader is None:
+        if spec is None:
             return None
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            # The bytes compared above, not a fresh read of the path. exec_module
+            # reopens the file, and the comparison and that open are two moments:
+            # a writer with access to the shared cache replaces the file between
+            # them and its bytes run as unsloth_cached_moe_utils having matched
+            # nothing. compiler.py's loader closed the same window; this one is
+            # the copy of it that lives here.
+            exec(compile(cached_bytes, cache_file, "exec"), module.__dict__)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
         _CACHED_MOE_UTILS_MODULE = module
         return module
     except Exception:
