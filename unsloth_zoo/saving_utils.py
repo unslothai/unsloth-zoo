@@ -1171,32 +1171,50 @@ except ImportError:
 # merge has to reproduce the forward that trained the adapter; imported rather than copied
 # so the two cannot drift. The fallback repeats PEFT's packing for an install where
 # temporary_patches is unavailable, which is the same answer the import gives.
+# The fallback is defined unconditionally, not inside the `except`, so it is reachable to a
+# test on an ordinary install where the import succeeds. Only the binding below is
+# conditional.
+_FALLBACK_GROUPED_BY_EXPERT = "grouped_by_expert"
+_FALLBACK_LAYOUTS = ("rank_major", _FALLBACK_GROUPED_BY_EXPERT)
+
+
+def _fallback_layout(layout):
+    if layout is None:
+        layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", "rank_major")
+    if layout not in _FALLBACK_LAYOUTS:
+        # Matches moe_lora_b_layout(): a typo must not quietly mean rank_major and
+        # scramble a legacy adapter at merge time.
+        raise ValueError(
+            f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_FALLBACK_LAYOUTS}, "
+            f"got {layout!r}."
+        )
+    return layout
+
+
+def _fallback_moe_lora_b_expert_columns(expert_idx, num_experts, rank_per_expert, layout = None):
+    if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
+        return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
+    return slice(expert_idx, num_experts * rank_per_expert, num_experts)
+
+
+def _fallback_unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B, layout = None):
+    # reshape rather than view, so a non-contiguous lora_B does not raise here and nowhere
+    # else.
+    if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
+        return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
+    return weight_B.reshape(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
+
+
 try:
     from unsloth_zoo.temporary_patches.moe_utils import (
         moe_lora_b_expert_columns as _moe_lora_b_expert_columns,
         unflatten_moe_lora_b as _unflatten_moe_lora_b,
     )
 except ImportError:
-    # Only reachable on an install with no temporary_patches, which is also an install
-    # with no separated MoE forward to disagree with. It still honours the layout it is
-    # handed rather than silently ignoring it, and it still reshapes rather than views,
-    # so a non-contiguous lora_B does not turn into an exception here and nowhere else.
-    _FALLBACK_GROUPED_BY_EXPERT = "grouped_by_expert"
-
-    def _fallback_layout(layout):
-        if layout is not None:
-            return layout
-        return os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", "rank_major")
-
-    def _moe_lora_b_expert_columns(expert_idx, num_experts, rank_per_expert, layout = None):
-        if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
-            return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
-        return slice(expert_idx, num_experts * rank_per_expert, num_experts)
-
-    def _unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B, layout = None):
-        if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
-            return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
-        return weight_B.reshape(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
+    # Only reachable on an install with no temporary_patches, which is also an install with
+    # no separated MoE forward to disagree with.
+    _moe_lora_b_expert_columns = _fallback_moe_lora_b_expert_columns
+    _unflatten_moe_lora_b = _fallback_unflatten_moe_lora_b
 
 
 def _merge_moe_expert_quant_aware(

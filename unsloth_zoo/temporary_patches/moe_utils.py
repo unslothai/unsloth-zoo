@@ -863,16 +863,32 @@ LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
 _LORA_B_LAYOUTS = (LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT)
 
 
+class MoELoRABLayoutError(ValueError):
+    """`UNSLOTH_MOE_LORA_B_LAYOUT` is set to something that is not a layout.
+
+    Its own class because `_extract_lora_from_wrapper` turns every exception into "this
+    wrapper has no LoRA", which would silently drop the adapter and train the base model.
+    A configuration mistake has to be louder than that, so it is re-raised there by type.
+    """
+
+
 def moe_lora_b_layout() -> str:
     """Which packing to read a fused expert `lora_B` with.
 
     `rank_major` (PEFT's, and therefore everyone's) unless
     `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` asks for the pre-fix reading, which is
-    what an adapter trained by an older Unsloth needs. Read per call rather than cached at
-    import so a caller can set it around a single load."""
+    what an adapter trained by an older Unsloth needs.
+
+    It is a process-wide mode, not a load-time option. Nothing is recorded on the adapter,
+    and every forward and every merge resolves it again, so setting it only around
+    `load_adapter` leaves the rest of the run reading a legacy adapter as `rank_major` and
+    scrambling it. Set it before the process does any MoE work and leave it set. Reading
+    the layout back off the adapter itself needs the `adapter_config.json` marker, which is
+    the migration path, not this switch.
+    """
     layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
     if layout not in _LORA_B_LAYOUTS:
-        raise ValueError(
+        raise MoELoRABLayoutError(
             f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_LORA_B_LAYOUTS}, got "
             f"{layout!r}."
         )
@@ -1135,6 +1151,9 @@ def _extract_lora_from_wrapper(
             experts_module=experts_module,
             model_name="MoE",
         )
+    except MoELoRABLayoutError:
+        # A misspelled UNSLOTH_MOE_LORA_B_LAYOUT must not read as "no adapter here".
+        raise
     except Exception:
         return None
 

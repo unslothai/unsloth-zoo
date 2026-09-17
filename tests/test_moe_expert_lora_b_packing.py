@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """A fused MoE expert lora_B must be read the way PEFT packed it.
 
 PEFT stores a fused expert LoRA as two ordinary Linear weights and does NOT flatten them
@@ -318,3 +334,90 @@ def test_separated_forward_matches_stock_peft_forward():
     effect = (reference - base).abs().max().item()
     assert effect > 1e-3, "the adapter does not reach the forward, so this proves nothing"
     assert (separated - reference).abs().max().item() < effect * 1e-3
+
+
+def _stub_wrapper(num_experts, rank, dim_in, dim_out):
+    """The smallest thing `_extract_lora_from_wrapper` accepts: two Linear-shaped weight
+    holders, a scaling and an expert count."""
+    class _Weight:
+        def __init__(self, tensor):
+            self.weight = tensor
+
+    class _Wrapper:
+        def __init__(self):
+            weight_A, weight_B = _factors(num_experts, rank, dim_in, dim_out)
+            self.lora_A = {"default": _Weight(weight_A.float())}
+            self.lora_B = {"default": _Weight(weight_B.float())}
+            self.scaling = {"default": 1.0}
+            self.num_experts = num_experts
+
+        def get_base_layer(self):
+            return None
+
+    return _Wrapper()
+
+
+def test_a_misspelled_layout_raises_instead_of_dropping_the_adapter(monkeypatch):
+    """`_extract_lora_from_wrapper` turns every exception into "no LoRA here", so a typo in
+    `UNSLOTH_MOE_LORA_B_LAYOUT` used to train the base model in silence. The one error that
+    means "your configuration is wrong" has to escape that fallback."""
+    from unsloth_zoo.temporary_patches.moe_utils import (
+        MoELoRABLayoutError,
+        _extract_lora_from_wrapper,
+    )
+
+    wrapper = _stub_wrapper(4, 6, 16, 12)
+
+    monkeypatch.delenv("UNSLOTH_MOE_LORA_B_LAYOUT", raising = False)
+    assert _extract_lora_from_wrapper(wrapper) is not None
+
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", "grouped-by-expert")
+    with pytest.raises(MoELoRABLayoutError):
+        _extract_lora_from_wrapper(wrapper)
+
+    assert issubclass(MoELoRABLayoutError, ValueError)
+
+
+@pytest.mark.parametrize(
+    "layout", [LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT],
+)
+def test_the_saving_utils_fallback_agrees_with_the_real_helpers(layout):
+    """`saving_utils` keeps its own copy of the two readings for an install with no
+    `temporary_patches`. Nothing else pins it, so it is free to drift away from the forward
+    that trained the adapter."""
+    from unsloth_zoo.saving_utils import (
+        _fallback_moe_lora_b_expert_columns,
+        _fallback_unflatten_moe_lora_b,
+    )
+
+    num_experts, rank, dim_out = 4, 6, 12
+    _, weight_B = _factors(num_experts, rank, 16, dim_out)
+
+    assert torch.equal(
+        _fallback_unflatten_moe_lora_b(weight_B, num_experts, rank, dim_out, layout = layout),
+        unflatten_moe_lora_b(weight_B, num_experts, rank, dim_out, layout = layout),
+    )
+    for expert_idx in range(num_experts):
+        assert (
+            _fallback_moe_lora_b_expert_columns(expert_idx, num_experts, rank, layout = layout)
+            == moe_lora_b_expert_columns(expert_idx, num_experts, rank, layout = layout)
+        )
+
+
+def test_the_saving_utils_fallback_rejects_a_misspelled_layout(monkeypatch):
+    """It resolves the same environment variable as `moe_lora_b_layout`, so it has to reject
+    the same typos. Defaulting to rank_major on a typo would merge a legacy adapter with the
+    wrong reading and bake the scramble into the checkpoint."""
+    from unsloth_zoo.saving_utils import _fallback_layout
+
+    monkeypatch.delenv("UNSLOTH_MOE_LORA_B_LAYOUT", raising = False)
+    assert _fallback_layout(None) == LORA_B_LAYOUT_RANK_MAJOR
+
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_GROUPED_BY_EXPERT)
+    assert _fallback_layout(None) == LORA_B_LAYOUT_GROUPED_BY_EXPERT
+
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", "grouped-by-expert")
+    with pytest.raises(ValueError):
+        _fallback_layout(None)
+    with pytest.raises(ValueError):
+        _fallback_layout("expert_major")

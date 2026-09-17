@@ -484,17 +484,44 @@ def test_moe_expert_merge_follows_the_layout_override(monkeypatch, layout):
     lora_B = torch.randn(2 * inter_dim, total_rank, dtype=torch.float32) * 0.5
     expert_idx = 1
 
-    out = _merge_moe_gate_expert(
-        gate_W.clone(), _ls(lora_A, lora_B, alpha),
-        expert_idx=expert_idx, num_experts=num_experts,
-        output_dtype=torch.float32,
-    ).to(torch.float32).cpu()
-
     b_slice = (_peft_expert_lora_b(lora_B, expert_idx, num_experts) if layout == "rank_major"
                else _expert_slowest_lora_b(lora_B, expert_idx, rank_per))
     a_slice = lora_A[expert_idx * rank_per:(expert_idx + 1) * rank_per]
-    expected = gate_W + alpha * (b_slice[:inter_dim, :] @ a_slice)
-    torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
+
+    # The override has to reach all three per-expert helpers. gate and up split the same
+    # lora_B in half; down_proj takes the whole slice against its own weight.
+    for merge, base_W, expected_delta in (
+        (_merge_moe_gate_expert, gate_W, b_slice[:inter_dim, :] @ a_slice),
+        (_merge_moe_up_expert,   gate_W, b_slice[inter_dim:, :] @ a_slice),
+    ):
+        out = merge(
+            base_W.clone(), _ls(lora_A, lora_B, alpha),
+            expert_idx=expert_idx, num_experts=num_experts,
+            output_dtype=torch.float32,
+        ).to(torch.float32).cpu()
+        torch.testing.assert_close(
+            out, base_W + alpha * expected_delta, atol=1e-4, rtol=1e-4,
+        )
+
+    down_W = torch.randn(hidden_dim, inter_dim, dtype=torch.float32)
+    down_A = torch.randn(total_rank, inter_dim, dtype=torch.float32) * 0.5
+    down_B = torch.randn(hidden_dim, total_rank, dtype=torch.float32) * 0.5
+    down_b = (_peft_expert_lora_b(down_B, expert_idx, num_experts) if layout == "rank_major"
+              else _expert_slowest_lora_b(down_B, expert_idx, rank_per))
+    down_out = _merge_moe_down_proj_expert(
+        down_W.clone(), _ls(down_A, down_B, alpha),
+        expert_idx=expert_idx, num_experts=num_experts,
+        output_dtype=torch.float32,
+    ).to(torch.float32).cpu()
+    down_a = down_A[expert_idx * rank_per:(expert_idx + 1) * rank_per]
+    torch.testing.assert_close(
+        down_out, down_W + alpha * (down_b @ down_a), atol=1e-4, rtol=1e-4,
+    )
+
+    # Not vacuous: the other reading would have failed every assertion above.
+    other = (_expert_slowest_lora_b(lora_B, expert_idx, rank_per) if layout == "rank_major"
+             else _peft_expert_lora_b(lora_B, expert_idx, num_experts))
+    assert (other - b_slice).abs().max().item() > 1e-3
 
 
 # 9. Layout detection + fallback (#5410).
