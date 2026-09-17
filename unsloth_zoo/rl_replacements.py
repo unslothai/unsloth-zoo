@@ -1086,8 +1086,6 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
     An unrecognised model still gets its ``pixel_values``, as stock TRL does; dropping
     them silently recomputes the reference logprobs from the text alone.
     """
-    import torch
-
     def _as_int_list(value):
         if value is None:
             return None

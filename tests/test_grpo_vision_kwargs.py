@@ -21,7 +21,9 @@ and image_position_ids, and dropped pixel_values entirely for a model with no
 image_grid_thw, silently recomputing the reference logprobs from the text alone.
 """
 
+import ast
 import inspect
+import textwrap
 
 import torch
 
@@ -188,9 +190,6 @@ def test_released_unsloth_can_still_see_num_images_in_this_function():
     # The probe above is satisfied by a COMMENT mentioning num_images, which the periodic
     # comment-reduction pass is entitled to delete. So pin the binding itself: parsed, not
     # grepped, so the guarantee survives any rewording of the text around it.
-    import ast
-    import textwrap
-
     tree = ast.parse(textwrap.dedent(source))
     bound = {
         target.id
@@ -209,7 +208,6 @@ def test_released_unsloth_can_still_see_num_images_in_this_function():
 # still carries its own hard coded no-grad key list. See grpo_companion_vision_keys.
 
 import sys
-import textwrap
 import types
 
 import pytest
@@ -489,8 +487,6 @@ def _which_branch(monkeypatch, vision_kwargs):
     exactly how that got through, so this one runs the function and reports which branch it
     took -- each side raises its own sentinel the moment it is reached.
     """
-    import types
-
     def _no_packing(*_a, **_k):
         raise _TookTheTextBranch
 
