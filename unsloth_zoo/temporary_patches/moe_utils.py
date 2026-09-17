@@ -2057,9 +2057,27 @@ def _forward_statically_reads_stash(experts_module):
     # is then dropped as already seen. Measured on a synthetic forward with both routes,
     # 5 of 14 PYTHONHASHSEED values returned False for a forward that does reach the
     # stash, which would send that compiled cold start down the failing PEFT path.
-    seen_code = {}
-    alive = []
+    # A LIST keyed by `is`, not a dict and not id().
+    #
+    # Equality is wrong: two functions compiled from identical source at the same filename
+    # and name have code objects that compare and hash equal while being distinct objects
+    # with different __globals__, so a dict collapses them and the scan misses whichever
+    # route is second.
+    #
+    # id() is right but untraceable: Dynamo rejects it on a code object with
+    # "Unsupported: id() with unsupported args" on some torch versions, which is a hard
+    # compile failure in the branch that exists to keep compilation working. `is` gives
+    # the same identity semantics and traces everywhere. The list stays tiny, bounded by
+    # the depth limit, so the linear scan costs nothing.
+    seen_code = []
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
+
+    def _visited_at_or_above(target, depth):
+        for seen, seen_depth in seen_code:
+            if seen is target:
+                return seen_depth <= depth
+        return False
+
     while pending:
         current, namespace, depth = pending.pop()
         # Keyed by IDENTITY, not equality. Two functions compiled from identical source at
@@ -2069,11 +2087,9 @@ def _forward_statically_reads_stash(experts_module):
         # unrelated helper and the second to take_moe_lora_stash, the second is skipped
         # and the scan wrongly answers False. `alive` holds a reference to everything
         # visited, so no id() can be recycled by the collector mid-walk.
-        key = id(current)
-        if seen_code.get(key, _STASH_SCAN_MAX_DEPTH + 1) <= depth:
+        if _visited_at_or_above(current, depth):
             continue
-        seen_code[key] = depth
-        alive.append(current)
+        seen_code.append((current, depth))
         names = set(getattr(current, "co_names", ()))
         if names & _STASH_READ_MARKERS:
             return True
@@ -2088,7 +2104,7 @@ def _forward_statically_reads_stash(experts_module):
             called_code = getattr(called, "__code__", None)
             if called_code is None:
                 continue
-            if seen_code.get(id(called_code), _STASH_SCAN_MAX_DEPTH + 1) <= depth + 1:
+            if _visited_at_or_above(called_code, depth + 1):
                 continue
             pending.append((called_code, getattr(called, "__globals__", namespace), depth + 1))
     return False

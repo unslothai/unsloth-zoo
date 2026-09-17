@@ -1193,32 +1193,32 @@ def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
         assert torch.equal(first, second)
 
 
-def test_the_static_scan_never_takes_the_id_of_the_forward():
-    """Pin the mechanism, not just the symptom.
+def test_the_static_scan_takes_no_id_at_all():
+    """Pin the mechanism, because each spelling here breaks a different thing.
 
-    `id()` itself is fine and necessary here: the visited map must key on code-object
-    IDENTITY, because equal-but-distinct code objects exist. What wedged Dynamo was
-    `id(forward)` specifically, since `forward` traces back to `experts_module.forward`, a
-    bound method reallocated on every access, so `___check_obj_id` failed on the frame
-    that created it. So the invariant is narrow: id() may be taken of code objects, never
-    of the forward.
+    `id(forward)` wedged Dynamo: its argument traces to `experts_module.forward`, a bound
+    method reallocated on every access, so `___check_obj_id` failed on the frame that
+    created it. Keying on the code objects themselves instead collapsed equal-but-distinct
+    ones. Keying on `id(code)` fixed that but Dynamo rejects it on some torch versions
+    with "Unsupported: id() with unsupported args", which is a hard compile failure in the
+    branch whose whole purpose is to keep compilation working.
+
+    What survives all three is identity via `is`, so the scan must take no id() at all.
     """
     import ast
     import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(MU._forward_statically_reads_stash)))
-    id_arguments = [
-        node.args[0] for node in ast.walk(tree)
+    id_calls = [
+        node for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        and node.func.id == "id" and node.args
+        and node.func.id == "id"
     ]
-    assert id_arguments, "expected the scan to key on identity via id()"
-    for argument in id_arguments:
-        name = getattr(argument, "id", None)
-        assert name != "forward", (
-            "id(forward) installs a Dynamo guard on a bound method that can never match"
-        )
+    assert not id_calls, (
+        "the scan runs while Dynamo traces, and id() is unsupported there on some torch "
+        "versions; compare code objects with `is` instead"
+    )
 
 
 def test_a_deep_visit_does_not_suppress_a_shallower_one():
