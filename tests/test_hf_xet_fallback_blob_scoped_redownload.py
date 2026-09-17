@@ -771,34 +771,42 @@ def test_a_container_that_cannot_see_the_other_pods_processes_declines(monkeypat
     assert (blobs / stale).exists()
 
 
-def test_the_namespace_test_reads_containerisation_and_where_the_cache_lives(monkeypatch, tmp_path):
-    """An ordinary host is unaffected; inside a container the cache's own mount decides.
+def test_the_namespace_test_reads_containerisation_and_the_caches_mount(monkeypatch, tmp_path):
+    """An ordinary host is unaffected; inside a container the cache's own MOUNT decides.
 
-    On the container's root filesystem nobody outside can be writing into it. A separate
-    mount is the shared volume this case is about, and there the walk stops being proof.
+    Not its device id. A bind mount from the host into a directory-backed container, which is
+    what LXC and systemd-nspawn give you, carries the same `st_dev` as the container's own root
+    while sibling containers write into that cache and stay invisible to `process_iter`. So the
+    mount table is read instead, and only a path carried by the root mount itself counts as
+    private to this namespace.
 
-    The topology is stubbed rather than read off the runner: `tmp_path` and `/` are on the
-    same filesystem on an ordinary Linux runner, which would make this assert the runner's
+    The topology is stubbed rather than read off the runner, which would assert the runner's
     mount layout instead of the helper.
     """
     if os.name == "nt" or not os.path.isdir("/proc"):
         pytest.skip("POSIX containers only")
 
     monkeypatch.setattr(xf, "hf_cache_root", lambda cache_dir = None: Path("/cache"))
-    devices = {"/": 1, "/cache": 1}
-    monkeypatch.setattr(xf, "_device_of", lambda path: devices[str(path)])
+    ROOT_ONLY = "36 25 0:32 / / rw,relatime shared:1 - overlay overlay rw"
+    BIND = ROOT_ONLY + "\n41 36 8:1 /srv/models /cache rw,relatime - ext4 /dev/sda1 rw"
 
     monkeypatch.setattr(xf, "_running_in_a_container", lambda: False)
+    monkeypatch.setattr(xf, "_read_proc_text", lambda path: ROOT_ONLY)
     assert xf._process_walk_sees_every_writer(str(tmp_path)) is True, (
         "an ordinary host lost the purge it is entitled to"
     )
 
-    # Containerised, cache on the container's own root filesystem: nobody outside is here.
+    # Containerised, cache carried by the container's own root mount: nobody outside is here.
     monkeypatch.setattr(xf, "_running_in_a_container", lambda: True)
     assert xf._process_walk_sees_every_writer(str(tmp_path)) is True
 
-    # Containerised, cache on a separate mount: the shared volume this is about.
-    devices["/cache"] = 2
+    # Containerised, cache on a bind mount from the host. Same device as the root on a
+    # directory-backed container, and still a volume a sibling can be writing into.
+    monkeypatch.setattr(xf, "_read_proc_text", lambda path: BIND)
+    assert xf._process_walk_sees_every_writer(str(tmp_path)) is False
+
+    # A mount table we cannot read is not proof of anything.
+    monkeypatch.setattr(xf, "_read_proc_text", lambda path: None)
     assert xf._process_walk_sees_every_writer(str(tmp_path)) is False
 
 

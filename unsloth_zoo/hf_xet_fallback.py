@@ -1155,11 +1155,11 @@ def _process_walk_sees_every_writer(cache_dir: Optional[str] = None) -> bool:
         root = hf_cache_root(cache_dir = cache_dir)
         if root is None:
             return False
-        # Same device as this container's own root: not a shared volume.
-        cache_device, root_device = _device_of(root), _device_of("/")
-        if cache_device is None or root_device is None:
-            return False
-        return cache_device == root_device
+        # MOUNT TOPOLOGY, not the device id. A bind mount from the host into a directory-backed
+        # container -- LXC, systemd-nspawn -- carries the same `st_dev` as the container's own
+        # root while sibling containers write into it and stay invisible to `process_iter`, so
+        # equal devices never established that a path is container-private.
+        return _path_is_on_the_root_mount(root)
     except Exception:
         return False
 
@@ -1170,6 +1170,37 @@ def _process_walk_sees_every_writer(cache_dir: Optional[str] = None) -> bool:
 _HOST_INIT_NAMES = frozenset({
     "systemd", "init", "launchd", "runit", "openrc-init", "s6-svscan", "upstart", "sysvinit",
 })
+
+
+def _path_is_on_the_root_mount(path) -> bool:
+    """Whether *path* is covered by the root mount itself, with no mount of its own beneath it.
+
+    Read from ``/proc/self/mountinfo``, which lists every mount this namespace can see: the
+    longest mount point that is a prefix of the path is the one that carries it. Anything else,
+    including a mountinfo that cannot be read, answers False, which costs a purge rather than a
+    sibling's download.
+    """
+    text = _read_proc_text("/proc/self/mountinfo")
+    if not text:
+        return False
+    try:
+        target = os.path.realpath(str(path))
+    except Exception:
+        return False
+    carrier = ""
+    for line in text.splitlines():
+        fields = line.split(" ")
+        if len(fields) < 5:
+            continue
+        # Mount points are octal-escaped for space, tab, newline and backslash.
+        mount_point = (
+            fields[4].replace("\\040", " ").replace("\\011", "\t")
+            .replace("\\012", "\n").replace("\\134", "\\")
+        )
+        if target == mount_point or target.startswith(mount_point.rstrip("/") + os.sep):
+            if len(mount_point) > len(carrier):
+                carrier = mount_point
+    return carrier == "/"
 
 
 def _running_in_a_container() -> bool:
