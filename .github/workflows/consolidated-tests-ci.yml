@@ -245,6 +245,11 @@ jobs:
           pip install -e .[core]
           pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3 pyyaml==6.0.2
+          # gguf is not a dependency of the zoo, and unsloth goes in --no-deps, so
+          # without this every test that reads a GGUF back skips at
+          # `pytest.importorskip("gguf")`: 73 of them, the whole post conversion
+          # verification file, silently and with the job still green.
+          pip install gguf
 
       - uses: ./.github/actions/pip-cache-save
         with:
@@ -348,6 +353,14 @@ jobs:
         # URLs: the static bypass forms and, in the rebinding file, that the fetch
         # connects to the address the guard actually validated. Neither was executed
         # by any job before, so the guard could regress while CI stayed green.
+        #
+        # The three GGUF export files are the same story once more. They gate the
+        # converter child's `gguf` pin, the post conversion verification that
+        # decides whether an export is published at all, and the MTP config
+        # reconcile shared with unsloth. All three are CPU-pure, need no network
+        # and no llama.cpp toolchain, and they refuse a bad export, so a regression
+        # here silently publishes a broken GGUF. Left to --collect-only they would
+        # prove only that they import.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -386,6 +399,9 @@ jobs:
             tests/test_wheel_top_level_packages.py \
             tests/test_vision_url_ssrf_guard.py \
             tests/test_vision_url_dns_rebinding.py \
+            tests/test_gguf_converter_child_env.py \
+            tests/test_gguf_post_conversion_validation.py \
+            tests/test_mtp_config_reconcile.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
