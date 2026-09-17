@@ -1552,3 +1552,58 @@ def test_the_studio_path_forces_when_a_writer_we_cannot_describe_could_hold_the_
         owned_incomplete_blobs = {nonce},
     ) == set()
     assert snap.exists()
+
+
+def test_a_link_whose_partial_was_kept_is_kept_too(monkeypatch, tmp_path):
+    """Sparing the blob and then deleting its link strands the blob.
+
+    A writer that opens a whitelisted partial between the eligibility scan and the unlink has
+    written no bytes yet, so the partial's mtime is stale. The blob is correctly spared by the
+    writer recheck, but the snapshot sweep judges the link on that same stale mtime and reads it
+    as abandoned. The sibling is downloading for its own revision and will not recreate this
+    one's link, so a completed blob is left unreachable offline.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    partial = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    # An older revision pointing at the same blob, dangling because the blob is not finalized.
+    old_snapshot = tmp_path / REPO_DIR / "snapshots" / ("c" * 40)
+    old_snapshot.mkdir(parents = True)
+    link = old_snapshot / IN_FLIGHT
+    link.symlink_to(os.path.relpath(blobs / _blob_name(IN_FLIGHT), old_snapshot))
+
+    # The writer reappears after the scan whitelisted the partial.
+    monkeypatch.setattr(
+        xf, "_partial_paths_with_a_live_writer", lambda: {_held(tmp_path, partial)},
+    )
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: True)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
+
+    xf._clear_partials(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {partial}, ownership_is_an_earlier_scan = True,
+    )
+    assert (blobs / partial).exists(), "the writer recheck must spare the blob"
+    assert link.is_symlink(), "and the link to it must not be swept while the partial is there"
+
+
+def test_a_link_whose_partial_really_went_is_still_cleared(monkeypatch, tmp_path):
+    """The negative control: nothing above may stop the sweep doing its job."""
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    partial = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    old_snapshot = tmp_path / REPO_DIR / "snapshots" / ("c" * 40)
+    old_snapshot.mkdir(parents = True)
+    link = old_snapshot / IN_FLIGHT
+    link.symlink_to(os.path.relpath(blobs / _blob_name(IN_FLIGHT), old_snapshot))
+
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: True)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
+
+    xf._clear_partials(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {partial}, ownership_is_an_earlier_scan = True,
+    )
+    assert not (blobs / partial).exists(), "nobody holds it, so it goes"
+    assert not link.is_symlink(), "and its dangling link goes with it"

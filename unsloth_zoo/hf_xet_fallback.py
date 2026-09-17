@@ -549,6 +549,25 @@ def _partial_name_is_process_unique(name: str) -> bool:
     return "." in name[: -len(INCOMPLETE_SUFFIX)]
 
 
+def _link_partner_still_on_disk(link: Path, removed_partials: set) -> bool:
+    """Whether the link's target still has a partial THIS call did not remove.
+
+    Deliberately not the freshness test: a writer that has opened the partial without writing
+    yet leaves a stale mtime, and that is exactly the case where sparing the link matters. A
+    partner we unlinked ourselves does not count, or the sweep could never clear anything.
+    """
+    try:
+        target = Path(os.readlink(link))
+        if not target.is_absolute():
+            target = link.parent / target
+    except OSError:
+        return True                      # cannot tell, so do not remove the record
+    partners = _partial_partners_of(target)
+    if partners is None:
+        return True
+    return any(partner.name not in removed_partials for partner in partners)
+
+
 def _link_partner_is_owned(link: Path, owned_incomplete_blobs: set) -> bool:
     """Whether a dangling link's target blob is one of OUR partials, in either spelling.
 
@@ -660,6 +679,9 @@ def _clear_partials(
             and _process_walk_sees_every_writer(cache_dir)
             and _live_writer_walk_was_complete()
         )
+    # What this call actually unlinked, so the snapshot sweep below can tell a link whose
+    # blob is gone from one whose partial a guard above decided to keep.
+    removed_partials: set = set()
     try:
         for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
@@ -708,6 +730,7 @@ def _clear_partials(
                                 # no such sibling either.
                                 continue
                             blob.unlink()
+                            removed_partials.add(blob.name)
                         except OSError:
                             continue  # a locked / denied blob must not abort the rest
             # Clear broken snapshot symlinks (also read as active incomplete state). Sweep EVERY snapshot,
@@ -728,6 +751,14 @@ def _clear_partials(
                                 continue
                             # Spare a sibling's active link (target still has a fresh .incomplete).
                             if _broken_link_has_active_partner(link, active_grace = active_grace):
+                                continue
+                            # And spare one whose partial is still THERE because a check above
+                            # declined to remove it. A writer that reappeared between the scan
+                            # and the unlink has opened the blob without writing yet, so the
+                            # partner is stale and the freshness test alone reads it as
+                            # abandoned; removing the link would strand a blob that sibling is
+                            # about to finish, under a revision this retry will not relink.
+                            if _link_partner_still_on_disk(link, removed_partials):
                                 continue
                             try:
                                 link.unlink()
