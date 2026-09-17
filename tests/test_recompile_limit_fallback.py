@@ -89,8 +89,10 @@ def _an_unspent_recompile_budget():
     """
     utils = sys.modules["unsloth_zoo.temporary_patches.utils"]
     config = torch._dynamo.config
-    keys = [key for key in _LIMIT_KEYS if hasattr(config, key)]
-    limits = {key: getattr(config, key) for key in keys}
+    # Every name the bump path writes, not only this torch's pair: `_reset_bump_state` puts
+    # `_PRISTINE_LIMITS` back across all of them, and a fixture that saved a narrower set left
+    # the two views of "the real budget" disagreeing.
+    limits = {key: getattr(config, key) for key in _PRISTINE_LIMITS}
     saved = (
         utils._GLOBAL_BUMPS,
         dict(utils._ORIGINAL_RECOMPILE_LIMITS),
@@ -102,6 +104,13 @@ def _an_unspent_recompile_budget():
     utils._GLOBAL_BUMPS = 0
     utils._ORIGINAL_RECOMPILE_LIMITS.clear()
     utils._BUMPED_RECOMPILE_LIMITS.clear()
+    # The budget itself, not only the bookkeeping. `_reset_bump_state` restores the limits to
+    # `_PRISTINE_LIMITS`, so a test that enters on some OTHER value -- an earlier file in the
+    # same worker raised or lowered it, which is exactly the leak this fixture exists for --
+    # saw the helper hand back a number it never started from. Handing the pristine budget out
+    # here makes the two agree, and the outer value is still put back at teardown.
+    for key, value in _PRISTINE_LIMITS.items():
+        setattr(config, key, value)
     try:
         yield
     finally:

@@ -1346,3 +1346,87 @@ def test_a_partner_that_is_honestly_absent_is_still_absent(monkeypatch, tmp_path
     """Absence and unreadability are different answers; only the second one spares."""
     _build_cache(tmp_path, partial_age_s = 5.0)
     assert xf._partial_partners_of(tmp_path / REPO_DIR / "blobs" / "deadbeef") == []
+
+
+def test_a_blobs_dir_that_cannot_be_listed_is_unknown_not_partnerless(tmp_path):
+    """`Path.glob` swallows the directory's own read error and answers an EMPTY list.
+
+    Execute without read is the shape that poses it: `os.stat` on the exact name still resolves,
+    so only the listing fails, and the nonce-spelled partial a sibling is writing is invisible.
+    Reported as "no partner", that link is an orphan and gets unlinked mid-download.
+    """
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    target = blobs / _blob_name(IN_FLIGHT)
+    mode = blobs.stat().st_mode
+    os.chmod(blobs, 0o111)
+    try:
+        if os.access(blobs, os.R_OK):
+            pytest.skip("this user can list a 0o111 directory (root), so the flap cannot be posed")
+        assert xf._partial_partners_of(target) is None
+    finally:
+        os.chmod(blobs, mode)
+
+
+def test_a_reopened_owned_name_is_spared_when_the_walk_cannot_see_every_writer(
+    monkeypatch, tmp_path,
+):
+    """On a cache another UID can write into, an empty LOWER BOUND is not proof nobody holds it.
+
+    The first purge removes our deterministic `<etag>.incomplete`; on the older hub a sibling
+    waiting on the blob lock recreates and opens exactly that name. If the walk could not read
+    every process, unlinking it deletes that sibling's live download.
+    """
+    _build_cache(tmp_path, partial_age_s = 5.0)
+    mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: False)
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda *a, **k: False)
+
+    xf._clear_partials(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+        owned_incomplete_blobs = {mine}, owned_names_may_be_reopened = True,
+    )
+    assert mine in _partials(tmp_path), "a name another process may hold must not be unlinked"
+
+
+def test_the_stalled_child_is_killed_before_the_live_writer_walk(monkeypatch, tmp_path):
+    """A stalled child HOLDS its partial open, so asking first subtracted our own file.
+
+    The inference drops every post-baseline partial some live process holds, exempting only what
+    the per-pid probe reports -- and that probe is the one that answered nothing on Windows and
+    on a macOS child it may not inspect. Walking while the child is alive therefore inferred an
+    empty set on exactly those hosts, which is the repo-wide re-download of #9094.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    child_partial = _blob_name("model-00001-of-00002.safetensors") + ".child" + xf.INCOMPLETE_SUFFIX
+    order = []
+
+    def _open_partial():
+        (blobs / child_partial).write_bytes(b"\xa5" * 256)
+
+    class _Ctx:
+        def Process(self, *, target = None, kwargs = None, daemon = None):
+            return _StalledProc(_open_partial)
+
+        def Queue(self):
+            return _StalledQueue()
+
+    def _walk():
+        order.append("walk")
+        return {_held(tmp_path, child_partial)} if "kill" not in order else set()
+
+    monkeypatch.setattr(xf, "_CTX", _Ctx())
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda pid: None)
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", _walk)
+    monkeypatch.setattr(xf, "_terminate_process_group", lambda proc, grace: order.append("kill"))
+    params = {"repo_id": REPO, "revision": REV, "cache_dir": str(tmp_path)}
+    kind_result, _ = xf._run_download_attempt(
+        REPO, kind = "snapshot", params = params, token = None, repo_type = "model",
+        disable_xet = False, cancel_event = None, stall_timeout = 0.3, interval = 0.05,
+        grace_period = 0.1, on_status = None,
+    )
+    assert kind_result == "stall"
+    assert order[:2] == ["kill", "walk"], f"the walk must follow the kill, got {order}"
+    assert params.get("_owned_incomplete_blobs") == {child_partial}

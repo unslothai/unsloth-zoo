@@ -472,12 +472,25 @@ def _partial_partners_of(target: Path) -> "Optional[list]":
         # older revision is not recreated by the current retry, so the finished blob would be
         # unreachable from that revision. Unknown propagates instead.
         return None
+    # `os.scandir`, not `Path.glob`: glob suppresses the directory's own read error and answers
+    # an EMPTY list, which reads here as "no partner" -- the answer that lists a dangling link as
+    # an orphan and unlinks it while a sibling writes the nonce-spelled partial beside it. A
+    # blobs directory with execute but no read permission poses exactly that: the `os.stat` above
+    # succeeds or says ENOENT, and only the listing fails.
+    prefix = target.name + "."
     try:
-        partners += [
-            candidate
-            for candidate in target.parent.glob(f"{target.name}.*{INCOMPLETE_SUFFIX}")
-            if candidate.is_file()
-        ]
+        with os.scandir(target.parent) as entries:
+            for entry in entries:
+                if not (entry.name.startswith(prefix)
+                        and entry.name.endswith(INCOMPLETE_SUFFIX)):
+                    continue
+                try:
+                    if entry.is_file():
+                        partners.append(Path(entry.path))
+                except OSError:
+                    return None
+    except (FileNotFoundError, NotADirectoryError):
+        return partners
     except OSError:
         return None
     return partners
@@ -595,6 +608,23 @@ def _clear_partials(
                 cache_dir, repo_type = repo_type, repo_id = repo_id,
             ):
                 rescanned_writers = None
+    # The same question for the reopened-name pass, asked the other way round. There the walk is
+    # not proof of ownership but proof that nobody ELSE holds a name we once owned, so a lower
+    # bound reads as "free to unlink". PRIVACY decides it first: where no other UID can write
+    # into the cache, no sibling can have reopened the name and an unreadable writer table costs
+    # nothing -- that is every single-user machine, #9094's included, and declining there would
+    # hand them all the repo-wide force this exists to avoid. Only on a cache somebody else can
+    # write into does the walk have to carry the claim, and there a walk that could not read
+    # every process is not proof of absence.
+    reopened_scan_is_evidence = True
+    if owned_names_may_be_reopened:
+        reopened_scan_is_evidence = _cache_is_private_to_this_user(
+            cache_dir, repo_type = repo_type, repo_id = repo_id,
+        ) or (
+            rescanned_writers is not None
+            and _process_walk_sees_every_writer(cache_dir)
+            and _live_writer_walk_was_complete()
+        )
     try:
         for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
@@ -627,13 +657,19 @@ def _clear_partials(
                             if (
                                 owned
                                 and owned_names_may_be_reopened
-                                and rescanned_writers is not None
-                                and _normalized_partial_key(blob) in rescanned_writers
+                                and (
+                                    not reopened_scan_is_evidence
+                                    or (
+                                        rescanned_writers is not None
+                                        and _normalized_partial_key(blob) in rescanned_writers
+                                    )
+                                )
                             ):
                                 # Our child is dead, so a writer holding this name now is a
                                 # sibling that recreated the deterministic partial after the
                                 # earlier purge, and unlinking it would delete an open
-                                # download.
+                                # download. A walk that could not answer is not proof there is
+                                # no such sibling either.
                                 continue
                             blob.unlink()
                         except OSError:
@@ -2383,7 +2419,18 @@ def _run_download_attempt(
                 # them. Prefer the per-pid open-fd set; else post-baseline partials; None -> coarser mtime
                 # guard.
                 owned = _child_open_incomplete_blobs(proc.pid) if proc.pid else None
-                if not owned and baseline_partials is not None:
+                child_open = set(owned) if owned else set()
+                needs_inference = not owned and baseline_partials is not None
+                if needs_inference:
+                    # The inference below asks whether a LIVE process holds each post-baseline
+                    # partial, and until this call our own child is one -- holding the very
+                    # partial being claimed, since a stalled child is a child that has its
+                    # partial open. Asking first therefore subtracted our own file and inferred
+                    # nothing, on exactly the hosts that have no per-pid answer to fall back on
+                    # (Windows, and macOS where open_files() on the child is denied). Kill
+                    # first, then ask: after this, a live writer really is somebody else.
+                    _terminate_process_group(proc, grace_period)
+                if needs_inference:
                     # None (no psutil / proc) OR an empty set (the child stalled in the connect / metadata
                     # phase before opening any partial): try the post-baseline diff before giving up on scope.
                     current = set(
@@ -2394,9 +2441,9 @@ def _run_download_attempt(
                     # same-repo sibling downloading beside this one makes partials in the same
                     # window, and treating one as ours hands it to a purge that skips the age
                     # and live-writer guards entirely. So the names another live process holds
-                    # open are dropped -- all but our own child's, which is the one being
-                    # killed -- and the walk that says so has to have been able to read every
-                    # process, or the cache has to be one nobody else can write into.
+                    # open are dropped -- all but our own child's, which is dead by now -- and
+                    # the walk that says so has to have been able to read every process, or the
+                    # cache has to be one nobody else can write into.
                     writer_paths = _partial_paths_with_a_live_writer()
                     trustworthy = writer_paths is not None and _process_walk_sees_every_writer(
                         params.get("cache_dir")
@@ -2417,16 +2464,15 @@ def _run_download_attempt(
                         writers = _live_writer_names_for_repo(
                             writer_paths, repo_type, repo_id, params.get("cache_dir"),
                         )
-                        inferred -= writers - (
-                            _child_open_incomplete_blobs(proc.pid) or set() if proc.pid else set()
-                        )
+                        inferred -= writers - child_open
                     owned = inferred
                 # An empty ownership set would scope the HTTP-prep purge to NOTHING, leaving a pre-existing
                 # stale *.incomplete blob / dangling link for the retry to inherit and re-trip on. Fall back
                 # to None (unscoped) so the mtime + active-partner guards still clear genuinely-stale state
                 # while sparing a live sibling.
                 params["_owned_incomplete_blobs"] = owned or None
-                _terminate_process_group(proc, grace_period)
+                if not needs_inference:
+                    _terminate_process_group(proc, grace_period)
                 return ("stall", stall_verdict[0] if stall_verdict else "")
             try:
                 result = result_queue.get(timeout = _POLL_INTERVAL)
