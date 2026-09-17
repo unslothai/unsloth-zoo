@@ -967,6 +967,271 @@ def _has_lora_adapters(param) -> bool:
     return len(param.lora_A) > 0
 
 
+# How the flat `num_experts * rank` axis of a fused expert `lora_B` is laid out.
+#
+# PEFT stores a fused MoE expert LoRA as two ordinary Linear weights, lora_A of shape
+# (num_experts * rank, in) and lora_B of shape (out, num_experts * rank), and the two are
+# NOT flattened the same way. lora_A is expert-slowest, `reshape(E, r, in)`. lora_B is
+# expert-FASTEST: `reshape(out, r, E)`, so column j belongs to expert `j % E`. That
+# asymmetry is easy to miss, and it is the whole of this constant's reason to exist.
+#
+# Expert-fastest is what PEFT's own forward (`ParamWrapper.get_delta_factors`) and its
+# merge (`ParamWrapper.get_delta_weight`) both do, unchanged across PEFT 0.18 to 0.21;
+# what vLLM's `_stack_moe_lora_weights` does when it serves the adapter; and what prime-rl
+# writes. It is the only reading any consumer of a saved adapter implements, so it is what
+# the separated forward has to train.
+LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
+
+# What Unsloth's separated forward read before this fix: expert-SLOWEST, a rank-wide
+# contiguous block of columns per expert. Self-consistent, and understood by nothing else.
+# Kept only so an adapter trained that way can still be read back, see
+# `moe_lora_b_layout()`.
+LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
+
+_LORA_B_LAYOUTS = (LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT)
+
+
+class MoELoRABLayoutError(ValueError):
+    """`UNSLOTH_MOE_LORA_B_LAYOUT` is set to something that is not a layout.
+
+    Its own class because `_extract_lora_from_wrapper` turns every exception into "this
+    wrapper has no LoRA", which would silently drop the adapter and train the base model.
+    A configuration mistake has to be louder than that, so it is re-raised there by type.
+    """
+
+
+def _read_moe_lora_b_layout_from_env() -> str:
+    """`UNSLOTH_MOE_LORA_B_LAYOUT`, validated. Split out so the value can be refreshed into
+    a module global on every eager call, which is what makes the switch visible to a
+    compiled graph."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
+    if layout not in _LORA_B_LAYOUTS:
+        raise MoELoRABLayoutError(
+            f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_LORA_B_LAYOUTS}, got "
+            f"{layout!r}."
+        )
+    return layout
+
+
+_MOE_LORA_B_LAYOUT = _read_moe_lora_b_layout_from_env()
+
+
+def moe_lora_b_layout() -> str:
+    """Which packing to read a fused expert `lora_B` with.
+
+    `rank_major` (PEFT's, and therefore everyone's) unless
+    `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` asks for the pre-fix reading, which is
+    what an adapter trained by an older Unsloth needs.
+
+    It is a process-wide mode, not a load-time option. Nothing is recorded on the adapter,
+    and every forward and every merge resolves it again, so setting it only around
+    `load_adapter` leaves the rest of the run reading a legacy adapter as `rank_major` and
+    scrambling it. Set it before the process does any MoE work and leave it set. Reading
+    the layout back off the adapter itself needs the `adapter_config.json` marker, which is
+    the migration path, not this switch.
+    """
+    global _MOE_LORA_B_LAYOUT
+    # Refreshed on every call, including while Dynamo traces. Reading the environment at
+    # trace time bakes the then-current value into the graph, which is what the supported
+    # usage needs: `import unsloth` runs this module's import long before the application
+    # sets the variable, so an import-time value alone would be stale for exactly the
+    # normal case of setting it before training starts. Gating the refresh on
+    # `not is_compiling()` got this wrong, because a run whose first MoE call is already
+    # compiled never executes the eager branch at all.
+    #
+    # What this still does not do is notice a change made AFTER the first compiled call:
+    # Dynamo installs a guard on an `os.environ.get` only when the key is set at trace
+    # time, so there is nothing to invalidate the graph. That is the documented contract,
+    # a process-wide mode set before the process does any MoE work.
+    _MOE_LORA_B_LAYOUT = _read_moe_lora_b_layout_from_env()
+    return _MOE_LORA_B_LAYOUT
+
+
+def _resolve_moe_lora_b_layout(layout) -> str:
+    """The layout to use, whether the caller named one or left it to the environment.
+
+    A caller that names one still gets it validated. Both readers branch on "is this
+    rank_major" and fall through to grouped_by_expert otherwise, so an unvalidated typo
+    is not a no-op: it permutes the columns of a standard adapter, silently, which is the
+    exact damage `moe_lora_b_layout()` validates the environment variable to prevent. A
+    converter passing the layout in from a marker or a command line is the likeliest
+    source of one."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if layout is None:
+        return moe_lora_b_layout()
+    if layout not in _LORA_B_LAYOUTS:
+        raise MoELoRABLayoutError(
+            f"Unsloth: lora_B layout must be one of {_LORA_B_LAYOUTS}, got {layout!r}."
+        )
+    return layout
+
+
+def _moe_lora_b_column_permutation(num_experts, rank_per_expert, device, invert = False):
+    """The column permutation between PEFT's rank-major packing and expert-major order.
+
+    Forward: `out[:, k] = weight_B[:, perm[k]]`. The inverse is the same construction with
+    the two axes swapped, so neither direction needs the other's indices kept around."""
+    total = num_experts * rank_per_expert
+    rows, columns = (num_experts, rank_per_expert) if invert else (rank_per_expert, num_experts)
+    return torch.arange(total, device = device).view(rows, columns).t().reshape(-1)
+
+
+class _ExpertMajorGroupedOperand(torch.autograd.Function):
+    """`(out, E*rank)` -> `(E, rank, out)` for the grouped GEMM, in ONE materialization.
+
+    Gathering into expert-major column order and then permuting to the operand's shape
+    copies the whole tensor twice per projection, on every expert layer of every step.
+    Transposing to `(E*rank, out)` first makes the gather itself produce the operand: the
+    rows land in expert-major order, `index_select` on dim 0 writes a contiguous result,
+    and the final reshape is free.
+
+    Still a real gather, which is the property the grouped GEMM needs: under rank-major
+    packing the expert axis has stride 1, so a pure view chain lets Inductor elide the
+    copy and hand `aten._grouped_mm` an operand that is neither row nor column major.
+    Still saves nothing for the backward either, since the permutation is recomputed from
+    two integers, which is what non-reentrant checkpointing requires."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, weight_B, num_experts, rank_per_expert, layout):
+        ctx.num_experts = num_experts
+        ctx.rank_per_expert = rank_per_expert
+        ctx.layout = layout
+        ctx.dim_B = weight_B.shape[0]
+        rows = weight_B.t()
+        if layout == LORA_B_LAYOUT_RANK_MAJOR:
+            columns = _moe_lora_b_column_permutation(
+                num_experts, rank_per_expert, weight_B.device,
+            )
+            rows = rows.index_select(0, columns)
+        else:
+            rows = rows.contiguous()
+        return rows.reshape(num_experts, rank_per_expert, ctx.dim_B)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rows = grad_output.reshape(ctx.num_experts * ctx.rank_per_expert, ctx.dim_B)
+        if ctx.layout == LORA_B_LAYOUT_RANK_MAJOR:
+            columns = _moe_lora_b_column_permutation(
+                ctx.num_experts, ctx.rank_per_expert, grad_output.device, invert = True,
+            )
+            rows = rows.index_select(0, columns)
+        return rows.t(), None, None, None
+
+
+class _ExpertMajorColumns(torch.autograd.Function):
+    """Reorder `lora_B`'s columns expert-major, saving nothing for the backward.
+
+    `index_select` would do this in one line, but it saves its index tensor, and
+    `torch.utils.checkpoint(use_reentrant = False)` counts every saved tensor and refuses
+    when the recompute saves a different number than the forward. The measuring call in
+    `_patched_param_wrapper_forward` already runs the experts forward a different number
+    of times than the recompute does, so one more saved tensor on the default path is
+    enough to turn that into `CheckpointError`, which is transformers 5's default
+    configuration and Unsloth's own distributed vision path.
+
+    The permutation is fully determined by two integers, so the backward rebuilds the
+    inverse from `ctx` rather than from a saved tensor: nothing is saved, the count is
+    unchanged from the pure-view spelling, and the gradient still reaches `lora_B`.
+    A real gather is also what Inductor cannot fold back into a strided view of the
+    source, which is the other half of why this is not a plain `permute`."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, weight_B, num_experts, rank_per_expert):
+        ctx.num_experts = num_experts
+        ctx.rank_per_expert = rank_per_expert
+        columns = _moe_lora_b_column_permutation(
+            num_experts, rank_per_expert, weight_B.device,
+        )
+        return weight_B.index_select(1, columns)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        columns = _moe_lora_b_column_permutation(
+            ctx.num_experts, ctx.rank_per_expert, grad_output.device, invert = True,
+        )
+        return grad_output.index_select(1, columns), None, None
+
+
+def _moe_lora_b_columns_expert_major(weight_B, num_experts, rank_per_expert, layout):
+    """`lora_B`'s columns reordered so the expert index is slowest, without copying.
+
+    Shared by `unflatten_moe_lora_b` and the grouped-GEMM path so the two cannot disagree
+    about the column order, while each finishes with its OWN single permute into the shape
+    it wants. Doing the reorder here and the permute there is what keeps the copy count at
+    one: composing the two public shapes instead (unflatten, then transpose + contiguous)
+    materialises the tensor twice, which is an extra saved tensor and breaks non-reentrant
+    gradient checkpointing, whose recompute must save exactly what the forward did.
+
+    Returns `weight_B` untouched under grouped-by-expert, where the columns already are
+    expert-slowest."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layout = _resolve_moe_lora_b_layout(layout)
+    if layout != LORA_B_LAYOUT_RANK_MAJOR:
+        return weight_B
+    # PEFT packs expert index fastest: column j holds expert `j % num_experts`.
+    return _ExpertMajorColumns.apply(weight_B, num_experts, rank_per_expert)
+
+
+def unflatten_moe_lora_b(
+    weight_B: torch.Tensor,
+    num_experts: int,
+    rank_per_expert: int,
+    dim_B: int,
+    layout: str = None,
+) -> torch.Tensor:
+    """`(out, num_experts * rank)` -> `(num_experts, out, rank)`.
+
+    The single place the expert axis of a fused `lora_B` is resolved, so the forward, the
+    merge and any converter cannot drift apart. Both layouts end in `.contiguous()` on a
+    permuted view, so neither is cheaper than the other and the choice is purely one of
+    which convention the stored tensor was written in.
+
+    The rank-major branch regroups the columns with `index_select` before it views them,
+    rather than permuting the expert axis out of a three-way view. The two spell the same
+    tensor, but only the first survives `torch.compile`. Under rank-major packing the
+    expert axis has stride 1 in `weight_B`, so every view that puts experts first leaves
+    BOTH remaining axes with a stride above 1, and `aten._grouped_mm` rejects a `mat_b`
+    that is neither row nor column major. Eager is fine because `.contiguous()` really
+    copies; Inductor folds the whole view chain into one strided read of `weight_B` and
+    picks the source layout, so the copy disappears and the consumer sees
+    `(1, num_experts, num_experts * rank)` and raises `Invalid strides/sizes`. Measured on
+    `gemma-4-26B-A4B-it` (E=128, rank=8, out=1408) and reproduced standalone; the
+    pre-existing grouped-by-expert spelling escaped only because eliding ITS copy happens
+    to leave a legal column-major operand. `index_select` is a real gather that Inductor
+    cannot fold into a view, it keeps the gradient flowing to `lora_B`, and its indices are
+    a permutation, so its `index_add` backward has no duplicate targets to reduce
+    nondeterministically."""
+    weight_B = _moe_lora_b_columns_expert_major(
+        weight_B, num_experts, rank_per_expert, layout,
+    )
+    return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
+
+
+def moe_lora_b_expert_columns(
+    expert_idx: int,
+    num_experts: int,
+    rank_per_expert: int,
+    layout: str = None,
+) -> slice:
+    """Which columns of a flat `(out, num_experts * rank)` `lora_B` belong to one expert.
+
+    A `slice`, so indexing with it stays a view. The companion of
+    `unflatten_moe_lora_b` for the merge paths that walk one expert at a time; the two
+    must agree, which is why both live here. `lora_A`'s rows for the same expert are
+    always `expert_idx * rank : (expert_idx + 1) * rank`, in both layouts, and the
+    resulting column order matches that rank order."""
+    layout = _resolve_moe_lora_b_layout(layout)
+    if layout == LORA_B_LAYOUT_RANK_MAJOR:
+        return slice(expert_idx, num_experts * rank_per_expert, num_experts)
+    return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
+
+
 def _canonical_lora_weights_for_grouped_mm(
     weight_A: torch.Tensor,
     weight_B: torch.Tensor,
@@ -977,8 +1242,13 @@ def _canonical_lora_weights_for_grouped_mm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
     first_weight = first_weight.permute(0, 2, 1).contiguous()
-    second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-    second_weight = second_weight.permute(1, 2, 0).contiguous()
+    # (num_experts, rank, out) for X @ first @ second, in ONE copy. Going through
+    # unflatten_moe_lora_b and transposing its result materialises the tensor twice, and
+    # the extra saved tensor makes non-reentrant gradient checkpointing recompute a
+    # different number of tensors than the forward saved.
+    second_weight = _ExpertMajorGroupedOperand.apply(
+        weight_B, num_experts, rank_per_expert, _resolve_moe_lora_b_layout(None),
+    )
     return first_weight, second_weight
 
 
@@ -990,8 +1260,7 @@ def _reversed_lora_weights_for_grouped_mm(
     dim_A: int,
     dim_B: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-    first_weight = first_weight.permute(1, 0, 2).contiguous()
+    first_weight = unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B)
     second_weight = weight_A.view(num_experts, rank_per_expert, dim_A).contiguous()
     return first_weight, second_weight
 
@@ -1180,6 +1449,9 @@ def _extract_lora_from_wrapper(
             experts_module=experts_module,
             model_name="MoE",
         )
+    except MoELoRABLayoutError:
+        # A misspelled UNSLOTH_MOE_LORA_B_LAYOUT must not read as "no adapter here".
+        raise
     except Exception:
         return None
 
