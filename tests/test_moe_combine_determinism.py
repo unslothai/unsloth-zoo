@@ -102,3 +102,36 @@ def test_combine_covers_every_slot_exactly_once():
         ones, sorted_indices, num_tokens, top_k, out_dtype = torch.float64,
     )
     assert torch.equal(got, torch.full_like(got, float(top_k)))
+
+
+def test_combine_gradient_matches_the_index_add_form():
+    """The combine sits in the backward path of every MoE training step, so agreeing
+    on the forward is not enough: a reduction that summed the right values through a
+    different graph would pass every test above and still train a different model.
+
+    Both spellings are gathers in reverse, so with the same upstream gradient this is
+    an exact equality rather than a tolerance, in every dtype.
+    """
+    num_tokens, top_k, hidden, num_experts = 512, 4, 64, 16
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    for dtype in (torch.float64, torch.float32, torch.bfloat16):
+        sorted_indices, permuted = _make_case(
+            num_tokens, top_k, hidden, num_experts, dtype, device,
+        )
+        # One upstream gradient shared by both arms, or the comparison is meaningless.
+        upstream = torch.randn(num_tokens, hidden, dtype = dtype, device = device)
+
+        ours = permuted.clone().requires_grad_(True)
+        (combine_permuted_moe_outputs(
+            ours, sorted_indices, num_tokens, top_k, out_dtype = dtype,
+        ) * upstream).sum().backward()
+
+        theirs = permuted.clone().requires_grad_(True)
+        (_index_add_reference(
+            theirs, sorted_indices, num_tokens, top_k, hidden, dtype,
+        ) * upstream).sum().backward()
+
+        assert torch.equal(ours.grad, theirs.grad), (
+            f"{dtype}: combine gradient diverges from the index_add_ form, "
+            f"max diff {(ours.grad - theirs.grad).abs().max().item():.3e}"
+        )
