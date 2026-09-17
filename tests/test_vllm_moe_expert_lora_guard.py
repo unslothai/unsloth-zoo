@@ -15,10 +15,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """`load_lora` must refuse MoE expert adapters rather than ship them to vLLM.
 
-`load_lora`'s ".lora_A." / ".lora_B." filter lets stacked expert adapters past vLLM's
-validation, which then accepts and ignores them: rollouts come from the base experts while
-training keeps updating the adapters, and nothing raises. These pin the detector that turns
-that into a refusal, including the near-misses a substring match would wrongly reject.
+vLLM accepts and then ignores them, so rollouts come from the base experts while training
+keeps updating the adapters, silently. These pin the detector, and the near-misses a
+substring match would wrongly reject.
 """
 import pytest
 
@@ -26,11 +25,10 @@ from unsloth_zoo.vllm_utils import _is_moe_expert_lora_key
 
 
 EXPERT_KEYS = [
-    # Qwen3 MoE / Qwen3.5 / Qwen3.6, the layout Unsloth logs as
-    # "Enabling LoRA on MoE parameters: ['mlp.experts.gate_up_proj', 'mlp.experts.down_proj']"
+    # Qwen3 MoE / Qwen3.5 / 3.6
     "base_model.model.model.layers.0.mlp.experts.gate_up_proj.lora_A.weight",
     "base_model.model.model.layers.3.mlp.experts.down_proj.lora_B.weight",
-    # gpt-oss and Gemma 4 expose the stacked experts one level up
+    # gpt-oss and Gemma 4: experts one level up
     "model.layers.0.experts.gate_up_proj.lora_A.weight",
     "model.layers.11.experts.down_proj.lora_B.weight",
 ]
@@ -41,8 +39,7 @@ NON_EXPERT_KEYS = [
     "base_model.model.model.layers.0.mlp.gate_proj.lora_A.weight",
     "base_model.model.model.layers.0.mlp.up_proj.lora_A.weight",
     "base_model.model.model.layers.0.mlp.down_proj.lora_B.weight",
-    # Near-misses a substring test would reject. The second is real: Qwen MoE's shared
-    # expert is a DENSE mlp that vLLM serves through the ordinary LoRA path.
+    # Near-misses. The second is real: Qwen MoE's shared expert is a dense mlp vLLM serves.
     "base_model.model.model.layers.0.mlp.experts_gate.lora_A.weight",
     "base_model.model.model.layers.0.mlp.shared_expert.up_proj.lora_A.weight",
 ]
@@ -65,9 +62,8 @@ def test_detector_matches_dotted_segments_not_substrings():
     assert not _is_moe_expert_lora_key("a.expertsb.lora_A.weight")
 
 
-# --- the on-disk default branch (load_tensors=False) ----------------------------------
-# load_lora's default hands vLLM a PATH, so the in-memory check never runs; vLLM then skips
-# the expert keys it cannot place, for the same silent base-experts outcome.
+# --- on-disk branch (load_tensors=False): vLLM gets a PATH, so the in-memory check never
+# runs and vLLM silently skips the expert keys it cannot place. -------------------------
 import os
 
 import pytest
@@ -94,7 +90,7 @@ def test_dense_only_adapter_is_allowed(tmp_path):
     _write_safetensors(str(tmp_path / "adapter_model.safetensors"), [
         "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
         "base_model.model.model.layers.0.mlp.down_proj.lora_B.weight",
-        # the shared expert is a dense mlp and must NOT trip the guard
+        # dense shared expert must NOT trip the guard
         "base_model.model.model.layers.0.mlp.shared_expert.up_proj.lora_A.weight",
     ])
     assert _saved_adapter_expert_lora_keys(str(tmp_path)) == []
@@ -109,23 +105,22 @@ def test_reads_expert_keys_from_bin(tmp_path):
 
 
 def test_missing_or_unreadable_adapter_is_not_our_error(tmp_path):
-    # No adapter at all: vLLM should raise its own error, we must not pre-empt it.
+    # No adapter: vLLM raises its own error, we must not pre-empt it.
     assert _saved_adapter_expert_lora_keys(str(tmp_path)) == []
     (tmp_path / "adapter_model.safetensors").write_bytes(b"not a safetensors file")
     assert _saved_adapter_expert_lora_keys(str(tmp_path)) == []
 
 
 def test_non_lora_expert_tensors_are_ignored(tmp_path):
-    # Only adapter tensors matter; a stray expert base weight in the dir is not an adapter.
+    # A stray expert base weight is not an adapter.
     _write_safetensors(str(tmp_path / "adapter_model.safetensors"), [
         "base_model.model.model.layers.0.mlp.experts.gate_up_proj.weight",
     ])
     assert _saved_adapter_expert_lora_keys(str(tmp_path)) == []
 
 
-# --- the ".moe." spelling -------------------------------------------------------------
-# saving_utils.py treats ".moe" as an expert prefix and remaps it for Gemma 4, so adapters
-# from that layout carry ".moe." and are equally unservable. "experts" alone missed them.
+# --- ".moe.", the Gemma 4 spelling saving_utils.py remaps to ".experts": equally
+# unservable, and "experts" alone missed it. -------------------------------------------
 
 MOE_SPELLING_KEYS = [
     "base_model.model.model.layers.0.moe.gate_up_proj.lora_A.weight",
@@ -140,19 +135,17 @@ def test_moe_spelling_is_detected(key):
 
 
 def test_moe_spelling_is_still_segment_matched():
-    # "moe" must be a whole segment, so these dense names stay servable.
+    # whole segment only, so these dense names stay servable
     assert not _is_moe_expert_lora_key("a.moecoder.b.lora_A.weight")
     assert not _is_moe_expert_lora_key("a.my_moe_thing.b.lora_A.weight")
     assert not _is_moe_expert_lora_key("base_model.model.model.layers.0.mlp.shared_expert.up_proj.lora_A.weight")
 
 
-# --- parent-qualified expert names (GraniteMoE) ---------------------------------------
-# On transformers 4.57 through 5.0 GraniteMoE's experts are `block_sparse_moe.input_linear` /
-# `.output_linear`, which carry neither "experts" nor "moe" as a segment. They cannot be
-# matched bare: the same pair is a DENSE nn.Linear under `shared_mlp` in granitemoeshared /
-# _swa / hybrid, and a projector in granite_speech. Hence (parent, child) matching.
-# GraniteMoeShared on 4.57.6 carries both spellings at once, and PEFT
-# target_parameters=["input_linear.weight"] adapts both, so this really is one checkpoint.
+# --- parent-qualified names (GraniteMoE) ----------------------------------------------
+# On transformers 4.57 to 5.0 the experts are block_sparse_moe.input_linear / .output_linear,
+# matching neither "experts" nor "moe". Matching them bare would reject the DENSE pair at
+# shared_mlp.input_linear, which GraniteMoeShared carries in the SAME model. Hence
+# (parent, child) matching. ------------------------------------------------------------
 
 GRANITE_EXPERT_KEYS = [
     "base_model.model.model.layers.0.block_sparse_moe.input_linear.lora_A.default.weight",
