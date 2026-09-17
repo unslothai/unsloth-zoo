@@ -1177,11 +1177,26 @@ try:
         unflatten_moe_lora_b as _unflatten_moe_lora_b,
     )
 except ImportError:
+    # Only reachable on an install with no temporary_patches, which is also an install
+    # with no separated MoE forward to disagree with. It still honours the layout it is
+    # handed rather than silently ignoring it, and it still reshapes rather than views,
+    # so a non-contiguous lora_B does not turn into an exception here and nowhere else.
+    _FALLBACK_GROUPED_BY_EXPERT = "grouped_by_expert"
+
+    def _fallback_layout(layout):
+        if layout is not None:
+            return layout
+        return os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", "rank_major")
+
     def _moe_lora_b_expert_columns(expert_idx, num_experts, rank_per_expert, layout = None):
+        if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
+            return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
         return slice(expert_idx, num_experts * rank_per_expert, num_experts)
 
     def _unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B, layout = None):
-        return weight_B.view(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
+        if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
+            return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
+        return weight_B.reshape(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
 
 
 def _merge_moe_expert_quant_aware(
