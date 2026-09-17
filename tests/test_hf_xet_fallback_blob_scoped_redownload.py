@@ -1728,6 +1728,14 @@ def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
     monkeypatch.setattr(xf, "_read_proc_text", lambda path: proc_text.get(path))
 
     present: set = set()
+    # Every path the gate consults is answered from `present` alone. Delegating them to the
+    # real filesystem would read the runner's own `/.dockerenv` when this suite runs inside
+    # Docker or Podman, and the ordinary-host arm below would fail for the environment rather
+    # than for the behaviour under test.
+    simulated = frozenset({
+        "/.dockerenv", "/run/.containerenv", "/run/systemd/container", "/run/host",
+        "/proc/vz", "/proc/bc",
+    })
 
     class _WithMarkers:
         """Only this module's `os` lookups: patching os.path itself breaks pytest, which
@@ -1736,11 +1744,13 @@ def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
         class path:
             @staticmethod
             def exists(path):
-                return path in present or os.path.exists(path)
+                if path in simulated: return path in present
+                return os.path.exists(path)
 
             @staticmethod
             def isdir(path):
-                return path in present or os.path.isdir(path)
+                if path in simulated: return path in present
+                return os.path.isdir(path)
 
         def __getattr__(self, name):
             return getattr(os, name)
