@@ -311,6 +311,47 @@ def test_host_resolution_is_not_cached(monkeypatch):
     assert len(calls) == 3, "each validation must use a fresh answer"
 
 
+def test_an_absolute_name_is_resolved_absolutely(monkeypatch):
+    """A trailing dot is not cosmetic to DNS: it makes the name absolute.
+
+    _normalize_host strips it so a pin matches whichever spelling the client puts
+    on the connection, and resolving that stripped form let a resolver with search
+    domains answer for `cdn.example.<search-domain>` instead. Kubernetes ships
+    ndots:5 by default, so that is the ordinary case there: the guard would then
+    reject a valid public URL whose search-expanded twin is private, or pin the
+    request to an address belonging to a different name.
+    """
+    asked = []
+    real = __import__("socket").getaddrinfo
+
+    def recording(host, *args, **kwargs):
+        asked.append(host)
+        return real("93.184.216.34", *args, **kwargs)
+
+    monkeypatch.setattr(__import__("socket"), "getaddrinfo", recording)
+    vision_utils._check_fetchable_url("https://cdn.example./asset.png")
+    assert asked == ["cdn.example."], (
+        f"the absolute marker was dropped before resolution: {asked}"
+    )
+
+    # And the pin still compares against the spelling a client puts on the wire.
+    assert vision_utils._normalize_host("cdn.example.") == "cdn.example"
+
+
+def test_a_relative_name_is_left_alone(monkeypatch):
+    """The other half: nothing gains a dot it did not have."""
+    asked = []
+    real = __import__("socket").getaddrinfo
+
+    def recording(host, *args, **kwargs):
+        asked.append(host)
+        return real("93.184.216.34", *args, **kwargs)
+
+    monkeypatch.setattr(__import__("socket"), "getaddrinfo", recording)
+    vision_utils._check_fetchable_url("https://cdn.example/asset.png")
+    assert asked == ["cdn.example"], asked
+
+
 def test_resolution_failure_is_not_cached_either(monkeypatch):
     calls = []
 

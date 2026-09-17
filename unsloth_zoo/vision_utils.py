@@ -261,6 +261,27 @@ def _normalize_host(host: str) -> str:
     return host.rstrip(".").strip("[]").lower()
 
 
+def _resolvable_host(host: str) -> str:
+    """The spelling to hand the resolver, absolute marker intact.
+
+    `_normalize_host` strips a trailing dot so a pin matches whichever spelling
+    the client puts on the connection, but to DNS that dot is not cosmetic: it
+    makes the name absolute. Dropping it before getaddrinfo lets a resolver with
+    search domains answer for `cdn.example.<search-domain>` instead of the name
+    the URL asked for, and Kubernetes ships `ndots:5` by default so this is the
+    ordinary case there, not an exotic one. That both rejects valid public URLs
+    whose search-expanded twin is private, and pins the request to an address
+    belonging to a different name.
+
+    The dot goes back on AFTER `_wire_host`, because IDNA encoding is defined
+    over labels and the trailing empty label is not one of them.
+    """
+    wire = _wire_host(_normalize_host(host))
+    if host.endswith(".") and wire and not wire.endswith("."):
+        return wire + "."
+    return wire
+
+
 def _wire_host(host: str) -> str:
     """The spelling requests will actually put on the connection.
 
@@ -328,7 +349,7 @@ def _check_fetchable_url(url: str):
     # for the connection is the whole DNS rebinding hole, see _PinnedConnectionMixin.
     blocked_name = _is_blocked_hostname(host)
     # Resolve the spelling that will be dialled, not the one that was typed.
-    addresses = None if blocked_name else _resolve_host(_wire_host(_normalize_host(host)))
+    addresses = None if blocked_name else _resolve_host(_resolvable_host(host))
     if blocked_name or _is_blocked_resolution(addresses):
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{host}` since it resolves to a "
