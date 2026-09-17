@@ -298,6 +298,10 @@ jobs:
         # raising requires-python relaxes it rather than making it lie.
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
+        # test_safe_serialization_none pins that `safe_serialization = None` means the
+        # safetensors default rather than a pickle, and carries a drift gate over the whole
+        # package for any future save entry point that forwards the argument unnormalised.
+        # CPU-pure and stdlib-only, so it belongs in a gate rather than in collect-only.
         #
         # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
         # eager fallback: still falls back on a first-call refusal, ends the step
@@ -337,6 +341,10 @@ jobs:
         # request. Collecting the drift file here proves it still imports under
         # a plain root, and the sweep is a stdlib-only grep that refuses the
         # pattern anywhere in the suite.
+        # The two vision URL files gate the SSRF guard for dataset-supplied media
+        # URLs: the static bypass forms and, in the rebinding file, that the fetch
+        # connects to the address the guard actually validated. Neither was executed
+        # by any job before, so the guard could regress while CI stayed green.
         # test_merge_index_weight_map_traversal pins that shard names taken from a
         # local index cannot resolve outside save_directory, neither by creating a
         # file through copy2 nor by the in-place r+b merge of one that exists.
@@ -376,6 +384,8 @@ jobs:
             tests/test_checkpoint_modes.py \
             tests/test_gc_rewriter_bound_keywords.py \
             tests/test_wheel_top_level_packages.py \
+            tests/test_vision_url_ssrf_guard.py \
+            tests/test_vision_url_dns_rebinding.py \
             tests/test_merge_index_weight_map_traversal.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
@@ -391,6 +401,7 @@ jobs:
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
             tests/test_undefined_name_gate.py \
+            tests/test_safe_serialization_none.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -911,6 +922,10 @@ jobs:
                 # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
                 # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
                 # cannot turn these lanes red.
+                # test_merge_e2e_partial_refusal is here for the same reason: the bridge
+                # to a composite model's on-disk weights is a class attribute in
+                # transformers 4 and a registry in 5, and losing it merges nothing
+                # silently, so one pinned version cannot show the merge finds it.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -935,6 +950,7 @@ jobs:
                   tests/test_transformers_moe_structure_drift.py \
                   tests/test_moe_merge_e2e_cpu.py \
                   tests/test_merge_e2e_hub_unreachable.py \
+                  tests/test_merge_e2e_partial_refusal.py \
                   tests/test_gemma4_dtype_drift_guards.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else

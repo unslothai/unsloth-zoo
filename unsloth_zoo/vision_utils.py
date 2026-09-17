@@ -44,6 +44,7 @@ import torch
 import numpy as np
 from PIL import Image
 import base64
+import contextvars
 from io import BytesIO
 import math
 import time
@@ -193,15 +194,18 @@ def _resolve_host(host: str):
     import socket
 
     try:
-        infos = socket.getaddrinfo(host, None)
+        # SOCK_STREAM or glibc answers once per socket type, and the connection
+        # would then dial each address three times over.
+        infos = socket.getaddrinfo(host, None, type = socket.SOCK_STREAM)
     except Exception:
         return None
     addresses = []
     for info in infos:
         try:
-            addresses.append(ipaddress.ip_address(info[4][0].split("%", 1)[0]))
+            address = ipaddress.ip_address(info[4][0].split("%", 1)[0])
         except ValueError:
             continue
+        if address not in addresses: addresses.append(address)
     return tuple(addresses)
 
 
@@ -217,16 +221,103 @@ def _proxy_applies(url: str) -> bool:
         return False
 
 
-def _is_blocked_address(host: str) -> bool:
-    if host.lower().rstrip(".") in _BLOCKED_HOSTNAMES: return True
-    addresses = _resolve_host(host)
+def _is_blocked_hostname(host: str) -> bool:
+    return host.lower().rstrip(".") in _BLOCKED_HOSTNAMES
+
+
+def _is_blocked_resolution(addresses) -> bool:
     if addresses is None: return False  # unresolvable, see assert_fetchable_url
     return any(_is_blocked_ip(ip) for ip in addresses)
 
 
+def _is_blocked_address(host: str) -> bool:
+    if _is_blocked_hostname(host): return True
+    return _is_blocked_resolution(_resolve_host(host))
+
+
 def assert_fetchable_url(url: str) -> str:
     """Reject non-http(s) URLs and URLs pointing at loopback/private hosts."""
-    if _allow_private_url_fetch(): return url
+    _check_fetchable_url(url)
+    return url
+
+
+def _host_forms(host: str) -> tuple:
+    """Every spelling of `host` an HTTP client may put on the connection.
+
+    requests punycodes a non-ASCII host before it builds the connection pool, so
+    a pin recorded under the unicode spelling alone would never match and the
+    fetch would quietly resolve the name for itself again.
+    """
+    # urllib3 1.x hands the connection an IPv6 literal still in its brackets
+    # while 2.x strips them, and a pin has to match either spelling.
+    host = _normalize_host(host)
+    wire = _wire_host(host)
+    return (host,) if wire == host else (host, wire)
+
+
+def _normalize_host(host: str) -> str:
+    # urllib3 1.x hands the connection an IPv6 literal still in its brackets
+    # while 2.x strips them, and a pin has to match either spelling.
+    return host.rstrip(".").strip("[]").lower()
+
+
+def _resolvable_host(host: str) -> str:
+    """The spelling to hand the resolver, absolute marker intact.
+
+    `_normalize_host` strips a trailing dot so a pin matches whichever spelling
+    the client puts on the connection, but to DNS that dot is not cosmetic: it
+    makes the name absolute. Dropping it before getaddrinfo lets a resolver with
+    search domains answer for `cdn.example.<search-domain>` instead of the name
+    the URL asked for, and Kubernetes ships `ndots:5` by default so this is the
+    ordinary case there, not an exotic one. That both rejects valid public URLs
+    whose search-expanded twin is private, and pins the request to an address
+    belonging to a different name.
+
+    The dot goes back on AFTER `_wire_host`, because IDNA encoding is defined
+    over labels and the trailing empty label is not one of them.
+    """
+    wire = _wire_host(_normalize_host(host))
+    if host.endswith(".") and wire and not wire.endswith("."):
+        return wire + "."
+    return wire
+
+
+def _wire_host(host: str) -> str:
+    """The spelling requests will actually put on the connection.
+
+    This is the one that must be resolved, not the unicode spelling. The two are
+    not always the same domain: socket.getaddrinfo applies Python's builtin IDNA,
+    which maps `fass.de` onto `fa\u00df.de`, while requests applies UTS-46 and
+    sends `xn--fa-hia.de`. Resolving the unicode form and pinning both spellings
+    let the fetch reach one domain on another domain's checked address.
+    """
+    try:
+        host.encode("ascii")
+        return host
+    except UnicodeEncodeError:
+        pass
+    try:
+        # uts46 is how requests itself encodes, see requests.models.prepare_url.
+        import idna
+        return idna.encode(host, uts46 = True).decode("ascii").lower()
+    except Exception:
+        # Without the idna package requests falls back to the builtin encoding,
+        # so matching it here keeps the pin on whatever it will send.
+        try:
+            return host.encode("idna").decode("ascii").lower()
+        except Exception:
+            return host
+
+
+def _check_fetchable_url(url: str):
+    """Validate `url` and return what the fetch is then allowed to connect to.
+
+    Returns `(hosts, addresses)`: `hosts` the spellings of the host this applies
+    to, `addresses` the checked addresses, empty when the name did not resolve
+    here so nothing may be dialled for it. Returns `_UNPINNED` when the address
+    is genuinely not ours to choose: the opt-out is set, or a proxy picks it.
+    """
+    if _allow_private_url_fetch(): return _UNPINNED
     from urllib.parse import urlparse
 
     parsed = urlparse(url)
@@ -254,21 +345,150 @@ def assert_fetchable_url(url: str) -> str:
     host = parsed.hostname
     if host is None:
         raise ValueError(f"Unsloth: Refusing to fetch media from a URL with no host: `{url}`")
-    if _is_blocked_address(host):
+    # Resolve exactly once and hand the answer back to the caller: resolving again
+    # for the connection is the whole DNS rebinding hole, see _PinnedConnectionMixin.
+    blocked_name = _is_blocked_hostname(host)
+    # Resolve the spelling that will be dialled, not the one that was typed.
+    addresses = None if blocked_name else _resolve_host(_resolvable_host(host))
+    if blocked_name or _is_blocked_resolution(addresses):
         raise ValueError(
             f"Unsloth: Refusing to fetch media from `{host}` since it resolves to a "
             f"loopback, private, link-local or otherwise internal address. "
             f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to allow it."
         )
-    # Unresolvable is harmless on its own, since the request goes nowhere either.
-    # Behind a proxy it is not: the proxy resolves the name, so nothing was checked.
-    if _resolve_host(host) is None and _proxy_applies(url):
+    # A proxy makes the connection go to the proxy, not to these addresses, so
+    # there is nothing of ours to pin on that path.
+    if _proxy_applies(url):
+        # Behind a proxy an unresolvable name is not harmless: the proxy resolves
+        # it instead of us, so nothing was ever checked.
+        if not addresses:
+            raise ValueError(
+                f"Unsloth: Refusing to fetch media from `{host}` since this machine cannot "
+                f"resolve it and a proxy is configured, so its address is never checked. "
+                f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 if the proxy is trusted."
+            )
+        return _UNPINNED
+    # An empty set pins the host to nothing: a name that did not resolve for the
+    # check must not be resolved again for the connection, since the second
+    # answer is the attacker's chance to return an internal address.
+    return (_host_forms(host), tuple(str(ip) for ip in addresses or ()))
+
+
+# Validating the hostname and then handing the name to the HTTP client resolves
+# DNS twice, and an attacker who serves the authoritative zone for a hostname in
+# a dataset row can answer the two queries differently: a public address for the
+# check, 127.0.0.1 or an RFC1918 address for the connection. The fetch then
+# reaches an address the guard would have rejected. Closed by connecting to the
+# address that was actually checked, and restoring the hostname before the
+# connection is handed back, so the Host header, the SNI extension and
+# certificate verification all still see the hostname.
+_PINNED_ADDRESSES = contextvars.ContextVar("unsloth_pinned_addresses", default = None)
+# The address is not ours to choose here: the guard is off, or a proxy picks it.
+_UNPINNED = "unsloth_unpinned"
+
+
+class _PinnedConnectionMixin:
+    """Resolve to the checked address only, for the connect call only.
+
+    `host` is a property over `_dns_host`, so during the swap both read the
+    address. What keeps TLS honest is the restore: `HTTPSConnection.connect`
+    reads `host` for SNI and hostname matching, and httplib reads it for the
+    Host header, only after `_new_conn` has returned, by which point the
+    hostname is back in place.
+
+    These classes only ever serve a guarded session, so anything other than a
+    matching pin is refused rather than resolved again. That is the whole point:
+    a fetch that quietly falls back to its own DNS answer is the bug being fixed.
+    """
+    def _new_conn(self):
+        pinned = _PINNED_ADDRESSES.get()
+        if pinned is _UNPINNED: return super()._new_conn()
+        host = self._dns_host.rstrip(".").strip("[]").lower()
+        if pinned is None:
+            raise ValueError(
+                f"Unsloth: Refusing to connect to `{host}` for media since the checked "
+                f"address for it was not carried this far, so nothing pins where this "
+                f"connection lands. Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to skip "
+                f"the destination check entirely."
+            )
+        hosts, addresses = pinned
+        if host not in hosts:
+            raise ValueError(
+                f"Unsloth: Refusing to connect to `{host}` for media since the checked "
+                f"host was `{hosts[0]}`. Only the host the guard checked is fetched."
+            )
+        if not addresses:
+            raise ValueError(
+                f"Unsloth: Refusing to fetch media from `{host}` since it did not resolve "
+                f"when it was checked. Resolving it again for the connection would leave "
+                f"the address unchecked."
+            )
+        original = self._dns_host
+        error = None
+        for address in addresses:
+            # Every address here came back from the one checked resolution, so
+            # keep trying them in order the way the resolver path would.
+            self._dns_host = address
+            try:
+                return super()._new_conn()
+            except Exception as exception:
+                error = exception
+            finally:
+                self._dns_host = original
+        raise error
+
+
+@lru_cache(maxsize = 1)
+def _pinned_adapter_class():
+    """Build the pinned requests adapter, or fail closed if urllib3 moved."""
+    from urllib3.connection import HTTPConnection, HTTPSConnection
+    from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+
+    class _PinnedHTTPConnection(_PinnedConnectionMixin, HTTPConnection): pass
+    class _PinnedHTTPSConnection(_PinnedConnectionMixin, HTTPSConnection): pass
+    class _PinnedHTTPConnectionPool(HTTPConnectionPool):
+        ConnectionCls = _PinnedHTTPConnection
+    class _PinnedHTTPSConnectionPool(HTTPSConnectionPool):
+        ConnectionCls = _PinnedHTTPSConnection
+
+    class _PinnedAddressAdapter(requests.adapters.HTTPAdapter):
+        def init_poolmanager(self, *args, **kwargs):
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = {
+                "http" : _PinnedHTTPConnectionPool,
+                "https": _PinnedHTTPSConnectionPool,
+            }
+
+    # Prove the pools really are ours rather than trusting that this urllib3
+    # reads pool_classes_by_scheme off the manager: unpinned but working is the
+    # one outcome that must not be possible. Pools are lazy, nothing is dialled.
+    probe = _PinnedAddressAdapter()
+    try:
+        for scheme in ("http", "https"):
+            pool = probe.poolmanager.connection_from_url(f"{scheme}://unsloth.invalid")
+            if not issubclass(pool.ConnectionCls, _PinnedConnectionMixin):
+                raise RuntimeError(f"this urllib3 ignores pool_classes_by_scheme for {scheme}")
+    finally:
+        probe.close()
+    return _PinnedAddressAdapter
+
+
+def _guarded_session():
+    """A session whose connections only reach addresses the guard checked."""
+    session = requests.Session()
+    try:
+        adapter_class = _pinned_adapter_class()
+    except Exception as exception:
+        if _allow_private_url_fetch(): return session
+        session.close()
         raise ValueError(
-            f"Unsloth: Refusing to fetch media from `{host}` since this machine cannot "
-            f"resolve it and a proxy is configured, so its address is never checked. "
-            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 if the proxy is trusted."
-        )
-    return url
+            f"Unsloth: Cannot pin media fetches to the address that was checked "
+            f"({exception}), so a hostname could resolve to an internal address at "
+            f"connect time. Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to fetch anyway."
+        ) from exception
+    for prefix in ("http://", "https://"):
+        session.mount(prefix, adapter_class())
+    return session
 
 
 def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
@@ -284,32 +504,38 @@ def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
     current = url
     # One session for the chain: requests used to carry the cookie jar across
     # hops itself, and signed-cookie CDNs rely on it.
-    with requests.Session() as session:
+    with _guarded_session() as session:
         for _ in range(_MAX_MEDIA_REDIRECTS + 1):
-            assert_fetchable_url(current)
-            response = session.get(current, stream = True, timeout = timeout, allow_redirects = False)
+            # Each hop is checked and each hop connects to the address that check
+            # resolved, so a redirect cannot be rebound either.
+            token = _PINNED_ADDRESSES.set(_check_fetchable_url(current))
             try:
-                if response.is_redirect or response.is_permanent_redirect:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
-                    current = urljoin(current, location)
-                    continue
-                response.raise_for_status()
-                for chunk in response.iter_content(chunk_size = 1024 * 1024):
-                    if not chunk: continue
-                    sink.write(chunk)
-                    written += len(chunk)
-                    if max_bytes and written > max_bytes:
-                        raise ValueError(
-                            f"Unsloth: Media at `{url}` is larger than the "
-                            f"{max_bytes} byte limit. Raise "
-                            f"{UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
-                        )
-                return written
+                response = session.get(current, stream = True, timeout = timeout, allow_redirects = False)
+                try:
+                    if response.is_redirect or response.is_permanent_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError(f"Unsloth: Redirect without a Location header while fetching `{url}`")
+                        current = urljoin(current, location)
+                        continue
+                    response.raise_for_status()
+                    for chunk in response.iter_content(chunk_size = 1024 * 1024):
+                        if not chunk: continue
+                        sink.write(chunk)
+                        written += len(chunk)
+                        if max_bytes and written > max_bytes:
+                            raise ValueError(
+                                f"Unsloth: Media at `{url}` is larger than the "
+                                f"{max_bytes} byte limit. Raise "
+                                f"{UNSLOTH_MAX_MEDIA_DOWNLOAD_MB_VAR} to allow larger downloads."
+                            )
+                    return written
+                finally:
+                    # Close every hop; a leaked streaming response holds its connection.
+                    response.close()
             finally:
-                # Close every hop; a leaked streaming response holds its connection.
-                response.close()
+                # The pin covers the body too: it is read off the pinned socket.
+                _PINNED_ADDRESSES.reset(token)
     raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 
