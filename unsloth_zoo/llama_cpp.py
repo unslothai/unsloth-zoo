@@ -1774,14 +1774,11 @@ def _conversion_sibling_info(llama_cpp_dir):
             return (p, s.st_mtime_ns, s.st_size)
         except OSError:
             return (p, 0, 0)
-    try:
-        names = sorted(
-            name for name in os.listdir(conv_dir) if name.endswith(".py")
-        )
-    except OSError:
+    names = _conversion_package_modules(conv_dir)
+    if names is None:
         names = ["__init__.py", "base.py"]
     return (len(names),) + tuple(
-        _stat(os.path.join(conv_dir, name))
+        _stat(os.path.join(conv_dir, *name.split("/")))
         for name in names[:MAX_CONVERSION_PACKAGE_FILES]
     )
 pass
@@ -1907,23 +1904,47 @@ def _refuse_unscannable_conversion_package(conversion_dir, count):
         )
 
 
+def _conversion_package_modules(conversion_dir):
+    """Every .py under `conversion_dir`, nested packages included, or None.
+
+    Relative POSIX paths, sorted, so the caller's cap is stable across platforms.
+    None means the directory could not be walked, which the caller treats as
+    nothing to scan rather than as a clean package.
+
+    Recursive, because `os.listdir` saw immediate children only: a clean
+    `conversion/__init__.py` doing `from .nested import x` fronted
+    `conversion/nested/__init__.py`, which was neither scanned nor counted
+    against the cap, and Python imported and ran it all the same. Subdirectories
+    are walked whether or not they hold an `__init__.py`, since a namespace
+    package imports just as well.
+    """
+    found = []
+    try:
+        for root, _dirs, files in os.walk(conversion_dir):
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                full = os.path.join(root, name)
+                found.append(os.path.relpath(full, conversion_dir).replace(os.sep, "/"))
+    except OSError:
+        return None
+    return sorted(found)
+
+
 def _scan_conversion_package(llama_cpp_dir):
     """Scan the conversion/ package beside an unverified converter.
 
     Same warn-or-raise contract as the entrypoint: these files are imported and
     executed by it, so leaving them unscanned let a clean entrypoint front a
-    payload in conversion/__init__.py.
+    payload in conversion/__init__.py, or in a nested module below it.
     """
     if not llama_cpp_dir:
         return
     conversion_dir = os.path.join(llama_cpp_dir, "conversion")
     if not os.path.isdir(conversion_dir):
         return
-    try:
-        names = sorted(
-            name for name in os.listdir(conversion_dir) if name.endswith(".py")
-        )
-    except OSError:
+    names = _conversion_package_modules(conversion_dir)
+    if names is None:
         return
     if len(names) > MAX_CONVERSION_PACKAGE_FILES:
         # Truncating the list silently was the hole: a payload in a late-sorting
@@ -1934,7 +1955,7 @@ def _scan_conversion_package(llama_cpp_dir):
         _refuse_unscannable_conversion_package(conversion_dir, len(names))
         names = names[:MAX_CONVERSION_PACKAGE_FILES]
     for name in names:
-        path = os.path.join(conversion_dir, name)
+        path = os.path.join(conversion_dir, *name.split("/"))
         try:
             with open(path, "rb") as handle:
                 content = handle.read()

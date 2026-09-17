@@ -781,6 +781,40 @@ def _argparse_default_findings(raw):
 # ---------------------------------------------------------------------------
 # Scanner
 # ---------------------------------------------------------------------------
+def _decode_as_python_would(raw):
+    """Decode `raw` the way the interpreter that runs it will.
+
+    Returns (text, declared_encoding), the second being None when the file makes
+    no PEP 263 declaration and there is nothing to report about it.
+
+    The scanner must read the same characters the interpreter does, and a file
+    gets to choose that: `# coding: utf-7` on line one makes
+    `+AHM-+AHU-+AGI-+AHA-+AHI-+AG8-+AGM-+AGU-+AHM-+AHM-.run(...)` the source text
+    `subprocess.run(...)`. Decoded as UTF-8 that is a string of plus signs and
+    capital letters, matching nothing here, while the file Unsloth then writes
+    and executes spawns the process. Confirmed against the scanner as it stood:
+    zero findings on bytes whose declared decoding is a subprocess call.
+
+    A cookie CPython itself rejects reports nothing: the file will not parse, so
+    there is no decoding for the scan to disagree with and no execution to warn
+    about. What gets reported is the case that DOES run and runs as something
+    else.
+    """
+    import io
+    import tokenize
+
+    try:
+        encoding, _lines = tokenize.detect_encoding(io.BytesIO(raw).readline)
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return raw.decode("utf-8", errors = "replace"), None
+    if encoding.lower().replace("_", "-") in ("utf-8", "utf-8-sig"):
+        return raw.decode(encoding, errors = "replace"), None
+    try:
+        return raw.decode(encoding, errors = "replace"), encoding
+    except (LookupError, UnicodeDecodeError):
+        return raw.decode("utf-8", errors = "replace"), encoding
+
+
 def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
     """Return a list of ConverterScanFinding for one converter script.
 
@@ -793,9 +827,10 @@ def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
     subprocess is CRITICAL, obfuscation plus exec/eval is HIGH. The setup.py rule
     is not ported either, since the scanned file is never a setup.py.
     """
+    declared_encoding = None
     if isinstance(content, bytes):
         raw = content
-        text = content.decode("utf-8", errors = "replace")
+        text, declared_encoding = _decode_as_python_would(content)
     else:
         raw = content.encode("utf-8", errors = "replace")
         text = content
@@ -933,6 +968,19 @@ def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
 
     if truncated is not None:
         findings.append(truncated)
+
+    if declared_encoding is not None:
+        # Reported whether or not anything else matched. Every real converter is
+        # UTF-8, so a declaration is already odd, and its whole effect is to make
+        # the scanner and the interpreter read different characters -- which is
+        # worth a line in the warning even on the run where the rules above,
+        # reading the declared decoding, came back clean.
+        findings.append(ConverterScanFinding(
+            HIGH,
+            "Converter declares a non-UTF-8 source encoding, so its text is not "
+            "what it looks like on the wire",
+            f"PEP 263 cookie: {declared_encoding}",
+        ))
 
     return findings
 

