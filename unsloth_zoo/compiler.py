@@ -24,6 +24,7 @@ __all__ = [
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
+import contextlib
 import hashlib
 import io
 import inspect
@@ -1260,7 +1261,12 @@ def _moe_utils_copy_is_importable(folder):
     except Exception:
         return False
     try:
-        from .temporary_patches.moe_utils import cached_copy_is_importable
+        # Absolute, not `.temporary_patches.moe_utils`: transformers finds
+        # relative imports with a regex and joins the raw dotted capture onto the
+        # directory, so the relative spelling makes custom_object_save try to
+        # open unsloth_zoo/temporary_patches.moe_utils.py and fail every
+        # remote-code checkpoint save. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.temporary_patches.moe_utils import cached_copy_is_importable
     except Exception:
         return False
     try:
@@ -1269,24 +1275,107 @@ def _moe_utils_copy_is_importable(folder):
         return False
 
 
+def _drop_untrusted_cache_from_sys_path(folders):
+    """Remove every sys.path entry that resolves to one of `folders`.
+
+    By entry, not by string: the folder we refuse is usually the relative
+    "unsloth_compiled_cache" while the entry on the path can be the absolute
+    form, or the other way round, and either resolves to the same directory.
+    """
+    targets = set()
+    for folder in folders:
+        try:
+            targets.add(os.path.realpath(folder))
+        except Exception:
+            continue
+    if not targets:
+        return
+    kept = []
+    for entry in sys.path:
+        try:
+            resolved = os.path.realpath(entry) if isinstance(entry, str) else None
+        except Exception:
+            resolved = None
+        if resolved is None or resolved not in targets:
+            kept.append(entry)
+    sys.path[:] = kept
+
+
+@contextlib.contextmanager
+def _untrusted_cache_kept_out_of_imports(*folders):
+    """Keep a cache directory we do not vouch for out of a generated module's imports.
+
+    Declining to PREPEND an untrusted folder is not enough, because it can
+    already be on sys.path -- and we are the ones who put it there. Every
+    generated module carries _license_header, whose prologue runs
+    `sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)` above the module's own
+    `from moe_utils import ...`. So the module re-exposes the persistent cache
+    to itself mid-exec, no matter what sys.path looked like on entry, and the
+    entry then outlives the call because nothing here put it there to restore.
+    Stripping path-equivalent entries on both ends closes that leak; blocking
+    the NAME is what closes the window the prologue opens inside the exec.
+    `None` in sys.modules makes `from moe_utils import ...` raise
+    ModuleNotFoundError before any file is opened, which is exactly what that
+    bare import's `except Exception: pass` is written to absorb -- it costs the
+    backend names, as it already does whenever the copy is missing.
+
+    Both the active compile folder and UNSLOTH_COMPILE_LOCATION are passed in:
+    after a recovery they differ, and the prologue names the persistent one, so
+    running from node-local temp does not put the persistent cache out of reach.
+
+    Untrusted is a genuinely anomalous state, never the ordinary run: a folder
+    with no moe_utils.py in it is trusted (nothing is importable from it), so
+    this only engages when a foreign copy, a shadowing moe_utils/ or extension,
+    or an undeletable pyc is actually sitting there.
+    """
+    untrusted = [
+        folder for folder in dict.fromkeys(folders)
+        if folder and not _moe_utils_copy_is_importable(folder)
+    ]
+    if not untrusted:
+        yield
+        return
+    _drop_untrusted_cache_from_sys_path(untrusted)
+    missing = object()
+    previous = sys.modules.get("moe_utils", missing)
+    sys.modules["moe_utils"] = None
+    try:
+        yield
+    finally:
+        if previous is missing:
+            sys.modules.pop("moe_utils", None)
+        else:
+            sys.modules["moe_utils"] = previous
+        _drop_untrusted_cache_from_sys_path(untrusted)
+
+
 def _reject_shadowing_import_candidates(compile_folder, name):
     """Refuse a cache entry that would win the import over the verified file.
 
     The digest is checked against `<name>.py`, but import_module() resolves by
-    name, and two things beat a source module of that name. Both are planted, not
+    name, and three things beat a source module of that name. None of them is
     raced: the file can simply be sitting there, and nothing here ever creates
     one, so its presence is reason enough to stop.
 
     A directory is one: a regular package `<name>/__init__.py` is found first.
 
-    An extension module is the other, and it outranks even the package. FileFinder
-    is built with ExtensionFileLoader ahead of SourceFileLoader, so on this
+    An extension module is the second, and it outranks even the package.
+    FileFinder's loaders are `extension, source, bytecode`, so on this
     interpreter `<name>.cpython-313-x86_64-linux-gnu.so`, `<name>.abi3.so` and
     `<name>.so` are all tried before `<name>.py` -- and a shared library is loaded
     and run by the dynamic linker, with no source for any digest to cover.
-    importlib.machinery.EXTENSION_SUFFIXES is read rather than hardcoded so this
-    stays right on Windows (.pyd) and on a free-threaded or differently-tagged
-    build.
+
+    A sourceless `<name>.pyc` sitting directly in the directory (the legacy
+    layout, not `__pycache__/`) is the third. It loses to `<name>.py`, so it only
+    decides an import when no source is there -- but that is exactly the case
+    both this and cached_copy_is_importable() used to treat as "nothing can be
+    imported from here, so nothing needs rejecting". SourcelessFileLoader then
+    runs marshalled code with no source at all, which is strictly worse than the
+    planted-source case the digest covers.
+
+    Both suffix lists are read from importlib.machinery rather than hardcoded, so
+    this stays right on Windows (.pyd) and on a free-threaded or differently
+    tagged build.
     """
     candidate = os.path.join(compile_folder, name)
     if os.path.isdir(candidate):
@@ -1294,12 +1383,19 @@ def _reject_shadowing_import_candidates(compile_folder, name):
             f"Unsloth: Refusing to import {name} because {candidate} would be "
             f"imported instead of the verified source beside it."
         )
-    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
-        extension = os.path.join(compile_folder, name + suffix)
-        if os.path.isfile(extension):
+    shadowing = [
+        (suffix, "an extension module")
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ] + [
+        (suffix, "sourceless bytecode")
+        for suffix in importlib.machinery.BYTECODE_SUFFIXES
+    ]
+    for suffix, kind in shadowing:
+        shadow = os.path.join(compile_folder, name + suffix)
+        if os.path.isfile(shadow):
             raise RuntimeError(
-                f"Unsloth: Refusing to import {name} because {extension} is an "
-                f"extension module and would be loaded instead of the verified "
+                f"Unsloth: Refusing to import {name} because {shadow} is "
+                f"{kind} and would be loaded instead of the verified "
                 f"source beside it."
             )
 
@@ -2048,7 +2144,10 @@ def create_new_function(
                 # off compile_folder even though this one no longer does.
                 _reject_shadowing_import_candidates(compile_folder, name)
                 importlib.invalidate_caches()
-                new_module = _exec_verified_source(source, target_name, name)
+                with _untrusted_cache_kept_out_of_imports(
+                    compile_folder, UNSLOTH_COMPILE_LOCATION,
+                ):
+                    new_module = _exec_verified_source(source, target_name, name)
                 return new_module, old_path
         except Exception as e:
             if old_path is not None:
@@ -2085,14 +2184,19 @@ def create_new_function(
             for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
             if _moe_utils_copy_is_importable(folder)
         ]
-        old_path = list(sys.path)
-        sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
-        try:
-            return _exec_module_under_lock(
-                lock, file_location, module_name, expected_digest,
-            )
-        finally:
-            sys.path[:] = old_path
+        # Outside the sys.path juggling below, so its restore cannot put back an
+        # entry for a folder this refused.
+        with _untrusted_cache_kept_out_of_imports(
+            compile_folder, UNSLOTH_COMPILE_LOCATION,
+        ):
+            old_path = list(sys.path)
+            sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
+            try:
+                return _exec_module_under_lock(
+                    lock, file_location, module_name, expected_digest,
+                )
+            finally:
+                sys.path[:] = old_path
 
     pass
 
@@ -2181,6 +2285,15 @@ def create_new_function(
         # Restore original sys.path if we modified it
         if old_path is not None:
             sys.path[:] = old_path
+        # The snapshot above predates this call, so it can carry an entry a
+        # generated module's prologue left behind on an earlier one. Re-check
+        # rather than trust it: a folder is only dropped if it is still untrusted
+        # now.
+        _drop_untrusted_cache_from_sys_path([
+            folder
+            for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
+            if folder and not _moe_utils_copy_is_importable(folder)
+        ])
 
     if new_module is None:
         raise ImportError(

@@ -192,8 +192,12 @@ def _remove_cached_bytecode(source_file):
 def cached_copy_is_importable(directory) -> bool:
     """Whether a generated module may be allowed to import moe_utils from here.
 
-    True when there is no copy in `directory` at all: nothing can be imported
-    from it, so nothing needs rejecting.
+    True when there is no copy in `directory` at all. That is not the same as
+    "nothing is importable from it" -- a sourceless moe_utils.pyc beside it would
+    be, and a moe_utils/ or moe_utils.so outranks the source even when one is
+    present. The caller runs compiler._reject_shadowing_import_candidates over
+    this name before asking, which is where all three are refused; this function
+    answers only the question it is named for.
 
     Public because returning None from _load_cached_moe_utils_module() protects
     only its own callers. Generated MoE modules run a bare `from moe_utils import

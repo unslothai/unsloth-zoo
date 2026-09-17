@@ -1498,9 +1498,17 @@ def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
     `except Exception: pass`. An installation that could not replace a foreign
     copy, or a shared-cache writer that changed it afterwards, therefore got its
     top level executed on the ordinary path with the failure swallowed.
+
+    The prologue is the REAL _license_header, not a hand-written stand-in. This
+    row passed against a stub that omitted it while the code was still broken:
+    the header runs `sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)` above the very
+    import this is about, so the module re-exposes the cache to itself mid-exec
+    and declining to prepend the folder decides nothing.
     """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(primary))
     marker = primary / "NORMAL_PATH_PLANTED_RAN"
     (primary / "moe_utils.py").write_text(
         "import pathlib\n"
@@ -1510,12 +1518,13 @@ def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
     )
 
     previous_moe_utils = sys.modules.pop("moe_utils", None)
+    entry_path = list(sys.path)
     name = "normal_path_moe_utils_probe"
     try:
         module = probe(
             name,
             "return x * 2",
-            prepend = (
+            prepend = compiler._license_header + (
                 "try:\n"
                 "    from moe_utils import select_moe_backend\n"
                 "except Exception:\n"
@@ -1527,11 +1536,101 @@ def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
             "the planted helper was importable on the normal path"
         )
         assert not marker.exists(), "the planted helper's top level ran"
+        # The prologue's insert must not outlive the call: leaving it there hands
+        # the refused directory to the NEXT generated module's bare import.
+        assert str(primary) not in sys.path, (
+            "the refused cache directory was left on sys.path"
+        )
     finally:
+        sys.path[:] = entry_path
         for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
             sys.modules.pop(alias, None)
         if previous_moe_utils is not None:
             sys.modules["moe_utils"] = previous_moe_utils
+
+
+def test_a_refused_cache_already_on_sys_path_is_still_not_importable(
+    monkeypatch, compiler, probe, cache_dirs,
+):
+    """Declining to PREPEND decides nothing once the entry is already there.
+
+    An earlier generated module's _license_header puts UNSLOTH_COMPILE_LOCATION
+    on sys.path and nothing takes it off, so by the time a MoE module compiles,
+    the refused directory is reachable by name whatever this call does to the
+    front of the path.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(primary))
+    marker = primary / "PREEXISTING_ENTRY_PLANTED_RAN"
+    (primary / "moe_utils.py").write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+        "select_moe_backend = 'planted'\n",
+        encoding = "utf-8",
+    )
+
+    previous_moe_utils = sys.modules.pop("moe_utils", None)
+    entry_path = list(sys.path)
+    # Both spellings of the same directory: the entry is matched by what it
+    # resolves to, not by string equality with compile_folder.
+    sys.path.insert(0, str(primary))
+    sys.path.insert(0, os.path.join(str(primary), ".", ""))
+    name = "preexisting_entry_moe_utils_probe"
+    try:
+        module = probe(
+            name,
+            "return x * 2",
+            prepend = compiler._license_header + (
+                "try:\n"
+                "    from moe_utils import select_moe_backend\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+        )
+        assert getattr(module, f"{name}_fn")(21) == 42
+        assert getattr(module, "select_moe_backend", None) != "planted", (
+            "a pre-existing sys.path entry made the refused copy importable"
+        )
+        assert not marker.exists(), "the planted helper's top level ran"
+        assert not [
+            entry for entry in sys.path
+            if os.path.realpath(entry) == os.path.realpath(str(primary))
+        ], "a path-equivalent entry for the refused directory survived"
+    finally:
+        sys.path[:] = entry_path
+        for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
+            sys.modules.pop(alias, None)
+        if previous_moe_utils is not None:
+            sys.modules["moe_utils"] = previous_moe_utils
+
+
+def test_sourceless_bytecode_cannot_shadow_moe_utils(tmp_path, compiler):
+    """A directory holding only moe_utils.pyc is not an empty directory.
+
+    "No moe_utils.py here, so nothing can be imported from here" was the reason
+    such a folder counted as trusted, and it is false: FileFinder's loaders are
+    extension, source, bytecode, so SourcelessFileLoader picks up a legacy
+    moe_utils.pyc sitting directly in the directory and runs marshalled code with
+    no source for any digest to cover.
+    """
+    folder = tmp_path / "cache"
+    folder.mkdir()
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is True
+
+    source = tmp_path / "payload.py"
+    source.write_text("PAYLOAD = 1\n", encoding = "utf-8")
+    suffix = importlib.machinery.BYTECODE_SUFFIXES[0]
+    py_compile.compile(
+        str(source), cfile = str(folder / f"moe_utils{suffix}"), doraise = True,
+    )
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is False, (
+        "sourceless bytecode shadowing the helper was treated as importable"
+    )
+
+    with pytest.raises(RuntimeError, match = "sourceless bytecode"):
+        compiler._reject_shadowing_import_candidates(str(folder), "moe_utils")
 
 
 def _force_by_name_path_to_fail(monkeypatch, compiler, name, once = True):
