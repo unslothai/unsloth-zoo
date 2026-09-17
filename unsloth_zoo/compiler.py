@@ -29,6 +29,7 @@ import io
 import inspect
 import re
 import importlib
+import importlib.machinery
 import importlib.util
 import numpy as np
 import os
@@ -1238,15 +1239,54 @@ def _bytecode_would_be_used(function_location, bytecode_location):
     return mtime == int(source.st_mtime) & 0xFFFFFFFF and size == source.st_size & 0xFFFFFFFF
 pass
 
+def _moe_utils_copy_is_importable(folder):
+    """Whether it is safe to expose `folder` to a generated module's import.
+
+    Imported lazily and defensively: moe_utils lives under temporary_patches and
+    pulls in torch, so a hard import at module scope would reorder this file's
+    dependencies. A folder is only trusted when moe_utils itself vouches for the
+    copy in it, and an unreadable or unimportable helper means untrusted. That
+    call also drops any pyc sitting beside the copy, since a bare import prefers
+    one and an unchecked-hash pyc runs without the source being consulted at all.
+    """
+    if not folder:
+        return False
+    # A verbatim moe_utils.py does not settle it: `from moe_utils import ...`
+    # resolves BY NAME, so a planted moe_utils/ package or moe_utils.so in the
+    # same directory is what Python picks, exactly as for a generated module.
+    # Same check, same reasoning, one name over.
+    try:
+        _reject_shadowing_import_candidates(folder, "moe_utils")
+    except Exception:
+        return False
+    try:
+        from .temporary_patches.moe_utils import cached_copy_is_importable
+    except Exception:
+        return False
+    try:
+        return bool(cached_copy_is_importable(folder))
+    except Exception:
+        return False
+
+
 def _reject_shadowing_import_candidates(compile_folder, name):
     """Refuse a cache entry that would win the import over the verified file.
 
     The digest is checked against `<name>.py`, but import_module() resolves by
-    name, and a regular package beats a module of the same name. A planted
-    `<name>/__init__.py` beside the verified source is therefore imported and
-    executed with the verification having passed, and it needs no race: the
-    directory can simply be sitting there. Nothing here ever creates one, so its
-    presence is reason enough to stop.
+    name, and two things beat a source module of that name. Both are planted, not
+    raced: the file can simply be sitting there, and nothing here ever creates
+    one, so its presence is reason enough to stop.
+
+    A directory is one: a regular package `<name>/__init__.py` is found first.
+
+    An extension module is the other, and it outranks even the package. FileFinder
+    is built with ExtensionFileLoader ahead of SourceFileLoader, so on this
+    interpreter `<name>.cpython-313-x86_64-linux-gnu.so`, `<name>.abi3.so` and
+    `<name>.so` are all tried before `<name>.py` -- and a shared library is loaded
+    and run by the dynamic linker, with no source for any digest to cover.
+    importlib.machinery.EXTENSION_SUFFIXES is read rather than hardcoded so this
+    stays right on Windows (.pyd) and on a free-threaded or differently-tagged
+    build.
     """
     candidate = os.path.join(compile_folder, name)
     if os.path.isdir(candidate):
@@ -1254,6 +1294,14 @@ def _reject_shadowing_import_candidates(compile_folder, name):
             f"Unsloth: Refusing to import {name} because {candidate} would be "
             f"imported instead of the verified source beside it."
         )
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        extension = os.path.join(compile_folder, name + suffix)
+        if os.path.isfile(extension):
+            raise RuntimeError(
+                f"Unsloth: Refusing to import {name} because {extension} is an "
+                f"extension module and would be loaded instead of the verified "
+                f"source beside it."
+            )
 
 
 def _remove_compiled_cache_bytecode(function_location):
@@ -1366,22 +1414,49 @@ def _compiled_cache_file_is_foreign(function_location, new_write_bytes):
         return True
 pass
 
-def _verify_cache_digest_under_lock(function_location, expected_digest):
-    """Ensure the locked file still holds the bytes we decided to import.
+def _verified_cache_source(function_location, expected_digest):
+    """The bytes that passed the digest, read once, for the caller to EXECUTE.
 
-    The last gate before the file is executed, so it runs in every process, not
-    only a distributed one: a cache file that changed between the write and the
-    import is never the file we generated.
+    The last gate before the file runs, so it applies in every process, not only
+    a distributed one: a cache file that changed between the write and the import
+    is never the file we generated.
+
+    Returning the bytes is the point. Verifying one open and then letting the
+    import machinery reopen the path leaves a window between the two, and the
+    cache lock is cooperative, so it constrains our own ranks and not whoever
+    planted the file: a replacement landing in that window executed without ever
+    matching the digest. Callers compile and exec what comes back from here, so
+    the bytes that ran are the bytes that were checked.
     """
-    if expected_digest is None:
-        return
     with open(function_location, "rb") as file:
-        actual_digest = hashlib.sha256(file.read()).hexdigest()
+        source = file.read()
+    if expected_digest is None:
+        return source
+    actual_digest = hashlib.sha256(source).hexdigest()
     if actual_digest != expected_digest:
         raise RuntimeError(
             f"Unsloth: Compiled cache file {function_location} changed after "
             f"verification ({expected_digest[:12]} -> {actual_digest[:12]})."
         )
+    return source
+
+
+def _exec_verified_source(source, file_location, module_name):
+    """Build and run a module from `source`, never reopening `file_location`.
+
+    The path is still handed to compile() and to the spec, so tracebacks, the
+    module's __file__ and inspect.getsource all read normally; it is simply never
+    the thing that gets read back.
+    """
+    spec = importlib.util.spec_from_file_location(module_name, file_location)
+    new_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = new_module
+    try:
+        exec(compile(source, file_location, "exec"), new_module.__dict__)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return new_module
 pass
 
 def _compiled_cache_decision(function_location, write_new_source, overwrite):
@@ -1947,19 +2022,33 @@ def create_new_function(
         old_path = None
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
-        # Put the verified cache first even when it already appears later.
-        if not sys.path or sys.path[0] != compile_folder:
+        # Put the verified cache first even when it already appears later, but
+        # only once the moe_utils sitting in it is this package's own file. The
+        # generated module's `from moe_utils import ...` resolves off this entry,
+        # and it is a bare import inside `except Exception: pass`, so an
+        # installation that could not replace a foreign copy -- or a shared-cache
+        # writer that changed it afterwards -- otherwise got its top level
+        # executed here, on the ordinary path, with the failure swallowed. The
+        # recovery path below had this check; this one did not.
+        if _moe_utils_copy_is_importable(compile_folder) and (
+            not sys.path or sys.path[0] != compile_folder
+        ):
             old_path = list(sys.path)
             sys.path[:] = [path for path in sys.path if path != compile_folder]
             sys.path.insert(0, compile_folder)
         try:
             with lock:
-                # Try standard import
-                _verify_cache_digest_under_lock(target_name, expected_digest)
+                # Read and verify once, then execute THOSE bytes. Handing the
+                # name to importlib instead reopened the path, and the window
+                # between the two is not covered by this lock: it is cooperative,
+                # so it binds our own ranks and not whoever planted the file.
+                source = _verified_cache_source(target_name, expected_digest)
                 _remove_compiled_cache_bytecode(target_name)
+                # Still checked, because the module's OWN imports resolve by name
+                # off compile_folder even though this one no longer does.
                 _reject_shadowing_import_candidates(compile_folder, name)
                 importlib.invalidate_caches()
-                new_module = importlib.import_module(name)
+                new_module = _exec_verified_source(source, target_name, name)
                 return new_module, old_path
         except Exception as e:
             if old_path is not None:
@@ -1984,9 +2073,18 @@ def create_new_function(
         # `from moe_utils import ...`, so without this the load reports success
         # with every backend name undefined. Both folders: recovery switches to
         # node-local temp, but the helper sits next to the persistent cache.
-        search_paths = [compile_folder]
-        if UNSLOTH_COMPILE_LOCATION not in search_paths:
-            search_paths.append(UNSLOTH_COMPILE_LOCATION)
+        # A directory only goes on the path if the moe_utils.py sitting in it is
+        # this package's own file. `from moe_utils import ...` inside a generated
+        # module is a bare, unverified import wrapped in `except Exception: pass`,
+        # so a planted copy here would be imported and its top level executed with
+        # the failure swallowed -- the same copy _load_cached_moe_utils_module()
+        # already refuses to load for itself. Dropping the directory costs the
+        # backend names, which that import is written to survive losing.
+        search_paths = [
+            folder
+            for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
+            if _moe_utils_copy_is_importable(folder)
+        ]
         old_path = list(sys.path)
         sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
         try:
@@ -2000,16 +2098,9 @@ def create_new_function(
 
     def _exec_module_under_lock(lock, file_location, module_name, expected_digest):
         with lock:
-            _verify_cache_digest_under_lock(file_location, expected_digest)
+            source = _verified_cache_source(file_location, expected_digest)
             _remove_compiled_cache_bytecode(file_location)
-            spec = importlib.util.spec_from_file_location(module_name, file_location)
-            new_module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = new_module
-            try:
-                spec.loader.exec_module(new_module)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
+            new_module = _exec_verified_source(source, file_location, module_name)
         return new_module
 
     pass

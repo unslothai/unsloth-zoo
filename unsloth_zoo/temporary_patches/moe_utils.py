@@ -189,6 +189,40 @@ def _remove_cached_bytecode(source_file):
     return True
 
 
+def cached_copy_is_importable(directory) -> bool:
+    """Whether a generated module may be allowed to import moe_utils from here.
+
+    True when there is no copy in `directory` at all: nothing can be imported
+    from it, so nothing needs rejecting.
+
+    Public because returning None from _load_cached_moe_utils_module() protects
+    only its own callers. Generated MoE modules run a bare `from moe_utils import
+    ...`, and compiler.py's recovery path puts the persistent cache directory on
+    sys.path so that import can resolve -- which handed the very copy rejected
+    below straight to the import system, top-level payload and all. The caller
+    there asks this first and leaves the directory off the path if it says no.
+
+    Matching bytes are necessary and NOT sufficient, which is why this does more
+    than compare and is named for the decision rather than for the comparison. A
+    bare import prefers __pycache__/moe_utils.<tag>.pyc, and an unchecked-hash
+    pyc executes without CPython ever consulting the source beside it, so an
+    exact copy of this file with a planted pyc next to it would still have run
+    foreign code. The pyc is dropped here, and a pyc that cannot be dropped means
+    no.
+    """
+    try:
+        cache_file = os.path.abspath(os.path.join(directory, "moe_utils.py"))
+    except Exception:
+        return False
+    current_file = os.path.abspath(__file__)
+    if cache_file == current_file or not os.path.isfile(cache_file):
+        return True
+    cached_bytes = _read_file_bytes(cache_file)
+    if cached_bytes is None or cached_bytes != _read_file_bytes(current_file):
+        return False
+    return _remove_cached_bytecode(cache_file)
+
+
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 
@@ -216,11 +250,21 @@ def _load_cached_moe_utils_module():
             return None
 
         spec = importlib.util.spec_from_file_location(module_name, cache_file)
-        if spec is None or spec.loader is None:
+        if spec is None:
             return None
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            # The bytes compared above, not a fresh read of the path. exec_module
+            # reopens the file, and the comparison and that open are two moments:
+            # a writer with access to the shared cache replaces the file between
+            # them and its bytes run as unsloth_cached_moe_utils having matched
+            # nothing. compiler.py's loader closed the same window; this one is
+            # the copy of it that lives here.
+            exec(compile(cached_bytes, cache_file, "exec"), module.__dict__)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
         _CACHED_MOE_UTILS_MODULE = module
         return module
     except Exception:

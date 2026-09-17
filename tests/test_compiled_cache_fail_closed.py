@@ -226,7 +226,7 @@ def test_unlandable_rewrite_over_planted_bytes_is_not_imported(cache_dir, monkey
 def test_write_decision_carries_a_digest_without_a_process_group(cache_dir):
     """The digest gate has to be armed when no process group exists.
 
-    Without this, `_verify_cache_digest_under_lock` returns immediately and the
+    Without this, `_verified_cache_source` returns immediately and the
     bytes are imported unverified.
     """
     location = str(cache_dir / "UnslothFailClosedProbeDigest.py")
@@ -249,7 +249,7 @@ def test_digest_verification_rejects_bytes_we_did_not_write(cache_dir):
     location.write_text(_PLANTED_SOURCE)
 
     with pytest.raises(RuntimeError, match = "changed after"):
-        compiler._verify_cache_digest_under_lock(str(location), digest)
+        compiler._verified_cache_source(str(location), digest)
 
     assert not _planted_ran()
 
@@ -357,6 +357,50 @@ def test_install_to_cache_survives_a_cache_it_cannot_create(tmp_path, monkeypatc
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is False
+
+
+def test_the_moe_helper_runs_the_bytes_it_compared(tmp_path, monkeypatch):
+    """Comparing one open and executing from a later one leaves a window.
+
+    A writer with access to the shared cache replaces moe_utils.py between the
+    byte comparison and exec_module's own open, and those bytes then run as
+    unsloth_cached_moe_utils having matched nothing. compiler.py's loader closed
+    the same window; this is the copy of it that lives in moe_utils.
+    """
+    location = tmp_path / "moe_cache_swap"
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(location))
+    monkeypatch.setattr(moe_utils, "_CACHED_MOE_UTILS_MODULE", None)
+    monkeypatch.setattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", None)
+    monkeypatch.delitem(sys.modules, "unsloth_cached_moe_utils", raising = False)
+
+    assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is True
+    copy_path = location / "moe_utils.py"
+    marker = tmp_path / "SWAPPED_RAN"
+
+    real_read = moe_utils._read_file_bytes
+    swapped = {"done": False}
+
+    def read_then_swap(path):
+        data = real_read(path)
+        # Swap immediately after the comparison read, which is the window.
+        if not swapped["done"] and os.path.abspath(path) == os.path.abspath(copy_path):
+            swapped["done"] = True
+            copy_path.write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+                "forward_moe_backend = 'planted'\n",
+                encoding = "utf-8",
+            )
+        return data
+
+    monkeypatch.setattr(moe_utils, "_read_file_bytes", read_then_swap)
+    try:
+        module = moe_utils._load_cached_moe_utils_module()
+        assert not marker.exists(), "the swapped bytes were executed"
+        if module is not None:
+            assert getattr(module, "forward_moe_backend", None) != "planted"
+    finally:
+        sys.modules.pop("unsloth_cached_moe_utils", None)
 
 
 def test_moe_utils_cache_copy_loads_when_it_matches(tmp_path, monkeypatch):

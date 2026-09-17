@@ -28,10 +28,12 @@ import ast
 import builtins
 import hashlib
 import importlib
+import importlib.machinery
 import importlib.util
 import os
 import pathlib
 import py_compile
+import shutil
 import sys
 import threading
 import time
@@ -97,15 +99,17 @@ def probe(compiler):
     """Compile generated probes and always remove both module aliases."""
     names = []
 
-    def create(name, body="return x", *, overwrite=True):
+    def create(name, body="return x", *, overwrite=True, prepend=None):
         names.append(name)
         indented_body = "\n".join(f"    {line}" for line in body.splitlines())
+        extra = {} if prepend is None else {"prepend": prepend}
         return compiler.create_new_function(
             name,
             f"def {name}_fn(x):\n{indented_body}\n",
             "pr967",
             {},
             overwrite=overwrite,
+            **extra,
         )
 
     yield create
@@ -623,17 +627,7 @@ def test_import_rechecks_digest_while_holding_lock(
     monkeypatch.setattr(compiler, "get_lock", rewrite_on_import_lock)
 
     if load_path == "direct":
-        real_import = compiler.importlib.import_module
-        failed = False
-
-        def fail_initial_import(module_name, package=None):
-            nonlocal failed
-            if module_name == name and not failed:
-                failed = True
-                raise ImportError("force direct-load recovery")
-            return real_import(module_name, package)
-
-        monkeypatch.setattr(compiler.importlib, "import_module", fail_initial_import)
+        _force_by_name_path_to_fail(monkeypatch, compiler, name)
         with pytest.raises(RuntimeError, match="Direct module loading failed"):
             probe(name, "return x * 2")
         assert name not in sys.modules
@@ -698,7 +692,7 @@ def test_decision_still_hashes_without_process_group(
     """A process without a group takes the same decision, and still digests it.
 
     The digest is not only cross-rank agreement: it is what
-    _verify_cache_digest_under_lock() checks the file against just before the
+    _verified_cache_source() checks the file against just before the
     import, so a single process needs one too or the bytes on disk are executed
     unverified. See tests/test_compiled_cache_fail_closed.py.
     """
@@ -1125,15 +1119,7 @@ def test_remote_direct_load_failure_removes_successful_local_aliases(
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     name = "pr967_remote_direct_failure"
-    real_import = compiler.importlib.import_module
-    failed = False
-
-    def fail_initial_import(module_name, package=None):
-        nonlocal failed
-        if module_name == name and not failed:
-            failed = True
-            raise ImportError("force tempfile recovery")
-        return real_import(module_name, package)
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
 
     real_agreed_error = compiler._agreed_error
 
@@ -1143,7 +1129,6 @@ def test_remote_direct_load_failure_removes_successful_local_aliases(
             return RuntimeError("direct load failed on another rank")
         return real_agreed_error(local_error, operation)
 
-    monkeypatch.setattr(compiler.importlib, "import_module", fail_initial_import)
     monkeypatch.setattr(compiler, "_agreed_error", fail_direct_load_remotely)
 
     with pytest.raises(RuntimeError, match="another rank"):
@@ -1327,6 +1312,256 @@ def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
             sys.modules.pop(f"unsloth_cache_{module}", None)
 
 
+
+
+def test_a_planted_cache_moe_utils_is_kept_off_the_recovery_search_path(
+    monkeypatch, compiler, cache_dirs,
+):
+    """Returning None from _load_cached_moe_utils_module protects its own callers
+    and nothing else.
+
+    A generated MoE module runs a bare `from moe_utils import ...` wrapped in
+    `except Exception: pass`, and recovery puts the persistent cache directory on
+    sys.path so that import can resolve. That handed the very copy moe_utils had
+    already refused to load straight to the import system, top level and all, with
+    any error swallowed. The directory now goes on the path only when the copy in
+    it is this package's own file.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
+    marker = primary / "PLANTED_RAN"
+    (primary / "moe_utils.py").write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+        "select_moe_backend = 'planted'\n",
+        encoding = "utf-8",
+    )
+
+    previous_moe_utils = sys.modules.pop("moe_utils", None)
+    name = "planted_moe_utils_probe"
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
+    try:
+        module = compiler.create_new_function(
+            name,
+            f"def {name}_fn(x):\n    return x * 2\n",
+            "planted",
+            {},
+            prepend = (
+                "try:\n"
+                "    from moe_utils import select_moe_backend\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+            overwrite = True,
+        )
+        # The load still succeeds; losing the backend names is what that bare
+        # import is written to survive.
+        assert getattr(module, f"{name}_fn")(21) == 42
+        assert getattr(module, "select_moe_backend", None) != "planted", (
+            "the rejected cache copy was importable by the generated module"
+        )
+        assert not marker.exists(), "the planted module's top level ran"
+    finally:
+        for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
+            sys.modules.pop(alias, None)
+        if previous_moe_utils is not None:
+            sys.modules["moe_utils"] = previous_moe_utils
+
+
+def test_an_extension_module_cannot_shadow_the_verified_source(tmp_path, compiler):
+    """FileFinder tries ExtensionFileLoader before SourceFileLoader, so a planted
+    `<name>.so` beside the digest-checked `<name>.py` is what import_module loads
+    -- and a shared library is run by the dynamic linker with no source for any
+    digest to cover. The directory case was already refused; this is the one that
+    outranks even that."""
+    folder = tmp_path / "cache"
+    folder.mkdir()
+    (folder / "victim.py").write_text("VALUE = 1\n", encoding = "utf-8")
+
+    # Clean: nothing to shadow with.
+    compiler._reject_shadowing_import_candidates(str(folder), "victim")
+
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        planted = folder / f"victim{suffix}"
+        planted.write_bytes(b"\x7fELF not really\n")
+        try:
+            with pytest.raises(RuntimeError, match = "extension module"):
+                compiler._reject_shadowing_import_candidates(str(folder), "victim")
+        finally:
+            planted.unlink()
+
+    # And the directory case still fires, on its own message.
+    (folder / "victim").mkdir()
+    with pytest.raises(RuntimeError, match = "would be imported instead"):
+        compiler._reject_shadowing_import_candidates(str(folder), "victim")
+
+
+
+
+def test_a_planted_pyc_beside_a_verbatim_copy_is_not_importable(tmp_path, compiler):
+    """Matching bytes are necessary and not sufficient.
+
+    A bare `from moe_utils import ...` prefers __pycache__/moe_utils.<tag>.pyc,
+    and an unchecked-hash pyc runs without CPython consulting the source beside
+    it, so an exact copy of the file with a planted pyc next to it would still
+    have executed foreign code. The permission check drops the pyc, and says no
+    when it cannot.
+    """
+    import importlib.util as _util
+
+    folder = tmp_path / "cache"
+    folder.mkdir()
+    copy = folder / "moe_utils.py"
+    shutil.copyfile(_real_moe_utils_path(), copy)
+
+    # Verbatim and with nothing beside it: importable.
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is True
+
+    planted = pathlib.Path(_util.cache_from_source(str(copy)))
+    planted.parent.mkdir(parents = True, exist_ok = True)
+    planted.write_bytes(b"not really a pyc")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is True, (
+        "the check should clear the pyc rather than refuse outright"
+    )
+    assert not planted.exists(), "the planted bytecode survived the check"
+
+    # A folder with no copy in it has nothing to import and nothing to refuse.
+    assert compiler._moe_utils_copy_is_importable(str(tmp_path / "empty")) is True
+
+
+def test_the_bytes_that_run_are_the_bytes_that_were_verified(tmp_path, compiler):
+    """Verifying one open and executing from a later one leaves a window.
+
+    The cache lock is cooperative, so it binds our own ranks and not whoever
+    planted the file: a replacement landing between the digest read and the
+    loader's own open executed without ever matching. _verified_cache_source
+    hands the caller the bytes it checked, and those are what run.
+    """
+    location = tmp_path / "swap_probe.py"
+    genuine = b"VALUE = 'genuine'\n"
+    location.write_bytes(genuine)
+    digest = hashlib.sha256(genuine).hexdigest()
+
+    source = compiler._verified_cache_source(str(location), digest)
+    assert source == genuine
+
+    # The swap the window used to allow, performed in full.
+    location.write_bytes(b"VALUE = 'planted'\n")
+    module = compiler._exec_verified_source(source, str(location), "swap_probe")
+    try:
+        assert module.VALUE == "genuine", (
+            "the loader read the file again instead of the verified bytes"
+        )
+        assert module.__file__ == str(location)
+    finally:
+        sys.modules.pop("swap_probe", None)
+
+
+
+def test_a_package_shadowing_moe_utils_keeps_the_folder_off_the_path(tmp_path, compiler):
+    """A verbatim moe_utils.py does not settle it: the import resolves BY NAME.
+
+    A planted moe_utils/ package, or a moe_utils extension module, beside the
+    genuine copy is what Python picks, exactly as for a generated module. Same
+    check, one name over.
+    """
+    import importlib.machinery as _machinery
+
+    folder = tmp_path / "cache"
+    folder.mkdir()
+    shutil.copyfile(_real_moe_utils_path(), folder / "moe_utils.py")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is True
+
+    package = folder / "moe_utils"
+    package.mkdir()
+    (package / "__init__.py").write_text("PAYLOAD = 1\n", encoding = "utf-8")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is False, (
+        "a package shadowing the verified helper was treated as importable"
+    )
+    shutil.rmtree(package)
+
+    planted = folder / f"moe_utils{_machinery.EXTENSION_SUFFIXES[0]}"
+    planted.write_bytes(b"\x7fELF not really\n")
+    assert compiler._moe_utils_copy_is_importable(str(folder)) is False, (
+        "an extension module shadowing the verified helper was treated as importable"
+    )
+
+
+def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
+    monkeypatch, compiler, probe, cache_dirs,
+):
+    """The recovery path had this check and the ordinary one did not.
+
+    compile_folder goes first on sys.path so the generated module's bare
+    `from moe_utils import ...` resolves, and that import is wrapped in
+    `except Exception: pass`. An installation that could not replace a foreign
+    copy, or a shared-cache writer that changed it afterwards, therefore got its
+    top level executed on the ordinary path with the failure swallowed.
+    """
+    primary, temp = cache_dirs
+    _stub_compile_folders(monkeypatch, compiler, primary, temp)
+    marker = primary / "NORMAL_PATH_PLANTED_RAN"
+    (primary / "moe_utils.py").write_text(
+        "import pathlib\n"
+        f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+        "select_moe_backend = 'planted'\n",
+        encoding = "utf-8",
+    )
+
+    previous_moe_utils = sys.modules.pop("moe_utils", None)
+    name = "normal_path_moe_utils_probe"
+    try:
+        module = probe(
+            name,
+            "return x * 2",
+            prepend = (
+                "try:\n"
+                "    from moe_utils import select_moe_backend\n"
+                "except Exception:\n"
+                "    pass\n"
+            ),
+        )
+        assert getattr(module, f"{name}_fn")(21) == 42
+        assert getattr(module, "select_moe_backend", None) != "planted", (
+            "the planted helper was importable on the normal path"
+        )
+        assert not marker.exists(), "the planted helper's top level ran"
+    finally:
+        for alias in (name, f"unsloth_cache_{name}", "moe_utils"):
+            sys.modules.pop(alias, None)
+        if previous_moe_utils is not None:
+            sys.modules["moe_utils"] = previous_moe_utils
+
+
+def _force_by_name_path_to_fail(monkeypatch, compiler, name, once = True):
+    """Make create_new_function fall through to the direct load.
+
+    The seam is _reject_shadowing_import_candidates, which import_module() calls
+    and load_module_directly() does not. It used to be importlib.import_module,
+    but the by-name path no longer calls it: it executes the bytes it verified
+    rather than reopening the path for the loader, so patching that function
+    stopped forcing anything.
+    """
+    real = compiler._reject_shadowing_import_candidates
+    state = {"failed": False}
+
+    def refuse(compile_folder, candidate):
+        if candidate == name and not (once and state["failed"]):
+            state["failed"] = True
+            raise ImportError("force direct-load recovery")
+        return real(compile_folder, candidate)
+
+    monkeypatch.setattr(compiler, "_reject_shadowing_import_candidates", refuse)
+    return state
+
+
+def _real_moe_utils_path():
+    """The packaged moe_utils.py, which is the only copy install_to_cache writes."""
+    import unsloth_zoo.temporary_patches.moe_utils as _moe_utils
+    return _moe_utils.__file__
+
+
 def test_direct_recovery_can_still_import_cache_helpers(
     monkeypatch, compiler, cache_dirs,
 ):
@@ -1337,13 +1572,16 @@ def test_direct_recovery_can_still_import_cache_helpers(
     modules carry a bare `try: from moe_utils import ... except: pass`, so
     without the search path the direct load reports success while every MoE
     backend name is silently undefined and the first MoE forward fails instead.
+
+    The cache copy here is the real file, byte for byte, because that is the only
+    copy install_to_cache() ever writes and the only one this search path will
+    now expose. A stub stood in for it before, which the row below shows is a
+    planted file by that definition.
     """
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
-    (primary / "moe_utils.py").write_text(
-        "forward_moe_backend = 'installed'\n", encoding="utf-8",
-    )
+    shutil.copyfile(_real_moe_utils_path(), primary / "moe_utils.py")
 
     # The generated module does a bare `from moe_utils import ...`, so an entry
     # left in sys.modules by any earlier test wins over the file just written and
@@ -1352,17 +1590,7 @@ def test_direct_recovery_can_still_import_cache_helpers(
     previous_moe_utils = sys.modules.pop("moe_utils", None)
 
     name = "pr967_recovery_helper"
-    real_import = compiler.importlib.import_module
-    failed = False
-
-    def fail_once(module_name, package=None):
-        nonlocal failed
-        if module_name == name and not failed:
-            failed = True
-            raise ImportError("force direct-load recovery")
-        return real_import(module_name, package)
-
-    monkeypatch.setattr(compiler.importlib, "import_module", fail_once)
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
 
     try:
         module = compiler.create_new_function(
@@ -1372,7 +1600,7 @@ def test_direct_recovery_can_still_import_cache_helpers(
             {},
             prepend=(
                 "try:\n"
-                "    from moe_utils import forward_moe_backend\n"
+                "    from moe_utils import select_moe_backend\n"
                 "except Exception:\n"
                 "    pass\n"
             ),
@@ -1381,7 +1609,7 @@ def test_direct_recovery_can_still_import_cache_helpers(
 
         assert getattr(module, f"{name}_fn")(21) == 42
         resolved = getattr(sys.modules.get("moe_utils"), "__file__", None)
-        assert getattr(module, "forward_moe_backend", None) == "installed", (
+        assert getattr(module, "select_moe_backend", None) is not None, (
             "the recovered module could not import moe_utils from the compiled "
             "cache, so a generated MoE module would load with its backend names "
             "undefined and fail at the first forward. moe_utils resolved to "
@@ -1409,17 +1637,7 @@ def test_recovered_module_keeps_an_importable_module_identity(
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
 
     name = "pr967_recovered_identity"
-    real_import = compiler.importlib.import_module
-    failed = False
-
-    def fail_once(module_name, package=None):
-        nonlocal failed
-        if module_name == name and not failed:
-            failed = True
-            raise ImportError("force direct-load recovery")
-        return real_import(module_name, package)
-
-    monkeypatch.setattr(compiler.importlib, "import_module", fail_once)
+    _force_by_name_path_to_fail(monkeypatch, compiler, name)
 
     try:
         module = compiler.create_new_function(
