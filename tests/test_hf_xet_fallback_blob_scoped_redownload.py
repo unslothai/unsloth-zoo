@@ -1517,15 +1517,23 @@ def test_a_process_of_our_own_that_nothing_can_describe_raises_the_age_bar(
     ) == {partial}
 
     # Somebody ELSE's unreadable process is what privacy does answer for, at the normal grace.
-    _FakePsutil.procs = [theirs]
-    fresh = time.time() - 200.0
-    os.utime(blobs / partial, (fresh, fresh))
-    assert xf._unowned_partials_safe_to_clear(
-        "model", REPO, str(tmp_path), 180.0, None,
-    ) == {partial}
+    # Only where there is a uid to compare: Windows has none, so every process the walk could
+    # not read counts as possibly ours there, which is the documented behaviour rather than a
+    # gap this test should paper over.
+    if hasattr(os, "geteuid"):
+        _FakePsutil.procs = [theirs]
+        fresh = time.time() - 200.0
+        os.utime(blobs / partial, (fresh, fresh))
+        assert xf._unowned_partials_safe_to_clear(
+            "model", REPO, str(tmp_path), 180.0, None,
+        ) == {partial}
+    else:
+        assert xf._process_may_be_this_user(theirs, _FakePsutil) is True
 
     # And with an fd table that answers, our own denied process is not a miss at all.
     _FakePsutil.procs = [ours]
+    fresh = time.time() - 200.0
+    os.utime(blobs / partial, (fresh, fresh))
     monkeypatch.setattr(xf, "_proc_fd_partial_paths", lambda pid: set())
     assert xf._unowned_partials_safe_to_clear(
         "model", REPO, str(tmp_path), 180.0, None,
@@ -1704,3 +1712,55 @@ def test_a_cache_confirmed_clean_still_skips_the_clearance(monkeypatch, tmp_path
     attempt = _run_ladder(monkeypatch, tmp_path, owned = None)
     assert called == [], "a confirmed-clean cache needs no clearance pass"
     assert _http_force(attempt) is False
+
+
+def test_an_init_based_container_is_not_read_as_the_host(monkeypatch, tmp_path):
+    """systemd-nspawn runs systemd as PID 1, with `/init.scope` and no runtime marker.
+
+    PID 1's name is then evidence of nothing, and answering "host" skips the mount check
+    entirely, so an aged partial on a shared cache mount is unlinked while a sibling container
+    writes it. The markers systemd writes are what distinguishes the two.
+    """
+    if os.name == "nt" or not os.path.isdir("/proc"):
+        pytest.skip("POSIX containers only")
+
+    proc_text = {"/proc/1/cgroup": "0::/init.scope\n", "/proc/1/comm": "systemd\n"}
+    monkeypatch.setattr(xf, "_read_proc_text", lambda path: proc_text.get(path))
+
+    present: set = set()
+
+    class _WithMarkers:
+        """Only this module's `os` lookups: patching os.path itself breaks pytest, which
+        stats the files it is about to report on."""
+
+        class path:
+            @staticmethod
+            def exists(path):
+                return path in present or os.path.exists(path)
+
+            @staticmethod
+            def isdir(path):
+                return path in present or os.path.isdir(path)
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+    monkeypatch.setattr(xf, "os", _WithMarkers())
+
+    assert xf._running_in_a_container() is False, "an ordinary systemd host is not a container"
+
+    for marker in ("/run/systemd/container", "/run/host"):
+        present.clear()
+        present.add(marker)
+        assert xf._running_in_a_container() is True, f"{marker} names an init-based container"
+
+    # And the gate then consults the mount table rather than returning True on PID 1's name.
+    present.clear()
+    present.add("/run/systemd/container")
+    monkeypatch.setattr(xf, "hf_cache_root", lambda cache_dir = None: Path("/cache"))
+    monkeypatch.setattr(
+        xf, "_read_proc_text",
+        lambda path: proc_text.get(path) if path in proc_text else
+        "36 25 0:32 / / rw - overlay overlay rw\n41 36 8:1 /srv /cache rw - ext4 /dev/sda1 rw",
+    )
+    assert xf._process_walk_sees_every_writer(str(tmp_path)) is False

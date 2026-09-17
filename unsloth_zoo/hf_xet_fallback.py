@@ -1215,7 +1215,17 @@ def _running_in_a_container() -> bool:
     markers AND for that bare v2 line, and failing both, PID 1's own name decides: on a host
     it is an init system, and in a container it is the entrypoint.
     """
-    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+    # The markers systemd itself writes, which is what an init-based container looks like:
+    # nspawn and its relatives run systemd as PID 1 with a perfectly ordinary `/init.scope`
+    # cgroup and no runtime marker anywhere, so PID 1's NAME would answer "host" and the mount
+    # check below would never be consulted. `/run/systemd/container` names the technology;
+    # `/run/host` is the host mount nspawn exposes; `/proc/vz` without `/proc/bc` is OpenVZ.
+    for marker in (
+        "/.dockerenv", "/run/.containerenv", "/run/systemd/container", "/run/host",
+    ):
+        if os.path.exists(marker):
+            return True
+    if os.path.isdir("/proc/vz") and not os.path.isdir("/proc/bc"):
         return True
     cgroup = _read_proc_text("/proc/1/cgroup")
     if cgroup is None:
