@@ -1207,3 +1207,52 @@ def test_the_static_scan_keys_on_code_objects_not_ids():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "id" not in called, "the stash scan must not call id(); see the guard failure"
+
+
+def test_a_deep_visit_does_not_suppress_a_shallower_one():
+    """The scan must not depend on the hash seed.
+
+    A helper reachable both directly and through a chain can be popped first at the depth
+    limit, where its callees are not followed, and a plain visited set then discards the
+    later shallow entry. Measured before the fix: 5 of 14 PYTHONHASHSEED values returned
+    False for this forward, which does reach the stash, and a False there sends the
+    compiled cold start down the PEFT path that fails under fullgraph.
+
+    Built by exec so the call graph is exact rather than incidental to this file.
+    """
+    import torch.nn as nn
+
+    source = (
+        'def stash_reader(m): return take_moe_lora_stash(m, "gate_up_proj")\n'
+        "def helper(m): return stash_reader(m)\n"
+        "def h3(m): return helper(m)\n"
+        "def h2(m): return h3(m)\n"
+        "def h1(m): return h2(m)\n"
+        "def fwd(self, x):\n"
+        "    h1(self)\n"       # deep route: helper lands at the depth limit
+        "    helper(self)\n"   # shallow route: helper at depth 1, reaches the stash
+        "    return x\n"
+    )
+    namespace = {"take_moe_lora_stash": MU.take_moe_lora_stash}
+    exec(compile(source, "<depth-case>", "exec"), namespace)
+    experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
+
+    assert MU._forward_statically_reads_stash(experts) is True
+
+
+def test_the_scan_terminates_on_mutual_recursion():
+    """Revisiting at a shallower depth must not make the walk unbounded. The depth limit
+    caps how many times any one code object can be re-entered."""
+    import torch.nn as nn
+
+    source = (
+        "def a(m): return b(m)\n"
+        "def b(m): return a(m)\n"
+        "def fwd(self, x):\n"
+        "    a(self)\n"
+        "    return x\n"
+    )
+    namespace = {}
+    exec(compile(source, "<cycle>", "exec"), namespace)
+    experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
+    assert MU._forward_statically_reads_stash(experts) is False

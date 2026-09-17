@@ -1778,13 +1778,20 @@ def _forward_statically_reads_stash(experts_module):
     # Dynamo raises "Guard failed on the same frame it was created" under both fullgraph
     # settings with no eager fallback. Code objects are hashable, stable and 1:1 with the
     # functions here, so they also make the separate function set redundant.
-    seen_code = set()
+    # Keyed on the code objects themselves, never on id(), and remembering the SHALLOWEST
+    # depth each was reached at. A plain visited set makes the answer depend on the hash
+    # seed: a helper reachable both directly and through a chain can be popped first at
+    # the depth limit, where its own callees are not followed, and the later shallow entry
+    # is then dropped as already seen. Measured on a synthetic forward with both routes,
+    # 5 of 14 PYTHONHASHSEED values returned False for a forward that does reach the
+    # stash, which would send that compiled cold start down the failing PEFT path.
+    seen_code = {}
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
     while pending:
         current, namespace, depth = pending.pop()
-        if current in seen_code:
+        if seen_code.get(current, _STASH_SCAN_MAX_DEPTH + 1) <= depth:
             continue
-        seen_code.add(current)
+        seen_code[current] = depth
         names = set(getattr(current, "co_names", ()))
         if names & _STASH_READ_MARKERS:
             return True
@@ -1797,7 +1804,9 @@ def _forward_statically_reads_stash(experts_module):
             called = namespace.get(name)
             called = getattr(called, "__func__", called)
             called_code = getattr(called, "__code__", None)
-            if called_code is None or called_code in seen_code:
+            if called_code is None:
+                continue
+            if seen_code.get(called_code, _STASH_SCAN_MAX_DEPTH + 1) <= depth + 1:
                 continue
             pending.append((called_code, getattr(called, "__globals__", namespace), depth + 1))
     return False
