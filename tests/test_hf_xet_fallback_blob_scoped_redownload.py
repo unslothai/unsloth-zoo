@@ -425,6 +425,12 @@ def test_a_stalled_snapshot_child_publishes_its_own_new_partial_as_owned(monkeyp
 
     monkeypatch.setattr(xf, "_CTX", _Ctx())
     monkeypatch.setattr(xf, "_terminate_process_group", lambda proc, grace: None)
+    # An authoritative walk. With the real one this asserts the host rather than the inference:
+    # sd-pam is non-dumpable on every systemd login, so a process of ours cannot be described
+    # and the inference declines, which is the arm below.
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: True)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: False)
     params = {"repo_id": REPO, "revision": REV, "cache_dir": str(tmp_path)}
     kind_result, _ = xf._run_download_attempt(
         REPO, kind = "snapshot", params = params, token = None, repo_type = "model",
@@ -1607,3 +1613,49 @@ def test_a_link_whose_partial_really_went_is_still_cleared(monkeypatch, tmp_path
     )
     assert not (blobs / partial).exists(), "nobody holds it, so it goes"
     assert not link.is_symlink(), "and its dangling link goes with it"
+
+
+def test_a_snapshot_claims_nothing_when_a_process_of_ours_cannot_be_described(
+    monkeypatch, tmp_path,
+):
+    """Ownership is what exempts a blob from the age guard, so a wrong claim deletes a live
+    download.
+
+    The inference credits every post-baseline partial no live process holds to our child. If the
+    walk could not read a process running as us -- macOS TCC, or a non-dumpable one -- a
+    sibling's seconds-old partial is in that set, and cache privacy does not exclude it, since
+    privacy is about other UIDs. Claiming nothing costs a repo-wide re-download; claiming wrongly
+    costs somebody else's bytes.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    sibling = _blob_name("model-00001-of-00002.safetensors") + ".sibling" + xf.INCOMPLETE_SUFFIX
+
+    def _open_partial():
+        (blobs / sibling).write_bytes(b"\xa5" * 256)
+
+    class _Ctx:
+        def Process(self, *, target = None, kwargs = None, daemon = None):
+            return _StalledProc(_open_partial)
+
+        def Queue(self):
+            return _StalledQueue()
+
+    monkeypatch.setattr(xf, "_CTX", _Ctx())
+    monkeypatch.setattr(xf, "_terminate_process_group", lambda proc, grace: None)
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    monkeypatch.setattr(xf, "_live_writer_walk_was_complete", lambda: False)
+    monkeypatch.setattr(xf, "_live_writer_walk_missed_our_own_uid", lambda: True)
+    monkeypatch.setattr(xf, "_cache_is_private_to_this_user", lambda *a, **k: True)
+
+    params = {"repo_id": REPO, "revision": REV, "cache_dir": str(tmp_path)}
+    kind_result, _ = xf._run_download_attempt(
+        REPO, kind = "snapshot", params = params, token = None, repo_type = "model",
+        disable_xet = False, cancel_event = None, stall_timeout = 0.3, interval = 0.05,
+        grace_period = 0.1, on_status = None,
+    )
+    assert kind_result == "stall"
+    assert params.get("_owned_incomplete_blobs") is None, (
+        "a partial we cannot prove is ours must not be claimed"
+    )
+    assert (blobs / sibling).exists()

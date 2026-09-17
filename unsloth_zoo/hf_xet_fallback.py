@@ -2633,10 +2633,19 @@ def _run_download_attempt(
                         params.get("cache_dir")
                     ) and (
                         _live_writer_walk_was_complete()
-                        or _cache_is_private_to_this_user(
-                            params.get("cache_dir"),
-                            repo_type = repo_type,
-                            repo_id = repo_id,
+                        or (
+                            _cache_is_private_to_this_user(
+                                params.get("cache_dir"),
+                                repo_type = repo_type,
+                                repo_id = repo_id,
+                            )
+                            # Privacy excludes other UIDs, not a process of our own the walk
+                            # could not read. Here that omission does not merely spare a blob,
+                            # it CLAIMS one: an unseen sibling's post-baseline partial would be
+                            # marked child-owned, and ownership is what exempts a blob from the
+                            # age guard, so a seconds-old live download would be unlinked. The
+                            # cost of declining is the repo-wide force, which is bandwidth.
+                            and not _live_writer_walk_missed_our_own_uid()
                         )
                     )
                     if not trustworthy:
