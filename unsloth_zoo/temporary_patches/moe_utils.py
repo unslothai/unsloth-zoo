@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shutil
+import tempfile
 import sys
 import importlib
 import importlib.util
@@ -1705,6 +1706,34 @@ def _wrapper_uses_separated_moe_lora(wrapper, experts_module = None) -> bool:
     return _is_moe_experts_module(experts_module)
 
 
+def _wrapper_forward_applies_stash(wrapper):
+    """The measured verdict for this wrapper's experts forward, or None if unmeasured.
+
+    `_wrapper_uses_separated_moe_lora` answers a structural question, "does the separated
+    forward claim this parameter". `_patched_param_wrapper_forward` then asks a stronger
+    one at run time, "did the forward that actually ran read the stash", and falls back to
+    PEFT when the answer is False. The layout follows the forward that ran, so it has to
+    read the same verdict."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    parameter_name = getattr(wrapper, "parameter_name", None)
+    if parameter_name is None:
+        return None
+    get_base_layer = getattr(wrapper, "get_base_layer", None)
+    if get_base_layer is None:
+        return None
+    try:
+        experts_module = get_base_layer()
+    except Exception:
+        return None
+    if experts_module is None:
+        return None
+    try:
+        return moe_lora_forward_applies_stash(experts_module, parameter_name)
+    except Exception:
+        return None
+
+
 def _wrapper_has_adapter(wrapper, adapter_name) -> bool:
     """Whether `adapter_name` has a LoRA on this wrapper at all. A PeftModel can carry a
     fused expert adapter and a dense adapter side by side, and the fused expert wrappers
@@ -1756,6 +1785,16 @@ def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
     if not _wrapper_has_adapter(wrapper, adapter_name):
         return LORA_B_LAYOUT_RANK_MAJOR
     if _wrapper_uses_separated_moe_lora(wrapper):
+        if _wrapper_forward_applies_stash(wrapper) is False:
+            # The structural test says the separated forward claims this wrapper, but the
+            # forward that actually ran did not read the stash, so `_patched_param_wrapper_forward`
+            # handed the wrapper back to PEFT and PEFT trained it rank-major. That happens
+            # for a stacked-expert family Unsloth does not patch (Olmoe, for one). Believing
+            # the structural answer here would write a grouped_by_expert marker for
+            # rank-major weights, and, under the legacy override, merge them with the wrong
+            # pairing. Only a measured False overrides it; None means "not measured yet",
+            # which is not evidence either way.
+            return LORA_B_LAYOUT_RANK_MAJOR
         return _process_lora_b_layout()
     return LORA_B_LAYOUT_RANK_MAJOR
 
@@ -2600,12 +2639,44 @@ def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters
             # longer agree on one, so that key is now false. Only a value this could have
             # written is dropped: anything else is somebody else's key.
             config.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
-        with open(path, "w", encoding = "utf-8") as f:
-            # Byte for byte how PeftConfigMixin.save_pretrained writes it, so adding the
-            # marker does not also reformat the file PEFT produced.
-            f.write(json.dumps(config, indent = 2, sort_keys = True))
+        # Byte for byte how PeftConfigMixin.save_pretrained writes it, so adding the marker
+        # does not also reformat the file PEFT produced.
+        _atomic_write_text(path, json.dumps(config, indent = 2, sort_keys = True))
         written.append(path)
     return written
+
+
+def _atomic_write_text(path, text):
+    """Replace `path` with `text`, or leave it exactly as it was.
+
+    Opening the real file "w" truncates it before the first byte is written, so a write
+    that fails part way (a full disk, an erroring network mount) leaves a truncated
+    adapter_config.json behind. `_patched_peft_model_save_pretrained` then swallows the
+    exception and reports a successful save, so the checkpoint is unloadable and nothing
+    says so. Writing a sibling temporary file first means a failure destroys only that
+    file, and `os.replace` is atomic on POSIX and on Windows, so no reader can observe a
+    half-written config either.
+
+    The temporary file is a sibling, not a tempdir entry, because `os.replace` across
+    filesystems raises. It is removed on failure so a failed save leaves no litter."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    directory = os.path.dirname(path) or "."
+    handle, temporary = tempfile.mkstemp(
+        dir = directory, prefix = os.path.basename(path) + ".", suffix = ".tmp",
+    )
+    try:
+        with os.fdopen(handle, "w", encoding = "utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 # Store original PeftModel.save_pretrained for fallback

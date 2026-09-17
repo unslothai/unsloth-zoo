@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -40,6 +40,7 @@ import gc
 import json
 import os
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -1060,3 +1061,94 @@ def test_an_unwritable_stale_cache_still_gets_this_releases_patches(tmp_path):
         "a stale unwritable unsloth_compiled_cache/moe_utils.py silently kept the "
         "pre-#6930 merge"
     )
+
+
+@requires_target_parameters
+def test_a_forward_that_never_reads_the_stash_is_reported_rank_major(
+    moe_param_wrapper_patch, legacy_lora_b_layout,
+):
+    """A stacked-expert family Unsloth does not patch (Olmoe, for one) keeps transformers'
+    own experts forward, which never reads the stash. `_patched_param_wrapper_forward`
+    measures that and hands the wrapper back to PEFT, so PEFT trains lora_B rank-major.
+
+    The structural test still says "the separated forward claims this parameter", so
+    believing it would stamp a grouped_by_expert marker onto rank-major weights and, under
+    the legacy declaration this test sets, merge them with the wrong pairing. Only a
+    measured False may override the structural answer.
+    """
+    _, wrappers = _wrap(["experts.gate_up_proj"])
+    wrapper = wrappers["gate_up_proj"]
+    experts_module = wrapper.get_base_layer()
+
+    assert MU._wrapper_uses_separated_moe_lora(wrapper), \
+        "the structural test must still claim this wrapper, or the test proves nothing"
+    assert MU.moe_lora_b_layout_for_wrapper(wrapper) == MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT
+
+    MU._record_moe_lora_forward_verdict(experts_module, "gate_up_proj", False)
+    assert MU.moe_lora_forward_applies_stash(experts_module, "gate_up_proj") is False
+    assert MU.moe_lora_b_layout_for_wrapper(wrapper) == MU.LORA_B_LAYOUT_RANK_MAJOR, \
+        "a forward that does not read the stash leaves PEFT's rank-major packing in place"
+
+    MU._record_moe_lora_forward_verdict(experts_module, "gate_up_proj", True)
+    assert MU.moe_lora_b_layout_for_wrapper(wrapper) == MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT
+
+
+def test_an_unmeasured_verdict_does_not_override_the_structural_answer(
+    moe_param_wrapper_patch, legacy_lora_b_layout,
+):
+    """None means "not measured yet", which is not evidence that the forward ignores the
+    stash. Treating it as False would report rank_major for every wrapper before its first
+    forward, including the save path, which runs without one."""
+    _, wrappers = _wrap(["experts.gate_up_proj"])
+    wrapper = wrappers["gate_up_proj"]
+    assert MU.moe_lora_forward_applies_stash(
+        wrapper.get_base_layer(), "gate_up_proj",
+    ) is None
+    assert MU.moe_lora_b_layout_for_wrapper(wrapper) == MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT
+
+
+def test_a_failed_config_rewrite_leaves_the_original_loadable(tmp_path):
+    """Opening the real file "w" truncates it before the first byte lands, so a write that
+    dies part way (full disk, erroring network mount) used to leave a truncated
+    adapter_config.json. The save hook swallows that exception and reports success, so the
+    checkpoint was unloadable with nothing saying so."""
+    path = tmp_path / "adapter_config.json"
+    original = json.dumps({"peft_type": "LORA", "r": 8}, indent=2, sort_keys=True)
+    path.write_text(original, encoding="utf-8")
+
+    class _Boom(Exception):
+        pass
+
+    real_fdopen = os.fdopen
+
+    def _explode(fd, *args, **kwargs):
+        handle = real_fdopen(fd, *args, **kwargs)
+        original_write = handle.write
+
+        def _write(text):
+            original_write(text[: len(text) // 2])
+            raise _Boom("the filesystem filled up")
+
+        handle.write = _write
+        return handle
+
+    with mock.patch.object(os, "fdopen", _explode):
+        with pytest.raises(_Boom):
+            MU._atomic_write_text(str(path), '{"peft_type": "LORA", "r": 16}')
+
+    assert path.read_text(encoding="utf-8") == original, \
+        "a failed rewrite must leave the original config byte for byte"
+    assert json.loads(path.read_text(encoding="utf-8"))["r"] == 8
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "adapter_config.json"]
+    assert leftovers == [], f"a failed write left litter behind: {leftovers}"
+
+
+def test_the_atomic_rewrite_replaces_the_file_on_success(tmp_path):
+    """The success path still has to actually write, byte for byte."""
+    path = tmp_path / "adapter_config.json"
+    path.write_text("{}", encoding="utf-8")
+    payload = json.dumps({"peft_type": "LORA", "lora_B_layout": "rank_major"},
+                         indent=2, sort_keys=True)
+    MU._atomic_write_text(str(path), payload)
+    assert path.read_text(encoding="utf-8") == payload
+    assert [p.name for p in tmp_path.iterdir()] == ["adapter_config.json"]
