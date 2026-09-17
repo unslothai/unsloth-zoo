@@ -263,7 +263,9 @@ jobs:
         # use_cache disable/restore contract for gradient checkpointing
         # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
         # + cache-completeness gate (CPU-pure; collect-only would let it
-        # regress silently). test_train_on_responses_list_labels pins the
+        # regress silently), and test_hf_xet_fallback_blob_scoped_redownload
+        # pins that the same transition clears the blob at fault instead of
+        # every completed shard (#9094). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
         # no weights). The preference suite pins token boundaries, scheduling,
         # objective normalization, and reference lifecycle without model weights.
@@ -366,6 +368,7 @@ jobs:
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
+            tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
             tests/test_llama_cpp_consent_platforms.py \
             tests/test_get_transformers_model_type_empty.py \
