@@ -301,6 +301,35 @@ def test_conversion_sibling_info_none_for_monolith(monolith_layout):
     assert llama_cpp._conversion_sibling_info(str(monolith_layout)) is None
 
 
+def test_conversion_sibling_info_covers_a_module_the_patcher_never_edits(package_layout):
+    """The key decides whether the package is RESCANNED, not just re-patched.
+
+    _scan_conversion_package reads every module in conversion/, so a key built
+    from only __init__.py, base.py and qwen.py left a changed fourth module
+    invisible: in a long-lived process the next export returned the cached
+    converter without rescanning, and then executed the file that had changed.
+    """
+    llama_cpp = _load_llama_cpp_module()
+    other = package_layout / "conversion" / "zz_helper.py"
+    other.write_bytes(b"VALUE = 1\n")
+    before = llama_cpp._conversion_sibling_info(str(package_layout))
+    assert before is not None
+
+    other.write_bytes(b"VALUE = 2  # and a payload\n")
+    after = llama_cpp._conversion_sibling_info(str(package_layout))
+    assert after != before, (
+        "a module outside the patched three changed without moving the cache key"
+    )
+
+
+def test_conversion_sibling_info_notices_a_module_appearing(package_layout):
+    """A new module is a change too, and one an mtime on the old files misses."""
+    llama_cpp = _load_llama_cpp_module()
+    before = llama_cpp._conversion_sibling_info(str(package_layout))
+    (package_layout / "conversion" / "zz_new.py").write_bytes(b"VALUE = 1\n")
+    assert llama_cpp._conversion_sibling_info(str(package_layout)) != before
+
+
 # --- _get_llama_cpp_dir resolution (addresses PR #667 review) ---------------
 
 
@@ -403,7 +432,12 @@ def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
     assert resolved == str(root)
     sib = llama_cpp._conversion_sibling_info(resolved)
     assert sib is not None
-    assert sib[1][0] == str(conv / "base.py")  # base.py path in sibling tuple
+    # By membership, not by index: the tuple now carries every module in
+    # conversion/, so the scan is re-run when any of them changes, and its first
+    # element is the file count. What this row is about is the DIRECTORY.
+    paths = {entry[0] for entry in sib[1:]}
+    assert str(conv / "base.py") in paths, paths
+    assert str(conv / "__init__.py") in paths, paths
     layout = llama_cpp._detect_converter_layout(_PACKAGE_ENTRYPOINT, resolved)
     assert layout == "package"
 

@@ -68,6 +68,8 @@ __all__ = [
     "VENDORED_PATTERNS",
     "PATTERNS_NOT_VENDORED",
     "scan_converter_source",
+    "scan_is_disabled",
+    "scan_is_strict",
     "warn_on_suspicious_converter",
 ]
 
@@ -941,6 +943,22 @@ def _scan_is_disabled():
 
 def _scan_is_strict():
     return os.environ.get(ENV_STRICT_SCAN, "0") == "1"
+
+
+def scan_is_strict():
+    """Whether a finding in downloaded bytes should fail the export.
+
+    Public because llama_cpp.py has one refusal that cannot travel through
+    warn_on_suspicious_converter: a conversion/ package holding more modules than
+    the scan will read is a fact about the DIRECTORY, not about any bytes, and
+    that function takes the bytes it scans.
+    """
+    return _scan_is_strict()
+
+
+def scan_is_disabled():
+    """Whether the scan is switched off entirely, for the same caller."""
+    return _scan_is_disabled()
 
 
 def warn_on_suspicious_converter(

@@ -31,6 +31,7 @@ Three groups:
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
 import sys
 from pathlib import Path
@@ -730,7 +731,7 @@ def test_export_warns_but_completes_on_a_flagged_local_converter(
     assert os.path.isfile(patched), "a warning must not block the export"
 
 
-def test_only_a_pinned_or_verified_converter_is_exempt_from_strict_mode(tmp_path, monkeypatch):
+def test_only_a_pinned_converter_is_exempt_from_strict_mode(tmp_path, monkeypatch):
     """The exemption means "you chose this file", not "this file is on disk".
 
     When no prebuilt is available install_llama_cpp falls back to an unpinned
@@ -751,16 +752,109 @@ def test_only_a_pinned_or_verified_converter_is_exempt_from_strict_mode(tmp_path
         "a bare checkout must not be exempt"
     )
 
-    marker = clone / llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME
-    marker.write_text("{}")
-    assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
-        "a prebuilt bundle is sha256 verified on arrival"
-    )
-    marker.unlink()
-
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(clone))
     assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
         "an explicit pin is a deliberate user choice"
     )
 
     assert llama_cpp._converter_is_trusted_local(None) is False
+
+
+def test_an_oversized_conversion_package_is_reported_not_silently_truncated(
+    tmp_path, monkeypatch, caplog
+):
+    """Scanning only the first MAX names let a payload hide past the cap.
+
+    A package can put its payload in a late-sorting module and import it from an
+    otherwise clean __init__.py; with the list silently truncated, strict mode
+    executed the unscanned module with nothing reported at all. The cap stays --
+    an attacker must not choose how much work this does -- so crossing it is
+    itself the finding.
+    """
+    llama_cpp = _load("llama_cpp_cap_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    for index in range(llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1):
+        (conversion / f"mod_{index:03d}.py").write_text("VALUE = 1\n")
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert any("more than the" in record.message for record in caplog.records), (
+        f"the oversized package was not reported: {[r.message for r in caplog.records]}"
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError, match = "more than the"):
+        llama_cpp._scan_conversion_package(str(root))
+
+    # The same switch that silences every other finding silences this one.
+    monkeypatch.setenv("UNSLOTH_DISABLE_CONVERTER_SCAN", "1")
+    llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch, caplog):
+    """The other half: the report must not fire on an ordinary package."""
+    llama_cpp = _load("llama_cpp_cap_ok_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    for index in range(llama_cpp.MAX_CONVERSION_PACKAGE_FILES):
+        (conversion / f"mod_{index:03d}.py").write_text("VALUE = 1\n")
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert not [r for r in caplog.records if "more than the" in r.message]
+
+
+def test_a_prebuilt_marker_does_not_buy_the_exemption(tmp_path, monkeypatch):
+    """UNSLOTH_PREBUILT_INFO.json reads like proof of verification and is not.
+
+    _stage_prebuilt_install checks a sha256 for the BINARY asset, and only when
+    the release published one. The converter itself arrives separately through
+    _hydrate_converter_sources, which downloads a source tarball with no digest
+    at all, and the marker is written after that. So a replaced source tarball
+    wore a "verified" marker, took the strict-mode exemption and skipped the
+    conversion/ scan with it. The converter from a prebuilt bundle is a download
+    like any other and is scanned like one.
+    """
+    llama_cpp = _load("llama_cpp_marker_probe", "unsloth_zoo/llama_cpp.py")
+
+    bundle = tmp_path / "prebuilt"
+    bundle.mkdir()
+    script = bundle / "convert_hf_to_gguf.py"
+    script.write_text("# converter\n")
+    (bundle / llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME).write_text("{}")
+
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+    assert llama_cpp._converter_is_trusted_local(str(script)) is False, (
+        "the marker does not say these converter bytes were verified"
+    )
+
+
+def test_a_pin_written_with_a_tilde_is_still_a_pin(tmp_path, monkeypatch):
+    """_resolve_local_convert_script accepts the pin after expanduser, so this
+    check has to expand it too, or a deliberately pinned converter with a finding
+    is refused under strict mode as though it had been downloaded."""
+    llama_cpp = _load("llama_cpp_tilde_probe", "unsloth_zoo/llama_cpp.py")
+
+    home = tmp_path / "home"
+    pinned = home / "llama.cpp"
+    pinned.mkdir(parents = True)
+    script = pinned / "convert_hf_to_gguf.py"
+    script.write_text("# converter\n")
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", "~/llama.cpp")
+    assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
+        "an unexpanded pin compared unequal to the expanded script path"
+    )
