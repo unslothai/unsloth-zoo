@@ -1488,12 +1488,16 @@ _get_moe_lora_weights = _extract_lora_from_wrapper
 # by expert, lora_B is NOT, its expert index is the fastest axis. Unsloth does not use
 # PEFT's forward for fused MoE experts; the separated forward reads the same lora_B as
 # (out, E, R) (`_canonical_lora_weights_for_grouped_mm`), so a rank-contiguous block of
-# columns belongs to one expert. Both stacks are internally consistent, and they disagree
-# with each other whenever num_experts != rank, which is every real MoE checkpoint.
+# columns belongs to one expert. Both stacks are internally consistent, and both reshapes
+# always fit, since E*R == R*E, so nothing ever raises. They disagree with each other
+# whenever num_experts > 1 and rank > 1, which is every real MoE checkpoint. Equal
+# num_experts and rank does not make them agree: the two readings send flat column
+# r*E + e and flat column e*R + r to the same place, and those coincide for all (e, r)
+# only when E == 1 or R == 1.
 #
 # So the layout is a property of the forward that ran, not of the architecture, and every
-# consumer has to ask the same question of the same wrapper. That is what these two
-# helpers are for: the forward routing test below, and the layout name derived from it.
+# consumer has to ask the same question of the same wrapper, for the same adapter. That is
+# what these helpers are for: the forward routing test below, and the layout name from it.
 # The name is also written into adapter_config.json on save (unsloth#6930), because a
 # downstream converter has no wrapper to ask.
 # ---------------------------------------------------------------------------------------
@@ -1526,11 +1530,38 @@ def _wrapper_uses_separated_moe_lora(wrapper, experts_module = None) -> bool:
     return _is_moe_experts_module(experts_module)
 
 
-def moe_lora_b_layout(wrapper) -> str:
-    """Which convention packs `wrapper`'s lora_B columns: `grouped_by_expert` when the
-    separated MoE forward owns the wrapper, else PEFT's `rank_major`. A single expert (or
-    a wrapper PEFT collapses to a plain Linear) has no packing to get wrong and is
-    reported as rank_major, which is what PEFT's own reconstruction does for it.
+def _wrapper_has_adapter(wrapper, adapter_name) -> bool:
+    """Whether `adapter_name` has a LoRA on this wrapper at all. A PeftModel can carry a
+    fused expert adapter and a dense adapter side by side, and the fused expert wrappers
+    then exist for the whole model while only one adapter has weights in them, so every
+    layout answer has to be scoped to one adapter or it describes the wrong one.
+
+    `adapter_name = None` asks the weaker question "does this wrapper hold any adapter at
+    all", which is what the unnamed form of `moe_lora_b_layout` needs. Still a question:
+    `delete_adapter` empties lora_A and leaves the wrapper in place, and claiming a
+    packing for weights that are gone is the same mistake in a smaller form."""
+    lora_A = getattr(wrapper, "lora_A", None)
+    if lora_A is None:
+        return False
+    try:
+        if adapter_name is None:
+            return len(lora_A) != 0
+        return adapter_name in lora_A
+    except Exception:
+        return False
+
+
+def moe_lora_b_layout(wrapper, adapter_name = None) -> str:
+    """Which convention packs `wrapper`'s lora_B columns for `adapter_name`:
+    `grouped_by_expert` when the separated MoE forward owns the wrapper, else PEFT's
+    `rank_major`. A single expert (or a wrapper PEFT collapses to a plain Linear) has no
+    packing to get wrong and is reported as rank_major, which is what PEFT's own
+    reconstruction does for it.
+
+    `adapter_name` defaults to "whichever adapter this wrapper holds", which is the old
+    behaviour and is right for a model with one adapter. Name an adapter that has no LoRA
+    on this wrapper and the answer is rank_major, so the caller falls back to PEFT rather
+    than claiming a packing for weights that are not there.
 
     `wrapper` must be the PEFT ParamWrapper. Hand it anything else, the experts module
     itself for instance, and the answer is rank_major, because nothing on it says the
@@ -1538,6 +1569,8 @@ def moe_lora_b_layout(wrapper) -> str:
     when the truth is "cannot tell", so callers that may hold something else have to
     check for `parameter_name` and `lora_A` first."""
     if int(getattr(wrapper, "num_experts", 1) or 1) <= 1:
+        return LORA_B_LAYOUT_RANK_MAJOR
+    if not _wrapper_has_adapter(wrapper, adapter_name):
         return LORA_B_LAYOUT_RANK_MAJOR
     if _wrapper_uses_separated_moe_lora(wrapper):
         return LORA_B_LAYOUT_GROUPED_BY_EXPERT
@@ -1660,7 +1693,7 @@ def _patched_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
     leave every other wrapper on PEFT's own code."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    if moe_lora_b_layout(self) != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
+    if moe_lora_b_layout(self, adapter_name) != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
         return _original_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
 
     delta_weight = _grouped_by_expert_delta_weight(self, adapter_name)
@@ -1686,13 +1719,41 @@ FUSED_EXPERT_LORA_LAYOUT_KEY = "lora_B_layout"
 FUSED_EXPERT_LORA_DETAIL_KEY = "unsloth_fused_expert_lora"
 
 
-def fused_expert_lora_layout(peft_model) -> Optional[dict]:
-    """How every fused MoE expert LoRA on `peft_model` packs its lora_A and lora_B, or
-    None when the model has no fused expert LoRA at all.
+def _default_adapter_name(peft_model) -> str:
+    """The adapter `fused_expert_lora_layout` describes when the caller names none: the
+    model's active one, or PEFT's own default name. Both attributes are properties on
+    some PEFT versions and can raise on a partly built model, so neither is trusted."""
+    # delete_adapter leaves active_adapter a list, and active_adapters is always one.
+    for attribute in ("active_adapter", "active_adapters"):
+        try:
+            active = getattr(peft_model, attribute, None)
+        except Exception:
+            continue
+        if isinstance(active, str) and active:
+            return active
+        if isinstance(active, (list, tuple)) and len(active) != 0:
+            if isinstance(active[0], str) and active[0]:
+                return active[0]
+    return "default"
+
+
+def fused_expert_lora_layout(peft_model, adapter_name = None) -> Optional[dict]:
+    """How ONE adapter's fused MoE expert LoRA on `peft_model` packs its lora_A and
+    lora_B, or None when that adapter has no fused expert LoRA at all.
 
     lora_A is grouped by expert in both stacks. lora_B is the one that differs, and it is
     reported per PEFT parameter name, since that is what decides whether Unsloth's
-    separated forward or PEFT's own forward owns the wrapper."""
+    separated forward or PEFT's own forward owns the wrapper.
+
+    The answer is per adapter because a PeftModel can hold several. A fused expert
+    adapter and a dense adapter side by side share the fused expert wrappers, so a scan
+    that only asks "does this model have a fused expert LoRA anywhere" answers yes for
+    the dense adapter too, and that answer would be written into the dense adapter's own
+    adapter_config.json. `adapter_name` defaults to the model's active adapter, so the
+    single adapter case is unchanged."""
+    if adapter_name is None:
+        adapter_name = _default_adapter_name(peft_model)
+
     parameters = {}
     try:
         modules = list(peft_model.modules())
@@ -1703,11 +1764,14 @@ def fused_expert_lora_layout(peft_model) -> Optional[dict]:
         parameter_name = getattr(module, "parameter_name", None)
         if not parameter_name or not hasattr(module, "lora_A"):
             continue
+        if not _wrapper_has_adapter(module, adapter_name):
+            # A wrapper another adapter owns. Its packing is not this adapter's business.
+            continue
         num_experts = int(getattr(module, "num_experts", 1) or 1)
         if num_experts <= 1:
             # Not a fused expert stack, so there is no expert axis to pack.
             continue
-        layout = moe_lora_b_layout(module)
+        layout = moe_lora_b_layout(module, adapter_name)
         entry = parameters.get(parameter_name)
         if entry is None:
             parameters[parameter_name] = {
@@ -1725,14 +1789,21 @@ def fused_expert_lora_layout(peft_model) -> Optional[dict]:
         "parameters": parameters,
     }
     layouts = {entry["lora_B_layout"] for entry in parameters.values()}
+    # The flat key is what a converter branches on, so it is only written when every
+    # fused expert parameter agrees on one of the two real names. "mixed" is a report,
+    # not a layout, and a converter testing `== "grouped_by_expert"` would read it as
+    # rank_major, so it stays in the nested detail where it has to be read deliberately.
     if len(layouts) == 1:
-        detail["lora_B_layout"] = layouts.pop()
+        layout = layouts.pop()
+        if layout in (LORA_B_LAYOUT_GROUPED_BY_EXPERT, LORA_B_LAYOUT_RANK_MAJOR):
+            detail["lora_B_layout"] = layout
     return detail
 
 
 def _fused_expert_lora_adapter_config_paths(peft_model, save_directory, selected_adapters):
     """Where PEFT just wrote an adapter_config.json: the root for `default`, a
-    subdirectory named after any other adapter."""
+    subdirectory named after any other adapter. Paired with the adapter each file
+    belongs to, because the marker is per adapter."""
     if selected_adapters is None:
         try:
             selected_adapters = list(peft_model.peft_config.keys())
@@ -1745,24 +1816,29 @@ def _fused_expert_lora_adapter_config_paths(peft_model, save_directory, selected
             directory = os.path.join(save_directory, adapter_name)
         path = os.path.join(directory, "adapter_config.json")
         if os.path.isfile(path):
-            paths.append(path)
+            paths.append((adapter_name, path))
     return paths
 
 
 def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters = None):
     """Record the fused MoE expert lora_B packing in the adapter_config.json PEFT has
-    just written, and return the files updated. Nothing is written for a model with no
-    fused expert LoRA. PEFT ignores keys it does not know, so the checkpoint stays
-    loadable by any PEFT version; this only stops a downstream converter, or PEFT's own
-    merge in a differently configured process, from having to guess (unsloth#6930)."""
-    detail = fused_expert_lora_layout(peft_model)
-    if detail is None:
-        return []
+    just written, and return the files updated. PEFT ignores keys it does not know, so
+    the checkpoint stays loadable by any PEFT version; this only stops a downstream
+    converter, or PEFT's own merge in a differently configured process, from having to
+    guess (unsloth#6930).
 
+    The packing is recomputed for each adapter being saved, and an adapter with no fused
+    expert LoRA is left exactly as PEFT wrote it: not written, and not stripped either,
+    since a key this never put there is not this function's to remove. A model holding a
+    fused expert adapter and a dense one would otherwise describe the fused adapter's
+    experts in the dense adapter's config, which is worse than saying nothing."""
     written = []
-    for path in _fused_expert_lora_adapter_config_paths(
+    for adapter_name, path in _fused_expert_lora_adapter_config_paths(
         peft_model, save_directory, selected_adapters,
     ):
+        detail = fused_expert_lora_layout(peft_model, adapter_name)
+        if detail is None:
+            continue
         with open(path, "r", encoding = "utf-8") as f:
             config = json.load(f)
         if not isinstance(config, dict):
@@ -1770,7 +1846,12 @@ def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters
         config[FUSED_EXPERT_LORA_DETAIL_KEY] = detail
         if "lora_B_layout" in detail:
             config[FUSED_EXPERT_LORA_LAYOUT_KEY] = detail["lora_B_layout"]
-        else:
+        elif config.get(FUSED_EXPERT_LORA_LAYOUT_KEY) in (
+            LORA_B_LAYOUT_GROUPED_BY_EXPERT, LORA_B_LAYOUT_RANK_MAJOR,
+        ):
+            # An earlier save of this adapter wrote a flat layout and the parameters no
+            # longer agree on one, so that key is now false. Only a value this could have
+            # written is dropped: anything else is somebody else's key.
             config.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
         with open(path, "w", encoding = "utf-8") as f:
             # Byte for byte how PeftConfigMixin.save_pretrained writes it, so adding the
