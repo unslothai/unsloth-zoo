@@ -19,6 +19,7 @@ from .utils import Version
 import os
 import math
 import functools
+from collections.abc import Mapping
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
@@ -396,10 +397,14 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     #     something else: they raise here, or come back quietly short.
     # The guards differ in width on purpose. is_non_causal_head gates both routes; the
     # new route also demands a POSITIVE shifted-label signal, so Whisper and Florence2
-    # keep today's count rather than being rescaled here. No .ndim means no tensor ops
-    # at all: a list would hit the except below and kill a run stock trains through.
+    # keep today's count rather than being rescaled here. A sample has to be a Mapping
+    # before "labels" can be read off it, and then have a .ndim before any tensor op
+    # touches it: TRL's GRPO collator is the identity, so a sample is a LIST of dicts
+    # and `.get` on it raises. Both used to kill a run stock trains through, which is
+    # why the pre-#1217 spelling asked `"labels" in batch_samples[0]`.
     labels_are_countable = getattr(
-        batch_samples[0].get("labels") if len(batch_samples) > 0 else None, "ndim", None,
+        batch_samples[0].get("labels") if len(batch_samples) > 0
+        and isinstance(batch_samples[0], Mapping) else None, "ndim", None,
     ) is not None
     if (not is_non_causal_head) and labels_are_countable \
             and (has_kwargs or (getattr(self, "compute_loss_func", None) is not None
