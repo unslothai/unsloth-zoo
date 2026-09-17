@@ -447,6 +447,35 @@ def _default_scrub_secrets(text: str, hf_token: Optional[str] = None) -> str:
     return out
 
 
+def _partial_partners_of(target: Path) -> "list":
+    """Every ``*.incomplete`` file that names *target*, in BOTH spellings hub has used.
+
+    The blob-cache path wrote `<etag>.incomplete` (`file_download.py`, `blob_path +
+    ".incomplete"`). Current hub downloads to a PROCESS-UNIQUE partial instead,
+    `incomplete_path.with_name(f"{stem}.{uuid4().hex[:8]}.incomplete")`, because a shared
+    `<etag>.incomplete` corrupts the cache wherever `flock` silently succeeds for every caller
+    (Lustre, GPFS, some NFS mounts) -- huggingface_hub PR 4228. Checking only the exact name
+    therefore missed a live sibling's partial entirely on the newer generation, which is the
+    evidence a dangling link is being written right now.
+    """
+    partners = []
+    exact = target.with_name(target.name + INCOMPLETE_SUFFIX)
+    try:
+        if exact.is_file():
+            partners.append(exact)
+    except OSError:
+        pass
+    try:
+        partners += [
+            candidate
+            for candidate in target.parent.glob(f"{target.name}.*{INCOMPLETE_SUFFIX}")
+            if candidate.is_file()
+        ]
+    except OSError:
+        pass
+    return partners
+
+
 def _broken_link_has_active_partner(link: Path, *, active_grace: float) -> bool:
     """SPARE a dangling snapshot symlink iff a sibling is still writing its target blob. Discriminator
     is a FRESH ``.incomplete`` partner of the target, NOT the link mtime: our killed child's partner was
@@ -456,9 +485,14 @@ def _broken_link_has_active_partner(link: Path, *, active_grace: float) -> bool:
         target = Path(os.readlink(link))
         if not target.is_absolute():
             target = link.parent / target
-        incomplete_partner = target.with_name(target.name + INCOMPLETE_SUFFIX)
-        if incomplete_partner.is_file():
-            return time.time() - incomplete_partner.stat().st_mtime < active_grace
+        # Either spelling, and the freshest of them: a sibling on the current hub writes
+        # `<etag>.<nonce>.incomplete`, which the exact name alone never saw.
+        for partner in _partial_partners_of(target):
+            try:
+                if time.time() - partner.stat().st_mtime < active_grace:
+                    return True
+            except OSError:
+                continue
     except OSError:
         return False
     return False
@@ -471,6 +505,25 @@ def _link_incomplete_partner_name(link: Path) -> Optional[str]:
         return target.name + INCOMPLETE_SUFFIX
     except OSError:
         return None
+
+
+def _link_partner_is_owned(link: Path, owned_incomplete_blobs: set) -> bool:
+    """Whether a dangling link's target blob is one of OUR partials, in either spelling.
+
+    `<etag>.incomplete` on the older hub path and `<etag>.<nonce>.incomplete` on the current
+    one, so the ownership set is matched by the blob name the link points at rather than by
+    one exact filename.
+    """
+    try:
+        target_name = Path(os.readlink(link)).name
+    except OSError:
+        return False
+    prefix = target_name + "."
+    return any(
+        name == target_name + INCOMPLETE_SUFFIX
+        or (name.startswith(prefix) and name.endswith(INCOMPLETE_SUFFIX))
+        for name in owned_incomplete_blobs
+    )
 
 
 def _clear_partials(
@@ -503,9 +556,19 @@ def _clear_partials(
     """
     # Once per call rather than per blob: `process_iter` walks the whole host. Taken here so it
     # describes the moment of the deletion rather than the moment of the eligibility scan.
-    rescanned_writers = (
-        _partial_paths_with_a_live_writer() if ownership_is_an_earlier_scan else None
-    )
+    rescanned_writers = None
+    if ownership_is_an_earlier_scan:
+        rescanned_writers = _partial_paths_with_a_live_writer()
+        # The SAME gate the eligibility scan applies, re-applied to this reading: a walk that
+        # could not inspect every process is a lower bound, so "no writer holds this" is not a
+        # fact -- and on a cache another UID can write into, the process it could not read is
+        # a likely writer. Re-scanning without the gate would have let the deletion overturn
+        # the very decision the scan declined to make.
+        if rescanned_writers is not None and not _live_writer_walk_was_complete():
+            if not _cache_is_private_to_this_user(
+                cache_dir, repo_type = repo_type, repo_id = repo_id,
+            ):
+                rescanned_writers = None
     try:
         for entry in iter_active_repo_cache_dirs(repo_type, repo_id, cache_dir = cache_dir):
             blobs_dir = entry / "blobs"
@@ -550,8 +613,8 @@ def _clear_partials(
                     for link in snapshot.rglob("*"):
                         if link.is_symlink() and not link.exists():
                             # Scope to our own partials when known; a link to a sibling's blob is theirs.
-                            if owned_incomplete_blobs is not None and (
-                                _link_incomplete_partner_name(link) not in owned_incomplete_blobs
+                            if owned_incomplete_blobs is not None and not (
+                                _link_partner_is_owned(link, owned_incomplete_blobs)
                             ):
                                 continue
                             # Spare a sibling's active link (target still has a fresh .incomplete).
@@ -1064,7 +1127,7 @@ def _orphan_snapshot_links_safe_to_clear(
                         if not link.is_symlink() or link.exists():
                             continue
                         target = Path(os.path.realpath(link))
-                        if Path(str(target) + INCOMPLETE_SUFFIX).exists():
+                        if _partial_partners_of(target):
                             continue
                     except OSError:
                         continue
@@ -1097,7 +1160,7 @@ def _clear_orphan_snapshot_links(
             if not link.is_symlink() or link.exists():
                 continue
             target = Path(os.path.realpath(link))
-            if Path(str(target) + INCOMPLETE_SUFFIX).exists():
+            if _partial_partners_of(target):
                 continue
             link.unlink()
         except OSError:

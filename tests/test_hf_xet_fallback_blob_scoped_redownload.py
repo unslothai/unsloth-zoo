@@ -704,6 +704,72 @@ def test_a_link_that_stops_dangling_before_the_unlink_is_left_alone(monkeypatch,
     assert orphan.is_symlink(), "a link whose blob is being written was unlinked"
 
 
+def test_a_nonce_suffixed_partial_still_says_the_blob_is_being_written(monkeypatch, tmp_path):
+    """Current hub does not write `<etag>.incomplete` into the blobs directory.
+
+    It downloads to a process-unique `<etag>.<nonce>.incomplete` and renames, because a shared
+    name corrupts the cache wherever `flock` silently succeeds for every caller (huggingface_hub
+    PR 4228). Checking only the exact name missed a live sibling's partial, so a dangling link
+    whose blob was being downloaded right now was unlinked -- and a sibling targeting another
+    revision never recreates this older pointer, so a later offline load fails with the blob
+    cached.
+    """
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
+    snap = _build_cache(tmp_path, partial_age_s = 5.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    (blobs / (_blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX)).unlink()
+    orphan = snap / "tokenizer.model"
+    target_name = _blob_name("tokenizer.model")
+    orphan.symlink_to(os.path.relpath(blobs / target_name, snap))
+    # What a sibling downloading that blob leaves on disk on this hub generation.
+    (blobs / f"{target_name}.a1b2c3d4{xf.INCOMPLETE_SUFFIX}").write_bytes(b"\xa5" * 64)
+
+    scanned = [link.name for link in xf._orphan_snapshot_links_safe_to_clear(
+        "model", REPO, str(tmp_path),
+    )]
+    assert "tokenizer.model" not in scanned, scanned
+    assert xf._clear_orphan_snapshot_links("model", REPO, str(tmp_path)) == set()
+    assert orphan.is_symlink(), "a link whose blob a sibling was writing was unlinked"
+    # And the same name is recognised as a fresh partner by the purge's own spare rule.
+    assert xf._broken_link_has_active_partner(orphan, active_grace = 180.0) is True
+
+
+def test_a_deletion_time_walk_that_could_not_read_every_process_declines(monkeypatch, tmp_path):
+    """The re-scan at the deletion has to answer to the same gate as the eligibility scan.
+
+    A walk that could not inspect every process is a lower bound, so "no writer holds this" is
+    not a fact, and on a cache another UID can write into, the process it could not read is a
+    likely writer. Without the gate, the deletion-time reading overturned the decision the
+    eligibility scan had correctly declined to make.
+    """
+    _build_cache(tmp_path, partial_age_s = 1800.0)
+    blobs = tmp_path / REPO_DIR / "blobs"
+    stale = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
+    seen = {"scans": 0}
+
+    def _walk():
+        seen["scans"] += 1
+        if seen["scans"] == 1:
+            xf._LIVE_WRITER_WALK.complete = True     # the eligibility scan read everything
+        else:
+            xf._LIVE_WRITER_WALK.complete = False    # a process it could not read, at deletion
+        return set()
+
+    monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", _walk)
+    monkeypatch.setattr(
+        xf, "_cache_is_private_to_this_user", lambda _cache_dir = None, **_kwargs: False,
+    )
+
+    survivors = xf._clear_unsafe_partials_for_http(
+        "model", REPO, cache_dir = str(tmp_path), active_grace = 180.0,
+    )
+    assert seen["scans"] >= 2
+    assert (blobs / stale).exists(), (
+        "an unreadable process at deletion time did not stop the purge the scan had gated"
+    )
+    assert survivors == {stale}
+
+
 def test_a_partial_a_sibling_reopens_after_the_scan_is_not_unlinked(monkeypatch, tmp_path):
     """The whitelist is the result of an earlier scan, not a fact about our own dead child.
 
