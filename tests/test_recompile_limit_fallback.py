@@ -75,6 +75,54 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse = True)
+def _an_unspent_recompile_budget():
+    """Every wrapper in the process borrows from ONE budget, so these tests share state.
+
+    `_bump_recompile_limits` raises `torch._dynamo.config` itself and counts the borrow in the
+    module-global `_GLOBAL_BUMPS`, capped at `_MAX_TOTAL_RECOMPILE_LIMIT_BUMPS` for the whole
+    process; the count is only handed back when every borrower has settled to eager. A test
+    whose wrapper is still pending when it ends therefore leaves the budget spent, and the
+    NEXT test's retry silently declines -- one compiled attempt instead of two, which is an
+    assertion failure in a test that has nothing to do with the leak and changes with the
+    order the suite happens to run in. Each test gets the budget back here instead.
+    """
+    utils = sys.modules["unsloth_zoo.temporary_patches.utils"]
+    config = torch._dynamo.config
+    keys = [key for key in _LIMIT_KEYS if hasattr(config, key)]
+    limits = {key: getattr(config, key) for key in keys}
+    saved = (
+        utils._GLOBAL_BUMPS,
+        dict(utils._ORIGINAL_RECOMPILE_LIMITS),
+        dict(utils._BUMPED_RECOMPILE_LIMITS),
+        set(utils._LATCHED_EAGER_LABELS),
+        set(utils._PENDING_EAGER_LABELS),
+        set(utils._RECENT_EAGER_LABELS),
+    )
+    utils._GLOBAL_BUMPS = 0
+    utils._ORIGINAL_RECOMPILE_LIMITS.clear()
+    utils._BUMPED_RECOMPILE_LIMITS.clear()
+    try:
+        yield
+    finally:
+        for key, value in limits.items():
+            setattr(config, key, value)
+        utils._GLOBAL_BUMPS = saved[0]
+        for table, restored in (
+            (utils._ORIGINAL_RECOMPILE_LIMITS, saved[1]),
+            (utils._BUMPED_RECOMPILE_LIMITS, saved[2]),
+        ):
+            table.clear()
+            table.update(restored)
+        for labels, restored in (
+            (utils._LATCHED_EAGER_LABELS, saved[3]),
+            (utils._PENDING_EAGER_LABELS, saved[4]),
+            (utils._RECENT_EAGER_LABELS, saved[5]),
+        ):
+            labels.clear()
+            labels.update(restored)
+
+
 def _pair(compiled_raises = None, calls = None):
     calls = calls if calls is not None else {"c": 0, "e": 0}
 
