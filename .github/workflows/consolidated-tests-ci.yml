@@ -263,7 +263,9 @@ jobs:
         # use_cache disable/restore contract for gradient checkpointing
         # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
         # + cache-completeness gate (CPU-pure; collect-only would let it
-        # regress silently). test_train_on_responses_list_labels pins the
+        # regress silently), and test_hf_xet_fallback_blob_scoped_redownload
+        # pins that the same transition clears the blob at fault instead of
+        # every completed shard (#9094). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
         # no weights). The preference suite pins token boundaries, scheduling,
         # objective normalization, and reference lifecycle without model weights.
@@ -281,6 +283,17 @@ jobs:
         # and that the weight-preprocessor registry is one dict across the package
         # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
         # neither was executed by any job before.
+        #
+        # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
+        # the forward of a stacked-expert family Unsloth has no forward for, which is
+        # what stops an adapter that looks healthy in named_parameters from having no
+        # effect on the output. It belongs in a gate and not in collect-only because
+        # half of it is a fullgraph torch.compile of the fold that replaces PEFT's
+        # parametrization, and that fold is version-sensitive: the first version of it
+        # removed a shadowing entry with `experts_module.__dict__.pop`, which Dynamo
+        # refuses to trace on the torch floor this job installs (>=2.4, <2.11) while
+        # tracing it fine on 2.13. Collecting the file proves only that it imports, so
+        # the compile error was invisible on every check.
         #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
@@ -312,9 +325,12 @@ jobs:
         # shipped broken for the same reason this comment keeps repeating -- the
         # file was in NO job, so `--collect-only` proved only that it imports while
         # the count double-removed every document boundary a collator had already
-        # masked, inflating loss and every gradient. `.[core]` resolves trl 0.24.0
-        # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
-        # so this job exercises the regressed regime on every pull request.
+        # masked, inflating loss and every gradient. `.[core]` resolves a trl that
+        # masks the document boundary itself (trl added that in 0.23.1 and every
+        # release since keeps it), so this job exercises the regressed regime on
+        # every pull request. Stated as the mechanism rather than as a version
+        # number, because the number moves with the cap and a stale one here reads
+        # like a guarantee that the lane no longer provides.
         #
         # test_hip_bf16_offload_dtype pins that the HIP branch ASKS whether bf16 is
         # supported rather than hardcoding True, which is what kills an RDNA 1/2 card
@@ -348,6 +364,9 @@ jobs:
         # test_llama_cpp_converter_scan pins that the scan stays quiet on the real
         # upstream converter and still flags a planted payload. A scan that warns on
         # every export is one users learn to ignore, so both directions are gated.
+        # test_compiled_cache_fail_closed pins that the compiled cache refuses bytes
+        # it did not generate, bytecode included: the digest covers the .py, so the
+        # pyc has to be dropped before every verified import.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -355,6 +374,7 @@ jobs:
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
+            tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
             tests/test_llama_cpp_consent_platforms.py \
             tests/test_get_transformers_model_type_empty.py \
@@ -379,6 +399,7 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_moe_stacked_expert_lora_reaches_forward.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
@@ -387,6 +408,7 @@ jobs:
             tests/test_vision_url_ssrf_guard.py \
             tests/test_vision_url_dns_rebinding.py \
             tests/test_llama_cpp_converter_scan.py \
+            tests/test_compiled_cache_fail_closed.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
@@ -525,7 +547,7 @@ jobs:
           # on the newest mlx-vlm that fits, which is the 0.6.4 ceiling the audio
           # gate records.
           #
-          # The <0.7.0 bound is repeated here because pyproject's copy is marker-gated
+          # The <=0.7.1 bound is repeated here because pyproject's copy is marker-gated
           # to darwin + arm64 and so constrains nothing on this Linux lane. Without it
           # the lane resolved mlx-vlm 0.7.0 the moment the transformers cap moved,
           # gating a combination pyproject forbids.
@@ -537,7 +559,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<0.7.0" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.1" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3

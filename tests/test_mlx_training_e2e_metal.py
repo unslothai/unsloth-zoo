@@ -568,6 +568,128 @@ def test_lora_sft_baseline_loss_value_clip(tmp_path):
 _NormTok = type("Tok", (), {"pad_token_id": 0, "eos_token_id": 0})
 
 
+def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0):
+    from types import SimpleNamespace
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(rows, dim)
+
+        def __call__(self, ids):
+            if calls is not None:
+                calls.append("backbone")
+            return self.embed_tokens(ids)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = LoRALinear(dim, 8192, r=8, scale=2.0) if lora else nn.Linear(dim, 8192, bias=False)
+            base = self.lm_head.linear if lora else self.lm_head
+            if lora and (softcap or dim > 1024):
+                dtype = mx.float16 if softcap and not quantized else mx.bfloat16
+                self.model.set_dtype(dtype)
+                base.set_dtype(dtype)
+                self.model.embed_tokens.weight *= 50 if softcap else 1
+                if softcap and not quantized:
+                    self.model.embed_tokens.weight = mx.full((rows, dim), 200, dtype=dtype)
+                    base.weight = mx.full((8192, dim), 200, dtype=dtype)
+                    base.bias = mx.full((8192,), -40000 * dim, dtype=mx.float32)
+            if quantized:
+                base = nn.QuantizedLinear.from_linear(base)
+            if lora or quantized:
+                base.freeze()
+            if lora:
+                self.lm_head.linear = base
+                self.lm_head.lora_b = mx.random.normal((8, 8192)) * 0.02
+            else:
+                self.lm_head = base
+            self.args = SimpleNamespace(tie_word_embeddings=False, final_logit_softcapping=softcap)
+
+        def __call__(self, ids):
+            if calls is not None:
+                calls.append("model")
+            return _apply_softcap(self.lm_head(self.model(ids)), softcap)
+
+    return Model()
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
+    import numpy as np
+    from types import SimpleNamespace
+    from mlx.utils import tree_flatten
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(2053, 64)
+
+        def __call__(self, ids):
+            return self.embed_tokens(ids)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = nn.Linear(64, 8192, bias=False)
+            self.args = SimpleNamespace(tie_word_embeddings=False)
+            if quantized:
+                self.lm_head = nn.QuantizedLinear.from_linear(self.lm_head)
+                self.lm_head.freeze()
+
+    rows = []
+    for row in range(4):
+        labels = np.full(513, -100, dtype=np.int64)
+        positions = np.arange(20 + row, 513, 11 + row)
+        labels[positions] = (positions * 17 + row) % 2048
+        labels[1] = 7
+        rows.append(_FiniteTextRow(
+            tuple(range(row * 513, (row + 1) * 513)), offset=10, labels=tuple(labels),
+        ))
+    plan = FiniteTextBatchPlan(rows, [(0, 1), (2, 3)], max_seq_length=513, pad_id=0)
+    plan.configure_cce_compaction()
+    kernel_rows = []
+    original = mlx_utils._get_runtime_cce
+
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+
+        def record(hidden, *args):
+            kernel_rows.append(hidden.shape[0])
+            return runtime(hidden, *args)
+
+        return record
+
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    mx.random.seed(853)
+    model = Model()
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_compaction
+    grad = nn.value_and_grad(model, loss_fn)
+    compiled = mx.compile(lambda *batch: grad(model, *batch), inputs=model.state, outputs=model.state)
+    for index in range(2):
+        batch = plan[index]
+        prepared = plan.prepare_cce_batch(index, batch)
+        assert prepared[3].shape == (256,)
+        assert mx.any(prepared[3] >= 512).item()
+        reference = grad(model, *batch)
+        kernel_rows.clear()
+        actual = compiled(*prepared)
+        mx.eval(reference, actual)
+        assert kernel_rows == ([256] if index == 0 else [])
+        assert actual[0][0].item() == pytest.approx(reference[0][0].item(), abs=3e-5)
+        assert actual[0][1].item() == reference[0][1].item()
+        for (_, expected), (_, got) in zip(tree_flatten(reference[1]), tree_flatten(actual[1])):
+            assert mx.allclose(expected, got, atol=2e-5, rtol=2e-4).item()
+    plan.configure_cce_compaction(False)
+    assert plan.prepare_cce_batch(1, batch) is batch
+
+
 def _norm_model(seed=77, dtype=None):
     class _TinyLM(nn.Module):
         def __init__(self):
@@ -1057,6 +1179,360 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert aux <= trainable, sorted(aux - trainable)
     assert _adapter_keys(reloaded) <= trainable
     assert trainable == _adapter_keys(reloaded) | aux
+
+
+def _record_cce_rows(monkeypatch):
+    rows, original = [], mlx_utils._get_runtime_cce
+
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+        return lambda hidden, *args: (rows.append(hidden.shape[0]), runtime(hidden, *args))[1]
+
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    return rows
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("prompt_share", ["low", "high"])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, reference, prompt_share, dtype, kind):
+    from unsloth_zoo.mlx import preference as p
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    mx.random.seed(937)
+    kernel_rows, calls = _record_cce_rows(monkeypatch), []
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
+                            softcap=0.5 if head == "softcap" else 0.0)
+    policy = None
+    if reference:
+        adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
+        adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.02
+        model.model.embed_tokens = adapter
+        model.freeze()
+        adapter.unfreeze(keys=["lora_a", "lora_b"])
+        policy = p.LoRAReferencePolicy([adapter])
+    model.set_dtype(getattr(mx, dtype))
+    rows = []
+    for i in range(8):
+        chosen = tuple((j * 7 + i) % 2053 for j in range(513 if i % 4 == 0 else 45 + i))
+        rejected = tuple((j * 11 + i) % 2053 for j in range(507 if i % 4 == 0 else 43 + i))
+        cut, other = (-13 - i, -14 + i) if prompt_share == "high" else (13 + i, 14 - i)
+        rows.append(p.TokenizedPreferenceRow(chosen[:cut], chosen[cut:], rejected[:other], rejected[other:]))
+    normalizers = [(sum(len(row.chosen) - 1 for row in rows), 8, 2)] * 2
+    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1, 2, 3), (4, 5, 6, 7)], normalizers=normalizers,
+                                     cycle_length=2, max_seq_length=513, pad_id=0)
+    plan.configure_cce_compaction(kind=kind)
+    if kind == "dpo":
+        objective = p.resolve_preference_objective("dpo", beta=0.2, reference_free=not reference,
+            loss_type=["sigmoid", "ipo"] if reference else ["robust", "hinge"])
+        dense = p.make_dpo_loss_fn(objective, reference_policy=policy)
+        loss = p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy)
+    else:
+        objective = p.resolve_preference_objective("orpo", beta=0.2)
+        dense, loss = p.make_orpo_loss_fn(objective), p.make_orpo_cce_loss_fn(model, objective)
+    grad = nn.value_and_grad(model, loss)
+    run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    for index in range(2):
+        batch = plan[index]
+        compact = plan.prepare_cce_batch(index, batch)
+        # bfloat16 logits lose the logit sums to rounding, so there the uncompacted kernel is the reference.
+        eager_rows = len(kernel_rows)
+        expected = nn.value_and_grad(model, dense if dtype == "float32" else loss)(model, *batch)
+        mx.eval(expected)
+        calls.clear()
+        del kernel_rows[eager_rows:]
+        actual = run(*compact)
+        mx.eval(actual)
+        assert "model" not in calls
+        capacity = compact[3].shape[0]
+        assert capacity < batch[0].shape[0] * (batch[0].shape[1] - 1)
+        assert kernel_rows == [capacity] * (2 if reference and kind == "dpo" else 1)
+        for want, got in zip(expected[0], actual[0]):
+            assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
+        # A bfloat16 run accumulates chunks in a different order; the softcap derivative amplifies that.
+        rtol = 2e-4 if dtype == "float32" else 2e-2 if head == "softcap" else 5e-3
+        for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+            assert mx.allclose(want, got, atol=2e-5, rtol=rtol).item()
+        if reference:
+            assert adapter.scale == 2.0
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("labeled", [False, True])
+def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
+    from types import SimpleNamespace
+    import numpy as np
+
+    rows = []
+    for row, width in enumerate((513, 507, 769)):
+        ids = (np.arange(width) * (7 + row) + row) % 2053
+        offset = width - 55 - row * 3
+        labels = None
+        if labeled:
+            labels = np.full(width, -100, dtype=np.int32)
+            positions = np.arange(offset + row, width, row + 2)
+            labels[positions] = (positions * 19 + row) % 8192
+            labels[1] = 7
+            labels = tuple(labels)
+        rows.append(_FiniteTextRow(tuple(ids), offset=offset, labels=labels))
+    plan = FiniteTextBatchPlan(rows, [(0, None, 1), (2,), (None, None)],
+                              max_seq_length=769, pad_id=0, minimum_width=2)
+    mx.random.seed(927)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    model.set_dtype(mx.bfloat16)
+    original, projected = mlx_utils._get_runtime_cce, []
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+        def record(hidden, *args):
+            projected.append(hidden.shape[0])
+            return runtime(hidden, *args)
+        return record
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    candidate = mlx_utils.make_cce_loss_fn(model)
+    def baseline(model, *batch):
+        return candidate(model, *batch)
+    def fail(failed, _context, error):
+        if failed:
+            raise error
+    trainer = SimpleNamespace(model=model, stop_requested=False,
+        _distributed_eval_status=lambda failed=False: (False, failed),
+        _raise_distributed_failure_from_any=fail, _fire_prediction_step=lambda: None)
+    trainer.args = SimpleNamespace(use_cce=True, streaming=False, max_seq_length=769,
+                                  seed=42, dataset_text_field="text", append_eos=False)
+    trainer.tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=None)
+    trainer.formatting_func = None
+    trainer.distributed_world = None
+    dataset = [{"input_ids": list(row.input_ids), **({"labels": list(row.labels)} if labeled else {})}
+               for row in rows]
+    prepared = MLXTrainer._create_text_eval_batches(trainer, dataset, 2, False, False)
+    assert isinstance(prepared, FiniteTextBatchPlan)
+    expected = MLXTrainer._evaluate_batch_totals(trainer, plan, baseline)
+    dense_shapes = list(projected)
+    projected.clear()
+    actual = MLXTrainer._evaluate_batch_totals(trainer, plan, candidate)
+    mx.eval(expected[:2], actual[:2])
+    assert projected[:2] == [256, 256] and all(n > 256 for n in dense_shapes[:2])
+    assert len(projected) == 3 and projected[2] == dense_shapes[2]
+    assert expected[2] is None and actual[2] is None
+    expected_tokens = sum(
+        sum(label != -100 for label in row.labels[row.offset:]) if labeled else
+        len(row.input_ids) - row.offset for row in rows
+    )
+    assert actual[1].item() == expected_tokens
+    for want, got in zip(expected[:2], actual[:2]):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-6).item()
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_preference_logit_sums_keep_float32_precision(quantized):
+    from unsloth_zoo.mlx import preference as p
+
+    mx.random.seed(739)
+    hidden = mx.random.normal((37, 64)).astype(mx.bfloat16)
+    weight = (mx.random.normal((8192, 64)) * 0.5).astype(mx.bfloat16)
+    head, quantization = (weight, None, None), {}
+    if quantized:
+        quantization = dict(group_size=64, bits=4, mode="affine")
+        head = mx.quantize(weight, group_size=64, bits=4)
+        weight = mx.dequantize(*head, group_size=64, bits=4)
+    expected = (hidden.astype(mx.float32) @ weight.astype(mx.float32).T).sum(axis=-1)
+    actual = p._head_logit_sums(hidden, *head, quantization, 0.0)
+    assert mx.allclose(expected, actual, atol=1e-3, rtol=0).item()
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("kind", ["dpo", "orpo"])
+def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, dtype, kind):
+    from types import SimpleNamespace
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    from unsloth_zoo.mlx import preference as p
+
+    mx.random.seed(738)
+    kernel_rows = _record_cce_rows(monkeypatch)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    policy = None
+    if reference:
+        adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
+        adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * .02
+        model.model.embed_tokens = adapter
+        policy = p.LoRAReferencePolicy([adapter])
+    model.set_dtype(getattr(mx, dtype))
+    model.eval()
+    rows = []
+    for i in range(7):
+        chosen = tuple((j * 7 + i) % 2053 for j in range(513 if i % 4 == 0 else 45 + i))
+        rejected = tuple((j * 11 + i) % 2053 for j in range(507 if i % 4 == 0 else 43 + i))
+        rows.append(p.TokenizedPreferenceRow(chosen[:-13-i], chosen[-13-i:],
+                    rejected[:-14+i], rejected[-14+i:]))
+    plan = p.FinitePreferenceBatchPlan(rows, [(0, 1, 2, 3), (4, 5, 6)],
+        normalizers=[(1234, 37, 9)] * 2, cycle_length=2, max_seq_length=513, pad_id=0)
+    objective = p.resolve_preference_objective(kind, beta=.2,
+        **({"reference_free": not reference} if kind == "dpo" else {}))
+    baseline = p.make_preference_eval_fn(objective, reference_policy=policy)
+    candidate = p.make_preference_eval_fn(objective, reference_policy=policy, model=model)
+    assert not baseline._unsloth_cce_compaction and candidate._unsloth_cce_compaction
+    if dtype == "bfloat16":
+        # bfloat16 logits lose the logit sums to rounding, so there the uncompacted kernel is the reference.
+        baseline = p.make_preference_eval_fn(objective, reference_policy=policy, model=model)
+        baseline._unsloth_cce_compaction = False
+    calls = []
+    def fail(failed, _context, error):
+        if failed:
+            raise error
+    trainer = SimpleNamespace(model=model, stop_requested=False,
+        _distributed_eval_status=lambda failed=False: (False, failed),
+        _raise_distributed_failure_from_any=fail, _fire_prediction_step=lambda: calls.append(1))
+    expected = MLXTrainer._evaluate_batch_totals(trainer, plan, baseline)
+    kernel_rows.clear()
+    actual = MLXTrainer._evaluate_batch_totals(trainer, plan, candidate)
+    mx.eval(expected, actual)
+    capacity = 256 if kind == "dpo" else 768
+    assert kernel_rows == [capacity] * (4 if kind == "dpo" and reference else 2)
+    assert len(calls) == 4 and actual[1].item() == 7
+    for want, got in zip(expected, actual):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-5).item()
+    if reference:
+        assert adapter.scale == 2.0
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
+    mx.random.seed(735)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    ids = mx.arange(1026).reshape(2, 513)
+    batch = {"input_ids": ids, "labels": mx.where((ids % 11) == 5, ids, -100)}
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    small_limit = getattr(loss, "_unsloth_cce_small_capacity_limit", 0)
+    assert bool(small_limit) == quantized
+    plan = mlx_utils.FiniteVLMBatchPlan([], [], None, processor=None, config={}, max_seq_length=1024, image_size=None)
+    plan.configure_cce_compaction(small_capacity_limit=small_limit)
+    compact = plan.prepare_cce_batch(0, batch)
+    assert compact["_unsloth_cce_indices"].shape == (256 if quantized else 512, 2) and "_unsloth_cce_indices" not in batch
+    def forward(m, b, **kwargs):
+        target = b["labels"][:, 1:-4]
+        return m.model.embed_tokens(b["input_ids"])[:, :-5], target, (target != -100).sum()
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", forward)
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    grad = nn.value_and_grad(model, loss)
+    run = mx.compile(lambda b: grad(model, b), inputs=model.state, outputs=model.state)
+    expected, actual = grad(model, batch), run(compact)
+    mx.eval(expected, actual)
+    assert actual[0][1].item() == expected[0][1].item()
+    assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=2e-5)
+    for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+
+
+@metal_only
+def test_vlm_cce_small_capacity_admission_and_rebuilds():
+    import numpy as np
+    from unsloth_zoo.mlx.shape_guard import TextShapeGuardReport, TextShapePlan
+
+    plan = mlx_utils.FiniteVLMBatchPlan([], [], None, processor=None, config={}, max_seq_length=2048, image_size=None)
+    catalog = frozenset({("full_step", "update", ("vlm",), 1025)})
+    report = TextShapeGuardReport("exact", "test", 3, "full_step", 1, 1, 1)
+    plan._shape_plan = TextShapePlan(report, catalog, catalog)
+    ids = mx.arange(2050).reshape(2, 1025)
+    sparse = {"labels": mx.where(ids % 17 == 5, ids, -100)}
+    for cap, count, expected in ((2, 2, 1024), (3, 3, 256), (3, 3, 256)):
+        result = plan.configure_cce_compaction(max_variants=cap, small_capacity_limit=1024)
+        assert result.planned_signatures == count
+        prepared = plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"]
+        assert prepared.shape == (expected, 2)
+        selected = np.argwhere(np.asarray(sparse["labels"])[:, 1:] != -100)
+        assert mx.array_equal(prepared[:selected.shape[0]], mx.array(selected)).item()
+        assert mx.all(prepared[selected.shape[0]:] == -1).item()
+    medium = {"labels": mx.where(ids % 5 == 0, ids, -100)}
+    assert plan.prepare_cce_batch(0, medium)["_unsloth_cce_indices"].shape == (1024, 2)
+    assert plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"].shape == (256, 2)
+    dense = {"labels": ids}
+    assert plan.prepare_cce_batch(0, dense) is dense
+    assert plan.prepare_cce_batch(0, sparse) is sparse
+    plan.configure_cce_compaction(max_variants=3, small_capacity_limit=512)
+    assert plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"].shape == (1024, 2)
+    result = plan.configure_cce_compaction(max_variants=3)
+    assert result.planned_signatures == 2
+    assert plan.prepare_cce_batch(0, sparse)["_unsloth_cce_indices"].shape == (1024, 2)
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    # The 256-row capacity is admitted only when it shares vocabulary chunks with
+    # the half capacity, and that limit is derived from _get_memory_budget(), which
+    # is 0.1% of the device's recommended working set. On a 128 GB machine the limit
+    # is 16384 and the assertion below holds; on an 8 GB M1, the hosted Apple Silicon
+    # runner, the budget is 6 MB, the limit is 768, the 1024-row capacity no longer
+    # fits under it and the assertion reads [1024, 1024] == [256, 256]. Pin the budget
+    # so this tests the admission rule rather than how much memory the runner has.
+    monkeypatch.setattr(runtime_cce, "_CHUNK_BUDGET", 128 * 1024 * 1024)
+
+    mx.random.seed(412)
+    model = _cce_text_model(2053, 64, quantized=quantized)
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    ids = mx.arange(2050).reshape(2, 1025)
+    batch = {"input_ids": ids, "labels": mx.where(ids % 17 == 5, ids, -100)}
+
+    def forward(m, b, **kwargs):
+        target = b["labels"][:, 1:]
+        return (m.model.embed_tokens(b["input_ids"])[:, :-1], target,
+                (target != -100).sum())
+
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", forward)
+    projected = []
+    original = mlx_utils._get_runtime_cce
+
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+
+        def record(hidden, *args):
+            projected.append(hidden.shape[0])
+            return runtime(hidden, *args)
+
+        return record
+
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    loss_fn = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_compaction
+    steps = []
+    trainer = SimpleNamespace(
+        model=model, stop_requested=False,
+        _distributed_eval_status=lambda failed=False: (False, failed),
+        _raise_distributed_failure_from_any=lambda failed, _context, error: None,
+        _fire_prediction_step=lambda: steps.append(1),
+    )
+
+    def dense_fn(model, batch):
+        return loss_fn(model, batch)
+
+    def totals(fn):
+        projected.clear()
+        # Trainer VLM evaluation batches are an eager list, not a plan.
+        result = MLXTrainer._evaluate_batch_totals(trainer, [batch, batch], fn, is_vlm=True)
+        mx.eval(result[:2])
+        return result, list(projected)
+
+    expected, dense_rows = totals(dense_fn)
+    actual, compact_rows = totals(loss_fn)
+    # The plan admits half the tokens, or 256 once a quantized head raises the
+    # small-capacity limit; either way evaluation must stop projecting all of them.
+    assert dense_rows == [2048] * 2
+    assert compact_rows == [256 if quantized else 1024] * 2
+    assert len(steps) == 4 and actual[1].item() == expected[1].item()
+    assert actual[0].item() == pytest.approx(expected[0].item(), rel=2e-5)
 
 
 @metal_only
@@ -1605,3 +2081,93 @@ def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
     _, grads = nn.value_and_grad(model, lambda m: m(mx.array([[1, 2]])).sum())(model)
     assert _adapters(model) == ["lm_head"]
     assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
+
+
+@metal_only
+def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
+    """Borrowed K/V's cotangent is consumed by the source layer's backward; left
+    to run by that consumer, each borrowing layer keeps its T x T attention
+    cotangents alive until then."""
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+
+    seq_len = 512
+    ids = mx.random.randint(0, 64, (1, seq_len))
+
+    def build(num_kv_shared_layers):
+        mx.random.seed(0)
+        model = Gemma4TextModel(TextConfig(
+            hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+            num_attention_heads=8, head_dim=16, global_head_dim=32,
+            vocab_size=64, vocab_size_per_layer_input=64,
+            hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+            num_kv_shared_layers=num_kv_shared_layers))
+        mx.eval(model.parameters())
+        return model
+
+    def peak_and_grads(model):
+        loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
+        mx.eval(loss_and_grad(model))
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        grads = loss_and_grad(model)[1]
+        mx.eval(grads)
+        return mx.get_peak_memory() - resident, grads
+
+    shared, unshared = build(10), build(0)
+    _, reference = peak_and_grads(shared)
+    mlx_utils._patch_layer_class_for_gc(DecoderLayer)
+    try:
+        unshared_peak, _ = peak_and_grads(unshared)
+        shared_peak, grads = peak_and_grads(shared)
+    finally:
+        mlx_utils._unpatch_layer_class_gc(DecoderLayer)
+    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
+    for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
+        assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_checkpointing_keeps_cacheless_kv_shared_gradients():
+    from types import SimpleNamespace
+    from mlx_vlm.models.gemma3n.config import TextConfig
+    from mlx_vlm.models.gemma3n.language import Gemma3Model, Gemma3nDecoderLayer
+    from unsloth_zoo.mlx.loader import _fix_gemma4_kv_sharing
+
+    mx.random.seed(0)
+    backbone = Gemma3Model(TextConfig(
+        model_type="gemma3n_text", hidden_size=64, num_hidden_layers=6,
+        intermediate_size=[128] * 6, activation_sparsity_pattern=[0.0] * 6,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, laurel_rank=4, sliding_window=16,
+        num_kv_shared_layers=2,
+        layer_types=["sliding_attention", "full_attention"] * 3))
+    mx.eval(backbone.parameters())
+    ids = mx.random.randint(0, 64, (1, 32))
+    loss_and_grad = nn.value_and_grad(backbone, lambda m: (m(ids) ** 2).sum())
+
+    original_call = Gemma3Model.__call__
+    _fix_gemma4_kv_sharing(SimpleNamespace(language_model=SimpleNamespace(model=backbone)))
+    # Seven early returns in the shim leave the class unpatched, and an unpatched
+    # class takes the plain checkpoint branch, which is the state this test exists
+    # to reject. Without this the test would pass having proved nothing.
+    assert "_kv_sharing_patched" in Gemma3Model.__dict__, "the shim did not install"
+    try:
+        reference = loss_and_grad(backbone)[1]
+        mlx_utils._patch_layer_class_for_gc(Gemma3nDecoderLayer)
+        try:
+            grads = loss_and_grad(backbone)[1]
+        finally:
+            mlx_utils._unpatch_layer_class_gc(Gemma3nDecoderLayer)
+    finally:
+        Gemma3Model.__call__ = original_call
+        # Delete only a flag this test set. `del` on an absent attribute raises
+        # from the finally and buries the real failure behind an AttributeError,
+        # and `hasattr` would consume a flag inherited from an earlier patch,
+        # disarming the shim's own idempotence guard for whatever runs next.
+        if "_kv_sharing_patched" in Gemma3Model.__dict__:
+            del Gemma3Model._kv_sharing_patched
+    for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
+        assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
