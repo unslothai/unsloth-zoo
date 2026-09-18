@@ -783,3 +783,90 @@ def test_a_stale_index_that_is_not_an_object_does_not_abort_the_merge(
         adapted      = adapted,
         base_dir     = real_base,
     )
+
+
+def test_an_inert_index_beside_usable_shards_does_not_block_the_export(
+    monkeypatch, tmp_path,
+):
+    """An index the export never carries must not be able to veto it.
+
+    When `os.listdir` already found the shards, the index values are never used for
+    the shard list, and a single non-HF-named shard means the index is not copied
+    either. Refusing on its contents would fail an export that has always worked over
+    a file nothing downstream reads.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    base_dir = os.path.join(str(tmp_path), "base")
+    model = H.build_and_save_base(spec, base_dir)
+    shards = [f for f in os.listdir(base_dir) if f.endswith(".safetensors")]
+    if len(shards) != 1 or shards[0] != "model.safetensors":
+        pytest.skip("the tiny base model is not the single-flat-shard layout under test")
+    base_tensors = H.read_safetensors_dir(base_dir)
+    peft_model = H.attach_lora(model, spec, "full")
+    adapted = H.extract_adapted(peft_model)
+
+    # Stale, and as bad as it gets: a traversal and a value that is not even a string.
+    with open(
+        os.path.join(base_dir, "model.safetensors.index.json"), "w", encoding = "utf-8",
+    ) as f:
+        json.dump({"weight_map": {"a": "../../x.safetensors", "b": None}}, f)
+
+    monkeypatch.chdir(tmp_path)
+    save_directory = os.path.join(str(tmp_path), "merged")
+    H.run_merge(peft_model, base_dir, save_directory, save_dtype = torch.float32)
+
+    # It merged, and the hostile index did not travel with it.
+    assert not os.path.exists(
+        os.path.join(save_directory, "model.safetensors.index.json")
+    ), "the inert index was exported after all, so refusing it would have been right"
+    H.assert_merge_correct(
+        family = FAMILY, base_tensors = base_tensors, out_dir = save_directory,
+        save_dtype = torch.float32, adapted = adapted, base_dir = base_dir,
+    )
+
+
+def test_the_exported_index_keeps_the_mode_and_time_copy2_gave_it(
+    monkeypatch, tmp_path,
+):
+    """The validated-byte write replaced `copy2`, which is copy plus copystat.
+
+    Only the copy half was replaced, so without the copystat the exported index takes
+    the process creation mode rather than the source's: a `0600` index lands world
+    readable, a widening in the one file this change exists to keep honest.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    base_dir = os.path.join(str(tmp_path), "base")
+    # Small shards, so the export is multi-shard and the index is really carried.
+    model = H.build_and_save_base(spec, base_dir, max_shard_size = "32KB")
+    if len([f for f in os.listdir(base_dir) if f.endswith(".safetensors")]) < 2:
+        pytest.skip("the tiny base model did not shard into more than one file")
+    peft_model = H.attach_lora(model, spec, "full")
+
+    source_index = os.path.join(base_dir, "model.safetensors.index.json")
+    assert os.path.exists(source_index), "the sharded base wrote no index"
+    os.chmod(source_index, 0o600)
+    backdated = os.stat(source_index).st_mtime - 100000
+    os.utime(source_index, (backdated, backdated))
+
+    monkeypatch.chdir(tmp_path)
+    save_directory = os.path.join(str(tmp_path), "merged")
+    H.run_merge(peft_model, base_dir, save_directory, save_dtype = torch.float32)
+
+    exported = os.path.join(save_directory, "model.safetensors.index.json")
+    assert os.path.exists(exported), "the index was not exported"
+    source_stat, exported_stat = os.stat(source_index), os.stat(exported)
+    assert oct(exported_stat.st_mode & 0o777) == oct(source_stat.st_mode & 0o777), (
+        f"the exported index widened from {oct(source_stat.st_mode & 0o777)} to "
+        f"{oct(exported_stat.st_mode & 0o777)}"
+    )
+    assert int(exported_stat.st_mtime) == int(source_stat.st_mtime), (
+        "the exported index did not keep the source mtime that copy2 preserved"
+    )

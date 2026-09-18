@@ -3579,10 +3579,17 @@ def merge_and_overwrite_lora(
     # that branch is skipped entirely on a dequant or splitting export, and an in-place
     # merge (save_directory == model_name) then leaves the unsafe index in the output
     # directory, with regenerate_index false whenever one non-HF-named shard remains.
+    # Scoped to the indexes that can actually reach the output. An index the export
+    # never carries, and whose values the shard list never used because `os.listdir`
+    # already found the shards, is inert: refusing it would fail an export that has
+    # always worked, over a file nobody downstream will read. The two arms that are
+    # not inert: the index is going to be written into the output, or the output IS
+    # the model directory, so it is already sitting there.
     _validated_index_bytes = None
     if is_local_path:
         _local_index_path = os.path.join(model_name, "model.safetensors.index.json")
-        if os.path.exists(_local_index_path):
+        _exports_in_place = os.path.realpath(save_directory) == os.path.realpath(model_name)
+        if (safe_tensor_index_files or _exports_in_place) and os.path.exists(_local_index_path):
             _validated_index_bytes = _reject_unsafe_shard_index(_local_index_path)
     # ONLY download/copy the original index if we are NOT dequantizing a quantized model
     if not _is_quant_dequant and not needs_splitting:
@@ -3606,6 +3613,12 @@ def merge_and_overwrite_lora(
                             # traverses, and the export would carry the swapped copy.
                             with open(_index_destination, "wb") as _index_file:
                                 _index_file.write(_validated_index_bytes)
+                            # `copy2` is copy plus copystat, and only the copy half is
+                            # replaced here. Without this the exported index takes the
+                            # creation mode instead of the source's, so a `0600` index
+                            # lands as `0644`: a widening, in the one file this change
+                            # exists to keep honest.
+                            shutil.copystat(local_index_path, _index_destination)
                     except shutil.SameFileError:
                         pass
                     except Exception as e:
