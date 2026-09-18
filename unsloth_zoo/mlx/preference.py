@@ -10,7 +10,10 @@ import mlx.nn as nn
 import mlx.utils
 import numpy as np
 
-from .cce.runtime_cce import _apply_softcap, _chunk_matmul, _resolve_chunk_size
+# Absolute, like the other cce imports in this package: transformers' remote-code walk
+# turns `from .cce.runtime_cce import x` into unsloth_zoo/mlx/cce.runtime_cce.py and dies
+# on the missing file. See tests/test_relative_imports_resolve.py.
+from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap, _chunk_matmul, _resolve_chunk_size
 from .utils import (
     _FiniteVisitMixin,
     _encode_mlx_prompt_completion,

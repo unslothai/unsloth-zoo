@@ -4307,7 +4307,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     if use_quantized:
-        from .cce import runtime_cce
+        # Absolute: a dotted relative import is unresolvable to transformers' remote-code
+        # walk. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.mlx.cce import runtime_cce
         budget = runtime_cce._CHUNK_BUDGET or runtime_cce._get_memory_budget()
         base_chunk = max(2048, (lm_layer.weight.shape[0] + 15) // 16)
         # Keep half-capacity and 256-row projections on the same vocabulary chunks.
