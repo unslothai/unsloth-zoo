@@ -1304,3 +1304,53 @@ def test_equal_but_distinct_code_objects_are_both_scanned():
     )
     experts = type("T", (nn.Module,), {"forward": namespace["fwd"]})()
     assert MU._forward_statically_reads_stash(experts) is True
+
+
+@pytest.mark.parametrize("experts_cls", [_StashIgnoringExperts, _StashReadingExperts])
+@pytest.mark.parametrize("fullgraph", [True, False])
+def test_a_real_cold_compile_reaches_the_static_probe_without_a_guard_on_a_bound_method(
+    restore_param_wrapper, experts_cls, fullgraph
+):
+    """REGRESSION: the cold compiled start, compiled for real rather than simulated.
+
+    The other cold-start tests reach the probe by monkeypatching
+    `torch.compiler.is_compiling` to True while running eagerly, so `torch.compile` never
+    traces `_forward_statically_reads_stash` and nothing here was ever exercised under
+    Dynamo. It has to be, because the probe reads `experts_module.forward` off a module
+    Dynamo is tracing, and Unsloth installs its forwards on the CLASS, so that attribute
+    is a bound method CPython allocates fresh on every access. Taking `id()` of it made
+    Dynamo guard `___check_obj_id(module.forward, <address>)`, which cannot hold by the
+    time it is checked: Dynamo saw a guard fail on the frame that created it and raised
+    `AssertionError: Guard failed on the same frame it was created`, under both fullgraph
+    settings, on precisely the first-compiled-call path this patch exists to serve.
+
+    Both families are covered because the probe runs before the answer is known, so a
+    guard installed here breaks the supported families too, not only the rerouted ones.
+    """
+    assert MU.patch_param_wrapper_for_moe()
+    x = _inputs()
+
+    # The reference gets its own model, so the subject's FIRST call is the compiled one
+    # and no eagerly measured verdict can stand in for the probe.
+    with torch.no_grad():
+        expected = _build(experts_cls)(x)
+
+    model = _build(experts_cls)
+    experts = model.base_model.model.experts.get_base_layer()
+    assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None, (
+        "this test is only meaningful while no verdict has been recorded"
+    )
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(model, backend = "eager", fullgraph = fullgraph, dynamic = False)
+        with torch.no_grad():
+            out = compiled(x)
+            again = compiled(_inputs())
+    finally:
+        torch._dynamo.reset()
+
+    assert torch.allclose(out, expected, atol = 1e-5), (
+        "a real cold compiled start does not agree with the eager fold"
+    )
+    assert again.shape == out.shape
