@@ -874,6 +874,35 @@ def test_each_dpo_variant_matches_the_trl_formula(name):
     assert scored.tolist() == pytest.approx(_TRL_PAIR_LOSSES[name], rel=1e-5)
 
 
+@pytest.mark.parametrize("tau", [0.05, 0.5, 1.0])
+def test_discopop_extreme_margins_have_finite_loss_and_gradients(tau):
+    import mlx.core as mx
+    import torch
+    from unsloth_zoo.mlx import preference
+
+    objective = preference.resolve_preference_objective(
+        "dpo", beta=0.1, loss_type="discopop", discopop_tau=tau,
+    )
+    values = [-1000.0, -100.0, 0.0, 100.0, 1000.0]
+
+    def loss(delta):
+        return preference._dpo_discopop(objective, types.SimpleNamespace(delta=delta)).sum()
+
+    delta = mx.array(values, dtype=mx.float32)
+    actual = loss(delta)
+    gradient = mx.grad(loss)(delta)
+    # Float64 represents both factors of the original formula at these margins.
+    reference = torch.tensor(values, dtype=torch.float64, requires_grad=True)
+    scaled = 0.1 * reference
+    modulation = torch.sigmoid(scaled / tau)
+    expected = (torch.nn.functional.softplus(-scaled) * (1 - modulation)
+                + torch.exp(-scaled) * modulation).sum()
+    expected.backward()
+
+    assert float(actual.item()) == pytest.approx(expected.item(), rel=1e-5)
+    assert gradient.tolist() == pytest.approx(reference.grad.tolist(), rel=1e-5, abs=1e-6)
+
+
 def test_an_objective_is_valid_however_it_was_built():
     import dataclasses
     from unsloth_zoo.mlx.preference import (

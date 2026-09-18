@@ -1185,7 +1185,7 @@ def _dpo_discopop(objective, terms):
     modulation = mx.sigmoid(scaled / objective.discopop_tau)
     return (
         -_log_sigmoid(scaled) * (1.0 - modulation)
-        + mx.exp(-scaled) * modulation
+        + mx.exp(_log_sigmoid(scaled / objective.discopop_tau) - scaled)
     )
 
 
