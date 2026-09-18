@@ -1819,3 +1819,48 @@ def test_the_resolver_hands_back_a_writable_directory_from_a_read_only_cache(
         ), "the writable copy lost the co-versioned gguf-py"
     finally:
         os.chmod(stage, 0o755)
+
+
+# --- an explicit pin that cannot be staged ---
+
+def test_a_pinned_revision_that_cannot_stage_fails_instead_of_downloading_master(
+    mod, tmp_path, monkeypatch, staging_env,
+):
+    """The pin suppresses both installed-converter rows, so falling through meant
+    downloading the master entrypoint and pairing it with the install's older
+    gguf-py: the skew this change removes, at a revision the user did not ask for.
+    A misspelled tag or a codeload outage has to say so."""
+    bundle = _write_source_tree(tmp_path / "install")
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b-does-not-exist")
+    staging_env["fail"] = RuntimeError("404 while fetching the source tarball")
+    def _trap(*a, **k):
+        raise AssertionError("a failed pin must not fall through to the master download")
+    monkeypatch.setattr(mod, "_download_convert_hf_to_gguf_file", _trap, raising = False)
+    monkeypatch.setattr(mod.requests, "get", _trap)
+    mod._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        with pytest.raises(mod._ConverterSourcesIncomplete, match = "b-does-not-exist"):
+            mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+    finally:
+        mod._download_convert_hf_to_gguf_cached.cache_clear()
+
+
+def test_an_unpinned_export_still_falls_back_when_staging_fails(mod, tmp_path, monkeypatch, staging_env):
+    """The negative half: failing closed is what an EXPLICIT pin buys. Without one,
+    a staging failure must still fall back rather than start failing exports that
+    work today."""
+    bundle = tmp_path / "old_install"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    _write_sibling_gguf_py(bundle)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
+    staging_env["fail"] = RuntimeError("codeload is down")
+    mod._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        patched_path, text_archs, _ = mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+    finally:
+        mod._download_convert_hf_to_gguf_cached.cache_clear()
+    assert "LlamaForCausalLM" in text_archs
+    assert Path(patched_path).parent == bundle

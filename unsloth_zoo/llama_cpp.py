@@ -2753,6 +2753,23 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
         # and refusing it here would fail an export that currently works whenever
         # there is no network to stage from.
         local_script_info = _resolve_monolith_bundle_convert_script(require_gguf_py = False)
+    if local_script_info is None and _revision_pinned:
+        # Fail closed. The pin suppresses both installed-converter rows above, so
+        # falling through here downloads the master entrypoint and pairs it with the
+        # install's older gguf-py, which is both the skew this change removes and a
+        # revision the user did not ask for. A misspelled tag, a codeload outage or
+        # an unwritable cache has to say so rather than quietly convert with
+        # something else.
+        raise _ConverterSourcesIncomplete(
+            f"Unsloth: UNSLOTH_LLAMA_CPP_CONVERTER_TAG is set to "
+            f"'{os.environ.get('UNSLOTH_LLAMA_CPP_CONVERTER_TAG', '').strip()}' but its "
+            f"converter sources could not be staged. Check the tag exists at "
+            f"https://github.com/ggml-org/llama.cpp/releases, that this process is not "
+            f"offline, and that the converter cache is writable. Unset the variable to "
+            f"use the revision matching the installed llama.cpp, or point "
+            f"UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a checkout holding convert_hf_to_gguf.py, "
+            f"conversion/ and gguf-py/ together."
+        )
     # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
     # or replaced after the first conversion still gets the Qwen3.5 aliases.
     _patch_tensor_mapping_for_qwen35(_get_llama_cpp_dir(local_script_info))
