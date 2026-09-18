@@ -545,6 +545,7 @@ def _mlx_declared_iterable_length(dataset):
 
 from .utils import (
     _config_get,
+    _validate_output_token_mask,
     _model_carries_audio_modules,
     _vlm_batch_carries_audio,
     audio_merge_patch_needed,
@@ -4565,6 +4566,7 @@ class MLXTrainer:
         args = self.args
         model = self.model
         self._text_shape_guard_preflight = None
+        _validate_output_token_mask(model)
         if (
             hasattr(self, "_batches")
             and not getattr(self, "_is_vlm", False)

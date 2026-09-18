@@ -940,6 +940,27 @@ def _get_text_backbone(model):
     return getattr(tm, "model", None)
 
 
+def _validate_output_token_mask(model):
+    tm = _get_text_model(model)
+    ids = getattr(tm, "_dummy_tokenizer_ids", None)
+    if ids is None or getattr(ids, "size", 0) == 0:
+        return
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(type(tm).__call__)))
+    except (OSError, TypeError, SyntaxError):
+        return
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store)
+                and _self_attr_chain(node.slice) == "_dummy_tokenizer_ids"):
+            # This scatter's VJP can fault on Metal even when forward succeeds.
+            raise ValueError(
+                "Unsloth: unsafe output token mask: vocabulary token IDs index "
+                "the batch axis of [batch, sequence, vocabulary] logits. "
+                "Training is disabled to prevent a Metal address fault; the "
+                "backend must mask the final (vocabulary) axis instead."
+            )
+
+
 def _has_hidden_stack(obj):
     """Whether an object exposes embed_tokens/layers/norm for manual hidden-state forward."""
     if obj is None:
@@ -1412,6 +1433,13 @@ def _has_direct_hidden_stack(model):
 def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     """Run a text stack up to pre-lm_head hidden states for CCE."""
     tm = _get_text_model(model)
+    if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
+            and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
+            and callable(getattr(model, "get_input_embeddings", None))):
+        inputs_embeds, embed_kwargs = _unpack_embed_result(
+            model.get_input_embeddings(inputs, None), model, input_ids=inputs,
+        )
+        kwargs = {**embed_kwargs, **kwargs}
     backbone = getattr(tm, "model", None)
     if backbone is not None:
         if (
@@ -2996,14 +3024,13 @@ def _get_backbone_embed_kwarg(backbone):
     try:
         params = inspect.signature(backbone.__call__).parameters
     except (TypeError, ValueError):
-        return "inputs_embeds"
-    if "inputs_embeds" in params:
-        return "inputs_embeds"
-    if "input_embeddings" in params:
-        return "input_embeddings"
-    if "input_embeds" in params:
-        return "input_embeds"
-    return "inputs_embeds"
+        return None
+    for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
+        if name in params and params[name].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return name
+    return None
 
 
 def _filter_backbone_kwargs(backbone, kwargs):
@@ -3011,6 +3038,9 @@ def _filter_backbone_kwargs(backbone, kwargs):
         params = inspect.signature(backbone.__call__).parameters
     except (TypeError, ValueError):
         return kwargs
+    if "image_mask" in params and "image_mask" not in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["image_mask"] = kwargs.pop("visual_pos_masks", None)
     cache = params.get("cache")
     if (
         cache is not None and cache.default is inspect.Parameter.empty
@@ -4179,6 +4209,11 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             "falling back to baseline CE loss.",
             stacklevel=2,
         )
+        return _marked_vlm_baseline()
+
+    backbone = getattr(tm, "model", None)
+    if backbone is not None and _get_backbone_embed_kwarg(backbone) is None:
+        print("Unsloth: CCE backbone has no explicit embedding argument; using standard cross-entropy.")
         return _marked_vlm_baseline()
 
     head_desc = describe_output_head(model)

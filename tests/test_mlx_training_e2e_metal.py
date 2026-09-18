@@ -1407,6 +1407,9 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
 def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     mx.random.seed(735)
     model = _cce_text_model(2053, 64, quantized=quantized)
+    def embed_forward(self, ids, inputs_embeds=None):
+        return self.embed_tokens(ids) if inputs_embeds is None else inputs_embeds
+    monkeypatch.setattr(type(model.model), "__call__", embed_forward)
     model.get_input_embeddings = lambda *args, **kwargs: None
     ids = mx.arange(1026).reshape(2, 513)
     batch = {"input_ids": ids, "labels": mx.where((ids % 11) == 5, ids, -100)}
@@ -1482,6 +1485,9 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
     mx.random.seed(412)
     model = _cce_text_model(2053, 64, quantized=quantized)
+    def embed_forward(self, ids, inputs_embeds=None):
+        return self.embed_tokens(ids) if inputs_embeds is None else inputs_embeds
+    monkeypatch.setattr(type(model.model), "__call__", embed_forward)
     model.get_input_embeddings = lambda *args, **kwargs: None
     ids = mx.arange(2050).reshape(2, 1025)
     batch = {"input_ids": ids, "labels": mx.where(ids % 17 == 5, ids, -100)}
@@ -2195,3 +2201,95 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_cce_hidden_forward_preserves_wrapper_embeddings_and_image_mask():
+    from types import SimpleNamespace
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(32, 64)
+
+        def __call__(self, ids, inputs_embeds=None, per_layer_inputs=None, image_mask=None):
+            h = self.embed_tokens(ids) * 8 if inputs_embeds is None else inputs_embeds
+            if per_layer_inputs is not None:
+                h = h + per_layer_inputs
+            if image_mask is not None:
+                h = h * mx.where(image_mask[..., None], 2, 1)
+            return h
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.model = Backbone()
+            self._unsloth_text_only_vlm = True
+
+        def get_input_embeddings(self, ids, pixels):
+            h = self.language_model.model.embed_tokens(ids)
+            return SimpleNamespace(inputs_embeds=h, per_layer_inputs=h * 0.3)
+
+    model = Wrapper()
+    for rows in ([[2, 3, 4], [5, 6, 7]], [[7, 6, 5], [4, 3, 2]]):
+        ids = mx.array(rows)
+        features = model.get_input_embeddings(ids, None)
+        mask = ids % 2 == 0
+        expected = model.language_model.model(ids, inputs_embeds=features.inputs_embeds,
+            per_layer_inputs=features.per_layer_inputs, image_mask=mask)
+        actual = mlx_utils._forward_text_hidden_states(model, ids, visual_pos_masks=mask)
+        assert mx.array_equal(actual, expected).item()
+        inverse = mlx_utils._forward_text_hidden_states(model, ids, visual_pos_masks=~mask)
+        assert not mx.array_equal(inverse, expected).item()
+
+
+@metal_only
+def test_cce_embedding_signature_falls_back_before_loss(capsys):
+    model = _cce_text_model(32, 64, quantized=False)
+    model.get_input_embeddings = lambda ids, pixels, **kw: model.model.embed_tokens(ids)
+    assert mlx_utils._get_backbone_embed_kwarg(model.model) is None
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert loss._unsloth_cce_backend == "baseline-fallback"
+    assert "no explicit embedding argument" in capsys.readouterr().out
+
+    class Alias:
+        def __call__(self, ids, input_embeddings=None):
+            pass
+    class Unknown:
+        def __call__(self, ids, **kwargs):
+            pass
+    class Positional:
+        def __call__(self, ids, inputs_embeds=None, /):
+            pass
+    assert mlx_utils._get_backbone_embed_kwarg(Alias()) == "input_embeddings"
+    assert mlx_utils._get_backbone_embed_kwarg(Unknown()) is None
+    assert mlx_utils._get_backbone_embed_kwarg(Positional()) is None
+
+
+@metal_only
+def test_training_refuses_batch_axis_vocabulary_mask():
+    class Unsafe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._dummy_tokenizer_ids = mx.array([3, 7])
+
+        def __call__(self, logits):
+            logits[self._dummy_tokenizer_ids] = -float("inf")
+            return logits
+
+    class Corrected(Unsafe):
+        def __call__(self, logits):
+            logits[..., self._dummy_tokenizer_ids] = -float("inf")
+            return logits
+
+    with pytest.raises(ValueError, match="unsafe output token mask.*batch axis"):
+        mlx_utils._validate_output_token_mask(Unsafe())
+    mlx_utils._validate_output_token_mask(Corrected())
+    empty = Unsafe()
+    empty._dummy_tokenizer_ids = mx.array([], mx.int32)
+    mlx_utils._validate_output_token_mask(empty)
+    logits = Corrected()(mx.zeros((2, 3, 8)))
+    assert mx.isneginf(logits[..., 3]).all().item()
+    assert mx.isneginf(logits[..., 7]).all().item()
+    assert (logits[..., 2] == 0).all().item()
