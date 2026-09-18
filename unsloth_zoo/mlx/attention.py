@@ -116,3 +116,67 @@ def install_quantized_attention():
         setattr(module, _PATCH_FLAG, True)
         patched.append(module_path)
     return tuple(patched)
+
+
+def _indexed_attention_training_over(original):
+    @functools.wraps(original)
+    def attention(*args, **kwargs):
+        from .utils import mlx_training_patches_active
+        if mlx_training_patches_active():
+            return None
+        return original(*args, **kwargs)
+    return attention
+
+
+def _qsa_attention_training_over(original):
+    backend = original.__globals__
+
+    @functools.wraps(original)
+    def attention(queries, keys, values, block_indices, query_ends, *, cache,
+                  scale, block_size, causal, mask, mask_factory,
+                  allow_sparse_decode=False):
+        from .utils import mlx_training_patches_active
+        if mlx_training_patches_active():
+            plan = backend["select_qsa_execution_plan"](
+                queries, keys, values, block_indices, query_ends,
+                block_size=block_size, causal=causal,
+                allow_sparse_decode=allow_sparse_decode)
+            if plan is backend["QSAExecutionPlan"].INDEXED_SPARSE_PREFILL:
+                # The fused path ignores `mask`; its selection owns the sparse mask.
+                sparse_mask = mask_factory()
+                output = backend["scaled_dot_product_attention"](
+                    queries, keys, values, cache=cache, scale=scale, mask=sparse_mask)
+                return mx.where(mx.any(sparse_mask, axis=-1, keepdims=True), output, 0)
+        return original(
+            queries, keys, values, block_indices, query_ends, cache=cache,
+            scale=scale, block_size=block_size, causal=causal, mask=mask,
+            mask_factory=mask_factory, allow_sparse_decode=allow_sparse_decode)
+    return attention
+
+
+def install_sparse_attention_training():
+    """Route loaded custom attention kernels through differentiable training paths."""
+    import sys
+
+    targets = (
+        ("mlx_vlm.models.sparse_attention", "indexed_sparse_attention",
+         _indexed_attention_training_over),
+        ("mlx_vlm.models.qwen4_exp.qsa_kernel", "dispatch_qsa_attention",
+         _qsa_attention_training_over),
+    )
+    for module_path, name, wrap in targets:
+        module = sys.modules.get(module_path)
+        original = getattr(module, name, None)
+        if original is None:
+            continue
+        if getattr(original, "_unsloth_sparse_attention_original", None) is not None:
+            wrapped = original
+            original = wrapped._unsloth_sparse_attention_original
+        else:
+            wrapped = wrap(original)
+            wrapped._unsloth_sparse_attention_original = original
+        for path, consumer in list(sys.modules.items()):
+            if path.startswith("mlx_vlm.") and consumer is not None:
+                for alias, value in list(vars(consumer).items()):
+                    if value is original:
+                        setattr(consumer, alias, wrapped)

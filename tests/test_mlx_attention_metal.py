@@ -362,3 +362,145 @@ def test_every_model_load_path_installs_the_patch():
     assert (isinstance(install, ast.Call) and isinstance(install.func, ast.Name)
             and install.func.id == "install_quantized_attention"), \
         "_finish_load does not install the patch before returning"
+
+
+def _sparse_training_case(kind, seed=13):
+    from types import SimpleNamespace
+
+    glm = pytest.importorskip("mlx_vlm.models.glm5_next.language")
+    qwen = pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+    qsa = pytest.importorskip("mlx_vlm.models.qwen4_exp.qsa_kernel")
+    mx.random.seed(seed)
+    q = mx.random.normal((2, 4, 81, 64)).astype(mx.bfloat16)
+    k, v = [mx.random.normal((2, 2, 96, 64)).astype(mx.bfloat16) for _ in range(2)]
+    if kind == "indexed":
+        module = pytest.importorskip("mlx_vlm.models.sparse_attention")
+        idx = mx.random.randint(0, 96, (2, 81, 8))
+        idx = mx.where(mx.arange(8) == 7, -1, idx)
+        idx = mx.where(mx.arange(81)[None, :, None] == 4, -1, idx)
+        call = lambda q, k, v: glm._sparse_prefill_attention(q, k, v, idx, 64 ** -.5)
+        kernel_name = "_indexed_sparse_attention_kernel"
+    else:
+        module, kernel_name = qsa, "_qsa_sparse_attention_kernel"
+        ends = mx.broadcast_to(mx.arange(10, 91), (2, 81))
+        blocks = mx.broadcast_to(mx.array([0, 1]), (2, 81, 2))
+        blocks = mx.where((mx.arange(2)[:, None, None] == 1) & (ends[..., None] >= 12),
+                          blocks + 1, blocks)
+        blocks = mx.where(mx.arange(81)[None, :, None] == 4, -1, blocks)
+        ends = mx.where(mx.arange(81)[None, :] == 4, 0, ends)
+        selection = SimpleNamespace(
+            selected_blocks=blocks, query_ends=ends, complete_counts=ends // 4,
+            left_padding=mx.zeros((2,), mx.int32), key_len=96)
+        indexer = SimpleNamespace(compress_ratio=4, block_topk=2)
+        factory = lambda: qwen.Qwen4ExpQSAIndexer.build_mask(indexer, selection)
+        call = lambda q, k, v: qsa.dispatch_qsa_attention(
+            q, k, v, blocks, ends, cache=None, scale=64 ** -.5,
+            block_size=4, causal=True, mask="causal", mask_factory=factory)
+    return (q, k, v), call, module, kernel_name
+
+
+@pytest.mark.parametrize("kind", ["indexed", "qsa"])
+@pytest.mark.parametrize("seed", [13, 41])
+def test_sparse_training_matches_fused_forward_and_preserves_inference(kind, seed, monkeypatch):
+    import contextvars
+    from unsloth_zoo.mlx import utils
+
+    inputs, call, module, kernel_name = _sparse_training_case(kind, seed)
+    dispatches = []
+    original = getattr(module, kernel_name)
+
+    def observed(*args, **kwargs):
+        kernel = original(*args, **kwargs)
+        def invoke(*args, **kwargs):
+            dispatches.append(True)
+            return kernel(*args, **kwargs)
+        return invoke
+
+    monkeypatch.setattr(module, kernel_name, observed)
+    expected = call(*inputs)
+    mx.eval(expected)
+    assert len(dispatches) == 1
+    utils.acquire_mlx_training_patches()
+    try:
+        actual = call(*inputs)
+        gradients = mx.grad(lambda q, k, v: call(q, k, v).astype(mx.float32).square().sum(),
+                            argnums=(0, 1, 2))(*inputs)
+        mx.eval(actual, gradients)
+        assert len(dispatches) == 1
+        assert _divergence(expected, actual) < 5e-3
+        for row in range(2):
+            assert _divergence(expected[row], actual[row]) < 5e-3
+            for gradient in gradients:
+                assert mx.all(mx.isfinite(gradient[row])).item()
+                assert mx.max(mx.abs(gradient[row])).item() > 0
+        assert mx.all(actual[:, :, 4] == 0).item()
+        # A concurrent inference context and nested evaluation both keep the kernel.
+        other = contextvars.Context().run(call, *inputs)
+        mx.eval(other)
+        paused = utils.pause_mlx_training_patches()
+        try:
+            evaluated = call(*inputs)
+            mx.eval(evaluated)
+        finally:
+            utils.resume_mlx_training_patches(paused)
+        assert len(dispatches) == 3
+        assert mx.array_equal(expected, other).item()
+        assert mx.array_equal(expected, evaluated).item()
+    finally:
+        utils.release_mlx_training_patches()
+    after = call(*inputs)
+    mx.eval(after)
+    assert len(dispatches) == 4
+    assert mx.array_equal(expected, after).item()
+
+
+@pytest.mark.parametrize("key_kind", ["array", "tuple", "list", "take"])
+def test_training_index_consumers_detach_only_integer_keys(key_kind):
+    import contextvars
+    from unsloth_zoo.mlx import utils
+
+    original = mx.array.__getitem__
+    x = mx.array([[1.1, 0.2, 2.3], [2.1, 1.2, 0.3]])
+    def loss(x):
+        idx = x[:, :2].astype(mx.int32)
+        values = x.T
+        if key_kind == "take":
+            return mx.take(values, indices=idx, axis=0).sum()
+        key = idx if key_kind == "array" else (idx,)
+        if key_kind == "list":
+            key = [idx]
+        return values[key].sum()
+
+    with pytest.raises(ValueError, match="VJP with respect to indices"):
+        mx.eval(mx.grad(loss)(x))
+    utils.acquire_mlx_training_patches()
+    try:
+        with pytest.raises(ValueError, match="VJP with respect to indices"):
+            contextvars.Context().run(lambda: mx.eval(mx.grad(loss)(x)))
+        gradient = mx.grad(loss)(x)
+        mx.eval(gradient)
+        assert mx.array_equal(gradient, mx.array([[1., 2., 1.], [1., 2., 1.]])).item()
+    finally:
+        utils.release_mlx_training_patches()
+    assert mx.array.__getitem__ is original
+
+
+def test_sparse_training_installs_for_imported_aliases_and_missing_modules(monkeypatch):
+    import types
+    from unsloth_zoo.mlx import attention, utils
+
+    sparse = pytest.importorskip("mlx_vlm.models.sparse_attention")
+    original = getattr(sparse.indexed_sparse_attention,
+                       "_unsloth_sparse_attention_original", sparse.indexed_sparse_attention)
+    consumer = types.ModuleType("mlx_vlm.models.future_consumer")
+    consumer.other_name = original
+    monkeypatch.setitem(sys.modules, consumer.__name__, consumer)
+    utils.acquire_mlx_training_patches()
+    try:
+        assert consumer.other_name is sparse.indexed_sparse_attention
+        assert consumer.other_name(None) is None
+    finally:
+        utils.release_mlx_training_patches()
+    for path in ("mlx_vlm.models.sparse_attention", "mlx_vlm.models.qwen4_exp.qsa_kernel"):
+        monkeypatch.delitem(sys.modules, path, raising=False)
+    attention.install_sparse_attention_training()

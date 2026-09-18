@@ -442,6 +442,8 @@ def _wrap_mlx_index_op(name, original):
 
     @wraps(original)
     def wrapper(*args, **kwargs):
+        if not mlx_training_patches_active():
+            return original(*args, **kwargs)
         if positions is None:  # producer: the result is entirely an index
             return mx.stop_gradient(original(*args, **kwargs))
         return original(
@@ -467,12 +469,29 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
         elif not enabled and patched:
             setattr(mx, name, current._unsloth_index_original)
 
+    current = mx.array.__getitem__
+    patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+    if enabled and not patched:
+        @wraps(current)
+        def getitem(array, key):
+            if mlx_training_patches_active():
+                key = _detach_integer_arrays(key)
+            return current(array, key)
+
+        getitem._unsloth_index_stop_gradient = True
+        getitem._unsloth_index_original = current
+        mx.array.__getitem__ = getitem
+    elif not enabled and patched:
+        mx.array.__getitem__ = current._unsloth_index_original
+
 
 def acquire_mlx_training_patches() -> None:
     """Reference-counted: the `mlx.core` patches are process-wide while trainer
     runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
+        from .attention import install_sparse_attention_training
+        install_sparse_attention_training()
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
