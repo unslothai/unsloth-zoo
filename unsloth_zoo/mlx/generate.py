@@ -2425,6 +2425,8 @@ class _VLMBatchAdapter:
         self.make_sampler = sample_utils.make_sampler
         self.sample_utils = sample_utils
         self.model = model
+        from .utils import _ensure_vlm_pad_token
+        _ensure_vlm_pad_token(processor)
         self.processor = processor
         self.defaults = defaults
         self.audio_warn_stacklevel = audio_warn_stacklevel
@@ -3584,6 +3586,8 @@ class BatchStream:
         session = self._require_open()
         validate = _validate_vlm_requests if self._is_vlm else _validate_text_requests
         (validated,) = validate([request], session.adapter.defaults)
+        from .utils import _validate_mlx_image_input
+        _validate_mlx_image_input(session.adapter.model, validated.image is not None)
         return session.add(validated)
 
     def cancel(self, row: int) -> bool:
@@ -3775,6 +3779,8 @@ def _stream_batch(
         if is_vlm
         else _validate_text_requests(requests, defaults)
     )
+    from .utils import _validate_mlx_image_input
+    _validate_mlx_image_input(model, any(request.image is not None for request in validated))
     if is_vlm and (gap := _vlm_quantized_cache_gap(model, defaults)) is not None:
         raise ValueError(gap)
     if any(request.prompt_cache_state is not None for request in validated):
