@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import functools
+import sys
+import threading
 from types import FunctionType, SimpleNamespace
 
 import numpy as np
@@ -52,8 +54,19 @@ def _equal(a, b):
     assert np.array_equal(np.array(a.view(mx.uint8)), np.array(b.view(mx.uint8)))
 
 
-def _identical(a, b):
+def _identical(a, b, nan_payload_may_differ = False):
     assert a.dtype == b.dtype
+    if nan_payload_may_differ and mx.issubdtype(a.dtype, mx.floating):
+        # A poisoned row is NaN on both paths, but WHICH NaN is not stable: the same native chain
+        # yields bfloat16 0x7FC0 on one Apple GPU family and 0x7FFF on another, while the kernel
+        # writes Metal's canonical NAN. IEEE-754 does not specify payloads and neither does MLX, so
+        # requiring those bits to agree asserts something no fixed kernel output can satisfy on all
+        # hardware. Poisoning is what has to match, and it is still checked exactly: the NaN
+        # positions must be identical, and every other byte -- every index, every finite weight --
+        # still compares bit for bit.
+        assert mx.array_equal(mx.isnan(a), mx.isnan(b)), "the poisoned positions differ"
+        quiet = mx.array(float("nan"), dtype = a.dtype)
+        a, b = mx.where(mx.isnan(a), quiet, a), mx.where(mx.isnan(b), quiet, b)
     _equal(a, b)
 
 
@@ -344,7 +357,7 @@ def test_kernel_reproduces_native_routing(dtype, experts, top_k, mode, normalize
         assert fused is not None
         assert fusion._fused_moe_router(logits[0], scale, top_k, mode, normalize) is None  # rank-1 takes the native chain
         for a, b in zip(fusion._native_moe_router(logits, scale, top_k, mode, normalize), fused):
-            _identical(a, b)
+            _identical(a, b, nan_payload_may_differ = True)
 
 
 def _prepared(module):
@@ -592,3 +605,37 @@ def test_nested_scopes_and_generation_mode_restore():
     with generation_mode(root):
         assert not any(type(m) is native for m, native in zip(modules, natives))
     assert [type(m) for m in modules] == natives
+
+
+def test_contended_scopes_leave_no_module_patched():
+    # The loader's generate() wrappers enter this scope without the lock generation_mode holds, so
+    # two requests can be in the entry loop at once. Without _MOE_ROUTER_LOCK a lost increment or
+    # decrement strands the patched class for the life of the process, and popping the count
+    # between another thread's guard and its `+= 1` raises AttributeError out of generation.
+    # Unpatched, this reproduced in 5 of 40 rounds; the switch interval makes it prompt.
+    block = _block(lm_qwen)
+    base = type(block)
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    failures = []
+
+    def worker():
+        try:
+            for _ in range(40):
+                with fusion.fused_moe_router(block):
+                    pass
+        except BaseException as error:          # noqa: BLE001 -- reported, not swallowed
+            failures.append(error)
+
+    try:
+        for _ in range(25):
+            threads = [threading.Thread(target = worker) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout = 60)
+            assert not failures, failures[0]
+            assert type(block) is base, "a patched class outlived every scope that asked for it"
+            assert "_unsloth_router_scopes" not in block.__dict__
+    finally:
+        sys.setswitchinterval(previous)

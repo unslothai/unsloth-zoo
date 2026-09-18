@@ -1023,6 +1023,15 @@ def _moe_router_class(base):
     return patched, mode, experts_path, top_k_path
 
 
+# Held across entry and exit, for the reason fused_moe_gate_up and fused_residual_norm hold
+# theirs: `generation_mode` serializes, but the loader's two generate() wrappers enter these
+# scopes directly and nothing there does. This scope needs it more than either sibling, because
+# it is the only one carrying a per-module scope count, and `count += 1` against a `finally` that
+# pops the same key is not one step: two threads can both read the count before either writes it
+# and strand the patched class for the life of the process, or one can pop the key between the
+# other's guard and its increment and raise AttributeError out of generation.
+_MOE_ROUTER_LOCK = RLock()
+
 @contextmanager
 def fused_moe_router(model):
     """Fuse the MoE routing chain into one Metal dispatch during serialized inference.
@@ -1035,45 +1044,52 @@ def fused_moe_router(model):
     scope exits, so `scale` must stay fixed while the scope is open, as the gate and up
     packing requires of its own weights: replacing it is detected and takes the native
     call, editing it in place is not detected. Edits between scopes are always picked up.
+
+    Bit-identity covers every index and every finite weight. It does not cover the NaN
+    payload of a poisoned row: MLX's own payload for one is not stable across Apple GPU
+    families, so no single kernel output can match it everywhere. Both paths return NaN
+    in the same positions, which is what poisoning means downstream.
     """
     changed = []
     try:
-        modules = model.named_modules() if hasattr(model, "named_modules") else ()
-        if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
-                and _moe_router_kernel() is not None):
-            for _, module in modules:
-                # Type before `training`: named_modules() may yield plain stand-ins.
-                if not isinstance(module, dict) or module.training or "__call__" in module:
-                    continue
-                base = type(module)
-                if getattr(base, "_unsloth_router_native", None) is not None:
-                    if getattr(module, "_unsloth_router_scopes", 0):
-                        module._unsloth_router_scopes += 1
-                        changed.append(module)
-                    continue
-                spec = _moe_router_class(base)
-                if spec is None:
-                    continue
-                patched, mode, experts_path, top_k_path = spec
-                experts = _resolve_dotted(module, experts_path)
-                top_k = _resolve_dotted(module, top_k_path)
-                if not (isinstance(experts, int) and isinstance(top_k, int)
-                        and _moe_router_shape_ok(experts, top_k, mode)):
-                    continue
-                module.__class__ = patched
-                module._unsloth_router_scopes = 1
-                changed.append(module)
-                if mode == _GEMMA_ROUTING:
-                    module._unsloth_router_norm = _RouterNormScale(module)
+        with _MOE_ROUTER_LOCK:
+            modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and _moe_router_kernel() is not None):
+                for _, module in modules:
+                    # Type before `training`: named_modules() may yield plain stand-ins.
+                    if not isinstance(module, dict) or module.training or "__call__" in module:
+                        continue
+                    base = type(module)
+                    if getattr(base, "_unsloth_router_native", None) is not None:
+                        if getattr(module, "_unsloth_router_scopes", 0):
+                            module._unsloth_router_scopes += 1
+                            changed.append(module)
+                        continue
+                    spec = _moe_router_class(base)
+                    if spec is None:
+                        continue
+                    patched, mode, experts_path, top_k_path = spec
+                    experts = _resolve_dotted(module, experts_path)
+                    top_k = _resolve_dotted(module, top_k_path)
+                    if not (isinstance(experts, int) and isinstance(top_k, int)
+                            and _moe_router_shape_ok(experts, top_k, mode)):
+                        continue
+                    module.__class__ = patched
+                    module._unsloth_router_scopes = 1
+                    changed.append(module)
+                    if mode == _GEMMA_ROUTING:
+                        module._unsloth_router_norm = _RouterNormScale(module)
         yield model
     finally:
-        for module in reversed(changed):
-            scopes = getattr(module, "_unsloth_router_scopes", 0)
-            if scopes > 1:
-                module._unsloth_router_scopes = scopes - 1
-                continue
-            native = getattr(type(module), "_unsloth_router_native", None)
-            if native is not None:
-                module.__class__ = native
-            module.__dict__.pop("_unsloth_router_scopes", None)
-            module.__dict__.pop("_unsloth_router_norm", None)
+        with _MOE_ROUTER_LOCK:
+            for module in reversed(changed):
+                scopes = getattr(module, "_unsloth_router_scopes", 0)
+                if scopes > 1:
+                    module._unsloth_router_scopes = scopes - 1
+                    continue
+                native = getattr(type(module), "_unsloth_router_native", None)
+                if native is not None:
+                    module.__class__ = native
+                module.__dict__.pop("_unsloth_router_scopes", None)
+                module.__dict__.pop("_unsloth_router_norm", None)
