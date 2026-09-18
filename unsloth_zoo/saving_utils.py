@@ -3823,7 +3823,15 @@ def merge_and_overwrite_lora(
     _quant_dequant_index = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
     ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
-    regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
+    # A dequant or splitting export skips the index-copy block entirely, so regeneration
+    # is the only thing that can leave an index behind. A lone shard in a subdirectory
+    # needs one for the same reason it does there: from_pretrained looks for exactly
+    # `model.safetensors` then `model.safetensors.index.json` at the root of the
+    # directory, and a nested singleton is neither, so without this the export has no
+    # discoverable weights at all. Read off the FINAL list, since splitting and
+    # renumbering flatten the names before this point.
+    _final_has_nested_shard = any(os.path.dirname(_f) for _f in final_safetensors_list)
+    regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded or _final_has_nested_shard) and save_method != "mxfp4"
     weight_map = {}
 
     # Collect all tensor keys encountered across shards so we can reason about tied embeddings

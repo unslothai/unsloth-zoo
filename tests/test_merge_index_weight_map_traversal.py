@@ -1015,3 +1015,80 @@ def test_a_symlink_that_stays_inside_the_output_is_left_alone(tmp_path):
 
     assert os.path.islink(link), "a contained link was needlessly replaced"
     assert saving_utils._resolves_inside(link, output)
+
+
+@pytest.mark.parametrize("quant_type", ["mxfp4", "fp8"])
+def test_a_dequantized_nested_singleton_still_gets_an_index(
+    monkeypatch, tmp_path, quant_type,
+):
+    """A dequant export skips the index-copy block, so regeneration is the only path.
+
+    `regenerate_index` also needed more than one shard, or an HF-sharded name, so a lone
+    `weights/model.safetensors` got neither. `from_pretrained` looks for exactly
+    `model.safetensors` then `model.safetensors.index.json` at the ROOT of the directory
+    (`modeling_utils`, transformers 5.17.0), and a nested singleton is neither, so the
+    export had no discoverable weights at all.
+
+    The tensor-level dequant arithmetic is stubbed, deliberately: it is irrelevant to
+    which index the export ends up with, and it is the only part that needs real
+    quantized weights. Everything deciding and writing the index is the real code.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    peft_model = H.attach_lora(model, spec, "full")
+
+    nested_root, base_rel, weight_map = _nested_layout(tmp_path, ["weights"])
+    if len(set(weight_map.values())) != 1:
+        pytest.skip("the tiny base model did not fit in a single nested shard")
+
+    monkeypatch.chdir(tmp_path)
+    # A quantized base, so the export takes the dequant route.
+    monkeypatch.setattr(
+        saving_utils, "check_hf_model_exists", lambda *a, **k: True, raising = True,
+    )
+    monkeypatch.setattr(
+        saving_utils, "check_model_quantization_status",
+        lambda *a, **k: (True, quant_type), raising = True,
+    )
+    # The shard rewrite runs for real, as an ordinary 16bit merge: only the tensor-level
+    # dequant needs weights this tiny model does not have, and it has no bearing on which
+    # index the export ends up with. Everything deciding and writing the index is real.
+    _real_merge = saving_utils._merge_and_overwrite_lora
+    def _merge_without_dequant(*a, **k):
+        k["base_model_is_quantized"] = False
+        k["quant_type"] = None
+        return _real_merge(*a, **k)
+    monkeypatch.setattr(
+        saving_utils, "_merge_and_overwrite_lora", _merge_without_dequant, raising = True,
+    )
+
+    save_directory = os.path.join("out", "merged")
+    saving_utils.merge_and_overwrite_lora(
+        get_model_name  = lambda *a, **k: base_rel,
+        model           = peft_model,
+        tokenizer       = None,
+        save_directory  = save_directory,
+        save_method     = "merged_16bit",
+        push_to_hub     = False,
+    )
+
+    output = os.path.join(str(tmp_path), save_directory)
+    root_shard = os.path.join(output, "model.safetensors")
+    index = os.path.join(output, "model.safetensors.index.json")
+    assert os.path.exists(root_shard) or os.path.exists(index), (
+        f"a dequantized nested singleton was exported with neither a root "
+        f"model.safetensors nor an index, so nothing can load it: {os.listdir(output)}"
+    )
+    if os.path.exists(index):
+        with open(index, encoding = "utf-8") as f:
+            exported = json.load(f)["weight_map"]
+        assert exported, "the regenerated index names no shard"
+        for value in set(exported.values()):
+            assert os.path.exists(os.path.join(output, value)), (
+                f"the regenerated index names {value!r}, which is not in the export"
+            )
