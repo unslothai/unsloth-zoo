@@ -12,8 +12,43 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_shim():
-    from mlx_simulation import simulate_mlx_on_torch
+    # Evicting unsloth_zoo.mlx.* is what makes the shim reach the code under
+    # test. Where a real mlx is installed -- every Apple Silicon machine, which
+    # is the hardware this module is about -- unsloth_zoo.mlx.trainer may
+    # already be imported and bound to the real mlx.core / mlx.utils at module
+    # scope. Installing the shim afterwards only changes what THIS file imports,
+    # so the test hands a torch tensor to a real mlx op. Dropping the modules
+    # forces the next import to rebuild them against the shim. Mirrors
+    # test_mlx_trainer_internals.py::_install_shim; see its comment for the
+    # module-identity hazard this snapshot/restore pair avoids.
+    import sys
+
+    from mlx_simulation import (
+        restore_modules,
+        simulate_mlx_on_torch,
+        snapshot_modules,
+    )
+    from mlx_simulation.mlx_stub import _MLXFinder
+
+    shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
+
+    def _owned(name):
+        return (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        )
+
+    real_mlx_modules = snapshot_modules(_owned)
     simulate_mlx_on_torch()
+    for name in list(sys.modules):
+        if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
+            sys.modules.pop(name, None)
+    yield
+    sys.meta_path[:] = [
+        finder for finder in sys.meta_path
+        if not isinstance(finder, _MLXFinder)
+    ]
+    restore_modules(real_mlx_modules, _owned)
 
 
 def _resolve(raw_mgv=None, raw_mgln=None, max_grad_norm=0.0):
