@@ -2158,11 +2158,24 @@ def create_new_function(
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
-    # Only a call that changes the bytes can leave a stale pyc, so only such a
-    # call removes one. Every process start walks the warm cache, where deleting
-    # the pyc forced a full recompile on each import. Tracks the WRITE, not the
-    # decision: overwrite=True is the default for unsloth_compile_transformers
-    # and patch_lora_forwards even when write_file() writes nothing.
+    # Tracks the WRITE, not the decision: overwrite=True is the default for
+    # unsloth_compile_transformers and patch_lora_forwards even when write_file()
+    # writes nothing. It no longer decides whether the pyc is dropped. That was
+    # the reasoning while only a rewrite could leave a stale pyc, and it stopped
+    # holding once a pyc nobody here wrote became the thing to worry about, so
+    # the removal is unconditional and this value is now carried for the rank
+    # agreement and for callers rather than as a staleness verdict.
+    #
+    # The price is paid on every warm start and it is not small: the verified
+    # loader execs the bytes it checked, so CPython never writes a pyc for a
+    # generated module and never gets to reuse one. Measured on this tree, a
+    # real `import unsloth` loads 15 generated trainers totalling 1.72 MB and
+    # spends 996 ms in create_new_function against 860 ms before, a median
+    # +136 ms per process start (n=12 a side, disjoint IQRs), tracking source
+    # size at about +0.076 ms per KB. The new checks are not what costs it:
+    # all nine of them together come to ~185 us per module, under 2% of the
+    # delta. Recovering the pyc would mean trusting a file on disk to say what
+    # our source compiles to, which is the thing this whole path exists to stop.
     rewrote_cache_file = False
     if should_write_cache_file:
         if UNSLOTH_COMPILE_USE_TEMP:
