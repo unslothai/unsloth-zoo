@@ -377,7 +377,9 @@ def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatc
 
     def distributed(_name, model_type, *, config_override_data=None, allow_remote_code=None, **_kwargs):
         calls.append((model_type, config_override_data, allow_remote_code))
-        return types.SimpleNamespace(), types.SimpleNamespace(tokenizer=object())
+        return types.SimpleNamespace(), types.SimpleNamespace(
+            tokenizer=types.SimpleNamespace(stopping_criteria=object()), detokenizer=object(),
+        )
 
     monkeypatch.setattr(loader, "_load_mlx_vlm_distributed", distributed)
     noops = (
