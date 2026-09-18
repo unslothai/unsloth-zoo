@@ -1605,3 +1605,48 @@ def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
     _, grads = nn.value_and_grad(model, lambda m: m(mx.array([[1, 2]])).sum())(model)
     assert _adapters(model) == ["lm_head"]
     assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
+
+
+@metal_only
+def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
+    """Borrowed K/V's cotangent is consumed by the source layer's backward; left
+    to run by that consumer, each borrowing layer keeps its T x T attention
+    cotangents alive until then."""
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+
+    seq_len = 512
+    ids = mx.random.randint(0, 64, (1, seq_len))
+
+    def build(num_kv_shared_layers):
+        mx.random.seed(0)
+        model = Gemma4TextModel(TextConfig(
+            hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+            num_attention_heads=8, head_dim=16, global_head_dim=32,
+            vocab_size=64, vocab_size_per_layer_input=64,
+            hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+            num_kv_shared_layers=num_kv_shared_layers))
+        mx.eval(model.parameters())
+        return model
+
+    def peak_and_grads(model):
+        loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
+        mx.eval(loss_and_grad(model))
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        grads = loss_and_grad(model)[1]
+        mx.eval(grads)
+        return mx.get_peak_memory() - resident, grads
+
+    shared, unshared = build(10), build(0)
+    _, reference = peak_and_grads(shared)
+    mlx_utils._patch_layer_class_for_gc(DecoderLayer)
+    try:
+        unshared_peak, _ = peak_and_grads(unshared)
+        shared_peak, grads = peak_and_grads(shared)
+    finally:
+        mlx_utils._unpatch_layer_class_gc(DecoderLayer)
+    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
+    for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
+        assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
