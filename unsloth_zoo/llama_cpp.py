@@ -1556,7 +1556,18 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
             # then refuses to publish. Move the wreck into our private staging dir so
             # the `finally` disposes of it, rather than deleting a tree in place.
             try:
+                # Re-check immediately before the move, not only in the condition
+                # above. Between the two, another process repairing the same entry
+                # can publish a valid replacement, and moving THAT aside would delete
+                # a live tree in our `finally` while its own export is still holding
+                # the path. Re-reading here does not close the window, nothing short
+                # of a lock does, but it turns the common interleaving from a
+                # destroyed tree into an adopted one.
+                if _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
+                    raise _StageRepairedByAnother()
                 shutil.move(stage_dir, os.path.join(staging, "superseded"))
+            except _StageRepairedByAnother:
+                pass
             except (OSError, shutil.Error):
                 # Lost to another process doing the same repair. Fall through: the
                 # usability check below decides whether its result is good enough.
@@ -1617,7 +1628,9 @@ def _read_prebuilt_marker(install_folder):
     return repo, tag.strip()
 
 
-@lru_cache(4)
+_CONVERTER_RELEASE_TAGS = {}
+
+
 def _latest_converter_release_tag(_llama_tag_pin):
     """The release tag a fresh install would get, memoized for the process.
 
@@ -1629,8 +1642,22 @@ def _latest_converter_release_tag(_llama_tag_pin):
 
     UNSLOTH_LLAMA_TAG is the cache key rather than being read inside, so changing
     the pin mid-process still re-resolves."""
+    if _llama_tag_pin in _CONVERTER_RELEASE_TAGS:
+        return _CONVERTER_RELEASE_TAGS[_llama_tag_pin]
     release = _resolve_llama_cpp_release()
-    return None if release is None else release[0]
+    if release is None:
+        # Deliberately NOT remembered. A tag is immutable so a success is worth
+        # keeping for the process, but a failure is a statement about the network a
+        # second ago. Caching it meant one lookup exhausting its retries turned every
+        # later export in the process into a skipped staging and a fall through to
+        # the package-style master entrypoint, which has no conversion/ beside it and
+        # fails as incomplete, long after connectivity had come back.
+        return None
+    _CONVERTER_RELEASE_TAGS[_llama_tag_pin] = release[0]
+    return release[0]
+
+
+_latest_converter_release_tag.cache_clear = _CONVERTER_RELEASE_TAGS.clear
 
 
 def _resolve_converter_revision(llama_cpp_dir):
@@ -2317,6 +2344,11 @@ def _conversion_sibling_info(llama_cpp_dir):
         _stat(qwen_py) if os.path.isfile(qwen_py) else None,
     )
 pass
+
+
+class _StageRepairedByAnother(Exception):
+    """Another process published a valid entry while we were about to clear ours."""
+    pass
 
 
 class _ConverterSourcesIncomplete(RuntimeError):

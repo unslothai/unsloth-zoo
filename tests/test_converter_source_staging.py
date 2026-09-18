@@ -1469,3 +1469,75 @@ def test_a_package_entrypoint_truncated_after_its_import_is_not_a_cache_hit(mod,
     # A valid package entrypoint is still accepted.
     Path(stage, "convert_hf_to_gguf.py").write_bytes(_SHIM_ENTRYPOINT)
     assert mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9500")
+
+
+def test_a_failed_release_lookup_is_not_remembered(mod, monkeypatch):
+    """A tag is immutable, so a successful lookup is worth keeping for the process.
+    A failure is a statement about the network a second ago. Caching it meant one
+    lookup exhausting its retries turned every later export in the process into a
+    skipped staging and a fall through to the package-style master entrypoint, which
+    has no conversion/ beside it and fails as incomplete, long after connectivity had
+    come back."""
+    mod._latest_converter_release_tag.cache_clear()
+    calls = {"n": 0}
+    outcomes = [None, None, ("b11037", {})]
+
+    def flaky():
+        calls["n"] += 1
+        return outcomes[min(calls["n"] - 1, len(outcomes) - 1)]
+    monkeypatch.setattr(mod, "_resolve_llama_cpp_release", flaky)
+
+    assert mod._latest_converter_release_tag("") is None
+    assert mod._latest_converter_release_tag("") is None
+    assert calls["n"] == 2, "a failed lookup was cached and never retried"
+    assert mod._latest_converter_release_tag("") == "b11037"
+    assert calls["n"] == 3
+    # The success IS remembered, which is the whole point of memoizing.
+    assert mod._latest_converter_release_tag("") == "b11037"
+    assert calls["n"] == 3
+    mod._latest_converter_release_tag.cache_clear()
+
+
+def test_a_stage_repaired_by_another_process_is_adopted_not_destroyed(mod, staging_env, monkeypatch):
+    """Two processes repair the same damaged entry. Between our own condition and
+    the move, the other publishes a valid replacement; moving THAT aside would delete
+    a live tree in our finally while its export still holds the path.
+
+    Asserted on the operation rather than on the end state: we republish at the same
+    path either way, so a directory-exists check afterwards cannot tell adoption from
+    replacement. What must not happen is stage_dir being moved at all."""
+    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    _write_source_tree(stage_dir)
+    Path(stage_dir, "convert_hf_to_gguf.py").write_bytes(b"")   # damaged: enters repair
+
+    real_usable = mod._converter_stage_is_usable
+    seen = {"n": 0}
+
+    def repaired_after_the_condition(path, repo = None, tag = None):
+        if os.path.abspath(path) == os.path.abspath(stage_dir):
+            seen["n"] += 1
+            # 1: the cache-hit probe on entry, a miss.
+            # 2: the repair condition, still a wreck.
+            # 3: the guard's re-check, by which point the other process published.
+            if seen["n"] <= 2:
+                return False
+            if seen["n"] == 3:
+                return True
+        return real_usable(path, repo = repo, tag = tag)
+    monkeypatch.setattr(mod, "_converter_stage_is_usable", repaired_after_the_condition)
+
+    moved = []
+    real_move = mod.shutil.move
+    def spy(src, dst, *a, **k):
+        moved.append(os.path.abspath(src))
+        return real_move(src, dst, *a, **k)
+    monkeypatch.setattr(mod.shutil, "move", spy)
+
+    mod._stage_converter_sources("b9000")
+    monkeypatch.undo()
+
+    assert seen["n"] >= 3, "the repair window was never entered, so this proved nothing"
+    assert os.path.abspath(stage_dir) not in moved, (
+        "a replacement published between the condition and the move was moved aside, "
+        "which deletes a live tree in the finally while another export holds the path"
+    )
