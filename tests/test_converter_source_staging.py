@@ -289,6 +289,43 @@ def test_a_shim_tarball_without_its_conversion_package_is_refused(mod, staging_e
     assert not os.path.exists(mod._converter_stage_dir("ggml-org/llama.cpp", "b9000"))
 
 
+def test_an_unwritable_cache_root_is_a_miss_not_a_raise(mod, staging_env, monkeypatch):
+    """The contract is that a staging miss returns None and the caller falls back
+    to the single-file download. Creating the cache root is the one step that used
+    to sit outside the try, so a read-only HOME, a full disk or a directory owned
+    by somebody else raised out of here and failed an export that works today."""
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(mod.os, "makedirs", refuse)
+    assert mod._stage_converter_sources("b9000") is None
+    assert staging_env["downloads"] == 0
+
+
+def test_a_cache_root_that_cannot_hold_a_temp_dir_is_a_miss_not_a_raise(
+    mod, staging_env, monkeypatch,
+):
+    """The second half of the same step. mkdtemp is where a full disk shows up,
+    and it is also why this cannot be folded into the main try: that try's finally
+    removes `staging`, which a failed mkdtemp never bound."""
+    def refuse(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(mod.tempfile, "mkdtemp", refuse)
+    assert mod._stage_converter_sources("b9000") is None
+    assert staging_env["downloads"] == 0
+
+
+def test_an_unwritable_cache_root_still_serves_an_existing_entry(mod, staging_env, monkeypatch):
+    """A cache that went read-only after it was populated is still a cache hit:
+    the probe runs before any of this, so nothing needs to be created."""
+    stage = mod._stage_converter_sources("b9000")
+    assert stage is not None
+    def refuse(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(mod.os, "makedirs", refuse)
+    monkeypatch.setattr(mod.tempfile, "mkdtemp", refuse)
+    assert mod._stage_converter_sources("b9000") == stage
+
+
 def test_a_failed_stage_leaves_a_working_entry_intact(mod, staging_env):
     good = mod._stage_converter_sources("b9000")
     marker = Path(good, "conversion", "__init__.py").read_text()

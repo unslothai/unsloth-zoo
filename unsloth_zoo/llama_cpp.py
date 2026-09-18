@@ -1521,10 +1521,25 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
         return None
 
     parent_dir = os.path.dirname(stage_dir) or "."
-    os.makedirs(parent_dir, exist_ok = True)
-    # Staged beside the destination so publication is a same-filesystem move, and
-    # private to this process so the cleanup below can never touch a live entry.
-    staging = tempfile.mkdtemp(prefix = ".llama_cpp_converter_", dir = parent_dir)
+    # Its own try, ahead of the main one, for two reasons. Failing to create the
+    # cache root is a staging MISS like any other, and this function's contract is
+    # that a miss returns None and the caller falls back to the single-file
+    # download; letting an OSError out of here instead would fail an export that
+    # works today, on a read-only HOME, a full disk or a directory somebody else
+    # owns. And it cannot live in the main try, whose `finally` removes `staging`,
+    # because a mkdtemp that raised never bound that name.
+    try:
+        os.makedirs(parent_dir, exist_ok = True)
+        # Staged beside the destination so publication is a same-filesystem move, and
+        # private to this process so the cleanup below can never touch a live entry.
+        staging = tempfile.mkdtemp(prefix = ".llama_cpp_converter_", dir = parent_dir)
+    except OSError as e:
+        logger.warning(
+            f"Unsloth: Could not prepare the llama.cpp converter cache at {parent_dir} "
+            f"({type(e).__name__}: {e}). Set UNSLOTH_LLAMA_CPP_CONVERTER_CACHE to a "
+            f"writable directory to cache converter sources."
+        )
+        return None
     try:
         staged_sources = os.path.join(staging, "sources")
         logger.info(f"Unsloth: Staging llama.cpp converter sources for {tag} ({repo})")
