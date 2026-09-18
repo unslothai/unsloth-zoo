@@ -2944,23 +2944,14 @@ def _remove_transformers_version(config_path: Path):
     pass
 pass
 
-# Multi-token-prediction (MTP) reconciliation for exported checkpoints.
-#
-# Qwen3.5 / Qwen3.6 checkpoints ship a built-in MTP head as top-level `mtp.*`
-# tensors and declare it with `mtp_num_hidden_layers` (in `text_config` for the
-# multimodal configs). transformers has no MTP module for these architectures and
+# Multi-token-prediction reconciliation. Qwen3.5 / Qwen3.6 ship an MTP head as
+# top-level `mtp.*` tensors declared by `mtp_num_hidden_layers`, and transformers
 # drops those tensors on load (`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`
-# in transformers' modeling_qwen3_5.py), so any export that round-trips the model
-# writes weights with no MTP head while the config still declares one. Consumers
-# that trust the config then look for weights that are not there: llama.cpp's
-# converter asserts on the missing layer, which is why convert_to_gguf already
-# reconciles the same key before converting, and vLLM resolves its MTP draft
-# config off `mtp_num_hidden_layers` too.
-#
-# The rule below is the one invariant worth enforcing at export time: what the
-# config declares and what the weights contain must agree. It never invents
-# weights, and it only edits the declaration when the weights can actually be
-# inspected, so an unreadable checkpoint is left exactly as it was.
+# in modeling_qwen3_5.py), so a round-tripped export declares a head it no longer
+# has. Consumers trusting the config then break: llama.cpp's converter asserts on
+# the missing layer and vLLM resolves its draft config off the same key.
+# The invariant: config and weights must agree. Never invents weights, and edits
+# the declaration only when the weights could be inspected.
 MTP_CONFIG_KEY = "mtp_num_hidden_layers"
 
 # Matches llama.cpp's converter view of an MTP tensor: a top-level `mtp.` block,
@@ -3021,13 +3012,11 @@ def _checkpoint_tensor_names(folder):
     return None
 
 
-# The other MTP spelling: DeepSeek-V3 / GLM style heads are stored as extra
-# `layers.N` blocks past `num_hidden_layers` and declared with
-# `num_nextn_predict_layers`, not as `mtp.*`. That form needs a layer count to
-# decide anything, so it is deliberately left to the writers that already do it
-# (`unsloth_zoo/mlx/utils.py` for the MLX export, `_has_mtp_weight_tensors` in
-# `unsloth_zoo/llama_cpp.py` for the GGUF converter). It is checked here only to
-# keep this repair from firing on such a checkpoint.
+# The other MTP spelling: DeepSeek-V3 / GLM heads are extra `layers.N` blocks past
+# `num_hidden_layers` declared by `num_nextn_predict_layers`. Deciding anything
+# there needs a layer count, so it is left to the writers that already handle it
+# (`mlx/utils.py`, `_has_mtp_weight_tensors` in `llama_cpp.py`) and detected here
+# only to keep this repair from firing on such a checkpoint.
 _LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model)\.)*layers\.(\d+)\.")
 
 

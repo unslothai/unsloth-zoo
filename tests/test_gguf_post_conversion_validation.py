@@ -99,9 +99,7 @@ def write_gguf(path, architecture = "llama", keys = None, tensors = None,
     return str(path)
 
 
-# ---------------------------------------------------------------------------
-# The required metadata gate (unsloth#8360, unsloth#8513)
-# ---------------------------------------------------------------------------
+# --- The required metadata gate (unsloth#8360, unsloth#8513) ---
 
 def test_complete_file_has_no_problems(llama_cpp, tmp_path):
     """The gate must be silent on a correct file. A check that fires on a good
@@ -267,9 +265,7 @@ def test_unreadable_file_is_reported_not_raised(llama_cpp, tmp_path):
     assert problems and "could not be read" in problems[0], problems
 
 
-# ---------------------------------------------------------------------------
-# Split exports
-# ---------------------------------------------------------------------------
+# --- Split exports ---
 
 def test_any_shard_resolves_to_the_whole_set(llama_cpp, tmp_path):
     """Only shard 1 carries the KV metadata. Handed shard 2, the gate must read
@@ -392,9 +388,7 @@ def test_assert_correct_gguf_checks_each_split_set_once(llama_cpp, tmp_path, mon
     assert seen == [shards[0], other], seen
 
 
-# ---------------------------------------------------------------------------
-# Tensor sanity (unsloth#6056)
-# ---------------------------------------------------------------------------
+# --- Tensor sanity (unsloth#6056) ---
 
 def test_a_damaged_non_final_tensor_is_caught(llama_cpp, tmp_path):
     """The point of unsloth#6056. On main the reader was rewritten to build
@@ -500,9 +494,7 @@ def test_an_f16_infinity_is_caught(llama_cpp, tmp_path):
     assert any("NaN or Inf" in problem for problem in problems), problems
 
 
-# ---------------------------------------------------------------------------
-# Sampling
-# ---------------------------------------------------------------------------
+# --- Sampling ---
 
 def test_sampling_is_deterministic_and_covers_the_ends(llama_cpp):
     first = llama_cpp._gguf_sample_indices(236, 8, ("model.gguf", 236))
@@ -528,9 +520,7 @@ def test_sample_size_env_is_read_at_the_call(llama_cpp, monkeypatch):
     assert llama_cpp._gguf_sample_size() == llama_cpp.GGUF_VERIFY_SAMPLE_DEFAULT
 
 
-# ---------------------------------------------------------------------------
-# The gate `convert_to_gguf` runs
-# ---------------------------------------------------------------------------
+# --- The gate `convert_to_gguf` runs ---
 
 def test_the_gate_refuses_a_file_missing_required_metadata(llama_cpp, tmp_path):
     keys = {k: v for k, v in UNIVERSAL.items() if k != "llama.block_count"}
@@ -648,12 +638,7 @@ def test_a_quantized_file_is_detected_from_its_own_tensors(llama_cpp, tmp_path):
     assert not llama_cpp._gguf_holds_any_float_tensor(llama_cpp._gguf_open_shards(quant))
 
 
-# ---------------------------------------------------------------------------
-# A mixed file is the common case, not the exotic one: `q4_k_m` and MXFP4 both
-# leave the projector, and usually `token_embd` and the norms, at a float type.
-# Those tensors have to stay checked, and the quantized blocks beside them have
-# to stay unchecked.
-# ---------------------------------------------------------------------------
+# --- A mixed file is the common case, not the exotic one: `q4_k_m` and MXFP4 both leave the projector, and usually `token_embd` and the norms, at a float type. Those tensors have to stay checked, and the quantized blocks beside them have to stay unchecked. ---
 
 def write_mixed_gguf(path, float_tensors, quantized_tensors, architecture = "llama",
                      keys = None, raw_dtype = GGMLQuantizationType.Q8_0):
@@ -781,9 +766,7 @@ def test_the_gate_checks_a_split_set_once(llama_cpp, tmp_path):
     assert len(opened) == 2, opened
 
 
-# ---------------------------------------------------------------------------
-# What the rebuild removed
-# ---------------------------------------------------------------------------
+# --- What the rebuild removed ---
 
 def test_the_reader_is_no_longer_rebuilt_with_exec(llama_cpp):
     """The old validator ran `inspect.getsource(GGUFReader.__init__)` through
@@ -1005,9 +988,7 @@ def test_the_announcement_is_printed_once_for_a_split_set(llama_cpp, tmp_path, c
     assert capsys.readouterr().out.count("Reading the GGUF back") == 1
 
 
-# ---------------------------------------------------------------------------
-# The shape comparison covers the whole model, not just the first shard
-# ---------------------------------------------------------------------------
+# --- The shape comparison covers the whole model, not just the first shard ---
 
 class _FakeParameter:
     def __init__(self, shape):
@@ -1091,9 +1072,7 @@ def test_an_unreadable_later_shard_does_not_break_the_shape_pass(llama_cpp, tmp_
     ) == []
 
 
-# ---------------------------------------------------------------------------
-# The read-back uses the gguf that wrote the file, not whatever the parent has
-# ---------------------------------------------------------------------------
+# --- The read-back uses the gguf that wrote the file, not whatever the parent has ---
 
 def _fake_gguf_tree(tmp_path, name = "gguf-py"):
     """A directory laid out the way an importable gguf-py tree is."""
@@ -1200,9 +1179,7 @@ def test_the_conversion_passes_the_derived_tree_to_the_verifier(llama_cpp):
 
 
 
-# ---------------------------------------------------------------------------
-# A projector has no vocabulary, and that is not a defect
-# ---------------------------------------------------------------------------
+# --- A projector has no vocabulary, and that is not a defect ---
 
 class _BareTokenizer:
     bos_token_id = 1
@@ -1349,9 +1326,7 @@ def test_a_corrupt_shard_is_reported_for_a_projector_too(llama_cpp, tmp_path):
     assert llama_cpp.gguf_metadata_problems(ok_first) == []
 
 
-# ---------------------------------------------------------------------------
-# A failed OPTIONAL run is a text-only downgrade, not an aborted export.
-# ---------------------------------------------------------------------------
+# --- A failed OPTIONAL run is a text-only downgrade, not an aborted export. ---
 
 def test_a_required_run_that_fails_verification_raises(llama_cpp, tmp_path):
     keys = {k: v for k, v in UNIVERSAL.items() if k != "llama.block_count"}

@@ -270,13 +270,10 @@ def use_local_gguf(gguf_py_path = None):
     try:
         if os.path.exists(gguf_py_path):
             logger.debug(f"Adding {gguf_py_path} to sys.path")
-            # Index 0, ahead of everything including the script or working directory that
-            # Python puts there. This tree is named, not searched for: `convert_to_gguf`
-            # passes the one the converter child reported, and the whole point of the read
-            # back is to parse the file with the `gguf` that wrote it. A process launched
-            # from inside another gguf-py checkout has that checkout at sys.path[0], so
-            # inserting after it re-imports the wrong package and the verification runs
-            # against a reader that may not understand what was written.
+            # Index 0, ahead of the script directory Python puts there: a process
+            # launched from inside another gguf-py checkout has that checkout at
+            # sys.path[0], and the point of the read back is to parse the file with
+            # the `gguf` that wrote it.
             sys.path.insert(0, gguf_py_path)
 
             # Drop system gguf modules to force a reimport from gguf-py
@@ -2778,25 +2775,13 @@ def _remove_gguf_outputs(output_file):
             pass
 
 
-# --- GGUF converter / gguf-py version skew (unsloth#3581) -------------------
-# The converter runs in a child process, and none of the launch sites used to
-# pass `env=`, so the child inherited whatever `gguf` the ambient environment
-# resolved. Worse, every llama.cpp converter entrypoint self-locates its own
-# tree with `sys.path.insert(1, Path(__file__).parent / "gguf-py")`, which sits
-# ahead of PYTHONPATH and site-packages. Unsloth downloads the entrypoint from
-# llama.cpp master but the sibling gguf-py belongs to whatever checkout or
-# bundle is on disk, so a newer entrypoint can be run against an older gguf-py
-# (reported as `module 'gguf.utility' has no attribute 'SafetensorsLocal'`), and
-# an entrypoint with no sibling tree at all falls through to the unpinned
-# site-packages `gguf` (reported as `cannot import name 'MistralTokenizerType'
-# from 'gguf.vocab'`). `use_local_gguf()` only ever fixed the parent process.
-#
-# Package version numbers do not settle this: the llama.cpp fork bundles a
-# gguf-py that also calls itself 0.19.0 while carrying architectures the PyPI
-# 0.19.0 has never heard of. So we probe for the symbols the chosen entrypoint
-# actually needs, exactly as import_fixes.py probes behaviour instead of
-# versions, and we pin the child's gguf explicitly once we know which tree
-# satisfies them.
+# GGUF converter / gguf-py version skew (unsloth#3581). Every converter
+# entrypoint self-locates with `sys.path.insert(1, __file__/../gguf-py)`, which
+# outranks PYTHONPATH and site-packages, so the child's gguf is decided by
+# whatever tree sits beside the entrypoint, not by `use_local_gguf()`.
+# Version numbers cannot settle which tree is right: the fork's gguf-py calls
+# itself 0.19.0 while carrying architectures PyPI 0.19.0 lacks. So probe for the
+# symbols the entrypoint needs and pin the child's gguf to the tree with them.
 
 # How many conversion/*.py files to read when collecting requirements. A cap so
 # an unexpected directory cannot turn the preflight into a filesystem walk.
@@ -2973,15 +2958,11 @@ def _gguf_requirements_from_source(source_bytes):
                     visit_expression(piece, eager)
                 visit_body(child, False)
             elif isinstance(child, ast.Try):
-                # The guarded parts are advisory: a `try` body may be probing for a
-                # symbol on purpose, and a handler runs only if it was missing. The
-                # `finally` is not like that. It runs on EVERY path through the
-                # statement, including the one where nothing was raised, so at module
-                # level it is evaluated exactly as surely as a plain statement and a
-                # `gguf` name it reads makes the import fail if it is absent. Demoting
-                # it with the rest reported such a name as merely advisory, and the
-                # resolver then kept an incompatible baseline without so much as
-                # probing a pin that would have worked.
+                # Body and handlers are advisory: a `try` body may be probing for a
+                # symbol on purpose. `finally` is not, since it runs on every path,
+                # so at module level a `gguf` name it reads fails the import as surely
+                # as a plain statement would. Demoting it let the resolver keep an
+                # incompatible baseline without probing a pin that would have worked.
                 for part in (child.body, child.handlers, child.orelse):
                     for statement in part:
                         visit(ast.Module(body = [statement], type_ignores = []), False)
@@ -2999,14 +2980,11 @@ def _gguf_requirements_from_source(source_bytes):
                 for statement in child.orelse:
                     visit(ast.Module(body = [statement], type_ignores = []), eager)
             elif isinstance(child, ast.If):
-                # An ordinary module-level guard -- `if sys.platform == "win32":`, `if
-                # importlib.util.find_spec(...)`, a version test -- runs AT MOST ONE of its
-                # two branches, so a name referenced in the other is not certainly evaluated.
-                # Counting both as certain let a symbol that only the inactive branch reads
-                # pin a different gguf, or replace a converter that works perfectly well with
-                # an older fallback. The TEST itself is evaluated whichever way it goes, so it
-                # keeps the eager reading; the branches are advisory, like a try body, unless
-                # the branch is one this can prove (above).
+                # A module-level guard (`if sys.platform == "win32"`, a find_spec or
+                # version test) runs at most one branch, so counting both as certain let
+                # a symbol only the dead branch reads pin a different gguf. The test runs
+                # either way and stays eager; the branches are advisory unless provable
+                # above.
                 visit_expression(child.test, eager)
                 for statement in list(child.body) + list(child.orelse):
                     visit(ast.Module(body = [statement], type_ignores = []), False)
@@ -4170,14 +4148,10 @@ def convert_to_gguf(
             else:
                 print(f"Unsloth: Successfully saved {description} GGUF as {len(found_files)} shards (total size: {size_str})")
 
-    # The converter reports success on a file that no llama.cpp build can load:
-    # it never re-reads what it wrote. Check the architecture required metadata,
-    # and on an unquantized export the sampled tensors, before any caller
-    # uploads or quantizes this (unsloth#6056, unsloth#8360, unsloth#8513).
-    # `_gguf_py_pin` is None on the common path, where nothing was pinned because nothing
-    # needed to be. The read-back still has to know which `gguf` wrote the file: see
-    # `_gguf_readback_tree`, which derives it from the probe report without changing what
-    # the child ran with.
+    # The converter never re-reads what it wrote, so it reports success on a file
+    # no llama.cpp build can load (unsloth#6056, unsloth#8360, unsloth#8513).
+    # `_gguf_py_pin` is None whenever nothing needed pinning, so the read back derives
+    # the writer's tree from the probe report instead.
     _readback_tree = _gguf_py_pin or _gguf_readback_tree(_gguf_report)
     for _files, _description, _required in verify_groups:
         if not _verify_run_outputs(
@@ -4406,23 +4380,11 @@ def quantize_gguf(
 pass
 
 
-# ---------------------------------------------------------------------------
-# Post-conversion GGUF verification
-#
-# Two checks that run on every export, plus one that needs the torch model.
-#
-# 1. `gguf_metadata_problems` - the architecture-required metadata gate. A GGUF
-#    that is missing a key llama.cpp reads unconditionally loads nowhere, and
-#    the converter itself does not check (unsloth#8360, unsloth#8513: MiniMax
-#    M3 quants published without `{arch}.attention.indexer.head_count`).
-# 2. `gguf_tensor_problems` - degenerate sampled tensors (all zero, NaN, Inf).
-#    Architecture independent, so it cannot fire on a legitimate export.
-# 3. `assert_correct_gguf` - vocab plus sampled tensor shapes against a model.
-#
-# Every key below is taken from the llama.cpp sources that read it, not from a
-# guess. Provenance is on each entry, and the key strings come from
-# `src/llama-arch.cpp`'s LLM_KV_NAMES table.
-# ---------------------------------------------------------------------------
+# Post-conversion GGUF verification. The converter does not check its own
+# output, so a GGUF missing a key llama.cpp reads unconditionally is published
+# and loads nowhere (unsloth#8360, unsloth#8513: MiniMax M3 quants without
+# `{arch}.attention.indexer.head_count`). Key strings below come from
+# `src/llama-arch.cpp`'s LLM_KV_NAMES, not from a guess.
 
 # `general.architecture` names the arch; llama.cpp cannot choose a model
 # loader without it (src/llama-arch.cpp maps it to LLM_ARCH_*).
@@ -4439,22 +4401,13 @@ GGUF_UNIVERSAL_REQUIRED_KEYS = (
     "{arch}.block_count",       # ml.get_key(LLM_KV_BLOCK_COUNT,      hparams.n_layer_all)
 )
 
-# A tensor namespace in the file implies the metadata namespace that describes
-# it. Each entry is (tensor name marker, required keys, exempt architectures,
-# why).
-#
-# Only keys llama.cpp refuses to load without belong here, because a problem
-# from this table refuses to publish the file and a gate that rejects a good
-# GGUF is worse than no gate. That means a key qualifies only when every
-# architecture that can carry the namespace reads it with no trailing `false`
-# in its `src/models/*.cpp`; the ones that read it optionally go in the exempt
-# set, named by the `general.architecture` string from src/llama-arch.cpp.
-# Anything weaker goes in GGUF_CONDITIONAL_ADVISORY_KEYS below.
-#
-# Extending this: find the `ml.get_key(...)` calls for the new namespace in
-# `src/models/*.cpp`, drop any architecture that passes `false` into the exempt
-# set, and record the files you read. Verified against llama.cpp b49650a
-# (b49650adb31f2e49a0d76113aeb1792134fd8413).
+# A tensor namespace implies the metadata namespace describing it:
+# (tensor marker, required keys, exempt architectures, why).
+# A key qualifies only if every architecture carrying the namespace reads it
+# with no trailing `false` in `src/models/*.cpp`; ones reading it optionally go
+# in the exempt set, anything weaker in GGUF_CONDITIONAL_ADVISORY_KEYS. A hit
+# here refuses to publish, and rejecting a good GGUF is worse than no gate.
+# Verified against llama.cpp b49650adb31f2e49a0d76113aeb1792134fd8413.
 GGUF_CONDITIONAL_REQUIRED_KEYS = (
     (
         # `blk.N.indexer.*` and `blk.N.indexer_compressor_*`
@@ -4901,15 +4854,11 @@ def _gguf_window_size():
         return GGUF_VERIFY_WINDOW_DEFAULT
 
 
-# GGUF float types that gguf-py hands back as raw bytes rather than as a numpy
-# float dtype, and the unsigned integer view that exposes their sign and
-# exponent bits. numpy has no bfloat16, so a BF16 tensor arrives as uint8 and a
-# plain `np.issubdtype(..., np.floating)` test skipped every one of them.
-# Values from gguf-py/gguf/constants.py GGMLQuantizationType.
-# BF16 is the only GGUF float type numpy has no dtype for, so it is the only one
-# that arrives as raw bytes and needs its exponent field located by hand. F32,
-# F64 and F16 all come back as real float dtypes (measured on a real f16 export),
-# so they take the `np.issubdtype` fast path below and never reach this table.
+# GGUF float types gguf-py returns as raw bytes, with the unsigned view exposing
+# their exponent bits. numpy has no bfloat16, so BF16 arrives as uint8 and a
+# plain `np.issubdtype(..., np.floating)` test skipped it; F32, F64 and F16 come
+# back as real float dtypes and take that fast path instead. Values from
+# gguf-py/gguf/constants.py GGMLQuantizationType.
 _GGUF_BYTEWISE_FLOAT_TYPES = {
     30: ("uint16", 0x7F80),  # BF16: 8 exponent bits
 }
@@ -5035,16 +4984,12 @@ def gguf_tensor_problems(
                 except Exception:
                     values = None
                 if values is None: continue
-            # All-zero is only a defect inside a transformer block, and not even
-            # there for a bias. `blk.` is where unsloth#6056's damage lives;
-            # outside it zero is a legitimate weight (BERT `token_types.weight`
-            # on a single-segment model, projector padding). NaN and Inf are
-            # still checked everywhere.
-            # The two sublayer output projections are excluded as well: LLaMA Pro
-            # block expansion (arXiv 2401.02415) zero-initialises o_proj and
-            # down_proj so a copied block is an exact identity, and a LoRA that
-            # does not target them leaves the merged weight at exactly zero. That
-            # file loads in llama.cpp, so refusing it would break a real export.
+            # Zero is a legitimate weight outside `blk.` (BERT `token_types.weight`,
+            # projector padding) and for a bias, so all-zero is only a defect inside
+            # a block, which is where unsloth#6056's damage lives. o_proj and
+            # down_proj are excluded too: LLaMA Pro block expansion (arXiv
+            # 2401.02415) zero-initialises them and llama.cpp loads that file.
+            # NaN and Inf stay checked everywhere.
             check_zero = (
                 tensor.name.startswith("blk.")
                 and not tensor.name.endswith(".bias")
@@ -5172,13 +5117,10 @@ def _verify_converted_gguf(
                     detail = f" ({type(error).__name__}: {error})"
                 break
             if _writer_tree_known and not reader_unavailable:
-                # The one reason this is a warning is version skew: an installed `gguf`
-                # older than the converter that wrote the file fails on an export that is
-                # perfectly good. That reason is gone here. This IS the tree the converter
-                # child ran with, so a file its own writer cannot reopen is a malformed or
-                # truncated output, and the checks above it are existence and shard
-                # numbering only -- a converter that exits zero after writing a broken GGUF
-                # would otherwise have it published with nothing but a warning.
+                # Elsewhere this is only a warning because an older installed `gguf`
+                # fails on a perfectly good export. Not here: this IS the tree the child
+                # wrote with, so a file its own writer cannot reopen is malformed, and
+                # everything above checks existence and shard numbering only.
                 raise RuntimeError(
                     f"Unsloth: the GGUF converter wrote {unreadable}, and the same `gguf` "
                     f"package that wrote it cannot read it back{detail}. The file is "
@@ -5350,14 +5292,11 @@ def _gguf_shape_problems(model, readers, sample_size):
     )
     if arch_enum is None:
         return []
-    # `TensorNameMap`'s second argument is the BLOCK count, and it expands every per-block
-    # template once per index, so the number it is given is the size of the map. The
-    # parameter count is not that number: a model with separately named MoE experts has
-    # tens of thousands of parameters and a few dozen blocks, and asking for one mapping per
-    # parameter builds hundreds of megabytes of names for layers that do not exist before
-    # a single tensor is looked at. The file says how many blocks it has -- llama.cpp
-    # refuses to load without `{arch}.block_count` -- and the parameter names are the
-    # fallback for a file that somehow lacks it.
+    # `TensorNameMap`'s second argument is the BLOCK count and it expands every
+    # per-block template once per index, so passing the parameter count instead builds
+    # hundreds of megabytes of names for layers that do not exist (an MoE with named
+    # experts has tens of thousands of parameters and a few dozen blocks). llama.cpp
+    # refuses to load without `{arch}.block_count`; parameter names are the fallback.
     block_count = _gguf_field_int(reader, f"{architecture}.block_count")
     if block_count is None or block_count <= 0:
         block_count = _model_block_count(shapes)

@@ -523,12 +523,7 @@ def test_a_writable_config_is_still_rewritten(tmp_path, monkeypatch):
     assert _config_is_writable(config_path) is True
 
 
-# ---------------------------------------------------------------------------
-# Nested config shapes. The three nested containers are the ones
-# _sync_gguf_nextn_layer_config in unsloth_zoo/mlx/utils.py already reads; a
-# declaration missed here is left in the exported config with no weights behind it,
-# which is the state that makes a later GGUF conversion fail on missing MTP layers.
-# ---------------------------------------------------------------------------
+# --- Nested config shapes. The three nested containers are the ones _sync_gguf_nextn_layer_config in unsloth_zoo/mlx/utils.py already reads; a declaration missed here is left in the exported config with no weights behind it, which is the state that makes a later GGUF conversion fail on missing MTP layers. ---
 
 from unsloth_zoo.saving_utils import _mtp_config_containers
 

@@ -78,9 +78,7 @@ def _make_gguf_py(root, *, package=True, symbols=(), version=None):
     return gguf_py
 
 
-# ---------------------------------------------------------------------------
-# _converter_child_env
-# ---------------------------------------------------------------------------
+# --- _converter_child_env ---
 
 def test_child_env_is_a_copy_of_the_parent_environment(mod, monkeypatch):
     monkeypatch.setenv("UNSLOTH_CHILD_ENV_CANARY", "kept")
@@ -135,9 +133,7 @@ def test_child_env_does_not_duplicate_an_entry_already_present(mod, monkeypatch,
     assert env["PYTHONPATH"].split(os.pathsep) == [str(gguf_py), "/x"]
 
 
-# ---------------------------------------------------------------------------
-# _importable_gguf_py
-# ---------------------------------------------------------------------------
+# --- _importable_gguf_py ---
 
 def test_importable_gguf_py_accepts_a_real_package(mod, tmp_path):
     gguf_py = _make_gguf_py(tmp_path)
@@ -156,9 +152,7 @@ def test_importable_gguf_py_handles_missing_and_empty_input(mod, tmp_path):
     assert mod._importable_gguf_py(None) is None
 
 
-# ---------------------------------------------------------------------------
-# requirement scanning
-# ---------------------------------------------------------------------------
+# --- requirement scanning ---
 
 def test_module_level_imports_are_certain(mod):
     source = b"from gguf.vocab import MistralTokenizerType\nimport gguf.utility\n"
@@ -280,16 +274,7 @@ def test_conversion_package_is_scanned_only_when_imported(mod, tmp_path):
     assert "gguf.vocab.MistralTokenizerType" not in certain
 
 
-# ---------------------------------------------------------------------------
-# architecture scoping of the requirement scan
-#
-# conversion/__init__.py imports base.py eagerly and then, through
-# get_model_class, the ONE module the architecture maps to. load_all_models
-# imports the rest inside a per-module `try/except Exception` that only warns,
-# and the entrypoint does not call it. So another architecture's module cannot
-# break this conversion, and counting its names as certain would abandon a
-# working converter for an older one.
-# ---------------------------------------------------------------------------
+# --- architecture scoping of the requirement scan conversion/__init__.py imports base.py eagerly and then, through get_model_class, the ONE module the architecture maps to. load_all_models imports the rest inside a per-module `try/except Exception` that only warns, and the entrypoint does not call it. So another architecture's module cannot break this conversion, and counting its names as certain would abandon a working converter for an older one. ---
 
 def _make_conversion_tree(tmp_path):
     """An entrypoint plus a conversion/ package shaped like llama.cpp's own."""
@@ -442,9 +427,7 @@ def test_the_diagnosis_names_the_symbol_that_actually_stopped_the_import(
     assert "gguf.MODEL_ARCH.AFMOE" not in note
 
 
-# ---------------------------------------------------------------------------
-# the child probe
-# ---------------------------------------------------------------------------
+# --- the child probe ---
 
 def test_probe_reports_the_tree_the_entrypoint_would_self_locate(mod, tmp_path):
     """The probe must resolve gguf the way the real run does, i.e. through the
@@ -516,9 +499,7 @@ def test_probe_returns_none_when_it_cannot_run(mod):
     assert mod._probe_child_gguf("/nonexistent/python", dict(os.environ), ("gguf.X",)) is None
 
 
-# ---------------------------------------------------------------------------
-# candidate ranking
-# ---------------------------------------------------------------------------
+# --- candidate ranking ---
 
 def test_candidates_start_with_the_requested_pair_untouched(mod, tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
@@ -695,9 +676,7 @@ def test_resolver_keeps_the_request_when_nothing_satisfies_it(mod, tmp_path, mon
     assert "gguf.NeverExists" in report["missing"]
 
 
-# ---------------------------------------------------------------------------
-# failure diagnosis
-# ---------------------------------------------------------------------------
+# --- failure diagnosis ---
 
 @pytest.mark.parametrize("text", [
     "ImportError: cannot import name 'MistralTokenizerType' from 'gguf.vocab' (/x/gguf/vocab.py)",
@@ -776,9 +755,7 @@ def test_report_summary_handles_every_shape(mod):
     assert mod._gguf_report_summary({"missing": []}, ()) == "reason unknown"
 
 
-# ---------------------------------------------------------------------------
-# wiring
-# ---------------------------------------------------------------------------
+# --- wiring ---
 
 def test_every_converter_launch_passes_an_explicit_env(mod):
     """Regression guard: a launch site without env= silently reintroduces the bug."""
@@ -803,9 +780,7 @@ def test_failure_path_attaches_the_diagnosis(mod):
     assert "_looks_like_gguf_skew(captured)" not in source
 
 
-# ---------------------------------------------------------------------------
-# end to end, skipped unless the real toolchain is staged
-# ---------------------------------------------------------------------------
+# --- end to end, skipped unless the real toolchain is staged ---
 
 _TOOLCHAIN = Path(os.environ.get("UNSLOTH_TEST_LLAMACPP_DIR") or os.devnull)
 _MODEL = Path(os.environ.get("UNSLOTH_TEST_GGUF_MODEL") or os.devnull)
@@ -870,9 +845,7 @@ def test_the_preflight_returns_a_pin_not_a_frozen_environment(mod, tmp_path, mon
     assert pin is None or isinstance(pin, str)
 
 
-# ---------------------------------------------------------------------------
-# The installed gguf wheel as a candidate (verification pass)
-# ---------------------------------------------------------------------------
+# --- The installed gguf wheel as a candidate (verification pass) ---
 
 def test_the_installed_gguf_wheel_is_used_when_the_sibling_tree_is_too_old(
     mod, tmp_path, monkeypatch, capsys,
@@ -998,12 +971,7 @@ def test_postponed_annotations_are_not_evaluated(mod):
     assert "gguf.Result" not in certain
 
 
-# ---------------------------------------------------------------------------
-# PEP 649. From 3.14 an annotation is compiled into a lazily built `__annotate__`
-# rather than evaluated in the signature, with no future import needed, so the
-# interpreter version decides this and not just the file's own imports. The
-# version tested is this one because the child is `[sys.executable, converter]`.
-# ---------------------------------------------------------------------------
+# --- PEP 649. From 3.14 an annotation is compiled into a lazily built `__annotate__` rather than evaluated in the signature, with no future import needed, so the interpreter version decides this and not just the file's own imports. The version tested is this one because the child is `[sys.executable, converter]`. ---
 
 def test_an_annotation_is_deferred_on_314_without_the_future_import(mod, monkeypatch):
     """No `from __future__ import annotations`, yet on 3.14 the return annotation
@@ -1210,9 +1178,7 @@ def test_the_required_halves_are_read_off_the_requested_converter(mod, tmp_path)
     assert mod._converter_maps_architecture(str(packaged), "Gemma3ForCausalLM") is True
 
 
-# ---------------------------------------------------------------------------
-# the conversion halves this call really runs
-# ---------------------------------------------------------------------------
+# --- the conversion halves this call really runs ---
 
 def _make_dual_mapped_tree(tmp_path):
     """An architecture named by BOTH maps, whose projector module needs a symbol
@@ -1304,9 +1270,7 @@ def test_the_conversion_is_resolved_after_the_vlm_downgrade(mod):
     assert downgrade_line < resolve_line, "is_vlm is downgraded after the resolver ran"
 
 
-# ---------------------------------------------------------------------------
-# A module-level `finally` runs on every path, so it is not guarded.
-# ---------------------------------------------------------------------------
+# --- A module-level `finally` runs on every path, so it is not guarded. ---
 
 def test_a_module_level_finally_is_certain(mod):
     """`try` bodies and handlers are advisory because they may be probing for a
