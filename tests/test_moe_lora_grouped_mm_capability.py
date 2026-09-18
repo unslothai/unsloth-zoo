@@ -397,6 +397,39 @@ def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
         M._routing_signature = real
 
 
+def _live_tensor_count():
+    """Live tensors in the process, without tripping over somebody else's dead weakref.
+
+    ``gc.get_objects()`` returns every tracked object in the PROCESS, which includes dead
+    ``weakref.proxy`` objects other test modules leave behind; PEFT's parametrization makes
+    them. ``torch.is_tensor(o)`` is ``isinstance(o, torch.Tensor)``, and isinstance on a
+    dead weakproxy RAISES ``ReferenceError`` rather than answering False, so the walk died
+    with "weakly-referenced object no longer exists" -- a message about a weakref, raised
+    from a test about tensor retention, in a file that never creates one.
+
+    Reproduced deterministically rather than guessed: make a ``weakref.proxy``, drop its
+    referent, collect, then walk ``gc.get_objects()`` calling ``torch.is_tensor``. A single
+    dead proxy anywhere in the process is enough. That is why this only ever failed under
+    xdist, where other modules share the worker, and never when the file ran alone.
+
+    test_moe_fused_lora_merge_layout.py already clears its own proxies for this reason, and
+    that is worth keeping. It cannot be the whole answer though: it asks every producer to
+    remember, and any test in any file may leave one behind. So the consumer is made safe
+    too. Skipping the unreadable object is right -- a dead weakproxy is not a live tensor,
+    which is the only thing being counted.
+    """
+    import gc
+
+    total = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                total += 1
+        except ReferenceError:
+            continue
+    return total
+
+
 def test_no_grad_decoding_retains_nothing(unsupported):
     """The stash that was here held a strong reference to each `weight`, and the PEFT
     extraction path hands over a FRESH contiguous tensor per call, so a long generation
@@ -404,13 +437,40 @@ def test_no_grad_decoding_retains_nothing(unsupported):
     import gc
 
     inputs, _, offsets = _case()
-    before = sum(1 for o in gc.get_objects() if torch.is_tensor(o))
+    before = _live_tensor_count()
     with torch.no_grad():
         for _ in range(50):
             M._grouped_mm_with_backward_fix(inputs, torch.randn(3, 8, 6), offsets)
     gc.collect()
-    after = sum(1 for o in gc.get_objects() if torch.is_tensor(o))
+    after = _live_tensor_count()
     assert after - before < 20, f"grad-off calls retained {after - before} tensors"
+
+
+def test_the_live_tensor_walk_survives_a_dead_weakproxy():
+    """The regression that sent Core zoo red, pinned so it cannot come back.
+
+    Without the guard this raises ReferenceError instead of counting, and it does so only
+    when some other module in the same worker has left a dead proxy around, which is the
+    hardest kind of failure to attribute: the traceback names neither the test that made
+    the proxy nor anything this file does.
+    """
+    import gc
+    import weakref
+
+    class _Referent:
+        pass
+
+    referent = _Referent()
+    proxy = weakref.proxy(referent)
+    del referent
+    gc.collect()
+
+    # The proxy is dead but still reachable, exactly as it is in a shared xdist worker.
+    with pytest.raises(ReferenceError):
+        isinstance(proxy, torch.Tensor)
+
+    count = _live_tensor_count()
+    assert isinstance(count, int) and count >= 0
 
 
 def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
