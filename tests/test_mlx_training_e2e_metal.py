@@ -2071,3 +2071,93 @@ def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
     _, grads = nn.value_and_grad(model, lambda m: m(mx.array([[1, 2]])).sum())(model)
     assert _adapters(model) == ["lm_head"]
     assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
+
+
+@metal_only
+def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
+    """Borrowed K/V's cotangent is consumed by the source layer's backward; left
+    to run by that consumer, each borrowing layer keeps its T x T attention
+    cotangents alive until then."""
+    from mlx_vlm.models.gemma4.config import TextConfig
+    from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+
+    seq_len = 512
+    ids = mx.random.randint(0, 64, (1, seq_len))
+
+    def build(num_kv_shared_layers):
+        mx.random.seed(0)
+        model = Gemma4TextModel(TextConfig(
+            hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+            num_attention_heads=8, head_dim=16, global_head_dim=32,
+            vocab_size=64, vocab_size_per_layer_input=64,
+            hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+            num_kv_shared_layers=num_kv_shared_layers))
+        mx.eval(model.parameters())
+        return model
+
+    def peak_and_grads(model):
+        loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
+        mx.eval(loss_and_grad(model))
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        grads = loss_and_grad(model)[1]
+        mx.eval(grads)
+        return mx.get_peak_memory() - resident, grads
+
+    shared, unshared = build(10), build(0)
+    _, reference = peak_and_grads(shared)
+    mlx_utils._patch_layer_class_for_gc(DecoderLayer)
+    try:
+        unshared_peak, _ = peak_and_grads(unshared)
+        shared_peak, grads = peak_and_grads(shared)
+    finally:
+        mlx_utils._unpatch_layer_class_gc(DecoderLayer)
+    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
+    for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
+        assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_checkpointing_keeps_cacheless_kv_shared_gradients():
+    from types import SimpleNamespace
+    from mlx_vlm.models.gemma3n.config import TextConfig
+    from mlx_vlm.models.gemma3n.language import Gemma3Model, Gemma3nDecoderLayer
+    from unsloth_zoo.mlx.loader import _fix_gemma4_kv_sharing
+
+    mx.random.seed(0)
+    backbone = Gemma3Model(TextConfig(
+        model_type="gemma3n_text", hidden_size=64, num_hidden_layers=6,
+        intermediate_size=[128] * 6, activation_sparsity_pattern=[0.0] * 6,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, laurel_rank=4, sliding_window=16,
+        num_kv_shared_layers=2,
+        layer_types=["sliding_attention", "full_attention"] * 3))
+    mx.eval(backbone.parameters())
+    ids = mx.random.randint(0, 64, (1, 32))
+    loss_and_grad = nn.value_and_grad(backbone, lambda m: (m(ids) ** 2).sum())
+
+    original_call = Gemma3Model.__call__
+    _fix_gemma4_kv_sharing(SimpleNamespace(language_model=SimpleNamespace(model=backbone)))
+    # Seven early returns in the shim leave the class unpatched, and an unpatched
+    # class takes the plain checkpoint branch, which is the state this test exists
+    # to reject. Without this the test would pass having proved nothing.
+    assert "_kv_sharing_patched" in Gemma3Model.__dict__, "the shim did not install"
+    try:
+        reference = loss_and_grad(backbone)[1]
+        mlx_utils._patch_layer_class_for_gc(Gemma3nDecoderLayer)
+        try:
+            grads = loss_and_grad(backbone)[1]
+        finally:
+            mlx_utils._unpatch_layer_class_gc(Gemma3nDecoderLayer)
+    finally:
+        Gemma3Model.__call__ = original_call
+        # Delete only a flag this test set. `del` on an absent attribute raises
+        # from the finally and buries the real failure behind an AttributeError,
+        # and `hasattr` would consume a flag inherited from an earlier patch,
+        # disarming the shim's own idempotence guard for whatever runs next.
+        if "_kv_sharing_patched" in Gemma3Model.__dict__:
+            del Gemma3Model._kv_sharing_patched
+    for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
+        assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name

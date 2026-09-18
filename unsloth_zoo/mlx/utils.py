@@ -825,6 +825,30 @@ def _detach_integer_arrays(value):
     return _detach_if_index(value)
 
 
+@mx.custom_function
+def _tie_shared_kv_cotangent(x, shared_kv):
+    return x, shared_kv
+
+
+@_tie_shared_kv_cotangent.vjp
+def _tie_shared_kv_cotangent_vjp(primals, cotangents, outputs):
+    # Only the source layer's backward consumes borrowed K/V's cotangent, and
+    # `mx.eval` defers it to there, keeping every borrowing layer's T x T
+    # attention cotangents alive; the hidden state's makes it run in place.
+    d_x, d_shared_kv = cotangents
+    return mx.depends(d_x, list(d_shared_kv)), d_shared_kv
+
+
+def _tie_to_hidden_state(args, shared_kv):
+    """Tie borrowed K/V to the layer's hidden-state input, when it has both."""
+    if (not args or not isinstance(args[0], mx.array)
+            or not isinstance(shared_kv, (tuple, list)) or not shared_kv
+            or not all(isinstance(a, mx.array) for a in shared_kv)):
+        return args, shared_kv
+    x, shared_kv = _tie_shared_kv_cotangent(args[0], tuple(shared_kv))
+    return (x, *args[1:]), shared_kv
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -834,6 +858,10 @@ def _patch_layer_class_for_gc(layer_cls):
     def checkpointed_fn(self, *args, **kwargs):
         slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
         if slot is None:
+            if "shared_kv" in kwargs:
+                args, kwargs["shared_kv"] = _tie_to_hidden_state(
+                    args, kwargs["shared_kv"])
+
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
                 args = tuple(_detach_integer_arrays(a) for a in args)
@@ -852,8 +880,9 @@ def _patch_layer_class_for_gc(layer_cls):
             out = fn(self, *args, **kwargs)
             return out, slot.recorded()
 
+        args, borrowed = _tie_to_hidden_state(args, slot.borrow())
         out, recorded = mx.checkpoint(inner_fn)(
-            self.trainable_parameters(), slot.borrow(), *args, **kwargs)
+            self.trainable_parameters(), borrowed, *args, **kwargs)
         slot.install(recorded)
         return out
 

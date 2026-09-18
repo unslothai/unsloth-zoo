@@ -22,6 +22,7 @@ import shutil
 import stat
 import tempfile
 import sys
+import warnings
 import importlib
 import importlib.util
 from typing import Optional, Tuple
@@ -69,8 +70,75 @@ def _log_info(message: str):
         print(message)
 
 
+def _warn_without_raising(message):
+    """warnings.warn, except that it cannot be the thing that fails the import.
+
+    install_to_cache() runs at import and simplefilter("error") would turn this
+    into a raise, for a condition already handled by not using the file.
+    """
+    try:
+        warnings.warn(message)
+    except Exception:
+        print(message)
+
+
+def _read_file_bytes(path):
+    """The file's bytes, or None when it cannot be read."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _replace_with_copy(current_file, destination):
+    """Copy over `destination` by replacing the path, not by writing into it.
+
+    shutil.copy() opens the destination, so a read-only one refuses it, and it
+    is not atomic while nothing locks this file and every rank installs it at
+    import. os.replace() needs only the directory and is atomic.
+    """
+    directory = os.path.dirname(destination) or "."
+    descriptor, temporary = tempfile.mkstemp(
+        prefix = f".{os.path.basename(destination)}.", suffix = ".tmp", dir = directory,
+    )
+    try:
+        # Through the DESCRIPTOR, not by reopening the name, or the copy and the
+        # mode follow that name somewhere else; this directory is writable by
+        # whoever would plant a copy here. Same shape as
+        # compiler._replace_compiled_cache_file.
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            with open(current_file, "rb") as source:
+                shutil.copyfileobj(source, handle)
+            handle.flush()
+            # mkstemp is owner-only; keep the mode shutil.copy() would have left.
+            mode = stat.S_IMODE(os.stat(current_file).st_mode)
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), mode)
+            else:
+                os.chmod(temporary, mode)
+        os.replace(temporary, destination)
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def install_to_cache(source_path, destination_filename=None):
-    """Copy a file into unsloth_compiled_cache so compiled modules can use it."""
+    """Copy a file into unsloth_compiled_cache so compiled modules can use it.
+
+    Returns whether the copy is known to match `source_path`. Runs at import
+    time, so an unwritable directory is not fatal; a destination that exists and
+    does NOT match is reported, since _load_cached_moe_utils_module() execs it.
+    """
     compile_location = _get_compile_location()
     if not os.path.exists(compile_location):
         try:
@@ -84,11 +152,45 @@ def install_to_cache(source_path, destination_filename=None):
 
     destination = os.path.abspath(os.path.join(compile_location, destination_filename))
 
-    if current_file != destination:
+    if current_file == destination:
+        return True
+
+    current = _read_file_bytes(current_file)
+    if current is not None and _read_file_bytes(destination) == current:
+        # Already installed. This runs on every `import unsloth_zoo`, on every
+        # rank, and copies this whole module, so without the compare the steady
+        # state was replacing a file with an identical copy of itself.
+        return True
+
+    try:
+        _replace_with_copy(current_file, destination)
+    except Exception as replace_error:
+        # A directory we cannot add a temp file to can still hold a destination
+        # we can write through, so the plain copy is worth one attempt. It gives
+        # up the atomicity above, so the readback below is what keeps a partial
+        # copy from being used.
         try:
             shutil.copy(current_file, destination)
-        except Exception:
-            pass
+        except Exception as copy_error:
+            _log_info(
+                f"Unsloth: Could not install {destination}: "
+                f"{replace_error}; {copy_error}"
+            )
+
+    current = _read_file_bytes(current_file)
+    installed = _read_file_bytes(destination)
+    if installed is None or current is None:
+        # Nothing landed, or there is nothing to compare it against. Either way
+        # no compiled module gets to use it.
+        return False
+    if installed == current:
+        return True
+    _warn_without_raising(
+        f"Unsloth: {destination} does not match {current_file} and could not be "
+        "replaced, so it will not be used. Delete it to restore the compiled "
+        "cache copy."
+    )
+    return False
 
 
 install_to_cache(__file__, "moe_utils.py")
@@ -103,20 +205,13 @@ _WARNED_STALE_CACHE = set()
 def _cached_copy_is_current(cache_file, current_file) -> bool:
     """Whether the compiled cache holds byte for byte what this module is.
 
-    `install_to_cache` rewrites the cache on every import, so the two normally
-    match and this is a cheap confirmation. They diverge when the copy could not
-    be written: a cache directory baked into an image, a read only mount, or a
-    file owned by another user. `shutil.copy` fails there and the failure is
-    swallowed, so the cache keeps an OLDER unsloth_zoo, and every caller below
-    prefers it, which silently installs that older module's patches over the
-    ones this release ships. Prefer this module in that case, and say so once.
+    They diverge when the copy could not be written, leaving an OLDER
+    unsloth_zoo that every caller below would prefer, silently installing that
+    release's patches over this one's. Prefer this module, and say so once.
     """
-    try:
-        with open(cache_file, "rb") as f:
-            cached = f.read()
-        with open(current_file, "rb") as f:
-            current = f.read()
-    except Exception:
+    cached = _read_file_bytes(cache_file)
+    current = _read_file_bytes(current_file)
+    if cached is None or current is None:
         return False
     if cached == current:
         return True
@@ -133,6 +228,64 @@ def _cached_copy_is_current(cache_file, current_file) -> bool:
     return False
 
 
+def _remove_cached_bytecode(source_file):
+    """Drop the pyc beside a cache copy we are about to execute.
+
+    The comparison covers the .py only, and CPython runs an unchecked-hash pyc
+    without consulting it, so a pyc we cannot remove means using our own defs.
+    """
+    try:
+        bytecode_location = importlib.util.cache_from_source(source_file)
+    except NotImplementedError:
+        return True
+    # A symlinked `__pycache__` sends this unlink outside the cache. Refusing
+    # costs the cache copy and falls back to our own definitions, which beats
+    # deleting somebody else's file. sys.pycache_prefix is the user's own.
+    if not getattr(sys, "pycache_prefix", None):
+        try:
+            if os.path.islink(os.path.dirname(bytecode_location)):
+                return False
+        except OSError:
+            return False
+    try:
+        os.remove(bytecode_location)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return not os.path.isfile(bytecode_location)
+    return True
+
+
+def cached_copy_is_importable(directory) -> bool:
+    """Whether a generated module may be allowed to import moe_utils from here.
+
+    A path that exists and is not a real directory is never trusted: zipimport
+    is a default sys.path hook, so a ZIP named `unsloth_compiled_cache` passed
+    every isfile check and served moe_utils out of the archive.
+
+    True when there is no copy at all; the caller runs
+    compiler._reject_shadowing_import_candidates first, which refuses a
+    moe_utils package, extension or sourceless pyc. Matching bytes are necessary
+    and NOT sufficient, hence the name: a bare import prefers the pyc, so it is
+    dropped here and one that cannot be dropped means no.
+    """
+    try:
+        # Exists but is not a directory, not merely "is not a directory": a path
+        # that does not exist yet imports nothing and stays trusted, which is
+        # what a cache folder looks like before it is created.
+        if os.path.exists(directory) and not os.path.isdir(directory):
+            return False
+        cache_file = os.path.abspath(os.path.join(directory, "moe_utils.py"))
+    except Exception:
+        return False
+    current_file = os.path.abspath(__file__)
+    if cache_file == current_file or not os.path.isfile(cache_file):
+        return True
+    if not _cached_copy_is_current(cache_file, current_file):
+        return False
+    return _remove_cached_bytecode(cache_file)
+
+
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 
@@ -144,6 +297,14 @@ def _load_cached_moe_utils_module():
         _CACHED_MOE_UTILS_MODULE = None
         return None
 
+    # The cache copy is only ever a copy of this file, so bytes that differ are
+    # bytes install_to_cache() did not put there, and exec_module() below runs
+    # whatever is in the file. Use this module's own definitions instead, which
+    # is what every caller falls back to anyway.
+    cached_bytes = _read_file_bytes(cache_file)
+    if cached_bytes is None or cached_bytes != _read_file_bytes(current_file):
+        return None
+
     try:
         module_name = "unsloth_cached_moe_utils"
         module = sys.modules.get(module_name, None)
@@ -151,12 +312,25 @@ def _load_cached_moe_utils_module():
             _CACHED_MOE_UTILS_MODULE = module
             return module
 
+        if not _remove_cached_bytecode(cache_file):
+            return None
+
         spec = importlib.util.spec_from_file_location(module_name, cache_file)
-        if spec is None or spec.loader is None:
+        if spec is None:
             return None
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            # The bytes compared above, not a fresh read of the path. exec_module
+            # reopens the file, and the comparison and that open are two moments:
+            # a writer with access to the shared cache replaces the file between
+            # them and its bytes run as unsloth_cached_moe_utils having matched
+            # nothing. compiler.py's loader closed the same window; this one is
+            # the copy of it that lives here.
+            exec(compile(cached_bytes, cache_file, "exec"), module.__dict__)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
         _CACHED_MOE_UTILS_MODULE = module
         return module
     except Exception:
