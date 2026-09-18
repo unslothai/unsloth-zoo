@@ -1189,3 +1189,69 @@ def test_a_backslash_named_singleton_still_gets_an_index(monkeypatch, tmp_path):
             assert os.path.exists(os.path.join(output, value)), (
                 f"the exported index names {value!r}, which is not in the export"
             )
+
+
+# Names that leave a directory and re-enter a sibling of the same name. A containment
+# test that joins onto a STAND-IN root and checks the prefix accepts every one of these,
+# because they normalise back under the stand-in while the real join lands outside.
+COLLIDING_NAMES = [
+    pytest.param("../unsloth_shard_root/victim.safetensors", id = "re-enter-the-stand-in"),
+    pytest.param("..///unsloth_shard_root/victim.safetensors", id = "extra-separators"),
+    pytest.param("sub/../../unsloth_shard_root/victim.safetensors", id = "via-a-subdirectory"),
+    pytest.param("..\\unsloth_shard_root\\victim.safetensors", id = "windows-spelling"),
+]
+
+
+@pytest.mark.parametrize("name", COLLIDING_NAMES)
+def test_a_name_that_re_enters_a_same_named_sibling_is_refused(name):
+    """The predicate must not be defeated by knowing the stand-in root's name."""
+    assert saving_utils._shard_name_stays_inside(name) is False, (
+        f"{name!r} was accepted; joined onto a real output it resolves to "
+        f"{os.path.normpath(os.path.join('/tmp/out/merged', name))!r}"
+    )
+
+
+@pytest.mark.parametrize("name", COLLIDING_NAMES)
+def test_a_colliding_name_never_reaches_the_filesystem(monkeypatch, tmp_path, name):
+    """End to end: nothing may be created outside the requested output directory.
+
+    The write sinks refuse this name, but the shard preparation loop runs first and its
+    `os.makedirs` plus `shutil.copy2` had already created the file outside before the
+    refusal. Asserting on the filesystem rather than on the exception is the point.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    peft_model = H.attach_lora(model, spec, "full")
+
+    base_rel = _shadow_directory(tmp_path, name)
+    _plant_payload(tmp_path, base_rel, name)
+    save_directory = os.path.join("out", "deep", "merged")
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+    try:
+        saving_utils.merge_and_overwrite_lora(
+            get_model_name  = lambda *a, **k: base_rel,
+            model           = peft_model,
+            tokenizer       = None,
+            save_directory  = save_directory,
+            save_method     = "merged_16bit",
+            push_to_hub     = False,
+        )
+    except Exception:
+        # Refusing is fine. Escaping is not, and that is what is asserted below.
+        pass
+
+    inside = os.path.realpath(os.path.join(str(tmp_path), save_directory))
+    escaped = []
+    for root, _dirs, files in os.walk(os.path.join(str(tmp_path), "out")):
+        for entry in files:
+            resolved = os.path.realpath(os.path.join(root, entry))
+            if resolved != inside and not resolved.startswith(inside + os.sep):
+                escaped.append(os.path.relpath(resolved, str(tmp_path)))
+    assert not escaped, f"{name!r} put {escaped} outside {save_directory!r}"

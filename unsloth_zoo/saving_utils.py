@@ -3086,8 +3086,21 @@ def _shard_name_stays_inside(name):
     for _module in (posixpath, ntpath):
         if _module.isabs(name):
             return False
-        root = _module.join(_module.sep, "unsloth_shard_root")
-        if not _module.normpath(_module.join(root, name)).startswith(root + _module.sep):
+        # Normalise the name ON ITS OWN and reject one that still begins by climbing
+        # out. `normpath` collapses every interior `..`, so a leading one is left
+        # exactly when the path escapes whatever it is joined onto, whatever that
+        # directory is called.
+        #
+        # This deliberately does NOT join onto a stand-in root and test the prefix.
+        # That is collidable: `../unsloth_shard_root/victim.safetensors` leaves the
+        # stand-in and re-enters a sibling of the same name, normalising back under
+        # it, so the check passed while the real join landed in
+        # `<parent of save_directory>/unsloth_shard_root/victim.safetensors`.
+        # `..///unsloth_shard_root/v` did the same.
+        _normalized = _module.normpath(name)
+        if _normalized in (_module.curdir, _module.pardir):
+            return False
+        if _normalized.startswith(_module.pardir + _module.sep):
             return False
     return True
 
