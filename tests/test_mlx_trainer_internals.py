@@ -1338,6 +1338,29 @@ def test_norm_clip_keeps_small_gradients():
         np.testing.assert_array_equal(np.array(clipped["weight"]), np.array(grad["weight"]))
 
 
+def test_global_norm_clip_reduces_across_every_leaf():
+    """Global clipping reduces over the whole tree; leaf clipping does not.
+
+    Norms 5 and 12 combine to a global norm of 13, so one cross-tree scale of
+    5/13 applies to both leaves. Leaf mode instead leaves the leaf already at
+    the cap alone and scales only the one above it.
+    """
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"a": mx.array([3.0, 4.0]), "b": mx.array([0.0, 12.0])}
+
+    clipped, norm = _clip_grad_norm_fp32(grad, max_norm=5.0)
+    assert float(norm) == pytest.approx(13.0)
+    np.testing.assert_allclose(np.array(clipped["a"]), [15 / 13, 20 / 13], rtol=1e-5)
+    np.testing.assert_allclose(np.array(clipped["b"]), [0.0, 60 / 13], rtol=1e-5)
+
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=5.0)
+    np.testing.assert_allclose(np.array(leaf_clipped["a"]), [3.0, 4.0], rtol=1e-5)
+    np.testing.assert_allclose(np.array(leaf_clipped["b"]), [0.0, 5.0], rtol=1e-5)
+
+
 @pytest.mark.parametrize(
     ("scheduler", "warmup"),
     [
