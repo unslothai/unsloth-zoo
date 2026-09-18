@@ -48,6 +48,7 @@ import tempfile
 import logging
 import shlex
 import shutil
+import stat as stat_module
 import tarfile
 import zipfile
 import platform
@@ -326,7 +327,7 @@ def _resolve_bundle_convert_script():
 pass
 
 
-def _resolve_monolith_bundle_convert_script():
+def _resolve_monolith_bundle_convert_script(require_gguf_py = True):
     """Last local resolver before the network: an install predating upstream's split,
     whose converter carries its own model classes and needs no conversion/ package.
 
@@ -339,7 +340,16 @@ def _resolve_monolith_bundle_convert_script():
     Without this row, a pre-split install with a perfectly good converter falls
     through to staging, which resolves a revision, downloads a source tarball, finds
     no conversion/ in it and declines, all to end up back at a file that was sitting
-    there the whole time. Checking it here keeps that whole population offline."""
+    there the whole time. Checking it here keeps that whole population offline.
+
+    `require_gguf_py` is what keeps this row from defeating the point of the change.
+    The converter's own `sys.path.insert(1, __file__.parent / "gguf-py")` finds
+    nothing when that tree is missing, so the child falls through to an unpinned
+    site-packages `gguf`, which is the skew staging exists to remove, and answering
+    here means staging never gets the chance. So the normal pass demands the sibling
+    tree. The caller re-runs it without that demand only after staging has failed,
+    because a monolith with a working pip `gguf` converts today and must keep
+    converting when there is no network to stage from."""
     bundle_dir = LLAMA_CPP_DEFAULT_DIR
     if not bundle_dir or not os.path.isdir(bundle_dir):
         return None
@@ -362,6 +372,15 @@ def _resolve_monolith_bundle_convert_script():
                 with open(candidate, "rb") as f: source = f.read()
             except OSError:
                 continue
+            if require_gguf_py and not os.path.isfile(
+                os.path.join(bundle_dir, "gguf-py", "gguf", "__init__.py")
+            ):
+                logger.info(
+                    f"Unsloth: {candidate} is self-contained but has no gguf-py "
+                    f"beside it, so staging is preferred over pairing it with "
+                    f"whichever gguf the child happens to import."
+                )
+                return None
             text_archs, vision_archs = _extract_archs_from_monolith_source(source)
             if not text_archs and not vision_archs:
                 logger.info(
@@ -2609,6 +2628,9 @@ def _resolve_staged_convert_script():
     stage_dir = _stage_converter_sources(tag, repo = repo or "ggml-org/llama.cpp")
     if stage_dir is None:
         return None
+    stage_dir = _writable_stage(stage_dir, repo = repo or "ggml-org/llama.cpp", tag = tag)
+    if stage_dir is None:
+        return None
     candidate = os.path.join(stage_dir, "convert_hf_to_gguf.py")
     try:
         stat = os.stat(candidate)
@@ -2619,6 +2641,81 @@ def _resolve_staged_convert_script():
         f"(co-versioned with conversion/ and gguf-py/)"
     )
     return (candidate, stat.st_mtime_ns, stat.st_size)
+
+
+def _writable_stage(stage_dir, repo, tag):
+    """`stage_dir`, or a writable copy of it, or None.
+
+    The patcher writes `unsloth_convert_hf_to_gguf.py` into the directory it
+    resolved, and it has to land there rather than anywhere else, because the child
+    resolves `from conversion import ...` and its own gguf-py relative to the file
+    it runs. A cache shared between users, or baked read-only into an image, is a
+    reasonable thing to point UNSLOTH_LLAMA_CPP_CONVERTER_CACHE at, and a valid
+    stage in one was unusable: every export died on the patched write, cache hit or
+    not, online or off.
+
+    So a stage we cannot write to is copied once into the default cache root, which
+    belongs to this user, and used from there. The copy costs one tarball's worth of
+    disk and only happens when the configured cache is not writable."""
+    if stage_dir is None: return None
+    if os.access(stage_dir, os.W_OK): return stage_dir
+    default_root = os.path.join(UNSLOTH_HOME, "llama.cpp-converter")
+    if os.path.abspath(default_root) == os.path.abspath(LLAMA_CPP_CONVERTER_CACHE_DIR):
+        logger.warning(
+            f"Unsloth: The staged converter sources at {stage_dir} are not writable "
+            f"and there is no other cache root to copy them to. Point "
+            f"UNSLOTH_LLAMA_CPP_CONVERTER_CACHE at a writable directory."
+        )
+        return None
+    mirror = os.path.join(
+        default_root, os.path.basename(_converter_stage_dir(repo, tag)),
+    )
+    if _converter_stage_is_usable(mirror, repo = repo, tag = tag):
+        return mirror
+    logger.info(
+        f"Unsloth: {stage_dir} is not writable, so its converter sources are being "
+        f"copied to {mirror} once."
+    )
+    try:
+        os.makedirs(default_root, exist_ok = True)
+        staging = tempfile.mkdtemp(prefix = ".llama_cpp_mirror_", dir = default_root)
+    except OSError as e:
+        logger.warning(
+            f"Unsloth: Could not prepare {default_root} to hold a writable copy of "
+            f"{stage_dir} ({type(e).__name__}: {e})."
+        )
+        return None
+    try:
+        copied = os.path.join(staging, "sources")
+        shutil.copytree(stage_dir, copied)
+        # copytree copies the source's mode last, so the copy of a read-only tree is
+        # itself read-only, and renaming a directory needs write permission ON that
+        # directory. Give the copy back its owner write bit, which is the entire
+        # point of making it.
+        for root, directories, files in os.walk(copied):
+            for entry in [root] + [os.path.join(root, n) for n in directories + files]:
+                try:
+                    os.chmod(entry, os.stat(entry).st_mode | stat_module.S_IWUSR)
+                except OSError:
+                    pass
+        if not os.path.exists(mirror):
+            try:
+                # Same publication rule as staging itself: os.rename so a process that
+                # got there first raises rather than having its tree nested inside.
+                os.rename(copied, mirror)
+            except OSError:
+                pass
+        if not _converter_stage_is_usable(mirror, repo = repo, tag = tag):
+            return None
+        return mirror
+    except Exception as e:
+        logger.warning(
+            f"Unsloth: Could not copy the staged converter sources from {stage_dir} "
+            f"({type(e).__name__}: {e})."
+        )
+        return None
+    finally:
+        shutil.rmtree(staging, ignore_errors = True)
 
 
 def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
@@ -2650,6 +2747,12 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
         # rather than downloading the entrypoint alone and pairing it with
         # whatever conversion/ and gguf-py/ happen to be around.
         local_script_info = _resolve_staged_convert_script()
+    if local_script_info is None and not _revision_pinned:
+        # Staging could not answer, so a self-contained converter with no sibling
+        # gguf-py is better than nothing: it is what converts on this install today,
+        # and refusing it here would fail an export that currently works whenever
+        # there is no network to stage from.
+        local_script_info = _resolve_monolith_bundle_convert_script(require_gguf_py = False)
     # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
     # or replaced after the first conversion still gets the Qwen3.5 aliases.
     _patch_tensor_mapping_for_qwen35(_get_llama_cpp_dir(local_script_info))

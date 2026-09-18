@@ -836,12 +836,22 @@ def test_a_bundle_with_its_conversion_package_never_reaches_staging(mod, tmp_pat
     assert Path(info[0]).parent == bundle
 
 
+def _write_sibling_gguf_py(bundle):
+    """The gguf-py tree every real llama.cpp install ships beside its converter."""
+    pkg = Path(bundle) / "gguf-py" / "gguf"
+    pkg.mkdir(parents = True, exist_ok = True)
+    (pkg / "__init__.py").write_text("# gguf\n")
+    (pkg / "tensor_mapping.py").write_text("class TensorNameMap:\n    pass\n")
+    return pkg
+
+
 def test_an_installed_self_contained_converter_is_used_instead_of_a_download(mod, tmp_path, monkeypatch):
     """A pre-split install has a working converter that matches its binaries. It
     used to be ignored in favour of a master shim it could never run."""
     bundle = tmp_path / "old_install"
     bundle.mkdir()
     (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    _write_sibling_gguf_py(bundle)
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
     info = mod._resolve_monolith_bundle_convert_script()
     assert info is not None
@@ -878,6 +888,7 @@ def test_an_old_install_patches_its_own_converter_and_touches_no_network(mod, tm
     bundle = tmp_path / "old_install"
     bundle.mkdir()
     (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    _write_sibling_gguf_py(bundle)
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
     _no_network(mod, monkeypatch, "an installed self-contained converter must not download")
     mod._download_convert_hf_to_gguf_cached.cache_clear()
@@ -1655,3 +1666,156 @@ def test_a_replacement_published_during_the_move_is_restored_not_deleted(mod, st
         "holding that path lost the files underneath it"
     )
     assert mod._converter_stage_is_usable(stage_dir, repo = "ggml-org/llama.cpp", tag = "b9000")
+
+
+def test_a_monolith_without_its_gguf_py_is_left_to_staging(mod, tmp_path, monkeypatch):
+    """The row exists to keep a co-versioned install offline, so it must not answer
+    for an install that is NOT co-versioned. With no sibling gguf-py the converter's
+    own `sys.path.insert(1, __file__.parent / "gguf-py")` finds nothing and the child
+    falls through to an unpinned site-packages gguf, which is the skew this change
+    exists to remove, and answering here means staging never gets the chance."""
+    bundle = tmp_path / "no_gguf_py"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_a_monolith_with_a_damaged_gguf_py_is_left_to_staging(mod, tmp_path, monkeypatch):
+    """A gguf-py directory can exist and hold no importable package at all."""
+    bundle = tmp_path / "damaged_gguf_py"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    (bundle / "gguf-py" / "gguf").mkdir(parents = True)   # no __init__.py
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_a_monolith_without_gguf_py_is_still_used_when_staging_cannot_answer(mod, tmp_path, monkeypatch):
+    """The other half, and the reason this is not simply a refusal. That install
+    converts today against a pip-installed gguf, so when there is no network to
+    stage from it has to keep converting rather than fail outright."""
+    bundle = tmp_path / "no_gguf_py_offline"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_OFFLINE", "1")
+    # Not _no_network: that traps _resolve_converter_revision too, and calling it is
+    # how the offline decision gets made. Only real transfers are barred here.
+    def _trap(*args, **kwargs):
+        raise AssertionError("offline must not download")
+    monkeypatch.setattr(mod, "_download_archive", _trap)
+    monkeypatch.setattr(mod, "_resolve_llama_cpp_release", _trap)
+    monkeypatch.setattr(mod.requests, "get", _trap)
+    mod._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        patched_path, text_archs, _ = mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+    finally:
+        mod._download_convert_hf_to_gguf_cached.cache_clear()
+    assert "LlamaForCausalLM" in text_archs
+    assert Path(patched_path).parent == bundle
+
+
+# --- a read-only or shared cache ---
+
+def _read_only(path):
+    os.chmod(path, 0o555)
+
+
+def test_a_read_only_cache_hit_is_copied_somewhere_writable(mod, tmp_path, monkeypatch, staging_env):
+    """The patcher writes unsloth_convert_hf_to_gguf.py into the directory it
+    resolved, because the child resolves conversion/ and gguf-py relative to the file
+    it runs. A cache baked read-only into an image, or shared between users, is a
+    reasonable thing to point UNSLOTH_LLAMA_CPP_CONVERTER_CACHE at, and a valid stage
+    in one used to be unusable: every export died on that write."""
+    stage = mod._stage_converter_sources("b9000")
+    assert stage is not None
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
+    _read_only(stage)
+    try:
+        resolved = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert resolved is not None
+        assert os.path.abspath(resolved) != os.path.abspath(stage)
+        assert os.access(resolved, os.W_OK)
+        assert mod._converter_stage_is_usable(
+            resolved, repo = "ggml-org/llama.cpp", tag = "b9000",
+        )
+        # The writable copy is what the patched file can actually be written into.
+        Path(resolved, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
+    finally:
+        os.chmod(stage, 0o755)
+
+
+def test_the_writable_copy_is_made_once_and_then_reused(mod, tmp_path, monkeypatch, staging_env):
+    stage = mod._stage_converter_sources("b9000")
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
+    _read_only(stage)
+    try:
+        first = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        Path(first, "MARKER").write_text("first copy\n")
+        second = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert second == first
+        assert Path(second, "MARKER").is_file(), "it copied again instead of reusing"
+    finally:
+        os.chmod(stage, 0o755)
+
+
+def test_a_writable_stage_is_returned_untouched(mod, tmp_path, monkeypatch, staging_env):
+    """The negative half: the copy is for the read-only case only, so an ordinary
+    writable stage must not be duplicated."""
+    stage = mod._stage_converter_sources("b9000")
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
+    assert mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000") == stage
+    assert not home.exists(), "a writable stage was copied anyway"
+
+
+def test_a_read_only_default_cache_is_reported_rather_than_copied_onto_itself(
+    mod, tmp_path, monkeypatch, staging_env,
+):
+    """When the unwritable cache IS the default root there is nowhere better to copy
+    to, so it says so instead of pretending it recovered."""
+    stage = mod._stage_converter_sources("b9000")
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        mod, "LLAMA_CPP_CONVERTER_CACHE_DIR",
+        os.path.join(str(tmp_path), "llama.cpp-converter"),
+    )
+    _read_only(stage)
+    try:
+        assert mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000") is None
+    finally:
+        os.chmod(stage, 0o755)
+
+
+def test_the_resolver_hands_back_a_writable_directory_from_a_read_only_cache(
+    mod, tmp_path, monkeypatch, staging_env,
+):
+    """Through the production entry point, not the helper. _resolve_staged_convert_script
+    is what the patcher's write location comes from, so it is what has to stop naming a
+    directory nothing can be written into."""
+    stage = mod._stage_converter_sources("b9000")
+    assert stage is not None
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(mod, "_resolve_converter_revision",
+                        lambda *a, **k: ("ggml-org/llama.cpp", "b9000"))
+    _read_only(stage)
+    try:
+        info = mod._resolve_staged_convert_script()
+        assert info is not None, "a valid but read-only cache hit was abandoned"
+        resolved_dir = os.path.dirname(info[0])
+        assert os.access(resolved_dir, os.W_OK), (
+            "the resolver named a directory the patched converter cannot be written to"
+        )
+        # The patcher writes exactly this, and it must not raise.
+        Path(resolved_dir, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
+        assert os.path.isfile(os.path.join(resolved_dir, "conversion", "__init__.py")), (
+            "the writable copy lost the co-versioned conversion/ the child imports"
+        )
+        assert os.path.isfile(
+            os.path.join(resolved_dir, "gguf-py", "gguf", "__init__.py")
+        ), "the writable copy lost the co-versioned gguf-py"
+    finally:
+        os.chmod(stage, 0o755)
