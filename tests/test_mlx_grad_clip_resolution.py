@@ -12,8 +12,43 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_shim():
-    from mlx_simulation import simulate_mlx_on_torch
+    # Evicting unsloth_zoo.mlx.* is what makes the shim reach the code under
+    # test. Where a real mlx is installed -- every Apple Silicon machine, which
+    # is the hardware this module is about -- unsloth_zoo.mlx.trainer may
+    # already be imported and bound to the real mlx.core / mlx.utils at module
+    # scope. Installing the shim afterwards only changes what THIS file imports,
+    # so the test hands a torch tensor to a real mlx op. Dropping the modules
+    # forces the next import to rebuild them against the shim. Mirrors
+    # test_mlx_trainer_internals.py::_install_shim; see its comment for the
+    # module-identity hazard this snapshot/restore pair avoids.
+    import sys
+
+    from mlx_simulation import (
+        restore_modules,
+        simulate_mlx_on_torch,
+        snapshot_modules,
+    )
+    from mlx_simulation.mlx_stub import _MLXFinder
+
+    shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
+
+    def _owned(name):
+        return (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        )
+
+    real_mlx_modules = snapshot_modules(_owned)
     simulate_mlx_on_torch()
+    for name in list(sys.modules):
+        if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
+            sys.modules.pop(name, None)
+    yield
+    sys.meta_path[:] = [
+        finder for finder in sys.meta_path
+        if not isinstance(finder, _MLXFinder)
+    ]
+    restore_modules(real_mlx_modules, _owned)
 
 
 def _resolve(raw_mgv=None, raw_mgln=None, max_grad_norm=0.0):
@@ -151,15 +186,13 @@ def test_trainer_source_pins_resolution_rule():
     assert 'return 0.0, 0.0, 1.0, "leaf_norm"' in src
 
 
-def test_source_distinguishes_leaf_norm_from_elementwise_value_clip():
-    """Pin the API split: value is elementwise, leaf_norm is proportional."""
-    import inspect
-    from unsloth_zoo.mlx import trainer as T
+def test_leaf_norm_and_value_clipping_have_distinct_results():
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_by_value
 
-    value_src = inspect.getsource(T._clip_grad_by_value)
-    leaf_src = inspect.getsource(T._clip_grad_by_leaf_norm)
-
-    assert "mx.clip" in value_src
-    assert "mx.sqrt(mx.sum" in leaf_src
-    assert "return g * scale.astype(g.dtype)" in leaf_src
-    assert "mx.clip" not in leaf_src
+    grad = {"weight": mx.array([3.0, 4.0])}
+    value_clipped = _clip_grad_by_value(grad, 2.0)
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, 2.5)
+    np.testing.assert_allclose(np.array(value_clipped["weight"]), [2.0, 2.0])
+    np.testing.assert_allclose(np.array(leaf_clipped["weight"]), [1.5, 2.0], rtol=1e-6)
