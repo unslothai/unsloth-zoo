@@ -161,9 +161,20 @@ def _ceiling(spec: SpecifierSet) -> Version:
     that excludes the tested release. Ties are broken by exclusivity, since `<5.16.0` is
     tighter than `<=5.16.0`.
     """
+    return _ceiling_bound(spec)[0]
+
+
+def _ceiling_bound(spec: SpecifierSet) -> tuple[Version, bool]:
+    """The tightest upper bound AND whether it is exclusive.
+
+    `_ceiling` alone cannot answer "is this the exact declared bound", because `<2.15.0`
+    and `<=2.15.0` share a version and admit different release sets: the second lets in a
+    2.15.0 the matrix never ran. Every assertion that compares a bound against a declared
+    one has to compare this pair, not just the version.
+    """
     tops = [(Version(str(s.version)), s.operator == "<") for s in spec if s.operator in ("<=", "<")]
     assert tops, f"no upper bound declared: {spec}"
-    return min(tops, key = lambda pair: (pair[0], pair[1]))[0]
+    return min(tops, key = lambda pair: (pair[0], pair[1]))
 
 
 def _transformers_lists() -> dict[str, list[Requirement]]:
@@ -271,7 +282,7 @@ def test_the_torch_ceiling_admits_what_the_matrix_ran() -> None:
         # still admits the tested release, so an admission-only check would let the package
         # publish support for a torch 2.15.x nobody ran, with this file still declaring
         # TORCH_BOUND as <2.15.0.
-        assert _ceiling(req.specifier) == _ceiling(SpecifierSet(TORCH_BOUND)), (
+        assert _ceiling_bound(req.specifier) == _ceiling_bound(SpecifierSet(TORCH_BOUND)), (
             f"pyproject.toml bounds torch as {req.specifier}, not the {TORCH_BOUND} this "
             f"file declares. Moving the bound means running the matrix on the newly "
             f"admitted releases and moving TESTED_TORCH and TORCH_BOUND here in the same "
@@ -325,7 +336,7 @@ def test_no_workflow_mirror_of_the_torch_bound_drifted() -> None:
         widened = sorted(
             raw
             for raw in mirrors[name]
-            if _ceiling(Requirement(raw).specifier) != _ceiling(SpecifierSet(TORCH_BOUND))
+            if _ceiling_bound(Requirement(raw).specifier) != _ceiling_bound(SpecifierSet(TORCH_BOUND))
         )
         assert not widened, (
             f"{name} installs {widened}, which does not stop where the published "
@@ -590,8 +601,13 @@ def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_rele
     """
     widened = SpecifierSet(">=2.4.0,<2.16.0")
     assert TESTED_TORCH in widened, "the premise: an admission-only check cannot see this"
-    assert _ceiling(widened) != _ceiling(SpecifierSet(TORCH_BOUND))
-    assert _ceiling(SpecifierSet(f">=2.4.0,{TORCH_BOUND}")) == _ceiling(SpecifierSet(TORCH_BOUND))
+    assert _ceiling_bound(widened) != _ceiling_bound(SpecifierSet(TORCH_BOUND))
+    assert _ceiling_bound(SpecifierSet(f">=2.4.0,{TORCH_BOUND}")) == _ceiling_bound(SpecifierSet(TORCH_BOUND))
+    # The case the version-only comparison could not see: same number, different set.
+    assert _ceiling(SpecifierSet("<=2.15.0")) == _ceiling(SpecifierSet("<2.15.0"))
+    assert _ceiling_bound(SpecifierSet("<=2.15.0")) != _ceiling_bound(SpecifierSet("<2.15.0"))
+    assert Version("2.15.0") in SpecifierSet("<=2.15.0")
+    assert Version("2.15.0") not in SpecifierSet("<2.15.0")
 
 
 def test_both_halves_declare_the_floor_that_peft_needs() -> None:
