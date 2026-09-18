@@ -1215,3 +1215,52 @@ def test_a_users_pinned_checkout_is_never_treated_as_our_cache(tmp_path, monkeyp
     llama_cpp = _load_llama_cpp_module()
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
     assert llama_cpp._is_inside_converter_cache(str(tmp_path / "my-llama.cpp")) is False
+
+
+def test_the_converter_tag_pin_outranks_a_leftover_self_contained_converter(mod, staging_env, monkeypatch):
+    """The unsupported-architecture message tells the user to set
+    UNSLOTH_LLAMA_CPP_CONVERTER_TAG. If a leftover self-contained converter on disk
+    won over that pin, the documented way out of "this revision does not know your
+    architecture" would do nothing, and the user would have no way to act on the
+    error they were just handed."""
+    install = tmp = Path(staging_env["cache"]).parent / "install"
+    _write_source_tree(install, entrypoint = _MONOLITH_ENTRYPOINT, conversion = False)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(install))
+
+    # Without the pin the installed converter answers, offline.
+    mod._download_convert_hf_to_gguf.cache_clear()
+    chosen, _t, _v = mod._download_convert_hf_to_gguf()
+    assert os.path.dirname(chosen) == str(install)
+    assert staging_env["downloads"] == 0
+
+    # With the pin, the named revision is staged instead.
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b9000")
+    mod._download_convert_hf_to_gguf.cache_clear()
+    chosen, _t, _v = mod._download_convert_hf_to_gguf()
+    mod._download_convert_hf_to_gguf.cache_clear()
+    assert os.path.dirname(chosen) == mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    assert staging_env["downloads"] == 1
+
+
+def test_replacing_a_file_keeps_the_mode_it_had(tmp_path):
+    """mkstemp creates 0600 and os.replace carries that mode onto the destination,
+    so replacing a world-readable converter would quietly make it owner-only and
+    every other user of a shared install would lose the read access the plain
+    open(path, 'wb') this replaced had left them."""
+    mod = _load_llama_cpp_module()
+    target = tmp_path / "converter.py"
+    target.write_bytes(b"old\n")
+    os.chmod(str(target), 0o644)
+    mod._atomic_write_bytes(str(target), b"new\n")
+    assert target.read_bytes() == b"new\n"
+    assert os.stat(str(target)).st_mode & 0o777 == 0o644
+
+
+def test_a_brand_new_file_is_not_created_owner_only(tmp_path):
+    """No destination to copy a mode from: fall back to what an ordinary create
+    would have produced under the active umask, not to mkstemp's 0600."""
+    mod = _load_llama_cpp_module()
+    target = tmp_path / "fresh.py"
+    mod._atomic_write_bytes(str(target), b"x\n")
+    umask = os.umask(0); os.umask(umask)
+    assert os.stat(str(target)).st_mode & 0o777 == 0o666 & ~umask

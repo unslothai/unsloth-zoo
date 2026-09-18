@@ -1123,6 +1123,18 @@ def _atomic_write_bytes(path, content):
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp creates 0600, and os.replace carries the staged file's mode onto
+        # the destination. Replacing a 0644 converter would therefore silently make
+        # it owner-only, and on a shared install every other user loses the read
+        # access the plain open(path, "wb") this replaces had left them. Carry the
+        # destination's own mode over when there is one, and otherwise fall back to
+        # what a normal create would have produced under the active umask.
+        try:
+            os.chmod(staged, os.stat(path).st_mode & 0o7777)
+        except OSError:
+            umask = os.umask(0); os.umask(umask)
+            try: os.chmod(staged, 0o666 & ~umask)
+            except OSError: pass
         os.replace(staged, path)
     except BaseException:
         # Never leave the staged file behind; the real file is untouched because
@@ -2506,11 +2518,18 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     local_script_info = _resolve_local_convert_script()
     if local_script_info is None:
         local_script_info = _resolve_bundle_convert_script()
-    if local_script_info is None:
+    if local_script_info is None and not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip():
         # Before reaching for the network: an install predating the split already
         # has a self-contained converter matching its binaries. Staging would
         # resolve a revision and download a tarball only to find that revision has
         # no conversion/ and decline, so answer it here and stay offline.
+        #
+        # Skipped when the user named a revision. That pin is an explicit request
+        # for a specific llama.cpp, and it is what the unsupported-architecture
+        # message tells people to set; letting a leftover self-contained converter
+        # win over it would make the documented way out of "this revision does not
+        # know your architecture" do nothing at all. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
+        # still outranks the pin, above: it is the more specific explicit answer.
         local_script_info = _resolve_monolith_bundle_convert_script()
     if local_script_info is None:
         # Nothing co-versioned on disk. Stage all three trees from one revision
