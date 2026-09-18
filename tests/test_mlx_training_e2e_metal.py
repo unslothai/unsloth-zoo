@@ -1650,3 +1650,39 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_checkpointing_keeps_cacheless_kv_shared_gradients():
+    from types import SimpleNamespace
+    from mlx_vlm.models.gemma3n.config import TextConfig
+    from mlx_vlm.models.gemma3n.language import Gemma3Model, Gemma3nDecoderLayer
+    from unsloth_zoo.mlx.loader import _fix_gemma4_kv_sharing
+
+    mx.random.seed(0)
+    backbone = Gemma3Model(TextConfig(
+        model_type="gemma3n_text", hidden_size=64, num_hidden_layers=6,
+        intermediate_size=[128] * 6, activation_sparsity_pattern=[0.0] * 6,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, laurel_rank=4, sliding_window=16,
+        num_kv_shared_layers=2,
+        layer_types=["sliding_attention", "full_attention"] * 3))
+    mx.eval(backbone.parameters())
+    ids = mx.random.randint(0, 64, (1, 32))
+    loss_and_grad = nn.value_and_grad(backbone, lambda m: (m(ids) ** 2).sum())
+
+    original_call = Gemma3Model.__call__
+    _fix_gemma4_kv_sharing(SimpleNamespace(language_model=SimpleNamespace(model=backbone)))
+    try:
+        reference = loss_and_grad(backbone)[1]
+        mlx_utils._patch_layer_class_for_gc(Gemma3nDecoderLayer)
+        try:
+            grads = loss_and_grad(backbone)[1]
+        finally:
+            mlx_utils._unpatch_layer_class_gc(Gemma3nDecoderLayer)
+    finally:
+        Gemma3Model.__call__ = original_call
+        del Gemma3Model._kv_sharing_patched
+    for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
+        assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
