@@ -571,6 +571,7 @@ from .utils import (
     _create_vlm_batch_plan,
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
+    _compact_vlm_cce_batch,
     _preserved_preprocessing_rng,
     _mlx_rng_key,
     _restore_mlx_rng_key,
@@ -615,7 +616,9 @@ from .preference import (
     create_preference_batch_plan,
     encode_generation_prompt_text,
     make_dpo_loss_fn,
+    make_dpo_cce_loss_fn,
     make_orpo_loss_fn,
+    make_orpo_cce_loss_fn,
     make_preference_eval_fn,
     resolve_preference_objective,
     resolve_preference_length_policy,
@@ -3909,6 +3912,20 @@ class MLXTrainer:
         Returns ``(all_losses, ntokens, stats)``; ``stats`` is None unless the
         loss function also reports per-batch metric sums.
         """
+        compaction = getattr(loss_fn, "_unsloth_cce_compaction", False)
+        compact_batches = (
+            compaction and not is_vlm
+            and isinstance(eval_batches, _FINITE_BATCH_PLAN_TYPES)
+        )
+        # Evaluation runs eager, so compacted VLM shapes cost no compiled
+        # variants and the eager batch lists qualify as well as plans.
+        compact_vlm = compaction and is_vlm
+        small_capacity_limit = getattr(loss_fn, "_unsloth_cce_small_capacity_limit", 0)
+        if compact_batches:
+            if isinstance(eval_batches, FinitePreferenceBatchPlan):
+                eval_batches.configure_cce_compaction(kind=loss_fn._unsloth_cce_kind)
+            else:
+                eval_batches.configure_cce_compaction()
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
         metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
@@ -3923,6 +3940,7 @@ class MLXTrainer:
         if should_stop:
             return all_losses, ntokens, stats
         iterator = iter(eval_batches)
+        batch_index = 0
 
         while True:
             failed = False
@@ -3939,11 +3957,16 @@ class MLXTrainer:
 
             if not failed and not self.stop_requested:
                 try:
+                    if compact_batches:
+                        batch_data = eval_batches.prepare_cce_batch(batch_index, batch_data)
+                    elif compact_vlm and isinstance(batch_data, dict):
+                        batch_data = _compact_vlm_cce_batch(
+                            batch_data, small_capacity_limit,
+                        ) or batch_data
                     if is_vlm:
                         scored = loss_fn(self.model, batch_data)
                     else:
-                        batch, lengths, labels = batch_data
-                        scored = loss_fn(self.model, batch, lengths, labels)
+                        scored = loss_fn(self.model, *batch_data)
                     loss, ntoks = scored[0], scored[1]
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
@@ -3965,6 +3988,8 @@ class MLXTrainer:
                 except BaseException as exc:
                     failed = True
                     error = exc
+
+            batch_index += 1
 
             should_stop, failed_any = self._distributed_eval_status(failed)
             self._raise_distributed_failure_from_any(
@@ -4041,7 +4066,8 @@ class MLXTrainer:
                 max_batches=max_batches,
                 comm_group=self.distributed_world,
             )
-        return create_batches(
+        batch_factory = _create_text_batch_plan if args.use_cce else create_batches
+        return batch_factory(
             **common,
             comm_group=self.distributed_world,
             distributed_pad_mode="empty",
@@ -5199,6 +5225,18 @@ class MLXTrainer:
                 ),
                 vlm_compile_decision=getattr(self, "_compile_decision", None),
             )
+        if isinstance(batches, FiniteTextBatchPlan):
+            batches.configure_cce_compaction(
+                getattr(loss_fn, "_unsloth_cce_compaction", False),
+            )
+        if isinstance(batches, FiniteVLMBatchPlan):
+            compaction_report = batches.configure_cce_compaction(
+                getattr(loss_fn, "_unsloth_cce_compaction", False) and distributed_world_size == 1,
+                max_variants=resolve_compile_max_variants(getattr(args, "compile_max_variants", None)),
+                small_capacity_limit=getattr(loss_fn, "_unsloth_cce_small_capacity_limit", 0),
+            )
+            if compaction_report is not None:
+                _compile_shape_guard_report = compaction_report
         # Shared by the preflight and prepared paths: batch_iter is the
         # streaming producer when active, None otherwise.
         _prefetch_active = bool(
@@ -5444,7 +5482,9 @@ class MLXTrainer:
         if preference_kind:
             if preference_kind == "orpo":
                 objective = resolve_preference_objective("orpo", beta=args.beta)
-                loss_fn = make_orpo_loss_fn(objective)
+                loss_fn = (make_orpo_cce_loss_fn(model, objective)
+                           if args.use_cce else make_orpo_loss_fn(objective))
+                use_cce = getattr(loss_fn, "_unsloth_cce_compaction", False)
                 self._preference_reference_provenance = {
                     "kind": "orpo_no_reference"
                 }
@@ -5472,9 +5512,9 @@ class MLXTrainer:
                 # Sampling borrows this policy's adapter modules so it zeroes
                 # the same ones the loss does. NEFTune is already off in eval.
                 _sampling_reference = reference_policy
-                loss_fn = make_dpo_loss_fn(
-                    objective, reference_policy=reference_policy,
-                )
+                loss_fn = (make_dpo_cce_loss_fn(model, objective, reference_policy=reference_policy)
+                           if args.use_cce else make_dpo_loss_fn(objective, reference_policy=reference_policy))
+                use_cce = getattr(loss_fn, "_unsloth_cce_compaction", False)
                 _main_print(
                     f"Unsloth: Using DPO loss (beta={args.beta}, "
                     f"loss_type={list(objective.loss_types)})."
@@ -5485,7 +5525,12 @@ class MLXTrainer:
             # Not the training loss: that one normalizes across a window.
             preference_eval_fn = make_preference_eval_fn(
                 objective, reference_policy=_sampling_reference,
+                model=model if args.use_cce else None,
             )
+            if isinstance(batches, FinitePreferenceBatchPlan):
+                batches.configure_cce_compaction(
+                    getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
+                )
 
         self.callback_handler.optimizer = optimizer
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
@@ -5752,9 +5797,7 @@ class MLXTrainer:
         def _loss_and_grad(batch_data):
             if isinstance(batch_data, dict):
                 return loss_and_grad_fn(model, batch_data)
-            return loss_and_grad_fn(
-                model, batch_data[0], batch_data[1], batch_data[2]
-            )
+            return loss_and_grad_fn(model, *batch_data)
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
@@ -7297,6 +7340,10 @@ class MLXTrainer:
                         )
                     else:
                         batch_data = batches[scheduled_index]
+                    if isinstance(batches, (FiniteTextBatchPlan, FiniteVLMBatchPlan, FinitePreferenceBatchPlan)):
+                        batch_data = batches.prepare_cce_batch(
+                            scheduled_index, batch_data,
+                        )
                     batch_idx += 1
             except BaseException as e:
                 batch_error = e
@@ -9036,6 +9083,7 @@ def _prepare_response_labeled_eval_batches(
             return_dataset=True,
             comm_group=comm_group,
             distributed_pad_mode="empty",
+            return_plan=True,
         )
         return batches, response_masked_dataset
 
