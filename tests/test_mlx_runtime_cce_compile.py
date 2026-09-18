@@ -531,7 +531,7 @@ def test_label_smoothing_matches_closed_form():
     assert max(float(mx.abs(a - b).max().item()) for a, b in zip(gc, gm)) < 2e-5
 
 
-@pytest.mark.parametrize("quantized, eps, softcap", [(False, 0.1, 0.0), (False, 1.0, 5.0), (True, 0.1, 5.0)])
+@pytest.mark.parametrize("quantized, eps, softcap", [(False, 0.1, 0.0), (False, 0.1, 5.0), (False, 1.0, 5.0), (True, 0.1, 5.0)])
 def test_compiled_label_smoothing_across_chunks(quantized, eps, softcap):
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
@@ -571,3 +571,27 @@ def test_compiled_label_smoothing_across_chunks(quantized, eps, softcap):
     # Quantized dH accumulates the vocabulary chunks in bf16.
     assert relative_error < (0.05 if quantized else 2e-4)
     assert mx.all(grad[3] == 0).item()
+
+
+def test_compiled_label_smoothing_softcap_adds_no_memory():
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    mx.random.seed(31)
+    hidden = (mx.random.normal((1024, 256)) * 0.05).astype(mx.bfloat16)
+    weight = (mx.random.normal((65536, 256)) * 0.02).astype(mx.bfloat16)
+    targets = mx.random.randint(0, 65536, (1024,))
+    mx.eval(hidden, weight, targets)
+
+    def peak(softcap):
+        cce, _ = make_chunked_cross_entropy_loss(chunk_size=4096, label_smoothing=0.1, logit_softcap=softcap)
+        step = mx.compile(mx.value_and_grad(lambda h: cce(h, weight, targets).sum()))
+        mx.eval(step(hidden))
+        mx.synchronize()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        mx.eval(step(hidden))
+        mx.synchronize()
+        return mx.get_peak_memory() - resident
+
+    assert peak(30.0) <= 1.05 * peak(0.0)

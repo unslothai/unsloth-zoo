@@ -533,10 +533,14 @@ def _build_smoothing_forward_kernel(finalize: bool) -> Callable:
         threadgroup float max_buf[256];
         threadgroup float exp_buf[256];
         threadgroup float capped_buf[256];
+        float softcap = softcap_arr[0];
         float local_max = -INFINITY;
         float local_capped = 0.0f;
         for (uint col = lid; col < width; col += 256) {
             float val = logits[base + col];
+            if (softcap > 0.0f) {
+                val = softcap * fast::tanh(val / softcap);
+            }
             local_max = metal::max(local_max, val);
             local_capped += val;
         }
@@ -553,7 +557,11 @@ def _build_smoothing_forward_kernel(finalize: bool) -> Callable:
         float chunk_max = max_buf[0];
         float local_exp = 0.0f;
         for (uint col = lid; col < width; col += 256) {
-            local_exp += fast::exp(logits[base + col] - chunk_max);
+            float val = logits[base + col];
+            if (softcap > 0.0f) {
+                val = softcap * fast::tanh(val / softcap);
+            }
+            local_exp += fast::exp(val - chunk_max);
         }
         exp_buf[lid] = local_exp;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -573,6 +581,9 @@ def _build_smoothing_forward_kernel(finalize: bool) -> Callable:
             float next_target = running_target[row];
             if (target >= start && target < start + int(width)) {
                 next_target = logits[base + uint(target - start)];
+                if (softcap > 0.0f) {
+                    next_target = softcap * fast::tanh(next_target / softcap);
+                }
             }
             FINALIZE_BODY
         }
@@ -596,18 +607,19 @@ def _build_smoothing_forward_kernel(finalize: bool) -> Callable:
     return mx.fast.metal_kernel(
         name="cce_runtime_smoothing_forward_" + str(int(finalize)),
         input_names=["logits", "targets", "running_max", "running_sum",
-                     "running_target", "running_capped", "start_arr", "smoothing"],
+                     "running_target", "running_capped", "start_arr", "softcap_arr", "smoothing"],
         output_names=output_names,
         source=source.replace("FINALIZE_BODY", body),
         ensure_row_contiguous=True,
     )
 
 
-def _build_smoothing_dlogits_kernel(logit_softcap: float) -> Callable:
+def _build_smoothing_dlogits_kernel() -> Callable:
     source = """
         uint base = thread_position_in_grid.x * 4;
-        uint total = capped_shape[0] * capped_shape[1];
-        uint width = capped_shape[1];
+        uint total = logits_shape[0] * logits_shape[1];
+        uint width = logits_shape[1];
+        float softcap = softcap_arr[0];
         for (uint i = 0; i < 4; i++) {
             uint elem = base + i;
             if (elem >= total) {
@@ -624,44 +636,40 @@ def _build_smoothing_dlogits_kernel(logit_softcap: float) -> Callable:
                 continue;
             }
             int global_v = start_arr[0] + int(elem % width);
-            float prob = fast::exp(float(capped[elem]) - lse[row]);
+            float raw = logits[elem];
+            float capped = raw;
+            float t = 0.0f;
+            if (softcap > 0.0f) {
+                t = fast::tanh(raw / softcap);
+                capped = softcap * t;
+            }
+            float prob = fast::exp(capped - lse[row]);
             float grad = prob - smoothing[0] * float(global_v == target);
             grad = (grad - smoothing[1]) * grad_output[row];
-            SOFTCAP_DERIVATIVE
+            if (softcap > 0.0f) {
+                grad *= (1.0f - t * t);
+            }
             d_logits[elem] = static_cast<O>(grad);
         }
     """
-    derivative = """
-            grad *= float(softcap_derivative[elem]);
-    """ if logit_softcap > 0 else ""
     kernel = mx.fast.metal_kernel(
-        name="cce_runtime_smoothing_dlogits_" + str(int(logit_softcap > 0)),
-        input_names=["capped", "lse", "targets", "grad_output", "start_arr",
-                     "ignore_arr", "smoothing", "softcap_derivative"],
-        output_names=["d_logits"], source=source.replace("SOFTCAP_DERIVATIVE", derivative),
+        name="cce_runtime_smoothing_dlogits",
+        input_names=["logits", "lse", "targets", "grad_output", "start_arr",
+                     "ignore_arr", "softcap_arr", "smoothing"],
+        output_names=["d_logits"], source=source,
         ensure_row_contiguous=True,
     )
 
     def call(*, inputs, **kwargs):
-        logits, lse, targets, grad_output, start_arr, ignore_arr, _, smoothing = inputs
-        # Preserve the fallback's softcap and derivative rounding.
-        capped = _apply_softcap(logits, logit_softcap)
-        if logit_softcap > 0:
-            softcap = mx.array(logit_softcap, dtype=mx.float32)
-            t = mx.tanh(logits / softcap)
-            softcap_derivative = 1.0 - t * t
-        else:
-            softcap_derivative = mx.zeros((1,), dtype=mx.float32)
-        kwargs["output_dtypes"] = [logits.dtype]
-        kwargs["template"] = [("O", logits.dtype)]
-        return kernel(inputs=[capped, lse, targets, grad_output, start_arr,
-                              ignore_arr, smoothing, softcap_derivative], **kwargs)
+        dtype = inputs[0].dtype
+        kwargs["output_dtypes"] = [dtype]
+        kwargs["template"] = [("O", dtype)]
+        return kernel(inputs=inputs, **kwargs)
     return call
 
 
 def _build_kernel_set(
     label_smoothing: float = 0.0,
-    logit_softcap: float = 0.0,
 ) -> tuple[Callable | None, Callable | None, Callable | None]:
     if not mx.metal.is_available():
         return None, None, None
@@ -670,7 +678,7 @@ def _build_kernel_set(
         return (
             _build_smoothing_forward_kernel(False),
             _build_smoothing_forward_kernel(True),
-            _build_smoothing_dlogits_kernel(logit_softcap),
+            _build_smoothing_dlogits_kernel(),
         )
 
     return (
@@ -734,7 +742,7 @@ def _forward_chunked_fused_finalize(
     targets = targets_raw.astype(mx.int32)
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
     if label_smoothing > 0.0:
-        compute_bytes = 4  # smoothing casts each logits chunk to fp32
+        compute_bytes = 4  # sized for the fallback, which casts each smoothed chunk to fp32
     chunk_size = _resolve_chunk_size(
         chunk_size,
         n,
@@ -822,15 +830,13 @@ def _forward_chunked_fused_finalize(
         )
 
         if sum_capped is not None:
-            # Keep softcap rounding before promoting the smoothing reduction.
-            logits = _apply_softcap(logits, logit_softcap).astype(mx.float32)
             finalize = chunk_idx == last_chunk_idx
             kernel = forward_update_finalize_kernel if finalize else forward_update_kernel
             count = 2 if finalize else 4
             result = kernel(
                 inputs=[
                     logits, targets, running_max, running_sum_exp, target_logit,
-                    sum_capped, chunk_starts[chunk_idx], smoothing_arr,
+                    sum_capped, chunk_starts[chunk_idx], softcap_arr, smoothing_arr,
                 ],
                 output_shapes=[(n,)] * count,
                 output_dtypes=[mx.float32] * count,
@@ -952,7 +958,7 @@ def make_runtime_cce_loss_fused_finalize(
 ):
     label_smoothing = _normalize_label_smoothing(label_smoothing)
     forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel = _build_kernel_set(
-        label_smoothing, logit_softcap,
+        label_smoothing,
     )
     use_metal_kernel = dlogits_kernel is not None
 
@@ -978,7 +984,7 @@ def make_runtime_cce_loss_fused_finalize(
         vocab_size = weight.shape[0]
         compute_bytes = 2 if hidden.dtype in (mx.float16, mx.bfloat16) else 4
         if label_smoothing > 0.0:
-            compute_bytes = 4  # smoothing casts each logits chunk to fp32
+            compute_bytes = 4  # sized for the fallback, which casts each smoothed chunk to fp32
         resolved_chunk_size = _resolve_chunk_size(
             chunk_size,
             n_tokens,
