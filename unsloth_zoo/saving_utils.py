@@ -3092,6 +3092,18 @@ def _shard_name_stays_inside(name):
     return True
 
 
+def _has_directory_component(name):
+    """Whether `name` puts its shard in a subdirectory, under EITHER separator rule.
+
+    `_shard_name_stays_inside` admits a name if it is contained under both posixpath
+    and ntpath, so `weights\\model.safetensors` survives and is written verbatim. The
+    native `os.path.dirname` sees no directory in that on POSIX, which would leave the
+    export with neither a root `model.safetensors` nor an index naming the file it does
+    have. Judged the same way the predicate that admitted it judges.
+    """
+    return bool(posixpath.dirname(name)) or bool(ntpath.dirname(name))
+
+
 def _reject_unsafe_shard_index(index_path):
     """Refuse an index whose weight_map points outside the directory it sits in.
 
@@ -3149,7 +3161,14 @@ def _resolves_inside(path, directory):
     """
     resolved = os.path.realpath(path)
     root = os.path.realpath(directory)
-    return resolved == root or resolved.startswith(root + os.sep)
+    try:
+        # `commonpath` rather than a `root + os.sep` prefix, which is wrong at a
+        # filesystem root: realpath("/") is "/", so the prefix becomes "//" and
+        # "/model.safetensors" tests as outside the directory holding it.
+        return os.path.commonpath([resolved, root]) == root
+    except ValueError:
+        # Different Windows drives, or a mix the comparison cannot span. Not inside.
+        return False
 
 
 def _materialize_shard_that_resolves_outside(file_path, save_directory):
@@ -3634,7 +3653,7 @@ def merge_and_overwrite_lora(
     # several shards, or the HF `model-0000n-of-0000m` naming. A single
     # `weights/model.safetensors` is neither, and without its index the export holds no
     # root `model.safetensors` and nothing pointing at the one it does hold.
-    _has_nested_shard = any(os.path.dirname(_f) for _f in safetensors_list)
+    _has_nested_shard = any(_has_directory_component(_f) for _f in safetensors_list)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
@@ -3830,7 +3849,7 @@ def merge_and_overwrite_lora(
     # directory, and a nested singleton is neither, so without this the export has no
     # discoverable weights at all. Read off the FINAL list, since splitting and
     # renumbering flatten the names before this point.
-    _final_has_nested_shard = any(os.path.dirname(_f) for _f in final_safetensors_list)
+    _final_has_nested_shard = any(_has_directory_component(_f) for _f in final_safetensors_list)
     regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded or _final_has_nested_shard) and save_method != "mxfp4"
     weight_map = {}
 

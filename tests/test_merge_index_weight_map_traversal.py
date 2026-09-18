@@ -1092,3 +1092,100 @@ def test_a_dequantized_nested_singleton_still_gets_an_index(
             assert os.path.exists(os.path.join(output, value)), (
                 f"the regenerated index names {value!r}, which is not in the export"
             )
+
+
+@pytest.mark.parametrize("directory, path, expected", [
+    ("/",     "/model.safetensors",          True),
+    ("/",     "/sub/model.safetensors",      True),
+    ("/tmp",  "/tmp/model.safetensors",      True),
+    ("/tmp",  "/tmp",                        True),
+    ("/tmp",  "/etc/passwd",                 False),
+    ("/tmp",  "/tmpfoo/model.safetensors",   False),
+])
+def test_containment_holds_at_a_filesystem_root(directory, path, expected):
+    """A `root + os.sep` prefix test is wrong at a filesystem root.
+
+    `os.path.realpath("/")` is `/`, so the prefix becomes `//` and `/model.safetensors`
+    reads as outside the directory that holds it. Every guarded writer then refuses a
+    shard that is genuinely inside, after the config files have already been written.
+    The `/tmpfoo` case pins that the fix does not go the other way and accept a sibling
+    whose name merely starts with the directory's.
+    """
+    assert saving_utils._resolves_inside(path, directory) is expected
+
+
+@pytest.mark.parametrize("name, nested", [
+    ("model.safetensors",                    False),
+    ("model-00001-of-00002.safetensors",     False),
+    ("weights/model.safetensors",            True),
+    ("weights\\model.safetensors",           True),
+    ("a/b/model.safetensors",                True),
+    ("a\\b\\model.safetensors",              True),
+])
+def test_nesting_is_detected_under_both_separator_rules(name, nested):
+    """`_shard_name_stays_inside` admits a name if it is contained under BOTH rules, so
+    `weights\\model.safetensors` survives and is written verbatim. Detecting nesting with
+    only the native separator misses it on POSIX, and the export then carries neither a
+    root `model.safetensors` nor an index naming the file it does have."""
+    assert saving_utils._shard_name_stays_inside(name) is True
+    assert saving_utils._has_directory_component(name) is nested
+
+
+def test_a_backslash_named_singleton_still_gets_an_index(monkeypatch, tmp_path):
+    """End to end for the case above: the export must be loadable, not just consistent."""
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    if os.name == "nt":
+        pytest.skip("a backslash is a separator on Windows, so this is the nested case")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
+    if len(shards) != 1:
+        pytest.skip("the tiny base model did not fit in a single shard")
+    peft_model = H.attach_lora(model, spec, "full")
+
+    # One shard, named with a backslash: an ordinary POSIX filename, no directory.
+    relative = "weights\\model.safetensors"
+    shadow = os.path.join(str(tmp_path), "ns", "base")
+    os.makedirs(shadow, exist_ok = True)
+    shutil.copy2(os.path.join(real_base, "config.json"), os.path.join(shadow, "config.json"))
+    shutil.copy2(os.path.join(real_base, shards[0]), os.path.join(shadow, relative))
+    from safetensors import safe_open
+    weight_map = {}
+    with safe_open(os.path.join(shadow, relative), framework = "pt") as f:
+        for key in f.keys():
+            weight_map[key] = relative
+    with open(
+        os.path.join(shadow, "model.safetensors.index.json"), "w", encoding = "utf-8",
+    ) as f:
+        json.dump({"metadata": {"total_size": 1}, "weight_map": weight_map}, f)
+
+    base_rel = os.path.join("ns", "base")
+    save_directory = os.path.join("out", "merged")
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+
+    saving_utils.merge_and_overwrite_lora(
+        get_model_name  = lambda *a, **k: base_rel,
+        model           = peft_model,
+        tokenizer       = None,
+        save_directory  = save_directory,
+        save_method     = "merged_16bit",
+        push_to_hub     = False,
+    )
+
+    output = os.path.join(str(tmp_path), save_directory)
+    index = os.path.join(output, "model.safetensors.index.json")
+    assert os.path.exists(os.path.join(output, "model.safetensors")) or os.path.exists(index), (
+        f"nothing in the export is discoverable by a loader: {os.listdir(output)}"
+    )
+    if os.path.exists(index):
+        with open(index, encoding = "utf-8") as f:
+            exported = json.load(f)["weight_map"]
+        for value in set(exported.values()):
+            assert os.path.exists(os.path.join(output, value)), (
+                f"the exported index names {value!r}, which is not in the export"
+            )
