@@ -3651,6 +3651,35 @@ def _gguf_skew_diagnosis(converter_location, python_exe, report = None, architec
         return ""
 
 
+def _verify_run_outputs(files, description, required, quantization_type,
+                        print_output = False, gguf_py_dir = None):
+    """Read one converter run's outputs back. True to keep them, False to drop them.
+
+    A REQUIRED run raises, which is the export failing. An OPTIONAL run, i.e. the
+    projector, does not: a converter that exits 0 while writing an unreadable or
+    structurally invalid GGUF is the same outcome for the user as one that exits
+    non-zero, and that case is already handled as a text-only downgrade. Aborting
+    here instead would throw away a text model that is present and valid, which is
+    the opposite of what the optional handling exists to do. The bad projector is
+    removed so that nothing uploads it."""
+    try:
+        _verify_converted_gguf(
+            files, quantization_type, print_output = print_output,
+            gguf_py_dir = gguf_py_dir,
+        )
+        return True
+    except Exception as error:
+        if required: raise
+        for path in files: _remove_gguf_outputs(path)
+        print(
+            f"Unsloth: The {description} converted but did not pass verification "
+            f"({error}). It has been removed. The text model was converted "
+            f"successfully and is usable; only multimodal (image/audio) input is "
+            f"unavailable in this GGUF."
+        )
+        return False
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -3781,6 +3810,10 @@ def convert_to_gguf(
     pass
 
     all_output_files = []
+    # Which files came from which run, and whether that run was required. The
+    # read-back below needs it: a projector is an OPTIONAL run, and its failure is
+    # already a text-only downgrade rather than an aborted export.
+    verify_groups = []
     runs_to_do = []
 
     if is_vlm:
@@ -4102,6 +4135,7 @@ def convert_to_gguf(
             print(f"Found {len(shard_files)} sharded output files for {description}")
             all_output_files.extend(shard_files)
             found_files = shard_files
+        verify_groups.append((list(found_files), description, required))
         pass
 
         if print_output:
@@ -4125,10 +4159,14 @@ def convert_to_gguf(
     # needed to be. The read-back still has to know which `gguf` wrote the file: see
     # `_gguf_readback_tree`, which derives it from the probe report without changing what
     # the child ran with.
-    _verify_converted_gguf(
-        all_output_files, quantization_type, print_output = print_output,
-        gguf_py_dir = _gguf_py_pin or _gguf_readback_tree(_gguf_report),
-    )
+    _readback_tree = _gguf_py_pin or _gguf_readback_tree(_gguf_report)
+    for _files, _description, _required in verify_groups:
+        if not _verify_run_outputs(
+            _files, _description, _required, quantization_type,
+            print_output = print_output, gguf_py_dir = _readback_tree,
+        ):
+            all_output_files = [f for f in all_output_files if f not in set(_files)]
+            is_vlm = False
 
     return all_output_files, is_vlm
 pass

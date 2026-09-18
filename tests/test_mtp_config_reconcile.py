@@ -521,3 +521,54 @@ def test_a_writable_config_is_still_rewritten(tmp_path, monkeypatch):
         else real_stat(path, *a, **k),
     )
     assert _config_is_writable(config_path) is True
+
+
+# ---------------------------------------------------------------------------
+# Nested config shapes. The three nested containers are the ones
+# _sync_gguf_nextn_layer_config in unsloth_zoo/mlx/utils.py already reads; a
+# declaration missed here is left in the exported config with no weights behind it,
+# which is the state that makes a later GGUF conversion fail on missing MTP layers.
+# ---------------------------------------------------------------------------
+
+from unsloth_zoo.saving_utils import _mtp_config_containers
+
+
+@pytest.mark.parametrize("shape, build", [
+    ("top_level",                  lambda k: {k: 1}),
+    ("text_config",                lambda k: {"text_config": {k: 1}}),
+    ("language_config",            lambda k: {"language_config": {k: 1}}),
+    ("thinker_config_text_config", lambda k: {"thinker_config": {"text_config": {k: 1}}}),
+])
+def test_every_supported_nested_shape_is_reconciled(tmp_path, shape, build):
+    folder = tmp_path / shape
+    folder.mkdir()
+    _write_checkpoint(folder, ["model.layers.0.self_attn.q_proj.weight"])
+    (folder / "config.json").write_text(json.dumps(build(MTP_CONFIG_KEY)), encoding = "utf-8")
+
+    assert reconcile_mtp_config(str(folder)) == "stripped"
+    rewritten = (folder / "config.json").read_text(encoding = "utf-8")
+    assert MTP_CONFIG_KEY not in rewritten, f"{shape}: the unbacked declaration survived"
+
+
+def test_a_declaration_backed_by_weights_is_kept_in_a_nested_shape(tmp_path):
+    folder = tmp_path / "backed"
+    folder.mkdir()
+    _write_checkpoint(folder, [
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.mtp.0.weight",
+    ])
+    (folder / "config.json").write_text(
+        json.dumps({"language_config": {MTP_CONFIG_KEY: 1}}), encoding = "utf-8")
+    assert reconcile_mtp_config(str(folder)) == "agrees"
+    kept = json.loads((folder / "config.json").read_text(encoding = "utf-8"))
+    assert kept["language_config"][MTP_CONFIG_KEY] == 1
+
+
+def test_the_same_container_reachable_twice_is_collected_once():
+    """Identity, not equality: two shapes can hold equal dicts and both need
+    rewriting, while one dict reachable by two paths must be collected once."""
+    shared = {MTP_CONFIG_KEY: 1}
+    aliased = {MTP_CONFIG_KEY: 1, "text_config": shared, "language_config": shared}
+    assert len(_mtp_config_containers(aliased)) == 2
+    distinct = {"text_config": {MTP_CONFIG_KEY: 1}, "language_config": {MTP_CONFIG_KEY: 1}}
+    assert len(_mtp_config_containers(distinct)) == 2

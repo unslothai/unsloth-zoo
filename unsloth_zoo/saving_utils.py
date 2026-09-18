@@ -3013,15 +3013,33 @@ def mtp_head_is_present(tensor_names, config = None, container = None):
 
 
 def _mtp_config_containers(config):
-    """Every dict inside a loaded config.json that declares the MTP key."""
+    """Every dict inside a loaded config.json that declares the MTP key.
+
+    The nested shapes are the three `_sync_gguf_nextn_layer_config` in
+    `unsloth_zoo/mlx/utils.py` already reads, kept identical on purpose: a
+    declaration this misses is left in the exported config with no weights behind
+    it, which is the state that makes a later GGUF conversion fail on the missing
+    MTP layers. Reaching only `text_config` meant a checkpoint declaring the key
+    under `language_config` or `thinker_config.text_config` reported `not-declared`
+    and was silently left stale."""
     if not isinstance(config, dict):
         return []
+    thinker = config.get("thinker_config")
+    candidates = [
+        config,
+        config.get("text_config"),
+        config.get("language_config"),
+        thinker.get("text_config") if isinstance(thinker, dict) else None,
+    ]
     containers = []
-    if MTP_CONFIG_KEY in config:
-        containers.append(config)
-    nested = config.get("text_config")
-    if isinstance(nested, dict) and MTP_CONFIG_KEY in nested:
-        containers.append(nested)
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or MTP_CONFIG_KEY not in candidate:
+            continue
+        # Identity, not equality: two shapes can hold equal dicts and both need
+        # rewriting, while the same dict reachable twice must be rewritten once.
+        if any(candidate is seen for seen in containers):
+            continue
+        containers.append(candidate)
     return containers
 
 

@@ -1057,11 +1057,42 @@ def test_a_report_with_no_usable_location_still_changes_nothing(llama_cpp, tmp_p
 
 
 def test_the_conversion_passes_the_derived_tree_to_the_verifier(llama_cpp):
-    """The derivation is only worth anything if `convert_to_gguf` uses it. A call site still
-    passing `_gguf_py_pin` alone would leave every case above passing while the common path
-    read the file back with the parent's gguf exactly as before."""
-    source = Path(llama_cpp.__file__).read_text()
-    assert "gguf_py_dir = _gguf_py_pin or _gguf_readback_tree(_gguf_report)," in source
+    """The derivation is only worth anything if `convert_to_gguf` uses it. A call site
+    still passing `_gguf_py_pin` alone would leave every case above passing while the
+    common path read the file back with the parent's gguf exactly as before.
+
+    Checked through the AST rather than by matching the source line: the literal
+    version of this test failed the moment the call was refactored, on code that was
+    correct, which is the opposite of what a guard is for."""
+    import ast as _ast
+    tree = _ast.parse(Path(llama_cpp.__file__).read_text())
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == "convert_to_gguf")
+
+    # Names assigned from an expression that mentions _gguf_readback_tree.
+    derived = set()
+    for node in _ast.walk(fn):
+        if isinstance(node, _ast.Assign) and any(
+            isinstance(c, _ast.Name) and c.id == "_gguf_readback_tree"
+            for c in _ast.walk(node.value)
+        ):
+            derived.update(t.id for t in node.targets if isinstance(t, _ast.Name))
+    assert derived, "convert_to_gguf never derives a read-back tree"
+
+    # Every verification call must be handed one of those names, or the expression.
+    calls = [n for n in _ast.walk(fn) if isinstance(n, _ast.Call)
+             and isinstance(n.func, _ast.Name)
+             and n.func.id in ("_verify_converted_gguf", "_verify_run_outputs")]
+    assert calls, "convert_to_gguf no longer verifies what it wrote"
+    for call in calls:
+        kw = {k.arg: k.value for k in call.keywords}
+        assert "gguf_py_dir" in kw, "a verification call lost gguf_py_dir"
+        value = kw["gguf_py_dir"]
+        names = {c.id for c in _ast.walk(value) if isinstance(c, _ast.Name)}
+        assert names & (derived | {"_gguf_readback_tree"}), (
+            "gguf_py_dir is not the derived read-back tree"
+        )
+
 
 
 # ---------------------------------------------------------------------------
@@ -1211,3 +1242,63 @@ def test_a_corrupt_shard_is_reported_for_a_projector_too(llama_cpp, tmp_path):
     write_gguf(tmp_path / "q-00002-of-00002.gguf", architecture = "clip", keys = {},
                tensors = {"mm.1.weight": None})
     assert llama_cpp.gguf_metadata_problems(ok_first) == []
+
+
+# ---------------------------------------------------------------------------
+# A failed OPTIONAL run is a text-only downgrade, not an aborted export.
+# ---------------------------------------------------------------------------
+
+def test_a_required_run_that_fails_verification_raises(llama_cpp, tmp_path):
+    keys = {k: v for k, v in UNIVERSAL.items() if k != "llama.block_count"}
+    path = write_gguf(tmp_path / "text.gguf", keys = keys,
+                      tensors = {"blk.0.attn_q.weight": None})
+    with pytest.raises(RuntimeError, match = "did not pass post conversion verification"):
+        llama_cpp._verify_run_outputs(
+            [path], "text model", True, "bf16", print_output = False,
+        )
+    assert os.path.exists(path), "a required run's output is left for the caller to inspect"
+
+
+def test_a_failed_optional_run_is_dropped_and_the_export_continues(llama_cpp, tmp_path, capsys):
+    """The projector is an OPTIONAL run. A converter that exits 0 while writing a
+    structurally invalid GGUF is the same outcome for the user as one that exits
+    non-zero, and that case is already a text-only downgrade. Aborting here would
+    throw away a text model that is present and valid."""
+    keys = {k: v for k, v in UNIVERSAL.items() if k != "llama.block_count"}
+    path = write_gguf(tmp_path / "mmproj.gguf", keys = keys,
+                      tensors = {"blk.0.attn_q.weight": None})
+    kept = llama_cpp._verify_run_outputs(
+        [path], "vision projector", False, "bf16", print_output = False,
+    )
+    assert kept is False
+    assert not os.path.exists(path), "the bad projector must be removed so nothing uploads it"
+    out = capsys.readouterr().out
+    assert "vision projector" in out
+    assert "text model was converted" in out
+
+
+def test_a_clean_optional_run_is_kept(llama_cpp, tmp_path):
+    path = write_gguf(tmp_path / "mmproj.gguf", architecture = "clip",
+                      keys = {}, tensors = {"mm.0.weight": None})
+    assert llama_cpp._verify_run_outputs(
+        [path], "vision projector", False, "bf16", print_output = False,
+    ) is True
+    assert os.path.exists(path)
+
+
+def test_the_conversion_drops_only_the_failed_optional_runs_files(llama_cpp):
+    """The loop must remove exactly that run's files from the returned list and flip
+    is_vlm, not abort. Pinned through the AST so a refactor that reverts to verifying
+    the aggregate list is caught."""
+    import ast as _ast
+    tree = _ast.parse(Path(llama_cpp.__file__).read_text())
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == "convert_to_gguf")
+    calls = [n for n in _ast.walk(fn) if isinstance(n, _ast.Call)
+             and isinstance(n.func, _ast.Name) and n.func.id == "_verify_run_outputs"]
+    assert calls, "convert_to_gguf no longer verifies per run"
+    # The required flag must be passed through, not hardcoded.
+    for call in calls:
+        args = [a for a in call.args if isinstance(a, _ast.Name)]
+        assert any(a.id.endswith("required") for a in args), \
+            "the run's required flag is not reaching the verifier"
