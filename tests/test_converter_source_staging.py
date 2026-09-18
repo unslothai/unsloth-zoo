@@ -1059,15 +1059,7 @@ def test_convert_to_gguf_hands_the_user_the_staged_tag_and_the_escape_hatch(mod,
     assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in message
 
 
-# ---------------------------------------------------------------------------
-# Which spellings of the conversion import count.
-#
-# Three decisions read this: whether an installed converter is offered as already
-# self-contained, whether a staged tree is missing a tree it needs, and whether a
-# layout is package / monolith / incomplete. A substring test for the one spelling
-# upstream happens to use today reads every other spelling as self-contained, and
-# the child then dies on an import the entrypoint really does make.
-# ---------------------------------------------------------------------------
+# --- Which spellings of the conversion import count. Three decisions read this: whether an installed converter is offered as already self-contained, whether a staged tree is missing a tree it needs, and whether a layout is package / monolith / incomplete. A substring test for the one spelling upstream happens to use today reads every other spelling as self-contained, and the child then dies on an import the entrypoint really does make. ---
 
 _CONVERSION_IMPORT_SPELLINGS = (
     (b"from conversion import ModelBase\n",            True),
@@ -1116,10 +1108,7 @@ def test_a_shim_using_a_submodule_import_is_not_offered_as_self_contained(tmp_pa
     assert llama_cpp._entrypoint_needs_conversion_package(str(converter)) is True
 
 
-# ---------------------------------------------------------------------------
-# Cache identity, publication, and where a staged monolith's patched file lands.
-# All four of these were found by driving the staging code rather than reading it.
-# ---------------------------------------------------------------------------
+# --- Cache identity, publication, and where a staged monolith's patched file lands. All four of these were found by driving the staging code rather than reading it. ---
 
 def _complete_stage(root, *, package, repo, tag, schema = None, manifest_repo = None,
                     manifest_tag = None):
@@ -1333,9 +1322,7 @@ def test_an_atomically_replaced_file_stays_readable_on_every_platform(tmp_path):
     assert os.access(str(target), os.W_OK)
 
 
-# ---------------------------------------------------------------------------
-# Two items Codex raised on ad88db33, both reproduced at head before fixing.
-# ---------------------------------------------------------------------------
+# --- Two items Codex raised on ad88db33, both reproduced at head before fixing. ---
 
 def test_offline_does_not_fall_through_to_the_legacy_master_download(mod, tmp_path, monkeypatch):
     """The offline switches gate staging, and they have to gate the legacy

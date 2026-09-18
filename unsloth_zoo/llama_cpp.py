@@ -176,19 +176,14 @@ LLAMA_CPP_SOURCE_TARBALL = "https://codeload.github.com/ggml-org/llama.cpp/tar.g
 LLAMA_CPP_PREBUILT_MANIFEST_ASSET = "llama-prebuilt-manifest.json"
 LLAMA_CPP_PREBUILT_SHA256_ASSET = "llama-prebuilt-sha256.json"
 
-# Co-versioned converter sources.
-#
-# The entrypoint at LLAMA_CPP_CONVERT_FILE is a single file from refs/heads/master,
-# but upstream split the converter: that file is now a shim that does
-# `from conversion import ...` and inserts its sibling gguf-py onto sys.path. Its
-# two dependencies are NOT downloaded with it, so they come from whatever llama.cpp
-# happens to sit in LLAMA_CPP_DEFAULT_DIR, which is a tagged release, a floating
-# clone, or a user directory. Entrypoint and libraries are then free to be different
-# revisions, which is the skew this cache exists to remove.
-#
-# Entries are keyed by an immutable tag, so a hit needs no freshness check and never
-# touches the network. Nothing is garbage collected: a reader holds no lock, so any
-# automatic eviction could delete a tree a concurrent export is importing from.
+# Co-versioned converter sources. LLAMA_CPP_CONVERT_FILE is one file from
+# refs/heads/master, but upstream split the converter: it is now a shim doing
+# `from conversion import ...` whose two dependencies are not downloaded with it
+# and instead come from whatever sits in LLAMA_CPP_DEFAULT_DIR, so entrypoint and
+# libraries are free to be different revisions. That is the skew this removes.
+# Keyed by immutable tag, so a hit needs no freshness check and no network.
+# Never garbage collected: a reader holds no lock, so eviction could delete a tree
+# a concurrent export is importing from.
 UNSLOTH_CONVERTER_STAGE_FILENAME = "UNSLOTH_CONVERTER_STAGE.json"
 # Bumped when the staged layout or its validation changes, so an entry written by an
 # older unsloth_zoo is re-staged rather than trusted.
@@ -1571,13 +1566,11 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
             # then refuses to publish. Move the wreck into our private staging dir so
             # the `finally` disposes of it, rather than deleting a tree in place.
             try:
-                # Re-check immediately before the move, not only in the condition
-                # above. Between the two, another process repairing the same entry
-                # can publish a valid replacement, and moving THAT aside would delete
-                # a live tree in our `finally` while its own export is still holding
-                # the path. Re-reading here does not close the window, nothing short
-                # of a lock does, but it turns the common interleaving from a
-                # destroyed tree into an adopted one.
+                # Re-checked here, not only in the condition above: between the two
+                # another process can publish a valid replacement, and moving THAT
+                # aside would have our `finally` delete a live tree. This narrows the
+                # window rather than closing it, which needs a lock, but it turns the
+                # common interleaving from a destroyed tree into an adopted one.
                 if _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
                     raise _StageRepairedByAnother()
                 shutil.move(stage_dir, os.path.join(staging, "superseded"))
@@ -1590,12 +1583,10 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
         if not os.path.exists(stage_dir):
             try:
                 # os.rename, not shutil.move: shutil.move onto an EXISTING directory
-                # moves the source INSIDE it instead of failing, so a process that
-                # published between the check above and this line would leave us with
-                # <stage_dir>/sources/ nested inside its tree, silently, with no
-                # exception to catch. os.rename raises there instead, which is the
-                # signal the loser needs. Same filesystem by construction: `staging`
-                # is created inside the cache root.
+                # nests the source INSIDE it silently, so a process publishing between
+                # the check and this line would leave <stage_dir>/sources/ with no
+                # exception to catch. os.rename raises, which is the signal the loser
+                # needs. Same filesystem by construction, `staging` being in the cache.
                 os.rename(staged_sources, stage_dir)
             except OSError as exc:
                 # Another process published between the check and the move. Its
@@ -1661,12 +1652,10 @@ def _latest_converter_release_tag(_llama_tag_pin):
         return _CONVERTER_RELEASE_TAGS[_llama_tag_pin]
     release = _resolve_llama_cpp_release()
     if release is None:
-        # Deliberately NOT remembered. A tag is immutable so a success is worth
-        # keeping for the process, but a failure is a statement about the network a
-        # second ago. Caching it meant one lookup exhausting its retries turned every
-        # later export in the process into a skipped staging and a fall through to
-        # the package-style master entrypoint, which has no conversion/ beside it and
-        # fails as incomplete, long after connectivity had come back.
+        # Deliberately NOT remembered: a tag is immutable so a success is worth
+        # keeping, but a failure only describes the network a second ago. Caching it
+        # meant one exhausted lookup skipped staging for every later export in the
+        # process, long after connectivity came back.
         return None
     _CONVERTER_RELEASE_TAGS[_llama_tag_pin] = release[0]
     return release[0]
@@ -2625,17 +2614,13 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     if local_script_info is None and not _revision_pinned:
         local_script_info = _resolve_bundle_convert_script()
     if local_script_info is None and not _revision_pinned:
-        # Before reaching for the network: an install predating the split already
-        # has a self-contained converter matching its binaries. Staging would
-        # resolve a revision and download a tarball only to find that revision has
-        # no conversion/ and decline, so answer it here and stay offline.
-        #
-        # Skipped when the user named a revision. That pin is an explicit request
-        # for a specific llama.cpp, and it is what the unsupported-architecture
-        # message tells people to set; letting a leftover self-contained converter
-        # win over it would make the documented way out of "this revision does not
-        # know your architecture" do nothing at all. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
-        # still outranks the pin, above: it is the more specific explicit answer.
+        # Answered before the network: an install predating the split already has a
+        # self-contained converter matching its binaries, and staging would download a
+        # tarball only to find that revision has no conversion/ and decline.
+        # Skipped when a revision is pinned, since that pin is what the
+        # unsupported-architecture message tells people to set and a leftover
+        # converter winning over it would make the documented way out do nothing.
+        # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR still outranks the pin, above.
         local_script_info = _resolve_monolith_bundle_convert_script()
     if local_script_info is None:
         # Nothing co-versioned on disk. Stage all three trees from one revision
@@ -2911,19 +2896,13 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
 
 
         # 4. Write Patched File
-        # Keep package-layout entrypoints beside conversion/ so subprocess
-        # execution resolves `from conversion import ...`.
-        #
-        # A staged MONOLITH needs the same treatment for the other tree. Its layout
-        # is "monolith", so the old rule sent it to LLAMA_CPP_DEFAULT_DIR, and the
-        # entrypoint's own `sys.path.insert(1, __file__.parent / 'gguf-py')` then
-        # resolved against the INSTALL's gguf-py rather than the co-versioned one we
-        # just staged beside it. That is precisely the revision skew this staging
-        # exists to remove, reintroduced for old tags. Anchor anything that came out
-        # of our own cache on its stage, whatever its layout. A converter from the
-        # default dir or from a user's pinned checkout is untouched by this: the
-        # first already resolves to the same directory, and the second must not be
-        # written into.
+        # Package entrypoints stay beside conversion/ so the child resolves
+        # `from conversion import ...`. A staged MONOLITH needs the same for the
+        # other tree: sending it to LLAMA_CPP_DEFAULT_DIR left its own
+        # `sys.path.insert(1, __file__.parent / 'gguf-py')` resolving against the
+        # INSTALL's gguf-py, reintroducing the skew for old tags. So anchor anything
+        # from our cache on its stage whatever the layout; the default dir already
+        # resolves there and a user's pinned checkout must not be written into.
         patched_dir = _llama_cpp_dir if (
             _layout == "package" or _is_inside_converter_cache(_llama_cpp_dir)
         ) else LLAMA_CPP_DEFAULT_DIR
