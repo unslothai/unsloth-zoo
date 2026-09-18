@@ -1255,3 +1255,98 @@ def test_a_colliding_name_never_reaches_the_filesystem(monkeypatch, tmp_path, na
             if resolved != inside and not resolved.startswith(inside + os.sep):
                 escaped.append(os.path.relpath(resolved, str(tmp_path)))
     assert not escaped, f"{name!r} put {escaped} outside {save_directory!r}"
+
+
+@pytest.mark.parametrize("name", [
+    pytest.param("C:..\\victim.safetensors",  id = "drive-relative-parent"),
+    pytest.param("C:victim.safetensors",      id = "drive-relative-plain"),
+    pytest.param("C:../victim.safetensors",   id = "drive-relative-posix-sep"),
+    pytest.param("c:..\\victim.safetensors",  id = "lowercase-drive"),
+    pytest.param("Z:..\\victim.safetensors",  id = "other-drive"),
+])
+def test_a_drive_relative_name_is_refused(name):
+    """`ntpath.isabs('C:..\\x')` is False and normpath keeps the drive ahead of the
+    `..`, so neither the absolute test nor the leading-`..` test sees it. On Windows it
+    joins relative to that drive's working directory: `C:\\out\\merged` + `C:..\\x` is
+    `C:\\out\\x`, and another drive leaves the output tree altogether."""
+    assert saving_utils._shard_name_stays_inside(name) is False
+
+
+def test_a_symlinked_output_component_is_refused_before_the_copy(monkeypatch, tmp_path):
+    """An out-of-place export whose OUTPUT already contains a linked component.
+
+    `save_directory/weights -> /outside` with a legitimate index entry
+    `weights/model.safetensors`: `makedirs` accepts the existing link and `copy2` writes
+    straight through it. The write sinks refuse the path, but only much later, so the
+    file was already outside by the time the export reported a refusal. Asserting on the
+    filesystem, not on the exception.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    peft_model = H.attach_lora(model, spec, "full")
+    _nested_root, base_rel, _weight_map = _nested_layout(tmp_path, ["weights"])
+
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+    save_directory = os.path.join("out", "merged")
+    os.makedirs(os.path.join(str(tmp_path), save_directory), exist_ok = True)
+    os.symlink(outside, os.path.join(str(tmp_path), save_directory, "weights"))
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+    try:
+        saving_utils.merge_and_overwrite_lora(
+            get_model_name  = lambda *a, **k: base_rel,
+            model           = peft_model,
+            tokenizer       = None,
+            save_directory  = save_directory,
+            save_method     = "merged_16bit",
+            push_to_hub     = False,
+        )
+    except Exception:
+        pass
+
+    assert os.listdir(outside) == [], (
+        f"the export wrote {os.listdir(outside)} through the linked output component"
+    )
+
+
+def test_a_failed_materialization_leaves_the_input_checkpoint_intact(tmp_path):
+    """The shard can be gigabytes; a failed copy must not destroy what it replaces.
+
+    Unlinking first and copying second leaves the user's own checkpoint with its link
+    gone and a partial file in its place on ENOSPC or an interruption.
+    """
+    output = os.path.join(str(tmp_path), "model_dir")
+    os.makedirs(output, exist_ok = True)
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+    target = os.path.join(outside, "victim.safetensors")
+    with open(target, "wb") as f:
+        f.write(b"the real weights")
+    link = os.path.join(output, "model.safetensors")
+    os.symlink(target, link)
+
+    boom = RuntimeError("no space left on device")
+    real_copy2 = shutil.copy2
+    def failing_copy2(src, dst, *a, **k):
+        real_copy2(src, dst, *a, **k)     # a partial file exists, as it would on ENOSPC
+        raise boom
+    shutil.copy2 = failing_copy2
+    try:
+        with pytest.raises(RuntimeError):
+            saving_utils._materialize_shard_that_resolves_outside(link, output)
+    finally:
+        shutil.copy2 = real_copy2
+
+    assert os.path.islink(link), "the link was removed before the copy succeeded"
+    assert os.path.realpath(link) == os.path.realpath(target)
+    with open(target, "rb") as f:
+        assert f.read() == b"the real weights", "the link target was modified"
+    leftovers = [n for n in os.listdir(output) if n.endswith(".unsloth-materializing")]
+    assert leftovers == [], f"a staging file was left behind: {leftovers}"

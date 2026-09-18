@@ -3083,6 +3083,13 @@ def _shard_name_stays_inside(name):
         # No filename holds one, and `os.path.exists` raises ValueError on it, which
         # the shard-list branch swallows and turns into a bare assert 300 lines later.
         return False
+    if ntpath.splitdrive(name)[0]:
+        # Drive-qualified but NOT drive-absolute: `ntpath.isabs("C:..\\x")` is False and
+        # normpath keeps the `C:` ahead of the `..`, so a leading-`..` test never sees
+        # it. On Windows it joins relative to that drive's working directory, so
+        # `C:\out\merged` + `C:..\x` lands in `C:\out\x`, and a name on another drive
+        # (`Z:..\x`) leaves the output tree entirely.
+        return False
     for _module in (posixpath, ntpath):
         if _module.isabs(name):
             return False
@@ -3215,8 +3222,21 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
         # A dangling or non-file link is not something to copy; the writer's check
         # reports it rather than this guessing at an intent.
         return
-    os.remove(file_path)                       # the link only, never its target
-    shutil.copy2(target, file_path)
+    # Copy beside it, then replace, rather than unlink and then copy. The shard can be
+    # many gigabytes, and on ENOSPC, a permission error or an interruption the unlink
+    # ordering leaves the user's own checkpoint with its link gone and a partial file
+    # where it was. `os.replace` is atomic and overwrites the link itself, not its target.
+    staging = file_path + ".unsloth-materializing"
+    try:
+        shutil.copy2(target, staging)
+        os.replace(staging, file_path)
+    except BaseException:
+        if os.path.exists(staging):
+            try:
+                os.remove(staging)
+            except OSError:
+                pass
+        raise
     print(
         f"Unsloth: Copied {os.path.basename(file_path)} out of the link it pointed at, "
         f"so the merge does not write outside {save_directory}"
@@ -3791,6 +3811,12 @@ def merge_and_overwrite_lora(
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
         file_path = os.path.join(save_directory, filename)
         _materialize_shard_that_resolves_outside(file_path, save_directory)
+        # Before the copy, not only at the writers. The writers run much later, so an
+        # escape here was reported as a refusal on an export that had already created
+        # the file outside: an output component that is a link (`save_directory/weights
+        # -> /outside`) is followed by `makedirs` and `copy2` alike, and realpath sees
+        # it even though the shard itself does not exist yet.
+        _assert_shard_is_inside(file_path, save_directory)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
         # For local models, copy the file if needed
