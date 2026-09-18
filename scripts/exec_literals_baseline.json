@@ -223,20 +223,6 @@
       "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
     },
     {
-      "file": "unsloth_zoo/llama_cpp.py",
-      "sink": "exec",
-      "digest": "3725bba562bb6fff",
-      "count": 1,
-      "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
-    },
-    {
-      "file": "unsloth_zoo/llama_cpp.py",
-      "sink": "exec",
-      "digest": "7330700d494b9249",
-      "count": 1,
-      "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
-    },
-    {
       "file": "unsloth_zoo/mlx/inference.py",
       "sink": "compile",
       "digest": "bcb6972ff2f41122",
