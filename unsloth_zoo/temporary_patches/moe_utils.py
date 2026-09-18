@@ -22,7 +22,6 @@ import shutil
 import stat
 import tempfile
 import sys
-import tempfile
 import warnings
 import importlib
 import importlib.util
@@ -108,13 +107,30 @@ def _replace_with_copy(current_file, destination):
     descriptor, temporary = tempfile.mkstemp(
         prefix = f".{os.path.basename(destination)}.", suffix = ".tmp", dir = directory,
     )
-    os.close(descriptor)
     try:
-        shutil.copyfile(current_file, temporary)
-        # mkstemp is owner-only; keep the mode shutil.copy() would have left.
-        shutil.copymode(current_file, temporary)
+        # Through the DESCRIPTOR, not by reopening the name: this directory is
+        # writable by whoever would be planting a copy here, and closing the
+        # descriptor first would let the copy and the chmod follow the name
+        # somewhere else. compiler._replace_compiled_cache_file has the same
+        # shape for the same reason.
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            with open(current_file, "rb") as source:
+                shutil.copyfileobj(source, handle)
+            handle.flush()
+            # mkstemp is owner-only; keep the mode shutil.copy() would have left.
+            mode = stat.S_IMODE(os.stat(current_file).st_mode)
+            if hasattr(os, "fchmod"):
+                os.fchmod(handle.fileno(), mode)
+            else:
+                os.chmod(temporary, mode)
         os.replace(temporary, destination)
     except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             os.remove(temporary)
         except OSError:
@@ -148,6 +164,16 @@ def install_to_cache(source_path, destination_filename=None):
     destination = os.path.abspath(os.path.join(compile_location, destination_filename))
 
     if current_file == destination:
+        return True
+
+    current = _read_file_bytes(current_file)
+    if current is not None and _read_file_bytes(destination) == current:
+        # Already what we would install. This runs on every `import
+        # unsloth_zoo`, on every rank, and the file is this whole module, so the
+        # ordinary steady state was a replacement of a file with an identical
+        # copy of itself: a new inode each time, watcher events, and a copy of
+        # every byte for nothing. It also means a read-only cache holding the
+        # CURRENT copy no longer reports a failed install it did not need.
         return True
 
     try:

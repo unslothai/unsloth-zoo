@@ -1368,24 +1368,37 @@ def _untrusted_cache_kept_out_of_imports(*folders):
     # exit restores that `None` permanently and every later legitimate
     # `import moe_utils` in the process dies on it. Only the outermost guard
     # touches sys.modules, so neither half can happen.
-    with _MOE_UTILS_BLOCK_LOCK:
-        if _MOE_UTILS_BLOCK["depth"] == 0:
-            _MOE_UTILS_BLOCK["was_present"] = "moe_utils" in sys.modules
-            _MOE_UTILS_BLOCK["previous"] = sys.modules.get("moe_utils")
-            sys.modules["moe_utils"] = None
-        _MOE_UTILS_BLOCK["depth"] += 1
+    # Everything that mutates the bookkeeping sits INSIDE the try, and the
+    # increment is what arms the restore. A signal lands between bytecodes, so
+    # entering the block outside the try left the two states this ordering
+    # removes: interrupted after `sys.modules["moe_utils"] = None` with no
+    # finally armed, which blocks the name for the life of the process, and
+    # interrupted after the depth increment, which makes every later guard
+    # nest inside a block nothing will ever leave. Raising the depth first and
+    # blocking the name second means an interrupt between them restores the
+    # value that was already recorded, which is still the true one.
+    entered = False
     try:
+        with _MOE_UTILS_BLOCK_LOCK:
+            if _MOE_UTILS_BLOCK["depth"] == 0:
+                _MOE_UTILS_BLOCK["was_present"] = "moe_utils" in sys.modules
+                _MOE_UTILS_BLOCK["previous"] = sys.modules.get("moe_utils")
+            _MOE_UTILS_BLOCK["depth"] += 1
+            entered = True
+            if _MOE_UTILS_BLOCK["depth"] == 1:
+                sys.modules["moe_utils"] = None
         yield
     finally:
-        with _MOE_UTILS_BLOCK_LOCK:
-            _MOE_UTILS_BLOCK["depth"] -= 1
-            if _MOE_UTILS_BLOCK["depth"] == 0:
-                if _MOE_UTILS_BLOCK["was_present"]:
-                    sys.modules["moe_utils"] = _MOE_UTILS_BLOCK["previous"]
-                else:
-                    sys.modules.pop("moe_utils", None)
-                _MOE_UTILS_BLOCK["previous"] = None
-                _MOE_UTILS_BLOCK["was_present"] = False
+        if entered:
+            with _MOE_UTILS_BLOCK_LOCK:
+                _MOE_UTILS_BLOCK["depth"] -= 1
+                if _MOE_UTILS_BLOCK["depth"] == 0:
+                    if _MOE_UTILS_BLOCK["was_present"]:
+                        sys.modules["moe_utils"] = _MOE_UTILS_BLOCK["previous"]
+                    else:
+                        sys.modules.pop("moe_utils", None)
+                    _MOE_UTILS_BLOCK["previous"] = None
+                    _MOE_UTILS_BLOCK["was_present"] = False
         _drop_untrusted_cache_from_sys_path(untrusted)
 
 
@@ -1441,6 +1454,17 @@ def _reject_shadowing_import_candidates(compile_folder, name):
     ] + [
         (suffix, "sourceless bytecode")
         for suffix in importlib.machinery.BYTECODE_SUFFIXES
+    ] + [
+        # Every SOURCE suffix except the one the digest covers. On Windows
+        # CPython registers `.pyw` alongside `.py`, so `<name>.pyw` is a source
+        # module FileFinder will happily load under this exact name. It loses to
+        # `<name>.py` when that is present, which is the ordinary case -- but the
+        # case that matters is the one where it is absent, and that is precisely
+        # the case cached_copy_is_importable() answers "nothing here to reject"
+        # for. Read from the interpreter rather than spelled out, so this is
+        # empty on POSIX and finds `.pyw` on Windows without naming either.
+        (suffix, "a source module")
+        for suffix in importlib.machinery.SOURCE_SUFFIXES if suffix != ".py"
     ]
     for suffix, kind in shadowing:
         shadow = os.path.join(compile_folder, name + suffix)
@@ -1515,17 +1539,47 @@ def _replace_compiled_cache_file(function_location, new_write_bytes):
         prefix = f".{os.path.basename(function_location)}.", suffix = ".tmp",
         dir = directory,
     )
-    os.close(descriptor)
     try:
-        _write_bytes_durably(temporary_location, new_write_bytes)
-        os.chmod(temporary_location, 0o644)
+        # Through the DESCRIPTOR mkstemp returned, never by reopening the name.
+        # mkstemp's exclusive create only settles who created the file; closing
+        # the descriptor and coming back to the path leaves a window in a
+        # directory that is, by assumption here, writable by whoever planted the
+        # cache file in the first place, and the write and the chmod would then
+        # land on whatever the name resolves to by then rather than on the file
+        # we made. The descriptor is bound to the inode, so it cannot be
+        # redirected. os.replace still goes by name, but it only ever exposes a
+        # file this wrote in full.
+        with os.fdopen(descriptor, "wb") as file:
+            descriptor = None
+            file.write(new_write_bytes)
+            file.flush()
+            os.fsync(file.fileno())
+            _set_mode_by_descriptor(file.fileno(), temporary_location, 0o644)
         os.replace(temporary_location, function_location)
     except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             os.remove(temporary_location)
         except OSError:
             pass
         raise
+pass
+
+def _set_mode_by_descriptor(descriptor, location, mode):
+    """fchmod when there is one, else chmod by name.
+
+    Windows has no os.fchmod, and there chmod is only the read-only attribute
+    anyway, so the name is all there is. Everywhere else the descriptor keeps
+    the mode on the file that was written.
+    """
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, mode)
+    else:
+        os.chmod(location, mode)
 pass
 
 def _write_bytes_durably(location, new_write_bytes):
@@ -2010,8 +2064,11 @@ def create_new_function(
 
                 if need_write:
                     _write_compiled_cache_file(function_location, new_write_bytes)
-            # Did the bytes change, which is what makes a pyc stale.
-            # overwrite=True means "you may rewrite", not "the content differs".
+            # Did the bytes change. overwrite=True means "you may rewrite", not
+            # "the content differs". This no longer decides whether the pyc is
+            # dropped -- that is unconditional now, because a planted pyc does
+            # not need our bytes to have changed -- so it is reported for the
+            # rank agreement and for callers, not as a staleness verdict.
             return need_write
         except Exception as e:
             # consider adding logging to main_process only
