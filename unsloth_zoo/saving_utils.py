@@ -3090,25 +3090,41 @@ def _shard_name_stays_inside(name):
         # `C:\out\merged` + `C:..\x` lands in `C:\out\x`, and a name on another drive
         # (`Z:..\x`) leaves the output tree entirely.
         return False
-    for _module in (posixpath, ntpath):
-        if _module.isabs(name):
-            return False
-        # Normalise the name ON ITS OWN and reject one that still begins by climbing
-        # out. `normpath` collapses every interior `..`, so a leading one is left
-        # exactly when the path escapes whatever it is joined onto, whatever that
-        # directory is called.
-        #
-        # This deliberately does NOT join onto a stand-in root and test the prefix.
-        # That is collidable: `../unsloth_shard_root/victim.safetensors` leaves the
-        # stand-in and re-enters a sibling of the same name, normalising back under
-        # it, so the check passed while the real join landed in
-        # `<parent of save_directory>/unsloth_shard_root/victim.safetensors`.
-        # `..///unsloth_shard_root/v` did the same.
-        _normalized = _module.normpath(name)
-        if _normalized in (_module.curdir, _module.pardir):
-            return False
-        if _normalized.startswith(_module.pardir + _module.sep):
-            return False
+    # Windows strips trailing spaces from a path component at the object manager layer,
+    # so `.. ` is created and opened as `..` while `ntpath.normpath` preserves the space
+    # and the traversal test below never matches it. Judge the Windows-visible spelling
+    # as well as the literal one. Only trailing SPACES are stripped here: `.` and `..`
+    # are relative components Windows does not strip further, and `...` is a legal name
+    # rather than a traversal, so neither is rewritten.
+    # learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats
+    _windows_view = "\\".join(
+        _component.rstrip(" ") for _component in name.replace("/", "\\").split("\\")
+    )
+    for _candidate in (name, _windows_view):
+        for _module in (posixpath, ntpath):
+            if _module.isabs(_candidate):
+                return False
+            if _candidate[:1] in ("\\", "/"):
+                # Rooted but drive-relative, e.g. `\victim.safetensors`. Python 3.13's
+                # `ntpath.isabs` reports these as NOT absolute, correctly, since Windows
+                # resolves them against the CURRENT drive rather than a named one. They
+                # still land at that drive's root, outside any output directory.
+                return False
+            # Normalise the candidate ON ITS OWN and reject one that still begins by
+            # climbing out. `normpath` collapses every interior `..`, so a leading one
+            # is left exactly when the path escapes whatever it is joined onto,
+            # whatever that directory is called.
+            #
+            # This deliberately does NOT join onto a stand-in root and test the prefix.
+            # That is collidable: `../unsloth_shard_root/victim.safetensors` leaves the
+            # stand-in and re-enters a sibling of the same name, normalising back under
+            # it, so the check passed while the real join landed in
+            # `<parent of save_directory>/unsloth_shard_root/victim.safetensors`.
+            _normalized = _module.normpath(_candidate)
+            if _normalized in (_module.curdir, _module.pardir):
+                return False
+            if _normalized.startswith(_module.pardir + _module.sep):
+                return False
     return True
 
 
@@ -3228,7 +3244,19 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     # where it was. `os.replace` is atomic and overwrites the link itself, not its target.
     staging = file_path + ".unsloth-materializing"
     try:
-        shutil.copy2(target, staging)
+        # Created exclusively, never opened by name for writing. This path sits in the
+        # same attacker-supplied directory as the shard, so a symlink planted here would
+        # otherwise be followed by the copy and its target overwritten: a second write
+        # sink introduced by the staging step itself. Unlinking first closes a leftover
+        # from an interrupted run, and O_EXCL closes the race that opens.
+        try:
+            os.remove(staging)
+        except OSError:
+            pass
+        _staging_fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(_staging_fd, "wb") as _staging_file, open(target, "rb") as _source:
+            shutil.copyfileobj(_source, _staging_file)
+        shutil.copystat(target, staging)
         os.replace(staging, file_path)
     except BaseException:
         if os.path.exists(staging):

@@ -1332,17 +1332,20 @@ def test_a_failed_materialization_leaves_the_input_checkpoint_intact(tmp_path):
     link = os.path.join(output, "model.safetensors")
     os.symlink(target, link)
 
+    # Injected where the staging copy actually happens, so this cannot quietly stop
+    # exercising a failure if the copy mechanism changes again.
     boom = RuntimeError("no space left on device")
-    real_copy2 = shutil.copy2
-    def failing_copy2(src, dst, *a, **k):
-        real_copy2(src, dst, *a, **k)     # a partial file exists, as it would on ENOSPC
+    real_copyfileobj = shutil.copyfileobj
+    def failing_copyfileobj(src, dst, *a, **k):
+        dst.write(src.read(4))            # a partial file exists, as it would on ENOSPC
+        dst.flush()
         raise boom
-    shutil.copy2 = failing_copy2
+    shutil.copyfileobj = failing_copyfileobj
     try:
         with pytest.raises(RuntimeError):
             saving_utils._materialize_shard_that_resolves_outside(link, output)
     finally:
-        shutil.copy2 = real_copy2
+        shutil.copyfileobj = real_copyfileobj
 
     assert os.path.islink(link), "the link was removed before the copy succeeded"
     assert os.path.realpath(link) == os.path.realpath(target)
@@ -1350,3 +1353,76 @@ def test_a_failed_materialization_leaves_the_input_checkpoint_intact(tmp_path):
         assert f.read() == b"the real weights", "the link target was modified"
     leftovers = [n for n in os.listdir(output) if n.endswith(".unsloth-materializing")]
     assert leftovers == [], f"a staging file was left behind: {leftovers}"
+
+
+@pytest.mark.parametrize("name", [
+    pytest.param(".. \\victim.safetensors",     id = "parent-plus-trailing-space"),
+    pytest.param(".. /victim.safetensors",      id = "parent-plus-space-posix-sep"),
+    pytest.param("   \\victim.safetensors",     id = "spaces-only-becomes-rooted"),
+])
+def test_a_dots_and_spaces_component_is_refused(name):
+    """Windows strips trailing spaces and periods from a name at the object manager
+    layer, so `.. ` is created and opened as `..`, while `ntpath.normpath` preserves the
+    space and the leading-`..` test never matches. `...` is a legal Windows name rather
+    than a traversal, but no shard is called that, so the whole family is refused rather
+    than modelled. See learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats"""
+    assert saving_utils._shard_name_stays_inside(name) is False
+
+
+def test_the_staging_path_is_never_written_through_a_symlink(tmp_path):
+    """The staging file sits in the same attacker-supplied directory as the shard.
+
+    Opening it by name let `copy2` follow a planted symlink and overwrite its target: a
+    second write sink introduced by the staging step that was meant to make the first
+    one safe.
+    """
+    model_dir = os.path.join(str(tmp_path), "model")
+    os.makedirs(model_dir, exist_ok = True)
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+
+    shard_target = os.path.join(outside, "real.safetensors")
+    with open(shard_target, "wb") as f:
+        f.write(b"REAL SHARD BYTES")
+    shard = os.path.join(model_dir, "model.safetensors")
+    os.symlink(shard_target, shard)
+
+    # A second external file, reachable only through the staging pathname.
+    second = os.path.join(outside, "second_victim.bin")
+    with open(second, "wb") as f:
+        f.write(b"DO NOT TOUCH ME")
+    os.symlink(second, shard + ".unsloth-materializing")
+
+    saving_utils._materialize_shard_that_resolves_outside(shard, model_dir)
+
+    with open(second, "rb") as f:
+        assert f.read() == b"DO NOT TOUCH ME", (
+            "the copy followed the planted staging symlink and overwrote its target"
+        )
+    # The shard was still materialised correctly.
+    assert not os.path.islink(shard)
+    with open(shard, "rb") as f:
+        assert f.read() == b"REAL SHARD BYTES"
+    assert not os.path.exists(shard + ".unsloth-materializing")
+
+
+@pytest.mark.parametrize("name", [
+    "model.safetensors",
+    "./model.safetensors",
+    "a/./model.safetensors",
+    "a/../model.safetensors",
+    "weights/model.safetensors",
+    "...",
+    "...\\victim.safetensors",
+    "a\\.. \\victim.safetensors",
+    ". \\victim.safetensors",
+])
+def test_a_contained_name_is_not_refused_by_the_windows_view(name):
+    """The Windows-visible spelling must not reject names that stay inside.
+
+    `.` and `..` are relative components Windows does not strip further, and a segment
+    of three or more periods is a legal Windows name rather than a traversal, so none of
+    these is rewritten. An earlier, blunter rule that refused every dots-and-spaces
+    component rejected all of these, each of which merges on main.
+    """
+    assert saving_utils._shard_name_stays_inside(name) is True
