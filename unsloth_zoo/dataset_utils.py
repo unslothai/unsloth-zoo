@@ -2043,6 +2043,12 @@ def train_on_responses_only(
     # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
     # from a processor already returned above, so what is left here only pads.
     _collator = getattr(trainer, "data_collator", None)
+    # TRL's padding-free collator preserves labels and builds position_ids.
+    # Keep the instance so Unsloth's sequence-length wrapper survives too.
+    _padding_free_collator = getattr(_collator, "padding_free", False) and any(
+        cls.__name__ == "DataCollatorForLanguageModeling" and cls.__module__.startswith("trl.")
+        for cls in type(_collator).__mro__
+    )
     # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding) pads
     # through a `.pad` processors do not have, so it dies on the first batch;
     # rebuild it around the unwrapped text tokenizer. A collator holding no
@@ -2059,7 +2065,8 @@ def train_on_responses_only(
     # anything was mapped.
     if hasattr(trainer, "data_collator") and (
         _processor_backed or _bypassed_vision_collator
-        or (not isinstance(_collator, DataCollatorForSeq2Seq) and not packing_enabled)
+        or (not isinstance(_collator, DataCollatorForSeq2Seq)
+            and not packing_enabled and not _padding_free_collator)
     ):
         # Keep the caller's settings when only swapping the tokenizer on a seq2seq
         # collator; for any other class this is a replacement, not a swap, and its
