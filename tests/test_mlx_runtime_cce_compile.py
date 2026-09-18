@@ -880,7 +880,7 @@ def test_finite_logits_past_the_cap_match_the_saturated_loss(dtype, ratio):
     assert losses.item() == pytest.approx(rows * expected, rel=1e-4)
 
 
-@pytest.mark.parametrize("quantized, eps, softcap", [(False, 0.1, 0.0), (False, 1.0, 5.0), (True, 0.1, 5.0)])
+@pytest.mark.parametrize("quantized, eps, softcap", [(False, 0.1, 0.0), (False, 0.1, 5.0), (False, 1.0, 5.0), (True, 0.1, 5.0)])
 def test_compiled_label_smoothing_across_chunks(quantized, eps, softcap):
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
@@ -920,3 +920,53 @@ def test_compiled_label_smoothing_across_chunks(quantized, eps, softcap):
     # Quantized dH accumulates the vocabulary chunks in bf16.
     assert relative_error < (0.05 if quantized else 2e-4)
     assert mx.all(grad[3] == 0).item()
+
+
+def test_compiled_label_smoothing_softcap_adds_no_memory():
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    mx.random.seed(31)
+    hidden = (mx.random.normal((1024, 256)) * 0.05).astype(mx.bfloat16)
+    weight = (mx.random.normal((65536, 256)) * 0.02).astype(mx.bfloat16)
+    targets = mx.random.randint(0, 65536, (1024,))
+    mx.eval(hidden, weight, targets)
+
+    def peak(softcap):
+        cce, _ = make_chunked_cross_entropy_loss(chunk_size=4096, label_smoothing=0.1, logit_softcap=softcap)
+        step = mx.compile(mx.value_and_grad(lambda h: cce(h, weight, targets).sum()))
+        mx.eval(step(hidden))
+        mx.synchronize()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        mx.eval(step(hidden))
+        mx.synchronize()
+        return mx.get_peak_memory() - resident
+
+    assert peak(30.0) <= 1.05 * peak(0.0)
+
+
+@pytest.mark.parametrize("ratio", [44.2, 60.0])
+def test_smoothed_finite_logits_past_the_cap_match_the_saturated_loss(ratio):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    # The smoothing kernels cap their own logits, so they need the same saturation
+    # the eps=0 kernels use: raw fast::tanh gives 576.70 here at 44.2 and NaN at 60.
+    cap, eps, rows, dim, vocab = 9.0, 0.1, 64, 128, 8192
+    hidden = mx.ones((rows, dim), dtype=mx.float32)
+    even = (mx.arange(vocab) % 2 == 0)[:, None]
+    weight = mx.where(even, ratio * cap / dim, 0.0).astype(mx.float32) * mx.ones((vocab, dim), dtype=mx.float32)
+    targets = (mx.arange(rows) * 2).astype(mx.int32)
+    runtime, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100, logit_softcap=cap, chunk_size=2048, label_smoothing=eps,
+    )
+    losses, grad = mx.value_and_grad(lambda h: runtime(h, weight, targets).sum())(hidden)
+    mx.eval(losses, grad)
+    assert mx.all(mx.isfinite(grad)).item()
+    # Even classes saturate to the cap, odd ones stay at 0; the target is a capped class.
+    lse = math.log(vocab / 2 * (1.0 + math.exp(-cap))) + cap
+    expected = rows * (lse - (1 - eps) * cap - eps * (cap / 2))
+    assert losses.item() == pytest.approx(expected, rel=1e-4)
