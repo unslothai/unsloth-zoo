@@ -1242,6 +1242,7 @@ def test_the_converter_tag_pin_outranks_a_leftover_self_contained_converter(mod,
     assert staging_env["downloads"] == 1
 
 
+@pytest.mark.skipif(os.name == "nt", reason = "Windows has no POSIX mode bits; chmod there only toggles the read-only flag, so st_mode & 0o777 is never 0o644. The Windows-relevant property is covered by the readability check below.")
 def test_replacing_a_file_keeps_the_mode_it_had(tmp_path):
     """mkstemp creates 0600 and os.replace carries that mode onto the destination,
     so replacing a world-readable converter would quietly make it owner-only and
@@ -1256,6 +1257,7 @@ def test_replacing_a_file_keeps_the_mode_it_had(tmp_path):
     assert os.stat(str(target)).st_mode & 0o777 == 0o644
 
 
+@pytest.mark.skipif(os.name == "nt", reason = "umask is POSIX only")
 def test_a_brand_new_file_is_not_created_owner_only(tmp_path):
     """No destination to copy a mode from: fall back to what an ordinary create
     would have produced under the active umask, not to mkstemp's 0600."""
@@ -1264,3 +1266,16 @@ def test_a_brand_new_file_is_not_created_owner_only(tmp_path):
     mod._atomic_write_bytes(str(target), b"x\n")
     umask = os.umask(0); os.umask(umask)
     assert os.stat(str(target)).st_mode & 0o777 == 0o666 & ~umask
+
+
+def test_an_atomically_replaced_file_stays_readable_on_every_platform(tmp_path):
+    """The portable half of the same guarantee, and the one that holds on Windows:
+    whatever the mode representation, the replaced file must still be readable and
+    writable by the process that owns the install."""
+    mod = _load_llama_cpp_module()
+    target = tmp_path / "converter.py"
+    target.write_bytes(b"old\n")
+    mod._atomic_write_bytes(str(target), b"new\n")
+    assert target.read_bytes() == b"new\n"
+    assert os.access(str(target), os.R_OK)
+    assert os.access(str(target), os.W_OK)
