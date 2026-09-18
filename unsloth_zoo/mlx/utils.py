@@ -468,6 +468,118 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
             setattr(mx, name, current._unsloth_index_original)
 
 
+# MLX trains attention through its unfused fallback, which scores every query
+# against every key; sliding-window layers discard all but a band of them.
+_TRAINING_ATTENTION_BLOCK = 512
+_WINDOW_MASKS = {}
+
+
+def _register_window_mask(mask, window):
+    key = id(mask)
+
+    def forget(ref):
+        if _WINDOW_MASKS.get(key, (None,))[0] is ref:
+            del _WINDOW_MASKS[key]
+
+    _WINDOW_MASKS[key] = (weakref.ref(mask, forget), window)
+
+
+def _registered_window(mask):
+    ref, window = _WINDOW_MASKS.get(id(mask), (None, None))
+    return window if ref is not None and ref() is mask else None
+
+
+def _carry_window_masks(outer, inner):
+    """`mx.checkpoint` hands the layer new array objects for its arguments."""
+    (outer_args, outer_kwargs), (inner_args, inner_kwargs) = outer, inner
+    pairs = [*zip(outer_args, inner_args),
+             *((outer_kwargs[k], inner_kwargs.get(k)) for k in outer_kwargs)]
+    for before, after in pairs:
+        if (window := _registered_window(before)) is not None:
+            _register_window_mask(after, window)
+
+
+def _wrap_create_causal_mask(original):
+    @wraps(original)
+    def wrapper(N, offset=0, window_size=None, *args, **kwargs):
+        mask = original(N, offset, window_size, *args, **kwargs)
+        if (window_size is not None and isinstance(offset, int) and offset == 0 and not args
+                and all(v is None for v in kwargs.values())
+                and mlx_training_patches_active()):
+            _register_window_mask(mask, window_size)
+        return mask
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _windowed_attention(sdpa, q, k, v, scale, window, block):
+    # One call over query blocks folded into the batch, each against its own and
+    # the previous key block: per-block slices would sum full-size gradient
+    # scatters that the compiler can fuse past Metal's kernel argument limit.
+    B, T = q.shape[0], q.shape[-2]
+    n = -(-T // block)
+
+    def fold(t, with_previous):
+        t = mx.pad(t, [(0, 0), (0, 0), (0, n * block - T), (0, 0)])
+        t = t.reshape(B, t.shape[1], n, block, t.shape[-1])
+        if with_previous:
+            previous = mx.pad(t[:, :, :-1], [(0, 0), (0, 0), (1, 0), (0, 0), (0, 0)])
+            t = mx.concatenate([previous, t], axis=3)
+        return t.transpose(0, 2, 1, 3, 4).reshape(B * n, t.shape[1], t.shape[3], t.shape[4])
+
+    rows = mx.arange(n)[:, None, None] * block + mx.arange(block)[:, None]
+    cols = mx.arange(n)[:, None, None] * block + mx.arange(-block, block)
+    mask = (cols >= 0) & (rows >= cols) & (rows < cols + window)
+    mask = mx.broadcast_to(mask[None, :, None], (B, n, 1, block, 2 * block))
+    mask = mask.reshape(B * n, 1, block, 2 * block)
+    out = sdpa(fold(q, False), fold(k, True), fold(v, True), scale=scale, mask=mask)
+    out = out.reshape(B, n, -1, block, out.shape[-1]).transpose(0, 2, 1, 3, 4)
+    return out.reshape(B, -1, n * block, out.shape[-1])[..., :T, :]
+
+
+def _windowing_pays(q, k, block):
+    # Break-even measured on bf16 training attention: skipped scores against the
+    # padded, folded q/k/v copies.
+    heads, T, dim = q.shape[1], q.shape[2], q.shape[3]
+    padded = -(-T // block) * block
+    skipped = heads * (T * T - 2 * block * padded)
+    return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
+
+
+def _wrap_training_sdpa(original):
+    @wraps(original)
+    def wrapper(q, k, v, *, scale, mask=None, **kwargs):
+        T = q.shape[-2]
+        if (isinstance(mask, mx.array) and mask.shape == (T, T) and k.shape[-2] == T
+                and all(value is None for value in kwargs.values())):
+            window = _registered_window(mask)
+            if window is not None:
+                block = max(_TRAINING_ATTENTION_BLOCK, window)
+                if _windowing_pays(q, k, block):
+                    return _windowed_attention(original, q, k, v, scale, window, block)
+        return original(q, k, v, scale=scale, mask=mask, **kwargs)
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _set_mlx_windowed_attention(enabled: bool) -> None:
+    targets = [(mx.fast, "scaled_dot_product_attention", _wrap_training_sdpa)]
+    for name in ("mlx_lm.models.base", "mlx_vlm.models.base"):
+        if sys.modules.get(name) is not None:
+            targets.append((sys.modules[name], "create_causal_mask", _wrap_create_causal_mask))
+    for module, attr, wrap in targets:
+        current = getattr(module, attr, None)
+        if current is None:
+            continue
+        original = getattr(current, "_unsloth_original", None)
+        if enabled and original is None:
+            setattr(module, attr, wrap(current))
+        elif not enabled and original is not None:
+            setattr(module, attr, original)
+
+
 def acquire_mlx_training_patches() -> None:
     """Reference-counted: the `mlx.core` patches are process-wide while trainer
     runs are not, so an inner run must not unpatch an outer one."""
@@ -475,6 +587,7 @@ def acquire_mlx_training_patches() -> None:
     with _MLX_INDEX_GRADIENT_LOCK:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
+            _set_mlx_windowed_attention(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
     _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
 
@@ -487,6 +600,7 @@ def release_mlx_training_patches() -> None:
         _MLX_TRAINING_PATCH_DEPTH -= 1
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
+            _set_mlx_windowed_attention(False)
     _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
 
 
@@ -509,6 +623,7 @@ def pause_mlx_training_patches() -> bool:
             return False
         _MLX_TRAINING_PATCH_DEPTH = 0
         _set_mlx_index_gradient_stop(False)
+        _set_mlx_windowed_attention(False)
         return True
 
 
@@ -526,6 +641,7 @@ def resume_mlx_training_patches(paused: bool) -> None:
         if paused:
             if _MLX_TRAINING_PATCH_DEPTH == 0:
                 _set_mlx_index_gradient_stop(True)
+                _set_mlx_windowed_attention(True)
             _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
@@ -861,9 +977,11 @@ def _patch_layer_class_for_gc(layer_cls):
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
+            outer = (args, kwargs)
 
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
@@ -872,9 +990,12 @@ def _patch_layer_class_for_gc(layer_cls):
 
         # Shared K/V crosses the checkpoint boundary as a traced argument and a
         # traced result; read off the slot and the VJP drops the gradient.
+        outer = (args, kwargs)
+
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            _carry_window_masks(outer, (args, kwargs))
             args = tuple(_detach_integer_arrays(a) for a in args)
             kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
