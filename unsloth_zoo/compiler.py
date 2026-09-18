@@ -1500,6 +1500,12 @@ def _remove_compiled_cache_bytecode(function_location):
         bytecode_location = importlib.util.cache_from_source(function_location)
     except NotImplementedError:
         return
+    if _bytecode_directory_is_redirected(bytecode_location):
+        raise RuntimeError(
+            f"Unsloth: Refusing to remove bytecode for {function_location}: "
+            f"{os.path.dirname(bytecode_location)} is a symlink, so the unlink "
+            f"would land outside the compiled cache."
+        )
     try:
         os.remove(bytecode_location)
     except FileNotFoundError:
@@ -1511,6 +1517,36 @@ def _remove_compiled_cache_bytecode(function_location):
                 f"{error}. Refusing to import the source while bytecode we did "
                 f"not write survives beside it."
             ) from error
+pass
+
+def _bytecode_directory_is_redirected(bytecode_location):
+    """Whether unlinking this pyc would delete something outside the cache.
+
+    The removal is the one part of this path that DESTROYS rather than refuses,
+    and the directory it destroys in is chosen by whoever controls the cache
+    directory: `__pycache__` can simply be a symlink, and then the unlink
+    follows it and removes `<somewhere else>/<name>.cpython-3XX.pyc`. Only one
+    fixed, oddly named path per module is reachable that way, so this is not a
+    privilege gain, but it is a write outside the directory we were asked to
+    manage, and it now happens before EVERY verified import rather than only
+    after a rewrite.
+
+    Refusing is fail-closed in the same sense as the rest of this function: the
+    caller treats it as an unwritable cache and recovers into a node-local temp
+    directory instead.
+
+    sys.pycache_prefix is deliberately exempt. That one redirects the pyc
+    wherever the USER asked for it, cache_from_source already honours it, and
+    the directory it names is theirs rather than the cache's -- refusing there
+    would push everyone who sets it into permanent recovery for a choice they
+    made on purpose.
+    """
+    if getattr(sys, "pycache_prefix", None):
+        return False
+    try:
+        return os.path.islink(os.path.dirname(bytecode_location))
+    except OSError:
+        return True
 pass
 
 def _replace_compiled_cache_file(function_location, new_write_bytes):

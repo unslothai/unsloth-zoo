@@ -68,6 +68,19 @@ _GENUINE_SOURCE = "def probe():\n    return 'genuine'\n"
 # Every test below leans on a mode bit actually stopping a write. Root bypasses
 # them all: a 0444 planted file is rewritten rather than refused, so the guards
 # either fail outright or pass without exercising anything.
+#
+# What this skip COSTS, measured on real runners rather than assumed: 36 of the
+# 161 cells in this file and its neighbours skip on Windows, 8 of them here. So
+# the Windows outcome of the repair path is asserted by no executed test on any
+# platform. That outcome is not in doubt -- a direct probe on windows-latest has
+# os.replace over a 0444 destination, and over a destination merely held open by
+# a READER, both raising WinError 5, so the planted file survives and the caller
+# recovers into a node-local temp cache, which is fail-closed and intended --
+# but it is measured, not pinned. Windows cells are writable in principle, since
+# os.chmod(path, stat.S_IREAD) does set FILE_ATTRIBUTE_READONLY there; the
+# reason there are none is that this repo's CI is ubuntu-latest only, so such a
+# cell would be verified by nobody. Read the skip count before trusting a green
+# Windows run of this file.
 _needs_mode_enforcement = pytest.mark.skipif(
     os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
     reason = "POSIX file permissions, which root bypasses",
@@ -765,3 +778,68 @@ def test_a_source_suffix_that_is_not_py_cannot_shadow_the_verified_module(
     # And the verified `.py` beside it is still perfectly loadable: the refusal
     # is about the shadow, not about the directory.
     assert not _planted_ran()
+
+
+def test_a_symlinked_pycache_does_not_get_a_file_outside_the_cache_deleted(
+    cache_dir, tmp_path,
+):
+    """The pyc removal must not follow a `__pycache__` symlink out of the cache.
+
+    Dropping the pyc is the one part of this path that DESTROYS rather than
+    refuses, and it does so in a directory chosen by whoever controls the cache:
+    `__pycache__` can just be a symlink, and the unlink then removes
+    `<somewhere else>/<name>.cpython-3XX.pyc`. One fixed, oddly named path per
+    module, so not a privilege gain, but it is a delete outside the directory we
+    were asked to manage -- and it now runs before every verified import rather
+    than only after a rewrite.
+    """
+    name = "UnslothFailClosedProbePycacheLink"
+    source = cache_dir / f"{name}.py"
+    source.write_text(_GENUINE_SOURCE)
+
+    outside = tmp_path / "somebody_elses_pycache"
+    outside.mkdir()
+    victim = pathlib.Path(
+        importlib.util.cache_from_source(str(source))
+    ).name
+    (outside / victim).write_text("not ours to delete")
+
+    (cache_dir / "__pycache__").symlink_to(outside, target_is_directory = True)
+
+    with pytest.raises(RuntimeError, match = "outside the compiled cache"):
+        compiler._remove_compiled_cache_bytecode(str(source))
+
+    assert (outside / victim).read_text() == "not ours to delete", (
+        "the unlink followed the __pycache__ symlink out of the cache"
+    )
+    # moe_utils' copy of the same removal refuses rather than raising, because
+    # its caller falls back to this module's own definitions.
+    assert moe_utils._remove_cached_bytecode(str(source)) is False
+    assert (outside / victim).read_text() == "not ours to delete"
+
+
+def test_a_user_set_pycache_prefix_is_not_treated_as_a_redirect(
+    cache_dir, tmp_path, monkeypatch,
+):
+    """sys.pycache_prefix is the user's own choice and must keep working.
+
+    cache_from_source already honours it, so refusing every pyc under it would
+    push everyone who sets it into permanent temp-cache recovery for a
+    configuration they chose on purpose. The negative control for the test
+    above: same shape, and it must NOT refuse.
+    """
+    name = "UnslothFailClosedProbePycachePrefix"
+    source = cache_dir / f"{name}.py"
+    source.write_text(_GENUINE_SOURCE)
+
+    prefix = tmp_path / "pycache_prefix"
+    prefix.mkdir()
+    monkeypatch.setattr(sys, "pycache_prefix", str(prefix))
+
+    bytecode = pathlib.Path(importlib.util.cache_from_source(str(source)))
+    bytecode.parent.mkdir(parents = True, exist_ok = True)
+    bytecode.write_bytes(b"\x00" * 16)
+
+    compiler._remove_compiled_cache_bytecode(str(source))
+    assert not bytecode.exists(), "the pyc under the user's prefix was not removed"
+    assert moe_utils._remove_cached_bytecode(str(source)) is True

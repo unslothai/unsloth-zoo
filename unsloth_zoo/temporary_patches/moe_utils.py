@@ -263,6 +263,16 @@ def _remove_cached_bytecode(source_file):
         bytecode_location = importlib.util.cache_from_source(source_file)
     except NotImplementedError:
         return True
+    # A `__pycache__` that is a symlink sends this unlink outside the cache
+    # directory. Refusing costs the cache copy and falls back to this module's
+    # own definitions, which is cheaper than deleting somebody else's file.
+    # sys.pycache_prefix is exempt: that redirection is the user's own.
+    if not getattr(sys, "pycache_prefix", None):
+        try:
+            if os.path.islink(os.path.dirname(bytecode_location)):
+                return False
+        except OSError:
+            return False
     try:
         os.remove(bytecode_location)
     except FileNotFoundError:
