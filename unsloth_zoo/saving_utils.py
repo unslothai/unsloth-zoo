@@ -3226,6 +3226,14 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     An out-of-place export already lands here safely, since `shutil.copy2` follows the
     link and writes content, so this only ever fires for the in-place case.
     """
+    if not _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory):
+        # Materialising is itself a write, so it must not happen in a directory that is
+        # not ours. With a linked output component AND a linked shard beneath it
+        # (`save_directory/weights -> /outside/dir`, `/outside/dir/model.safetensors ->
+        # /victim`) this replaced the link inside `/outside/dir`, mutating a directory
+        # the export has no business touching, and only then did the caller's
+        # containment check refuse. Leave it untouched and let that check speak.
+        return
     if not os.path.islink(file_path):
         # A path that resolves out through a symlinked PARENT cannot be repaired by
         # replacing the file, so it is refused at the sink instead. Not silently

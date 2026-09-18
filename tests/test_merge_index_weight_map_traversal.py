@@ -1426,3 +1426,39 @@ def test_a_contained_name_is_not_refused_by_the_windows_view(name):
     component rejected all of these, each of which merges on main.
     """
     assert saving_utils._shard_name_stays_inside(name) is True
+
+
+def test_a_linked_parent_and_linked_shard_leaves_the_external_directory_alone(tmp_path):
+    """Materialising is a write, so it must not happen in a directory that is not ours.
+
+    With `save_directory/weights -> /outside/dir` AND
+    `/outside/dir/model.safetensors -> /victim`, the repair replaced the link inside
+    `/outside/dir`, mutating a directory the export has no business touching, and only
+    afterwards did the containment check refuse. The victim's bytes survived, because
+    the repair copies content in, but an external directory had still been rewritten.
+    """
+    save_directory = os.path.join(str(tmp_path), "out", "merged")
+    os.makedirs(save_directory, exist_ok = True)
+    outside_dir = os.path.join(str(tmp_path), "outside", "dir")
+    os.makedirs(outside_dir, exist_ok = True)
+    victim = os.path.join(str(tmp_path), "victim.safetensors")
+    with open(victim, "wb") as f:
+        f.write(b"VICTIM BYTES")
+
+    external_shard = os.path.join(outside_dir, "model.safetensors")
+    os.symlink(victim, external_shard)
+    os.symlink(outside_dir, os.path.join(save_directory, "weights"))
+
+    before = sorted(os.listdir(outside_dir))
+    file_path = os.path.join(save_directory, "weights", "model.safetensors")
+    saving_utils._materialize_shard_that_resolves_outside(file_path, save_directory)
+
+    assert os.path.islink(external_shard), (
+        "the link inside the external directory was replaced with a regular file"
+    )
+    assert sorted(os.listdir(outside_dir)) == before
+    with open(victim, "rb") as f:
+        assert f.read() == b"VICTIM BYTES"
+    # And the export still refuses, which is what should have happened all along.
+    with pytest.raises(RuntimeError, match = "outside the output directory"):
+        saving_utils._assert_shard_is_inside(file_path, save_directory)
