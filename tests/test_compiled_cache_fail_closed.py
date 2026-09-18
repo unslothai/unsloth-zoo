@@ -780,6 +780,72 @@ def test_a_source_suffix_that_is_not_py_cannot_shadow_the_verified_module(
     assert not _planted_ran()
 
 
+def test_moe_utils_swapped_after_the_check_is_not_imported(cache_dir):
+    """A verified cache copy is BOUND, not re-resolved off the filesystem.
+
+    The trusted path checked the cache copy and then left the name to be
+    resolved by the import system when the generated module ran its bare
+    `from moe_utils import ...`. That is a check-then-use: a writer with access
+    to a shared cache replaces the file in the gap and its top level runs,
+    having matched nothing. The lock does not help, because it binds our own
+    ranks and not the writer.
+
+    The swap is performed here from inside the guarded region, which is exactly
+    the window the report describes.
+    """
+    genuine = cache_dir / "moe_utils.py"
+    shutil.copyfile(moe_utils.__file__, genuine)
+
+    original_path = list(sys.path)
+    sentinel = object()
+    previous = sys.modules.get("moe_utils", sentinel)
+    try:
+        with compiler._untrusted_cache_kept_out_of_imports(str(cache_dir)):
+            # The generated module's own prologue puts the cache on sys.path
+            # mid-exec, which is what makes the bare import resolvable at all.
+            sys.path.insert(0, str(cache_dir))
+            # The window: the copy that passed is replaced before the import.
+            genuine.write_text(_PLANTED_SOURCE)
+            try:
+                resolved = importlib.import_module("moe_utils")
+            except Exception:
+                resolved = None
+    finally:
+        sys.path[:] = original_path
+        if previous is sentinel:
+            sys.modules.pop("moe_utils", None)
+        else:
+            sys.modules["moe_utils"] = previous
+
+    assert not _planted_ran(), (
+        "the replacement was imported and executed after passing the check"
+    )
+    assert resolved is not None, "a verified copy should still answer the import"
+    assert resolved is moe_utils, (
+        "the import resolved off the filesystem instead of the verified module"
+    )
+
+
+def test_no_cache_copy_still_leaves_the_bare_import_alone(cache_dir):
+    """With no copy in the cache, the guard must not invent a binding.
+
+    Negative control for the test above: nothing was ever going to be imported
+    from an empty directory, so the generated module keeps today's behaviour of
+    losing the backend names rather than being handed ones it does not get now.
+    """
+    sentinel = object()
+    previous = sys.modules.get("moe_utils", sentinel)
+    try:
+        with compiler._untrusted_cache_kept_out_of_imports(str(cache_dir)):
+            during = sys.modules.get("moe_utils", sentinel)
+        assert during is previous, "the guard bound a name with no copy to vouch for"
+    finally:
+        if previous is sentinel:
+            sys.modules.pop("moe_utils", None)
+        else:
+            sys.modules["moe_utils"] = previous
+
+
 def test_a_symlinked_pycache_does_not_get_a_file_outside_the_cache_deleted(
     cache_dir, tmp_path,
 ):

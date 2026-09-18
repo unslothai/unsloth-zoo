@@ -1324,10 +1324,66 @@ def _drop_untrusted_cache_from_sys_path(folders):
 _MOE_UTILS_BLOCK_LOCK = threading.Lock()
 _MOE_UTILS_BLOCK = {"depth": 0, "previous": None, "was_present": False}
 
+# Distinct from None, which is itself a meaningful binding: None in sys.modules
+# is what BLOCKS the name.
+_NO_MOE_UTILS_BINDING = object()
+
+
+def _installed_moe_utils():
+    """This package's own moe_utils module object, or None if it will not import."""
+    try:
+        from unsloth_zoo.temporary_patches import moe_utils
+    except Exception:
+        return None
+    return moe_utils
+
+
+def _verified_moe_utils_binding(folders):
+    """What `moe_utils` should resolve to while a generated module executes.
+
+    Checking the cache copy and then leaving the NAME to be resolved off the
+    filesystem is a check-then-use, and the gap is real: the copy passes, and
+    between that and the generated module's bare `from moe_utils import ...` a
+    writer with access to a shared cache replaces the file, or plants a pyc, and
+    the replacement's top level runs. The cache lock does not help, since it
+    binds our own ranks and not whoever is writing.
+
+    So do not re-resolve it. A copy that passes is byte-identical to this
+    package's own moe_utils by construction -- that is what the check tests --
+    so binding the module object we already imported gives the generated module
+    exactly the definitions the verified bytes would have produced, while no
+    file is opened for that import at all. There is no window left to race.
+
+    Returning _NO_MOE_UTILS_BINDING means "no copy in any of these folders, so
+    nothing here was ever going to be imported": left alone, as today, where the
+    bare import fails and the generated module loses the backend names, which it
+    is written to survive. Binding the module there instead would hand it names
+    it does not get today, which is a wider change than the hole being closed.
+    """
+    for folder in folders:
+        if not folder:
+            continue
+        try:
+            if not os.path.isfile(os.path.join(folder, "moe_utils.py")):
+                continue
+        except Exception:
+            continue
+        # A verified copy is there. Bind ours, or block the name if ours will
+        # not import: what must not happen is the file being resolved again.
+        return _installed_moe_utils()
+    return _NO_MOE_UTILS_BINDING
+
 
 @contextlib.contextmanager
 def _untrusted_cache_kept_out_of_imports(*folders):
-    """Keep a cache directory we do not vouch for out of a generated module's imports.
+    """Decide what `moe_utils` resolves to while a generated module executes.
+
+    Two jobs, one piece of bookkeeping. A cache directory we do not vouch for is
+    kept out of the import entirely (the name is blocked with None). A directory
+    we DO vouch for gets the verified module bound under the name instead, so
+    the generated module's bare import is answered from memory rather than
+    resolved off the filesystem a second time; see _verified_moe_utils_binding
+    for why re-resolving it was a check-then-use with a real gap in it.
 
     Declining to PREPEND an untrusted folder is not enough, because it can
     already be on sys.path -- and we are the ones who put it there. Every
@@ -1356,10 +1412,14 @@ def _untrusted_cache_kept_out_of_imports(*folders):
         folder for folder in dict.fromkeys(folders)
         if folder and not _moe_utils_copy_is_importable(folder)
     ]
-    if not untrusted:
-        yield
-        return
-    _drop_untrusted_cache_from_sys_path(untrusted)
+    if untrusted:
+        binding = None
+        _drop_untrusted_cache_from_sys_path(untrusted)
+    else:
+        binding = _verified_moe_utils_binding(folders)
+        if binding is _NO_MOE_UTILS_BINDING:
+            yield
+            return
     # Nest by depth under one lock, rather than each guard saving and restoring
     # for itself. Two overlapping guards that each keep their own copy get this,
     # measured on the real guard: the inner one saves the outer one's `None`, the
@@ -1386,7 +1446,7 @@ def _untrusted_cache_kept_out_of_imports(*folders):
             _MOE_UTILS_BLOCK["depth"] += 1
             entered = True
             if _MOE_UTILS_BLOCK["depth"] == 1:
-                sys.modules["moe_utils"] = None
+                sys.modules["moe_utils"] = binding
         yield
     finally:
         if entered:
