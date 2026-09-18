@@ -2967,7 +2967,20 @@ def _gguf_requirements_from_source(source_bytes):
                     visit_expression(piece, eager)
                 visit_body(child, False)
             elif isinstance(child, ast.Try):
-                visit(child, False)
+                # The guarded parts are advisory: a `try` body may be probing for a
+                # symbol on purpose, and a handler runs only if it was missing. The
+                # `finally` is not like that. It runs on EVERY path through the
+                # statement, including the one where nothing was raised, so at module
+                # level it is evaluated exactly as surely as a plain statement and a
+                # `gguf` name it reads makes the import fail if it is absent. Demoting
+                # it with the rest reported such a name as merely advisory, and the
+                # resolver then kept an incompatible baseline without so much as
+                # probing a pin that would have worked.
+                for part in (child.body, child.handlers, child.orelse):
+                    for statement in part:
+                        visit(ast.Module(body = [statement], type_ignores = []), False)
+                for statement in child.finalbody:
+                    visit(ast.Module(body = [statement], type_ignores = []), eager)
             elif isinstance(child, ast.If) and _is_type_checking_test(child.test):
                 # `if TYPE_CHECKING: from gguf... import X` is the documented way to import a
                 # name for annotations only, and the branch is FALSE at run time, so the

@@ -1240,3 +1240,45 @@ def test_the_conversion_is_resolved_after_the_vlm_downgrade(mod):
             downgrade_line = node.lineno
     assert downgrade_line is not None and resolve_line is not None
     assert downgrade_line < resolve_line, "is_vlm is downgraded after the resolver ran"
+
+
+# ---------------------------------------------------------------------------
+# A module-level `finally` runs on every path, so it is not guarded.
+# ---------------------------------------------------------------------------
+
+def test_a_module_level_finally_is_certain(mod):
+    """`try` bodies and handlers are advisory because they may be probing for a
+    symbol on purpose. A `finally` is not like that: it runs on every path through
+    the statement, so at module level a gguf name it reads makes the import fail if
+    the name is absent. Demoting it with the rest reported such a name as merely
+    advisory, and the resolver then kept an incompatible baseline rather than
+    probing a pin that would have worked."""
+    certain, advisory = mod._gguf_requirements_from_source(
+        b"import gguf\ntry:\n    pass\nfinally:\n    x = gguf.InFinally\n"
+    )
+    assert "gguf.InFinally" in certain
+    assert "gguf.InFinally" not in advisory
+
+
+@pytest.mark.parametrize("label, source, name", [
+    ("try body",  b"import gguf\ntry:\n    x = gguf.InTry\nexcept Exception:\n    pass\n", "gguf.InTry"),
+    ("handler",   b"import gguf\ntry:\n    pass\nexcept Exception:\n    x = gguf.InHandler\n", "gguf.InHandler"),
+    ("else",      b"import gguf\ntry:\n    pass\nexcept Exception:\n    pass\nelse:\n    x = gguf.InElse\n", "gguf.InElse"),
+])
+def test_the_other_try_parts_stay_advisory(mod, label, source, name):
+    """The demotion the finally change must not have widened: a body may be probing,
+    a handler runs only if something was missing, and an else runs only if nothing
+    was raised. None of the three is certain."""
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert name in advisory, label
+    assert name not in certain, label
+
+
+def test_a_finally_inside_a_function_body_is_still_advisory(mod):
+    """The function body demotes first, and a finally inside it does not run at
+    import time at all."""
+    certain, advisory = mod._gguf_requirements_from_source(
+        b"import gguf\ndef f():\n    try:\n        pass\n    finally:\n        x = gguf.InFnFinally\n"
+    )
+    assert "gguf.InFnFinally" in advisory
+    assert "gguf.InFnFinally" not in certain
