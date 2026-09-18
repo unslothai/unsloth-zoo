@@ -184,11 +184,24 @@ def test_detect_layout_returns_monolith_for_old_tree(monolith_layout):
     assert llama_cpp._detect_converter_layout(entry_bytes, str(monolith_layout)) == "monolith"
 
 
-def test_detect_layout_falls_back_to_monolith_when_conversion_dir_missing(tmp_path):
+def test_detect_layout_reports_incomplete_when_conversion_dir_missing(tmp_path):
     """Entrypoint has the `from conversion import` anchor but the package dir is
-    absent on disk -> treat as monolith (defensive)."""
+    absent on disk.
+
+    This used to report "monolith", which sent every downstream decision the same
+    wrong way: arch extraction found no registrations and returned empty sets, the
+    branding and num_experts patches found no target and only warned, and the
+    entrypoint was written to a directory where its own `from conversion import`
+    cannot resolve. It is not a layout the patcher can work with, so it is named."""
     llama_cpp = _load_llama_cpp_module()
-    assert llama_cpp._detect_converter_layout(_PACKAGE_ENTRYPOINT, str(tmp_path)) == "monolith"
+    assert llama_cpp._detect_converter_layout(_PACKAGE_ENTRYPOINT, str(tmp_path)) == "incomplete"
+
+
+def test_detect_layout_still_says_monolith_for_a_real_monolith(tmp_path):
+    """The other two verdicts keep their exact meaning: a converter that carries its
+    own model classes has no conversion/ to be missing."""
+    llama_cpp = _load_llama_cpp_module()
+    assert llama_cpp._detect_converter_layout(_MONOLITH, str(tmp_path)) == "monolith"
 
 
 
