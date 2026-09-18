@@ -969,7 +969,9 @@ def test_signature_expressions_are_certain(mod):
     assert "gguf.register" in certain
     assert "gguf.NEW_KIND" in certain
     assert "gguf.MODE.FAST" in certain
-    assert "gguf.Result" in certain
+    if sys.version_info < (3, 14):
+        # PEP 649 defers this one from 3.14 on, which the next tests pin directly.
+        assert "gguf.Result" in certain
     # The body is still advisory: it may never run.
     assert "gguf.MODEL_ARCH.MAYBE" in advisory
     assert "gguf.MODEL_ARCH.MAYBE" not in certain
@@ -994,6 +996,66 @@ def test_postponed_annotations_are_not_evaluated(mod):
     certain, advisory = mod._gguf_requirements_from_source(source)
     assert "gguf.NEW_KIND" in certain
     assert "gguf.Result" not in certain
+
+
+# ---------------------------------------------------------------------------
+# PEP 649. From 3.14 an annotation is compiled into a lazily built `__annotate__`
+# rather than evaluated in the signature, with no future import needed, so the
+# interpreter version decides this and not just the file's own imports. The
+# version tested is this one because the child is `[sys.executable, converter]`.
+# ---------------------------------------------------------------------------
+
+def test_an_annotation_is_deferred_on_314_without_the_future_import(mod, monkeypatch):
+    """No `from __future__ import annotations`, yet on 3.14 the return annotation
+    is never evaluated at import. Calling it certain makes the resolver reject a
+    gguf package that would in fact run the converter."""
+    source = (
+        b"import gguf\n"
+        b"def convert(kind = gguf.NEW_KIND) -> gguf.Result:\n"
+        b"    return None\n"
+    )
+    monkeypatch.setattr(mod.sys, "version_info", (3, 14, 0, "final", 0))
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.NEW_KIND" in certain, "a default is still evaluated eagerly on 3.14"
+    assert "gguf.Result" not in certain
+
+
+def test_the_same_annotation_is_eager_on_313(mod, monkeypatch):
+    """The negative half: below 3.14 the annotation really does run at import, so
+    the version test must not have simply turned annotations off everywhere."""
+    source = (
+        b"import gguf\n"
+        b"def convert(kind = gguf.NEW_KIND) -> gguf.Result:\n"
+        b"    return None\n"
+    )
+    monkeypatch.setattr(mod.sys, "version_info", (3, 13, 0, "final", 0))
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.Result" in certain
+
+
+def test_an_argument_annotation_is_deferred_on_314(mod, monkeypatch):
+    source = (
+        b"import gguf\n"
+        b"def convert(kind: gguf.Kind, *rest: gguf.Rest, **kw: gguf.Kw) -> None:\n"
+        b"    return None\n"
+    )
+    monkeypatch.setattr(mod.sys, "version_info", (3, 14, 0, "final", 0))
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    for symbol in ("gguf.Kind", "gguf.Rest", "gguf.Kw"):
+        assert symbol not in certain
+
+
+def test_a_decorator_is_still_certain_on_314(mod, monkeypatch):
+    """PEP 649 defers annotations and nothing else. A decorator still runs."""
+    source = (
+        b"import gguf\n"
+        b"@gguf.register\n"
+        b"def convert(kind: gguf.Kind) -> gguf.Result:\n"
+        b"    return None\n"
+    )
+    monkeypatch.setattr(mod.sys, "version_info", (3, 14, 0, "final", 0))
+    certain, advisory = mod._gguf_requirements_from_source(source)
+    assert "gguf.register" in certain
 
 
 def test_a_signature_under_a_try_is_still_advisory(mod):

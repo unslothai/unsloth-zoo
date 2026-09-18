@@ -644,8 +644,113 @@ def test_a_quantized_file_is_detected_from_its_own_tensors(llama_cpp, tmp_path):
     quant = write_gguf(tmp_path / "q8.gguf", keys = UNIVERSAL,
                        tensors = {"blk.0.attn_q.weight": ones},
                        raw_dtype = GGMLQuantizationType.Q8_0)
-    assert llama_cpp._gguf_holds_only_float_tensors(llama_cpp._gguf_open_shards(plain))
-    assert not llama_cpp._gguf_holds_only_float_tensors(llama_cpp._gguf_open_shards(quant))
+    assert llama_cpp._gguf_holds_any_float_tensor(llama_cpp._gguf_open_shards(plain))
+    assert not llama_cpp._gguf_holds_any_float_tensor(llama_cpp._gguf_open_shards(quant))
+
+
+# ---------------------------------------------------------------------------
+# A mixed file is the common case, not the exotic one: `q4_k_m` and MXFP4 both
+# leave the projector, and usually `token_embd` and the norms, at a float type.
+# Those tensors have to stay checked, and the quantized blocks beside them have
+# to stay unchecked.
+# ---------------------------------------------------------------------------
+
+def write_mixed_gguf(path, float_tensors, quantized_tensors, architecture = "llama",
+                     keys = None, raw_dtype = GGMLQuantizationType.Q8_0):
+    """One GGUF holding float tensors and quantized tensors together.
+
+    `write_gguf` declares one dtype for the whole file, which cannot express the
+    thing under test here.
+    """
+    writer = GGUFWriter(str(path), architecture)
+    for key, value in (keys or {}).items():
+        if isinstance(value, str):
+            writer.add_string(key, value)
+        else:
+            writer.add_uint32(key, int(value))
+    for name, array in float_tensors.items():
+        writer.add_tensor(name, array)
+    for name, array in quantized_tensors.items():
+        writer.add_tensor(name, array, raw_shape = array.shape, raw_dtype = raw_dtype)
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+    return str(path)
+
+
+def test_a_nan_projector_beside_quantized_blocks_is_still_caught(llama_cpp, tmp_path):
+    """The whole point. A `q4_k_m` VLM writes `mm.0.weight` at f16, and NaN there
+    is exactly as fatal as NaN in a plain f16 export. Requiring every tensor in
+    the file to be float meant the quantized blocks turned this check off."""
+    nan = np.full((32, 32), np.nan, dtype = np.float32)
+    ones = np.ones((32, 32), dtype = np.float32)
+    path = write_mixed_gguf(
+        tmp_path / "mixed.gguf", keys = UNIVERSAL,
+        float_tensors = {"mm.0.weight": nan},
+        quantized_tensors = {"blk.0.attn_q.weight": ones},
+    )
+    with pytest.raises(RuntimeError, match = "NaN or Inf"):
+        llama_cpp._verify_converted_gguf([path], "q4_k_m")
+
+
+def test_a_nan_float_block_weight_beside_quantized_blocks_is_caught(llama_cpp, tmp_path):
+    nan = np.full((32, 32), np.nan, dtype = np.float32)
+    ones = np.ones((32, 32), dtype = np.float32)
+    path = write_mixed_gguf(
+        tmp_path / "mixed_blk.gguf", keys = UNIVERSAL,
+        float_tensors = {"blk.0.attn_norm.weight": nan},
+        quantized_tensors = {"blk.0.attn_q.weight": ones},
+    )
+    with pytest.raises(RuntimeError, match = "NaN or Inf"):
+        llama_cpp._verify_converted_gguf([path], "q4_k_m")
+
+
+def test_a_mixed_file_is_not_counted_as_value_skipped(llama_cpp, tmp_path, caplog):
+    """A mixed file did get a value check, so the closing line must not claim the
+    tensor pass was skipped for it."""
+    ones = np.ones((32, 32), dtype = np.float32)
+    path = write_mixed_gguf(
+        tmp_path / "clean_mixed.gguf", keys = UNIVERSAL,
+        float_tensors = {"mm.0.weight": ones},
+        quantized_tensors = {"blk.0.attn_q.weight": ones},
+    )
+    with caplog.at_level("INFO"):
+        llama_cpp._verify_converted_gguf([path], "q4_k_m", print_output = True)
+    assert "metadata only" not in caplog.text.lower()
+
+
+def test_quantized_block_bytes_are_left_alone_in_a_mixed_file(llama_cpp, tmp_path):
+    """No new false positive. A quantized tensor whose block bytes happen to be
+    entirely zero is not a value the gate can read, so it must not be refused
+    just because a float tensor put the file back in scope."""
+    zeros = np.zeros((32, 32), dtype = np.float32)
+    ones = np.ones((32, 32), dtype = np.float32)
+    path = write_mixed_gguf(
+        tmp_path / "zero_block.gguf", keys = UNIVERSAL,
+        float_tensors = {"mm.0.weight": ones},
+        quantized_tensors = {"blk.0.attn_q.weight": zeros},
+    )
+    llama_cpp._verify_converted_gguf([path], "q4_k_m")
+
+
+def test_a_fully_quantized_file_still_gets_the_metadata_gate_only(llama_cpp, tmp_path):
+    zeros = np.zeros((32, 32), dtype = np.float32)
+    path = write_gguf(tmp_path / "allquant.gguf", keys = UNIVERSAL,
+                      tensors = {"blk.0.attn_q.weight": zeros},
+                      raw_dtype = GGMLQuantizationType.Q8_0)
+    llama_cpp._verify_converted_gguf([path], "q8_0")
+
+
+def test_verify_gguf_still_checks_quantized_tensors_by_default(llama_cpp, tmp_path):
+    """`float_tensors_only` is the export gate's choice, not the default. A user
+    pointing `verify_gguf` at a file keeps the all-zero check over block bytes."""
+    zeros = np.zeros((32, 32), dtype = np.float32)
+    path = write_gguf(tmp_path / "user.gguf", keys = UNIVERSAL,
+                      tensors = {"blk.0.attn_q.weight": zeros},
+                      raw_dtype = GGMLQuantizationType.Q8_0)
+    assert any("entirely zero" in p for p in llama_cpp.gguf_tensor_problems(path))
+    assert llama_cpp.gguf_tensor_problems(path, float_tensors_only = True) == []
 
 
 def test_the_gate_can_be_turned_off(llama_cpp, tmp_path, monkeypatch):

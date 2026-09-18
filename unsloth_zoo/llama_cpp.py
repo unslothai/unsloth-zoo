@@ -2896,7 +2896,13 @@ def _gguf_requirements_from_source(source_bytes):
     # PEP 563: with `from __future__ import annotations` every annotation is a string and
     # nothing in it is evaluated at import time, so an annotation naming a missing symbol
     # costs nothing. Without it, an annotation is an ordinary expression in the signature.
-    annotations_eager = not any(
+    #
+    # PEP 649 makes that the default from 3.14 on: an annotation becomes a lazily built
+    # `__annotate__` function that import never calls, future import or not. The version
+    # tested is this interpreter's because the converter child is launched as
+    # `[sys.executable, converter_location]`, so the process that will evaluate these
+    # annotations is this one.
+    annotations_eager = sys.version_info < (3, 14) and not any(
         isinstance(node, ast.ImportFrom)
         and node.module == "__future__"
         and any(alias.name == "annotations" for alias in node.names)
@@ -4982,7 +4988,9 @@ def _gguf_degenerate_problem(tensor, sample_deeply, window, check_zero = True):
     return None if raw.any() else "is entirely zero"
 
 
-def gguf_tensor_problems(gguf_file, sample_size = None, readers = None):
+def gguf_tensor_problems(
+    gguf_file, sample_size = None, readers = None, float_tensors_only = False,
+):
     """Tensors in a GGUF that cannot be real weights, as a list of strings.
 
     Rejects only what no architecture produces legitimately: a weight that is
@@ -4997,9 +5005,14 @@ def gguf_tensor_problems(gguf_file, sample_size = None, readers = None):
     comparison can tell a transform from damage without reproducing each
     architecture's `modify_tensors`.
 
-    Only meaningful for unquantized exports, since a quantized block format is
-    raw bytes rather than values; `convert_to_gguf` only calls this for
-    f32/f16/bf16 output, and the dtype test skips anything else.
+    `float_tensors_only` restricts the pass to tensors that have a float view,
+    which is what the export gate wants: one conversion writes both, so a
+    `q4_k_m` file still carries float tensors (the projector, and often
+    `token_embd` and the norms), and those are exactly the ones a value check
+    means something for. The quantized tensors in that file are then left alone
+    rather than having the all-zero test run over their block bytes. Off by
+    default so `verify_gguf` on a user's file keeps checking every tensor it
+    can, quantized blocks included.
     """
     if sample_size is None:
         sample_size = _gguf_sample_size()
@@ -5016,6 +5029,12 @@ def gguf_tensor_problems(gguf_file, sample_size = None, readers = None):
             len(tensors), sample_size, (os.path.basename(shard), len(tensors)),
         ))
         for index, tensor in enumerate(tensors):
+            if float_tensors_only:
+                try:
+                    values, _mask = _gguf_float_view(tensor)
+                except Exception:
+                    values = None
+                if values is None: continue
             # All-zero is only a defect inside a transformer block, and not even
             # there for a bias. `blk.` is where unsloth#6056's damage lives;
             # outside it zero is a legitimate weight (BERT `token_types.weight`
@@ -5046,26 +5065,28 @@ def gguf_tensor_problems(gguf_file, sample_size = None, readers = None):
     return problems
 
 
-def _gguf_holds_only_float_tensors(readers):
-    """Whether every tensor in this file is a plain float type.
+def _gguf_holds_any_float_tensor(readers):
+    """Whether any tensor in this file has a float view, so a value check means something.
 
-    Read off the file rather than from the requested quantization_type, because
-    one conversion can write both: a VLM's projector is written at its own dtype
-    (bf16 or f16) even when the text half is `q4_k_m`, so a per-call dtype left
-    the projector unchecked. A quantized block format yields no float view, and
-    then a float reading of its bytes would be meaningless.
+    The export gate asks this rather than "are they all floats", because one
+    conversion writes both. A `q4_k_m` VLM still carries its projector at bf16
+    or f16, and usually `token_embd` and the norms at f32, and NaN or Inf in
+    those is exactly as fatal as it would be in a plain f16 export. Requiring
+    every tensor to be float meant a single quantized block turned the whole
+    file's value check off, which on a q4_k_m or MXFP4 export is every file
+    most people publish.
     """
     for _path, reader in readers:
         if reader is None:
-            return False
+            continue
         for tensor in reader.tensors:
             try:
                 values, _mask = _gguf_float_view(tensor)
             except Exception:
-                return False
-            if values is None:
-                return False
-    return True
+                continue
+            if values is not None:
+                return True
+    return False
 
 
 def _verify_converted_gguf(
@@ -5181,14 +5202,16 @@ def _verify_converted_gguf(
         # it as verified tells the user a gate passed that never executed.
         verified.add(shards[0])
         problems = gguf_metadata_problems(output_file, readers = readers)
-        if _gguf_holds_only_float_tensors(readers):
-            problems = problems + gguf_tensor_problems(output_file, readers = readers)
+        if _gguf_holds_any_float_tensor(readers):
+            problems = problems + gguf_tensor_problems(
+                output_file, readers = readers, float_tensors_only = True,
+            )
         else:
-            # A quantized block format holds bytes rather than values, so the tensor
-            # pass does not run and this set got the metadata gate only. Counted so
-            # the closing line cannot report a value check that never happened: on a
-            # q4_k_m or MXFP4 export, which is what most people publish, that is
-            # every set.
+            # Nothing in this set has a float view, so the tensor pass has nothing to
+            # read and the set got the metadata gate only. Counted so the closing line
+            # cannot report a value check that never happened. A mixed file does not
+            # land here: its float tensors are checked and only its quantized blocks,
+            # which hold bytes rather than values, are passed over.
             values_skipped.add(shards[0])
         # llama.cpp loads these, so they never refuse the file.
         for advisory in gguf_metadata_warnings(output_file, readers = readers):
