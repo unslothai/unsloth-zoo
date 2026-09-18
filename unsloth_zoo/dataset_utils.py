@@ -765,6 +765,17 @@ def train_on_responses_only(
     len_Q_must = len(Q_must)
     Q_left_reversed = Q_left[::-1]
     Q_right_forward = Q_right
+
+    # Shared special-token openers (ChatML, Llama, Gemma) delimit every role,
+    # including tool/system. A plain-text common prefix could also occur in an answer.
+    message_start = []
+    for q, a in zip(Q_must, A_must):
+        if q != a: break
+        message_start.append(q)
+    if not set(message_start).intersection(getattr(tokenizer, "all_special_ids", []) or []):
+        message_start = []
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
@@ -805,7 +816,7 @@ def train_on_responses_only(
             n_minus_1 = n - 1
             j = 0
 
-            # Collect all (assistant_k, user_j) spans for this sample
+            # Collect assistant spans, stopping at message or sample boundaries.
             spans = []
             while j < n:
                 # Find <assistant>
@@ -827,8 +838,19 @@ def train_on_responses_only(
                     assistant_k = k
 
                     j = assistant_k
-                    # Find the next <user> (or the final item if assistant is last)
+                    # Keep the assistant's EOS, but never span another message/sample.
                     while j < n:
+                        if input_ids[j] == eos_token_id:
+                            spans.append((assistant_k, j + 1))
+                            break
+                        if input_ids[j] == bos_token_id or \
+                            (message_start and input_ids[j] == message_start[0] and \
+                             input_ids[j : j + len(message_start)] == message_start) or \
+                            (input_ids[j] == A_first and input_ids[j : j + len_A_must] == A_must):
+                            spans.append((assistant_k, j))
+                            # Revisit the boundary so a following assistant is not skipped.
+                            j -= 1
+                            break
                         if (j == n_minus_1) or \
                             ((input_ids[j] == Q_first) and \
                              (input_ids[j : (k := j + len_Q_must)] == Q_must)):
