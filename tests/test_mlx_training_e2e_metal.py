@@ -1674,6 +1674,10 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
 
     original_call = Gemma3Model.__call__
     _fix_gemma4_kv_sharing(SimpleNamespace(language_model=SimpleNamespace(model=backbone)))
+    # Seven early returns in the shim leave the class unpatched, and an unpatched
+    # class takes the plain checkpoint branch, which is the state this test exists
+    # to reject. Without this the test would pass having proved nothing.
+    assert "_kv_sharing_patched" in Gemma3Model.__dict__, "the shim did not install"
     try:
         reference = loss_and_grad(backbone)[1]
         mlx_utils._patch_layer_class_for_gc(Gemma3nDecoderLayer)
@@ -1683,6 +1687,11 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             mlx_utils._unpatch_layer_class_gc(Gemma3nDecoderLayer)
     finally:
         Gemma3Model.__call__ = original_call
-        del Gemma3Model._kv_sharing_patched
+        # Delete only a flag this test set. `del` on an absent attribute raises
+        # from the finally and buries the real failure behind an AttributeError,
+        # and `hasattr` would consume a flag inherited from an earlier patch,
+        # disarming the shim's own idempotence guard for whatever runs next.
+        if "_kv_sharing_patched" in Gemma3Model.__dict__:
+            del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
