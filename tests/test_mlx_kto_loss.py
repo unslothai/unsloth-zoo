@@ -1,0 +1,339 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Pure-logic regression for the MLX KTO loss primitives.
+
+Covers the unpaired KTO loss (`_kto_loss`), the batch KL baseline clamp
+(`_kto_kl_baseline`), the summed-logp extractor (`_kto_sum_logp`), and the
+batch-size guard in `_build_kto_batches`. Runs under the torch shim so Linux
+CI collection covers it without MLX/Metal (all four primitives are backend-
+agnostic MLX-array math).
+
+Reference values are the ones proven in the KTO Step 1 investigation, where
+`_kto_loss` matched a torch reimplementation of TRL's kto_loss and a pure-numpy
+hand computation to ~1e-8 across desirable/undesirable weight settings.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _install_shim():
+    from mlx_simulation import simulate_mlx_on_torch
+    simulate_mlx_on_torch()
+
+
+# --------------------------------------------------------------------------
+# Fixed inputs + independent numpy reference (the KTO Step 1 fixtures).
+# --------------------------------------------------------------------------
+def _fixed_logps():
+    rng = np.random.default_rng(0)
+    return dict(
+        pol_ch=rng.normal(-8, 2, size=3).astype(np.float32),
+        pol_rej=rng.normal(-9, 2, size=2).astype(np.float32),
+        pol_kl=rng.normal(-8.5, 2, size=5).astype(np.float32),
+        ref_ch=rng.normal(-8, 2, size=3).astype(np.float32),
+        ref_rej=rng.normal(-9, 2, size=2).astype(np.float32),
+        ref_kl=rng.normal(-8.5, 2, size=5).astype(np.float32),
+    )
+
+
+def _numpy_kto_loss(pol_ch, pol_rej, ref_ch, ref_rej, kl, beta, wd, wu):
+    sig = lambda z: 1.0 / (1.0 + np.exp(-z))
+    ch = wd * (1 - sig(beta * ((pol_ch - ref_ch) - kl)))
+    rej = wu * (1 - sig(beta * (kl - (pol_rej - ref_rej))))
+    return float(np.concatenate([ch, rej]).mean())
+
+
+# Pinned from Step 1 (MLX == numpy == TRL-torch to ~1e-8).
+_EXPECTED = {(1.0, 1.0): 0.4772096276283264,
+             (1.33, 1.0): 0.566311240196228,
+             (1.0, 1.5): 0.5808119177818298}
+_EXPECTED_KL = 0.31288090348243713
+
+
+def test_kto_loss_matches_reference_across_weights():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import _kto_loss, _kto_kl_baseline
+    f = _fixed_logps()
+    kl = float(_kto_kl_baseline(mx.array(f["pol_kl"]), mx.array(f["ref_kl"])))
+    assert kl == pytest.approx(_EXPECTED_KL, abs=1e-6)  # matches TRL 0.31288
+    for (wd, wu), expected in _EXPECTED.items():
+        loss = float(_kto_loss(
+            mx.array(f["pol_ch"]), mx.array(f["pol_rej"]),
+            mx.array(f["ref_ch"]), mx.array(f["ref_rej"]), mx.array(kl),
+            0.1, wd, wu,
+        ))
+        npy = _numpy_kto_loss(f["pol_ch"], f["pol_rej"], f["ref_ch"], f["ref_rej"], kl, 0.1, wd, wu)
+        assert loss == pytest.approx(npy, abs=1e-6), f"w=({wd},{wu}) MLX vs numpy"
+        assert loss == pytest.approx(expected, abs=1e-6), f"w=({wd},{wu}) vs pinned"
+
+
+def test_kl_baseline_clamps_negative_to_zero():
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import _kto_kl_baseline
+    # policy far below reference on the mismatched completions -> raw mean < 0.
+    pol_kl = mx.array([-30.0, -28.0, -35.0])
+    ref_kl = mx.array([-20.0, -22.0, -19.0])
+    assert float(_kto_kl_baseline(pol_kl, ref_kl)) == 0.0
+    # positive estimate passes through unclamped.
+    assert float(_kto_kl_baseline(ref_kl, pol_kl)) > 0.0
+
+
+@pytest.mark.parametrize("labels_present", ["desirable_only", "undesirable_only"])
+def test_kto_loss_single_label_batches_are_finite(labels_present):
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import _kto_loss
+    empty = mx.array(np.array([], dtype=np.float32))
+    if labels_present == "desirable_only":
+        pol_ch, ref_ch = mx.array([-8.0, -9.0]), mx.array([-8.3, -9.4])
+        pol_rej = ref_rej = empty
+    else:
+        pol_rej, ref_rej = mx.array([-8.0, -9.0]), mx.array([-8.3, -9.4])
+        pol_ch = ref_ch = empty
+    loss = float(_kto_loss(pol_ch, pol_rej, ref_ch, ref_rej, mx.array(0.5), 0.1, 1.0, 1.0))
+    assert np.isfinite(loss) and 0.0 <= loss <= 1.0
+
+
+# NOTE: _kto_sum_logp's numpy-reference check lives in the Metal-gated
+# test_mlx_kto_train_metal.py. Its .astype(mx.float32) / cross_entropy path
+# resolves a real mlx dtype under the torch shim in the pytest import order, so
+# it is exercised against real MLX instead of the shim.
+
+
+def test_build_kto_batches_requires_batch_size_two():
+    from unsloth_zoo.mlx.trainer import _build_kto_batches, MLXKTOConfig
+
+    class _DummyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1, 2, 3]}
+
+    dataset = [{"prompt": "a", "completion": " b", "label": True},
+               {"prompt": "c", "completion": " d", "label": False}]
+    with pytest.raises(ValueError) as exc:
+        _build_kto_batches(dataset, _DummyTokenizer(), MLXKTOConfig(per_device_train_batch_size=1))
+    msg = str(exc.value)
+    assert "per_device_train_batch_size" in msg and ">= 2" in msg
+
+    # batch_size >= 2 builds batches with the mismatched-pair KL variant.
+    batches = _build_kto_batches(dataset, _DummyTokenizer(), MLXKTOConfig(per_device_train_batch_size=2))
+    assert len(batches) == 1
+    for key in ("comp_ids", "comp_labels", "kl_ids", "kl_labels", "label"):
+        assert key in batches[0]
+
+
+def test_kto_string_labels_parsed_not_truthy():
+    # KTO data from CSV stores the binary label as a STRING. Plain bool() is
+    # wrong: bool("false") and bool("0") are both True, so every undesirable row
+    # would silently flip to desirable. _build_kto_batches must parse the string.
+    from unsloth_zoo.mlx.trainer import (
+        _build_kto_batches, _kto_parse_label, MLXKTOConfig,
+    )
+
+    # The exact coercions bool() gets wrong:
+    assert _kto_parse_label("false") is False
+    assert _kto_parse_label("0") is False
+    assert _kto_parse_label("0.0") is False
+    assert _kto_parse_label("true") is True
+    assert _kto_parse_label("1") is True
+    assert _kto_parse_label(True) is True and _kto_parse_label(0) is False
+    with pytest.raises(ValueError):
+        _kto_parse_label("maybe")
+
+    class _DummyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1, 2, 3]}
+
+    # Two rows with string labels "false"/"0" -> both must be undesirable.
+    dataset = [{"prompt": "a", "completion": " b", "label": "false"},
+               {"prompt": "c", "completion": " d", "label": "0"}]
+    batches = _build_kto_batches(
+        dataset, _DummyTokenizer(), MLXKTOConfig(per_device_train_batch_size=2),
+    )
+    assert batches[0]["label"] == [False, False], batches[0]["label"]
+
+
+def test_kto_tokenize_row_caps_completion_exceeding_max_length():
+    # When max_completion_length is unset and a completion alone exceeds
+    # max_length, the old code set keep=0 (dropping the prompt) but left the
+    # whole completion, so the returned sequence exceeded max_length. The
+    # completion must be capped too.
+    from unsloth_zoo.mlx.trainer import _kto_tokenize_row, MLXKTOConfig
+
+    class _LenTokenizer:  # one token id per whitespace-split word
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": list(range(len(text.split())))}
+
+    args = MLXKTOConfig(max_length=8, max_completion_length=None, max_prompt_length=0)
+    p, c = _kto_tokenize_row(_LenTokenizer(), "a b c", " ".join(["w"] * 20), args)
+    assert len(p) + len(c) <= 8, (len(p), len(c))
+    assert len(p) == 0 and len(c) == 8  # prompt dropped, completion capped
+
+
+def test_kto_appends_eos_and_preserves_it_under_truncation():
+    from unsloth_zoo.mlx.trainer import _kto_tokenize_row, MLXKTOConfig
+
+    EOS = 99
+
+    class _Tok:  # one id per word, never emits EOS itself
+        eos_token_id = EOS
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1 + i for i in range(len(text.split()))]}
+
+    big = MLXKTOConfig(max_length=1024, max_completion_length=None, max_prompt_length=0)
+
+    # 1) EOS appended when the completion lacks it
+    _, c = _kto_tokenize_row(_Tok(), "q", "a b c", big)
+    assert c[-1] == EOS and c.count(EOS) == 1
+
+    # 2) no double EOS when the completion already ends in EOS
+    class _TokEndsEos(_Tok):
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": super().__call__(text)["input_ids"] + [EOS]}
+    _, c = _kto_tokenize_row(_TokEndsEos(), "q", "a b", big)
+    assert c[-1] == EOS and c.count(EOS) == 1
+
+    # 3) append_eos=False -> no EOS
+    no_eos = MLXKTOConfig(max_length=1024, max_completion_length=None,
+                          max_prompt_length=0, append_eos=False)
+    _, c = _kto_tokenize_row(_Tok(), "q", "a b c", no_eos)
+    assert EOS not in c
+
+    # 4) over-length vs max_completion_length: EOS survives the cap
+    cap = MLXKTOConfig(max_length=1024, max_completion_length=4, max_prompt_length=0)
+    _, c = _kto_tokenize_row(_Tok(), "q", " ".join(["w"] * 20), cap)
+    assert len(c) == 4 and c[-1] == EOS
+
+    # 5) over-length vs max_length: EOS survives
+    ml = MLXKTOConfig(max_length=4, max_completion_length=None, max_prompt_length=0)
+    p, c = _kto_tokenize_row(_Tok(), "q", " ".join(["w"] * 20), ml)
+    assert len(p) + len(c) <= 4 and c[-1] == EOS
+
+
+def test_kto_rejects_streaming_dataset():
+    # KTO materializes the whole dataset to form KL batches, so streaming must
+    # be rejected loudly rather than silently exhausting the source.
+    from unsloth_zoo.mlx.trainer import _build_kto_batches, MLXKTOConfig
+
+    class _DummyTokenizer:
+        pad_token_id = 0
+        eos_token_id = 0
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [1, 2, 3]}
+
+    ds = [{"prompt": "a", "completion": " b", "label": True},
+          {"prompt": "c", "completion": " d", "label": False}]
+    with pytest.raises(NotImplementedError, match="streaming"):
+        _build_kto_batches(ds, _DummyTokenizer(),
+                           MLXKTOConfig(per_device_train_batch_size=2, streaming=True))
+
+    def _gen():  # a bare iterable-without-__len__ passed directly
+        yield from ds
+    with pytest.raises(NotImplementedError, match="streaming"):
+        _build_kto_batches(_gen(), _DummyTokenizer(),
+                           MLXKTOConfig(per_device_train_batch_size=2))
+
+
+def test_kto_rejects_non_kto_loss_type():
+    # loss_type is never read by the KTO loop; a non-'kto' value would silently
+    # run standard KTO. Reject it instead of ignoring the caller's request.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer, MLXKTOConfig
+    with pytest.raises(ValueError, match="loss_type='kto'"):
+        MLXKTOTrainer(object(), object(), [],
+                      args=MLXKTOConfig(loss_type="apo_zero_unpaired"))
+
+
+def test_kto_rejects_ref_model_kwarg():
+    # KTO's reference is the adapter-off forward; a passed ref_model would be
+    # swallowed by **kwargs and ignored, so reject it.
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer, MLXKTOConfig
+    with pytest.raises(ValueError, match="ref_model"):
+        MLXKTOTrainer(object(), object(), [], args=MLXKTOConfig(), ref_model=object())
+
+
+def test_kto_rejects_gated_delta_and_vlm(monkeypatch):
+    # KTO bypasses the base trainer's patch_gated_delta and VLM handling; both
+    # cases already hard-fail downstream, so train() rejects them up front.
+    import unsloth_zoo.mlx.trainer as T
+    from unsloth_zoo.mlx.trainer import MLXKTOTrainer, MLXKTOConfig
+
+    def _mk(tokenizer):
+        tr = MLXKTOTrainer.__new__(MLXKTOTrainer)  # skip __init__ (needs a real model)
+        tr.args = MLXKTOConfig()
+        tr.model = object()
+        tr.tokenizer = tokenizer
+        return tr
+
+    monkeypatch.setattr(T, "iter_mlx_lora_modules", lambda m: [("m", object())])
+
+    # gated-delta model -> reject
+    monkeypatch.setattr(T, "model_has_gated_delta_layers", lambda m: True)
+    with pytest.raises(NotImplementedError, match="gated-delta"):
+        _mk(object()).train()
+
+    # VLM tokenizer (has image_processor) -> reject
+    monkeypatch.setattr(T, "model_has_gated_delta_layers", lambda m: False)
+
+    class _VLMTok:
+        image_processor = object()
+    with pytest.raises(NotImplementedError, match="vision-language"):
+        _mk(_VLMTok()).train()
+
+
+def test_kto_rejects_non_lora_trainable_params(monkeypatch):
+    # KTO's reference is the adapter-off forward; trainable non-LoRA tensors would
+    # drift and corrupt it. train() rejects them (structural, no reference_free).
+    import unsloth_zoo.mlx.trainer as T
+    from unsloth_zoo.mlx.trainer import (
+        MLXKTOTrainer, MLXKTOConfig, _kto_model_has_non_lora_trainable_params,
+    )
+
+    # Predicate: a model with no trainable params has no non-LoRA trainables.
+    class _Empty:
+        def trainable_parameters(self):
+            return {}
+    assert _kto_model_has_non_lora_trainable_params(_Empty()) is False
+
+    # Guard: train() raises when the predicate reports non-LoRA trainables.
+    tr = MLXKTOTrainer.__new__(MLXKTOTrainer)
+    tr.args = MLXKTOConfig()
+    tr.model = object()
+    tr.tokenizer = object()
+    monkeypatch.setattr(T, "iter_mlx_lora_modules", lambda m: [("m", object())])
+    monkeypatch.setattr(T, "model_has_gated_delta_layers", lambda m: False)
+    monkeypatch.setattr(T, "_kto_model_has_non_lora_trainable_params", lambda m: True)
+    with pytest.raises(ValueError, match="structural limit"):
+        tr.train()
+
+
+def test_kto_config_inherits_parent_init_not_a_generated_one():
+    # Bare @dataclass regenerates __init__ and bypasses MLXTrainingConfig.__init__
+    # (dropping e.g. _unsloth_mlx_warmup_steps_explicit). @dataclass(init=False)
+    # inherits the parent init while keeping the KTO-specific fields.
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXTrainingConfig
+    assert MLXKTOConfig.__init__ is MLXTrainingConfig.__init__
+    c = MLXKTOConfig()
+    assert hasattr(c, "_unsloth_mlx_warmup_steps_explicit")  # parent init ran
+    assert c.beta == 0.1 and c.loss_type == "kto"  # KTO fields intact
+    c2 = MLXKTOConfig(beta=0.5, desirable_weight=2.0)
+    assert c2.beta == 0.5 and c2.desirable_weight == 2.0
