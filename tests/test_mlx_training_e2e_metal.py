@@ -1181,16 +1181,30 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert trainable == _adapter_keys(reloaded) | aux
 
 
+def _record_cce_rows(monkeypatch):
+    rows, original = [], mlx_utils._get_runtime_cce
+
+    def factory(**kwargs):
+        runtime = original(**kwargs)
+        return lambda hidden, *args: (rows.append(hidden.shape[0]), runtime(hidden, *args))[1]
+
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", factory)
+    return rows
+
+
 @metal_only
-@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 @pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("prompt_share", ["low", "high"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("kind", ["dpo", "orpo"])
-def test_preference_compaction_preserves_pair_ownership(monkeypatch, quantized, reference, dtype, kind):
+def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, reference, prompt_share, dtype, kind):
     from unsloth_zoo.mlx import preference as p
     from mlx_lm.tuner.lora import LoRAEmbedding
     mx.random.seed(937)
-    model = _cce_text_model(2053, 64, quantized=quantized)
+    kernel_rows, calls = _record_cce_rows(monkeypatch), []
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
+                            softcap=0.5 if head == "softcap" else 0.0)
     policy = None
     if reference:
         adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
@@ -1204,37 +1218,43 @@ def test_preference_compaction_preserves_pair_ownership(monkeypatch, quantized, 
     for i in range(8):
         chosen = tuple((j * 7 + i) % 2053 for j in range(513 if i % 4 == 0 else 45 + i))
         rejected = tuple((j * 11 + i) % 2053 for j in range(507 if i % 4 == 0 else 43 + i))
-        rows.append(p.TokenizedPreferenceRow(chosen[:-13-i], chosen[-13-i:],
-                    rejected[:-14+i], rejected[-14+i:]))
+        cut, other = (-13 - i, -14 + i) if prompt_share == "high" else (13 + i, 14 - i)
+        rows.append(p.TokenizedPreferenceRow(chosen[:cut], chosen[cut:], rejected[:other], rejected[other:]))
     normalizers = [(sum(len(row.chosen) - 1 for row in rows), 8, 2)] * 2
     plan = p.FinitePreferenceBatchPlan(rows, [(0, 1, 2, 3), (4, 5, 6, 7)], normalizers=normalizers,
                                      cycle_length=2, max_seq_length=513, pad_id=0)
     plan.configure_cce_compaction(kind=kind)
-    objective = p.resolve_preference_objective(kind, beta=0.2, **({"reference_free": not reference} if kind == "dpo" else {}))
-    loss = (p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy) if kind == "dpo" else
-            p.make_orpo_cce_loss_fn(model, objective))
-    capacity = 256 if kind == "dpo" else 768
+    if kind == "dpo":
+        objective = p.resolve_preference_objective("dpo", beta=0.2, reference_free=not reference,
+            loss_type=["sigmoid", "ipo"] if reference else ["robust", "hinge"])
+        dense = p.make_dpo_loss_fn(objective, reference_policy=policy)
+        loss = p.make_dpo_cce_loss_fn(model, objective, reference_policy=policy)
+    else:
+        objective = p.resolve_preference_objective("orpo", beta=0.2)
+        dense, loss = p.make_orpo_loss_fn(objective), p.make_orpo_cce_loss_fn(model, objective)
     grad = nn.value_and_grad(model, loss)
     run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
-    original, projected = nn.losses.cross_entropy, []
-    def ce(logits, *args, **kwargs):
-        projected.append(logits.shape[0])
-        return original(logits, *args, **kwargs)
-    monkeypatch.setattr(nn.losses, "cross_entropy", ce)
     for index in range(2):
         batch = plan[index]
         compact = plan.prepare_cce_batch(index, batch)
-        assert len(batch) == 3 and compact[3].shape == (capacity,)
-        expected = grad(model, *batch)
+        # bfloat16 logits lose the logit sums to rounding, so there the uncompacted kernel is the reference.
+        eager_rows = len(kernel_rows)
+        expected = nn.value_and_grad(model, dense if dtype == "float32" else loss)(model, *batch)
         mx.eval(expected)
-        projected.clear()
+        calls.clear()
+        del kernel_rows[eager_rows:]
         actual = run(*compact)
         mx.eval(actual)
-        assert projected == ([capacity] * (2 if reference and kind == "dpo" else 1) if index == 0 else [])
+        assert "model" not in calls
+        capacity = compact[3].shape[0]
+        assert capacity < batch[0].shape[0] * (batch[0].shape[1] - 1)
+        assert kernel_rows == [capacity] * (2 if reference and kind == "dpo" else 1)
         for want, got in zip(expected[0], actual[0]):
-            assert mx.allclose(want, got, atol=2e-5, rtol=2e-5).item()
+            assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
+        # A bfloat16 run accumulates chunks in a different order; the softcap derivative amplifies that.
+        rtol = 2e-4 if dtype == "float32" else 2e-2 if head == "softcap" else 5e-3
         for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
-            assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+            assert mx.allclose(want, got, atol=2e-5, rtol=rtol).item()
         if reference:
             assert adapter.scale == 2.0
 
@@ -1308,14 +1328,34 @@ def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
 
 @metal_only
 @pytest.mark.parametrize("quantized", [False, True])
+def test_preference_logit_sums_keep_float32_precision(quantized):
+    from unsloth_zoo.mlx import preference as p
+
+    mx.random.seed(739)
+    hidden = mx.random.normal((37, 64)).astype(mx.bfloat16)
+    weight = (mx.random.normal((8192, 64)) * 0.5).astype(mx.bfloat16)
+    head, quantization = (weight, None, None), {}
+    if quantized:
+        quantization = dict(group_size=64, bits=4, mode="affine")
+        head = mx.quantize(weight, group_size=64, bits=4)
+        weight = mx.dequantize(*head, group_size=64, bits=4)
+    expected = (hidden.astype(mx.float32) @ weight.astype(mx.float32).T).sum(axis=-1)
+    actual = p._head_logit_sums(hidden, *head, quantization, 0.0)
+    assert mx.allclose(expected, actual, atol=1e-3, rtol=0).item()
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("reference", [False, True])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("kind", ["dpo", "orpo"])
-def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, kind):
+def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, reference, dtype, kind):
     from types import SimpleNamespace
     from mlx_lm.tuner.lora import LoRAEmbedding
     from unsloth_zoo.mlx import preference as p
 
     mx.random.seed(738)
+    kernel_rows = _record_cce_rows(monkeypatch)
     model = _cce_text_model(2053, 64, quantized=quantized)
     policy = None
     if reference:
@@ -1323,7 +1363,7 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
         adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * .02
         model.model.embed_tokens = adapter
         policy = p.LoRAReferencePolicy([adapter])
-    model.set_dtype(mx.bfloat16)
+    model.set_dtype(getattr(mx, dtype))
     model.eval()
     rows = []
     for i in range(7):
@@ -1338,6 +1378,10 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
     baseline = p.make_preference_eval_fn(objective, reference_policy=policy)
     candidate = p.make_preference_eval_fn(objective, reference_policy=policy, model=model)
     assert not baseline._unsloth_cce_compaction and candidate._unsloth_cce_compaction
+    if dtype == "bfloat16":
+        # bfloat16 logits lose the logit sums to rounding, so there the uncompacted kernel is the reference.
+        baseline = p.make_preference_eval_fn(objective, reference_policy=policy, model=model)
+        baseline._unsloth_cce_compaction = False
     calls = []
     def fail(failed, _context, error):
         if failed:
@@ -1346,15 +1390,11 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
         _distributed_eval_status=lambda failed=False: (False, failed),
         _raise_distributed_failure_from_any=fail, _fire_prediction_step=lambda: calls.append(1))
     expected = MLXTrainer._evaluate_batch_totals(trainer, plan, baseline)
-    original, shapes = nn.losses.cross_entropy, []
-    def ce(logits, *args, **kwargs):
-        shapes.append(logits.shape)
-        return original(logits, *args, **kwargs)
-    monkeypatch.setattr(nn.losses, "cross_entropy", ce)
+    kernel_rows.clear()
     actual = MLXTrainer._evaluate_batch_totals(trainer, plan, candidate)
     mx.eval(expected, actual)
     capacity = 256 if kind == "dpo" else 768
-    assert shapes == [(capacity, 8192)] * (4 if kind == "dpo" and reference else 2)
+    assert kernel_rows == [capacity] * (4 if kind == "dpo" and reference else 2)
     assert len(calls) == 4 and actual[1].item() == 7
     for want, got in zip(expected, actual):
         assert mx.allclose(want, got, atol=2e-5, rtol=2e-5).item()
