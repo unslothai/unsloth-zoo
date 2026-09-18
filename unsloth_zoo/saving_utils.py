@@ -3114,6 +3114,12 @@ def _reject_unsafe_shard_index(index_path):
         # An index we cannot parse at all is not one we can vouch for, but it is also
         # not the traversal being guarded against; leave it to the reader that needs it.
         return None
+    if not isinstance(index_data, dict):
+        # `[]`, `null` and a bare scalar are all valid JSON, so `json.loads` does not
+        # raise and the `except` above never sees them. They carry no weight_map to
+        # traverse with, and a stale one of these beside a model that does not need an
+        # index used to be ignored, so this must not abort an otherwise valid export.
+        return None
     weight_map = index_data.get("weight_map")
     if not isinstance(weight_map, dict):
         return raw
@@ -3552,7 +3558,13 @@ def merge_and_overwrite_lora(
     copied_all_from_cache = False
     copied_tokenizer_model_from_cache = False
     is_hf_sharded = is_hf_sharded_safetensors(safetensors_list)
-    safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
+    # A lone shard the index puts in a subdirectory needs the index carried across too.
+    # The two conditions beside this one cover the layouts a loader can find on its own:
+    # several shards, or the HF `model-0000n-of-0000m` naming. A single
+    # `weights/model.safetensors` is neither, and without its index the export holds no
+    # root `model.safetensors` and nothing pointing at the one it does hold.
+    _has_nested_shard = any(os.path.dirname(_f) for _f in safetensors_list)
+    safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
     # copying it (regenerated below). FP8 only dequantizes on a merged_16bit save, so an

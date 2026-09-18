@@ -661,3 +661,125 @@ def test_the_exported_index_is_the_one_that_was_validated(monkeypatch, tmp_path)
         assert all(saving_utils._shard_name_stays_inside(v) for v in values), (
             f"the swapped index reached the export: {values!r}"
         )
+
+
+def test_a_lone_nested_shard_keeps_its_index(monkeypatch, tmp_path):
+    """One shard under a subdirectory is not a layout a loader can find unaided.
+
+    `safe_tensor_index_files` is set for several shards or for the HF
+    `model-0000n-of-0000m` naming, and a single `weights/model.safetensors` is
+    neither. Without the index the export holds that one file, no root
+    `model.safetensors`, and nothing naming what it does hold.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    shards = sorted(f for f in os.listdir(real_base) if f.endswith(".safetensors"))
+    if len(shards) != 1:
+        pytest.skip("the tiny base model did not fit in a single shard")
+    peft_model = H.attach_lora(model, spec, "full")
+
+    # Deliberately not an HF shard name, so only the nested test can carry the index.
+    relative = "weights/model.safetensors"
+    nested_root = os.path.join(str(tmp_path), "ns", "base")
+    os.makedirs(os.path.join(nested_root, "weights"), exist_ok = True)
+    shutil.copy2(
+        os.path.join(real_base, "config.json"), os.path.join(nested_root, "config.json"),
+    )
+    destination = os.path.join(nested_root, "weights", "model.safetensors")
+    shutil.copy2(os.path.join(real_base, shards[0]), destination)
+
+    from safetensors import safe_open
+    weight_map = {}
+    with safe_open(destination, framework = "pt") as f:
+        for key in f.keys():
+            weight_map[key] = relative
+    with open(
+        os.path.join(nested_root, "model.safetensors.index.json"), "w", encoding = "utf-8",
+    ) as f:
+        json.dump(
+            {"metadata" : {"total_size" : os.path.getsize(destination)},
+             "weight_map" : weight_map}, f,
+        )
+
+    base_rel = os.path.join("ns", "base")
+    save_directory = os.path.join("out", "deep", "merged")
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+
+    saving_utils.merge_and_overwrite_lora(
+        get_model_name  = lambda *a, **k: base_rel,
+        model           = peft_model,
+        tokenizer       = None,
+        save_directory  = save_directory,
+        save_method     = "merged_16bit",
+        push_to_hub     = False,
+    )
+
+    output = os.path.join(str(tmp_path), save_directory)
+    exported_index = os.path.join(output, "model.safetensors.index.json")
+    assert os.path.exists(exported_index), (
+        f"a lone nested shard was exported without an index: {os.listdir(output)}"
+    )
+    with open(exported_index, encoding = "utf-8") as f:
+        exported_map = json.load(f)["weight_map"]
+    assert exported_map, "the exported index names no shard"
+    for value in set(exported_map.values()):
+        assert os.path.exists(os.path.join(output, value)), (
+            f"the exported index names {value!r}, which is not in the export"
+        )
+
+
+@pytest.mark.parametrize("payload", ["[]", "null", '"index"', "3"], ids = list("lnsi"))
+def test_a_stale_index_that_is_not_an_object_does_not_abort_the_merge(
+    monkeypatch, tmp_path, payload,
+):
+    """Valid JSON that is not an object carries no weight_map to traverse with.
+
+    `json.loads` does not raise on any of these, so the guard's `except` never sees
+    them and an unconditional `.get` turned a stale file beside a perfectly good
+    single-shard model into an AttributeError out of the whole merge.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    base_tensors = H.read_safetensors_dir(real_base)
+    peft_model = H.attach_lora(model, spec, "full")
+    adapted = H.extract_adapted(peft_model)
+
+    # The shards stay where they are; only the stale index is bogus.
+    with open(
+        os.path.join(real_base, "model.safetensors.index.json"), "w", encoding = "utf-8",
+    ) as f:
+        f.write(payload)
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+    save_directory = os.path.join("out", "merged")
+
+    saving_utils.merge_and_overwrite_lora(
+        get_model_name  = lambda *a, **k: "real_base",
+        model           = peft_model,
+        tokenizer       = None,
+        save_directory  = save_directory,
+        save_method     = "merged_16bit",
+        output_dtype    = torch.float32,
+        push_to_hub     = False,
+    )
+
+    H.assert_merge_correct(
+        family       = FAMILY,
+        base_tensors = base_tensors,
+        out_dir      = os.path.join(str(tmp_path), save_directory),
+        save_dtype   = torch.float32,
+        adapted      = adapted,
+        base_dir     = real_base,
+    )
