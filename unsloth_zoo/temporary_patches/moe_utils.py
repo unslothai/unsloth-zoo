@@ -108,11 +108,10 @@ def _replace_with_copy(current_file, destination):
         prefix = f".{os.path.basename(destination)}.", suffix = ".tmp", dir = directory,
     )
     try:
-        # Through the DESCRIPTOR, not by reopening the name: this directory is
-        # writable by whoever would be planting a copy here, and closing the
-        # descriptor first would let the copy and the chmod follow the name
-        # somewhere else. compiler._replace_compiled_cache_file has the same
-        # shape for the same reason.
+        # Through the DESCRIPTOR, not by reopening the name, or the copy and the
+        # mode follow that name somewhere else; this directory is writable by
+        # whoever would plant a copy here. Same shape as
+        # compiler._replace_compiled_cache_file.
         with os.fdopen(descriptor, "wb") as handle:
             descriptor = None
             with open(current_file, "rb") as source:
@@ -168,12 +167,9 @@ def install_to_cache(source_path, destination_filename=None):
 
     current = _read_file_bytes(current_file)
     if current is not None and _read_file_bytes(destination) == current:
-        # Already what we would install. This runs on every `import
-        # unsloth_zoo`, on every rank, and the file is this whole module, so the
-        # ordinary steady state was a replacement of a file with an identical
-        # copy of itself: a new inode each time, watcher events, and a copy of
-        # every byte for nothing. It also means a read-only cache holding the
-        # CURRENT copy no longer reports a failed install it did not need.
+        # Already installed. This runs on every `import unsloth_zoo`, on every
+        # rank, and copies this whole module, so without the compare the steady
+        # state was replacing a file with an identical copy of itself.
         return True
 
     try:
@@ -263,10 +259,9 @@ def _remove_cached_bytecode(source_file):
         bytecode_location = importlib.util.cache_from_source(source_file)
     except NotImplementedError:
         return True
-    # A `__pycache__` that is a symlink sends this unlink outside the cache
-    # directory. Refusing costs the cache copy and falls back to this module's
-    # own definitions, which is cheaper than deleting somebody else's file.
-    # sys.pycache_prefix is exempt: that redirection is the user's own.
+    # A symlinked `__pycache__` sends this unlink outside the cache. Refusing
+    # costs the cache copy and falls back to our own definitions, which beats
+    # deleting somebody else's file. sys.pycache_prefix is the user's own.
     if not getattr(sys, "pycache_prefix", None):
         try:
             if os.path.islink(os.path.dirname(bytecode_location)):

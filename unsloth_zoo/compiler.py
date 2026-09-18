@@ -1341,24 +1341,16 @@ def _installed_moe_utils():
 def _verified_moe_utils_binding(folders):
     """What `moe_utils` should resolve to while a generated module executes.
 
-    Checking the cache copy and then leaving the NAME to be resolved off the
-    filesystem is a check-then-use, and the gap is real: the copy passes, and
-    between that and the generated module's bare `from moe_utils import ...` a
-    writer with access to a shared cache replaces the file, or plants a pyc, and
-    the replacement's top level runs. The cache lock does not help, since it
-    binds our own ranks and not whoever is writing.
+    Checking the copy and then letting the NAME be resolved off the filesystem
+    is a check-then-use: a writer with access to a shared cache replaces the
+    file between the two and its top level runs. The lock binds our own ranks,
+    not that writer. A copy that passes is byte-identical to this package's own
+    moe_utils, which is what the check tests, so binding the module already
+    imported here gives the same definitions with no file opened at all.
 
-    So do not re-resolve it. A copy that passes is byte-identical to this
-    package's own moe_utils by construction -- that is what the check tests --
-    so binding the module object we already imported gives the generated module
-    exactly the definitions the verified bytes would have produced, while no
-    file is opened for that import at all. There is no window left to race.
-
-    Returning _NO_MOE_UTILS_BINDING means "no copy in any of these folders, so
-    nothing here was ever going to be imported": left alone, as today, where the
-    bare import fails and the generated module loses the backend names, which it
-    is written to survive. Binding the module there instead would hand it names
-    it does not get today, which is a wider change than the hole being closed.
+    _NO_MOE_UTILS_BINDING means no copy in any folder, so nothing was going to
+    be imported: left alone rather than bound, since binding would hand the
+    generated module names it does not get today.
     """
     for folder in folders:
         if not folder:
@@ -1378,35 +1370,18 @@ def _verified_moe_utils_binding(folders):
 def _untrusted_cache_kept_out_of_imports(*folders):
     """Decide what `moe_utils` resolves to while a generated module executes.
 
-    Two jobs, one piece of bookkeeping. A cache directory we do not vouch for is
-    kept out of the import entirely (the name is blocked with None). A directory
-    we DO vouch for gets the verified module bound under the name instead, so
-    the generated module's bare import is answered from memory rather than
-    resolved off the filesystem a second time; see _verified_moe_utils_binding
-    for why re-resolving it was a check-then-use with a real gap in it.
+    Untrusted folder: block the name with None. Trusted: bind the verified
+    module, so the import is answered from memory (_verified_moe_utils_binding).
 
-    Declining to PREPEND an untrusted folder is not enough, because it can
-    already be on sys.path -- and we are the ones who put it there. Every
-    generated module carries _license_header, whose prologue runs
-    `sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)` above the module's own
-    `from moe_utils import ...`. So the module re-exposes the persistent cache
-    to itself mid-exec, no matter what sys.path looked like on entry, and the
-    entry then outlives the call because nothing here put it there to restore.
-    Stripping path-equivalent entries on both ends closes that leak; blocking
-    the NAME is what closes the window the prologue opens inside the exec.
-    `None` in sys.modules makes `from moe_utils import ...` raise
-    ModuleNotFoundError before any file is opened, which is exactly what that
-    bare import's `except Exception: pass` is written to absorb -- it costs the
-    backend names, as it already does whenever the copy is missing.
+    Keeping the folder off sys.path is not enough on its own: every generated
+    module's prologue runs `sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)` above
+    its own `from moe_utils import ...`, re-exposing the cache mid-exec whatever
+    sys.path held on entry. Blocking the NAME is what closes that window; a
+    blocked name costs the backend names, which the bare import's
+    `except Exception: pass` already absorbs whenever the copy is missing.
 
-    Both the active compile folder and UNSLOTH_COMPILE_LOCATION are passed in:
-    after a recovery they differ, and the prologue names the persistent one, so
-    running from node-local temp does not put the persistent cache out of reach.
-
-    Untrusted is a genuinely anomalous state, never the ordinary run: a folder
-    with no moe_utils.py in it is trusted (nothing is importable from it), so
-    this only engages when a foreign copy, a shadowing moe_utils/ or extension,
-    or an undeletable pyc is actually sitting there.
+    Both folders are passed in because a recovery makes them differ while the
+    prologue still names the persistent one.
     """
     untrusted = [
         folder for folder in dict.fromkeys(folders)
@@ -1420,23 +1395,14 @@ def _untrusted_cache_kept_out_of_imports(*folders):
         if binding is _NO_MOE_UTILS_BINDING:
             yield
             return
-    # Nest by depth under one lock, rather than each guard saving and restoring
-    # for itself. Two overlapping guards that each keep their own copy get this,
-    # measured on the real guard: the inner one saves the outer one's `None`, the
-    # outer exits and REMOVES the entry while the inner is still running, so the
-    # inner block is unprotected for the rest of its body, and then the inner
-    # exit restores that `None` permanently and every later legitimate
-    # `import moe_utils` in the process dies on it. Only the outermost guard
-    # touches sys.modules, so neither half can happen.
-    # Everything that mutates the bookkeeping sits INSIDE the try, and the
-    # increment is what arms the restore. A signal lands between bytecodes, so
-    # entering the block outside the try left the two states this ordering
-    # removes: interrupted after `sys.modules["moe_utils"] = None` with no
-    # finally armed, which blocks the name for the life of the process, and
-    # interrupted after the depth increment, which makes every later guard
-    # nest inside a block nothing will ever leave. Raising the depth first and
-    # blocking the name second means an interrupt between them restores the
-    # value that was already recorded, which is still the true one.
+    # Depth-nested under one lock, and only the outermost guard touches
+    # sys.modules: two guards each saving their own copy had the inner one save
+    # the outer's entry, the outer then remove it mid-body, and the inner restore
+    # it permanently on exit.
+    # Mutations sit inside the try and the increment arms the restore, because a
+    # signal lands between bytecodes: entering outside the try could block the
+    # name with no finally to undo it. Depth first, name second, so an interrupt
+    # between them restores the value already recorded.
     entered = False
     try:
         with _MOE_UTILS_BLOCK_LOCK:
@@ -1516,14 +1482,10 @@ def _reject_shadowing_import_candidates(compile_folder, name):
         (suffix, "sourceless bytecode")
         for suffix in importlib.machinery.BYTECODE_SUFFIXES
     ] + [
-        # Every SOURCE suffix except the one the digest covers. On Windows
-        # CPython registers `.pyw` alongside `.py`, so `<name>.pyw` is a source
-        # module FileFinder will happily load under this exact name. It loses to
-        # `<name>.py` when that is present, which is the ordinary case -- but the
-        # case that matters is the one where it is absent, and that is precisely
-        # the case cached_copy_is_importable() answers "nothing here to reject"
-        # for. Read from the interpreter rather than spelled out, so this is
-        # empty on POSIX and finds `.pyw` on Windows without naming either.
+        # Every SOURCE suffix but the one the digest covers. Windows registers
+        # `.pyw`, which loses to `<name>.py` but decides the import when that is
+        # absent -- the case cached_copy_is_importable() calls nothing to reject.
+        # Read from the interpreter, so this is empty on POSIX.
         (suffix, "a source module")
         for suffix in importlib.machinery.SOURCE_SUFFIXES if suffix != ".py"
     ]
@@ -1583,23 +1545,12 @@ def _bytecode_directory_is_redirected(bytecode_location):
     """Whether unlinking this pyc would delete something outside the cache.
 
     The removal is the one part of this path that DESTROYS rather than refuses,
-    and the directory it destroys in is chosen by whoever controls the cache
-    directory: `__pycache__` can simply be a symlink, and then the unlink
-    follows it and removes `<somewhere else>/<name>.cpython-3XX.pyc`. Only one
-    fixed, oddly named path per module is reachable that way, so this is not a
-    privilege gain, but it is a write outside the directory we were asked to
-    manage, and it now happens before EVERY verified import rather than only
-    after a rewrite.
+    and `__pycache__` can simply be a symlink, so the unlink follows it out of
+    the cache. Refusing is fail-closed like the rest: the caller treats it as an
+    unwritable cache and recovers into temp.
 
-    Refusing is fail-closed in the same sense as the rest of this function: the
-    caller treats it as an unwritable cache and recovers into a node-local temp
-    directory instead.
-
-    sys.pycache_prefix is deliberately exempt. That one redirects the pyc
-    wherever the USER asked for it, cache_from_source already honours it, and
-    the directory it names is theirs rather than the cache's -- refusing there
-    would push everyone who sets it into permanent recovery for a choice they
-    made on purpose.
+    sys.pycache_prefix is exempt; that redirection is the user's own, and
+    refusing there would put everyone who sets it into permanent recovery.
     """
     if getattr(sys, "pycache_prefix", None):
         return False
@@ -1637,15 +1588,12 @@ def _replace_compiled_cache_file(function_location, new_write_bytes):
         dir = directory,
     )
     try:
-        # Through the DESCRIPTOR mkstemp returned, never by reopening the name.
-        # mkstemp's exclusive create only settles who created the file; closing
-        # the descriptor and coming back to the path leaves a window in a
-        # directory that is, by assumption here, writable by whoever planted the
-        # cache file in the first place, and the write and the chmod would then
-        # land on whatever the name resolves to by then rather than on the file
-        # we made. The descriptor is bound to the inode, so it cannot be
-        # redirected. os.replace still goes by name, but it only ever exposes a
-        # file this wrote in full.
+        # Through the DESCRIPTOR, never by reopening the name: mkstemp's
+        # exclusive create settles who created the file and nothing after, so
+        # reopening the path would put the write and the mode on whatever the
+        # name resolves to by then, in a directory writable by whoever planted
+        # the cache file. os.replace still goes by name, but only ever publishes
+        # a file this wrote in full.
         with os.fdopen(descriptor, "wb") as file:
             descriptor = None
             file.write(new_write_bytes)
@@ -1667,12 +1615,7 @@ def _replace_compiled_cache_file(function_location, new_write_bytes):
 pass
 
 def _set_mode_by_descriptor(descriptor, location, mode):
-    """fchmod when there is one, else chmod by name.
-
-    Windows has no os.fchmod, and there chmod is only the read-only attribute
-    anyway, so the name is all there is. Everywhere else the descriptor keeps
-    the mode on the file that was written.
-    """
+    """fchmod when there is one, else chmod by name (Windows has no os.fchmod)."""
     if hasattr(os, "fchmod"):
         os.fchmod(descriptor, mode)
     else:
@@ -2254,24 +2197,15 @@ def create_new_function(
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
-    # Tracks the WRITE, not the decision: overwrite=True is the default for
-    # unsloth_compile_transformers and patch_lora_forwards even when write_file()
-    # writes nothing. It no longer decides whether the pyc is dropped. That was
-    # the reasoning while only a rewrite could leave a stale pyc, and it stopped
-    # holding once a pyc nobody here wrote became the thing to worry about, so
-    # the removal is unconditional and this value is now carried for the rank
-    # agreement and for callers rather than as a staleness verdict.
-    #
-    # The price is paid on every warm start and it is not small: the verified
-    # loader execs the bytes it checked, so CPython never writes a pyc for a
-    # generated module and never gets to reuse one. Measured on this tree, a
-    # real `import unsloth` loads 15 generated trainers totalling 1.72 MB and
-    # spends 996 ms in create_new_function against 860 ms before, a median
-    # +136 ms per process start (n=12 a side, disjoint IQRs), tracking source
-    # size at about +0.076 ms per KB. The new checks are not what costs it:
-    # all nine of them together come to ~185 us per module, under 2% of the
-    # delta. Recovering the pyc would mean trusting a file on disk to say what
-    # our source compiles to, which is the thing this whole path exists to stop.
+    # Tracks the WRITE, not the decision, and no longer decides whether the pyc
+    # is dropped: that is unconditional now, since a planted pyc does not need
+    # our bytes to have changed. Carried for the rank agreement instead.
+    # Cost of that, measured: the verified loader execs the bytes it checked, so
+    # no pyc is ever written or reused, and a real `import unsloth` (15 trainers,
+    # 1.72 MB) spends 996 ms here against 860 ms before, +136 ms per start
+    # (n=12 a side, disjoint IQRs, ~+0.076 ms/KB). The new checks are ~185 us of
+    # that; the rest is the lost bytecode cache, and recovering it would mean
+    # trusting a file on disk to say what our source compiles to.
     rewrote_cache_file = False
     if should_write_cache_file:
         if UNSLOTH_COMPILE_USE_TEMP:

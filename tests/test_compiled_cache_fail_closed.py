@@ -69,18 +69,12 @@ _GENUINE_SOURCE = "def probe():\n    return 'genuine'\n"
 # them all: a 0444 planted file is rewritten rather than refused, so the guards
 # either fail outright or pass without exercising anything.
 #
-# What this skip COSTS, measured on real runners rather than assumed: 36 of the
-# 161 cells in this file and its neighbours skip on Windows, 8 of them here. So
-# the Windows outcome of the repair path is asserted by no executed test on any
-# platform. That outcome is not in doubt -- a direct probe on windows-latest has
-# os.replace over a 0444 destination, and over a destination merely held open by
-# a READER, both raising WinError 5, so the planted file survives and the caller
-# recovers into a node-local temp cache, which is fail-closed and intended --
-# but it is measured, not pinned. Windows cells are writable in principle, since
-# os.chmod(path, stat.S_IREAD) does set FILE_ATTRIBUTE_READONLY there; the
-# reason there are none is that this repo's CI is ubuntu-latest only, so such a
-# cell would be verified by nobody. Read the skip count before trusting a green
-# Windows run of this file.
+# What it costs, measured: 36 of 161 cells here and next door skip on Windows,
+# so the Windows outcome of the repair path is pinned by no test anywhere. It is
+# measured though -- on windows-latest os.replace over a 0444 destination, and
+# over one merely held open by a reader, both raise WinError 5, so the planted
+# file survives and the caller recovers into temp, which is intended. Read the
+# skip count before trusting a green Windows run of this file.
 _needs_mode_enforcement = pytest.mark.skipif(
     os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
     reason = "POSIX file permissions, which root bypasses",
@@ -627,16 +621,11 @@ def test_a_planted_package_does_not_shadow_the_verified_module(cache_dir):
 def test_the_replacement_writes_through_the_descriptor_it_created(cache_dir, monkeypatch):
     """The temp file is written by descriptor, so its NAME cannot be redirected.
 
-    mkstemp's exclusive create settles who created the file and nothing after
-    that. Closing the descriptor and coming back to the path put the write and
-    the mode change on whatever the name resolved to by then, in a directory
-    that is, by assumption here, writable by whoever planted the cache file in
-    the first place -- so the generated source, and a 0644, could land on a
-    target of their choosing.
-
-    The swap is stood in for by pointing the temp path at a decoy outside the
-    cache the moment the code would reopen it: if the write follows the name,
-    the decoy changes, which is the whole finding.
+    mkstemp's exclusive create settles who created the file and nothing after,
+    so reopening the path put the write and the mode on whatever the name
+    resolved to by then, in a directory writable by whoever planted the cache
+    file. The swap is stood in for by pointing that path at a decoy outside the
+    cache: if the write follows the name, the decoy changes.
     """
     name = "UnslothFailClosedProbeFdRace"
     outside = cache_dir.parent / "outside_the_cache.txt"
@@ -674,16 +663,12 @@ def test_an_interrupted_guard_entry_does_not_block_moe_utils_forever(
 ):
     """A BaseException during guard ENTRY must not leave `moe_utils` blocked.
 
-    The guard sets sys.modules["moe_utils"] = None and restores it on exit. An
-    exception inside the body is not the interesting case -- the finally handles
-    that one. The interesting case is an interrupt DURING entry, because a
-    signal lands between bytecodes: while the mutation happened before the try,
-    the None was left with no finally armed to undo it, and every later
-    legitimate `import moe_utils` in the process died on it. Permanently, since
-    the next guard then records that None as the value it must restore.
-
-    The interrupt is stood in for by failing the depth bookkeeping itself, which
-    is the instruction the window sits on.
+    An exception inside the body is handled by the finally; the interesting case
+    is an interrupt during ENTRY, since a signal lands between bytecodes. With
+    the mutation before the try, the None was left with no finally armed, and
+    every later legitimate `import moe_utils` died on it -- permanently, since
+    the next guard records that None as the value to restore. Stood in for by
+    failing the depth bookkeeping, the instruction the window sits on.
     """
     class _Interrupt(BaseException):
         pass
@@ -724,11 +709,9 @@ def test_an_interrupted_guard_entry_does_not_block_moe_utils_forever(
 def test_a_matching_cache_copy_is_not_rewritten(cache_dir, monkeypatch):
     """install_to_cache() must not replace a copy that already matches.
 
-    It runs on every `import unsloth_zoo`, on every rank, and the file it
-    installs is this whole module, so replacing an identical copy meant copying
-    every byte and burning a new inode on each import for nothing -- and it made
-    a read-only cache that already held the CURRENT copy report an install
-    failure it did not need.
+    It runs on every `import unsloth_zoo`, on every rank, and copies this whole
+    module, so replacing an identical copy burned a new inode per import and
+    made a read-only cache holding the CURRENT copy report a needless failure.
     """
     destination = cache_dir / "moe_utils.py"
     shutil.copyfile(moe_utils.__file__, destination)
@@ -751,17 +734,12 @@ def test_a_source_suffix_that_is_not_py_cannot_shadow_the_verified_module(
 ):
     """Every SOURCE suffix but `.py` is refused beside the verified file.
 
-    On Windows CPython registers `.pyw` as a source suffix, so `<name>.pyw` is a
-    module FileFinder loads under this exact name. It loses to `<name>.py`, so
-    it only decides an import when no source is there -- which is exactly the
-    case both this and cached_copy_is_importable() treated as "nothing here to
-    reject".
-
-    POSIX registers no second source suffix, so the list is what gets stood in
-    for: the interpreter running this is the one that would have to be Windows
-    for the real thing, and the code reads the list rather than spelling `.pyw`
-    out, which is the property under test. On Windows this runs against the
-    genuine list and the planted file is a real `.pyw`.
+    Windows registers `.pyw`, which FileFinder loads under this exact name. It
+    loses to `<name>.py`, so it decides an import only when no source is there,
+    which is the case both this and cached_copy_is_importable() called nothing
+    to reject. POSIX has no second source suffix, so the LIST is stood in for;
+    the property under test is that the code reads it rather than spelling
+    `.pyw` out, and on Windows it runs against the genuine list.
     """
     name = "UnslothFailClosedProbeSourceShadow"
     suffixes = list(importlib.machinery.SOURCE_SUFFIXES)
@@ -783,15 +761,11 @@ def test_a_source_suffix_that_is_not_py_cannot_shadow_the_verified_module(
 def test_moe_utils_swapped_after_the_check_is_not_imported(cache_dir):
     """A verified cache copy is BOUND, not re-resolved off the filesystem.
 
-    The trusted path checked the cache copy and then left the name to be
-    resolved by the import system when the generated module ran its bare
-    `from moe_utils import ...`. That is a check-then-use: a writer with access
-    to a shared cache replaces the file in the gap and its top level runs,
-    having matched nothing. The lock does not help, because it binds our own
-    ranks and not the writer.
-
-    The swap is performed here from inside the guarded region, which is exactly
-    the window the report describes.
+    The trusted path checked the copy and then left the name to the import
+    system when the generated module ran its bare `from moe_utils import ...`.
+    A writer with access to a shared cache replaces the file in that gap and its
+    top level runs, having matched nothing; the lock binds our ranks, not them.
+    The swap here happens from inside the guarded region, which is the window.
     """
     genuine = cache_dir / "moe_utils.py"
     shutil.copyfile(moe_utils.__file__, genuine)
@@ -827,11 +801,11 @@ def test_moe_utils_swapped_after_the_check_is_not_imported(cache_dir):
 
 
 def test_no_cache_copy_still_leaves_the_bare_import_alone(cache_dir):
-    """With no copy in the cache, the guard must not invent a binding.
+    """With no copy, the guard must not invent a binding.
 
-    Negative control for the test above: nothing was ever going to be imported
-    from an empty directory, so the generated module keeps today's behaviour of
-    losing the backend names rather than being handed ones it does not get now.
+    Negative control for the test above: nothing was going to be imported from
+    an empty directory, so the generated module keeps today's behaviour rather
+    than being handed names it does not get now.
     """
     sentinel = object()
     previous = sys.modules.get("moe_utils", sentinel)
@@ -852,12 +826,10 @@ def test_a_symlinked_pycache_does_not_get_a_file_outside_the_cache_deleted(
     """The pyc removal must not follow a `__pycache__` symlink out of the cache.
 
     Dropping the pyc is the one part of this path that DESTROYS rather than
-    refuses, and it does so in a directory chosen by whoever controls the cache:
-    `__pycache__` can just be a symlink, and the unlink then removes
-    `<somewhere else>/<name>.cpython-3XX.pyc`. One fixed, oddly named path per
-    module, so not a privilege gain, but it is a delete outside the directory we
-    were asked to manage -- and it now runs before every verified import rather
-    than only after a rewrite.
+    refuses, and `__pycache__` can just be a symlink, so the unlink lands on
+    `<somewhere else>/<name>.cpython-3XX.pyc`. One fixed path per module, so not
+    a privilege gain, but it is a delete outside the cache, and since the
+    removal became unconditional it runs before every verified import.
     """
     name = "UnslothFailClosedProbePycacheLink"
     source = cache_dir / f"{name}.py"
@@ -887,12 +859,10 @@ def test_a_symlinked_pycache_does_not_get_a_file_outside_the_cache_deleted(
 def test_a_user_set_pycache_prefix_is_not_treated_as_a_redirect(
     cache_dir, tmp_path, monkeypatch,
 ):
-    """sys.pycache_prefix is the user's own choice and must keep working.
+    """sys.pycache_prefix must keep working: negative control for the test above.
 
-    cache_from_source already honours it, so refusing every pyc under it would
-    push everyone who sets it into permanent temp-cache recovery for a
-    configuration they chose on purpose. The negative control for the test
-    above: same shape, and it must NOT refuse.
+    Refusing every pyc under it would put everyone who sets it into permanent
+    recovery for a configuration they chose on purpose.
     """
     name = "UnslothFailClosedProbePycachePrefix"
     source = cache_dir / f"{name}.py"
