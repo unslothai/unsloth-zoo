@@ -1985,6 +1985,14 @@ def get_class_predicate(p, m):
     return scoped_load
 
 
+def _auto_image_processor_from_pretrained(model_path, *, trust_remote_code=False):
+    from transformers import AutoImageProcessor
+
+    return AutoImageProcessor.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code,
+    )
+
+
 def _build_vlm_image_processor_from_config(
     model_path, processor_config, preprocessor_config, model_type=None,
     *, trust_remote_code=False,
@@ -2023,8 +2031,7 @@ def _build_vlm_image_processor_from_config(
             pass
 
     try:
-        from transformers import AutoImageProcessor
-        return AutoImageProcessor.from_pretrained(
+        return _auto_image_processor_from_pretrained(
             model_path, trust_remote_code=trust_remote_code,
         )
     except Exception:
