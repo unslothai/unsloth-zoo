@@ -15,8 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import torch
 import torch.nn.functional as F
+import contextlib
+import json
 import os
 import shutil
+import stat
+import tempfile
 import sys
 import importlib
 import importlib.util
@@ -31,9 +35,25 @@ UNSLOTH_COMPILE_LOCATION = os.environ.get(
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
-    HAS_BNB = True
+    # unsloth_zoo installs a permissive bitsandbytes stub wherever the real package is
+    # absent, macOS arm64 among others, and every attribute of that stub resolves to a
+    # placeholder object rather than a class. `isinstance(x, Params4bit)` against one
+    # raises TypeError: isinstance() arg 2 must be a type, so a non-class Params4bit has
+    # to count as no bitsandbytes at all. On a real install this is just True.
+    HAS_BNB = isinstance(Params4bit, type)
+    if not HAS_BNB:
+        Params4bit = None
 except Exception:
     # Not just ImportError: a bitsandbytes mismatched with torch fails its own import with AttributeError.
+    HAS_BNB = False
+    Params4bit = None
+
+if not isinstance(Params4bit, type):
+    # A bitsandbytes that imports but does not expose Params4bit as a class, which is what
+    # the macOS build does, makes every `isinstance(param, Params4bit)` below raise
+    # TypeError instead of answering False. Probe the object, not the platform or the
+    # version, and treat that install as no bitsandbytes at all: there is no 4-bit expert
+    # path without the class.
     HAS_BNB = False
     Params4bit = None
 
@@ -77,12 +97,51 @@ _CACHED_FORWARD_MOE_BACKEND = None
 _CACHED_MOE_UTILS_MODULE = None
 
 
+_WARNED_STALE_CACHE = set()
+
+
+def _cached_copy_is_current(cache_file, current_file) -> bool:
+    """Whether the compiled cache holds byte for byte what this module is.
+
+    `install_to_cache` rewrites the cache on every import, so the two normally
+    match and this is a cheap confirmation. They diverge when the copy could not
+    be written: a cache directory baked into an image, a read only mount, or a
+    file owned by another user. `shutil.copy` fails there and the failure is
+    swallowed, so the cache keeps an OLDER unsloth_zoo, and every caller below
+    prefers it, which silently installs that older module's patches over the
+    ones this release ships. Prefer this module in that case, and say so once.
+    """
+    try:
+        with open(cache_file, "rb") as f:
+            cached = f.read()
+        with open(current_file, "rb") as f:
+            current = f.read()
+    except Exception:
+        return False
+    if cached == current:
+        return True
+
+    if cache_file not in _WARNED_STALE_CACHE:
+        _WARNED_STALE_CACHE.add(cache_file)
+        logger = _moe_utils_logger()
+        if logger is not None:
+            logger.warning(
+                f"Unsloth: {cache_file} is from a different version of unsloth_zoo and "
+                f"could not be refreshed, so it is being ignored. Delete that directory "
+                f"if MoE behaviour looks stale."
+            )
+    return False
+
+
 def _load_cached_moe_utils_module():
     global _CACHED_MOE_UTILS_MODULE
 
     cache_file = os.path.abspath(os.path.join(_get_compile_location(), "moe_utils.py"))
     current_file = os.path.abspath(__file__)
     if not os.path.isfile(cache_file) or cache_file == current_file:
+        return None
+    if not _cached_copy_is_current(cache_file, current_file):
+        _CACHED_MOE_UTILS_MODULE = None
         return None
 
     try:
@@ -743,6 +802,63 @@ def forward_moe_backend(
     return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
 
+# Test-only call counter, wired at import time and OFF by default: incrementing a
+# module global is a Dynamo side effect, and leaving it always-on re-traced the
+# compiled MoE block every step (3.6 ms -> 572 ms).
+_EXPERT_COUNT_CALLS = [0]
+_COUNT_DEBUG = os.environ.get("UNSLOTH_MOE_COUNT_DEBUG", "0") == "1"
+
+
+def _count_tokens_per_expert(
+    flat_experts: torch.Tensor,
+    num_experts: int,
+    dtype: torch.dtype = torch.int32,
+) -> torch.Tensor:
+    """Per-expert token counts, WITHOUT synchronising the device.
+
+    Drop-in replacement for ``torch.bincount(flat_experts, minlength=num_experts)``
+    returning shape ``[num_experts]`` and the requested ``dtype``.
+
+    Why not bincount: on CUDA the output size of ``bincount`` depends on the data
+    (it must learn ``max(input)`` even when ``minlength`` is given), so the kernel
+    D2H-copies and blocks the host. Measured on B200, E=256 / 16384 routed rows:
+    2 sync warnings under ``torch.cuda.set_sync_debug_mode("warn")`` and ~58 us of
+    host time per call, versus 0 warnings and ~19 us here. With one MoE layer per
+    block that drain happens tens of times per step.
+
+    ``scatter_add_`` accumulates with atomics, so the ORDER of accumulation is
+    nondeterministic; integer addition is associative and commutative and every
+    addend is exactly 1, so the SUM is bit-exact and run-to-run deterministic
+    regardless of order. Verified bit-identical to ``bincount`` over random,
+    skewed, empty and single-token routings, and it does not trip
+    ``torch.use_deterministic_algorithms(True)``.
+
+    Caveat, same precondition as the caller already relies on: ``flat_experts``
+    must hold values in ``[0, num_experts)``. That holds for router ``topk``
+    output by construction. Out-of-range values make ``bincount`` silently return
+    a LONGER tensor (breaking the downstream ``offs=`` shape) whereas this writes
+    out of bounds, so neither is safe; the difference is only in how it fails.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+    if flat_experts.dim() != 1:
+        flat_experts = flat_experts.reshape(-1)
+    # scatter_add_ needs int64; router topk already gives one, so no copy.
+    index = flat_experts if flat_experts.dtype == torch.int64 else flat_experts.long()
+    counts = torch.zeros(num_experts, dtype=dtype, device=flat_experts.device)
+    counts.scatter_add_(0, index, torch.ones_like(index, dtype=dtype))
+    return counts
+
+
+if _COUNT_DEBUG:
+    def count_tokens_per_expert(flat_experts, num_experts, dtype=torch.int32):
+        _EXPERT_COUNT_CALLS[0] += 1
+        return _count_tokens_per_expert(flat_experts, num_experts, dtype)
+
+    count_tokens_per_expert.__doc__ = _count_tokens_per_expert.__doc__
+else:
+    count_tokens_per_expert = _count_tokens_per_expert
+
+
 @torch.no_grad()
 def _get_routing_indices(selected_experts, num_experts):
     """Compute token->expert mapping for grouped GEMM.
@@ -753,13 +869,82 @@ def _get_routing_indices(selected_experts, num_experts):
 
     flat_experts = selected_experts.view(-1)
 
-    # bincount avoids histc's float conversion overhead.
-    token_counts_by_expert = torch.bincount(flat_experts, minlength=num_experts).to(torch.int32)
+    # Sync-free; see count_tokens_per_expert.
+    token_counts_by_expert = count_tokens_per_expert(flat_experts, num_experts, torch.int32)
 
     # stable=True preserves order within each expert.
     gather_indices = flat_experts.argsort(stable=True)
 
     return token_counts_by_expert, gather_indices
+
+
+def combine_permuted_moe_outputs(
+    permuted_output: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+    out_dtype = None,
+) -> torch.Tensor:
+    """Sum the top_k expert outputs belonging to each token, in a fixed order.
+
+    The obvious spelling of this reduction is
+    ``zeros(num_tokens, hidden).index_add_(0, token_indices, permuted_output)``
+    with ``token_indices = sorted_indices // top_k``. Because every token index
+    appears ``top_k`` times in one call, that lands in ``index_add_``'s CUDA
+    atomicAdd path, and atomicAdd fixes no accumulation order. Float addition is
+    not associative, so the result moves from run to run: repeating one identical
+    forward 40 times on a single already-loaded Gemma-4 MoE, with no optimizer
+    step and no data change, gave 40 distinct losses spread over 0.0284 nats,
+    while the same 40 repeats through the reduction below returned one value.
+
+    ``sorted_indices`` is ``argsort`` of the flat expert assignment, so it is a
+    permutation of ``range(num_tokens * top_k)`` - every slot exactly once. That
+    means the permutation can simply be undone (a gather through the inverse
+    permutation: unique indices, no accumulation and so no atomics) and the
+    ``top_k`` axis reduced with an ordinary ``sum``, which has a fixed reduction
+    order. Same arithmetic, same values up to that ordering, reproducible.
+
+    ``out_dtype`` is applied AFTER the reduction, not before it. When the routed
+    slots arrive wider than ``out_dtype`` - the fp32-router case, where the
+    routing-weight multiply promotes the expert output to fp32 - casting first
+    would round every one of the ``top_k`` summands to bf16 and only then add
+    them. Summing first and rounding once is what ``transformers``
+    (``integrations/moe.py``) does, and it is measurably closer to an fp64
+    reference. With a bf16 router the two orders are bit-identical.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    # The gather below is safe only because sorted_indices is an argsort, so the indices
+    # are unique and, given the count check here matches, cover every row: nothing is left
+    # unread and no slot is counted twice. A bare `assert` would vanish under `python -O`,
+    # which is exactly the build where a silently wrong reduction is hardest to notice.
+    if sorted_indices.numel() != permuted_output.shape[0]:
+        raise ValueError(
+            f"Unsloth: expected a full permutation of {permuted_output.shape[0]} routed slots, "
+            f"got {sorted_indices.numel()} indices"
+        )
+    # inverse_indices[sorted_indices[i]] = i, i.e. "which routed slot holds original row j".
+    # Gathering with it is one [num_tokens * top_k, hidden] buffer, in the incoming dtype;
+    # the narrowing cast then only ever touches the small [num_tokens, hidden] result.
+    inverse_indices = torch.empty_like(sorted_indices)
+    inverse_indices.scatter_(
+        0,
+        sorted_indices,
+        torch.arange(
+            sorted_indices.numel(),
+            device = sorted_indices.device,
+            dtype = sorted_indices.dtype,
+        ),
+    )
+    combined = (
+        permuted_output
+        .index_select(0, inverse_indices)
+        .view(num_tokens, top_k, permuted_output.shape[-1])
+        .sum(dim = 1)
+    )
+    if out_dtype is not None:
+        combined = combined.to(out_dtype)
+    return combined
 
 
 def _silu_and_mul(x):
@@ -782,6 +967,271 @@ def _has_lora_adapters(param) -> bool:
     return len(param.lora_A) > 0
 
 
+# How the flat `num_experts * rank` axis of a fused expert `lora_B` is laid out.
+#
+# PEFT stores a fused MoE expert LoRA as two ordinary Linear weights, lora_A of shape
+# (num_experts * rank, in) and lora_B of shape (out, num_experts * rank), and the two are
+# NOT flattened the same way. lora_A is expert-slowest, `reshape(E, r, in)`. lora_B is
+# expert-FASTEST: `reshape(out, r, E)`, so column j belongs to expert `j % E`. That
+# asymmetry is easy to miss, and it is the whole of this constant's reason to exist.
+#
+# Expert-fastest is what PEFT's own forward (`ParamWrapper.get_delta_factors`) and its
+# merge (`ParamWrapper.get_delta_weight`) both do, unchanged across PEFT 0.18 to 0.21;
+# what vLLM's `_stack_moe_lora_weights` does when it serves the adapter; and what prime-rl
+# writes. It is the only reading any consumer of a saved adapter implements, so it is what
+# the separated forward has to train.
+LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
+
+# What Unsloth's separated forward read before this fix: expert-SLOWEST, a rank-wide
+# contiguous block of columns per expert. Self-consistent, and understood by nothing else.
+# Kept only so an adapter trained that way can still be read back, see
+# `moe_lora_b_layout()`.
+LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
+
+_LORA_B_LAYOUTS = (LORA_B_LAYOUT_RANK_MAJOR, LORA_B_LAYOUT_GROUPED_BY_EXPERT)
+
+
+class MoELoRABLayoutError(ValueError):
+    """`UNSLOTH_MOE_LORA_B_LAYOUT` is set to something that is not a layout.
+
+    Its own class because `_extract_lora_from_wrapper` turns every exception into "this
+    wrapper has no LoRA", which would silently drop the adapter and train the base model.
+    A configuration mistake has to be louder than that, so it is re-raised there by type.
+    """
+
+
+def _read_moe_lora_b_layout_from_env() -> str:
+    """`UNSLOTH_MOE_LORA_B_LAYOUT`, validated. Split out so the value can be refreshed into
+    a module global on every eager call, which is what makes the switch visible to a
+    compiled graph."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", LORA_B_LAYOUT_RANK_MAJOR)
+    if layout not in _LORA_B_LAYOUTS:
+        raise MoELoRABLayoutError(
+            f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_LORA_B_LAYOUTS}, got "
+            f"{layout!r}."
+        )
+    return layout
+
+
+_MOE_LORA_B_LAYOUT = _read_moe_lora_b_layout_from_env()
+
+
+def moe_lora_b_layout() -> str:
+    """Which packing to read a fused expert `lora_B` with.
+
+    `rank_major` (PEFT's, and therefore everyone's) unless
+    `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` asks for the pre-fix reading, which is
+    what an adapter trained by an older Unsloth needs.
+
+    It is a process-wide mode, not a load-time option. Nothing is recorded on the adapter,
+    and every forward and every merge resolves it again, so setting it only around
+    `load_adapter` leaves the rest of the run reading a legacy adapter as `rank_major` and
+    scrambling it. Set it before the process does any MoE work and leave it set. Reading
+    the layout back off the adapter itself needs the `adapter_config.json` marker, which is
+    the migration path, not this switch.
+    """
+    global _MOE_LORA_B_LAYOUT
+    # Refreshed on every call, including while Dynamo traces. Reading the environment at
+    # trace time bakes the then-current value into the graph, which is what the supported
+    # usage needs: `import unsloth` runs this module's import long before the application
+    # sets the variable, so an import-time value alone would be stale for exactly the
+    # normal case of setting it before training starts. Gating the refresh on
+    # `not is_compiling()` got this wrong, because a run whose first MoE call is already
+    # compiled never executes the eager branch at all.
+    #
+    # What this still does not do is notice a change made AFTER the first compiled call:
+    # Dynamo installs a guard on an `os.environ.get` only when the key is set at trace
+    # time, so there is nothing to invalidate the graph. That is the documented contract,
+    # a process-wide mode set before the process does any MoE work.
+    _MOE_LORA_B_LAYOUT = _read_moe_lora_b_layout_from_env()
+    return _MOE_LORA_B_LAYOUT
+
+
+def _resolve_moe_lora_b_layout(layout) -> str:
+    """The layout to use, whether the caller named one or left it to the environment.
+
+    A caller that names one still gets it validated. Both readers branch on "is this
+    rank_major" and fall through to grouped_by_expert otherwise, so an unvalidated typo
+    is not a no-op: it permutes the columns of a standard adapter, silently, which is the
+    exact damage `moe_lora_b_layout()` validates the environment variable to prevent. A
+    converter passing the layout in from a marker or a command line is the likeliest
+    source of one."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if layout is None:
+        return moe_lora_b_layout()
+    if layout not in _LORA_B_LAYOUTS:
+        raise MoELoRABLayoutError(
+            f"Unsloth: lora_B layout must be one of {_LORA_B_LAYOUTS}, got {layout!r}."
+        )
+    return layout
+
+
+def _moe_lora_b_column_permutation(num_experts, rank_per_expert, device, invert = False):
+    """The column permutation between PEFT's rank-major packing and expert-major order.
+
+    Forward: `out[:, k] = weight_B[:, perm[k]]`. The inverse is the same construction with
+    the two axes swapped, so neither direction needs the other's indices kept around."""
+    total = num_experts * rank_per_expert
+    rows, columns = (num_experts, rank_per_expert) if invert else (rank_per_expert, num_experts)
+    return torch.arange(total, device = device).view(rows, columns).t().reshape(-1)
+
+
+class _ExpertMajorGroupedOperand(torch.autograd.Function):
+    """`(out, E*rank)` -> `(E, rank, out)` for the grouped GEMM, in ONE materialization.
+
+    Gathering into expert-major column order and then permuting to the operand's shape
+    copies the whole tensor twice per projection, on every expert layer of every step.
+    Transposing to `(E*rank, out)` first makes the gather itself produce the operand: the
+    rows land in expert-major order, `index_select` on dim 0 writes a contiguous result,
+    and the final reshape is free.
+
+    Still a real gather, which is the property the grouped GEMM needs: under rank-major
+    packing the expert axis has stride 1, so a pure view chain lets Inductor elide the
+    copy and hand `aten._grouped_mm` an operand that is neither row nor column major.
+    Still saves nothing for the backward either, since the permutation is recomputed from
+    two integers, which is what non-reentrant checkpointing requires."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, weight_B, num_experts, rank_per_expert, layout):
+        ctx.num_experts = num_experts
+        ctx.rank_per_expert = rank_per_expert
+        ctx.layout = layout
+        ctx.dim_B = weight_B.shape[0]
+        rows = weight_B.t()
+        if layout == LORA_B_LAYOUT_RANK_MAJOR:
+            columns = _moe_lora_b_column_permutation(
+                num_experts, rank_per_expert, weight_B.device,
+            )
+            rows = rows.index_select(0, columns)
+        else:
+            rows = rows.contiguous()
+        return rows.reshape(num_experts, rank_per_expert, ctx.dim_B)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rows = grad_output.reshape(ctx.num_experts * ctx.rank_per_expert, ctx.dim_B)
+        if ctx.layout == LORA_B_LAYOUT_RANK_MAJOR:
+            columns = _moe_lora_b_column_permutation(
+                ctx.num_experts, ctx.rank_per_expert, grad_output.device, invert = True,
+            )
+            rows = rows.index_select(0, columns)
+        return rows.t(), None, None, None
+
+
+class _ExpertMajorColumns(torch.autograd.Function):
+    """Reorder `lora_B`'s columns expert-major, saving nothing for the backward.
+
+    `index_select` would do this in one line, but it saves its index tensor, and
+    `torch.utils.checkpoint(use_reentrant = False)` counts every saved tensor and refuses
+    when the recompute saves a different number than the forward. The measuring call in
+    `_patched_param_wrapper_forward` already runs the experts forward a different number
+    of times than the recompute does, so one more saved tensor on the default path is
+    enough to turn that into `CheckpointError`, which is transformers 5's default
+    configuration and Unsloth's own distributed vision path.
+
+    The permutation is fully determined by two integers, so the backward rebuilds the
+    inverse from `ctx` rather than from a saved tensor: nothing is saved, the count is
+    unchanged from the pure-view spelling, and the gradient still reaches `lora_B`.
+    A real gather is also what Inductor cannot fold back into a strided view of the
+    source, which is the other half of why this is not a plain `permute`."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    @staticmethod
+    def forward(ctx, weight_B, num_experts, rank_per_expert):
+        ctx.num_experts = num_experts
+        ctx.rank_per_expert = rank_per_expert
+        columns = _moe_lora_b_column_permutation(
+            num_experts, rank_per_expert, weight_B.device,
+        )
+        return weight_B.index_select(1, columns)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        columns = _moe_lora_b_column_permutation(
+            ctx.num_experts, ctx.rank_per_expert, grad_output.device, invert = True,
+        )
+        return grad_output.index_select(1, columns), None, None
+
+
+def _moe_lora_b_columns_expert_major(weight_B, num_experts, rank_per_expert, layout):
+    """`lora_B`'s columns reordered so the expert index is slowest, without copying.
+
+    Shared by `unflatten_moe_lora_b` and the grouped-GEMM path so the two cannot disagree
+    about the column order, while each finishes with its OWN single permute into the shape
+    it wants. Doing the reorder here and the permute there is what keeps the copy count at
+    one: composing the two public shapes instead (unflatten, then transpose + contiguous)
+    materialises the tensor twice, which is an extra saved tensor and breaks non-reentrant
+    gradient checkpointing, whose recompute must save exactly what the forward did.
+
+    Returns `weight_B` untouched under grouped-by-expert, where the columns already are
+    expert-slowest."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    layout = _resolve_moe_lora_b_layout(layout)
+    if layout != LORA_B_LAYOUT_RANK_MAJOR:
+        return weight_B
+    # PEFT packs expert index fastest: column j holds expert `j % num_experts`.
+    return _ExpertMajorColumns.apply(weight_B, num_experts, rank_per_expert)
+
+
+def unflatten_moe_lora_b(
+    weight_B: torch.Tensor,
+    num_experts: int,
+    rank_per_expert: int,
+    dim_B: int,
+    layout: str = None,
+) -> torch.Tensor:
+    """`(out, num_experts * rank)` -> `(num_experts, out, rank)`.
+
+    The single place the expert axis of a fused `lora_B` is resolved, so the forward, the
+    merge and any converter cannot drift apart. Both layouts end in `.contiguous()` on a
+    permuted view, so neither is cheaper than the other and the choice is purely one of
+    which convention the stored tensor was written in.
+
+    The rank-major branch regroups the columns with `index_select` before it views them,
+    rather than permuting the expert axis out of a three-way view. The two spell the same
+    tensor, but only the first survives `torch.compile`. Under rank-major packing the
+    expert axis has stride 1 in `weight_B`, so every view that puts experts first leaves
+    BOTH remaining axes with a stride above 1, and `aten._grouped_mm` rejects a `mat_b`
+    that is neither row nor column major. Eager is fine because `.contiguous()` really
+    copies; Inductor folds the whole view chain into one strided read of `weight_B` and
+    picks the source layout, so the copy disappears and the consumer sees
+    `(1, num_experts, num_experts * rank)` and raises `Invalid strides/sizes`. Measured on
+    `gemma-4-26B-A4B-it` (E=128, rank=8, out=1408) and reproduced standalone; the
+    pre-existing grouped-by-expert spelling escaped only because eliding ITS copy happens
+    to leave a legal column-major operand. `index_select` is a real gather that Inductor
+    cannot fold into a view, it keeps the gradient flowing to `lora_B`, and its indices are
+    a permutation, so its `index_add` backward has no duplicate targets to reduce
+    nondeterministically."""
+    weight_B = _moe_lora_b_columns_expert_major(
+        weight_B, num_experts, rank_per_expert, layout,
+    )
+    return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
+
+
+def moe_lora_b_expert_columns(
+    expert_idx: int,
+    num_experts: int,
+    rank_per_expert: int,
+    layout: str = None,
+) -> slice:
+    """Which columns of a flat `(out, num_experts * rank)` `lora_B` belong to one expert.
+
+    A `slice`, so indexing with it stays a view. The companion of
+    `unflatten_moe_lora_b` for the merge paths that walk one expert at a time; the two
+    must agree, which is why both live here. `lora_A`'s rows for the same expert are
+    always `expert_idx * rank : (expert_idx + 1) * rank`, in both layouts, and the
+    resulting column order matches that rank order."""
+    layout = _resolve_moe_lora_b_layout(layout)
+    if layout == LORA_B_LAYOUT_RANK_MAJOR:
+        return slice(expert_idx, num_experts * rank_per_expert, num_experts)
+    return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
+
+
 def _canonical_lora_weights_for_grouped_mm(
     weight_A: torch.Tensor,
     weight_B: torch.Tensor,
@@ -792,8 +1242,13 @@ def _canonical_lora_weights_for_grouped_mm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
     first_weight = first_weight.permute(0, 2, 1).contiguous()
-    second_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-    second_weight = second_weight.permute(1, 2, 0).contiguous()
+    # (num_experts, rank, out) for X @ first @ second, in ONE copy. Going through
+    # unflatten_moe_lora_b and transposing its result materialises the tensor twice, and
+    # the extra saved tensor makes non-reentrant gradient checkpointing recompute a
+    # different number of tensors than the forward saved.
+    second_weight = _ExpertMajorGroupedOperand.apply(
+        weight_B, num_experts, rank_per_expert, _resolve_moe_lora_b_layout(None),
+    )
     return first_weight, second_weight
 
 
@@ -805,8 +1260,7 @@ def _reversed_lora_weights_for_grouped_mm(
     dim_A: int,
     dim_B: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    first_weight = weight_B.view(dim_B, num_experts, rank_per_expert)
-    first_weight = first_weight.permute(1, 0, 2).contiguous()
+    first_weight = unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B)
     second_weight = weight_A.view(num_experts, rank_per_expert, dim_A).contiguous()
     return first_weight, second_weight
 
@@ -995,6 +1449,9 @@ def _extract_lora_from_wrapper(
             experts_module=experts_module,
             model_name="MoE",
         )
+    except MoELoRABLayoutError:
+        # A misspelled UNSLOTH_MOE_LORA_B_LAYOUT must not read as "no adapter here".
+        raise
     except Exception:
         return None
 
@@ -1050,18 +1507,24 @@ def _get_base_weight(param, target_dtype=None):
 
 
 def _get_lora_wrapper_for_param(experts_module, param_name):
-    """Get the PEFT ParamWrapper for gate_up_proj or down_proj; does not lazily set up wrappers."""
+    """Get the PEFT ParamWrapper for gate_up_proj or down_proj; does not lazily set up wrappers.
+
+    A forward that asks for the wrapper applies that parameter's LoRA itself rather than
+    reading the stash, so finding one counts as a read (see `mark_moe_lora_stash_read`).
+    """
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    wrapper = None
     if hasattr(experts_module, f"{param_name}_lora_wrapper"):
-        return getattr(experts_module, f"{param_name}_lora_wrapper")
-
-    if hasattr(experts_module, param_name):
+        wrapper = getattr(experts_module, f"{param_name}_lora_wrapper")
+    elif hasattr(experts_module, param_name):
         attr = getattr(experts_module, param_name)
         if hasattr(attr, "lora_A"):  # ParamWrapper
-            return attr
+            wrapper = attr
 
-    return None
+    if wrapper is not None:
+        mark_moe_lora_stash_read(experts_module, param_name)
+    return wrapper
 
 
 def native_moe_grouped_mm(
@@ -1431,6 +1894,729 @@ def _is_moe_experts_module(module) -> bool:
 _get_moe_lora_weights = _extract_lora_from_wrapper
 
 
+# ---------------------------------------------------------------------------------------
+# Which convention packs lora_B's (num_experts * rank) axis.
+#
+# PEFT's ParamWrapper builds lora_A as (E*R, in) and lora_B as (out, E*R) and pairs them
+# in get_delta_weight by reading A as (E, R, in) and B as (out, R, E): lora_A is grouped
+# by expert, lora_B is NOT, its expert index is the fastest axis. That reading is
+# unchanged in PEFT 0.18.0, 0.19.0, 0.19.1, 0.20.0 and 0.21.0, and it is what vLLM's
+# `_stack_moe_lora_weights` and every other consumer of a saved adapter implements, so it
+# is the only reading a stored fused expert lora_B can be expected to have.
+#
+# Unsloth's separated forward read the same lora_B as (out, E, R) instead
+# (`_canonical_lora_weights_for_grouped_mm`), so a rank-contiguous block of columns
+# belonged to one expert. Both reshapes always fit, since E*R == R*E, so nothing ever
+# raises and the disagreement is always silent. They disagree whenever num_experts > 1
+# and rank > 1, which is every real MoE checkpoint: equal num_experts and rank does not
+# make them agree, because the two readings send flat column r*E + e and flat column
+# e*R + r to the same place and those coincide for all (e, r) only when E == 1 or R == 1.
+#
+# The separated forward is being moved onto PEFT's packing (the `lora_B` packing fix,
+# unsloth_zoo#1269), with `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` left as the
+# opt-in for reading an adapter an older Unsloth trained. What stays here is the
+# *recording* side: which packing the adapter on this model was trained with, written
+# into adapter_config.json on save (unsloth#6930), because a downstream converter has no
+# wrapper to ask and Unsloth stamps no version into the file either, so a marker-less
+# adapter cannot be dated from its bytes.
+# ---------------------------------------------------------------------------------------
+
+# Also defined next to the packing helpers by unsloth_zoo#1269; same strings, so the two
+# definitions are interchangeable and either branch can land first.
+LORA_B_LAYOUT_GROUPED_BY_EXPERT = "grouped_by_expert"
+LORA_B_LAYOUT_RANK_MAJOR = "rank_major"
+
+
+def _process_lora_b_layout() -> str:
+    """Which packing the separated MoE forward uses in THIS process.
+
+    `moe_lora_b_layout()` (unsloth_zoo#1269) is the authority once that fix is in: it
+    reads `UNSLOTH_MOE_LORA_B_LAYOUT` and defaults to PEFT's `rank_major`. It is looked
+    up rather than imported because it lives in this same module, so the two can land in
+    either order. Without it the separated forward is unconditionally grouped by expert,
+    which is what a build predating the packing fix does, so that is the honest answer
+    there."""
+    resolver = globals().get("moe_lora_b_layout")
+    if callable(resolver):
+        return resolver()
+    return LORA_B_LAYOUT_GROUPED_BY_EXPERT
+
+
+def _legacy_lora_b_layout_requested() -> bool:
+    """Whether the caller has explicitly declared that the adapters in this process were
+    packed the pre-fix way, by setting `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert`.
+
+    Deliberately the raw environment variable and not `_process_lora_b_layout()`: this
+    gates a patch over PEFT's own `get_delta_weight`, and the packing of a *stored*
+    adapter is a property of the adapter, not of how this process happens to be routing
+    its forwards. Only an explicit statement about provenance may redirect PEFT's merge;
+    an unset variable leaves PEFT's reconstruction, which is the correct one for every
+    adapter trained with the packing fix in place, completely untouched."""
+    return os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT") == LORA_B_LAYOUT_GROUPED_BY_EXPERT
+
+# The only parameter names the separated forward claims. Anything else on an experts
+# module (the unfused experts.gate_proj / experts.up_proj pair that NemotronH uses, for
+# instance) stays on PEFT's own forward and keeps PEFT's own packing.
+_SEPARATED_MOE_LORA_PARAMETER_NAMES = ("gate_up_proj", "down_proj")
+
+
+def _wrapper_uses_separated_moe_lora(wrapper, experts_module = None) -> bool:
+    """True when `_patched_param_wrapper_forward` routes this wrapper to the separated
+    MoE forward instead of PEFT's `_activate_lora`. Kept in one place so the forward, the
+    delta reconstruction and the saved layout marker cannot drift apart."""
+    if not _should_use_separated_lora():
+        return False
+    if getattr(wrapper, "parameter_name", None) not in _SEPARATED_MOE_LORA_PARAMETER_NAMES:
+        return False
+    if experts_module is None:
+        get_base_layer = getattr(wrapper, "get_base_layer", None)
+        if get_base_layer is None:
+            return False
+        try:
+            experts_module = get_base_layer()
+        except Exception:
+            return False
+    return _is_moe_experts_module(experts_module)
+
+
+def _wrapper_forward_applies_stash(wrapper):
+    """The measured verdict for this wrapper's experts forward, or None if unmeasured.
+
+    `_wrapper_uses_separated_moe_lora` answers a structural question, "does the separated
+    forward claim this parameter". `_patched_param_wrapper_forward` then asks a stronger
+    one at run time, "did the forward that actually ran read the stash", and falls back to
+    PEFT when the answer is False. The layout follows the forward that ran, so it has to
+    read the same verdict."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    parameter_name = getattr(wrapper, "parameter_name", None)
+    if parameter_name is None:
+        return None
+    get_base_layer = getattr(wrapper, "get_base_layer", None)
+    if get_base_layer is None:
+        return None
+    try:
+        experts_module = get_base_layer()
+    except Exception:
+        return None
+    if experts_module is None:
+        return None
+    try:
+        return moe_lora_forward_applies_stash(experts_module, parameter_name)
+    except Exception:
+        return None
+
+
+def _wrapper_has_adapter(wrapper, adapter_name) -> bool:
+    """Whether `adapter_name` has a LoRA on this wrapper at all. A PeftModel can carry a
+    fused expert adapter and a dense adapter side by side, and the fused expert wrappers
+    then exist for the whole model while only one adapter has weights in them, so every
+    layout answer has to be scoped to one adapter or it describes the wrong one.
+
+    `adapter_name = None` asks the weaker question "does this wrapper hold any adapter at
+    all", which is what the unnamed form of `moe_lora_b_layout_for_wrapper` needs. Still
+    a question:
+    `delete_adapter` empties lora_A and leaves the wrapper in place, and claiming a
+    packing for weights that are gone is the same mistake in a smaller form."""
+    lora_A = getattr(wrapper, "lora_A", None)
+    if lora_A is None:
+        return False
+    try:
+        if adapter_name is None:
+            return len(lora_A) != 0
+        return adapter_name in lora_A
+    except Exception:
+        return False
+
+
+def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
+    """Which convention packs `wrapper`'s lora_B columns for `adapter_name`.
+
+    A wrapper the separated MoE forward owns is packed the way that forward packs, which
+    is `_process_lora_b_layout()`: PEFT's `rank_major` with the packing fix in place,
+    `grouped_by_expert` under `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` or on a build
+    predating the fix. Every other wrapper is on PEFT's own forward and is therefore
+    `rank_major`. A single expert (or a wrapper PEFT collapses to a plain Linear) has no
+    packing to get wrong and is reported as rank_major, which is what PEFT's own
+    reconstruction does for it.
+
+    Named for the wrapper on purpose: `moe_lora_b_layout()` is the process-wide setting
+    and takes no arguments, this one answers for one wrapper and one adapter.
+
+    `adapter_name` defaults to "whichever adapter this wrapper holds", which is the old
+    behaviour and is right for a model with one adapter. Name an adapter that has no LoRA
+    on this wrapper and the answer is rank_major, so the caller falls back to PEFT rather
+    than claiming a packing for weights that are not there.
+
+    `wrapper` must be the PEFT ParamWrapper. Hand it anything else, the experts module
+    itself for instance, and the answer is rank_major, because nothing on it says the
+    separated forward claimed a parameter. That reads as a confident "PEFT packed this"
+    when the truth is "cannot tell", so callers that may hold something else have to
+    check for `parameter_name` and `lora_A` first."""
+    if int(getattr(wrapper, "num_experts", 1) or 1) <= 1:
+        return LORA_B_LAYOUT_RANK_MAJOR
+    if not _wrapper_has_adapter(wrapper, adapter_name):
+        return LORA_B_LAYOUT_RANK_MAJOR
+    if _wrapper_uses_separated_moe_lora(wrapper):
+        if _wrapper_forward_applies_stash(wrapper) is False:
+            # The structural test says the separated forward claims this wrapper, but the
+            # forward that actually ran did not read the stash, so `_patched_param_wrapper_forward`
+            # handed the wrapper back to PEFT and PEFT trained it rank-major. That happens
+            # for a stacked-expert family Unsloth does not patch (Olmoe, for one). Believing
+            # the structural answer here would write a grouped_by_expert marker for
+            # rank-major weights, and, under the legacy override, merge them with the wrong
+            # pairing. Only a measured False overrides it; None means "not measured yet",
+            # which is not evidence either way.
+            return LORA_B_LAYOUT_RANK_MAJOR
+        return _process_lora_b_layout()
+    return LORA_B_LAYOUT_RANK_MAJOR
+
+
+# Did the experts forward actually read the LoRA that ParamWrapper.forward handed it?
+#
+# `_patched_param_wrapper_forward` deliberately does not let PEFT fold the expert LoRA into
+# the stacked expert weight. It stashes the factors on the experts module as
+# `_unsloth_lora_<parameter_name>` and lets the experts forward apply them as a separate
+# grouped GEMM, which is cheaper and keeps the base weight quantized. That is only correct
+# when the forward that runs is one that reads the stash. Unsloth installs such a forward for
+# the MoE families it patches. For a stacked-expert family it does not patch, transformers'
+# own experts forward runs, the stash is written and then deleted unread, and the expert LoRA
+# has no effect on the output at all while requires_grad and the optimizer still report a
+# healthy adapter. `_forward_native_fp8_expert_loop` already refuses rather than train an
+# adapter that nothing reads; this does the same job without having to enumerate the
+# families, by recording the read and asking afterwards.
+#
+# Every stash read goes through `take_moe_lora_stash`, which records the read on the experts
+# module. The wrapper resets the record, calls the base layer, and checks it: an unread stash
+# means this forward does not apply the expert LoRA, so the wrapper redoes the call through
+# PEFT's own `ParamWrapper.forward`, which folds the delta into the weight. The verdict is
+# cached per parameter name against the forward it was measured with, so the double call
+# happens at most once per experts module and never for a family whose forward does read it.
+
+_MOE_LORA_STASH_READ_ATTR = "_unsloth_moe_lora_stash_read"
+_MOE_LORA_STASH_VERDICT_ATTR = "_unsloth_moe_lora_forward_applies"
+
+
+def moe_lora_stash_name(parameter_name: str) -> str:
+    """Attribute name `_patched_param_wrapper_forward` stashes `parameter_name`'s LoRA under."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    return f"_unsloth_lora_{parameter_name}"
+
+
+def _moe_module_dict(module, attr):
+    """Per-module bookkeeping dict for `attr`, created on first use.
+
+    Read through `__dict__` and written with `setattr`: these are plain dicts, so
+    `nn.Module.__setattr__` stores them in the instance `__dict__`, and going straight to
+    `__dict__` on the read path skips `nn.Module.__getattr__` for a value that is never a
+    parameter, buffer or submodule.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        store = module.__dict__.get(attr)
+    except AttributeError:
+        return None
+    if store is None:
+        store = {}
+        try:
+            setattr(module, attr, store)
+        except Exception:
+            return None
+    return store
+
+
+def mark_moe_lora_stash_read(experts_module, parameter_name: str) -> None:
+    """Record that this experts forward applies `parameter_name`'s expert LoRA itself.
+
+    Called by `take_moe_lora_stash` for every stash read, and by
+    `_get_lora_wrapper_for_param` for the forwards that reach past the stash and pull the
+    LoRA straight off the PEFT wrapper (the MXFP4 GPT-OSS experts forward does that).
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    store = _moe_module_dict(experts_module, _MOE_LORA_STASH_READ_ATTR)
+    if store is not None:
+        store[parameter_name] = True
+
+
+def take_moe_lora_stash(experts_module, parameter_name: str):
+    """The stashed LoRA for `parameter_name`, or None, recording that this forward read it.
+
+    Records the read whatever the value is: an attempted read is what proves the forward
+    knows about the stash, and the stash is legitimately absent when no adapter is attached.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    mark_moe_lora_stash_read(experts_module, parameter_name)
+    return getattr(experts_module, moe_lora_stash_name(parameter_name), None)
+
+
+def _resolve_experts_forward(experts_module):
+    """The function object that `experts_module(...)` will run, or None."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    forward = getattr(experts_module, "forward", None)
+    return getattr(forward, "__func__", forward)
+
+
+def moe_lora_forward_applies_stash(experts_module, parameter_name: str):
+    """Cached verdict: does this experts forward apply the stashed expert LoRA itself?
+
+    True or False once measured, None when it has not been measured for the forward that is
+    currently installed. Re-patching the forward invalidates the verdict.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        cache = experts_module.__dict__.get(_MOE_LORA_STASH_VERDICT_ATTR)
+    except AttributeError:
+        return None
+    if not cache:
+        return None
+    entry = cache.get(parameter_name)
+    if entry is None:
+        return None
+    forward, verdict = entry
+    if forward is not _resolve_experts_forward(experts_module):
+        return None
+    return verdict
+
+
+def _record_moe_lora_forward_verdict(experts_module, parameter_name: str, verdict) -> None:
+    """Remember `verdict` for `parameter_name` against the forward currently installed."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    store = _moe_module_dict(experts_module, _MOE_LORA_STASH_VERDICT_ATTR)
+    if store is not None:
+        store[parameter_name] = (_resolve_experts_forward(experts_module), bool(verdict))
+
+
+def _reset_moe_lora_stash_read(experts_module, parameter_name: str) -> None:
+    """Clear the read record for `parameter_name` before calling the experts forward."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    store = _moe_module_dict(experts_module, _MOE_LORA_STASH_READ_ATTR)
+    if store is not None:
+        store[parameter_name] = False
+
+
+def _moe_lora_stash_was_read(experts_module, parameter_name: str) -> bool:
+    """Whether the experts forward read `parameter_name`'s stash since the last reset."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        store = experts_module.__dict__.get(_MOE_LORA_STASH_READ_ATTR)
+    except AttributeError:
+        return False
+    return bool(store and store.get(parameter_name))
+
+
+_MOE_LORA_STASH_UNREAD_LOGGED = set()
+
+
+def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None:
+    """One message per experts class and parameter, the first time the stash goes unread."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    key = (type(experts_module).__name__, parameter_name)
+    if key in _MOE_LORA_STASH_UNREAD_LOGGED:
+        return
+    _MOE_LORA_STASH_UNREAD_LOGGED.add(key)
+    _log_info(
+        f"Unsloth: {key[0]}.forward does not apply Unsloth's separated expert LoRA for "
+        f"{parameter_name}, so the {parameter_name} adapter is applied through PEFT's "
+        "parameter path instead."
+    )
+
+
+_STASH_READ_MARKERS = frozenset(("take_moe_lora_stash", "moe_lora_stash_name"))
+
+# How far the scan follows a call before giving up. The installed forwards delegate at most
+# twice (dispatcher -> backend -> helper), and a bound keeps a pathological import graph
+# from turning a cold start into a walk of the whole module tree.
+_STASH_SCAN_MAX_DEPTH = 4
+
+
+def _forward_statically_reads_stash(experts_module):
+    """Does this experts forward reach the stash API at all, read from its bytecode?
+
+    A static answer, which is the only kind available while Dynamo is tracing: the probe
+    cannot run inside a captured graph without being captured with it. Every forward that
+    applies Unsloth's separated expert LoRA reaches `take_moe_lora_stash`, so that name
+    appearing anywhere the forward can call is what distinguishes an Unsloth-installed
+    forward from transformers' own. Cheap and side-effect free: no call is made, only
+    names are read.
+
+    The reach matters. The forward installed for the Qwen MoE families IS
+    `forward_moe_backend`, a dispatcher that names only `forward_native_grouped_mm`,
+    `forward_triton_grouped_gemm` and `forward_native_moe_loop`, each of which reads the
+    stash. Scanning the dispatcher's own code object alone calls those supported families
+    stash-ignorant, which routes the first compiled call through PEFT's dynamic
+    parametrization and brings back the `fullgraph=True` failure this patch exists to
+    avoid. So a global name that resolves to a Python function is followed too, bounded by
+    `_STASH_SCAN_MAX_DEPTH` and by the visited set.
+
+    Only module globals are resolvable: a name imported inside the function body, or
+    reached through an instance attribute, is not bound anywhere this can read. That makes
+    the answer one-sided, True is certain and False is only "no route found", which is why
+    the caller treats False as a reason to log rather than a guarantee.
+
+    Returns True, False, or None when there is no code object to read.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    forward = getattr(experts_module, "forward", None)
+    forward = getattr(forward, "__func__", forward)
+    code = getattr(forward, "__code__", None)
+    if code is None:
+        return None
+
+    # Keyed on the code objects themselves, never on id(). Tracing id(forward) makes
+    # Dynamo guard the expression it tracked, `experts_module.forward`, a bound method
+    # CPython reallocates on every access, so ___check_obj_id can never match again and
+    # Dynamo raises "Guard failed on the same frame it was created" under both fullgraph
+    # settings with no eager fallback. Code objects are hashable, stable and 1:1 with the
+    # functions here, so they also make the separate function set redundant.
+    # Keyed on the code objects themselves, never on id(), and remembering the SHALLOWEST
+    # depth each was reached at. A plain visited set makes the answer depend on the hash
+    # seed: a helper reachable both directly and through a chain can be popped first at
+    # the depth limit, where its own callees are not followed, and the later shallow entry
+    # is then dropped as already seen. Measured on a synthetic forward with both routes,
+    # 5 of 14 PYTHONHASHSEED values returned False for a forward that does reach the
+    # stash, which would send that compiled cold start down the failing PEFT path.
+    # A LIST keyed by `is`, not a dict and not id().
+    #
+    # Equality is wrong: two functions compiled from identical source at the same filename
+    # and name have code objects that compare and hash equal while being distinct objects
+    # with different __globals__, so a dict collapses them and the scan misses whichever
+    # route is second.
+    #
+    # id() is right but untraceable: Dynamo rejects it on a code object with
+    # "Unsupported: id() with unsupported args" on some torch versions, which is a hard
+    # compile failure in the branch that exists to keep compilation working. `is` gives
+    # the same identity semantics and traces everywhere. The list stays tiny, bounded by
+    # the depth limit, so the linear scan costs nothing.
+    seen_code = []
+    pending = [(code, getattr(forward, "__globals__", {}), 0)]
+
+    def _visited_at_or_above(target, depth):
+        for seen, seen_depth in seen_code:
+            if seen is target:
+                return seen_depth <= depth
+        return False
+
+    while pending:
+        current, namespace, depth = pending.pop()
+        # Keyed by IDENTITY, not equality. Two functions compiled from identical source at
+        # the same filename and name have code objects that compare equal and hash equal
+        # while being distinct objects with different __globals__, so a dict keyed on the
+        # code objects themselves collapses them: if the first resolves its names to an
+        # unrelated helper and the second to take_moe_lora_stash, the second is skipped
+        # and the scan wrongly answers False. `alive` holds a reference to everything
+        # visited, so no id() can be recycled by the collector mid-walk.
+        if _visited_at_or_above(current, depth):
+            continue
+        seen_code.append((current, depth))
+        names = set(getattr(current, "co_names", ()))
+        if names & _STASH_READ_MARKERS:
+            return True
+        for constant in getattr(current, "co_consts", ()):
+            if hasattr(constant, "co_names"):
+                pending.append((constant, namespace, depth))
+        if depth >= _STASH_SCAN_MAX_DEPTH:
+            continue
+        for name in names:
+            called = namespace.get(name)
+            called = getattr(called, "__func__", called)
+            called_code = getattr(called, "__code__", None)
+            if called_code is None:
+                continue
+            if _visited_at_or_above(called_code, depth + 1):
+                continue
+            pending.append((called_code, getattr(called, "__globals__", namespace), depth + 1))
+    return False
+
+
+@contextlib.contextmanager
+def _preserved_rng_for_probe(x):
+    """Run the probe forward without advancing any generator the real forward will read.
+
+    `no_grad` only turns off the graph; every random draw inside the throwaway forward
+    still advances the generator, so a family with dropout in the experts path would get
+    different numbers out of the call that counts than it got before this probe existed.
+    Gradient checkpointing makes that a wrong-gradient bug rather than a reproducibility
+    one: non-reentrant checkpointing restores the RNG state at the start of the region and
+    replays it, so the original pass (probe plus real forward) and the recompute (verdict
+    cached, real forward only) would draw different masks for the same region.
+
+    Three things this is careful about, all of them ways a preservation attempt could be
+    worse than none:
+
+    * The BACKEND is named, not inferred. `fork_rng`'s `devices` identifies devices within
+      `device_type`, which it resolves from `torch.accelerator.current_accelerator()` and
+      falls back to "cuda" for, so handing it an XPU device without saying so can ask the
+      wrong module for a generator state.
+    * A failure here must not become the probe's answer. The caller turns any exception
+      into `None`, which caches no verdict and leaves the stash path selected, so a
+      `fork_rng` that raised would silently keep the LoRA unapplied on a family that
+      ignores the stash. Anything that goes wrong setting the fork up leaves the forward
+      to run unforked instead.
+    Reached only on the eager path: `_measure_moe_lora_stash_read` returns before it while
+    Dynamo is tracing, so a generator-based context manager never enters a captured graph.
+    The check is kept here as well because this helper is usable on its own.
+    """
+    if torch.compiler.is_compiling():
+        yield
+        return
+    device = x.device if isinstance(x, torch.Tensor) else None
+    fork = None
+    try:
+        if device is None or device.type in ("cpu", "meta"):
+            # The CPU generator is forked whatever `devices` says; an empty list is what
+            # keeps `fork_rng` from initialising every visible accelerator, which it does
+            # when `devices` is None, and warns about.
+            fork = torch.random.fork_rng(devices = [], device_type = "cpu")
+        else:
+            fork = torch.random.fork_rng(devices = [device], device_type = device.type)
+        fork.__enter__()
+    except Exception:
+        fork = None
+    try:
+        yield
+    finally:
+        if fork is not None:
+            try:
+                fork.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
+def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
+    """Run one throwaway experts forward under `no_grad` and report whether it read the stash.
+
+    Measured on a separate graph-free call rather than on the call that counts. The call
+    that counts then runs exactly one experts forward, on whichever path the verdict names,
+    and it runs that same single path again on a recompute. That is the property
+    non-reentrant gradient checkpointing requires: it replays the region and refuses, with
+    `CheckpointError: a different number of tensors was saved during the original forward
+    and recomputation`, if the replay does not save what the forward saved. Measuring in
+    band cannot have that property, because the measuring call has to run the forward once
+    to find out and then a second time through PEFT when the answer is no, while the
+    recompute already knows the answer and runs it once. transformers 5 enables gradient
+    checkpointing with `use_reentrant = False` by default
+    (`modeling_utils.py`: `gradient_checkpointing_kwargs = {"use_reentrant": False}`), and
+    Unsloth's own vision path selects it whenever the run is distributed, so that is the
+    common configuration and not a corner.
+
+    `no_grad` and the discarded result are what make this cheap enough to do eagerly: no
+    graph is built, nothing is saved for backward, and it happens once per experts module
+    and parameter for the lifetime of the process. A stash-reading family pays one extra
+    forward on its first step and nothing afterwards; a family that ignores the stash now
+    pays two forwards on its first step where the in-band measurement paid three.
+
+    Returns True, False, or None when the probe itself raised. None caches nothing and
+    leaves the call on the stash path, so the real call raises the real error with the real
+    traceback instead of a second, confusing one from PEFT's fold.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if torch.compiler.is_compiling():
+        # Never inside a captured graph. Dynamo has no notion of a one-time measurement: it
+        # traces this whole throwaway forward into the graph alongside the call that counts,
+        # so the compiled region ends up running the experts forward three times on EVERY
+        # invocation, not once during a single warm-up. Measured on PyTorch 2.12 with
+        # fullgraph: six expert einsums in one graph where two are correct.
+        #
+        # None, which is the "no evidence" answer: it caches no verdict and leaves the call
+        # on the stash path, which is exactly what this module did before the probe existed.
+        # An eager forward before or after compilation still establishes the verdict, and the
+        # cached one is consulted before this function is ever called.
+        return None
+    lora_data = _extract_lora_from_wrapper(wrapper)
+    lora_attr = moe_lora_stash_name(parameter_name)
+    if lora_data is not None:
+        setattr(experts_module, lora_attr, lora_data)
+    _reset_moe_lora_stash_read(experts_module, parameter_name)
+    try:
+        with _preserved_rng_for_probe(x):
+            with torch.no_grad():
+                wrapper.base_layer(x, *args, **kwargs)
+    except Exception:
+        # Not evidence either way, and not ours to report. Do not cache a verdict.
+        return None
+    finally:
+        if hasattr(experts_module, lora_attr):
+            delattr(experts_module, lora_attr)
+    was_read = _moe_lora_stash_was_read(experts_module, parameter_name)
+    _record_moe_lora_forward_verdict(experts_module, parameter_name, was_read)
+    return was_read
+
+
+def _moe_lora_folded_weight(self, param, active):
+    """`W` with the active adapters folded in, by the cheaper of PEFT's two routes.
+
+    PEFT's own choice, mirrored: with ONE active adapter over many experts it keeps the
+    low-rank factors and folds with a single `baddbmm`, and only otherwise materialises a
+    `get_delta_weight` the size of the whole expert stack. The difference is real on the
+    families this path exists for, OlmoE having 64 experts: the dense route allocates a
+    delta as large as the parameter and then a second tensor for the sum, so mirroring the
+    factored route halves the peak of every fold. `get_delta_factors` is newer than the
+    oldest PEFT with `target_parameters`, so it is asked for rather than assumed.
+
+    The autocast is disabled around the fold for PEFT's reason: a parametrization may not
+    change the dtype of the parameter, so the arithmetic stays in W's dtype. Float8 never
+    arrives here, since `_can_fold_moe_lora_through_peft` refuses it, so PEFT's low
+    precision add has no counterpart.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    factors = getattr(self, "get_delta_factors", None)
+    if factors is not None and len(active) == 1 and getattr(self, "num_experts", 1) > 1:
+        try:
+            lhs, rhs, scaling = factors(active[0])
+            with torch.autocast(device_type = param.device.type, enabled = False):
+                return torch.baddbmm(param, lhs, rhs, alpha = scaling)
+        except Exception:
+            pass
+    delta = None
+    try:
+        for name in active:
+            contribution = self.get_delta_weight(name)
+            delta = contribution if delta is None else delta + contribution
+    except Exception:
+        return None
+    return None if delta is None else param + delta
+
+
+def _fold_moe_lora_without_parametrization(
+    self, immediate_base_layer, experts_module, parameter_name, x, args, kwargs
+):
+    """PEFT's fold, arithmetically, with the parametrization left out. None if not doable.
+
+    Same folded weight PEFT would produce, by the same route it would choose (see
+    `_moe_lora_folded_weight`). The difference is only how the base forward gets to see
+    it: PEFT registers a parametrization on the stored parameter,
+    whose `set_` Dynamo rejects as a graph-input mutation, while this swaps the attribute
+    for `W + delta` for the duration of the call and puts the parameter back after.
+    Autograd is unaffected, since the sum is an ordinary op on both tensors.
+
+    Only for the compiled path. Eagerly PEFT's own forward stays in charge, so adapter
+    bookkeeping this does not reproduce (variants, merge state, anything future PEFT does
+    inside `_activate_lora`) is only ever bypassed where the alternative is not running at
+    all. Returns None whenever anything is missing, and the caller then falls through to
+    the stash path rather than losing the call.
+
+    Nested wrappers compose: the wrapper chain is down_proj -> gate_up_proj -> experts and
+    each level folds and restores its own parameter around the next, so both are folded
+    for the innermost forward.
+
+    The swap is done inside `_parameters` and nowhere else. `nn.Module.__getattr__` reads
+    the value straight out of that dict, so a plain tensor placed there is what the forward
+    sees, and the module's `__setattr__`, which would reject a plain tensor where a
+    Parameter is registered, is never involved. The obvious alternative, shadowing the
+    name in the instance `__dict__`, is what this used to do and it does not trace:
+    `experts_module.__dict__` is an unknown type to Dynamo, so removing the shadow in the
+    `finally` raises `Unsupported: Dynamo does not know how to trace method 'pop' of class
+    '<unknown type>'` on torch 2.10, the floor this package supports. That turned the
+    fullgraph compile this function exists to make possible back into a hard error.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    try:
+        active = [name for name in self.active_adapters if name in self.lora_A]
+    except Exception:
+        return None
+    if not active:
+        return None
+
+    parameters = getattr(experts_module, "_parameters", None)
+    if not isinstance(parameters, dict) or parameter_name not in parameters:
+        return None
+    if parameter_name in experts_module.__dict__:
+        # Something already shadows the registered parameter, so swapping `_parameters`
+        # would not reach the forward. Refuse rather than fold into a value nothing reads.
+        return None
+    original = parameters[parameter_name]
+    folded = _moe_lora_folded_weight(self, original, active)
+    if folded is None:
+        return None
+
+    parameters[parameter_name] = folded
+    try:
+        return immediate_base_layer(x, *args, **kwargs)
+    finally:
+        parameters[parameter_name] = original
+
+
+# PEFT names the float8 storage dtypes it must upcast in `peft.utils.UPCAST_DTYPES`. Track
+# that list rather than restating it, so a dtype PEFT adds later is excluded here too, and
+# fall back to resolving the names off torch for PEFT versions that do not export it. Every
+# one of these raises on `param + delta`, including the fnuz pair ROCm uses.
+def _resolve_float8_storage_dtypes():
+    names = None
+    try:
+        from peft.utils import UPCAST_DTYPES as names
+    except Exception:
+        names = (
+            "float8_e4m3fn", "float8_e4m3fnuz",
+            "float8_e5m2",   "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+        )
+    resolved = []
+    for name in names:
+        dtype = getattr(torch, name, None)
+        # Older torch does not define every float8 variant.
+        if isinstance(dtype, torch.dtype):
+            resolved.append(dtype)
+    return tuple(resolved)
+
+
+_FLOAT8_STORAGE_DTYPES = _resolve_float8_storage_dtypes()
+
+
+def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool:
+    """Whether handing this parameter back to PEFT would fold a delta into a real weight.
+
+    PEFT folds by registering a parametrization that adds `delta_weight` to the stored
+    parameter, which is only defined for a plain floating-point tensor. A stacked expert
+    weight held as bitsandbytes `Params4bit`, an MXFP4 blocked tensor or an FP8 tensor is
+    none of those: the add is a dtype or shape error at best and silent corruption at
+    worst. `_forward_native_fp8_expert_loop` says the same thing from the other side, that
+    the reroute must not take charge of a quantized parameter, and enforces it by recording
+    its reads; this enforces it for the quantized forwards that have no such hook, the
+    MXFP4 GPT-OSS experts forward among them, where `_get_lora_wrapper_for_param` resolves
+    to None against PEFT's `target_parameters` layout and so records nothing.
+
+    Refusing to reroute leaves that case exactly as it is on main: the stash is written and
+    the forward does what it does with it. That is not a fix for a quantized family, and it
+    is not meant to be one; it is a guarantee that this change cannot make one worse.
+    """
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if _original_param_wrapper_forward is None:
+        return False
+    param = getattr(experts_module, parameter_name, None)
+    if not isinstance(param, torch.Tensor):
+        return False
+    if not param.dtype.is_floating_point:
+        return False
+    # `is_floating_point` is True for every float8 storage dtype, and PEFT's own
+    # `get_delta_weight` special-cases them precisely because the add is not defined there:
+    # `param + delta` raises "Promotion for Float8 Types is not supported" for all five, and
+    # naming only the two CUDA ones let the fnuz pair that ROCm uses through.
+    if param.dtype in _FLOAT8_STORAGE_DTYPES:
+        return False
+    # bitsandbytes stores 4-bit weights in a float or uint8 tensor of the packed shape, and
+    # marks them with `quant_state`. Neither the dtype nor the shape gives it away.
+    if getattr(param, "quant_state", None) is not None:
+        return False
+    if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
+        return False
+    return True
+
+
 # Store original ParamWrapper.forward for fallback
 _original_param_wrapper_forward = None
 
@@ -1453,14 +2639,9 @@ def _patched_param_wrapper_forward(
     # For stashing LoRA data we need the actual experts module (recursive lookup).
     experts_module = self.get_base_layer()
 
-    use_separated = _should_use_separated_lora()
     param_name = getattr(self, "parameter_name", None)
 
-    if (
-        use_separated
-        and param_name in ("gate_up_proj", "down_proj")
-        and _is_moe_experts_module(experts_module)
-    ):
+    if _wrapper_uses_separated_moe_lora(self, experts_module):
         # MoE experts: bypass PEFT's _activate_lora, use separated computation.
         if self.disable_adapters:
             if self.merged:
@@ -1479,12 +2660,59 @@ def _patched_param_wrapper_forward(
                 if hasattr(p, "shape") and len(p.shape) >= 1:
                     self.num_experts = p.shape[0]
 
+        # An experts forward that does not read the stash never sees this LoRA, so hand the
+        # wrapper back to PEFT, which folds the delta into the weight instead. Measured once
+        # per experts module and parameter, before the call that counts, so the call that
+        # counts always runs exactly one experts forward on the path the verdict names.
+        applies_stash = moe_lora_forward_applies_stash(experts_module, param_name)
+        if applies_stash is None and torch.compiler.is_compiling():
+            # First invocation is a compiled one, so there is no verdict and no way to
+            # measure one: the probe cannot run inside a captured graph without being
+            # captured with it and re-run on every call. Answer statically instead, from
+            # whether the forward references the stash API at all.
+            #
+            # Both wrong answers are costly, which is why this is not a fixed assumption.
+            # Assuming unread sends a supported stash-reading family into PEFT's own
+            # ParamWrapper.forward, which registers and removes a parametrization while
+            # tracing and hard-fails under fullgraph with "Getting an inplace view on a
+            # graph input is not supported". Assuming read leaves the expert LoRA out of
+            # every output and gradient on a family that ignores the stash, silently and
+            # for the life of the captured graph. The bytecode says which family this is.
+            #
+            # Nothing is recorded either way, so the first eager call still measures and
+            # every later compile follows the real verdict.
+            applies_stash = _forward_statically_reads_stash(experts_module)
+            if applies_stash is False:
+                _log_moe_lora_stash_unread_once(experts_module, param_name)
+        elif applies_stash is None:
+            applies_stash = _measure_moe_lora_stash_read(
+                self, experts_module, param_name, x, args, kwargs
+            )
+            if applies_stash is False:
+                _log_moe_lora_stash_unread_once(experts_module, param_name)
+        if applies_stash is False and _can_fold_moe_lora_through_peft(experts_module, param_name):
+            if torch.compiler.is_compiling():
+                # PEFT's own fold cannot be traced. `_activate_lora` registers a
+                # parametrization for the call and removes it after, and the `set_` that
+                # registration performs on the stored parameter is a graph-input mutation,
+                # so Dynamo refuses it: "Getting an inplace view on a graph input is not
+                # supported". Under fullgraph that is a hard error, which would mean these
+                # families cannot compile at all. Folding the same delta ourselves keeps
+                # the arithmetic and drops the parametrization, and traces.
+                folded = _fold_moe_lora_without_parametrization(
+                    self, immediate_base_layer, experts_module, param_name, x, args, kwargs
+                )
+                if folded is not None:
+                    return folded
+            else:
+                return _original_param_wrapper_forward(self, x, *args, **kwargs)
+
         # Extract LoRA for this parameter and stash on the experts module
         # (not base_layer): _unsloth_lora_gate_up_proj / _unsloth_lora_down_proj.
         lora_data = _extract_lora_from_wrapper(self)
 
         if lora_data is not None and param_name:
-            lora_attr = f"_unsloth_lora_{param_name}"
+            lora_attr = moe_lora_stash_name(param_name)
             setattr(experts_module, lora_attr, lora_data)
 
         try:
@@ -1492,7 +2720,7 @@ def _patched_param_wrapper_forward(
             result = immediate_base_layer(x, *args, **kwargs)
         finally:
             if param_name:
-                lora_attr = f"_unsloth_lora_{param_name}"
+                lora_attr = moe_lora_stash_name(param_name)
                 if hasattr(experts_module, lora_attr):
                     delattr(experts_module, lora_attr)
 
@@ -1502,11 +2730,357 @@ def _patched_param_wrapper_forward(
     return _original_param_wrapper_forward(self, x, *args, **kwargs)
 
 
+# Store original ParamWrapper.get_delta_weight for fallback
+_original_param_wrapper_get_delta_weight = None
+
+
+def _grouped_by_expert_delta_weight(wrapper, adapter_name):
+    """PEFT's ParamWrapper.get_delta_weight arithmetic with lora_B read the way the
+    separated MoE forward reads it: (out, num_experts, rank) rather than PEFT's
+    (out, rank, num_experts). Everything else, including which einsum the swapped
+    in/out orientation needs, is PEFT's own."""
+    weight_A = wrapper.lora_A[adapter_name].weight
+    weight_B = wrapper.lora_B[adapter_name].weight
+    num_experts = int(wrapper.num_experts)
+
+    # experts x rank x in_features, as in PEFT: lora_A is grouped by expert there too.
+    weight_A = weight_A.reshape(num_experts, -1, weight_A.shape[-1])
+    # out_features x experts x rank. This is the one line that differs from PEFT.
+    weight_B = weight_B.reshape(weight_B.shape[0], num_experts, -1)
+
+    scaling = wrapper.scaling[adapter_name]
+    if not getattr(wrapper, "_did_swap_in_out_features", False):
+        return torch.einsum("o e r, e r i -> e i o", weight_B, weight_A) * scaling
+    # for some MoE layers, the order is (experts, out_features, in_features)
+    return torch.einsum("o e r, e r i -> e o i", weight_B, weight_A) * scaling
+
+
+def _cast_delta_weight_like_param(delta_weight, param):
+    """PEFT's own tail: move the delta to the parameter, and match its dtype unless that
+    dtype is a low precision one PEFT deliberately adds in higher precision (float8 and
+    friends). Probed from PEFT when it publishes the set, so this follows PEFT rather
+    than hardcoding a dtype list that a new release would make wrong."""
+    try:
+        from peft.tuners.lora.layer import ALLOWED_COMPUTE_DTYPES
+        allowed = param.dtype in ALLOWED_COMPUTE_DTYPES
+    except Exception:
+        # PEFT 0.18 has no such set and casts unconditionally, 0.19.0 onwards do; every dtype
+        # 0.18 accepts for a 3D expert parameter is an ordinary floating point one.
+        allowed = param.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+    if allowed:
+        return delta_weight.to(param.device, param.dtype)
+    return delta_weight.to(param.device)
+
+
+def _patched_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs):
+    """PEFT's `get_delta_weight` for a legacy, grouped-by-expert fused MoE expert LoRA.
+
+    PEFT reconstructs a fused expert delta with lora_B packed rank-major, which is what
+    it trained and what every consumer reads, so by default this does nothing at all and
+    PEFT's own code runs. It only takes over when the caller has explicitly declared that
+    the adapters in this process were packed the pre-fix way, with
+    `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert`; that same variable is what makes the
+    separated forward read them that way (unsloth_zoo#1269), and without this patch the
+    forward and PEFT's `merge_and_unload` / `merge_adapter` / `unmerge` would disagree for
+    exactly the checkpoints that switch exists to support (unsloth#6930).
+
+    Gating on the declaration rather than on "is this wrapper routed to the separated
+    forward" is the point: the packing of a stored adapter is a property of the adapter,
+    and reading it off this process's routing would scramble a correctly packed adapter
+    merged inside an Unsloth process."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    if not _legacy_lora_b_layout_requested():
+        return _original_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
+    if moe_lora_b_layout_for_wrapper(self, adapter_name) != LORA_B_LAYOUT_GROUPED_BY_EXPERT:
+        return _original_param_wrapper_get_delta_weight(self, adapter_name, *args, **kwargs)
+
+    delta_weight = _grouped_by_expert_delta_weight(self, adapter_name)
+    return _cast_delta_weight_like_param(delta_weight, self.get_param())
+
+
+def _moe_utils_logger():
+    """The shared patch logger, imported lazily and absolutely: this file is also copied
+    into unsloth_compiled_cache and executed there as a top level module, where a
+    relative import has no package to resolve against."""
+    try:
+        from unsloth_zoo.temporary_patches.common import logger
+        return logger
+    except Exception:
+        return None
+
+
+# The adapter_config.json keys. The flat one is what a converter branches on
+# (unsloth#6930 asks for exactly this key); the nested one carries the detail, because a
+# checkpoint can in principle hold one fused parameter trained through the separated
+# forward and another PEFT kept for itself.
+FUSED_EXPERT_LORA_LAYOUT_KEY = "lora_B_layout"
+FUSED_EXPERT_LORA_DETAIL_KEY = "unsloth_fused_expert_lora"
+
+
+def _default_adapter_name(peft_model) -> str:
+    """The adapter `fused_expert_lora_layout` describes when the caller names none: the
+    model's active one, or PEFT's own default name. Both attributes are properties on
+    some PEFT versions and can raise on a partly built model, so neither is trusted."""
+    # delete_adapter leaves active_adapter a list, and active_adapters is always one.
+    for attribute in ("active_adapter", "active_adapters"):
+        try:
+            active = getattr(peft_model, attribute, None)
+        except Exception:
+            continue
+        if isinstance(active, str) and active:
+            return active
+        if isinstance(active, (list, tuple)) and len(active) != 0:
+            if isinstance(active[0], str) and active[0]:
+                return active[0]
+    return "default"
+
+
+def fused_expert_lora_layout(peft_model, adapter_name = None) -> Optional[dict]:
+    """How ONE adapter's fused MoE expert LoRA on `peft_model` packs its lora_A and
+    lora_B, or None when that adapter has no fused expert LoRA at all.
+
+    lora_A is grouped by expert in both stacks. lora_B is the one that differs, and it is
+    reported per PEFT parameter name, since that is what decides whether Unsloth's
+    separated forward or PEFT's own forward owns the wrapper.
+
+    The answer is per adapter because a PeftModel can hold several. A fused expert
+    adapter and a dense adapter side by side share the fused expert wrappers, so a scan
+    that only asks "does this model have a fused expert LoRA anywhere" answers yes for
+    the dense adapter too, and that answer would be written into the dense adapter's own
+    adapter_config.json. `adapter_name` defaults to the model's active adapter, so the
+    single adapter case is unchanged."""
+    if adapter_name is None:
+        adapter_name = _default_adapter_name(peft_model)
+
+    parameters = {}
+    try:
+        modules = list(peft_model.modules())
+    except Exception:
+        return None
+
+    for module in modules:
+        parameter_name = getattr(module, "parameter_name", None)
+        if not parameter_name or not hasattr(module, "lora_A"):
+            continue
+        if not _wrapper_has_adapter(module, adapter_name):
+            # A wrapper another adapter owns. Its packing is not this adapter's business.
+            continue
+        num_experts = int(getattr(module, "num_experts", 1) or 1)
+        if num_experts <= 1:
+            # Not a fused expert stack, so there is no expert axis to pack.
+            continue
+        layout = moe_lora_b_layout_for_wrapper(module, adapter_name)
+        entry = parameters.get(parameter_name)
+        if entry is None:
+            parameters[parameter_name] = {
+                "lora_B_layout": layout,
+                "num_experts": num_experts,
+            }
+        elif entry["lora_B_layout"] != layout:
+            entry["lora_B_layout"] = "mixed"
+
+    if not parameters:
+        return None
+
+    detail = {
+        "lora_A_layout": LORA_B_LAYOUT_GROUPED_BY_EXPERT,
+        "parameters": parameters,
+    }
+    layouts = {entry["lora_B_layout"] for entry in parameters.values()}
+    # The flat key is what a converter branches on, so it is only written when every
+    # fused expert parameter agrees on one of the two real names. "mixed" is a report,
+    # not a layout, and a converter testing `== "grouped_by_expert"` would read it as
+    # rank_major, so it stays in the nested detail where it has to be read deliberately.
+    if len(layouts) == 1:
+        layout = layouts.pop()
+        if layout in (LORA_B_LAYOUT_GROUPED_BY_EXPERT, LORA_B_LAYOUT_RANK_MAJOR):
+            detail["lora_B_layout"] = layout
+    return detail
+
+
+def _fused_expert_lora_adapter_config_paths(peft_model, save_directory, selected_adapters):
+    """Where PEFT just wrote an adapter_config.json: the root for `default`, a
+    subdirectory named after any other adapter. Paired with the adapter each file
+    belongs to, because the marker is per adapter."""
+    if selected_adapters is None:
+        try:
+            selected_adapters = list(peft_model.peft_config.keys())
+        except Exception:
+            selected_adapters = ["default"]
+    paths = []
+    for adapter_name in selected_adapters:
+        directory = save_directory
+        if adapter_name != "default":
+            directory = os.path.join(save_directory, adapter_name)
+        path = os.path.join(directory, "adapter_config.json")
+        if os.path.isfile(path):
+            paths.append((adapter_name, path))
+    return paths
+
+
+def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters = None):
+    """Record the fused MoE expert lora_B packing in the adapter_config.json PEFT has
+    just written, and return the files updated. PEFT ignores keys it does not know, so
+    the checkpoint stays loadable by any PEFT version; this only stops a downstream
+    converter, or PEFT's own merge in a differently configured process, from having to
+    guess (unsloth#6930).
+
+    The packing is recomputed for each adapter being saved, and an adapter with no fused
+    expert LoRA is left exactly as PEFT wrote it: not written, and not stripped either,
+    since a key this never put there is not this function's to remove. A model holding a
+    fused expert adapter and a dense one would otherwise describe the fused adapter's
+    experts in the dense adapter's config, which is worse than saying nothing."""
+    written = []
+    for adapter_name, path in _fused_expert_lora_adapter_config_paths(
+        peft_model, save_directory, selected_adapters,
+    ):
+        detail = fused_expert_lora_layout(peft_model, adapter_name)
+        if detail is None:
+            continue
+        with open(path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            continue
+        config[FUSED_EXPERT_LORA_DETAIL_KEY] = detail
+        if "lora_B_layout" in detail:
+            config[FUSED_EXPERT_LORA_LAYOUT_KEY] = detail["lora_B_layout"]
+        elif config.get(FUSED_EXPERT_LORA_LAYOUT_KEY) in (
+            LORA_B_LAYOUT_GROUPED_BY_EXPERT, LORA_B_LAYOUT_RANK_MAJOR,
+        ):
+            # An earlier save of this adapter wrote a flat layout and the parameters no
+            # longer agree on one, so that key is now false. Only a value this could have
+            # written is dropped: anything else is somebody else's key.
+            config.pop(FUSED_EXPERT_LORA_LAYOUT_KEY, None)
+        # Byte for byte how PeftConfigMixin.save_pretrained writes it, so adding the marker
+        # does not also reformat the file PEFT produced.
+        _atomic_write_text(path, json.dumps(config, indent = 2, sort_keys = True))
+        written.append(path)
+    return written
+
+
+def _atomic_write_text(path, text):
+    """Replace `path` with `text`, or leave it exactly as it was.
+
+    Opening the real file "w" truncates it before the first byte is written, so a write
+    that fails part way (a full disk, an erroring network mount) leaves a truncated
+    adapter_config.json behind. `_patched_peft_model_save_pretrained` then swallows the
+    exception and reports a successful save, so the checkpoint is unloadable and nothing
+    says so. Writing a sibling temporary file first means a failure destroys only that
+    file, and `os.replace` is atomic on POSIX and on Windows, so no reader can observe a
+    half-written config either.
+
+    The temporary file is a sibling, not a tempdir entry, because `os.replace` across
+    filesystems raises. It is removed on failure so a failed save leaves no litter."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    directory = os.path.dirname(path) or "."
+    handle, temporary = tempfile.mkstemp(
+        dir = directory, prefix = os.path.basename(path) + ".", suffix = ".tmp",
+    )
+    try:
+        # mkstemp creates the file 0600 and os.replace keeps the NEW inode's mode, so
+        # without this the config silently drops from (say) 0644 to 0600 on every save
+        # and a checkpoint shared with other users or a serving process stops being
+        # readable, while its weight files stay readable. Carry the existing mode over;
+        # for a config PEFT has not written yet there is nothing to carry, so leave
+        # mkstemp's private mode rather than inventing a laxer one.
+        try:
+            os.chmod(temporary, stat.S_IMODE(os.stat(path).st_mode))
+        except OSError:
+            pass
+        with os.fdopen(handle, "w", encoding = "utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+# Store original PeftModel.save_pretrained for fallback
+_original_peft_model_save_pretrained = None
+
+
+def _save_pretrained_argument(name, default, args, kwargs):
+    """One of PeftModel.save_pretrained's arguments, whether the caller passed it by
+    keyword or positionally. Resolved against the real signature rather than a copy of
+    it, so a PEFT release that adds an argument cannot silently shift the index. `args`
+    excludes self and save_directory."""
+    if name in kwargs:
+        return kwargs[name]
+    try:
+        import inspect
+        parameters = list(
+            inspect.signature(_original_peft_model_save_pretrained).parameters
+        )
+        index = parameters.index(name) - 2
+        if 0 <= index < len(args):
+            return args[index]
+    except Exception:
+        pass
+    return default
+
+
+def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
+    """Add the fused expert layout marker to what PEFT saved. Never fails a save: the
+    adapter itself is already on disk by the time this runs."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    result = _original_peft_model_save_pretrained(self, save_directory, *args, **kwargs)
+    if _save_pretrained_argument("is_main_process", True, args, kwargs):
+        try:
+            write_fused_expert_lora_layout(
+                self, save_directory,
+                selected_adapters = _save_pretrained_argument(
+                    "selected_adapters", None, args, kwargs,
+                ),
+            )
+        except Exception as exception:
+            logger = _moe_utils_logger()
+            if logger is not None:
+                logger.warning(
+                    f"Unsloth: could not record the fused MoE expert LoRA layout in "
+                    f"adapter_config.json ({type(exception).__name__}: {exception}). The "
+                    f"adapter itself saved correctly."
+                )
+    return result
+
+
+def _patch_peft_save_pretrained_for_moe_layout():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_peft_model_save_pretrained
+
+    try:
+        from peft import PeftModel
+    except Exception:
+        return False
+
+    if getattr(PeftModel.save_pretrained, "_unsloth_moe_layout_patched", False):
+        return True
+
+    if _original_peft_model_save_pretrained is None:
+        _original_peft_model_save_pretrained = PeftModel.save_pretrained
+
+    patched = wraps(_original_peft_model_save_pretrained)(
+        _patched_peft_model_save_pretrained,
+    )
+    patched._unsloth_moe_layout_patched = True
+    PeftModel.save_pretrained = patched
+    return True
+
+
 def patch_param_wrapper_for_moe():
     """Patch PEFT's ParamWrapper.forward for MoE separated LoRA (call after PEFT import)."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     global _original_param_wrapper_forward
+    global _original_param_wrapper_get_delta_weight
 
     module = _load_cached_moe_utils_module()
     if module is not None and hasattr(module, "patch_param_wrapper_for_moe"):
@@ -1522,6 +3096,19 @@ def patch_param_wrapper_for_moe():
             _original_param_wrapper_forward = ParamWrapper.forward
 
         ParamWrapper.forward = _patched_param_wrapper_forward
+
+        # The forward is only half of it: the merge path reads lora_B through
+        # get_delta_weight, which is PEFT's and packs it the other way.
+        if not getattr(ParamWrapper.get_delta_weight, "_unsloth_moe_layout_patched", False):
+            if _original_param_wrapper_get_delta_weight is None:
+                _original_param_wrapper_get_delta_weight = ParamWrapper.get_delta_weight
+            patched = wraps(_original_param_wrapper_get_delta_weight)(
+                _patched_param_wrapper_get_delta_weight,
+            )
+            patched._unsloth_moe_layout_patched = True
+            ParamWrapper.get_delta_weight = patched
+
+        _patch_peft_save_pretrained_for_moe_layout()
         _patch_peft_get_peft_model_for_moe()
 
         return True
@@ -1628,7 +3215,7 @@ def forward_native_grouped_mm(
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
-    num_tokens_per_expert = torch.bincount(flat_top_k, minlength=self.num_experts).int()
+    num_tokens_per_expert = count_tokens_per_expert(flat_top_k, self.num_experts, torch.int32)
     sorted_indices = torch.argsort(flat_top_k, stable=True)
     token_indices = sorted_indices // top_k_index.shape[-1]
     permuted_input = hidden_states[token_indices]
@@ -1639,8 +3226,9 @@ def forward_native_grouped_mm(
     gate_up_lora = None
 
     # Prefer LoRA injected by the patched ParamWrapper; fall back to the parameter.
-    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
-        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]  # (first, second, scaling)
+    _stashed_gate_up_lora = take_moe_lora_stash(self, "gate_up_proj")
+    if _stashed_gate_up_lora is not None:
+        gate_up_lora = _stashed_gate_up_lora[:3]  # (first, second, scaling)
     elif (
         use_separated_lora
         and hasattr(self, "gate_up_proj")
@@ -1710,8 +3298,13 @@ def forward_native_grouped_mm(
             mm1_out = mm1_out + lora_delta * scaling
 
         if hasattr(self, "gate_up_proj_bias") and self.gate_up_proj_bias is not None:
-            num_repeats = num_tokens_per_expert.to(self.gate_up_proj_bias.device)
-            bias_expanded = self.gate_up_proj_bias.repeat_interleave(num_repeats, dim=0)
+            # repeat_interleave without output_size= D2H-syncs. sorted_indices is
+            # already in expert order, so gathering by expert id matches it, sync-free
+            # (74 us -> 8 us host at E=128 x 16384 rows).
+            sorted_expert_ids = flat_top_k[sorted_indices]
+            bias_expanded = self.gate_up_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.gate_up_proj_bias.device)
+            )
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
         if "GptOssExperts" in self.__class__.__name__:
@@ -1814,8 +3407,9 @@ def forward_native_grouped_mm(
     down_lora = None
 
     # Prefer LoRA injected by the patched ParamWrapper; fall back to the parameter.
-    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
-        down_lora = self._unsloth_lora_down_proj[:3]  # (first, second, scaling)
+    _stashed_down_lora = take_moe_lora_stash(self, "down_proj")
+    if _stashed_down_lora is not None:
+        down_lora = _stashed_down_lora[:3]  # (first, second, scaling)
     elif (
         use_separated_lora
         and hasattr(self, "down_proj")
@@ -1863,8 +3457,10 @@ def forward_native_grouped_mm(
             mm2_out = mm2_out + lora_delta * scaling
 
         if hasattr(self, "down_proj_bias") and self.down_proj_bias is not None:
-            bias_expanded = self.down_proj_bias.repeat_interleave(
-                num_tokens_per_expert.to(self.down_proj_bias.device), dim=0
+            # Capture-safe gather; see gate_up_proj_bias above.
+            sorted_expert_ids = flat_top_k[sorted_indices]
+            bias_expanded = self.down_proj_bias.index_select(
+                0, sorted_expert_ids.to(self.down_proj_bias.device)
             ).to(mm2_out.device)
             mm2_out = mm2_out + bias_expanded.to(mm2_out.dtype)
 
@@ -1894,13 +3490,13 @@ def forward_native_grouped_mm(
         permuted_weights = flat_weights[sorted_indices]
         mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
-    final_hidden_states = torch.zeros(
-        (batch_size * sequence_length, hidden_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    final_hidden_states = combine_permuted_moe_outputs(
+        mm2_out,
+        sorted_indices,
+        batch_size * sequence_length,
+        top_k_index.shape[-1],
+        out_dtype = hidden_states.dtype,
     )
-
-    final_hidden_states.index_add_(0, token_indices, mm2_out.to(hidden_states.dtype))
 
     if is_2d_input:
         return final_hidden_states
@@ -1927,8 +3523,9 @@ def forward_triton_grouped_gemm(
 
     # gate_up LoRA from the patched ParamWrapper (mirrors the down block below).
     gate_up_lora = None
-    if getattr(self, "_unsloth_lora_gate_up_proj", None) is not None:
-        gate_up_lora = self._unsloth_lora_gate_up_proj[:3]
+    _stashed_gate_up_lora = take_moe_lora_stash(self, "gate_up_proj")
+    if _stashed_gate_up_lora is not None:
+        gate_up_lora = _stashed_gate_up_lora[:3]
     elif (
         use_separated_lora
         and hasattr(self, "gate_up_proj")
@@ -2035,8 +3632,9 @@ def forward_triton_grouped_gemm(
 
     # Grouped GEMM 2: down projection.
     down_lora = None
-    if getattr(self, "_unsloth_lora_down_proj", None) is not None:
-        down_lora = self._unsloth_lora_down_proj[:3]
+    _stashed_down_lora = take_moe_lora_stash(self, "down_proj")
+    if _stashed_down_lora is not None:
+        down_lora = _stashed_down_lora[:3]
     elif (
         use_separated_lora
         and hasattr(self, "down_proj")
@@ -2117,7 +3715,7 @@ def forward_native_moe_loop(
     final_hidden_states = torch.zeros_like(hidden_states)
     use_separated_lora = _should_use_separated_lora()
 
-    gate_up_lora = getattr(self, "_unsloth_lora_gate_up_proj", None)
+    gate_up_lora = take_moe_lora_stash(self, "gate_up_proj")
     if gate_up_lora is not None:
         gate_up_lora = gate_up_lora[:3]
     elif (
@@ -2138,7 +3736,7 @@ def forward_native_moe_loop(
             _gate_up_scaling,
         )
 
-    down_lora = getattr(self, "_unsloth_lora_down_proj", None)
+    down_lora = take_moe_lora_stash(self, "down_proj")
     if down_lora is not None:
         down_lora = down_lora[:3]
     elif (

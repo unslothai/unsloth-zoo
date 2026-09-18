@@ -309,15 +309,63 @@ def get_model(model):
 pass
 
 
+def _execution_device_for_meta_layer(module):
+    """Where accelerate will actually run a layer whose weights are still on meta.
+
+    `execution_device` is typed `int | str | torch.device | None` and can itself be "meta"
+    mid-build, so only a real device is returned.
+    """
+    for hook in _iter_accelerate_hooks(getattr(module, "_hf_hook", None)):
+        execution_device = getattr(hook, "execution_device", None)
+        if execution_device is None:
+            continue
+        try:
+            device = torch.device(execution_device)
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        if device.type != "meta":
+            return device
+    return None
+
+
+def _iter_accelerate_hooks(hook, _depth = 0):
+    """`hook` and every hook nested inside it, outermost first: accelerate chains rather
+    than replaces, and the `SequentialHook` wrapper defines no `execution_device` of its
+    own. Depth-limited, since the chain is another library's data."""
+    if hook is None or _depth > 8:
+        return
+    yield hook
+    for nested in getattr(hook, "hooks", ()) or ():
+        yield from _iter_accelerate_hooks(nested, _depth + 1)
+
+
 def verify_and_set_device(module,):
     """
-    Verify that all parameters of a module are on the same device.
+    Verify that all parameters of a module are on the same device, and record that
+    device on the module for the pipeline-parallel inference paths to read back.
+
+    `_per_layer_device_index` stays an index because readers subscript per-device tuples
+    with it. CPU and meta have index None, which `move_to_device` rejects (unsloth#3538),
+    so the device TYPE is published instead; the obvious `or 0` would move activations to
+    cuda:0. meta is never published at all: it passes every type check yet propagates
+    through matmul rather than raising, so a decode runs and returns nothing. For a meta
+    layer accelerate's execution device is published instead, or nothing if there is none.
     """
     set_of_devices = set(x.device for x in module.parameters())
     if len(set_of_devices) > 1:
         raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
     device = set_of_devices.pop()
-    module._per_layer_device_index = device.index
+    if device.type == "meta":
+        device = _execution_device_for_meta_layer(module)
+        if device is None:
+            # Clear a stale pair: a layer moved back must not keep describing where it was.
+            for name in ("_per_layer_device", "_per_layer_device_index"):
+                module.__dict__.pop(name, None)
+            return
+    module._per_layer_device = device
+    module._per_layer_device_index = (
+        device.index if device.index is not None else device.type
+    )
 pass
 
 def patch_to_dict():

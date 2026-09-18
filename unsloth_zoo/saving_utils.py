@@ -1169,6 +1169,67 @@ except ImportError:
     _MOE_QUANT_UNSAFE = object()
 
 
+# How a fused expert lora_B packs its experts. Owned by the separated forward, because the
+# merge has to reproduce the forward that trained the adapter; imported rather than copied
+# so the two cannot drift. The fallback repeats PEFT's packing for an install where
+# temporary_patches is unavailable, which is the same answer the import gives.
+# The fallback is defined unconditionally, not inside the `except`, so it is reachable to a
+# test on an ordinary install where the import succeeds. Only the binding below is
+# conditional.
+_FALLBACK_GROUPED_BY_EXPERT = "grouped_by_expert"
+_FALLBACK_LAYOUTS = ("rank_major", _FALLBACK_GROUPED_BY_EXPERT)
+
+
+class _FallbackMoELoRABLayoutError(ValueError):
+    """Stand-in for moe_utils.MoELoRABLayoutError on an install with no temporary_patches.
+
+    Its own type for the same reason the real one has one: the per-expert merge wraps
+    everything in `except Exception` and turns a failure into "this expert merged
+    unchanged", which would publish a checkpoint with the expert deltas missing. Subclasses
+    ValueError, so any existing handler still catches it."""
+
+
+def _fallback_layout(layout):
+    if layout is None:
+        layout = os.environ.get("UNSLOTH_MOE_LORA_B_LAYOUT", "rank_major")
+    if layout not in _FALLBACK_LAYOUTS:
+        # Matches moe_lora_b_layout(): a typo must not quietly mean rank_major and
+        # scramble a legacy adapter at merge time.
+        raise _FallbackMoELoRABLayoutError(
+            f"Unsloth: UNSLOTH_MOE_LORA_B_LAYOUT must be one of {_FALLBACK_LAYOUTS}, "
+            f"got {layout!r}."
+        )
+    return layout
+
+
+def _fallback_moe_lora_b_expert_columns(expert_idx, num_experts, rank_per_expert, layout = None):
+    if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
+        return slice(expert_idx * rank_per_expert, (expert_idx + 1) * rank_per_expert)
+    return slice(expert_idx, num_experts * rank_per_expert, num_experts)
+
+
+def _fallback_unflatten_moe_lora_b(weight_B, num_experts, rank_per_expert, dim_B, layout = None):
+    # reshape rather than view, so a non-contiguous lora_B does not raise here and nowhere
+    # else.
+    if _fallback_layout(layout) == _FALLBACK_GROUPED_BY_EXPERT:
+        return weight_B.reshape(dim_B, num_experts, rank_per_expert).permute(1, 0, 2).contiguous()
+    return weight_B.reshape(dim_B, rank_per_expert, num_experts).permute(2, 0, 1).contiguous()
+
+
+try:
+    from unsloth_zoo.temporary_patches.moe_utils import (
+        MoELoRABLayoutError as _MoELoRABLayoutError,
+        moe_lora_b_expert_columns as _moe_lora_b_expert_columns,
+        unflatten_moe_lora_b as _unflatten_moe_lora_b,
+    )
+except ImportError:
+    # Only reachable on an install with no temporary_patches, which is also an install with
+    # no separated MoE forward to disagree with.
+    _moe_lora_b_expert_columns = _fallback_moe_lora_b_expert_columns
+    _unflatten_moe_lora_b = _fallback_unflatten_moe_lora_b
+    _MoELoRABLayoutError = _FallbackMoELoRABLayoutError
+
+
 def _merge_moe_expert_quant_aware(
     role: str,
     key: str,
@@ -1337,13 +1398,13 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             _record_moe_merge_fallback(role, expert_idx, "expert_idx out of range", lora_stats, (I, H))
             return W
 
-        # unsloth's MoE forward (temporary_patches/moe_utils.py
-        # `_canonical_lora_weights_for_grouped_mm`) views lora_B as
-        # (out, num_experts, r) — contiguous-r columns per expert. Must match
-        # here so the merged checkpoint reproduces the training-time forward.
-        # (unsloth bypasses PEFT's get_delta_weight via patch_param_wrapper_for_moe.)
+        # lora_A is grouped by expert, lora_B is not: PEFT packs its expert index
+        # fastest, so expert `e` owns columns `e::num_experts` rather than a
+        # contiguous block. `moe_lora_b_expert_columns` is the one place that is
+        # resolved, shared with the separated forward, so a merged checkpoint
+        # reproduces the forward that trained it.
         a_slice = lora_stats.lora_A[start:end, :]
-        b_slice = lora_stats.lora_B[:, start:end]
+        b_slice = lora_stats.lora_B[:, _moe_lora_b_expert_columns(expert_idx, num_experts, r)]
         device  = _active_merge_device()
         a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
         b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
@@ -1363,6 +1424,14 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
 
         _MOE_MERGE_STATE["applied"] += 1
         return merged.to(output_dtype)
+    except _MoELoRABLayoutError:
+        # A misspelled UNSLOTH_MOE_LORA_B_LAYOUT is a configuration mistake, not an expert
+        # this merge can skip. Recording it as a fallback returns the base weight unmerged,
+        # and merge_and_overwrite_lora writes, and can upload, every shard before it looks
+        # at _MOE_MERGE_STATE, so the typo would publish a checkpoint with the expert
+        # deltas silently missing and only then report failure. Let it escape before any
+        # tensor is written.
+        raise
     except Exception as exc:
         _record_moe_merge_fallback(role, expert_idx, repr(exc), lora_stats, tuple(W.shape))
         return W
@@ -1420,7 +1489,7 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
 
         # See _merge_moe_gate_or_up_expert for the slicing convention rationale.
         a_slice = lora_stats.lora_A[start:end, :]
-        b_slice = lora_stats.lora_B[:, start:end]
+        b_slice = lora_stats.lora_B[:, _moe_lora_b_expert_columns(expert_idx, num_experts, r)]
         device  = _active_merge_device()
         a_f     = a_slice.to(device, dtype = torch.float32, non_blocking = True)
         b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
@@ -1437,6 +1506,10 @@ def _merge_moe_down_proj_expert(down_W, lora_stats, expert_idx, num_experts, out
 
         _MOE_MERGE_STATE["applied"] += 1
         return merged.to(output_dtype)
+    except _MoELoRABLayoutError:
+        # Same reasoning as the gate/up merge above: a misspelled layout must not be
+        # recorded as an expert that merged unchanged and then written out.
+        raise
     except Exception as exc:
         _record_moe_merge_fallback("down", expert_idx, repr(exc), lora_stats, tuple(down_W.shape))
         return down_W
@@ -1834,7 +1907,8 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
     def _loop():
         for expert_idx in range(num_experts):
             start, end = expert_idx * rank, (expert_idx + 1) * rank
-            delta = lora_B_dev[:, start:end] @ lora_A_dev[start:end, :]
+            columns = _moe_lora_b_expert_columns(expert_idx, num_experts, rank)
+            delta = lora_B_dev[:, columns] @ lora_A_dev[start:end, :]
             merged[expert_idx].add_(delta.T if use_transpose else delta, alpha=alpha)
         return merged
 
@@ -1843,7 +1917,7 @@ def _apply_fused_expert_lora_delta(merged, lora_A_dev, lora_B_dev, num_experts, 
 
     try:
         # (E, dim_B, rank) @ (E, rank, dim_A) -> (E, dim_B, dim_A) = per-expert delta.
-        B_exp = lora_B_dev.reshape(dim_B, num_experts, rank).permute(1, 0, 2).contiguous()
+        B_exp = _unflatten_moe_lora_b(lora_B_dev, num_experts, rank, dim_B)
         A_exp = lora_A_dev.reshape(num_experts, rank, dim_A).contiguous()
         delta = torch.bmm(B_exp, A_exp)
         merged.add_(delta.transpose(1, 2) if use_transpose else delta, alpha=alpha)
@@ -1929,6 +2003,10 @@ def _merge_moe_fused_gate_up_expert(gate_up_W, lora_stats, output_dtype, is_tran
 
         _MOE_MERGE_STATE["applied"] += 1
         return gate_up_merged.to(output_dtype)
+    except _MoELoRABLayoutError:
+        # Same reasoning as the per-expert helpers: a misspelled layout is a configuration
+        # mistake, and _merge_moe_experts_file writes whatever this returns.
+        raise
     except Exception as exc:
         _record_moe_merge_fallback(
             "fused_gate_up", -1, repr(exc),
@@ -2007,6 +2085,10 @@ def _merge_moe_fused_down_proj_expert(down_W, lora_stats, output_dtype, is_trans
 
         _MOE_MERGE_STATE["applied"] += 1
         return down_merged.to(output_dtype)
+    except _MoELoRABLayoutError:
+        # Same reasoning as the per-expert helpers: a misspelled layout is a configuration
+        # mistake, and _merge_moe_experts_file writes whatever this returns.
+        raise
     except Exception as exc:
         _record_moe_merge_fallback(
             "fused_down", -1, repr(exc),
