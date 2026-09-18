@@ -73,10 +73,8 @@ def _log_info(message: str):
 def _warn_without_raising(message):
     """warnings.warn, except that it cannot be the thing that fails the import.
 
-    install_to_cache() runs at module import, and a consumer running under
-    warnings.simplefilter("error") turns a warning into a raise. The condition
-    being reported is one we already handle by not using the file, so it must
-    not take `import unsloth_zoo` down with it.
+    install_to_cache() runs at import and simplefilter("error") would turn this
+    into a raise, for a condition already handled by not using the file.
     """
     try:
         warnings.warn(message)
@@ -96,12 +94,9 @@ def _read_file_bytes(path):
 def _replace_with_copy(current_file, destination):
     """Copy over `destination` by replacing the path, not by writing into it.
 
-    Two reasons to prefer this over shutil.copy(). It opens the destination for
-    writing, so a destination left read-only refuses it even when the directory
-    is ours. It is also not atomic, and nothing locks this file: every rank of a
-    multi-GPU launch installs it at import, so a rank can otherwise read a copy
-    another rank is halfway through writing. os.replace() needs only the
-    directory and is atomic, so neither happens.
+    shutil.copy() opens the destination, so a read-only one refuses it, and it
+    is not atomic while nothing locks this file and every rank installs it at
+    import. os.replace() needs only the directory and is atomic.
     """
     directory = os.path.dirname(destination) or "."
     descriptor, temporary = tempfile.mkstemp(
@@ -140,14 +135,9 @@ def _replace_with_copy(current_file, destination):
 def install_to_cache(source_path, destination_filename=None):
     """Copy a file into unsloth_compiled_cache so compiled modules can use it.
 
-    Returns whether the cache copy is known to match `source_path`.
-
-    This runs at import time, so a cache directory we cannot create or write is
-    not fatal: nothing is installed and the compiled modules fall back to the
-    definitions in this module. A destination that exists and does not match
-    what we meant to install is a different matter, because
-    _load_cached_moe_utils_module() imports and executes it, so report it
-    instead of silently accepting it.
+    Returns whether the copy is known to match `source_path`. Runs at import
+    time, so an unwritable directory is not fatal; a destination that exists and
+    does NOT match is reported, since _load_cached_moe_utils_module() execs it.
     """
     compile_location = _get_compile_location()
     if not os.path.exists(compile_location):
@@ -215,17 +205,9 @@ _WARNED_STALE_CACHE = set()
 def _cached_copy_is_current(cache_file, current_file) -> bool:
     """Whether the compiled cache holds byte for byte what this module is.
 
-    `install_to_cache` rewrites the cache on every import, so the two normally
-    match and this is a cheap confirmation. They diverge when the copy could not
-    be written: a cache directory baked into an image, a read only mount, or a
-    file owned by another user. The copy fails there, so the cache keeps an
-    OLDER unsloth_zoo, and every caller below prefers it, which silently
-    installs that older module's patches over the ones this release ships.
-    Prefer this module in that case, and say so once.
-
-    Bytes that differ are also bytes install_to_cache() did not put there, so
-    this is the same question the importability gate below has to ask; it asks
-    it through here rather than comparing again.
+    They diverge when the copy could not be written, leaving an OLDER
+    unsloth_zoo that every caller below would prefer, silently installing that
+    release's patches over this one's. Prefer this module, and say so once.
     """
     cached = _read_file_bytes(cache_file)
     current = _read_file_bytes(current_file)
@@ -249,11 +231,8 @@ def _cached_copy_is_current(cache_file, current_file) -> bool:
 def _remove_cached_bytecode(source_file):
     """Drop the pyc beside a cache copy we are about to execute.
 
-    The comparison in _load_cached_moe_utils_module() covers the .py only, and
-    CPython can execute an unchecked-hash pyc without consulting the source
-    beside it. A pyc we cannot remove is one CPython may still prefer, so a
-    failure here is a reason to fall back to this module's own definitions
-    rather than to execute the cache copy.
+    The comparison covers the .py only, and CPython runs an unchecked-hash pyc
+    without consulting it, so a pyc we cannot remove means using our own defs.
     """
     try:
         bytecode_location = importlib.util.cache_from_source(source_file)
@@ -280,38 +259,15 @@ def _remove_cached_bytecode(source_file):
 def cached_copy_is_importable(directory) -> bool:
     """Whether a generated module may be allowed to import moe_utils from here.
 
-    A path that is not a real directory is never trusted. Every check here and in
-    _reject_shadowing_import_candidates asks the FILESYSTEM (os.path.isfile /
-    isdir), but the import that eventually runs is resolved by the whole import
-    machinery, and zipimport is a default sys.path hook: a ZIP ARCHIVE named
-    `unsloth_compiled_cache` in the working directory is not a dir and holds no
-    file called moe_utils.py, so every one of those checks said "nothing here to
-    reject" -- and then `from moe_utils import ...` resolved straight out of the
-    archive and ran the attacker's top level. One planted file, no env var
-    needed, reproduced end to end. Demanding a real directory is what puts the
-    filesystem question and the import question back in agreement.
+    A path that exists and is not a real directory is never trusted: zipimport
+    is a default sys.path hook, so a ZIP named `unsloth_compiled_cache` passed
+    every isfile check and served moe_utils out of the archive.
 
-    True when there is no copy in `directory` at all. That is not the same as
-    "nothing is importable from it" -- a sourceless moe_utils.pyc beside it would
-    be, and a moe_utils/ or moe_utils.so outranks the source even when one is
-    present. The caller runs compiler._reject_shadowing_import_candidates over
-    this name before asking, which is where all three are refused; this function
-    answers only the question it is named for.
-
-    Public because returning None from _load_cached_moe_utils_module() protects
-    only its own callers. Generated MoE modules run a bare `from moe_utils import
-    ...`, and compiler.py's recovery path puts the persistent cache directory on
-    sys.path so that import can resolve -- which handed the very copy rejected
-    below straight to the import system, top-level payload and all. The caller
-    there asks this first and leaves the directory off the path if it says no.
-
-    Matching bytes are necessary and NOT sufficient, which is why this does more
-    than compare and is named for the decision rather than for the comparison. A
-    bare import prefers __pycache__/moe_utils.<tag>.pyc, and an unchecked-hash
-    pyc executes without CPython ever consulting the source beside it, so an
-    exact copy of this file with a planted pyc next to it would still have run
-    foreign code. The pyc is dropped here, and a pyc that cannot be dropped means
-    no.
+    True when there is no copy at all; the caller runs
+    compiler._reject_shadowing_import_candidates first, which refuses a
+    moe_utils package, extension or sourceless pyc. Matching bytes are necessary
+    and NOT sufficient, hence the name: a bare import prefers the pyc, so it is
+    dropped here and one that cannot be dropped means no.
     """
     try:
         # Exists but is not a directory, not merely "is not a directory": a path
