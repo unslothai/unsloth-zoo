@@ -2192,35 +2192,6 @@ def _fix_missing_no_grad(model):
                 object.__setattr__(mod, "_training", True)
 
 
-class _TrainingKVStore:
-    """Minimal KV store for Gemma4 KV-sharing during training.
-
-    Gemma4 E2B/E4B shared layers borrow K/V from earlier "store" layers via
-    the cache; with cache=None they'd recompute K/V from the wrong hidden
-    states. This lets store layers write and shared layers read, with no
-    autoregressive offset tracking. Implements just the KVCache surface
-    Attention.__call__ needs: offset (0), state, update_and_fetch.
-    """
-    __slots__ = ("keys", "values")
-
-    def __init__(self):
-        self.keys = None
-        self.values = None
-
-    @property
-    def offset(self):
-        return 0
-
-    @property
-    def state(self):
-        return (self.keys, self.values)
-
-    def update_and_fetch(self, keys, values):
-        self.keys = keys
-        self.values = values
-        return keys, values
-
-
 def _gemma4_has_native_shared_kv(backbone):
     """Return whether mlx-vlm already threads Gemma4 shared K/V for training."""
     layers = getattr(backbone, "layers", None) or []
@@ -2248,7 +2219,7 @@ def _fix_gemma4_kv_sharing(model):
     (training), legacy shared layers recompute K/V from the wrong hidden state.
 
     mlx-vlm 0.5.0+ threads shared_kv natively; only older backbones need the
-    _TrainingKVStore cache shim.
+    _SharedKVSlot cache shim.
     """
     lm = getattr(model, "language_model", None)
     if lm is None:
@@ -2280,7 +2251,10 @@ def _fix_gemma4_kv_sharing(model):
             n_stores = getattr(self, "first_kv_shared_layer_idx", None)
             if n_stores is None:
                 n_stores = 0
-            cache = [_TrainingKVStore() for _ in range(int(n_stores))]
+            # Gradient checkpointing threads only _SharedKVSlot K/V through
+            # the recomputed region; any other cache drops shared-layer grads.
+            from .utils import _SharedKVSlot
+            cache = [_SharedKVSlot() for _ in range(int(n_stores))]
         return original_call(
             self, inputs=inputs, inputs_embeds=inputs_embeds, mask=mask,
             cache=cache, per_layer_inputs=per_layer_inputs, **kwargs,
