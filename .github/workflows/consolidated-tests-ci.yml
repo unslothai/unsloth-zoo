@@ -361,6 +361,9 @@ jobs:
         # URLs: the static bypass forms and, in the rebinding file, that the fetch
         # connects to the address the guard actually validated. Neither was executed
         # by any job before, so the guard could regress while CI stayed green.
+        # test_merge_index_weight_map_traversal pins that shard names taken from a
+        # local index cannot resolve outside save_directory, neither by creating a
+        # file through copy2 nor by the in-place r+b merge of one that exists.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -401,6 +404,7 @@ jobs:
             tests/test_wheel_top_level_packages.py \
             tests/test_vision_url_ssrf_guard.py \
             tests/test_vision_url_dns_rebinding.py \
+            tests/test_merge_index_weight_map_traversal.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
