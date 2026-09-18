@@ -1412,11 +1412,12 @@ def _reject_shadowing_import_candidates(compile_folder, name):
 
     A directory is one: a regular package `<name>/__init__.py` is found first.
 
-    An extension module is the second, and it outranks even the package.
-    FileFinder's loaders are `extension, source, bytecode`, so on this
-    interpreter `<name>.cpython-313-x86_64-linux-gnu.so`, `<name>.abi3.so` and
-    `<name>.so` are all tried before `<name>.py` -- and a shared library is loaded
-    and run by the dynamic linker, with no source for any digest to cover.
+    An extension module is the second. FileFinder checks the directory first and
+    then runs its loaders in the order `extension, source, bytecode`, so the
+    package above still wins over all of them, but on this interpreter
+    `<name>.cpython-313-x86_64-linux-gnu.so`, `<name>.abi3.so` and `<name>.so`
+    are all tried before `<name>.py` -- and a shared library is loaded and run by
+    the dynamic linker, with no source for any digest to cover.
 
     A sourceless `<name>.pyc` sitting directly in the directory (the legacy
     layout, not `__pycache__/`) is the third. It loses to `<name>.py`, so it only
