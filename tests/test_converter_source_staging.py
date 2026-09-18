@@ -36,6 +36,7 @@ import ast
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tarfile
 import threading
@@ -457,6 +458,50 @@ def test_offline_still_serves_a_complete_cache_entry(mod, staging_env, monkeypat
     monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
     assert mod._stage_converter_sources("b9000") == stage
     assert staging_env["downloads"] == 1
+
+
+def test_offline_reuses_a_revision_this_process_already_resolved(mod, monkeypatch, tmp_path):
+    """A tag resolved earlier in this process is a local fact. Without consulting it,
+    a process that staged the latest release and was then switched offline could not
+    find its own warm cache and reported that no converter was available, for an
+    answer that needs no network."""
+    mod._latest_converter_release_tag.cache_clear()
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_TAG", raising = False)
+    monkeypatch.setattr(mod, "_resolve_llama_cpp_release", lambda *a, **k: ("b9000", None))
+    # Online: resolves and memoizes.
+    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9000")
+    monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
+    monkeypatch.setattr(
+        mod, "_resolve_llama_cpp_release",
+        lambda *a, **k: pytest.fail("offline must not reach the releases API"),
+    )
+    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9000")
+    mod._latest_converter_release_tag.cache_clear()
+
+
+def test_offline_with_nothing_resolved_yet_still_declines(mod, monkeypatch, tmp_path):
+    """The negative half: the memo is consulted, not invented. A process that never
+    resolved a revision has no local answer and must still decline rather than guess."""
+    mod._latest_converter_release_tag.cache_clear()
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_TAG", raising = False)
+    monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (None, None)
+
+
+def test_offline_does_not_reuse_a_revision_resolved_under_another_pin(mod, monkeypatch, tmp_path):
+    """UNSLOTH_LLAMA_TAG is the memo key, so changing it mid-process must not serve
+    the tag resolved for the previous one."""
+    mod._latest_converter_release_tag.cache_clear()
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_TAG", raising = False)
+    monkeypatch.setattr(mod, "_resolve_llama_cpp_release", lambda *a, **k: ("b9000", None))
+    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9000")
+    monkeypatch.setenv("UNSLOTH_LLAMA_TAG", "b1234")
+    monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (None, None)
+    mod._latest_converter_release_tag.cache_clear()
 
 
 def test_offline_is_read_at_the_call_not_at_import(mod, monkeypatch):
@@ -1551,11 +1596,11 @@ def test_a_stage_repaired_by_another_process_is_adopted_not_destroyed(mod, stagi
     monkeypatch.setattr(mod, "_converter_stage_is_usable", repaired_after_the_condition)
 
     moved = []
-    real_move = mod.shutil.move
+    real_rename = mod.os.rename
     def spy(src, dst, *a, **k):
         moved.append(os.path.abspath(src))
-        return real_move(src, dst, *a, **k)
-    monkeypatch.setattr(mod.shutil, "move", spy)
+        return real_rename(src, dst, *a, **k)
+    monkeypatch.setattr(mod.os, "rename", spy)
 
     mod._stage_converter_sources("b9000")
     monkeypatch.undo()
@@ -1565,3 +1610,48 @@ def test_a_stage_repaired_by_another_process_is_adopted_not_destroyed(mod, stagi
         "a replacement published between the condition and the move was moved aside, "
         "which deletes a live tree in the finally while another export holds the path"
     )
+
+
+def test_a_replacement_published_during_the_move_is_restored_not_deleted(mod, staging_env, monkeypatch):
+    """The window the re-check above cannot cover: the other process publishes
+    between our guard and the move itself, so the probe's answer is already stale
+    by the time we take the directory. What we actually moved is the authority, so
+    a valid tree has to go straight back rather than be disposed of in `finally`.
+
+    The winner is injected inside the rename, which is the only way to land in a
+    sub-statement window deterministically. Its tree carries a marker so the
+    assertion cannot be satisfied by our own republished copy."""
+    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    _write_source_tree(stage_dir)
+    Path(stage_dir, "convert_hf_to_gguf.py").write_bytes(b"")   # damaged: enters repair
+
+    real_rename = mod.os.rename
+    swapped = {"done": False}
+
+    def publish_a_winner_then_rename(src, dst, *a, **k):
+        if not swapped["done"] and os.path.abspath(src) == os.path.abspath(stage_dir):
+            swapped["done"] = True
+            # The other process finishes its repair here, one instruction before we
+            # take the directory: a complete, valid, manifested tree at the name.
+            shutil.rmtree(stage_dir)
+            _write_source_tree(stage_dir)
+            Path(stage_dir, "WINNER").write_text("published by the other process\n")
+            Path(stage_dir, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
+                "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
+                "repo": "ggml-org/llama.cpp", "tag": "b9000",
+                "archive_sha256": "winner", "completed": True,
+            }))
+        return real_rename(src, dst, *a, **k)
+    monkeypatch.setattr(mod.os, "rename", publish_a_winner_then_rename)
+
+    result = mod._stage_converter_sources("b9000")
+    monkeypatch.undo()
+
+    assert swapped["done"], "the repair move never ran, so this proved nothing"
+    assert result == stage_dir
+    assert os.path.isdir(stage_dir), "the winner's tree was deleted in the finally"
+    assert Path(stage_dir, "WINNER").is_file(), (
+        "the winner's tree was replaced rather than restored, so the export still "
+        "holding that path lost the files underneath it"
+    )
+    assert mod._converter_stage_is_usable(stage_dir, repo = "ggml-org/llama.cpp", tag = "b9000")

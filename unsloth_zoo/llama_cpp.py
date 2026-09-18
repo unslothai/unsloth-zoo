@@ -1566,14 +1566,29 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
             # then refuses to publish. Move the wreck into our private staging dir so
             # the `finally` disposes of it, rather than deleting a tree in place.
             try:
-                # Re-checked here, not only in the condition above: between the two
-                # another process can publish a valid replacement, and moving THAT
-                # aside would have our `finally` delete a live tree. This narrows the
-                # window rather than closing it, which needs a lock, but it turns the
-                # common interleaving from a destroyed tree into an adopted one.
+                # Cheap early out for the common interleaving, where another process
+                # has already finished repairing this entry.
                 if _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
                     raise _StageRepairedByAnother()
-                shutil.move(stage_dir, os.path.join(staging, "superseded"))
+                superseded = os.path.join(staging, "superseded")
+                # os.rename, not shutil.move: taking the entry has to be one atomic
+                # step, so that what lands in `superseded` is exactly what was at
+                # `stage_dir` and nothing can be half moved.
+                os.rename(stage_dir, superseded)
+                # Compare AFTER the move, because the probe above describes a tree we
+                # had not taken yet. A process publishing a valid replacement in
+                # between leaves us holding ITS tree, which `finally` would delete
+                # while its own export is still using the path, so the authority is
+                # what we actually moved. Put a valid one straight back and adopt it.
+                if _converter_stage_is_usable(superseded, repo = repo, tag = tag):
+                    try:
+                        os.rename(superseded, stage_dir)
+                    except OSError:
+                        # A third process published into the name while we held it.
+                        # Its tree is the same revision, so ours is redundant and
+                        # `finally` disposing of it is correct.
+                        pass
+                    raise _StageRepairedByAnother()
             except _StageRepairedByAnother:
                 pass
             except (OSError, shutil.Error):
@@ -1685,9 +1700,17 @@ def _resolve_converter_revision(llama_cpp_dir):
     repo, tag = _read_prebuilt_marker(llama_cpp_dir)
     if tag:
         return repo, tag
+    llama_tag_pin = os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()
     if not _converter_network_allowed():
+        # A revision this process already resolved is a local fact, not a network
+        # call. Returning (None, None) here made a process that staged a release and
+        # was then switched offline unable to find its own warm cache, and report
+        # that no converter was available, for an answer needing no network at all.
+        memoized = _CONVERTER_RELEASE_TAGS.get(llama_tag_pin)
+        if memoized:
+            return "ggml-org/llama.cpp", memoized
         return None, None
-    tag = _latest_converter_release_tag(os.environ.get("UNSLOTH_LLAMA_TAG", "").strip())
+    tag = _latest_converter_release_tag(llama_tag_pin)
     if not tag:
         return None, None
     return "ggml-org/llama.cpp", tag
