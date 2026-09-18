@@ -1023,13 +1023,10 @@ def _moe_router_class(base):
     return patched, mode, experts_path, top_k_path
 
 
-# Held across entry and exit, for the reason fused_moe_gate_up and fused_residual_norm hold
-# theirs: `generation_mode` serializes, but the loader's two generate() wrappers enter these
-# scopes directly and nothing there does. This scope needs it more than either sibling, because
-# it is the only one carrying a per-module scope count, and `count += 1` against a `finally` that
-# pops the same key is not one step: two threads can both read the count before either writes it
-# and strand the patched class for the life of the process, or one can pop the key between the
-# other's guard and its increment and raise AttributeError out of generation.
+# `generation_mode` serializes, but the loader's two generate() wrappers enter this scope directly
+# and do not, and this is the only one of the four carrying a per-module count: unlocked,
+# `count += 1` against a `finally` that pops the same key strands the patched class or raises
+# AttributeError out of generation (5 of 40 contended rounds).
 _MOE_ROUTER_LOCK = RLock()
 
 @contextmanager
@@ -1045,10 +1042,9 @@ def fused_moe_router(model):
     packing requires of its own weights: replacing it is detected and takes the native
     call, editing it in place is not detected. Edits between scopes are always picked up.
 
-    Bit-identity covers every index and every finite weight. It does not cover the NaN
-    payload of a poisoned row: MLX's own payload for one is not stable across Apple GPU
-    families, so no single kernel output can match it everywhere. Both paths return NaN
-    in the same positions, which is what poisoning means downstream.
+    Bit-identity covers every index and every finite weight, not the NaN payload of a poisoned
+    row: MLX's own payload is not stable across Apple GPU families, so nothing can match it
+    everywhere. Both paths return NaN in the same positions.
     """
     changed = []
     try:
