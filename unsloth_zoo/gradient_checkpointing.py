@@ -76,6 +76,87 @@ def _double_buffer_disabled():
     return _any_device_integrated()
 
 
+# Pinned (page-locked) host memory is a far smaller budget than VRAM or RAM, and
+# exhausting it looks like a bare "CUDA error: out of memory" on an empty GPU. WSL2
+# caps it near 1-2GB and refuses single pinned allocations past a few MB, so fall
+# back to pageable memory (slower, no compute overlap) instead of dying. See
+# unslothai/unsloth 338, 1552, 1744, 1797 and https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications
+PINNED_MEMORY_AVAILABLE = True
+_WARNED_ABOUT_PINNED_MEMORY = False
+
+
+def _pinned_memory_disabled():
+    return os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1"
+
+
+def _is_host_alloc_oom(exception):
+    # torch >= 2.9 raises AcceleratorError, older torch RuntimeError; both subclass RuntimeError.
+    text = str(exception).lower()
+    return ("out of memory" in text) or ("cudaerrormemoryallocation" in text)
+
+
+def _warn_pinned_unavailable(detail):
+    global PINNED_MEMORY_AVAILABLE, _WARNED_ABOUT_PINNED_MEMORY
+    PINNED_MEMORY_AVAILABLE = False
+    if _WARNED_ABOUT_PINNED_MEMORY: return
+    _WARNED_ABOUT_PINNED_MEMORY = True
+    print(
+        "Unsloth: Could not allocate pinned (page-locked) host memory for gradient "
+        "checkpointing offload, so pageable host memory will be used instead. "
+        "Training continues and results are unchanged, but the offload copies no "
+        "longer overlap with compute, so each step is somewhat slower.\n"
+        f"Unsloth: The allocator reported: {detail}\n"
+        "Unsloth: This is normal under WSL2, which caps pinned memory per process. "
+        "Set UNSLOTH_DISABLE_PINNED_MEMORY=1 to skip pinning from the start."
+    )
+
+
+# Tensor.is_pinned() is a cudaPointerGetAttributes driver query, not a cached flag,
+# and the two offload copies run once per checkpointed layer per micro batch. Cache
+# the answer on the buffer itself instead of in a list parallel to CPU_BUFFERS: a
+# parallel list can drift out of step with the slot it describes and claim a pageable
+# buffer is pinned, which would issue an async copy out of pageable memory. Readers
+# use getattr(..., False), so an unmarked buffer only costs a synchronous copy.
+HOST_PINNED_ATTR = "_unsloth_is_pinned"
+
+
+def _mark_host_buffer(buffer):
+    """Record whether `buffer` is page-locked. Call wherever a host buffer is made or regrown."""
+    try:
+        pinned = buffer.is_pinned()
+    except Exception:
+        pinned = False
+    try:
+        setattr(buffer, HOST_PINNED_ATTR, pinned)
+    except AttributeError:
+        pass  # exotic tensor subclass; readers fall back to False
+    return buffer
+
+
+def _new_host_buffer(numel, dtype):
+    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled()):
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+    try:
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e): raise
+        _warn_pinned_unavailable(e)
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+
+
+def _grow_host_buffer(buffer, new_size):
+    """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
+    if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
+    try:
+        buffer.resize_(new_size)
+        return _mark_host_buffer(buffer)
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+        _warn_pinned_unavailable(e)
+        # Pinning is gone for this slot, so the cached flag has to flip with it.
+        return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+
+
 @contextmanager
 def _no_inference_mode():
     # Allocate GC buffers outside inference_mode (but in no_grad) so a later
@@ -628,9 +709,15 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
+    # Re-probe: an earlier model in this process may have tripped the fallback. Clear
+    # the warning latch too, otherwise a second model falls back silently.
+    global PINNED_MEMORY_AVAILABLE
+    global _WARNED_ABOUT_PINNED_MEMORY
+    PINNED_MEMORY_AVAILABLE = True
+    _WARNED_ABOUT_PINNED_MEMORY = False
     with _no_inference_mode():
-        for i in range(200):
-            x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
+        for i in range(INITIAL_CPU_BUFFER_COUNT):
+            x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
             CPU_BUFFERS.append(x)
     pass
 
@@ -801,13 +888,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
-                                x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
+                                x = _new_host_buffer(new_size, arg.dtype)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
                         shape = arg.shape
-                        if new_size > x.numel(): x.resize_(new_size)
+                        if new_size > x.numel():
+                            with _no_inference_mode():
+                                x = _grow_host_buffer(x, new_size)
+                            # Backward reads this slot by index, so store the replacement back.
+                            CPU_BUFFERS[CPU_INDEX] = x
                         if new_size > GPU_BUFFER.numel():
                             try:
                                 GPU_BUFFER.resize_(new_size)
@@ -839,13 +930,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFERS_B = None
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
 
+                        # Read the cached flag off the slot itself, before the view is
+                        # taken: a view is a fresh object and does not carry the attribute.
+                        host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
-                            x.copy_(arg, non_blocking = True)
+                            # Only a pinned destination gives a genuinely async copy.
+                            x.copy_(arg, non_blocking = host_is_pinned)
 
                         global NEXT_BUFFER_SLOT
                         buffer_slot = NEXT_BUFFER_SLOT[device_index]
@@ -912,7 +1007,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             else:
                 buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
 
-            x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
+            host_buffer = CPU_BUFFERS[CPU_INDEX]
+            host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
+            x = host_buffer[:new_size].view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
@@ -925,7 +1022,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
             with torch_gpu_stream(EXTRA_STREAM):
-                buffer.copy_(x, non_blocking = True)
+                buffer.copy_(x, non_blocking = host_is_pinned)
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
@@ -1214,6 +1311,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
         if i < INITIAL_CPU_BUFFER_COUNT:
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(INITIAL_CPU_BUFFER_SIZE)
+                # resize_ keeps the object and its pinning, but re-read rather than assume.
+                _mark_host_buffer(CPU_BUFFERS[i])
         else:
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(0)

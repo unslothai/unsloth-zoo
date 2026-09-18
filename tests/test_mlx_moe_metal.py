@@ -59,8 +59,11 @@ def _counting_gather_qmm(monkeypatch):
 
 
 def _sample(width = 2048):
-    return (mx.random.normal((1, 2, width)).astype(mx.bfloat16),
-            mx.array([[[7, 2, 0, 5], [6, 4, 1, 3]]]))
+    # past the upstream decode window, so eligibility is what decides the path taken, not length
+    length = getattr(vlm, "DECODE_BLOCK_SIZE", 0) + 2
+    rows = mx.array([[7, 2, 0, 5], [6, 4, 1, 3]])
+    return (mx.random.normal((1, length, width)).astype(mx.bfloat16),
+            mx.tile(rows, ((length + 1) // 2, 1))[None, :length])
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
@@ -69,6 +72,7 @@ def _sample(width = 2048):
 def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dims, quantization, monkeypatch):
     model = _model(native, dtype, dims, quantization)
     original_call = native.SwitchGLU.__call__
+    decode_block = getattr(native, "DECODE_BLOCK_SIZE", 0)
     names = {name for name, _ in tree_flatten(model.parameters())}
     samples = _samples(model, dtype, dims[0], [(1, 1), (2, 1), (1, 8), (1, 64), (1, 256)])
     calls, clears = _counting_gather_qmm(monkeypatch), []
@@ -79,8 +83,13 @@ def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dim
         assert {name for name, _ in tree_flatten(model.parameters())} == names
         for x, indices, expected in samples:
             calls.clear()
+            original_call(model, x, indices)
+            native_calls = len(calls)
+            calls.clear()
             _equal(model(x, indices), expected)
-            assert len(calls) == 2
+            # packing folds the separate gate and up projections into one, except where a short
+            # sequence belongs to an upstream decode path this body does not reimplement
+            assert len(calls) == (native_calls if 1 < x.shape[1] <= decode_block else 2)
         monkeypatch.setattr(native, "_gather_sort", None)  # a rebound switch layer function falls back per call
         calls.clear()
         _equal(model(*samples[0][:2]), samples[0][2])
@@ -93,8 +102,8 @@ def test_fusion_preserves_outputs_parameters_and_native_class(native, dtype, dim
 def test_each_contract_resolution_gets_its_own_bindings():
     # one list shared between resolutions would vouch for helpers a cached fused class never captured
     first, second = fusion._moe_switch_specs(), fusion._moe_switch_specs()
-    assert first[lm.SwitchGLU][3] is not second[lm.SwitchGLU][3]
-    fused = [fusion._fused_moe_gate_up_class(lm.SwitchGLU, kind, None, None, []) for kind in
+    assert first[lm.SwitchGLU][-1] is not second[lm.SwitchGLU][-1]
+    fused = [fusion._fused_moe_gate_up_class(lm.SwitchGLU, kind, None, None, 0, []) for kind in
              (lm.QuantizedSwitchLinear, type("Other", (lm.QuantizedSwitchLinear,), {}))]
     assert fused[0] is not fused[1]  # one class cached across projection types would guard the wrong one
 
@@ -195,8 +204,11 @@ def test_training_replacement_and_adapters_use_native_path(native, monkeypatch):
     def assert_native_path():
         calls.clear()
         actual = model(x, indices)
-        assert len(calls) == 3
-        _equal(actual, original_call(model, x, indices))
+        observed = len(calls)
+        calls.clear()
+        expected = original_call(model, x, indices)
+        assert observed == len(calls)  # packing would fold two projections into one call
+        _equal(actual, expected)
 
     with fused_moe_gate_up(model):
         model.train()
@@ -219,7 +231,7 @@ def test_ineligible_models_stay_native(reason, monkeypatch):
     elif reason == "partial":
         model.gate_proj.biases = None  # one projection carrying a field the other lacks cannot pack
     elif reason == "stale":
-        monkeypatch.setitem(fusion._MOE_GATE_UP_FUNCTIONS, "SwitchGLU.__call__", "stale")
+        monkeypatch.setitem(fusion._MOE_SWITCH_GLU_CALLS, "mlx_vlm.models.switch_layers", ("stale",))
     elif reason == "helper":  # a sort helper whose body is not the one the fused call was written against
         monkeypatch.setattr(vlm, "_gather_sort", vlm._scatter_unsort)
     elif reason == "custom":
@@ -259,3 +271,38 @@ def test_family_activation_is_preserved(dtype, family, bias):
         assert type(model) is not vlm.SwitchGLU
         for x, indices, expected in samples:
             _equal(model(x, indices), expected)
+
+
+def test_accepted_switch_glu_bodies_cover_the_installed_packages():
+    # the fused body reimplements these; an unlisted body must be caught here, not by wrong numbers
+    for path, accepted in fusion._MOE_SWITCH_GLU_CALLS.items():
+        native = {"mlx_lm.models.switch_layers": lm, "mlx_vlm.models.switch_layers": vlm}[path]
+        assert fusion._ast_fingerprint(native.SwitchGLU.__call__) in accepted
+
+
+@pytest.mark.skipif("weights" not in vlm.SwitchGLU.__call__.__code__.co_varnames,
+                    reason = "Requires an mlx-vlm that combines routing weights")
+@pytest.mark.parametrize("with_shared", [False, True])
+def test_combined_arguments_fall_back_to_the_native_path(with_shared, monkeypatch):
+    model = _model(vlm)
+    # longer than the upstream decode path covers, so only the combined arguments can defer
+    length = getattr(vlm, "DECODE_BLOCK_SIZE", 0) + 8
+    x = mx.random.normal((1, length, 2048)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, 8, (1, length, 4))
+    original_call = vlm.SwitchGLU.__call__
+    kwargs = {"weights": mx.random.normal(indices.shape).astype(mx.bfloat16)}
+    if with_shared:  # upstream weights the routed experts before adding the shared one
+        kwargs["shared"] = mx.random.normal((1, length, 2048)).astype(mx.bfloat16)
+    mx.eval((x, indices, kwargs))
+    expected = original_call(model, x, indices, **kwargs)
+    calls = _counting_gather_qmm(monkeypatch)
+    with fused_moe_gate_up(model):
+        assert type(model) is not vlm.SwitchGLU
+        calls.clear()
+        actual = model(x, indices, **kwargs)
+        observed = len(calls)
+        calls.clear()
+        original_call(model, x, indices, **kwargs)
+        assert observed == len(calls)  # packing here would drop the combine the native call performs
+    _equal(actual, expected)
+    _equal(model(x, indices, **kwargs), expected)

@@ -271,9 +271,15 @@ from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 """
 )
 
+# HAS_CUT_CROSS_ENTROPY travels with fused_linear_cross_entropy because the generated
+# causal-LM branch consults it. UNSLOTH_ENABLE_CCE defaults on and knows nothing about
+# whether `linear_cross_entropy` imported, so wherever that import is refused the flag
+# alone routed into fused_linear_cross_entropy and raised NameError. The elif below it
+# computes the standard loss, the documented fallback.
 _disabled_sdpa_code = f"""{_license_header}
 
 from unsloth_zoo.loss_utils import (
+    HAS_CUT_CROSS_ENTROPY,
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
@@ -2836,7 +2842,18 @@ def raise_logits_error(*args, **kwargs): raise NotImplementedError(LOGITS_ERROR_
 def return_none(*args, **kwargs): return None
 class EmptyLogits:
     def __init__(self): return
-    def raise_getattr_error(self, attr): return return_none if attr == "to" else raise_logits_error
+    def raise_getattr_error(self, attr):
+        if attr == "to": return return_none
+        # A catch-all __getattr__ makes hasattr() true for every name, dunders included, so the
+        # sentinel answers yes to protocol probes it cannot honour. torch.distributed's output cast
+        # tests `hasattr(x, "__dataclass_fields__")` and then calls `dataclasses.replace(x)` on
+        # whatever said yes, so with FSDP2 mixed precision every step died in
+        # `TypeError: replace() should be called on dataclass instances` (unsloth#409, reached
+        # through `_fsdp_state._cast_output_dtype`). Protocol probes get an honest AttributeError;
+        # ordinary attribute access still gets the callable that explains UNSLOTH_RETURN_LOGITS.
+        if len(attr) > 4 and attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {attr!r}")
+        return raise_logits_error
     __getitem__ = raise_logits_error
     __getattr__ = raise_getattr_error
     def __repr__(self): return LOGITS_ERROR_STRING
@@ -2969,7 +2986,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3061,7 +3078,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -4272,6 +4289,57 @@ pass
 """
 
 
+# Both spellings PEFT uses for the LoRA input cast, as (statement, expression).
+# A rename of both no-ops every replacement, leaving PEFT's own cast, which is the safe
+# direction; test_lora_input_cast_rewrite.py fails loudly on that drift.
+_LORA_INPUT_CASTS = (
+    (
+        "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
+        "self._cast_input_dtype(x, lora_A.weight.dtype)",
+    ),
+    (
+        "x = x.to(lora_A.weight.dtype)",
+        "x.to(lora_A.weight.dtype)",
+    ),
+)
+
+
+def _patch_lora_input_cast(source, force_float32 = None):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Rewrites PEFT's LoRA input cast inside the active-adapter loop.
+
+    Without UNSLOTH_FORCE_FLOAT32: cast `result` and `x` when autocast is off, leaving a
+    forward that branches on autocast itself alone. With it: the vanilla branch becomes
+    the self-casting `lora_forward`, but variants keep PEFT's branch and take `x` directly,
+    so deleting the cast left float16 meeting float32 LoRA weights (unsloth#4127). Hence
+    the variant-gated cast, with `getattr` for layers that have no variant branch.
+    """
+    if force_float32 is None:
+        force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0"
+
+    if not force_float32:
+        if "torch.is_autocast_enabled()" in source:
+            return source
+        new = (
+            "if not torch.is_autocast_enabled(): "
+            "result, x = "
+            "result.to(lora_A.weight.dtype), "
+            "x.to(lora_A.weight.dtype)"
+        )
+        for statement, _ in _LORA_INPUT_CASTS:
+            source = source.replace(statement, new)
+        return source
+
+    for statement, expression in _LORA_INPUT_CASTS:
+        guarded = (
+            f"x = ({expression}) if active_adapter in "
+            'getattr(self, "lora_variant", {}) else x'
+        )
+        source = source.replace(statement, guarded)
+    return source
+pass
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -4331,24 +4399,7 @@ def patch_lora_forwards(torch_compile_options):
         #     source = source.replace(source[variant_found : variant_end], "")
 
         # Check failed upcasting
-        replacements = [
-            "x = x.to(lora_A.weight.dtype)",
-            "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
-        ]
-        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
-            if "torch.is_autocast_enabled()" not in source:
-                new = (
-                    "if not torch.is_autocast_enabled(): "
-                    "result, x = "
-                    "result.to(lora_A.weight.dtype), "
-                    "x.to(lora_A.weight.dtype)"
-                )
-                for replace in replacements:
-                    source = source.replace(replace, new)
-        else:
-            for replace in replacements:
-                source = source.replace(replace, "")
-        pass
+        source = _patch_lora_input_cast(source)
         source = source.replace(
             "self._check_forward_args(x, *args, **kwargs)",
             "",

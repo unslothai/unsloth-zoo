@@ -33,6 +33,7 @@ import torch
 from safetensors import safe_open
 
 from unsloth_zoo.saving_utils import merge_and_overwrite_lora
+from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_expert_columns
 
 
 SEED = 1234
@@ -148,8 +149,9 @@ def _ref_fused(base3d: torch.Tensor, a: _Adapted) -> torch.Tensor:
     A = a.lora_A.to(torch.float64)
     B = a.lora_B.to(torch.float64)
     for e in range(E):
-        s, t = e * r, (e + 1) * r
-        delta = B[:, s:t] @ A[s:t, :]
+        # lora_A is expert-slowest, lora_B is expert-FASTEST. The two are not sliced the
+        # same way, which is the whole reason moe_lora_b_expert_columns exists.
+        delta = B[:, moe_lora_b_expert_columns(e, E, r)] @ A[e * r : (e + 1) * r, :]
         if tuple(delta.shape) == (d1, d2):
             out[e] += a.alpha * delta
         elif tuple(delta.shape) == (d2, d1):

@@ -42,7 +42,13 @@ __all__ = [
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
-    HAS_BNB = True
+    # The zoo injects a permissive bitsandbytes stub wherever the real package is absent,
+    # macOS arm64 among others, and every attribute of that stub is a placeholder object
+    # rather than a class. `isinstance(x, Params4bit)` against one raises TypeError, so a
+    # non-class Params4bit has to count as no bitsandbytes at all.
+    HAS_BNB = isinstance(Params4bit, type)
+    if not HAS_BNB:
+        Params4bit = None
 except Exception:
     HAS_BNB = False
     bnb = None
@@ -240,7 +246,9 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     flat_e = sel.reshape(-1)
     flat_w = rw.reshape(-1)
     tok_of_pair = torch.arange(T, device=dev).repeat_interleave(top_k)
-    counts = torch.bincount(flat_e, minlength=num_experts)
+    from .moe_utils import count_tokens_per_expert
+    # int64 matches what bincount returned, so cumsum is unchanged.
+    counts = count_tokens_per_expert(flat_e, num_experts, torch.int64)
     order = torch.argsort(flat_e, stable=True)
     sorted_tok = tok_of_pair[order]
     sorted_w = flat_w[order]
