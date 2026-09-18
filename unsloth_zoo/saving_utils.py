@@ -722,6 +722,7 @@ def _merge_and_overwrite_lora(
     pass
 
     filename_original = os.path.join(save_directory, filename)  # Original file path
+    _assert_shard_is_inside(filename_original, save_directory)
     count = 0
     # Collect keys for this shard so the caller can aggregate without re-reading the file (avoids
     # an extra safetensors pass purely for tied-embedding bookkeeping).
@@ -2174,6 +2175,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
+    _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
     count = 0
     safetensor_keys_seen = set()
@@ -2607,6 +2609,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
     filename_original = os.path.join(save_directory, filename)
+    _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
     count = 0
     safetensor_keys_seen = set()
@@ -3134,6 +3137,74 @@ def _reject_unsafe_shard_index(index_path):
             f"{', '.join(repr(name) for name in unsafe[:5])}."
         )
     return raw
+
+
+def _resolves_inside(path, directory):
+    """Whether `path` REALLY lands under `directory`, links resolved.
+
+    The `weight_map` guards above are lexical, which is the right test for a name we
+    are vouching for in a file someone else will open elsewhere. This one is about a
+    path we are about to write to on this machine, so it has to follow the links that
+    actually exist here.
+    """
+    resolved = os.path.realpath(path)
+    root = os.path.realpath(directory)
+    return resolved == root or resolved.startswith(root + os.sep)
+
+
+def _materialize_shard_that_resolves_outside(file_path, save_directory):
+    """Replace a shard that is a link out of `save_directory` with a real copy.
+
+    The merge opens each shard `r+b` and mmaps it for an in-place overwrite. When the
+    export is in place, nothing copies the shard first, because `os.path.exists` is
+    true THROUGH a symlink, so the write goes straight into whatever the link points
+    at. A model directory holding `model.safetensors -> /outside/victim.safetensors`
+    therefore had the victim rewritten, with no index involved at all, which is why
+    none of the `weight_map` guarding catches it.
+
+    Materialising rather than refusing, because the layout is ordinary: a Hugging Face
+    cache snapshot is exactly this, every shard a link into shared `blobs/`. Refusing
+    would break merging one of those, and writing through would corrupt a blob other
+    models share. Copying the content in breaks neither: the merge then rewrites a
+    real file of its own, and the link target is left alone.
+
+    An out-of-place export already lands here safely, since `shutil.copy2` follows the
+    link and writes content, so this only ever fires for the in-place case.
+    """
+    if not os.path.islink(file_path):
+        # A path that resolves out through a symlinked PARENT cannot be repaired by
+        # replacing the file, so it is refused at the sink instead. Not silently
+        # allowed: `_assert_shard_is_inside` is what every writer checks.
+        return
+    if _resolves_inside(file_path, save_directory):
+        return
+    target = os.path.realpath(file_path)
+    if not os.path.isfile(target):
+        # A dangling or non-file link is not something to copy; the writer's check
+        # reports it rather than this guessing at an intent.
+        return
+    os.remove(file_path)                       # the link only, never its target
+    shutil.copy2(target, file_path)
+    print(
+        f"Unsloth: Copied {os.path.basename(file_path)} out of the link it pointed at, "
+        f"so the merge does not write outside {save_directory}"
+    )
+
+
+def _assert_shard_is_inside(file_path, save_directory):
+    """Last check before a writer opens a shard. Every write sink calls this.
+
+    Placed at the sinks rather than only where the name is chosen, so it holds however
+    the path arrived: the local listing, the index, the Hub listing, or a later rename.
+    """
+    if _resolves_inside(file_path, save_directory):
+        return
+    raise RuntimeError(
+        f"Unsloth: Refusing to write {file_path} because it resolves to "
+        f"{os.path.realpath(file_path)}, outside the output directory "
+        f"{os.path.realpath(save_directory)}. A shard, or one of its parent "
+        f"directories, is a link out of the directory being exported to."
+    )
 
 
 @torch.inference_mode
@@ -3687,6 +3758,7 @@ def merge_and_overwrite_lora(
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
         file_path = os.path.join(save_directory, filename)
+        _materialize_shard_that_resolves_outside(file_path, save_directory)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
         # For local models, copy the file if needed

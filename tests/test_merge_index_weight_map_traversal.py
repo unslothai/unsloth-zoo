@@ -870,3 +870,148 @@ def test_the_exported_index_keeps_the_mode_and_time_copy2_gave_it(
     assert int(exported_stat.st_mtime) == int(source_stat.st_mtime), (
         "the exported index did not keep the source mtime that copy2 preserved"
     )
+
+
+def _symlinked_model(tmp_path, spec, *, link_the_parent = False):
+    """A model directory whose shard is a link out of it, and no index at all.
+
+    This is the shape a Hugging Face cache snapshot has, every shard a link into a
+    shared `blobs/` directory, and it reaches the merge through the `os.listdir`
+    branch without any `weight_map` involved.
+    """
+    real_base = os.path.join(str(tmp_path), "real_base")
+    shard = sorted(f for f in os.listdir(real_base) if f.endswith(".safetensors"))[0]
+
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+    victim = os.path.join(outside, "victim.safetensors")
+    shutil.copy2(os.path.join(real_base, shard), victim)
+
+    shadow = os.path.join(str(tmp_path), "ns", "base")
+    os.makedirs(shadow, exist_ok = True)
+    shutil.copy2(
+        os.path.join(real_base, "config.json"), os.path.join(shadow, "config.json"),
+    )
+    if link_the_parent:
+        # The shard itself is an ordinary file; a PARENT component is the link, which
+        # replacing the file cannot repair.
+        holder = os.path.join(str(tmp_path), "outside_holder")
+        os.makedirs(holder, exist_ok = True)
+        shutil.copy2(os.path.join(real_base, shard), os.path.join(holder, "model.safetensors"))
+        os.symlink(holder, os.path.join(shadow, "weights"))
+        with open(
+            os.path.join(shadow, "model.safetensors.index.json"), "w", encoding = "utf-8",
+        ) as f:
+            from safetensors import safe_open
+            weight_map = {}
+            with safe_open(os.path.join(holder, "model.safetensors"), framework = "pt") as g:
+                for key in g.keys():
+                    weight_map[key] = "weights/model.safetensors"
+            json.dump({"metadata": {"total_size": 1}, "weight_map": weight_map}, f)
+    else:
+        os.symlink(victim, os.path.join(shadow, "model.safetensors"))
+    assert not os.path.exists(os.path.join(shadow, "model.safetensors")) or \
+        os.path.islink(os.path.join(shadow, "model.safetensors")) or link_the_parent
+    return os.path.join("ns", "base"), victim
+
+
+def test_a_symlinked_shard_is_not_written_through(monkeypatch, tmp_path):
+    """The in-place merge must not write into whatever a shard links to.
+
+    Nothing copies the shard first, because `os.path.exists` is true THROUGH the link,
+    so the `r+b` overwrite went straight into the target. No index is involved, which
+    is why none of the `weight_map` guarding catches it. It is materialised rather than
+    refused: this is the ordinary shape of an HF cache snapshot, and writing through
+    would corrupt a blob other models share.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    base_tensors = H.read_safetensors_dir(real_base)
+    peft_model = H.attach_lora(model, spec, "full")
+    adapted = H.extract_adapted(peft_model)
+
+    base_rel, victim = _symlinked_model(tmp_path, spec)
+    before = hashlib.sha256(open(victim, "rb").read()).hexdigest()
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+
+    saving_utils.merge_and_overwrite_lora(
+        get_model_name  = lambda *a, **k: base_rel,
+        model           = peft_model,
+        tokenizer       = None,
+        save_directory  = base_rel,          # in place: the case that escaped
+        save_method     = "merged_16bit",
+        output_dtype    = torch.float32,
+        push_to_hub     = False,
+    )
+
+    after = hashlib.sha256(open(victim, "rb").read()).hexdigest()
+    assert before == after, (
+        f"the merge wrote through the link into {victim!r}, outside the output directory"
+    )
+    output = os.path.join(str(tmp_path), base_rel)
+    shard = os.path.join(output, "model.safetensors")
+    assert not os.path.islink(shard), "the shard is still a link, so the next write escapes"
+    # And it really merged, into its own copy.
+    H.assert_merge_correct(
+        family = FAMILY, base_tensors = base_tensors, out_dir = output,
+        save_dtype = torch.float32, adapted = adapted, base_dir = real_base,
+    )
+
+
+def test_a_shard_behind_a_symlinked_parent_is_refused(monkeypatch, tmp_path):
+    """Replacing the file cannot repair a path that escapes through a parent link.
+
+    So the writer refuses instead of materialising, rather than quietly writing out of
+    the directory the user asked to export to.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    model = H.build_and_save_base(spec, real_base)
+    peft_model = H.attach_lora(model, spec, "full")
+
+    base_rel, _victim = _symlinked_model(tmp_path, spec, link_the_parent = True)
+    holder = os.path.join(str(tmp_path), "outside_holder", "model.safetensors")
+    before = hashlib.sha256(open(holder, "rb").read()).hexdigest()
+
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+
+    with pytest.raises(RuntimeError, match = "outside the output directory"):
+        saving_utils.merge_and_overwrite_lora(
+            get_model_name  = lambda *a, **k: base_rel,
+            model           = peft_model,
+            tokenizer       = None,
+            save_directory  = base_rel,
+            save_method     = "merged_16bit",
+            push_to_hub     = False,
+        )
+
+    after = hashlib.sha256(open(holder, "rb").read()).hexdigest()
+    assert before == after, "the file behind the linked parent was modified anyway"
+
+
+def test_a_symlink_that_stays_inside_the_output_is_left_alone(tmp_path):
+    """Only a link OUT is repaired; one that resolves back inside is not touched."""
+    output = os.path.join(str(tmp_path), "out")
+    os.makedirs(os.path.join(output, "real"), exist_ok = True)
+    target = os.path.join(output, "real", "shard.safetensors")
+    with open(target, "wb") as f:
+        f.write(b"inside")
+    link = os.path.join(output, "model.safetensors")
+    os.symlink(target, link)
+
+    saving_utils._materialize_shard_that_resolves_outside(link, output)
+
+    assert os.path.islink(link), "a contained link was needlessly replaced"
+    assert saving_utils._resolves_inside(link, output)
