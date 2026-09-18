@@ -36,6 +36,7 @@ import os
 import time
 import re
 import ast
+import hashlib
 import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
@@ -239,14 +240,26 @@ def _converter_stage_dir(repo, tag):
 
     The repo slug is flattened and both halves are sanitised: a tag reaches this
     from a release API and an env var, and neither is trusted to stay inside the
-    cache root."""
+    cache root.
+
+    Sanitising alone cannot name a directory, because it is not injective: `v/a`
+    and `v_a` both clean to `v_a`. Comparing the manifest stops the wrong sources
+    being SERVED, but two revisions still contend for one directory, and the loser
+    is not merely confused, it is overwritten: staging `feature_foo` finds
+    `feature/foo`'s live tree failing its identity check, moves it aside as a wreck
+    and deletes it, so a process already holding that path reads a different
+    revision. A short digest of the exact, unsanitised identity restores
+    injectivity while the readable half keeps the directory diagnosable."""
     def _safe(text):
         cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(text or "unknown"))
         # A leading dot would hide the entry; "." and ".." would escape it.
         return cleaned.lstrip(".") or "unknown"
+    # NUL separated so ("a", "b_c") and ("a_b", "c") cannot produce one digest.
+    identity = f"{repo or ''}\x00{tag or ''}".encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(identity).hexdigest()[:12]
     return os.path.join(
         LLAMA_CPP_CONVERTER_CACHE_DIR,
-        f"{_safe(str(repo).replace('/', '_'))}@{_safe(tag)}",
+        f"{_safe(str(repo).replace('/', '_'))}@{_safe(tag)}-{digest}",
     )
 
 
@@ -1318,12 +1331,24 @@ def _staged_sources_are_complete(stage_dir):
         if not os.path.exists(os.path.join(stage_dir, member)):
             return False
     converter = os.path.join(stage_dir, "convert_hf_to_gguf.py")
-    if _entrypoint_needs_conversion_package(converter):
+    try:
+        with open(converter, "rb") as f: source = f.read()
+    except OSError:
+        return False
+    if _source_imports_conversion_package(source):
         conversion = os.path.join(stage_dir, "conversion")
         if not (os.path.isfile(os.path.join(conversion, "__init__.py")) and
                 os.path.isfile(os.path.join(conversion, "base.py"))):
             return False
-    return True
+        return True
+    # No conversion import, so this must be a pre-split monolith carrying its own
+    # model classes. Presence is not enough to conclude that: an entry whose
+    # entrypoint was truncated to nothing, while its manifest and gguf-py survived,
+    # also has no conversion import, and accepting it makes the damage PERMANENT.
+    # It stays a cache hit on every later export, so the patcher fails reading
+    # architectures out of it forever and staging is never asked to replace it.
+    text_archs, vision_archs = _extract_archs_from_monolith_source(source)
+    return bool(text_archs or vision_archs)
 
 
 def _read_converter_stage_manifest(stage_dir):

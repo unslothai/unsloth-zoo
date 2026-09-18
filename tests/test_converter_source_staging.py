@@ -1135,17 +1135,16 @@ def test_a_stage_from_another_repo_is_not_a_cache_hit(tmp_path):
 
 
 def test_two_tags_that_sanitise_alike_do_not_serve_each_others_sources(tmp_path, monkeypatch):
-    """`v/a` and `v_a` name the same directory. The identity check is what stops the
-    second one being handed the first one's tree."""
+    """Belt and braces. The directory digest already keeps these apart, so this pins
+    the second line of defence: even handed the wrong directory, the manifest
+    comparison refuses to serve one revision's sources under another's name."""
     llama_cpp = _load_llama_cpp_module()
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
     a = llama_cpp._converter_stage_dir("ggml-org/llama.cpp", "v/a")
-    b = llama_cpp._converter_stage_dir("ggml-org/llama.cpp", "v_a")
-    assert a == b, "precondition: these tags collide"
     os.makedirs(a, exist_ok = True)
     _complete_stage(a, package = True, repo = "ggml-org/llama.cpp", tag = "v/a")
     assert llama_cpp._converter_stage_is_usable(a, repo = "ggml-org/llama.cpp", tag = "v/a") is True
-    assert llama_cpp._converter_stage_is_usable(b, repo = "ggml-org/llama.cpp", tag = "v_a") is False
+    assert llama_cpp._converter_stage_is_usable(a, repo = "ggml-org/llama.cpp", tag = "v_a") is False
 
 
 def test_publishing_onto_a_directory_that_appeared_does_not_nest_the_tree(mod, staging_env, monkeypatch):
@@ -1358,3 +1357,62 @@ def test_an_empty_converter_file_is_not_offered_either(mod, tmp_path, monkeypatc
     (install / "convert_hf_to_gguf.py").write_bytes(b"")
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(install))
     assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_two_tags_that_sanitise_alike_get_different_directories(mod, tmp_path, monkeypatch):
+    """Sanitising is not injective: `feature/foo` and `feature_foo` both clean to
+    `feature_foo`. Comparing the manifest stops the wrong sources being SERVED, but
+    the two revisions still contend for one directory, and the loser is overwritten
+    rather than merely rejected."""
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    a = mod._converter_stage_dir("ggml-org/llama.cpp", "feature/foo")
+    b = mod._converter_stage_dir("ggml-org/llama.cpp", "feature_foo")
+    assert a != b
+    # The readable half survives so the directory is still diagnosable.
+    assert "feature_foo" in os.path.basename(a)
+    # Stable across calls, and the repo is part of the identity.
+    assert a == mod._converter_stage_dir("ggml-org/llama.cpp", "feature/foo")
+    assert a != mod._converter_stage_dir("unslothai/llama.cpp", "feature/foo")
+    # The split point cannot be forged by moving characters across it.
+    assert mod._converter_stage_dir("a", "b_c") != mod._converter_stage_dir("a_b", "c")
+
+
+def test_one_revision_never_overwrites_another_revisions_live_tree(mod, staging_env, monkeypatch):
+    """The harm the collision caused, driven end to end: a published tree for one tag
+    failed the other tag's identity check, was moved aside as a wreck and deleted,
+    so a process already holding that path read a different revision."""
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "feature/foo")
+    staging_env["entrypoint"] = _MONOLITH_ENTRYPOINT
+    staging_env["conversion"] = False
+    first = mod._stage_converter_sources("feature/foo")
+    assert first is not None
+    assert mod._converter_stage_is_usable(first, repo = "ggml-org/llama.cpp", tag = "feature/foo")
+
+    second = mod._stage_converter_sources("feature_foo")
+    assert second is not None and second != first
+    assert mod._converter_stage_is_usable(first, repo = "ggml-org/llama.cpp", tag = "feature/foo"), \
+        "staging the colliding tag destroyed the first revision's live tree"
+    assert mod._converter_stage_is_usable(second, repo = "ggml-org/llama.cpp", tag = "feature_foo")
+
+
+def test_a_truncated_cached_converter_is_not_a_cache_hit(mod, staging_env):
+    """An entry whose entrypoint was truncated while its manifest and gguf-py
+    survived has no conversion import either, so presence alone accepted it as a
+    complete monolith. That makes the damage permanent: it stays a cache hit on
+    every later export and staging is never asked to replace it."""
+    staging_env["entrypoint"] = _MONOLITH_ENTRYPOINT
+    staging_env["conversion"] = False
+    stage = mod._stage_converter_sources("b9000")
+    assert mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+
+    Path(stage, "convert_hf_to_gguf.py").write_bytes(b"")
+    assert not mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+
+    Path(stage, "convert_hf_to_gguf.py").write_bytes(b"import sys\n# truncated\n")
+    assert not mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+
+    # A staged package-layout entry is judged by its package, not by registrations.
+    staging_env["entrypoint"] = _SHIM_ENTRYPOINT
+    staging_env["conversion"] = True
+    pkg = mod._stage_converter_sources("b9500")
+    assert mod._converter_stage_is_usable(pkg, repo = "ggml-org/llama.cpp", tag = "b9500")
