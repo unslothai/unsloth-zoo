@@ -67,6 +67,14 @@ MLX_VLM_0_6_5_TRANSFORMERS_FLOOR = Version("5.14.0")
 TESTED_TORCH = Version("2.14.0")
 TORCH_BOUND = "<2.15.0"
 
+# The transformers floor both halves must declare. peft declares no transformers floor of
+# its own, and peft 0.18.0 imports `GradientCheckpointingLayer` from
+# `transformers.modeling_layers` at peft/tuners/lora/model.py:26, which first exists in
+# 4.52.0; at 4.51.3 `import unsloth_zoo.saving_utils` raised ModuleNotFoundError after a
+# resolve that satisfied every declared constraint. 4.52.4 and not 4.52.0 because
+# 4.52.0 through 4.52.3 were already rejected by name.
+DECLARED_FLOOR = Version("4.52.4")
+
 # Tested and rejected. A rewrite of the specifier must not drop one.
 REJECTED = (
     "4.52.0", "4.52.1", "4.52.2", "4.52.3", "4.53.0", "4.54.0",
@@ -521,7 +529,7 @@ def test_the_ci_sentinel_refuses_two_different_off_darwin_specs(tmp_path) -> Non
 def test_the_checker_rejects_the_window_that_shipped_the_defect() -> None:
     """Negative control. Every assertion above is a "nothing found" or "equals" shape, and
     a checker that has stopped checking reports the same thing."""
-    shipped = SpecifierSet("".join(f"!={v}," for v in REJECTED) + ">=4.51.3,<=5.5.0")
+    shipped = SpecifierSet("".join(f"!={v}," for v in REJECTED) + f">={DECLARED_FLOOR},<=5.5.0")
     assert "5.5.0" in shipped
     assert "5.17.0" not in shipped
     assert Version("2.14.0") not in SpecifierSet(">=2.4.0,<2.13.0")
@@ -584,3 +592,33 @@ def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_rele
     assert TESTED_TORCH in widened, "the premise: an admission-only check cannot see this"
     assert _ceiling(widened) != _ceiling(SpecifierSet(TORCH_BOUND))
     assert _ceiling(SpecifierSet(f">=2.4.0,{TORCH_BOUND}")) == _ceiling(SpecifierSet(TORCH_BOUND))
+
+
+def test_both_halves_declare_the_floor_that_peft_needs() -> None:
+    """The ceiling is pinned by several assertions above; the floor was pinned by none.
+
+    That asymmetry is not hypothetical. This branch was cut before the floor moved and
+    carried `>=4.51.3` onto a main that had already gone to 4.52.4, so the marker split
+    would have shipped a REGRESSION of the floor while every ceiling assertion stayed
+    green. `test_the_two_halves_differ_only_in_their_ceiling` does not catch it either: it
+    only requires the two halves to agree with EACH OTHER, and a stale floor is equally
+    stale on both.
+    """
+    lists = _transformers_lists()
+    assert lists, "no requirement list names transformers"
+    wrong = {}
+    for where, reqs in lists.items():
+        for req in reqs:
+            floors = [
+                Version(str(spec.version))
+                for spec in req.specifier
+                if spec.operator in (">=", "==", "~=")
+            ]
+            assert floors, f"{where}: transformers requirement {req} declares no floor"
+            if max(floors) != DECLARED_FLOOR:
+                wrong[f"{where}: {req}"] = str(max(floors))
+    assert not wrong, (
+        f"these transformers requirements do not declare the {DECLARED_FLOOR} floor "
+        f"peft 0.18.0 needs: {wrong}. A floor below 4.52.0 resolves cleanly and then "
+        f"fails at import with ModuleNotFoundError: transformers.modeling_layers."
+    )

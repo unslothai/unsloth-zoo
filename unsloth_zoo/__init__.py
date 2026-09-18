@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.9.3"
+__version__ = "2026.9.5"
 
 import os
 import platform
@@ -281,8 +281,15 @@ if not _SKIP_GPU_INIT:
     # expandable_segments is unsupported on Windows/WSL.
     IS_WSL_OR_WINDOWS = bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or os.name == "nt"
 
+    # Nor on an NVIDIA Tegra board, where the CUDA VMM calls it is built on fail: a 1MiB
+    # buffer dies with `RuntimeError: CUDA driver error: out of memory` on a board with 50GB
+    # free (unslothai/unsloth#2401). Detection is filesystem only because this runs before
+    # torch is imported; see unsloth_zoo/integrated_device.py.
+    from .integrated_device import expandable_segments_unsupported
+    EXPANDABLE_SEGMENTS_UNSUPPORTED = expandable_segments_unsupported()
+
     # Reduce VRAM fragmentation and optimize memory pinning
-    if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
+    if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0" and not EXPANDABLE_SEGMENTS_UNSUPPORTED:
         if IS_TORCH_2_10_OR_NEWER:
             if "PYTORCH_ALLOC_CONF" not in os.environ:
                 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -357,6 +364,14 @@ if not _SKIP_GPU_INIT:
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
+    # IMPORTANT: same ordering rule as the ROCm cleanup below. Adds nothing back, unlike the
+    # WSL branch: a unified-memory board has no separate VRAM pool to defragment, and rounding
+    # every block up would waste the system RAM the model is competing for.
+    if EXPANDABLE_SEGMENTS_UNSUPPORTED:
+        remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_ALLOC_CONF")
+
     # IMPORTANT: run ROCm cleanup before importing device_type (which imports torch).
     # HIP allocator settings can be read during torch initialization.
     if IS_TORCH_ROCM_BUILD:
@@ -397,8 +412,12 @@ if not _SKIP_GPU_INIT:
             promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
             if promoted is None:
                 promoted = _ORIGINAL_PYTORCH_HIP_ALLOC_CONF
-            # Keep standby + ROCm protections when promoting legacy values.
-            if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1" or IS_TORCH_ROCM_BUILD:
+            # Keep standby + ROCm + Tegra protections when promoting legacy values.
+            if (
+                os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1"
+                or IS_TORCH_ROCM_BUILD
+                or EXPANDABLE_SEGMENTS_UNSUPPORTED
+            ):
                 promoted = clean_expandable_segments_value(promoted)
             if promoted is not None:
                 os.environ["PYTORCH_ALLOC_CONF"] = promoted
@@ -503,6 +522,7 @@ if not _SKIP_GPU_INIT:
         del _torch, _rocm_arch, _sys, _user_blas, _user_wants_lt
     del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_10_OR_NEWER, IS_WSL_OR_WINDOWS, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
     del clean_expandable_segments_value
+    del expandable_segments_unsupported, EXPANDABLE_SEGMENTS_UNSUPPORTED
     del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
     if not ("UNSLOTH_IS_PRESENT" in os.environ):

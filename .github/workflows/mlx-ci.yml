@@ -107,7 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # mlx-vlm is upgraded past its `<0.7.0` ceiling too. The ceiling exists
+        # mlx-vlm is upgraded past its `<=0.7.1` ceiling too. The ceiling exists
         # because the current mlx-vlm wants transformers>=5.14.0 against the
         # darwin + arm64 half of this repo's transformers cap, which stays at
         # <=5.5.0 for exactly that reason while the other half is now <=5.17.0.

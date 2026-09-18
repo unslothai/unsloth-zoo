@@ -263,7 +263,9 @@ jobs:
         # use_cache disable/restore contract for gradient checkpointing
         # (#715). test_hf_xet_fallback exercises the Xet->HTTP stall fallback
         # + cache-completeness gate (CPU-pure; collect-only would let it
-        # regress silently). test_train_on_responses_list_labels pins the
+        # regress silently), and test_hf_xet_fallback_blob_scoped_redownload
+        # pins that the same transition clears the blob at fault instead of
+        # every completed shard (#9094). test_train_on_responses_list_labels pins the
         # tensor-vs-list labels contract for response masking (stub tokenizer,
         # no weights). The preference suite pins token boundaries, scheduling,
         # objective normalization, and reference lifecycle without model weights.
@@ -282,6 +284,17 @@ jobs:
         # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
         # neither was executed by any job before.
         #
+        # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
+        # the forward of a stacked-expert family Unsloth has no forward for, which is
+        # what stops an adapter that looks healthy in named_parameters from having no
+        # effect on the output. It belongs in a gate and not in collect-only because
+        # half of it is a fullgraph torch.compile of the fold that replaces PEFT's
+        # parametrization, and that fold is version-sensitive: the first version of it
+        # removed a shadowing entry with `experts_module.__dict__.pop`, which Dynamo
+        # refuses to trace on the torch floor this job installs (>=2.4, <2.11) while
+        # tracing it fine on 2.13. Collecting the file proves only that it imports, so
+        # the compile error was invisible on every check.
+        #
         # The seven base-model-source files are here for the same reason. They pin
         # that an unreachable Hub is never reported as a missing or unquantized
         # model, which is what stops save_pretrained_merged from writing nothing
@@ -298,6 +311,10 @@ jobs:
         # raising requires-python relaxes it rather than making it lie.
         # test_wheel_top_level_packages pins that discovery ships unsloth_zoo and
         # nothing else; collect-only would let the packaging config regress.
+        # test_safe_serialization_none pins that `safe_serialization = None` means the
+        # safetensors default rather than a pickle, and carries a drift gate over the whole
+        # package for any future save entry point that forwards the argument unnormalised.
+        # CPU-pure and stdlib-only, so it belongs in a gate rather than in collect-only.
         #
         # test_disabled_hook_checkpoint_guard pins the disabled-hook arm of the
         # eager fallback: still falls back on a first-call refusal, ends the step
@@ -308,9 +325,12 @@ jobs:
         # shipped broken for the same reason this comment keeps repeating -- the
         # file was in NO job, so `--collect-only` proved only that it imports while
         # the count double-removed every document boundary a collator had already
-        # masked, inflating loss and every gradient. `.[core]` resolves trl 0.24.0
-        # here, which masks labels[position_ids == 0] (trl added that in 0.23.1),
-        # so this job exercises the regressed regime on every pull request.
+        # masked, inflating loss and every gradient. `.[core]` resolves a trl that
+        # masks the document boundary itself (trl added that in 0.23.1 and every
+        # release since keeps it), so this job exercises the regressed regime on
+        # every pull request. Stated as the mechanism rather than as a version
+        # number, because the number moves with the cap and a stale one here reads
+        # like a guarantee that the lane no longer provides.
         #
         # test_hip_bf16_offload_dtype pins that the HIP branch ASKS whether bf16 is
         # supported rather than hardcoding True, which is what kills an RDNA 1/2 card
@@ -341,6 +361,13 @@ jobs:
         # request. Collecting the drift file here proves it still imports under
         # a plain root, and the sweep is a stdlib-only grep that refuses the
         # pattern anywhere in the suite.
+        # The two vision URL files gate the SSRF guard for dataset-supplied media
+        # URLs: the static bypass forms and, in the rebinding file, that the fetch
+        # connects to the address the guard actually validated. Neither was executed
+        # by any job before, so the guard could regress while CI stayed green.
+        # test_compiled_cache_fail_closed pins that the compiled cache refuses bytes
+        # it did not generate, bytecode included: the digest covers the .py, so the
+        # pyc has to be dropped before every verified import.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -348,6 +375,7 @@ jobs:
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
             tests/test_hf_xet_fallback.py \
+            tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
             tests/test_llama_cpp_consent_platforms.py \
             tests/test_get_transformers_model_type_empty.py \
@@ -372,11 +400,15 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_moe_stacked_expert_lora_reaches_forward.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
             tests/test_gc_rewriter_bound_keywords.py \
             tests/test_wheel_top_level_packages.py \
+            tests/test_vision_url_ssrf_guard.py \
+            tests/test_vision_url_dns_rebinding.py \
+            tests/test_compiled_cache_fail_closed.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
@@ -391,6 +423,7 @@ jobs:
             tests/test_compiled_cache_collective.py \
             tests/test_compiled_cache_collective_gloo.py \
             tests/test_undefined_name_gate.py \
+            tests/test_safe_serialization_none.py \
             tests/test_published_version_window.py \
             -v
 
@@ -414,6 +447,9 @@ jobs:
           python -m pytest tests/test_mlx_save_export_regressions.py -v
           python -m pytest tests/test_mlx_save_export_edge_cases.py -v
           python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
+
+      - name: Token initialization regressions
+        run: python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
 
       - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
         # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
@@ -519,10 +555,12 @@ jobs:
           #
           # Both bounds are repeated here because pyproject's mlx-vlm ceiling and the
           # 5.5.0 half of its transformers cap are marker-gated to darwin + arm64 and so
-          # constrain nothing on this Linux lane. Without <0.7.0 the lane resolved
-          # mlx-vlm 0.7.0, a combination pyproject forbids; without <=5.5.0 it follows
-          # the off-darwin cap to 0.6.17 and stops measuring the Apple Silicon stack.
-          # tests/mlx_simulation models the 0.6.4 surface, so 0.6.4 is deliberate.
+          # constrain nothing on this Linux lane. The mlx-vlm bound mirrors pyproject's
+          # <=0.7.1; without it the lane resolved 0.7.0, a combination pyproject forbids.
+          # transformers<=5.5.0 is what holds the resolution at mlx-vlm 0.6.4 (0.6.5+
+          # wants transformers>=5.14.0); without it the lane follows the off-darwin cap
+          # and stops measuring the Apple Silicon stack. tests/mlx_simulation models the
+          # 0.6.4 surface.
           (
             rc=0
             {
@@ -531,7 +569,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] "transformers<=5.5.0" \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<0.7.0" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.1" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
@@ -994,6 +1032,10 @@ jobs:
                 # it ever reaches the UNSLOTH_IS_PRESENT check. The probe therefore
                 # sets UNSLOTH_ZOO_DISABLE_GPU_INIT so a failed optional checkout
                 # cannot turn these lanes red.
+                # test_merge_e2e_partial_refusal is here for the same reason: the bridge
+                # to a composite model's on-disk weights is a class attribute in
+                # transformers 4 and a registry in 5, and losing it merges nothing
+                # silently, so one pinned version cannot show the merge finds it.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -1018,6 +1060,7 @@ jobs:
                   tests/test_transformers_moe_structure_drift.py \
                   tests/test_moe_merge_e2e_cpu.py \
                   tests/test_merge_e2e_hub_unreachable.py \
+                  tests/test_merge_e2e_partial_refusal.py \
                   tests/test_gemma4_dtype_drift_guards.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else
