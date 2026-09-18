@@ -3178,22 +3178,20 @@ def merge_and_overwrite_lora(
                         index_data = json.load(f)
                         # Extract file names from the index if available
                         if "weight_map" in index_data:
-                            # Keep only the last component, as the three sibling listings
-                            # do (`os.listdir` above, the Hub listing and the stale-shard
-                            # filter below). These values are joined onto both `model_name`
-                            # and `save_directory` and then copied, so `../../x` wrote
-                            # outside the directory the user asked to export to. A nested
-                            # name is collapsed rather than preserved: nothing downstream
-                            # creates its parent directory, so the copy raised
-                            # FileNotFoundError anyway. `.` and `..` survive a split and
-                            # still escape, so they are dropped.
+                            # Drop every name that does not stay inside the directory it is
+                            # joined onto, and keep the rest exactly as written. These values
+                            # reach both `os.path.join(model_name, name)` and
+                            # `os.path.join(save_directory, name)` and are then copied and
+                            # opened, so `../../x` wrote outside the directory the user asked
+                            # to export to. Filtering is what closes that, not flattening: a
+                            # contained nested name like `weights/model-00001-of-00002` is a
+                            # real file, and rewriting it to its basename points size
+                            # discovery and the merge at a path that does not exist. The same
+                            # predicate backs `_reject_unsafe_shard_index` below, so the list
+                            # and the index we vouch for agree on what is contained.
                             indexed_files = {
-                                _name for _name in (
-                                    os.path.split(v)[-1]
-                                    for v in index_data["weight_map"].values()
-                                    if isinstance(v, str)
-                                )
-                                if _name and _name not in (os.curdir, os.pardir)
+                                _name for _name in index_data["weight_map"].values()
+                                if _shard_name_stays_inside(_name)
                             }
                             # Only use these if we didn't find files directly
                             if not safetensors_list:
@@ -3588,6 +3586,11 @@ def merge_and_overwrite_lora(
         if is_local_path and not os.path.exists(file_path):
             local_file_path = os.path.join(model_name, filename)
             if os.path.exists(local_file_path):
+                # A shard the index names inside a subdirectory has no parent here yet:
+                # nothing before this point creates anything below `save_directory`, so
+                # `copy2` would raise FileNotFoundError. The name is already known to stay
+                # inside `save_directory`, so creating its parent cannot reach outside.
+                os.makedirs(os.path.dirname(file_path), exist_ok = True)
                 shutil.copy2(local_file_path, file_path)
                 print(f"Copied {filename} from local model directory")
 

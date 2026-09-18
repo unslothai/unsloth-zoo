@@ -47,6 +47,7 @@ import pathlib
 import shutil
 
 import pytest
+import torch
 
 import _merge_e2e_helpers as H
 from unsloth_zoo import saving_utils
@@ -289,57 +290,184 @@ def test_an_absolute_entry_cannot_overwrite_an_existing_file_outside_the_output(
         )
 
 
-def test_a_nested_shard_name_is_collapsed_to_its_last_component(monkeypatch, tmp_path):
-    """A nested value is collapsed, not preserved.
+def _nested_layout(tmp_path, subdirectories):
+    """A local model directory whose only shards live in subdirectories.
 
-    Nothing downstream creates the parent directory: the shard loop does
-    `shutil.copy2(..., os.path.join(save_directory, "weights/x.safetensors"))`, so
-    preserving the name only bought a FileNotFoundError. Collapsing matches the
-    three sibling listings in the same function and keeps a directory component
-    away from both join sites.
+    The index names them the way they are laid out, e.g. `weights/model-....safetensors`.
+    Such a name is contained: it resolves under the directory it is joined onto, so it
+    is not the traversal this file guards against, and it has to keep working. The
+    merge reaches this shape through the same shadowing route as the hostile cases,
+    because there is no top level `.safetensors` for `os.listdir` to find.
+
+    `subdirectories` is one name per shard, so passing the same shard count with two
+    different directories puts two shards under two parents.
+    """
+    from safetensors import safe_open
+
+    real_base = os.path.join(str(tmp_path), "real_base")
+    shards = sorted(f for f in os.listdir(real_base) if f.endswith(".safetensors"))
+    assert shards, "the base model produced no safetensors"
+
+    nested_root = os.path.join(str(tmp_path), "ns", "base")
+    os.makedirs(nested_root, exist_ok = True)
+    shutil.copy2(
+        os.path.join(real_base, "config.json"), os.path.join(nested_root, "config.json"),
+    )
+
+    weight_map = {}
+    total_size = 0
+    for index, shard in enumerate(shards):
+        directory = subdirectories[index % len(subdirectories)]
+        # Posix separators, which is what a real index carries on every platform.
+        relative = f"{directory}/{shard}"
+        destination = os.path.join(nested_root, directory, shard)
+        os.makedirs(os.path.dirname(destination), exist_ok = True)
+        shutil.copy2(os.path.join(real_base, shard), destination)
+        total_size += os.path.getsize(destination)
+        with safe_open(destination, framework = "pt") as f:
+            for key in f.keys():
+                weight_map[key] = relative
+
+    with open(
+        os.path.join(nested_root, "model.safetensors.index.json"), "w", encoding = "utf-8",
+    ) as f:
+        json.dump({"metadata" : {"total_size" : total_size}, "weight_map" : weight_map}, f)
+
+    return nested_root, os.path.join("ns", "base"), weight_map
+
+
+def _flattened(directory, into):
+    """Every `.safetensors` under `directory`, copied flat, for the helpers that read
+    a merged output with `os.listdir`."""
+    os.makedirs(into, exist_ok = True)
+    for root, _directories, files in os.walk(directory):
+        for name in files:
+            if name.endswith(".safetensors"):
+                shutil.copy2(os.path.join(root, name), os.path.join(into, name))
+    return into
+
+
+@pytest.mark.parametrize("in_place", [False, True], ids = ["out-of-place", "in-place"])
+def test_a_contained_nested_shard_name_still_merges(monkeypatch, tmp_path, in_place):
+    """A contained nested name is kept, not rewritten, and the merge completes.
+
+    Collapsing such a name to its last component pointed size discovery at
+    `model_name/model-....safetensors`, which does not exist, so an in-place merge of
+    this layout died on the bare `assert(max_size_in_bytes != 0 and ...)` instead of
+    merging. Out of place the shard has to be staged under a parent that nothing had
+    created yet. Both are asserted here against the real merge, with no swallowed
+    exception: a recorder that runs before the copy proves nothing about the export.
     """
     if not H.family_available(FAMILY):
         pytest.skip(f"{FAMILY} unavailable in this transformers")
     H.set_offline_cpu_env()
 
     spec = H.make_spec(FAMILY)
-    model = H.build_and_save_base(spec, os.path.join(str(tmp_path), "real_base"))
-    peft_model = H.attach_lora(model, spec, "full")
-
-    nested = os.path.join("weights", "model-00001-of-00002.safetensors")
-    base_rel = _shadow_directory(tmp_path, nested)
-
     real_base = os.path.join(str(tmp_path), "real_base")
-    shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
-    planted = os.path.join(str(tmp_path), base_rel, nested)
-    os.makedirs(os.path.dirname(planted), exist_ok = True)
-    shutil.copy2(os.path.join(real_base, shards[0]), planted)
+    model = H.build_and_save_base(spec, real_base)
+    base_tensors = H.read_safetensors_dir(real_base)
+    peft_model = H.attach_lora(model, spec, "full")
+    adapted = H.extract_adapted(peft_model)
+
+    nested_root, base_rel, weight_map = _nested_layout(tmp_path, ["weights"])
+    save_directory = base_rel if in_place else os.path.join("out", "deep", "merged")
 
     monkeypatch.chdir(tmp_path)
     _stub_the_hub(monkeypatch)
     shard_names = _record_shard_names(monkeypatch)
-    destinations = _record_copies(monkeypatch)
 
-    try:
-        saving_utils.merge_and_overwrite_lora(
-            get_model_name  = lambda *a, **k: base_rel,
-            model           = peft_model,
-            tokenizer       = None,
-            save_directory  = os.path.join("out", "deep", "merged"),
-            save_method     = "merged_16bit",
-            push_to_hub     = False,
+    saving_utils.merge_and_overwrite_lora(
+        get_model_name  = lambda *a, **k: base_rel,
+        model           = peft_model,
+        tokenizer       = None,
+        save_directory  = save_directory,
+        save_method     = "merged_16bit",
+        output_dtype    = torch.float32,
+        push_to_hub     = False,
+    )
+
+    # The name reached the merge as written, rather than as its last component.
+    assert set(shard_names) == set(weight_map.values()), (
+        f"the nested names did not survive: {shard_names!r}"
+    )
+
+    output = os.path.join(str(tmp_path), save_directory)
+    for relative in set(weight_map.values()):
+        assert os.path.exists(os.path.join(output, relative)), (
+            f"{relative!r} was never written under {output!r}"
         )
-    except Exception:
-        # A directory whose index names no readable shard cannot merge; the
-        # assertions below are about what the name became, not about success.
-        pass
 
-    assert nested not in shard_names, f"the nested name survived: {shard_names!r}"
-    for name in shard_names:
-        assert os.path.split(name)[-1] == name, f"{name!r} still carries a directory"
-    # And no copy was aimed at a directory the merge never created.
-    for destination in destinations:
-        assert os.path.isdir(os.path.dirname(destination) or os.curdir), destination
+    # And the tensors it wrote are the merge, not a copy of the base.
+    H.assert_merge_correct(
+        family       = FAMILY,
+        base_tensors = base_tensors,
+        out_dir      = _flattened(output, os.path.join(str(tmp_path), "flat")),
+        save_dtype   = torch.float32,
+        adapted      = adapted,
+        base_dir     = real_base,
+    )
+
+
+def test_two_nested_shards_sharing_a_basename_are_not_merged_into_one(
+    monkeypatch, tmp_path,
+):
+    """Collapsing to the last component also loses the difference between two shards.
+
+    `a/x.safetensors` and `b/x.safetensors` are two files; their basename is one name,
+    so a shard list built from basenames holds a single entry and half the tensors are
+    never merged.
+    """
+    if not H.family_available(FAMILY):
+        pytest.skip(f"{FAMILY} unavailable in this transformers")
+    H.set_offline_cpu_env()
+
+    spec = H.make_spec(FAMILY)
+    real_base = os.path.join(str(tmp_path), "real_base")
+    # Small enough shards that the base is written as more than one file.
+    model = H.build_and_save_base(spec, real_base, max_shard_size = "32KB")
+    shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
+    if len(shards) < 2:
+        pytest.skip("the tiny base model did not shard into more than one file")
+    peft_model = H.attach_lora(model, spec, "full")
+
+    # One shard per parent directory, every parent holding the same file name.
+    nested_root = os.path.join(str(tmp_path), "ns", "base")
+    os.makedirs(nested_root, exist_ok = True)
+    shutil.copy2(
+        os.path.join(real_base, "config.json"), os.path.join(nested_root, "config.json"),
+    )
+    from safetensors import safe_open
+    weight_map = {}
+    for index, shard in enumerate(sorted(shards)):
+        relative = f"part{index}/x.safetensors"
+        destination = os.path.join(nested_root, f"part{index}", "x.safetensors")
+        os.makedirs(os.path.dirname(destination), exist_ok = True)
+        shutil.copy2(os.path.join(real_base, shard), destination)
+        with safe_open(destination, framework = "pt") as f:
+            for key in f.keys():
+                weight_map[key] = relative
+    with open(
+        os.path.join(nested_root, "model.safetensors.index.json"), "w", encoding = "utf-8",
+    ) as f:
+        json.dump({"metadata" : {"total_size" : 0}, "weight_map" : weight_map}, f)
+
+    base_rel = os.path.join("ns", "base")
+    monkeypatch.chdir(tmp_path)
+    _stub_the_hub(monkeypatch)
+    shard_names = _record_shard_names(monkeypatch)
+
+    saving_utils.merge_and_overwrite_lora(
+        get_model_name  = lambda *a, **k: base_rel,
+        model           = peft_model,
+        tokenizer       = None,
+        save_directory  = base_rel,
+        save_method     = "merged_16bit",
+        push_to_hub     = False,
+    )
+
+    assert len(set(shard_names)) == len(set(weight_map.values())), (
+        f"{len(set(weight_map.values()))} distinct shards became {set(shard_names)!r}"
+    )
 
 
 @pytest.mark.parametrize("path", ["dequant", "splitting"])
