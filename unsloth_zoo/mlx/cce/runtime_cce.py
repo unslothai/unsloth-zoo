@@ -477,12 +477,12 @@ def _build_dlogits_kernel() -> Callable:
             // before the ignore_index check so wide invalid labels that
             // narrow to ignore_index still get NaN, not zero.
             if (isnan(lse[row])) {
-                d_logits[elem] = 0.0f / 0.0f;
+                d_logits[elem] = static_cast<O>(0.0f / 0.0f);
                 continue;
             }
 
             if (target == ignore_index) {
-                d_logits[elem] = 0.0f;
+                d_logits[elem] = static_cast<O>(0.0f);
                 continue;
             }
 
@@ -499,7 +499,7 @@ def _build_dlogits_kernel() -> Callable:
                 float t = fast::tanh(raw / softcap);
                 grad *= (1.0f - t * t);
             }
-            d_logits[elem] = grad;
+            d_logits[elem] = static_cast<O>(grad);
         }
     """
 
@@ -925,7 +925,7 @@ def make_runtime_cce_loss_fused_finalize(
 
                 if dlogits_kernel is not None:
                     total_threads = (logits.size + n_reads - 1) // n_reads
-                    dlogits_out_dtype = mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype
+                    dlogits_out_dtype = logits.dtype
                     d_logits = dlogits_kernel(
                         inputs=[
                             logits,
@@ -938,6 +938,7 @@ def make_runtime_cce_loss_fused_finalize(
                         ],
                         output_shapes=[logits.shape],
                         output_dtypes=[dlogits_out_dtype],
+                        template=[("O", dlogits_out_dtype)],
                         grid=(total_threads, 1, 1),
                         threadgroup=(256, 1, 1),
                     )[0]
@@ -1037,10 +1038,9 @@ def make_runtime_cce_loss_fused_finalize(
         vocab_size = weight_compute.shape[0]
 
         grad_hidden = mx.zeros_like(hidden_compute)
-        # Accumulate weight gradient in float32 to avoid precision loss with
-        # float16/bfloat16 hidden. Only matters for full fine-tuning (LoRA
-        # freezes the LM head, so this VJP path is never reached).
-        grad_weight = mx.zeros(weight_compute.shape, dtype=mx.float32)
+        # Vocabulary chunks are disjoint; only each GEMM needs fp32 accumulation.
+        grad_weight = mx.zeros(weight_compute.shape, dtype=weight.dtype)
+        hidden_f32 = hidden_compute.astype(mx.float32)
         n_reads = 4
 
         for chunk_idx, v_start in enumerate(chunk_starts_int):
@@ -1064,6 +1064,7 @@ def make_runtime_cce_loss_fused_finalize(
                     ],
                     output_shapes=[logits.shape],
                     output_dtypes=[dlogits_out_dtype],
+                    template=[("O", dlogits_out_dtype)],
                     grid=(total_threads, 1, 1),
                     threadgroup=(256, 1, 1),
                 )[0]
@@ -1085,8 +1086,7 @@ def make_runtime_cce_loss_fused_finalize(
             grad_hidden = grad_hidden + d_logits_compute @ weight_chunk
             # Weight gradient GEMM in float32 for accumulation precision
             d_logits_f32 = d_logits.astype(mx.float32)
-            hidden_f32 = hidden_compute.astype(mx.float32)
-            grad_weight_chunk = d_logits_f32.T @ hidden_f32
+            grad_weight_chunk = (d_logits_f32.T @ hidden_f32).astype(weight.dtype)
             grad_weight = mx.slice_update(
                 grad_weight,
                 grad_weight_chunk,
