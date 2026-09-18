@@ -1469,6 +1469,16 @@ def test_vlm_cce_small_capacity_admission_and_rebuilds():
 def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
     from types import SimpleNamespace
     from unsloth_zoo.mlx.trainer import MLXTrainer
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    # The 256-row capacity is admitted only when it shares vocabulary chunks with
+    # the half capacity, and that limit is derived from _get_memory_budget(), which
+    # is 0.1% of the device's recommended working set. On a 128 GB machine the limit
+    # is 16384 and the assertion below holds; on an 8 GB M1, the hosted Apple Silicon
+    # runner, the budget is 6 MB, the limit is 768, the 1024-row capacity no longer
+    # fits under it and the assertion reads [1024, 1024] == [256, 256]. Pin the budget
+    # so this tests the admission rule rather than how much memory the runner has.
+    monkeypatch.setattr(runtime_cce, "_CHUNK_BUDGET", 128 * 1024 * 1024)
 
     mx.random.seed(412)
     model = _cce_text_model(2053, 64, quantized=quantized)
