@@ -205,6 +205,20 @@ _CONVERTER_STAGE_REQUIRED = (
 )
 
 _OFFLINE_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+_STAGE_DISABLED_VALUES = frozenset({"0", "OFF", "FALSE", "NO"})
+
+
+def _converter_staging_enabled():
+    """Whether the export path may stage co-versioned converter sources.
+
+    UNSLOTH_CONVERTER_STAGE=0 turns staging off entirely and restores the previous
+    behaviour (the lone entrypoint download), without anyone having to edit code.
+    Read at the call rather than at import, for the same reason as
+    _converter_network_allowed. Only the export-time resolver consults this: a
+    prebuilt install still hydrates its own converter, because those sources are
+    part of the install rather than a separate cache."""
+    return os.environ.get("UNSLOTH_CONVERTER_STAGE", "1").strip().upper() \
+        not in _STAGE_DISABLED_VALUES
 
 
 def _converter_network_allowed():
@@ -298,6 +312,44 @@ def _resolve_bundle_convert_script():
         logger.info(
             f"Unsloth: Using bundle convert_hf_to_gguf.py from {candidate} "
             f"(co-versioned with its conversion/ package)"
+        )
+        return (candidate, stat.st_mtime_ns, stat.st_size)
+    return None
+pass
+
+
+def _resolve_monolith_bundle_convert_script():
+    """Last local resolver before the network: an install predating upstream's split,
+    whose converter carries its own model classes and needs no conversion/ package.
+
+    _resolve_bundle_convert_script deliberately refuses these, because a directory
+    with no conversion/ is either a genuine monolith or a package install that lost
+    its package, and it cannot tell which. Reading the entrypoint settles it: no
+    `from conversion import` means the file is self-contained, so it is a complete
+    converter and it is already co-versioned with the binaries beside it.
+
+    Without this row, a pre-split install with a perfectly good converter falls
+    through to staging, which resolves a revision, downloads a source tarball, finds
+    no conversion/ in it and declines, all to end up back at a file that was sitting
+    there the whole time. Checking it here keeps that whole population offline."""
+    bundle_dir = LLAMA_CPP_DEFAULT_DIR
+    if not bundle_dir or not os.path.isdir(bundle_dir):
+        return None
+    for name in LLAMA_CPP_CONVERTER_FILENAMES:
+        candidate = os.path.join(bundle_dir, name)
+        try:
+            if not os.path.isfile(candidate):
+                continue
+            if _entrypoint_needs_conversion_package(candidate):
+                # A package-era entrypoint without its package. Not self-contained,
+                # so staging (or an explicit checkout) has to supply the rest.
+                return None
+            stat = os.stat(candidate)
+        except OSError:
+            continue
+        logger.info(
+            f"Unsloth: Using the installed self-contained convert_hf_to_gguf.py "
+            f"from {candidate}"
         )
         return (candidate, stat.st_mtime_ns, stat.st_size)
     return None
@@ -1234,6 +1286,57 @@ def _converter_stage_is_usable(stage_dir):
     """A cache hit: complete manifest AND every required tree still on disk."""
     return _read_converter_stage_manifest(stage_dir) is not None and \
         _staged_sources_are_complete(stage_dir)
+
+
+def _staged_converter_tag(converter_location):
+    """The llama.cpp tag a converter was staged from, or None when it was not staged
+    (a pinned checkout, a prebuilt bundle, an old monolith, the master entrypoint).
+
+    On a staged tree the patched entrypoint is written beside the sources it imports,
+    so the stage manifest is its sibling. This is the only place the revision is still
+    knowable by the time an architecture is rejected."""
+    if not converter_location:
+        return None
+    try:
+        stage_dir = os.path.dirname(os.path.abspath(converter_location))
+    except (OSError, ValueError):
+        return None
+    manifest = _read_converter_stage_manifest(stage_dir)
+    if manifest is None:
+        return None
+    tag = manifest.get("tag")
+    if not isinstance(tag, str) or not tag.strip():
+        return None
+    return tag.strip()
+
+
+def _unsupported_arch_message(arch, converter_location):
+    """The message for an architecture the converter does not know.
+
+    Converter sources are pinned to the tag of the installed llama.cpp binaries, so
+    an architecture that only exists upstream will not convert until a release cuts.
+    That is a deliberate trade, and it is only acceptable if the person who hits it
+    can see which revision refused them and which knob moves it, so the staged tag
+    and UNSLOTH_LLAMA_CPP_CONVERTER_TAG are both named. An unstaged converter has no
+    tag to report, and gets the message unchanged."""
+    message = (
+        f"Unsloth: llama.cpp GGUF conversion does not yet support "
+        f"converting model types of `{arch}`."
+    )
+    tag = _staged_converter_tag(converter_location)
+    if tag is None:
+        return message
+    return (
+        f"{message}\n"
+        f"The converter, its conversion/ package and its gguf-py all came from "
+        f"llama.cpp `{tag}`, so only the architectures that revision knows can be "
+        f"converted.\n"
+        f"If `{arch}` is supported by a newer llama.cpp, set "
+        f"UNSLOTH_LLAMA_CPP_CONVERTER_TAG to that release tag (for example "
+        f"`UNSLOTH_LLAMA_CPP_CONVERTER_TAG=\"b9999\"`) and export again, or point "
+        f"UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a llama.cpp checkout that has "
+        f"convert_hf_to_gguf.py, conversion/ and gguf-py/ together."
+    )
 
 
 def _extract_converter_sources_into(tag, dest_folder, source_assets = None, archive_dir = None):
@@ -2306,6 +2409,12 @@ def _resolve_staged_convert_script():
 
     None means "could not stage", and the caller falls back to today's single-file
     download rather than failing an export that used to work."""
+    if not _converter_staging_enabled():
+        logger.info(
+            "Unsloth: UNSLOTH_CONVERTER_STAGE is off, so co-versioned converter "
+            "sources will not be staged."
+        )
+        return None
     repo, tag = _resolve_converter_revision(LLAMA_CPP_DEFAULT_DIR)
     if not tag:
         return None
@@ -2332,6 +2441,12 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     local_script_info = _resolve_local_convert_script()
     if local_script_info is None:
         local_script_info = _resolve_bundle_convert_script()
+    if local_script_info is None:
+        # Before reaching for the network: an install predating the split already
+        # has a self-contained converter matching its binaries. Staging would
+        # resolve a revision and download a tarball only to find that revision has
+        # no conversion/ and decline, so answer it here and stay offline.
+        local_script_info = _resolve_monolith_bundle_convert_script()
     if local_script_info is None:
         # Nothing co-versioned on disk. Stage all three trees from one revision
         # rather than downloading the entrypoint alone and pairing it with
@@ -3266,8 +3381,7 @@ def convert_to_gguf(
         arch = config_file["architectures"][0]
         if arch not in supported_types:
             raise NotImplementedError(
-                f"Unsloth: llama.cpp GGUF conversion does not yet support "\
-                f"converting model types of `{arch}`."
+                _unsupported_arch_message(arch, converter_location)
             )
     pass
 

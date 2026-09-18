@@ -16,11 +16,13 @@ a tarball on disk, so the archive handling is real while the transfer is not.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
 import sys
 import tarfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -39,6 +41,26 @@ def _load_llama_cpp_module():
 @pytest.fixture
 def mod():
     return _load_llama_cpp_module()
+
+
+@pytest.fixture(autouse = True)
+def _hermetic(mod, tmp_path, monkeypatch):
+    """Every test starts on a machine with no converter env vars and no llama.cpp.
+
+    LLAMA_CPP_DEFAULT_DIR defaults to ~/.unsloth/llama.cpp, and the resolvers read it
+    at the call, so without this a real install on the developer's box decides what
+    the precedence tests see. Tests that want an install point it somewhere real."""
+    for name in (
+        "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR",
+        "UNSLOTH_LLAMA_CPP_CONVERTER_TAG",
+        "UNSLOTH_CONVERTER_STAGE",
+        "UNSLOTH_LLAMA_TAG",
+        "UNSLOTH_LLAMA_CPP_OFFLINE",
+        "UNSLOTH_OFFLINE",
+        "HF_HUB_OFFLINE",
+    ):
+        monkeypatch.delenv(name, raising = False)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "no_llama_cpp"))
 
 
 # The shim shape upstream ships today: no model classes, imports the package.
@@ -68,6 +90,8 @@ def parse_args():
 """
 
 # A revision predating the split: self-contained, legitimately has no conversion/.
+# Carries the argparse block too, because the patcher refuses a converter it cannot
+# read flags out of, and a pre-split install has to drive it end to end.
 _MONOLITH_ENTRYPOINT = b"""\
 #!/usr/bin/env python3
 import gguf
@@ -76,7 +100,65 @@ import gguf
 @ModelBase.register("LlamaForCausalLM")
 class LlamaModel(TextModel):
     pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Convert a model to GGUF")
+    parser.add_argument("model", type=Path)
+    parser.add_argument("--outfile", type=Path, default=None)
+    parser.add_argument("--outtype", type=str, default="f16")
+    return parser.parse_args()
 """
+
+# conversion/ as upstream ships it, cut down to the three things the patcher looks
+# for: the two arch maps, the metadata line the branding patch anchors on, and a
+# qwen.py that already handles the expert aliases.
+_CONVERSION_INIT = """\
+TEXT_MODEL_MAP = {
+    'LlamaForCausalLM': 'llama',
+    'Qwen3MoeForCausalLM': 'qwen',
+}
+MMPROJ_MODEL_MAP = {
+    'Gemma3ForConditionalGeneration': 'gemma3',
+}
+"""
+
+_CONVERSION_BASE = """\
+import gguf
+
+
+class ModelBase:
+    def set_metadata(self):
+        self.metadata = gguf.Metadata.load(a, b, c)
+        return self.metadata
+"""
+
+_CONVERSION_QWEN = """\
+class Qwen3MoeModel(TextModel):
+    def modify_tensors(self):
+        n_experts = self.find_hparam(["num_local_experts", "num_experts"])
+        return n_experts
+"""
+
+
+def _write_source_tree(root, *, entrypoint = _SHIM_ENTRYPOINT, conversion = True,
+                       gguf_py = True):
+    """Write what a llama.cpp source tarball unpacks to, or an install directory."""
+    root = Path(root)
+    root.mkdir(parents = True, exist_ok = True)
+    (root / "convert_hf_to_gguf.py").write_bytes(entrypoint)
+    if gguf_py:
+        pkg = root / "gguf-py" / "gguf"
+        pkg.mkdir(parents = True, exist_ok = True)
+        (pkg / "__init__.py").write_text("# gguf\n")
+        (pkg / "tensor_mapping.py").write_text("class TensorNameMap:\n    pass\n")
+    if conversion:
+        conv = root / "conversion"
+        conv.mkdir(parents = True, exist_ok = True)
+        (conv / "__init__.py").write_text(_CONVERSION_INIT)
+        (conv / "base.py").write_text(_CONVERSION_BASE)
+        (conv / "qwen.py").write_text(_CONVERSION_QWEN)
+    return root
 
 
 def _build_source_tarball(path, *, entrypoint = _SHIM_ENTRYPOINT, conversion = True,
@@ -84,20 +166,10 @@ def _build_source_tarball(path, *, entrypoint = _SHIM_ENTRYPOINT, conversion = T
     """Write a llama.cpp source tarball nested under llama.cpp-{tag}/, the way
     codeload serves one."""
     root = Path(path).parent / f"_src_{tag}"
-    inner = root / f"llama.cpp-{tag}"
-    (inner).mkdir(parents = True, exist_ok = True)
-    (inner / "convert_hf_to_gguf.py").write_bytes(entrypoint)
-    if gguf_py:
-        pkg = inner / "gguf-py" / "gguf"
-        pkg.mkdir(parents = True, exist_ok = True)
-        (pkg / "__init__.py").write_text("# gguf\n")
-        (pkg / "tensor_mapping.py").write_text("class TensorNameMap:\n    pass\n")
-    if conversion:
-        conv = inner / "conversion"
-        conv.mkdir(parents = True, exist_ok = True)
-        (conv / "__init__.py").write_text("TEXT_MODEL_MAP = {'LlamaForCausalLM': 'llama'}\n")
-        (conv / "base.py").write_text("class ModelBase:\n    pass\n")
-        (conv / "qwen.py").write_text("# qwen\n")
+    inner = _write_source_tree(
+        root / f"llama.cpp-{tag}", entrypoint = entrypoint,
+        conversion = conversion, gguf_py = gguf_py,
+    )
     with tarfile.open(path, "w:gz") as archive:
         archive.add(inner, arcname = f"llama.cpp-{tag}")
     return path
@@ -586,9 +658,12 @@ def test_the_incomplete_error_is_not_wrapped_in_the_generic_one(mod, tmp_path, m
 def test_a_staged_revision_patches_as_a_package(mod, staging_env, tmp_path, monkeypatch):
     """End to end: with nothing co-versioned on disk, the patcher stages all three
     trees and then sees a package layout, so the patched entrypoint lands beside the
-    conversion/ it imports rather than in a directory where it cannot resolve."""
-    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
-    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "empty_install"))
+    conversion/ it imports rather than in a directory where it cannot resolve.
+
+    Also the compatibility claim in full: a staged tree is indistinguishable from a
+    prebuilt bundle, so every existing downstream step lands on it with no special
+    case. Arch extraction reads the staged conversion/__init__.py, the branding patch
+    edits the staged conversion/base.py, and the result still parses."""
     monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
     mod._download_convert_hf_to_gguf_cached.cache_clear()
     try:
@@ -598,5 +673,334 @@ def test_a_staged_revision_patches_as_a_package(mod, staging_env, tmp_path, monk
     stage = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
     assert os.path.dirname(patched_path) == stage
     assert os.path.isfile(os.path.join(stage, "conversion", "__init__.py"))
+    assert os.path.isfile(os.path.join(stage, "gguf-py", "gguf", "__init__.py"))
     # Archs come from the staged conversion/__init__.py, not from an empty scan.
     assert "LlamaForCausalLM" in text_archs
+    assert "Gemma3ForConditionalGeneration" in vision_archs
+    # Branding went into the staged conversion/base.py, not into a bundle elsewhere.
+    assert mod._UNSLOTH_BRANDING_MARKER in Path(stage, "conversion", "base.py").read_bytes()
+    ast.parse(Path(patched_path).read_bytes())
+
+
+def test_the_staged_gguf_py_is_the_one_offered_the_qwen35_mapping(mod, staging_env, monkeypatch):
+    """_patch_tensor_mapping_for_qwen35 is anchored on the converter's own directory,
+    so staging points it at the gguf-py the child will actually import."""
+    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
+    seen = []
+    monkeypatch.setattr(mod, "_patch_tensor_mapping_for_qwen35", lambda d: seen.append(d))
+    mod._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+    finally:
+        mod._download_convert_hf_to_gguf_cached.cache_clear()
+    assert seen == [mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")]
+
+
+def test_two_staged_revisions_do_not_share_one_patcher_cache_entry(mod, staging_env, monkeypatch):
+    """The patcher cache is lru_cache(1) keyed on (path, mtime, size). Two tags live
+    at different paths, so switching tags cannot be served the other one's result."""
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b9000")
+    mod._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        first, _, _ = mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+        monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b9001")
+        second, _, _ = mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+    finally:
+        mod._download_convert_hf_to_gguf_cached.cache_clear()
+    assert first != second
+    assert "b9000" in first and "b9001" in second
+
+
+# --- resolver precedence ------------------------------------------------------
+#
+# UNSLOTH_LLAMA_CPP_SCRIPTS_DIR -> bundle with conversion/ -> installed
+# self-contained monolith -> staged co-versioned sources -> the lone master
+# entrypoint. The first three are offline, and the tests below prove it by making
+# any network call an immediate failure rather than by inspecting logs.
+
+def _no_network(mod, monkeypatch, why):
+    """Turn every route to the network into a test failure."""
+    def _trap(*args, **kwargs):
+        raise AssertionError(why)
+    monkeypatch.setattr(mod, "_download_archive", _trap)
+    monkeypatch.setattr(mod, "_resolve_llama_cpp_release", _trap)
+    monkeypatch.setattr(mod, "_resolve_converter_revision", _trap)
+    monkeypatch.setattr(mod.requests, "get", _trap)
+
+
+def test_a_bundle_with_its_conversion_package_never_reaches_staging(mod, tmp_path, monkeypatch):
+    """A prebuilt bundle is already co-versioned, so nothing new may run."""
+    bundle = _write_source_tree(tmp_path / "bundle")
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    _no_network(mod, monkeypatch, "a co-versioned bundle must not trigger staging")
+    info = mod._resolve_bundle_convert_script()
+    assert info is not None
+    assert Path(info[0]).parent == bundle
+
+
+def test_an_installed_self_contained_converter_is_used_instead_of_a_download(mod, tmp_path, monkeypatch):
+    """A pre-split install has a working converter that matches its binaries. It
+    used to be ignored in favour of a master shim it could never run."""
+    bundle = tmp_path / "old_install"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    info = mod._resolve_monolith_bundle_convert_script()
+    assert info is not None
+    assert Path(info[0]) == bundle / "convert_hf_to_gguf.py"
+
+
+def test_a_shim_with_no_package_beside_it_is_not_offered_as_self_contained(mod, tmp_path, monkeypatch):
+    """The distinction _resolve_bundle_convert_script cannot make on directory
+    contents alone: this entrypoint imports conversion/, so it is half a revision
+    and must not be served as a complete converter."""
+    bundle = tmp_path / "half_install"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_SHIM_ENTRYPOINT)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_the_monolith_resolver_never_shadows_a_real_co_versioned_bundle(mod, tmp_path, monkeypatch):
+    bundle = _write_source_tree(tmp_path / "bundle")
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    assert mod._resolve_bundle_convert_script() is not None
+    assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_an_empty_install_offers_no_self_contained_converter(mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "nothing_here"))
+    assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_an_old_install_patches_its_own_converter_and_touches_no_network(mod, tmp_path, monkeypatch):
+    """Behavioural rather than structural: drive the real entry point on a pre-split
+    install. Without the monolith row this population resolves a revision, downloads
+    a tarball and only then discovers that revision has no conversion/."""
+    bundle = tmp_path / "old_install"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    _no_network(mod, monkeypatch, "an installed self-contained converter must not download")
+    mod._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        patched_path, text_archs, _ = mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+    finally:
+        mod._download_convert_hf_to_gguf_cached.cache_clear()
+    # The registrations came out of the installed monolith, not from an empty scan.
+    assert "LlamaForCausalLM" in text_archs
+    assert Path(patched_path).parent == bundle
+
+
+def test_staging_is_reached_only_when_the_three_local_rows_decline(mod, staging_env, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b9000")
+    assert mod._resolve_local_convert_script() is None
+    assert mod._resolve_bundle_convert_script() is None
+    assert mod._resolve_monolith_bundle_convert_script() is None
+    info = mod._resolve_staged_convert_script()
+    assert info is not None
+    assert Path(info[0]).name == "convert_hf_to_gguf.py"
+    assert staging_env["downloads"] == 1
+
+
+def test_a_machine_with_no_llama_cpp_stages_a_complete_tree(mod, staging_env, monkeypatch):
+    """The population this change exists for: nothing on disk, so what used to happen
+    was a lone shim download. What happens now is a tree that can actually run."""
+    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
+    info = mod._resolve_staged_convert_script()
+    assert info is not None
+    staged_dir = str(Path(info[0]).parent)
+    assert mod._detect_converter_layout(Path(info[0]).read_bytes(), staged_dir) == "package"
+
+
+# --- the staging kill switch --------------------------------------------------
+
+def test_staging_can_be_switched_off(mod, staging_env, monkeypatch):
+    """The escape hatch for anyone the new path surprises: behave exactly as before,
+    with no edit to any file."""
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b9000")
+    monkeypatch.setenv("UNSLOTH_CONVERTER_STAGE", "0")
+    assert mod._resolve_staged_convert_script() is None
+    assert staging_env["downloads"] == 0
+
+
+@pytest.mark.parametrize("value", ["0", "off", "FALSE", "no"])
+def test_every_spelling_of_off_switches_staging_off(mod, monkeypatch, value):
+    monkeypatch.setenv("UNSLOTH_CONVERTER_STAGE", value)
+    assert mod._converter_staging_enabled() is False
+
+
+@pytest.mark.parametrize("value", ["1", "on", "true", "yes", ""])
+def test_anything_else_leaves_staging_on(mod, monkeypatch, value):
+    monkeypatch.setenv("UNSLOTH_CONVERTER_STAGE", value)
+    assert mod._converter_staging_enabled() is True
+
+
+def test_the_staging_switch_is_read_at_the_call_not_at_import(mod, monkeypatch):
+    assert mod._converter_staging_enabled() is True
+    monkeypatch.setenv("UNSLOTH_CONVERTER_STAGE", "0")
+    assert mod._converter_staging_enabled() is False
+    monkeypatch.setenv("UNSLOTH_CONVERTER_STAGE", "1")
+    assert mod._converter_staging_enabled() is True
+
+
+def test_switching_staging_off_does_not_disable_the_prebuilt_hydration(mod, staging_env, tmp_path, monkeypatch):
+    """The switch is about the export-time cache. A prebuilt install still hydrates
+    its own converter, because those sources are part of the install."""
+    monkeypatch.setenv("UNSLOTH_CONVERTER_STAGE", "0")
+    install = tmp_path / "install"
+    install.mkdir()
+    mod._hydrate_converter_sources("b9000", str(install))
+    assert (install / "convert_hf_to_gguf.py").is_file()
+    assert (install / "conversion" / "base.py").is_file()
+    assert (install / "gguf-py" / "gguf" / "__init__.py").is_file()
+
+
+# --- staging robustness that the unit probes do not reach ---------------------
+
+def test_a_failed_stage_for_one_tag_leaves_another_tags_entry_intact(mod, staging_env):
+    good = mod._stage_converter_sources("b9000")
+    assert mod._converter_stage_is_usable(good)
+    staging_env["fail"] = RuntimeError("network died")
+    assert mod._stage_converter_sources("b9999") is None
+    assert mod._converter_stage_is_usable(good)
+
+
+def test_concurrent_stagers_converge_on_one_entry(mod, staging_env):
+    """Two exports racing on the same revision end up with one usable tree, not a
+    half-copied one. Concurrency is handled by the immutable key, not by a lock."""
+    results = []
+    errors = []
+
+    def _run():
+        try:
+            results.append(mod._stage_converter_sources("b9000"))
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target = _run) for _ in range(4)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+
+    assert errors == []
+    assert len(set(results)) == 1, results
+    assert results[0] is not None
+    assert mod._converter_stage_is_usable(results[0])
+
+
+def test_staging_uses_the_fork_source_asset_when_the_release_carries_one(mod, tmp_path, monkeypatch):
+    """Staging must resolve the same URL the prebuilt install would have, so the two
+    paths cannot drift on what a fork "mix" tag means."""
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    seen = []
+
+    def _record(url, dest_path):
+        seen.append(url)
+        raise RuntimeError("stop after URL resolution")
+    monkeypatch.setattr(mod, "_download_archive", _record)
+
+    mod._stage_converter_sources(
+        "b9739-mix-2d6bd50", repo = "unslothai/llama.cpp",
+        source_assets = {"llama.cpp-source-b9739-mix-2d6bd50.tar.gz": "https://fork.invalid/src.tar.gz"},
+    )
+    assert seen[-1] == "https://fork.invalid/src.tar.gz"
+
+    mod._stage_converter_sources("b9739-mix-2d6bd50", repo = "unslothai/llama.cpp")
+    assert seen[-1] == mod.LLAMA_CPP_SOURCE_TARBALL.format(tag = "b9739")
+
+
+def test_a_read_only_pinned_checkout_still_resolves(mod, tmp_path, monkeypatch):
+    """Someone pinning a read-only checkout keeps working: resolution only stats."""
+    checkout = _write_source_tree(tmp_path / "read_only")
+    paths = sorted(checkout.rglob("*"), reverse = True)
+    for path in paths:
+        os.chmod(path, 0o555 if path.is_dir() else 0o444)
+    os.chmod(checkout, 0o555)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(checkout))
+    try:
+        info = mod._resolve_local_convert_script()
+        assert info is not None
+        assert Path(info[0]).parent == checkout
+    finally:
+        os.chmod(checkout, 0o755)
+        for path in paths:
+            os.chmod(path, 0o755 if path.is_dir() else 0o644)
+
+
+# --- the cost of pinning to the installed tag, made self-serviceable ----------
+#
+# Sources are pinned to the revision of the installed binaries, so an architecture
+# that only exists on master will not convert until a release cuts. That is the
+# accepted trade. It is only acceptable if the person who hits it can see which
+# revision refused them and which knob moves it.
+
+def _staged_tree_at(mod, tag, root):
+    """A published stage for `tag` under `root`, without any download."""
+    stage = Path(mod._converter_stage_dir("ggml-org/llama.cpp", tag))
+    _write_source_tree(stage)
+    (stage / mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
+        "schema"    : mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
+        "repo"      : "ggml-org/llama.cpp",
+        "tag"       : tag,
+        "completed" : True,
+    }), encoding = "utf-8")
+    assert mod._converter_stage_is_usable(str(stage))
+    return stage
+
+
+def test_the_staged_tag_is_readable_back_off_a_published_stage(mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    stage = _staged_tree_at(mod, "b9000", tmp_path)
+    assert mod._staged_converter_tag(str(stage / "unsloth_convert_hf_to_gguf.py")) == "b9000"
+
+
+def test_an_unstaged_converter_reports_no_tag(mod, tmp_path):
+    """A pinned checkout, a bundle or an old monolith was never staged, so there is
+    no revision to name and the short message is the honest one."""
+    checkout = _write_source_tree(tmp_path / "checkout")
+    assert mod._staged_converter_tag(str(checkout / "convert_hf_to_gguf.py")) is None
+    assert mod._staged_converter_tag(None) is None
+
+
+def test_an_unsupported_arch_names_the_staged_tag_and_the_escape_hatch(mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    stage = _staged_tree_at(mod, "b9000", tmp_path)
+    message = mod._unsupported_arch_message(
+        "BrandNewForCausalLM", str(stage / "unsloth_convert_hf_to_gguf.py"),
+    )
+    assert "BrandNewForCausalLM" in message
+    assert "b9000" in message
+    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in message
+
+
+def test_an_unsupported_arch_on_an_unstaged_converter_keeps_the_short_message(mod, tmp_path):
+    checkout = _write_source_tree(tmp_path / "checkout")
+    message = mod._unsupported_arch_message(
+        "BrandNewForCausalLM", str(checkout / "convert_hf_to_gguf.py"),
+    )
+    assert message.endswith("converting model types of `BrandNewForCausalLM`.")
+    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" not in message
+
+
+def test_convert_to_gguf_hands_the_user_the_staged_tag_and_the_escape_hatch(mod, tmp_path, monkeypatch):
+    """End to end through the public entry point: the pin cost surfaces where the
+    user meets it, not only in a helper."""
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    stage = _staged_tree_at(mod, "b9000", tmp_path)
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps({"architectures": ["BrandNewForCausalLM"], "num_hidden_layers": 4}),
+        encoding = "utf-8",
+    )
+    with pytest.raises(NotImplementedError) as excinfo:
+        mod.convert_to_gguf(
+            "model", str(model_dir),
+            converter_location = str(stage / "unsloth_convert_hf_to_gguf.py"),
+            supported_text_archs = {"LlamaForCausalLM"},
+            supported_vision_archs = set(),
+        )
+    message = str(excinfo.value)
+    assert "BrandNewForCausalLM" in message
+    assert "b9000" in message
+    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in message
