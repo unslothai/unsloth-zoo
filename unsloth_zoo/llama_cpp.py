@@ -1340,6 +1340,15 @@ def _staged_sources_are_complete(stage_dir):
         if not (os.path.isfile(os.path.join(conversion, "__init__.py")) and
                 os.path.isfile(os.path.join(conversion, "base.py"))):
             return False
+        # The package files being present is not enough. An entrypoint truncated
+        # AFTER its `from conversion import (` line still carries that text, so the
+        # unparseable fallback in _source_imports_conversion_package reads it as
+        # package-based and this branch would accept it on file presence alone. It
+        # then stays a warm-cache hit forever while every export dies parsing it.
+        try:
+            ast.parse(source)
+        except (SyntaxError, ValueError):
+            return False
         return True
     # No conversion import, so this must be a pre-split monolith carrying its own
     # model classes. Presence is not enough to conclude that: an entry whose
@@ -2559,9 +2568,16 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # converter being patched (matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points
     # at a different checkout), not always LLAMA_CPP_DEFAULT_DIR.
     local_script_info = _resolve_local_convert_script()
-    if local_script_info is None:
+    # An explicit revision pin outranks everything discovered on disk, because it is
+    # what the unsupported-architecture message tells people to set. Gating only the
+    # self-contained row below left the hatch inert on the COMMON path: a modern
+    # prebuilt install carries conversion/, so the bundle row answered first and the
+    # requested revision was never reached. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR stays above
+    # the pin, being the more specific explicit answer.
+    _revision_pinned = bool(os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip())
+    if local_script_info is None and not _revision_pinned:
         local_script_info = _resolve_bundle_convert_script()
-    if local_script_info is None and not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip():
+    if local_script_info is None and not _revision_pinned:
         # Before reaching for the network: an install predating the split already
         # has a self-contained converter matching its binaries. Staging would
         # resolve a revision and download a tarball only to find that revision has

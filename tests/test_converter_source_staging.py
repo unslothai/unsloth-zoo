@@ -1416,3 +1416,56 @@ def test_a_truncated_cached_converter_is_not_a_cache_hit(mod, staging_env):
     staging_env["conversion"] = True
     pkg = mod._stage_converter_sources("b9500")
     assert mod._converter_stage_is_usable(pkg, repo = "ggml-org/llama.cpp", tag = "b9500")
+
+
+def test_the_revision_pin_beats_a_modern_bundle_install_too(mod, staging_env, monkeypatch):
+    """The common path. A modern prebuilt install carries conversion/, so the bundle
+    row answered before the pin was ever consulted and the documented escape hatch
+    out of 'this revision does not know your architecture' was inert exactly where
+    most users are."""
+    install = Path(staging_env["cache"]).parent / "bundle"
+    _write_source_tree(install)          # shim + conversion/ + gguf-py, the modern shape
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(install))
+
+    # No pin: the installed bundle answers, offline.
+    mod._download_convert_hf_to_gguf.cache_clear()
+    chosen, _t, _v = mod._download_convert_hf_to_gguf()
+    assert os.path.dirname(chosen) == str(install)
+    assert staging_env["downloads"] == 0
+
+    # Pinned: the named revision is staged instead.
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b9000")
+    mod._download_convert_hf_to_gguf.cache_clear()
+    chosen, _t, _v = mod._download_convert_hf_to_gguf()
+    mod._download_convert_hf_to_gguf.cache_clear()
+    assert os.path.dirname(chosen) == mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    assert staging_env["downloads"] == 1
+
+
+def test_an_explicit_scripts_dir_still_outranks_the_revision_pin(mod, staging_env, monkeypatch, tmp_path):
+    """The pin must not have been promoted above the more specific explicit answer."""
+    pinned_dir = tmp_path / "my-llama.cpp"
+    _write_source_tree(pinned_dir)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(pinned_dir))
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b9000")
+    mod._download_convert_hf_to_gguf.cache_clear()
+    chosen, _t, _v = mod._download_convert_hf_to_gguf()
+    mod._download_convert_hf_to_gguf.cache_clear()
+    assert os.path.dirname(chosen) == str(pinned_dir)
+    assert staging_env["downloads"] == 0
+
+
+def test_a_package_entrypoint_truncated_after_its_import_is_not_a_cache_hit(mod, staging_env):
+    """Truncated AFTER `from conversion import (`, so the text survives and the
+    unparseable fallback still reads it as package-based. Accepting it on the
+    presence of the two conversion files made it a permanent warm-cache hit while
+    every export died parsing it."""
+    stage = mod._stage_converter_sources("b9500")
+    assert mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9500")
+
+    Path(stage, "convert_hf_to_gguf.py").write_bytes(b"from conversion import (\n    ModelBase,\n")
+    assert not mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9500")
+
+    # A valid package entrypoint is still accepted.
+    Path(stage, "convert_hf_to_gguf.py").write_bytes(_SHIM_ENTRYPOINT)
+    assert mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9500")
