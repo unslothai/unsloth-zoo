@@ -3696,7 +3696,10 @@ def merge_and_overwrite_lora(
                 # A shard the index names inside a subdirectory has no parent here yet:
                 # nothing before this point creates anything below `save_directory`, so
                 # `copy2` would raise FileNotFoundError. The name is already known to stay
-                # inside `save_directory`, so creating its parent cannot reach outside.
+                # inside `save_directory` LEXICALLY, which is the same guarantee the rest
+                # of this change makes and no stronger: an existing symlinked component
+                # still resolves wherever it points, the pre-existing gap noted on the PR.
+                # A component later cancelled by `..` is created and left behind empty.
                 os.makedirs(os.path.dirname(file_path), exist_ok = True)
                 shutil.copy2(local_file_path, file_path)
                 print(f"Copied {filename} from local model directory")
