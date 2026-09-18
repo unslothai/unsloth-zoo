@@ -1004,3 +1004,60 @@ def test_convert_to_gguf_hands_the_user_the_staged_tag_and_the_escape_hatch(mod,
     assert "BrandNewForCausalLM" in message
     assert "b9000" in message
     assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in message
+
+
+# ---------------------------------------------------------------------------
+# Which spellings of the conversion import count.
+#
+# Three decisions read this: whether an installed converter is offered as already
+# self-contained, whether a staged tree is missing a tree it needs, and whether a
+# layout is package / monolith / incomplete. A substring test for the one spelling
+# upstream happens to use today reads every other spelling as self-contained, and
+# the child then dies on an import the entrypoint really does make.
+# ---------------------------------------------------------------------------
+
+_CONVERSION_IMPORT_SPELLINGS = (
+    (b"from conversion import ModelBase\n",            True),
+    (b"from conversion import (\n    ModelBase,\n)\n", True),
+    (b"import conversion\n",                           True),
+    (b"import conversion as _c\n",                     True),
+    (b"from conversion.base import ModelBase\n",       True),
+    (b"import conversion.base\n",                      True),
+    (b"class ModelBase:\n    pass\n",                  False),
+    (b"import convert_helpers\n",                      False),
+    (b"# from conversion import ModelBase\n",          False),
+    (b'CONVERSION_DOC = "from conversion import X"\n',  False),
+)
+
+
+@pytest.mark.parametrize("source, imports_it", _CONVERSION_IMPORT_SPELLINGS)
+def test_every_spelling_of_the_conversion_import_is_recognised(source, imports_it):
+    llama_cpp = _load_llama_cpp_module()
+    assert llama_cpp._source_imports_conversion_package(source) is imports_it
+
+
+@pytest.mark.parametrize("source, imports_it", _CONVERSION_IMPORT_SPELLINGS)
+def test_layout_detection_follows_the_same_rule(tmp_path, source, imports_it):
+    """A converter that needs the package and cannot see it is 'incomplete', for
+    every spelling. Reading only `from conversion import` sent the others back to
+    'monolith', which is the exact misdetection this branch exists to remove."""
+    llama_cpp = _load_llama_cpp_module()
+    expected = "incomplete" if imports_it else "monolith"
+    assert llama_cpp._detect_converter_layout(source, str(tmp_path)) == expected
+
+
+def test_an_entrypoint_that_will_not_parse_is_not_called_self_contained(tmp_path):
+    """Unparseable source falls back to the substring rather than to 'no import',
+    because guessing 'self-contained' there serves a converter that cannot run."""
+    llama_cpp = _load_llama_cpp_module()
+    broken = b"from conversion import ModelBase\nthis is not python(\n"
+    assert llama_cpp._source_imports_conversion_package(broken) is True
+
+
+def test_a_shim_using_a_submodule_import_is_not_offered_as_self_contained(tmp_path):
+    """End to end over the resolver: the installed converter imports conversion.base
+    and the package is absent, so it must not be served as a complete monolith."""
+    llama_cpp = _load_llama_cpp_module()
+    converter = tmp_path / "convert_hf_to_gguf.py"
+    converter.write_bytes(b"from conversion.base import ModelBase\n")
+    assert llama_cpp._entrypoint_needs_conversion_package(str(converter)) is True

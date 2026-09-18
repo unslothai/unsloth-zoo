@@ -1233,15 +1233,47 @@ def _converter_source_url(tag, source_assets = None):
     return LLAMA_CPP_SOURCE_TARBALL.format(tag = tag.split("-mix-")[0])
 
 
+def _source_imports_conversion_package(entry_content_bytes):
+    """True iff this converter source imports the conversion/ package, in any spelling.
+
+    Parsed rather than matched on a substring. Upstream writes
+    `from conversion import (...)` today, but `import conversion`,
+    `import conversion as c` and `from conversion.base import ModelBase` all need
+    the package just as much, and a substring test for the one current spelling
+    reads every one of them as self-contained. That verdict is load-bearing in
+    three places: it decides whether an installed converter is offered as already
+    complete, whether a staged tree is missing a tree it needs, and whether a
+    layout is 'package' or 'monolith'. Getting it wrong there hands the child an
+    entrypoint whose own import cannot resolve, which is the failure this staging
+    exists to remove.
+
+    Falls back to the substring on unparseable source so a converter this cannot
+    parse is never silently downgraded to 'monolith'."""
+    try:
+        tree = ast.parse(entry_content_bytes)
+    except (SyntaxError, ValueError):
+        return b"from conversion" in entry_content_bytes or \
+               b"import conversion" in entry_content_bytes
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            # `level` is non-zero for `from . import x`; module is None for that.
+            root = (node.module or "").split(".")[0]
+            if root == "conversion": return True
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "conversion": return True
+    return False
+
+
 def _entrypoint_needs_conversion_package(converter_path):
-    """True iff this revision's entrypoint imports the conversion/ package.
+    """True iff the entrypoint at this path imports the conversion/ package.
 
     Read off the file rather than assumed, because a revision predating upstream's
     split is a self-contained monolith whose staged tree legitimately has no
     conversion/ and must not be rejected as incomplete."""
     try:
         with open(converter_path, "rb") as f:
-            return b"from conversion import" in f.read()
+            return _source_imports_conversion_package(f.read())
     except OSError:
         return False
 
@@ -2204,7 +2236,7 @@ def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
 
     Structural, never by import:
 
-      package    entrypoint contains `from conversion import` AND
+      package    entrypoint imports the conversion/ package, in any spelling, AND
                  conversion/__init__.py + conversion/base.py exist on disk.
       monolith   entrypoint carries the model classes itself (no conversion import).
       incomplete entrypoint imports conversion/ but the package is not on disk.
@@ -2217,7 +2249,7 @@ def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
     patcher can work with, so it is named rather than silently absorbed, and the
     caller stages co-versioned sources instead."""
     try:
-        if b"from conversion import" not in entry_content_bytes:
+        if not _source_imports_conversion_package(entry_content_bytes):
             return "monolith"
         init_py = os.path.join(llama_cpp_dir, "conversion", "__init__.py")
         base_py = os.path.join(llama_cpp_dir, "conversion", "base.py")
