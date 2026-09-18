@@ -30,6 +30,41 @@ import torch
 from unsloth_zoo.patching_utils import verify_and_set_device
 
 
+def _an_accelerator_index_is_constructible() -> bool:
+    """Can `torch.device(<int>)` be built here?
+
+    A bare integer names the index of the DEFAULT ACCELERATOR, so it needs one to exist. A
+    CPU-only wheel has none and raises, and that is what CI installs:
+
+        torch 2.10.0+cpu
+        torch.device(2)       RuntimeError: Cannot access accelerator device when none is available.
+        torch.device("cpu")   cpu
+        torch.device("cuda:3")cuda:3
+
+    Measured on 2.10.0+cpu, not assumed. Note the last line: the STRING spellings construct
+    on any build, which is why only the integer cases below are gated and the "cuda:3" /
+    "xpu:1" ones elsewhere in this file are not. Hiding the GPUs with CUDA_VISIBLE_DEVICES
+    does not reproduce it either, since the wheel still has the backend compiled in.
+
+    `verify_and_set_device` swallows that RuntimeError and publishes nothing, so without this
+    gate the two integer tests failed on every CPU-only runner with an AttributeError about a
+    missing `_per_layer_device`, which named neither the device nor the cause.
+    """
+    try:
+        torch.device(0)
+    except RuntimeError:
+        return False
+    return True
+
+
+_HAS_ACCELERATOR_INDEX = _an_accelerator_index_is_constructible()
+
+_needs_an_accelerator_index = pytest.mark.skipif(
+    not _HAS_ACCELERATOR_INDEX,
+    reason = "torch.device(<int>) names the default accelerator, and this build has none",
+)
+
+
 class _FakeLayer:
     def __init__(self, *devices):
         self._devices = devices
@@ -140,12 +175,44 @@ def test_a_meta_layer_publishes_the_accelerate_execution_device():
     assert layer._per_layer_device == torch.device("cpu")
     assert layer._per_layer_device_index == "cpu"
 
+
+@_needs_an_accelerator_index
+def test_an_integer_execution_device_is_accepted_where_one_can_be_named():
+    """accelerate types `execution_device` as `int | str | torch.device | None`, so the bare
+    index is a real shape to accept and not just a spelling of the string form.
+
+    Split out of the test above rather than dropped: that one now carries only the "cpu"
+    case, which constructs on every build, so the two no longer stand or fall together.
+    """
     layer = _FakeLayer("meta")
     layer._hf_hook = SimpleNamespace(execution_device = 2)
     verify_and_set_device(layer)
 
     assert layer._per_layer_device == torch.device(2)
     assert layer._per_layer_device_index == 2
+
+
+@pytest.mark.skipif(
+    _HAS_ACCELERATOR_INDEX,
+    reason = "this build can name an accelerator index, so the refusal below cannot happen",
+)
+def test_an_integer_execution_device_publishes_nothing_without_an_accelerator():
+    """The other half of the same contract, and the one CI actually runs.
+
+    `torch.device(2)` raises on a CPU-only build, `_execution_device_for_meta_layer` treats
+    that as "this hook names no device I can use" and moves on, and nothing is published.
+    Publishing anything here would be worse: there is no device 2 to send activations to.
+
+    Written because this case had no coverage at all. The integer test above cannot run on a
+    CPU-only runner, so without this one the whole integer path would be silently untested
+    exactly where CI runs it.
+    """
+    layer = _FakeLayer("meta")
+    layer._hf_hook = SimpleNamespace(execution_device = 2)
+    verify_and_set_device(layer)
+
+    assert not hasattr(layer, "_per_layer_device")
+    assert not hasattr(layer, "_per_layer_device_index")
 
 
 @pytest.mark.parametrize("execution_device", [None, "meta", "not-a-device", object()])
@@ -180,17 +247,21 @@ def test_the_non_meta_placements_are_untouched():
 def test_a_chained_hook_is_unwrapped_to_the_alignment_device():
     """`append=True` stores `SequentialHook(old, new)`, which defines no
     `execution_device`, so the outer hook alone answered None and readers fell to device 0."""
+    # "cuda:1" rather than a bare 1: what this test is about is that the SEARCH descends into
+    # the wrapper, and the device spelling is incidental to that. The string constructs on a
+    # CPU-only build where the integer does not, so the test keeps running everywhere instead
+    # of skipping on exactly the runner CI uses. The integer form has its own two tests above.
     outer = SimpleNamespace(
         hooks = (
             SimpleNamespace(),
-            SimpleNamespace(execution_device = 1),
+            SimpleNamespace(execution_device = "cuda:1"),
         )
     )
     layer = _FakeLayer("meta")
     layer._hf_hook = outer
     verify_and_set_device(layer)
 
-    assert layer._per_layer_device == torch.device(1)
+    assert layer._per_layer_device == torch.device("cuda:1")
     assert layer._per_layer_device_index == 1
 
 

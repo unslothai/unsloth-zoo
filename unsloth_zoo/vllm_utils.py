@@ -3653,8 +3653,8 @@ def _is_moe_expert_lora_key(key):
     )
 
 
-def _saved_adapter_expert_lora_keys(save_directory):
-    """Expert adapter keys in a saved PEFT adapter, read from the file on disk.
+def _saved_adapter_lora_keys(save_directory):
+    """Adapter key names in a saved PEFT adapter, read from the file on disk.
 
     `load_lora`'s default is load_tensors=False, which hands vLLM a path instead of
     tensors, so the in-memory state_dict check never sees those adapters. Read the key
@@ -3681,23 +3681,303 @@ def _saved_adapter_expert_lora_keys(save_directory):
             return []
     else:
         return []
-    return [
-        k for k in keys
-        if (".lora_A." in k or ".lora_B." in k) and _is_moe_expert_lora_key(k)
-    ]
+    return [k for k in keys if ".lora_A." in k or ".lora_B." in k]
 
 
-def _raise_moe_expert_lora_unsupported(expert_lora_keys, source):
-    """One message for both branches, so they cannot drift apart."""
+def _saved_adapter_expert_lora_keys(save_directory):
+    """The subset of `_saved_adapter_lora_keys` that sits on stacked MoE expert tensors."""
     # All Unsloth Zoo code licensed under LGPLv3
-    raise NotImplementedError(
-        "Unsloth: fast_inference=True does not support LoRA on MoE expert weights yet "
-        f"({len(expert_lora_keys)} adapter tensors in {source}, e.g. "
-        f"'{sorted(expert_lora_keys)[0]}').\n"
-        "vLLM would silently generate from the base experts while training updates the "
-        "adapters, so rollouts would not match the policy.\n"
-        "Use fast_inference=False, or target only the attention and dense MLP projections."
+    return [k for k in _saved_adapter_lora_keys(save_directory) if _is_moe_expert_lora_key(k)]
+
+
+def _get_vllm_model_runner(model):
+    """vLLM's model runner, or None when it cannot be reached.
+
+    Everything below is a capability check on the engine that is about to serve the
+    adapter, so a model we cannot inspect must stay conservative rather than optimistic.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    llm = getattr(model, "vllm_engine", None)
+    if llm is None: return None
+    try:
+        engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
+        if hasattr(engine, "engine_core"):
+            engine = engine.engine_core.engine_core
+        return engine.model_executor.driver_worker.model_runner
+    except Exception:
+        return None
+pass
+
+
+def _get_vllm_lora_model(model, runner = None):
+    """The live vLLM nn.Module, or None when it cannot be reached."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if runner is None: runner = _get_vllm_model_runner(model)
+    return getattr(runner, "model", None)
+pass
+
+
+def _get_vllm_lora_manager(model, runner = None):
+    """vLLM's LoRAModelManager, whose `.modules` is exactly what activate_adapter walks."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if runner is None: runner = _get_vllm_model_runner(model)
+    try:
+        manager = runner.lora_manager._adapter_manager
+    except Exception:
+        return None
+    return manager if isinstance(getattr(manager, "modules", None), dict) else None
+pass
+
+
+def _vllm_mixed_moe_lora_enabled(model, runner = None, vllm_model = None):
+    """True when this engine forces vLLM's universal 2D expert wrapper, or None if unknown.
+
+    Read this off the LoRA stack, never off the model. `WorkerLoRAManager.__init__` always
+    stores `vllm_config.lora_config` as `self.lora_config`, and `LoRAModelManager.__init__`
+    resolves `is_moe and lora_config.enable_mixed_moe_lora_format` into
+    `_enable_mixed_moe_lora_format`, which is the exact bit `_create_merged_loras_inplace`
+    branches on. `vllm_model.vllm_config` is incidental by comparison: of the classes that
+    set `is_3d_moe_weight = True`, `Qwen3VLMoeForConditionalGeneration` and
+    `InternS1ProForConditionalGeneration` never assign it, so reading the mode there
+    answered "not mixed" for them and let a stacked adapter through into the 2D wrapper.
+    That path is silent: Unsloth's `LoRARequest` never sets `is_3d_lora_weight`, so vLLM
+    takes `_slice_moe_lora_ep` on a 3D adapter instead of `_convert_3d_to_2d_moe_lora`.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if runner is None: runner = _get_vllm_model_runner(model)
+    resolved = getattr(_get_vllm_lora_manager(model, runner), "_enable_mixed_moe_lora_format", None)
+    if isinstance(resolved, bool): return resolved
+    if vllm_model is None: vllm_model = _get_vllm_lora_model(model, runner)
+    for lora_config in (
+        getattr(getattr(runner, "lora_manager", None), "lora_config", None),
+        getattr(getattr(vllm_model, "vllm_config", None), "lora_config", None),
+    ):
+        if lora_config is None: continue
+        return getattr(lora_config, "enable_mixed_moe_lora_format", False) is True
+    return None
+pass
+
+
+def _vllm_lora_target_names(vllm_model, manager = None):
+    """(full module names, bare embedding names) vLLM can bind a LoRA to, or None.
+
+    vLLM's own `check_unexpected_modules` compares the LAST path component only
+    (vllm-project/vllm#34186), which is why an adapter whose parent path is wrong passes
+    it and is then dropped at `activate_adapter`. Gemma 4 is the live example: vLLM's
+    module is `...layers.N.moe.experts` while the checkpoint says `...layers.N.experts`,
+    and vLLM's rename regex is `$`-anchored so it never fires on a LoRA key
+    (vllm-project/vllm#41754). Both end in `experts`, so only a full-name comparison
+    separates them.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if vllm_model is None: return None
+    lora_types = []
+    for module_path, class_name in (
+        ("vllm.lora.layers.base", "BaseLayerWithLoRA"),
+        ("vllm.model_executor.layers.linear", "LinearBase"),
+        ("vllm.model_executor.layers.fused_moe", "MoERunner"),
+    ):
+        try:
+            lora_types.append(getattr(__import__(module_path, fromlist = [class_name]), class_name))
+        except Exception:
+            pass
+    if len(lora_types) == 0: return None
+    lora_types = tuple(lora_types)
+
+    packed = getattr(manager, "packed_modules_mapping", None)
+    if not isinstance(packed, dict):
+        try:
+            from vllm.model_executor.utils import get_packed_modules_mapping
+            packed = get_packed_modules_mapping(vllm_model)
+        except Exception:
+            packed = getattr(type(vllm_model), "packed_modules_mapping", None)
+    if not isinstance(packed, dict): packed = {}
+
+    embedding_names = set()
+    try:
+        named_modules = list(vllm_model.named_modules())
+    except Exception:
+        return None
+    for _, module in named_modules:
+        embedding_modules = getattr(module, "embedding_modules", None)
+        if isinstance(embedding_modules, dict):
+            embedding_names.update(embedding_modules.keys())
+
+    # Prefer the manager's own dict: those are the names activate_adapter looks up, so a
+    # module vLLM declined to wrap is correctly absent from it.
+    raw_names = list(getattr(manager, "modules", {}) or {})
+    if len(raw_names) == 0:
+        raw_names = [name for name, module in named_modules
+                     if name != "" and isinstance(module, lora_types)]
+
+    names = set()
+    for name in raw_names:
+        # Once LoRA is enabled the modules are wrapped, so named_modules reports the
+        # LinearBase at `<module>.base_layer` while adapters name `<module>`.
+        if name.endswith(".base_layer"): name = name[:-len(".base_layer")]
+        names.add(name)
+        # q_proj/k_proj/v_proj are one qkv_proj module in vLLM, so the adapter's own name
+        # never appears in named_modules. Expand the packed mapping back out.
+        parent, _, leaf = name.rpartition(".")
+        for sub in packed.get(leaf, ()):
+            names.add(f"{parent}.{sub}" if parent else sub)
+    if len(names) == 0: return None
+    return names, embedding_names
+pass
+
+
+def _resolve_lora_key_to_module(key, weights_mapper):
+    """The vLLM module name an adapter key binds to, or None when vLLM cannot parse it."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from vllm.lora.utils import parse_fine_tuned_lora_name
+        parsed = parse_fine_tuned_lora_name(key.replace(".default", ""), weights_mapper)
+    except Exception:
+        return None
+    module_name = parsed[0] if isinstance(parsed, tuple) else parsed
+    # PEFT's target_parameters layout stores the gate_up half of an expert pair under
+    # `<experts>.base_layer` and the down half under `<experts>` itself.
+    if module_name.endswith(".base_layer"): module_name = module_name[:-len(".base_layer")]
+    return module_name
+pass
+
+
+def _unmatched_lora_keys(model, keys):
+    """Adapter keys that resolve to a module the live vLLM model does not have.
+
+    None means "cannot tell" (no reachable engine, or an unrecognisable vLLM layout);
+    [] means every key resolved.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    runner = _get_vllm_model_runner(model)
+    vllm_model = _get_vllm_lora_model(model, runner)
+    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    if targets is None: return None
+    module_names, embedding_names = targets
+
+    weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+    if weights_mapper is not None:
+        from .vllm_lora_worker_manager import _drop_stacked_weight_maps
+        weights_mapper = _drop_stacked_weight_maps(weights_mapper)
+
+    unmatched = []
+    for key in keys:
+        module_name = _resolve_lora_key_to_module(key, weights_mapper)
+        # Unparseable is vLLM's error to raise with its own message, not ours to pre-empt.
+        if module_name is None: continue
+        if module_name in module_names: continue
+        if module_name.rsplit(".", 1)[-1] in embedding_names: continue
+        unmatched.append((key, module_name))
+    return unmatched
+pass
+
+
+def _peft_max_rank(peft_config):
+    """The largest rank the adapter uses, counting rank_pattern overrides."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if peft_config is None: return None
+    get = peft_config.get if isinstance(peft_config, dict) else \
+          (lambda k, d = None: getattr(peft_config, k, d))
+    r = get("r", None)
+    if not isinstance(r, int): return None
+    rank_pattern = get("rank_pattern", None)
+    if isinstance(rank_pattern, dict):
+        r = max([r] + [v for v in rank_pattern.values() if isinstance(v, int)])
+    return r
+pass
+
+
+def _is_bitsandbytes_quantized(model):
+    """True for an Unsloth 4bit/8bit (bitsandbytes) model."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+        return True
+    quant_config = getattr(getattr(model, "config", None), "quantization_config", None)
+    if quant_config is None: return False
+    method = getattr(quant_config, "quant_method", None)
+    if method is None and isinstance(quant_config, dict):
+        method = quant_config.get("quant_method", None)
+    return str(getattr(method, "value", method)).lower() == "bitsandbytes"
+pass
+
+
+def _moe_expert_lora_refusal_reason(model, peft_config):
+    """Why vLLM cannot serve a stacked MoE expert adapter here, or None when it can.
+
+    vLLM picks `FusedMoE3DWithLoRA` (which consumes PEFT's target_parameters layout
+    directly, so Unsloth's saved tensors need no conversion) exactly when the model class
+    sets `is_3d_moe_weight` and the engine has not forced the 2D wrapper. Read that flag
+    off the live class rather than comparing vLLM versions: it is the bit vLLM itself
+    branches on, it tracks new architectures automatically, and it catches a caller who
+    patches it off.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    runner = _get_vllm_model_runner(model)
+    vllm_model = _get_vllm_lora_model(model, runner)
+    if vllm_model is None:
+        return "the vLLM model could not be inspected, so 3D MoE LoRA support cannot be confirmed"
+
+    if getattr(type(vllm_model), "is_3d_moe_weight", False) is not True:
+        return (
+            "this architecture does not set is_3d_moe_weight, so vLLM wraps its experts with "
+            "the 2D FusedMoEWithLoRA and drops Unsloth's stacked adapter (vllm-project/vllm#41754)"
+        )
+
+    if _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is True:
+        return "enable_mixed_moe_lora_format forces vLLM's 2D expert wrapper, which cannot read a stacked adapter"
+
+    if _is_bitsandbytes_quantized(model):
+        return "vLLM does not support MoE LoRA on bitsandbytes weights, so load_in_4bit is out"
+
+    r = _peft_max_rank(peft_config)
+    if r is not None and r > 128:
+        return f"r = {r} is above the max_lora_rank <= 128 that vLLM's fused MoE LoRA kernel asserts"
+
+    return None
+pass
+
+
+def _check_lora_is_servable(model, keys, source, peft_config):
+    """Refuse an adapter vLLM would accept and then silently ignore.
+
+    Two checks, in order of how specific their message can be. First: stacked MoE expert
+    keys, which vLLM serves correctly only through `FusedMoE3DWithLoRA`. Second, and the
+    one that generalises: every key must resolve to a module the live engine actually
+    wrapped. `load_lora`'s lora_tensors path reaches vLLM through `from_lora_tensors`,
+    which unlike `from_local_checkpoint` runs no `check_unexpected_modules`, and
+    `activate_adapter` then zeroes unmatched modules at debug level. So without this an
+    adapter can be handed over, accepted, and dropped in silence, and GRPO keeps sampling
+    rollouts from the base weights while the trainer updates the adapter.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    expert_keys = [k for k in keys if _is_moe_expert_lora_key(k)]
+    if len(expert_keys) != 0:
+        reason = _moe_expert_lora_refusal_reason(model, peft_config)
+        if reason is not None:
+            raise NotImplementedError(
+                "Unsloth: fast_inference=True cannot serve this LoRA on MoE expert weights "
+                f"({len(expert_keys)} adapter tensors in {source}, e.g. "
+                f"'{sorted(expert_keys)[0]}') because {reason}.\n"
+                "vLLM would generate from the base experts while training updates the "
+                "adapters, so rollouts would not match the policy.\n"
+                "Use fast_inference=False, or target only the attention and dense MLP projections."
+            )
+    pass
+
+    if os.environ.get("UNSLOTH_DISABLE_LORA_NAME_CHECK", "0") == "1": return
+    unmatched = _unmatched_lora_keys(model, keys)
+    if not unmatched: return
+    examples = "\n".join(f"  {k}  ->  {n}" for k, n in sorted(unmatched)[:5])
+    raise RuntimeError(
+        f"Unsloth: {len(unmatched)} of {len(keys)} LoRA tensors in {source} name modules "
+        "that this vLLM engine does not have, so vLLM would load the adapter and then "
+        f"silently ignore those tensors:\n{examples}\n"
+        "This is usually a checkpoint-name against vLLM-module-name mismatch for the "
+        "architecture (see vllm-project/vllm#34186 and #41754), not a problem with "
+        "training. Use fast_inference=False, or target modules vLLM serves.\n"
+        "Set UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
     )
+pass
 
 
 @torch.inference_mode
@@ -3737,13 +4017,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
-        # Unsloth stacks these over the whole expert tensor; vLLM wants per-expert
-        # w13_weight / w2_weight and converts nothing. The filter above lets them past its
-        # shape validation, so they are accepted and ignored: rollouts come from the BASE
-        # experts while the trainer keeps updating the adapters. Refuse, and say why.
-        _expert_lora_keys = [k for k in state_dict if _is_moe_expert_lora_key(k)]
-        if len(_expert_lora_keys) != 0:
-            _raise_moe_expert_lora_unsupported(_expert_lora_keys, "the training model")
+        _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
@@ -3756,10 +4030,14 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
-        # Same refusal on the path branch: vLLM skips expert keys it cannot place.
-        _expert_lora_keys = _saved_adapter_expert_lora_keys(save_directory)
-        if len(_expert_lora_keys) != 0:
-            _raise_moe_expert_lora_unsupported(_expert_lora_keys, save_directory)
+        # Same checks on the path branch, read off the checkpoint header.
+        _saved_keys = _saved_adapter_lora_keys(save_directory)
+        if len(_saved_keys) != 0:
+            try:
+                _saved_peft_config = get_peft_config(save_directory)
+            except Exception:
+                _saved_peft_config = None
+            _check_lora_is_servable(model, _saved_keys, save_directory, _saved_peft_config)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
     pass
     # vllm_lora_already_loaded(model)

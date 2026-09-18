@@ -2150,26 +2150,28 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
     assert any("eval_loss" in entry for entry in trainer.state.log_history)
 
 
+@pytest.mark.parametrize("use_cce", [False, True])
 def test_the_config_carries_every_objective_field_into_the_run(tmp_path,
-                                                               monkeypatch):
+                                                               monkeypatch, use_cce):
     from unsloth_zoo.mlx import trainer as trainer_module
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     captured = {}
-    for name in ("make_dpo_loss_fn", "make_preference_eval_fn"):
+    factory = "make_dpo_cce_loss_fn" if use_cce else "make_dpo_loss_fn"
+    for name in (factory, "make_preference_eval_fn"):
         build = getattr(trainer_module, name)
         monkeypatch.setattr(trainer_module, name, (
-            lambda objective, build=build, name=name, **kwargs: (
-                captured.setdefault(name, objective),
-                build(objective, **kwargs))[1]))
+            lambda *args, build=build, name=name, **kwargs: (
+                captured.setdefault(name, args[-1]),
+                build(*args, **kwargs))[1]))
     common = _generation_common(
         tmp_path, max_steps=1, eval_steps=1, generate_during_eval=False,
-        reference_free=True, loss_type=["sigmoid", "robust"],
+        use_cce=use_cce, reference_free=True, loss_type=["sigmoid", "robust"],
         loss_weights=[0.25, 0.5], discopop_tau=0.2, label_smoothing=0.2)
     trainer = MLXDPOTrainer(_tiny_model(), Tokenizer(), rows(4),
                             eval_dataset=rows(3), args=MLXDPOConfig(**common))
     _run_generation_trainer(trainer, monkeypatch, [])
-    objective = captured["make_dpo_loss_fn"]
+    objective = captured[factory]
     assert (objective.loss_types, objective.weights) == (
         ("sigmoid", "robust"), (0.25, 0.5))
     assert (objective.discopop_tau, objective.label_smoothing) == (0.2, 0.2)
