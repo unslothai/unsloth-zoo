@@ -1061,3 +1061,157 @@ def test_a_shim_using_a_submodule_import_is_not_offered_as_self_contained(tmp_pa
     converter = tmp_path / "convert_hf_to_gguf.py"
     converter.write_bytes(b"from conversion.base import ModelBase\n")
     assert llama_cpp._entrypoint_needs_conversion_package(str(converter)) is True
+
+
+# ---------------------------------------------------------------------------
+# Cache identity, publication, and where a staged monolith's patched file lands.
+# All four of these were found by driving the staging code rather than reading it.
+# ---------------------------------------------------------------------------
+
+def _complete_stage(root, *, package, repo, tag, schema = None, manifest_repo = None,
+                    manifest_tag = None):
+    """A stage directory that passes every structural check, so the only thing
+    under test is the identity comparison."""
+    import json as _json
+    llama_cpp = _load_llama_cpp_module()
+    os.makedirs(os.path.join(root, "gguf-py", "gguf"), exist_ok = True)
+    open(os.path.join(root, "gguf-py", "gguf", "__init__.py"), "w").close()
+    if package:
+        conv = os.path.join(root, "conversion"); os.makedirs(conv, exist_ok = True)
+        open(os.path.join(conv, "__init__.py"), "w").close()
+        open(os.path.join(conv, "base.py"), "w").close()
+        body = b"from conversion import ModelBase\n"
+    else:
+        body = b"class ModelBase:\n    pass\n"
+    with open(os.path.join(root, "convert_hf_to_gguf.py"), "wb") as f: f.write(body)
+    with open(os.path.join(root, llama_cpp.UNSLOTH_CONVERTER_STAGE_FILENAME), "w") as f:
+        _json.dump({
+            "schema"    : schema if schema is not None else llama_cpp.UNSLOTH_CONVERTER_STAGE_SCHEMA,
+            "repo"      : manifest_repo if manifest_repo is not None else repo,
+            "tag"       : manifest_tag  if manifest_tag  is not None else tag,
+            "completed" : True,
+        }, f)
+    return root
+
+
+def test_a_stage_whose_manifest_names_another_revision_is_not_a_cache_hit(tmp_path):
+    """Both halves of the directory name are sanitised, so distinct tags can collide
+    on one directory. Serving whatever is in it would hand the caller a different
+    revision than it asked for, under a cache hit, with no download to notice."""
+    llama_cpp = _load_llama_cpp_module()
+    stage = _complete_stage(str(tmp_path / "s"), package = True,
+                            repo = "ggml-org/llama.cpp", tag = "b1111",
+                            manifest_tag = "b9999")
+    assert llama_cpp._converter_stage_is_usable(stage) is True
+    assert llama_cpp._converter_stage_is_usable(
+        stage, repo = "ggml-org/llama.cpp", tag = "b1111") is False
+    assert llama_cpp._converter_stage_is_usable(
+        stage, repo = "ggml-org/llama.cpp", tag = "b9999") is True
+
+
+def test_a_stage_from_another_repo_is_not_a_cache_hit(tmp_path):
+    llama_cpp = _load_llama_cpp_module()
+    stage = _complete_stage(str(tmp_path / "s"), package = True,
+                            repo = "ggml-org/llama.cpp", tag = "b1111",
+                            manifest_repo = "someone/else")
+    assert llama_cpp._converter_stage_is_usable(
+        stage, repo = "ggml-org/llama.cpp", tag = "b1111") is False
+
+
+def test_two_tags_that_sanitise_alike_do_not_serve_each_others_sources(tmp_path, monkeypatch):
+    """`v/a` and `v_a` name the same directory. The identity check is what stops the
+    second one being handed the first one's tree."""
+    llama_cpp = _load_llama_cpp_module()
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    a = llama_cpp._converter_stage_dir("ggml-org/llama.cpp", "v/a")
+    b = llama_cpp._converter_stage_dir("ggml-org/llama.cpp", "v_a")
+    assert a == b, "precondition: these tags collide"
+    os.makedirs(a, exist_ok = True)
+    _complete_stage(a, package = True, repo = "ggml-org/llama.cpp", tag = "v/a")
+    assert llama_cpp._converter_stage_is_usable(a, repo = "ggml-org/llama.cpp", tag = "v/a") is True
+    assert llama_cpp._converter_stage_is_usable(b, repo = "ggml-org/llama.cpp", tag = "v_a") is False
+
+
+def test_publishing_onto_a_directory_that_appeared_does_not_nest_the_tree(mod, staging_env, monkeypatch):
+    """Another process publishes while we are downloading, and we still reach the move.
+
+    Two things have to be true to enter that window, and both are arranged here
+    rather than hoped for: the entry probe must miss (so the winner publishes only
+    once our download has started), and the existence check guarding the move must
+    answer False (a one-statement window that no thread can be made to hit
+    reliably, so it is simulated precisely).
+
+    shutil.move onto an EXISTING directory moves the source INSIDE it and raises
+    nothing, so the loser's whole tree would be buried at <stage>/sources/ and would
+    stay there for every later cache hit. os.rename raises instead, which is the
+    signal the loser needs to discard its copy and adopt the published tree."""
+    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    winner_listing = {}
+
+    real_download = mod._download_archive
+
+    def download_then_lose_the_race(url, dest_path):
+        real_download(url, dest_path)
+        # The winner publishes now: after our entry probe missed, before our move.
+        _write_source_tree(stage_dir)
+        Path(stage_dir, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
+            "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
+            "repo": "ggml-org/llama.cpp", "tag": "b9000", "completed": True,
+        }), encoding = "utf-8")
+        winner_listing["files"] = sorted(os.listdir(stage_dir))
+    monkeypatch.setattr(mod, "_download_archive", download_then_lose_the_race)
+
+    real_exists = os.path.exists
+    seen = {"n": 0}
+
+    def exists_lying_on_the_move_guard(path):
+        if os.path.abspath(path) == os.path.abspath(stage_dir):
+            seen["n"] += 1
+            # 1st: the repair check. 2nd: the guard immediately before the move.
+            if seen["n"] == 2: return False
+        return real_exists(path)
+    monkeypatch.setattr(mod.os.path, "exists", exists_lying_on_the_move_guard)
+
+    stage = mod._stage_converter_sources("b9000")
+
+    monkeypatch.undo()
+    assert seen["n"] >= 2, "the move guard was never reached, so this proved nothing"
+    assert winner_listing, "the winner never published, so there was no race"
+    assert stage == stage_dir
+    assert sorted(os.listdir(stage_dir)) == winner_listing["files"], (
+        f"publication nested the loser's tree into the winner's: "
+        f"{sorted(os.listdir(stage_dir))}"
+    )
+    assert not os.path.exists(os.path.join(stage_dir, "sources"))
+
+
+def test_a_staged_monolith_keeps_its_patched_file_beside_its_own_gguf_py(mod, staging_env):
+    """A staged revision predating the split has no conversion/, so its layout is
+    'monolith'. Writing its patched entrypoint to the default install directory
+    would make the entrypoint's own sys.path.insert(1, __file__.parent / 'gguf-py')
+    resolve against the INSTALL's gguf-py instead of the co-versioned tree staged
+    right beside it, which is the revision skew this staging exists to remove."""
+    staging_env["entrypoint"] = _MONOLITH_ENTRYPOINT
+    staging_env["conversion"] = False
+    os.environ["UNSLOTH_LLAMA_CPP_CONVERTER_TAG"] = "b7000"
+    try:
+        mod._download_convert_hf_to_gguf.cache_clear()
+        patched, _text, _vision = mod._download_convert_hf_to_gguf()
+    finally:
+        os.environ.pop("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", None)
+        mod._download_convert_hf_to_gguf.cache_clear()
+
+    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b7000")
+    assert os.path.dirname(patched) == stage_dir, (
+        f"staged monolith patched file landed in {os.path.dirname(patched)}, "
+        f"away from the gguf-py staged with it at {stage_dir}"
+    )
+    assert os.path.isdir(os.path.join(os.path.dirname(patched), "gguf-py")), \
+        "the tree the entrypoint self-locates must be the one staged beside it"
+
+
+def test_a_users_pinned_checkout_is_never_treated_as_our_cache(tmp_path, monkeypatch):
+    """The anchoring rule must not start writing into a directory the user owns."""
+    llama_cpp = _load_llama_cpp_module()
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    assert llama_cpp._is_inside_converter_cache(str(tmp_path / "my-llama.cpp")) is False

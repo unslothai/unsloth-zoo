@@ -1314,10 +1314,36 @@ def _read_converter_stage_manifest(stage_dir):
     return manifest
 
 
-def _converter_stage_is_usable(stage_dir):
-    """A cache hit: complete manifest AND every required tree still on disk."""
-    return _read_converter_stage_manifest(stage_dir) is not None and \
-        _staged_sources_are_complete(stage_dir)
+def _is_inside_converter_cache(directory):
+    """Whether this directory is one of our own staged revisions.
+
+    Read at the call rather than closed over, because tests and
+    UNSLOTH_LLAMA_CPP_CONVERTER_CACHE point the cache root elsewhere."""
+    if not directory: return False
+    try:
+        root = os.path.realpath(LLAMA_CPP_CONVERTER_CACHE_DIR)
+        here = os.path.realpath(directory)
+    except OSError:
+        return False
+    return here == root or here.startswith(root + os.sep)
+
+
+def _converter_stage_is_usable(stage_dir, repo = None, tag = None):
+    """A cache hit: complete manifest, the identity we asked for, AND every
+    required tree still on disk.
+
+    The identity check is not redundant with the directory name. Both halves of
+    that name are sanitised, so distinct revisions can land on one directory: a
+    tag of `v/a` and a tag of `v_a` both become `...@v_a`. Without comparing the
+    manifest we would serve one revision's sources under another revision's name,
+    which is exactly the mixed-revision failure this cache exists to prevent, only
+    now with a cache hit and no download to notice it. A mismatch is a miss, so the
+    entry is re-staged under the identity that was actually requested."""
+    manifest = _read_converter_stage_manifest(stage_dir)
+    if manifest is None: return False
+    if repo is not None and manifest.get("repo") != repo: return False
+    if tag  is not None and manifest.get("tag")  != tag:  return False
+    return _staged_sources_are_complete(stage_dir)
 
 
 def _staged_converter_tag(converter_location):
@@ -1419,7 +1445,7 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
     if not tag:
         return None
     stage_dir = _converter_stage_dir(repo, tag)
-    if _converter_stage_is_usable(stage_dir):
+    if _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
         logger.info(f"Unsloth: Using cached llama.cpp converter sources for {tag} from {stage_dir}")
         return stage_dir
     if not _converter_network_allowed():
@@ -1459,7 +1485,7 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
             os.path.join(staged_sources, UNSLOTH_CONVERTER_STAGE_FILENAME),
             json.dumps(manifest, indent = 2).encode("utf-8"),
         )
-        if os.path.exists(stage_dir) and not _converter_stage_is_usable(stage_dir):
+        if os.path.exists(stage_dir) and not _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
             # A previous attempt died mid-publish, or somebody deleted files out of
             # the entry. Without this the directory exists forever, fails the probe
             # forever, and blocks its own replacement: every export re-downloads and
@@ -1473,15 +1499,22 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
                 pass
         if not os.path.exists(stage_dir):
             try:
-                shutil.move(staged_sources, stage_dir)
-            except (OSError, shutil.Error) as exc:
+                # os.rename, not shutil.move: shutil.move onto an EXISTING directory
+                # moves the source INSIDE it instead of failing, so a process that
+                # published between the check above and this line would leave us with
+                # <stage_dir>/sources/ nested inside its tree, silently, with no
+                # exception to catch. os.rename raises there instead, which is the
+                # signal the loser needs. Same filesystem by construction: `staging`
+                # is created inside the cache root.
+                os.rename(staged_sources, stage_dir)
+            except OSError as exc:
                 # Another process published between the check and the move. Its
                 # tree is the same revision, so take it rather than fight over it.
-                if not _converter_stage_is_usable(stage_dir):
+                if not _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
                     raise RuntimeError(
                         f"Unsloth: Could not publish llama.cpp converter sources for {tag}: {exc}"
                     ) from exc
-        if not _converter_stage_is_usable(stage_dir):
+        if not _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
             raise RuntimeError(
                 f"Unsloth: Published llama.cpp converter sources for {tag} did not validate."
             )
@@ -2742,7 +2775,20 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         # 4. Write Patched File
         # Keep package-layout entrypoints beside conversion/ so subprocess
         # execution resolves `from conversion import ...`.
-        patched_dir = _llama_cpp_dir if _layout == "package" else LLAMA_CPP_DEFAULT_DIR
+        #
+        # A staged MONOLITH needs the same treatment for the other tree. Its layout
+        # is "monolith", so the old rule sent it to LLAMA_CPP_DEFAULT_DIR, and the
+        # entrypoint's own `sys.path.insert(1, __file__.parent / 'gguf-py')` then
+        # resolved against the INSTALL's gguf-py rather than the co-versioned one we
+        # just staged beside it. That is precisely the revision skew this staging
+        # exists to remove, reintroduced for old tags. Anchor anything that came out
+        # of our own cache on its stage, whatever its layout. A converter from the
+        # default dir or from a user's pinned checkout is untouched by this: the
+        # first already resolves to the same directory, and the second must not be
+        # written into.
+        patched_dir = _llama_cpp_dir if (
+            _layout == "package" or _is_inside_converter_cache(_llama_cpp_dir)
+        ) else LLAMA_CPP_DEFAULT_DIR
         os.makedirs(patched_dir, exist_ok=True)
         patched_filename = os.path.join(patched_dir, f"{name}.py")
 
