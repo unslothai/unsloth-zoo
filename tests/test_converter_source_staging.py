@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Tests for co-versioned llama.cpp converter source staging.
 
 Upstream split convert_hf_to_gguf.py: the entrypoint is now a shim that does
@@ -1279,3 +1295,66 @@ def test_an_atomically_replaced_file_stays_readable_on_every_platform(tmp_path):
     assert target.read_bytes() == b"new\n"
     assert os.access(str(target), os.R_OK)
     assert os.access(str(target), os.W_OK)
+
+
+# ---------------------------------------------------------------------------
+# Two items Codex raised on ad88db33, both reproduced at head before fixing.
+# ---------------------------------------------------------------------------
+
+def test_offline_does_not_fall_through_to_the_legacy_master_download(mod, tmp_path, monkeypatch):
+    """The offline switches gate staging, and they have to gate the legacy
+    single-file download too. With no local converter and a cold cache every
+    resolver above declines, and falling through put three requests on the wire for
+    a process that had declared itself offline."""
+    install = tmp_path / "llama.cpp"
+    (install / "gguf-py" / "gguf").mkdir(parents = True)
+    (install / "gguf-py" / "gguf" / "__init__.py").write_text("")
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(install))
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_OFFLINE", "1")
+
+    attempts = []
+    def trap(*args, **kwargs):
+        attempts.append(args[0] if args else kwargs.get("url"))
+        raise AssertionError("offline, nothing should reach the network")
+    monkeypatch.setattr(mod.requests, "get", trap)
+
+    mod._download_convert_hf_to_gguf.cache_clear()
+    with pytest.raises(RuntimeError) as excinfo:
+        mod._download_convert_hf_to_gguf()
+    mod._download_convert_hf_to_gguf.cache_clear()
+
+    assert attempts == [], f"offline still hit the network: {attempts}"
+    message = str(excinfo.value)
+    assert "offline" in message.lower()
+    assert "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR" in message
+
+
+def test_a_damaged_converter_is_not_mistaken_for_a_self_contained_monolith(mod, tmp_path, monkeypatch):
+    """A truncated or half-written converter has no conversion import either, and
+    taking that absence as proof of a monolith hands back a file that cannot convert
+    anything: the patcher gets as far as reading architectures out of it and fails
+    with 'no arguments found', while staging, which could have repaired the install,
+    was never reached. A real monolith registers model classes."""
+    install = tmp_path / "llama.cpp"
+    (install / "gguf-py" / "gguf").mkdir(parents = True)
+    (install / "gguf-py" / "gguf" / "__init__.py").write_text("")
+    (install / "convert_hf_to_gguf.py").write_bytes(
+        b"#!/usr/bin/env python3\nimport sys\n# truncated mid-download\n"
+    )
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(install))
+    assert mod._resolve_monolith_bundle_convert_script() is None
+
+    # The same directory with a real monolith is still offered.
+    (install / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    resolved = mod._resolve_monolith_bundle_convert_script()
+    assert resolved is not None
+    assert resolved[0] == str(install / "convert_hf_to_gguf.py")
+
+
+def test_an_empty_converter_file_is_not_offered_either(mod, tmp_path, monkeypatch):
+    install = tmp_path / "llama.cpp"
+    install.mkdir(parents = True)
+    (install / "convert_hf_to_gguf.py").write_bytes(b"")
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(install))
+    assert mod._resolve_monolith_bundle_convert_script() is None

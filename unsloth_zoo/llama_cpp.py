@@ -344,6 +344,24 @@ def _resolve_monolith_bundle_convert_script():
                 # A package-era entrypoint without its package. Not self-contained,
                 # so staging (or an explicit checkout) has to supply the rest.
                 return None
+            # Positive evidence, not merely the absence of the import. A truncated or
+            # half-written converter also has no conversion import, and taking that
+            # as proof of a monolith hands back a file that cannot convert anything:
+            # the patcher gets as far as reading architectures out of it and fails
+            # with "no arguments found", while staging, which could have repaired the
+            # install, was never reached. A real monolith registers model classes.
+            try:
+                with open(candidate, "rb") as f: source = f.read()
+            except OSError:
+                continue
+            text_archs, vision_archs = _extract_archs_from_monolith_source(source)
+            if not text_archs and not vision_archs:
+                logger.info(
+                    f"Unsloth: Ignoring {candidate}: it imports no conversion/ package "
+                    f"and registers no model architectures, so it is damaged rather "
+                    f"than self-contained."
+                )
+                return None
             stat = os.stat(candidate)
         except OSError:
             continue
@@ -2575,6 +2593,19 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
             logger.info(f"Unsloth: Using local convert_hf_to_gguf.py from {_local_script}")
             with open(_local_script, "rb") as f:
                 original_content = f.read()
+        elif not _converter_network_allowed():
+            # The offline switches gate staging, and they have to gate this too or
+            # they do not mean anything: with no local converter and a cold cache
+            # every resolver above declines, and falling through here would put
+            # three requests on the wire for a process that declared itself offline.
+            raise _ConverterSourcesIncomplete(
+                f"Unsloth: No llama.cpp converter is available locally and this "
+                f"process is offline (UNSLOTH_LLAMA_CPP_OFFLINE / UNSLOTH_OFFLINE / "
+                f"HF_HUB_OFFLINE). Point UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a llama.cpp "
+                f"checkout holding convert_hf_to_gguf.py, conversion/ and gguf-py/ "
+                f"together, or unset the offline switch so the converter sources can "
+                f"be staged."
+            )
         else:
             # Retry with exponential backoff: the upstream host can
             # exceed the default read timeout on slower networks.
