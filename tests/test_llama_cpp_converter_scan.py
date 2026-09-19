@@ -1876,6 +1876,74 @@ def test_the_sibling_scan_does_not_rewrite_a_pinned_checkout(tmp_path, monkeypat
     assert not theirs.exists()
 
 
+def test_the_roots_own_bytecode_cache_is_not_skipped(tmp_path, monkeypatch):
+    """The root is walked without recursion and __pycache__ is not a location.
+
+    So a clean root gguf.py beside an attacker's __pycache__/gguf.<tag>.pyc was
+    seen by neither the purge nor the walk, and CPython validates and runs that
+    cache in place of the source the scan read. The cache belonging to a
+    directory's own modules is part of that directory, not a subtree.
+    """
+    llama_cpp = _load("llama_cpp_root_cache_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    (root / "gguf.py").write_text("WHO = 'clean'\n", encoding = "utf-8")
+    cache = root / "__pycache__"
+    cache.mkdir()
+    planted = cache / "gguf.cpython-313.pyc"
+    planted.write_bytes(_pyc(0))
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    assert llama_cpp._purge_imported_package_bytecode(str(root)) == ()
+    assert not planted.exists(), "the root's own cache was never reached"
+
+    # A sourceless one there cannot be rebuilt, so it is reported instead.
+    orphan = cache / "nosource.cpython-313.pyc"
+    orphan.write_bytes(_pyc(0))
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError, match = "cannot read"):
+        llama_cpp._scan_conversion_package(str(root))
+    assert orphan.exists()
+
+
+@pytest.mark.parametrize(
+    "extra, truncated",
+    [(-1, False), (0, False), (1, True)],
+    ids = ["one under the cap", "exactly at the cap", "one over it"],
+)
+def test_truncation_is_declared_only_when_something_was_dropped(
+    tmp_path, monkeypatch, extra, truncated
+):
+    """Stopping AT the cap called a root of exactly that many directories
+    truncated and refused it under strict mode, though every one was scanned.
+    The file and entry budgets already avoid this by asking for one more than
+    they keep."""
+    llama_cpp = _load(f"llama_cpp_cap_edge_probe_{extra}", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    # conversion/ and "." are locations too, so the directories are the rest.
+    plan_without = llama_cpp._scanned_locations(str(root))
+    already = len(plan_without.locations)
+    wanted = llama_cpp.MAX_SCAN_LOCATIONS - already + extra
+    for index in range(max(wanted, 0)):
+        (root / f"dir_{index:04d}").mkdir()
+
+    plan = llama_cpp._scanned_locations(str(root))
+    assert plan.truncated is truncated, (
+        f"{len(plan.locations)} locations, cap {llama_cpp.MAX_SCAN_LOCATIONS}"
+    )
+    assert len(plan.locations) <= llama_cpp.MAX_SCAN_LOCATIONS
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    if truncated:
+        with pytest.raises(llama_cpp.ConverterScanError, match = "directories this scan"):
+            llama_cpp._scan_conversion_package(str(root))
+    else:
+        llama_cpp._scan_conversion_package(str(root))      # must not raise
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"

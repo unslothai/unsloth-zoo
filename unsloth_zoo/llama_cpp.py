@@ -1861,6 +1861,9 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None, recursive = Tru
                         if entry.is_dir():
                             if recursive:
                                 pending.append(entry.path)
+                            elif entry.name == "__pycache__" and root == package_dir:
+                                # As above: the cache belonging to this directory.
+                                pending.append(entry.path)
                             continue
                     except OSError:
                         continue
@@ -1939,12 +1942,16 @@ def _scanned_locations(llama_cpp_dir):
                 # unscanned. Measured against llama.cpp master, the largest of
                 # them holds 1432 entries and 46 modules, well inside both bounds.
                 locations.append(ScanLocation(entry.name, entry.path, True, False, ()))
-                if len(locations) >= MAX_SCAN_LOCATIONS:
-                    # Reported by the caller, not dropped quietly: a root wide
-                    # enough to reach this is nowhere near the 4096-entry budget
-                    # that would otherwise have said something, so a payload in a
-                    # directory landing past the cap went unscanned in silence.
+                if len(locations) > MAX_SCAN_LOCATIONS:
+                    # One past, then trim: stopping AT the cap called a root of
+                    # exactly that many directories truncated and refused it under
+                    # strict mode, which is the same off-by-one the file and entry
+                    # budgets already avoid by asking for one more than they keep.
+                    # Reported rather than dropped quietly, because a root wide
+                    # enough to reach this is nowhere near the entry budget that
+                    # would otherwise have said something.
                     truncated = True
+                    locations = locations[:MAX_SCAN_LOCATIONS]
                     break
     except OSError:
         pass
@@ -2450,6 +2457,13 @@ def _conversion_package_modules(
                         continue
                     if is_directory:
                         if recursive:
+                            pending.append(entry.path)
+                        elif entry.name == "__pycache__" and root == conversion_dir:
+                            # Not a subtree, the cache for THIS directory's own
+                            # modules. Skipping it left a clean root gguf.py beside
+                            # an attacker's __pycache__/gguf.<tag>.pyc, which
+                            # CPython validates and runs in place of the source
+                            # that was scanned.
                             pending.append(entry.path)
                         continue
                     name = entry.name
