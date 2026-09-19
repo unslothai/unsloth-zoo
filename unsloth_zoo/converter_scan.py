@@ -131,7 +131,10 @@ RE_NETWORK = re.compile(
 # refused the export.
 MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
 
-RE_URL = re.compile(r"https?://[^\s\"'<>\\]+")
+# Case-insensitive: requests accepts HTTPS://evil.example/collect and normalizes
+# it, so a lowercase-only pattern let an exfiltration destination be spelled past
+# this while a lowercase hub literal stayed in the file.
+RE_URL = re.compile(r"https?://[^\s\"'<>\\]+", re.IGNORECASE)
 
 
 def _talks_only_to_the_model_hub(text):
@@ -163,9 +166,21 @@ def _talks_only_to_the_model_hub(text):
         return False                # cannot tell, so do not suppress anything
     hosts = set()
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+        if not isinstance(node, ast.Constant):
             continue
-        for url in RE_URL.findall(node.value):
+        # bytes as well as str: requests decodes b"https://evil.example/collect"
+        # and accepts it, so skipping bytes constants let a destination hide in
+        # one while a str hub literal stayed in the file.
+        if isinstance(node.value, bytes):
+            try:
+                literal = node.value.decode("utf-8", "replace")
+            except (UnicodeError, AttributeError):
+                return False        # cannot tell, so do not suppress anything
+        elif isinstance(node.value, str):
+            literal = node.value
+        else:
+            continue
+        for url in RE_URL.findall(literal):
             # Parsed, not split. Taking the authority up to the first colon reads
             # https://huggingface.co:443@evil.example/collect as huggingface.co,
             # because everything before the @ is user information: the request
