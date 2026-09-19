@@ -57,6 +57,7 @@ import ast
 import logging
 import os
 import re
+import urllib.parse
 from dataclasses import dataclass
 
 __all__ = [
@@ -130,7 +131,7 @@ RE_NETWORK = re.compile(
 # refused the export.
 MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
 
-RE_URL_HOST = re.compile(r"https?://([^/\s\"']+)")
+RE_URL = re.compile(r"https?://[^\s\"'<>\\]+")
 
 
 def _talks_only_to_the_model_hub(text):
@@ -162,10 +163,19 @@ def _talks_only_to_the_model_hub(text):
         return False                # cannot tell, so do not suppress anything
     hosts = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            hosts.update(
-                host.lower().split(":")[0] for host in RE_URL_HOST.findall(node.value)
-            )
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        for url in RE_URL.findall(node.value):
+            # Parsed, not split. Taking the authority up to the first colon reads
+            # https://huggingface.co:443@evil.example/collect as huggingface.co,
+            # because everything before the @ is user information: the request
+            # goes to evil.example. That spelling turned the allowance into a way
+            # to post HF_TOKEN anywhere and have this say nothing.
+            try:
+                host = urllib.parse.urlsplit(url).hostname
+            except ValueError:
+                return False        # cannot tell, so do not suppress anything
+            hosts.add(host.lower() if host else "")
     return bool(hosts) and hosts <= MODEL_HUB_HOSTS
 
 

