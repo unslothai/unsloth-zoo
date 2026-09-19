@@ -38,6 +38,33 @@ import pytest
 ATTRIBUTE = "merge_quantization_configs"
 
 
+def _strip_generated_globals(namespace, before):
+    """Drop whatever an exec added to `namespace`, keeping the rest untouched."""
+    for name in set(namespace) - before:
+        del namespace[name]
+
+
+def test_a_generated_global_is_removed_rather_than_restored():
+    """Why the fixture strips them itself. `monkeypatch.delitem` called after the
+    exec records the generated object as the value to put back, so its undo
+    reinstates the very name the test asked to remove, and the next call's
+    `globals().get("merge_quantization_configs")` reads a stale callable where the
+    rewritten source defined none."""
+    namespace = {"kept": 1}
+    before = set(namespace)
+    namespace[ATTRIBUTE] = lambda *a, **k: None       # as the exec would leave it
+
+    undone = pytest.MonkeyPatch()
+    undone.delitem(namespace, ATTRIBUTE)
+    assert ATTRIBUTE not in namespace
+    undone.undo()
+    assert ATTRIBUTE in namespace, "monkeypatch put it back, which is the trap"
+
+    _strip_generated_globals(namespace, before)
+    assert ATTRIBUTE not in namespace
+    assert namespace == {"kept": 1}
+
+
 @pytest.fixture
 def unpatched_quantizer(monkeypatch):
     """transformers.quantizers.auto with nothing of ours applied to it yet.
@@ -68,6 +95,7 @@ def unpatched_quantizer(monkeypatch):
     )
     # A previous test's exec would otherwise leave the name in these globals.
     monkeypatch.delitem(misc.__dict__, ATTRIBUTE, raising = False)
+    globals_before = set(misc.__dict__)
 
     def set_module_dir(returns):
         """PEP 562 module __dir__, set by hand rather than with monkeypatch.
@@ -82,6 +110,16 @@ def unpatched_quantizer(monkeypatch):
     try:
         yield auto, misc, recorded, set_module_dir
     finally:
+        # Every name the patch exec'd into the module's globals - the function it
+        # defined, and whatever its generated import pulled in - belongs to this
+        # test alone. `monkeypatch.delitem` cannot do this job: called after the
+        # exec it records the generated object as the value to put back, so
+        # teardown reinstates exactly what it was asked to remove, and the next
+        # test's `globals().get("merge_quantization_configs")` finds a stale
+        # callable where the rewritten source defined none. Remove them outright,
+        # and leave restoring anything that was already here to monkeypatch,
+        # whose undo runs after this fixture's.
+        _strip_generated_globals(misc.__dict__, globals_before)
         auto.__dict__.pop("__dir__", None)
         for name in names:
             if name in snapshot:
@@ -109,12 +147,15 @@ def test_an_empty_name_list_no_longer_ends_the_import(monkeypatch, unpatched_qua
     assert dir(auto) == []
 
     # A module global shadows the builtin inside that module's functions, so
-    # this reads exactly what the patch asked to execute.
+    # this reads exactly what the patch asked to execute. Set by hand: the
+    # fixture takes back every global that was not there before it, and
+    # monkeypatch's undo would then try to remove an attribute that has already
+    # gone and fail the teardown.
     execd = []
     def recording_exec(source, *args, **kwargs):
         execd.append(source)
         return exec(source, *args, **kwargs)
-    monkeypatch.setattr(misc, "exec", recording_exec, raising = False)
+    misc.__dict__["exec"] = recording_exec
 
     misc.patch_merge_quantization_configs()
 
@@ -149,7 +190,6 @@ def test_a_rewrite_that_needs_no_names_is_still_applied(monkeypatch, unpatched_q
     # own globals is what the "defined something else" guard depends on.
     assert replacement is not merge_quantization_configs
     assert replacement.__name__ == ATTRIBUTE
-    monkeypatch.delitem(misc.__dict__, ATTRIBUTE, raising = False)
 
 
 def test_an_import_that_fails_is_reported_not_raised(monkeypatch, unpatched_quantizer):
@@ -187,7 +227,6 @@ def test_a_rewrite_that_defines_nothing_is_reported_not_a_name_error(
     assert recorded == []
     assert ATTRIBUTE not in misc.__dict__
     assert "_defines_another_name" in misc.__dict__
-    monkeypatch.delitem(misc.__dict__, "_defines_another_name", raising = False)
 
 
 # ---------------------------------------------------------------- #2491
