@@ -725,6 +725,36 @@ def test_bounding_the_nested_wildcard_keeps_the_real_temp_exec_matches(scan, tex
     assert scan._matches(scan.RE_TEMP_EXEC, text) is True
 
 
+def test_the_nested_wildcard_bound_reaches_only_where_it_is_meant_to(scan):
+    """Bounding a surviving wildcard is a semantic trade: a match needing more
+    than MAX_CLASS_SPAN characters between the two halves is given up. It is
+    worth making for the one segment that is quadratic without it, and it should
+    not be made silently anywhere else, so the affected set is pinned. A pattern
+    that gains a nested wildcard lands here first, as a decision rather than as a
+    change in what the scan reports.
+    """
+    import re
+
+    affected = set()
+    for name, pattern in scan.VENDORED_PATTERNS.items():
+        dotall = bool(pattern.flags & re.DOTALL)
+        for alternative in scan._split_top_level_alternatives(pattern.pattern):
+            text = (
+                alternative.decode("latin-1")
+                if isinstance(alternative, bytes)
+                else alternative
+            )
+            segments = None
+            if ".*" in text and (dotall or not scan._has_anchor(text)):
+                segments = scan._split_on_dot_star(text)
+            for segment in (segments if segments is not None else [text]):
+                classes_only = scan._bound_class_repeats(segment)
+                if scan._bound_dot_star(classes_only) != classes_only:
+                    affected.add(name)
+
+    assert affected == {"RE_TEMP_EXEC"}, affected
+
+
 def test_hostile_file_scans_in_reasonable_time(scan):
     import time
 
