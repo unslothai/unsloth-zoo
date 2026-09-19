@@ -1472,36 +1472,81 @@ def test_a_native_extension_module_is_reported(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "flags, reported",
-    [
-        (0b00, False),   # timestamp cache: checked against the .py that was read
-        (0b11, False),   # checked-hash cache: likewise
-        (0b01, True),    # unchecked hash: loaded as-is, whatever the source says
-    ],
+    "flags",
+    [0b00, 0b11, 0b01],
     ids = ["timestamp", "checked hash", "unchecked hash"],
 )
-def test_only_the_pycache_entry_python_never_checks_is_a_finding(
-    tmp_path, monkeypatch, caplog, flags, reported
+def test_every_supplied_cache_with_a_source_is_removed_before_the_converter_runs(
+    tmp_path, monkeypatch, caplog, flags
 ):
-    """__pycache__ fills up on the first real export, so reporting all of it
-    would warn on every subsequent one. Only the PEP 552 unchecked-hash cache is
-    loaded without validating the source this scan actually read.
+    """CPython's validation does not prove the bytecode came from the source.
+
+    A timestamp cache is accepted when the source's mtime and size match the
+    header, a checked-hash cache when the source hashes to the stored value, and
+    whoever ships the archive sets both. Demonstrated outside this suite: a
+    timestamp-validated cache whose source reads VALUE = "clean" imported as
+    PWNED. An earlier version of this file read the invalidation mode as trust,
+    which was wrong, so every cache that has a source is now deleted and left for
+    Python to rebuild from the .py that was actually scanned.
     """
-    llama_cpp = _load(f"llama_cpp_pycache_probe_{flags}", "unsloth_zoo/llama_cpp.py")
+    llama_cpp = _load(f"llama_cpp_purge_probe_{flags}", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
     cache = root / "conversion" / "__pycache__"
     cache.mkdir()
-    (cache / "base.cpython-313.pyc").write_bytes(_pyc(flags))
+    supplied = cache / "base.cpython-313.pyc"
+    supplied.write_bytes(_pyc(flags))
 
-    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
     monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
     caplog.clear()
     with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))     # must not raise
+
+    assert not supplied.exists(), "supplied bytecode survived into the converter run"
+    # Silent: the .py it belonged to is still there and Python rebuilds it, so an
+    # ordinary export's own caches cost nothing and say nothing.
+    assert caplog.records == [], [r.message for r in caplog.records]
+
+
+def test_a_cache_that_cannot_be_removed_is_reported(tmp_path, monkeypatch):
+    """Deleting is the answer only while deleting works. On a read-only tree it
+    does not, and then the bytecode is still executable content nothing read."""
+    llama_cpp = _load("llama_cpp_stuck_cache_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    (cache / "base.cpython-313.pyc").write_bytes(_pyc(0))
+
+    real_remove = os.remove
+
+    def refuse(path, *args, **kwargs):
+        if str(path).endswith(".pyc"):
+            raise PermissionError(13, "read-only file system", str(path))
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(llama_cpp.os, "remove", refuse)
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError, match = "cannot read"):
         llama_cpp._scan_conversion_package(str(root))
-    assert any("cannot read" in r.message for r in caplog.records) is reported, (
-        [r.message for r in caplog.records]
-    )
+
+
+def test_a_sourceless_cache_is_reported_rather_than_deleted(tmp_path, monkeypatch):
+    """Nothing can rebuild this one, so removing it would break a package that
+    genuinely ships it. Reporting keeps the scan honest without breaking export."""
+    llama_cpp = _load("llama_cpp_sourceless_keep_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    orphan = root / "conversion" / "evil.pyc"
+    orphan.write_bytes(_pyc(0))
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError, match = "cannot read"):
+        llama_cpp._scan_conversion_package(str(root))
+    assert orphan.exists(), "a cache with no source must not be deleted"
 
 
 def test_ordinary_bytecode_caches_do_not_push_a_package_over_the_cap(

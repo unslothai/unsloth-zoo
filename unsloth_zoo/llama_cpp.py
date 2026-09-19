@@ -1797,26 +1797,75 @@ BYTECODE_SUFFIXES = (".pyc", ".pyo")
 COLLECTED_MODULE_SUFFIXES = (".py",) + BYTECODE_SUFFIXES + NATIVE_MODULE_SUFFIXES
 
 
-def _bytecode_is_authoritative(path):
-    """Whether CPython would run this .pyc without checking it against a source.
+def _purge_regenerable_bytecode(package_dir, entry_limit = None):
+    """Delete bytecode caches that came with an unverified package.
 
-    A timestamp cache and a checked-hash cache are both validated against the .py
-    beside them, which is the file the scan read, so they cannot say anything the
-    source does not. An UNCHECKED-hash cache (PEP 552) is loaded as-is: its
-    bytecode is what executes no matter what the .py contains. That one is a
-    payload the scan cannot see.
+    CPython's cache validation proves that a .pyc CLAIMS to belong to the source
+    beside it, not that its bytecode was compiled from that source: a timestamp
+    cache is accepted when the source's mtime and size match the header, and a
+    checked-hash cache when the source hashes to the value in the header. Anyone
+    who ships both files sets both, so a clean .py can be paired with arbitrary
+    marshalled code and that code is what runs. Verified directly: a
+    timestamp-validated cache whose source reads `VALUE = "clean"` imported as
+    `PWNED`. So the invalidation mode says nothing about trust, and an earlier
+    version of this file was wrong to read it that way.
+
+    Deleting is better than reporting for any cache that has a source, because
+    Python simply rebuilds it from the .py this scan did read: nothing is lost,
+    nothing legitimate breaks, and an ordinary export's own caches are removed
+    and rebuilt without a word. A sourceless .pyc is left alone and reported
+    instead, since deleting that one would break a package that needs it.
+
+    Returns the caches it could not remove, which are reported like any other
+    file Python will execute and this scan cannot read.
     """
-    try:
-        with open(path, "rb") as handle:
-            header = handle.read(8)
-    except OSError:
-        # Cannot tell, so do not report it as harmless.
-        return True
-    if len(header) < 8:
-        return True
-    flags = int.from_bytes(header[4:8], "little")
-    hash_based, checks_source = bool(flags & 0b01), bool(flags & 0b10)
-    return hash_based and not checks_source
+    stuck = []
+    entries = 0
+    pending = [package_dir]
+    seen_directories = set()
+    while pending:
+        root = pending.pop()
+        identity = _directory_identity(root)
+        if identity is not None:
+            if identity in seen_directories:
+                continue
+            seen_directories.add(identity)
+        try:
+            with os.scandir(root) as scanner:
+                for entry in scanner:
+                    entries += 1
+                    if entry_limit is not None and entries >= entry_limit:
+                        return stuck
+                    try:
+                        if entry.is_dir():
+                            pending.append(entry.path)
+                            continue
+                    except OSError:
+                        continue
+                    name = entry.name
+                    if os.path.splitext(name)[1].lower() not in BYTECODE_SUFFIXES:
+                        continue
+                    if not _has_a_source(root, name):
+                        continue        # sourceless: reported, not removed
+                    try:
+                        os.remove(entry.path)
+                    except OSError:
+                        stuck.append(
+                            os.path.relpath(entry.path, package_dir).replace(os.sep, "/")
+                        )
+        except OSError:
+            continue
+    return stuck
+
+
+def _has_a_source(root, name):
+    """Whether this cache has a .py beside it that Python can rebuild it from."""
+    if os.path.basename(root) == "__pycache__":
+        # base.cpython-313.pyc -> ../base.py
+        stem = name.split(".")[0]
+        return os.path.isfile(os.path.join(os.path.dirname(root), stem + ".py"))
+    suffix = os.path.splitext(name)[1]
+    return os.path.isfile(os.path.join(root, name[: -len(suffix)] + ".py"))
 
 
 def _counts_as_a_module(root, name):
@@ -1838,30 +1887,25 @@ def _counts_as_a_module(root, name):
         return True
     if suffix not in BYTECODE_SUFFIXES:
         return False
-    if os.path.basename(root) == "__pycache__":
-        # base.cpython-313.pyc, the compiled form of a base.py this scan reads.
-        # Only the cache CPython never checks against that source stands alone.
-        return _bytecode_is_authoritative(os.path.join(root, name))
-    # Beside its own source, so the source is what gets imported and scanned.
-    return not os.path.isfile(os.path.join(root, name[: -len(suffix)] + ".py"))
+    # A cache with a source is deleted before the converter runs and rebuilt by
+    # Python from the .py this scan read, so it is not a module of its own. One
+    # without a source is, and gets reported.
+    return not _has_a_source(root, name)
 
 
 def _unscannable_modules(package_dir, names):
-    """The collected names Python can execute and `warn_on_suspicious_converter` cannot read."""
-    sources = set(names)
+    """The collected names Python can execute and `warn_on_suspicious_converter` cannot read.
+
+    Native extensions, and bytecode with no source to rebuild it from. A cache
+    that HAS a source never reaches here: _purge_regenerable_bytecode removes it
+    before the converter runs, and anything it could not remove is reported by
+    that function instead.
+    """
     found = []
     for name in names:
         suffix = os.path.splitext(name)[1].lower()
-        if suffix in NATIVE_MODULE_SUFFIXES:
+        if suffix in NATIVE_MODULE_SUFFIXES or suffix in BYTECODE_SUFFIXES:
             found.append(name)
-        elif suffix in BYTECODE_SUFFIXES:
-            if "__pycache__" in name.split("/"):
-                # The compiled form of a .py this scan already read, unless it is
-                # the one kind of cache CPython never checks against that source.
-                if _bytecode_is_authoritative(os.path.join(package_dir, *name.split("/"))):
-                    found.append(name)
-            elif name[: -len(suffix)] + ".py" not in sources:
-                found.append(name)
     return found
 
 
@@ -2282,6 +2326,13 @@ def _scan_conversion_package(llama_cpp_dir):
 
 def _scan_imported_package(package_dir):
     """Read every module in one imported package, or report why it could not be."""
+    # First, before the walk and long before the converter runs: bytecode that
+    # came with the package executes in place of the source this scan reads, and
+    # CPython's validation does not prove otherwise. Anything with a source is
+    # removed and rebuilt from the .py; what could not be removed is reported.
+    stuck_bytecode = _purge_regenerable_bytecode(
+        package_dir, entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+    )
     # One past each cap: enough to establish it was crossed, and no more. Both
     # limits, because stopping AT the limit reports a package of exactly that
     # many entries as holding more than it does, which strict mode then refuses.
@@ -2312,7 +2363,7 @@ def _scan_imported_package(package_dir):
             f"this scan reads",
         )
         names = names[:MAX_CONVERSION_PACKAGE_FILES]
-    opaque = _unscannable_modules(package_dir, names)
+    opaque = _unscannable_modules(package_dir, names) + stuck_bytecode
     if opaque:
         # Reporting is the whole answer available here: this scan reads source,
         # and these are the files it provably cannot. Passing over them quietly
