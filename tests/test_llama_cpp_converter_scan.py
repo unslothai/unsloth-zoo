@@ -1740,6 +1740,32 @@ def test_a_checkout_with_no_readable_entrypoint_still_narrows(tmp_path):
     assert "scripts" not in labels, sorted(labels)
 
 
+def test_the_import_closure_reads_each_package_once(tmp_path, monkeypatch):
+    """conversion/ and gguf-py/gguf are both seeded and admitted by name, so
+    without a guard each is parsed twice per export. On a real clone of
+    llama.cpp master that was 250 ms of the 560 ms the cache key took, and the
+    key runs on every export, not once per process.
+    """
+    llama_cpp = _load("llama_cpp_double_parse_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    gguf = root / "gguf-py" / "gguf"
+    gguf.mkdir(parents = True)
+    (gguf / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+
+    seen = []
+    real = llama_cpp._imported_top_level_names
+
+    def _counting(directory, only = None, recursive = False):
+        if recursive:
+            seen.append(os.path.realpath(directory))
+        return real(directory, only = only, recursive = recursive)
+
+    monkeypatch.setattr(llama_cpp, "_imported_top_level_names", _counting)
+    llama_cpp._scanned_locations(str(root))
+    assert len(seen) == len(set(seen)), sorted(seen)
+
+
 def test_scan_plan_discovery_is_bounded_before_it_reads_anything(tmp_path, monkeypatch):
     """The plan is built from an unverified tree, so discovery carries its own
     budget. Both walks materialized the directory first and applied a limit

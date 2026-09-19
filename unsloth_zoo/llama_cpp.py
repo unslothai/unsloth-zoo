@@ -2027,10 +2027,16 @@ def _scanned_locations(llama_cpp_dir):
     ]
     imported_names = set()
     unreadable = True
+    walked = set()
     for path, only in seeds:
-        # Top level only here. Each package is admitted below by name and its
-        # whole tree read there, so walking it twice bought nothing.
-        found = _imported_top_level_names(path, only = only)
+        # Recursively for the packages, and remembered: these are admitted below
+        # by name and their imports collected again there, and parsing each of
+        # them twice was 250 ms of the 560 ms this took per export on a checkout
+        # the size of llama.cpp master.
+        recursive = only is None
+        found = _imported_top_level_names(path, only = only, recursive = recursive)
+        if recursive:
+            walked.add(os.path.realpath(path))
         if found is None:
             continue
         unreadable = False
@@ -2113,8 +2119,9 @@ def _scanned_locations(llama_cpp_dir):
             locations.append(
                 ScanLocation(child, path, True, child in NAMED_IMPORT_PACKAGES, ())
             )
-            if imported_names is not None:
+            if imported_names is not None and os.path.realpath(path) not in walked:
                 # This directory is part of what runs, so what IT imports is too.
+                walked.add(os.path.realpath(path))
                 reached = _imported_top_level_names(path, recursive = True)
                 if reached:
                     imported_names |= reached
@@ -2797,13 +2804,22 @@ def _scan_conversion_package(llama_cpp_dir, is_local_copy = False):
     gguf-py/gguf, which arrives in the same undigested tarball and which the
     entrypoint puts on sys.path itself.
     """
-    # Cost, measured against a tree built from llama.cpp master's real manifest
-    # (3605 files, 374 directories): about 1.3s in total, of which conversion/ is
-    # 560ms for its 94 modules and the root plus its directories are the rest.
-    # That is paid inside the cached patcher, so once per process rather than per
-    # export, and an export runs for minutes. The two things that DO run on every
-    # export are the cache key and the bytecode purge, at about 11ms together.
-    # Worth re-measuring before widening what gets scanned any further.
+    # Cost, measured against a real clone of llama.cpp master rather than a tree
+    # shaped like one: 3.1s for the four locations it now reads, paid inside the
+    # cached patcher, so once per process rather than per export, against an
+    # export that runs for minutes.
+    #
+    # What runs on EVERY export is the cache key, and that is no longer the 11ms
+    # it once was: it builds the scan plan, which parses the converter's import
+    # closure to decide which directories are reachable, and that is 296ms of the
+    # 314ms the key takes. Parsing each package twice, as a seed and again as an
+    # admitted location, was another 250ms on top until it was deduplicated.
+    # Memoizing the plan across exports would take it to about 1ms, since the
+    # signature that would invalidate it costs 0.3ms, and that is the thing to do
+    # if this ever needs to be cheaper.
+    #
+    # Worth re-measuring, against a real clone, before widening what gets scanned
+    # any further.
     if not llama_cpp_dir:
         return
     if scan_is_disabled():
