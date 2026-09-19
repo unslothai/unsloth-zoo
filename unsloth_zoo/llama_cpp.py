@@ -29,6 +29,7 @@ __all__ = [
     "IS_WINDOWS",
 ]
 
+import collections
 import errno
 import hashlib
 import threading
@@ -2003,14 +2004,15 @@ def _conversion_sibling_info(llama_cpp_dir):
             header.append((subdir, 0, True))
             continue
         found_any = True
-        names, complete = _conversion_package_modules(
+        walk = _conversion_package_modules(
             package_dir,
             file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
             entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
         )
-        if names is None:
-            names, complete = ["__init__.py", "base.py"], False
-        header.append((subdir, len(names), complete))
+        names = walk.names if walk.names is not None else ["__init__.py", "base.py"]
+        # The unreadable directories travel too: one becoming readable, or a new
+        # one appearing, changes what this scan can say and so has to re-run it.
+        header.append((subdir, len(names), walk.complete, walk.unreadable))
         entries.extend(
             _identity(os.path.join(package_dir, *name.split("/")))
             for name in names[:MAX_CONVERSION_PACKAGE_FILES]
@@ -2255,6 +2257,11 @@ def _directory_identity(path):
     return (info.st_dev, info.st_ino)
 
 
+# Named, because this result has now grown three times and twice a caller read a
+# new field as though it were an old one.
+PackageWalk = collections.namedtuple("PackageWalk", "names complete unreadable")
+
+
 def _conversion_package_modules(
     conversion_dir,
     file_limit = None,
@@ -2291,16 +2298,17 @@ def _conversion_package_modules(
     """
     found = []
     seen_directories = set()
+    unreadable = []
     entries = 0
     pending = [conversion_dir]
-    try:
-        while pending:
-            root = pending.pop()
-            identity = _directory_identity(root)
-            if identity is not None:
-                if identity in seen_directories:
-                    continue
-                seen_directories.add(identity)
+    while pending:
+        root = pending.pop()
+        identity = _directory_identity(root)
+        if identity is not None:
+            if identity in seen_directories:
+                continue
+            seen_directories.add(identity)
+        try:
             # scandir rather than walk: walk hands back a whole directory's names
             # at once, so a single directory with a great many entries was fully
             # listed and copied before either budget was consulted, and the
@@ -2310,7 +2318,7 @@ def _conversion_package_modules(
                 for entry in scanner:
                     entries += 1
                     if entry_limit is not None and entries >= entry_limit:
-                        return sorted(found), False
+                        return PackageWalk(sorted(found), False, tuple(unreadable))
                     try:
                         # Follows symlinks, because the import machinery does.
                         is_directory = entry.is_dir()
@@ -2330,10 +2338,21 @@ def _conversion_package_modules(
                     if file_limit is not None and len(found) >= file_limit:
                         # Sorted first: which names survive stays deterministic
                         # even though which directories were reached does not.
-                        return sorted(found)[:file_limit], False
-    except OSError:
-        return None, False
-    return sorted(found), True
+                        return PackageWalk(
+                            sorted(found)[:file_limit], False, tuple(unreadable),
+                        )
+        except OSError:
+            # One unreadable directory, not the whole package. Aborting the walk
+            # here and reporting nothing meant an unreadable directory beside a
+            # readable malicious module silenced the scan entirely, strict mode
+            # included. Keep what was collected and name what could not be read.
+            if root == conversion_dir:
+                return PackageWalk(None, False, (".",))
+            unreadable.append(
+                os.path.relpath(root, conversion_dir).replace(os.sep, "/")
+            )
+            continue
+    return PackageWalk(sorted(found), not unreadable, tuple(unreadable))
 
 
 def _scan_conversion_package(llama_cpp_dir):
@@ -2365,14 +2384,25 @@ def _scan_imported_package(package_dir):
     # One past each cap: enough to establish it was crossed, and no more. Both
     # limits, because stopping AT the limit reports a package of exactly that
     # many entries as holding more than it does, which strict mode then refuses.
-    names, complete = _conversion_package_modules(
+    walk = _conversion_package_modules(
         package_dir,
         file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
         entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
     )
+    names, complete = walk.names, walk.complete
+    if walk.unreadable:
+        # Silence here was the hole: an unreadable directory beside a readable
+        # module its initializer imports meant the whole package went unscanned
+        # and unreported, under strict mode as well.
+        shown = ", ".join(walk.unreadable[:5]) + ("..." if len(walk.unreadable) > 5 else "")
+        _refuse_unscannable_conversion_package(
+            package_dir,
+            f"holds {len(walk.unreadable)} director(y/ies) this scan could not "
+            f"read ({shown})",
+        )
     if names is None:
         return
-    if not complete and len(names) <= MAX_CONVERSION_PACKAGE_FILES:
+    if not complete and len(names) <= MAX_CONVERSION_PACKAGE_FILES and not walk.unreadable:
         # Stopped on the traversal budget rather than the file cap: few enough
         # modules, far too many entries to have walked. Unread either way.
         _refuse_unscannable_conversion_package(
