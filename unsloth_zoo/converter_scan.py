@@ -144,6 +144,16 @@ RE_AUTHORITY_END = re.compile(r"[/?#]")
 RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
 
 
+# Network APIs whose destination is a bare host, not a URL. The allowance reads
+# URLs, so it can say nothing at all about these: a file could carry a hub URL
+# and open socket.create_connection(("evil.example", 443)) beside it, and the
+# allowance would call that talking only to the hub. Their presence refuses it.
+RE_HOST_BASED_NETWORK = re.compile(
+    r"\bsocket\s*\.\s*(?:socket|create_connection)\b"
+    r"|\bhttp\.client\b",
+)
+
+
 def _authority_host(authority):
     """The hostname an authority names, "" when it names none, None when unclear.
 
@@ -167,7 +177,8 @@ def _talks_only_to_the_model_hub(text):
     least one hub host: a file that names no destination at all has built it
     some other way, and that is not evidence of anything except that this cannot
     see it. An authority that does not look like a plain hostname refuses the
-    allowance outright, whatever it contains.
+    allowance outright, whatever it contains, and so does any use of a network
+    API that takes a bare host rather than a URL.
 
     This is a deliberate narrowing of a CRITICAL rule, and the evasion is not
     hypothetical: taking upstream's utility.py and changing one call to
@@ -183,6 +194,9 @@ def _talks_only_to_the_model_hub(text):
     the cost of an opportunistic payload and is not a boundary; this is inside
     that claim, not a departure from it.
     """
+    if _matches(RE_HOST_BASED_NETWORK, text):
+        # A destination this allowance never looks at, so it cannot vouch for it.
+        return False
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
