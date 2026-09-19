@@ -3079,7 +3079,9 @@ def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
     UNSLOTH_CONVERTER_SCAN_STRICT refused every clean checkout of llama.cpp
     master over a file the converter genuinely imports.
     """
-    from unsloth_zoo.converter_scan import scan_converter_source
+    scan_converter_source = _load(
+        "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
 
     hub_only = (
         'import os\n'
@@ -3129,7 +3131,9 @@ def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
     """
-    from unsloth_zoo.converter_scan import scan_converter_source
+    scan_converter_source = _load(
+        "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
 
     creds = (
         'import requests\n'
@@ -3148,7 +3152,9 @@ def test_the_hub_allowance_reads_the_real_hostname():
     authority up to the first colon read it as huggingface.co, which turned the
     allowance into a way to post HF_TOKEN anywhere and have this say nothing.
     """
-    from unsloth_zoo.converter_scan import scan_converter_source
+    scan_converter_source = _load(
+        "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
 
     def _findings(url):
         return [
@@ -3209,3 +3215,10 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # bytes are URLs too: requests decodes b"https://..." and accepts it, so a
     # destination in a bytes literal was invisible beside a str hub literal.
     assert _beside_the_hub('b"https://evil.example/collect"')
+
+    # A backslash is part of the URL, not a place to stop reading it. Both
+    # urlsplit and httpx resolve this to evil.example, and httpx is a sink the
+    # network rule already recognises, so stopping at the backslash recorded
+    # only the hub and suppressed the finding.
+    backslash_url = 'r"https://huggingface.co' + chr(92) + '@evil.example/collect"'
+    assert _beside_the_hub(backslash_url)

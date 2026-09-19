@@ -131,10 +131,14 @@ RE_NETWORK = re.compile(
 # refused the export.
 MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
 
-# Case-insensitive: requests accepts HTTPS://evil.example/collect and normalizes
-# it, so a lowercase-only pattern let an exfiltration destination be spelled past
-# this while a lowercase hub literal stayed in the file.
-RE_URL = re.compile(r"https?://[^\s\"'<>\\]+", re.IGNORECASE)
+# Case-insensitive, and backslashes are part of the URL, not a place to stop.
+# requests accepts HTTPS://evil.example/collect and normalizes it, so a
+# lowercase-only pattern let a destination be spelled past this. Stopping at a
+# backslash did the same for r"https://huggingface.co\@evil.example/collect":
+# both urlsplit and httpx resolve that to evil.example, while a pattern that
+# stopped at the backslash recorded only the hub. Every one of these left a
+# lowercase hub literal in the file and sent the token somewhere else.
+RE_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 
 def _talks_only_to_the_model_hub(text):
