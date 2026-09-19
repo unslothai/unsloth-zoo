@@ -296,9 +296,27 @@ def test_conversion_sibling_info_changes_when_base_py_changes(package_layout):
     )
 
 
-def test_conversion_sibling_info_none_for_monolith(monolith_layout):
+def test_conversion_sibling_info_still_keys_a_monolith_on_its_own_directory(monolith_layout):
+    """A monolith has no conversion/ or gguf-py/gguf, and used to key on nothing.
+
+    The converter's own directory is sys.path[0] for the subprocess, so it is
+    exactly where a module shadowing one of its imports would sit. Keying on
+    nothing there meant a shadowing module could be added between exports without
+    the patcher cache noticing.
+    """
     llama_cpp = _load_llama_cpp_module()
-    assert llama_cpp._conversion_sibling_info(str(monolith_layout)) is None
+    info = llama_cpp._conversion_sibling_info(str(monolith_layout))
+    assert info is not None
+    paths = {entry[0] for entry in info[1:]}
+    assert any(path.endswith("convert_hf_to_gguf.py") for path in paths), paths
+
+    (monolith_layout / "gguf.py").write_text("WHO = 'shadow'\n", encoding = "utf-8")
+    assert llama_cpp._conversion_sibling_info(str(monolith_layout)) != info
+
+
+def test_conversion_sibling_info_none_when_there_is_nothing_on_disk(tmp_path):
+    llama_cpp = _load_llama_cpp_module()
+    assert llama_cpp._conversion_sibling_info(str(tmp_path / "absent")) is None
 
 
 def test_conversion_sibling_info_covers_a_module_the_patcher_never_edits(package_layout):

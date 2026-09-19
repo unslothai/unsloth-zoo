@@ -1798,7 +1798,7 @@ BYTECODE_SUFFIXES = (".pyc", ".pyo")
 COLLECTED_MODULE_SUFFIXES = (".py",) + BYTECODE_SUFFIXES + NATIVE_MODULE_SUFFIXES
 
 
-def _purge_regenerable_bytecode(package_dir, entry_limit = None):
+def _purge_regenerable_bytecode(package_dir, entry_limit = None, recursive = True):
     """Delete bytecode caches that came with an unverified package.
 
     CPython's cache validation proves that a .pyc CLAIMS to belong to the source
@@ -1839,7 +1839,8 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None):
                         return stuck
                     try:
                         if entry.is_dir():
-                            pending.append(entry.path)
+                            if recursive:
+                                pending.append(entry.path)
                             continue
                     except OSError:
                         continue
@@ -1859,6 +1860,56 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None):
     return stuck
 
 
+def _scanned_locations(llama_cpp_dir):
+    """Every place the converter can import from, as (label, directory, recursive).
+
+    The packages it imports by name, plus the directory the converter script
+    itself sits in. That last one is sys.path[0] for the subprocess and is
+    searched BEFORE the gguf-py entry the entrypoint inserts at index 1, so a
+    root-level gguf.py shadows the whole gguf package: verified directly, a
+    root gguf.py won over gguf-py/gguf/__init__.py. Scanning only the named
+    packages left that module executing under a clean entrypoint and clean
+    packages, strict mode included.
+
+    The root is walked WITHOUT recursion. Its subdirectories are the rest of the
+    llama.cpp checkout, which is enormous and none of which is importable by
+    itself; a subdirectory that IS importable, meaning it carries an __init__.py,
+    is added as its own recursive location instead.
+
+    One list, used by the scan and by the cache key both. Keeping two of these in
+    step by hand is what left gguf-py scanned but unkeyed earlier in this branch.
+    """
+    if not llama_cpp_dir:
+        return []
+    locations = []
+    for subdir in IMPORTED_PACKAGE_SUBDIRS:
+        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
+        if os.path.isdir(package_dir):
+            locations.append((subdir, package_dir, True))
+    if not os.path.isdir(llama_cpp_dir):
+        return locations
+    locations.append((".", llama_cpp_dir, False))
+    named = {subdir.split("/")[0] for subdir in IMPORTED_PACKAGE_SUBDIRS}
+    try:
+        with os.scandir(llama_cpp_dir) as scanner:
+            for entry in scanner:
+                if entry.name in named or entry.name == "__pycache__":
+                    continue
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+                # An __init__.py is what makes a root directory a package whose
+                # code runs on import. A namespace directory imports to an empty
+                # module and executes nothing, so it is not this hazard.
+                if os.path.isfile(os.path.join(entry.path, "__init__.py")):
+                    locations.append((entry.name, entry.path, True))
+    except OSError:
+        pass
+    return locations
+
+
 def _purge_imported_package_bytecode(llama_cpp_dir):
     """Purge every imported package's supplied bytecode, and say what is stuck.
 
@@ -1875,14 +1926,13 @@ def _purge_imported_package_bytecode(llama_cpp_dir):
     if not llama_cpp_dir:
         return ()
     stuck = []
-    for subdir in IMPORTED_PACKAGE_SUBDIRS:
-        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
-        if not os.path.isdir(package_dir):
-            continue
+    for label, package_dir, recursive in _scanned_locations(llama_cpp_dir):
         stuck.extend(
-            f"{subdir}/{name}"
+            f"{label}/{name}"
             for name in _purge_regenerable_bytecode(
-                package_dir, entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+                package_dir,
+                entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+                recursive = recursive,
             )
         )
     return tuple(sorted(stuck))
@@ -1942,7 +1992,11 @@ def _unscannable_modules(package_dir, names):
 def _conversion_sibling_info(llama_cpp_dir):
     """Hashable (path, digest) pairs for EVERY module the converter imports,
     folded into the patcher cache key so re-pulled checkouts re-patch and
-    re-scan. None when neither package is on disk.
+    re-scan. None only when there is nothing on disk to look at.
+
+    Covers the same places the scan does, the converter's own directory included.
+    A monolith checkout used to key on nothing, which is exactly where a module
+    that shadows one of the converter's imports would sit.
 
     Every package in IMPORTED_PACKAGE_SUBDIRS, not just conversion/: the key is
     what decides whether the scan runs again, so a package it does not cover is
@@ -1995,19 +2049,18 @@ def _conversion_sibling_info(llama_cpp_dir):
             return (p, -1, "")
     header, entries = [], []
     found_any = False
-    for subdir in IMPORTED_PACKAGE_SUBDIRS:
-        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
-        present = has_conversion if subdir == "conversion" else os.path.isdir(package_dir)
-        if not present:
-            # Absent, not unreadable. A converter that ships no gguf-py is the
-            # ordinary case and must not be keyed on placeholder entries.
-            header.append((subdir, 0, True))
+    for subdir, package_dir, recursive in _scanned_locations(llama_cpp_dir):
+        if subdir == "conversion" and not has_conversion:
+            # The directory exists but is not the package layout, so it is not
+            # the conversion package this key has always meant.
+            header.append((subdir, 0, True, ()))
             continue
         found_any = True
         walk = _conversion_package_modules(
             package_dir,
             file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
             entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+            recursive = recursive,
         )
         names = walk.names if walk.names is not None else ["__init__.py", "base.py"]
         # The unreadable directories travel too: one becoming readable, or a new
@@ -2018,8 +2071,7 @@ def _conversion_sibling_info(llama_cpp_dir):
             for name in names[:MAX_CONVERSION_PACKAGE_FILES]
         )
     if not found_any:
-        # Neither package on disk: nothing for this key to say, which is what the
-        # monolith-with-no-gguf-py case has always meant.
+        # Nothing on disk at all, not even a directory to look in.
         return None
     # The header is ONE element, however much it comes to carry: callers read the
     # per-module entries as info[1:], so widening it in place silently fed them a
@@ -2266,6 +2318,7 @@ def _conversion_package_modules(
     conversion_dir,
     file_limit = None,
     entry_limit = None,
+    recursive = True,
 ):
     """`(names, complete)` for the .py files under `conversion_dir`, nested included.
 
@@ -2325,7 +2378,8 @@ def _conversion_package_modules(
                     except OSError:
                         continue
                     if is_directory:
-                        pending.append(entry.path)
+                        if recursive:
+                            pending.append(entry.path)
                         continue
                     name = entry.name
                     if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
@@ -2366,20 +2420,20 @@ def _scan_conversion_package(llama_cpp_dir):
     """
     if not llama_cpp_dir:
         return
-    for subdir in IMPORTED_PACKAGE_SUBDIRS:
-        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
-        if os.path.isdir(package_dir):
-            _scan_imported_package(package_dir)
+    for _label, package_dir, recursive in _scanned_locations(llama_cpp_dir):
+        _scan_imported_package(package_dir, recursive = recursive)
 
 
-def _scan_imported_package(package_dir):
+def _scan_imported_package(package_dir, recursive = True):
     """Read every module in one imported package, or report why it could not be."""
     # First, before the walk and long before the converter runs: bytecode that
     # came with the package executes in place of the source this scan reads, and
     # CPython's validation does not prove otherwise. Anything with a source is
     # removed and rebuilt from the .py; what could not be removed is reported.
     stuck_bytecode = _purge_regenerable_bytecode(
-        package_dir, entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+        package_dir,
+        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+        recursive = recursive,
     )
     # One past each cap: enough to establish it was crossed, and no more. Both
     # limits, because stopping AT the limit reports a package of exactly that
@@ -2388,6 +2442,7 @@ def _scan_imported_package(package_dir):
         package_dir,
         file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
         entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+        recursive = recursive,
     )
     names, complete = walk.names, walk.complete
     if walk.unreadable:
