@@ -2445,6 +2445,9 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
         local_script_info,
         _conversion_sibling_info(_get_llama_cpp_dir(local_script_info)),
         _converter_scan_mode(),
+        _converter_is_trusted_local(
+            local_script_info[0] if local_script_info is not None else None
+        ),
     )
 
 
@@ -2455,6 +2458,14 @@ def _converter_scan_mode():
     sees a warning, sets UNSLOTH_CONVERTER_SCAN_STRICT=1 and retries in the same
     session gets the cached converter back and no second scan, which reads as the
     strict mode having accepted the file.
+
+    Whether the converter is a user pin travels in the key for the same reason
+    and is computed beside this one: a first call under an explicit pin could
+    accept a flagged converter as trusted and cache it, and MLX routing to that
+    same folder afterwards matched every other component of the key, so the
+    cached result came back without the trust test or the package scan running
+    again. The distinction internal_scripts_dir_pin draws is only as good as the
+    key that carries it.
     """
     return (
         os.environ.get("UNSLOTH_CONVERTER_SCAN_STRICT", ""),
@@ -2464,7 +2475,7 @@ def _converter_scan_mode():
 
 @lru_cache(1)
 def _download_convert_hf_to_gguf_cached(
-    name, _local_script_info, _conversion_info, _scan_mode = None,
+    name, _local_script_info, _conversion_info, _scan_mode = None, _trusted_local = False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Download from llama.cpp's GitHub, or read a local copy when
@@ -2521,7 +2532,8 @@ def _download_convert_hf_to_gguf_cached(
         # by default (see converter_scan for why it does not block), and raises
         # ConverterScanError only under UNSLOTH_CONVERTER_SCAN_STRICT=1 on
         # downloaded bytes.
-        _trusted_local = _converter_is_trusted_local(_local_script)
+        # Passed in, not recomputed: it is a cache key component, so deciding it
+        # again in here could disagree with the entry that was looked up.
         warn_on_suspicious_converter(
             original_content,
             _local_script if _local_script is not None else LLAMA_CPP_CONVERT_FILE,

@@ -1310,6 +1310,47 @@ def test_a_real_user_pin_still_earns_the_exemption(tmp_path, monkeypatch):
     assert llama_cpp._converter_is_trusted_local(str(script)) is True
 
 
+def test_the_converter_cache_key_carries_whether_the_pin_was_the_users(tmp_path, monkeypatch):
+    """The internal-pin distinction is only as good as the key that carries it.
+
+    A first call under an explicit user pin can accept a flagged converter as
+    trusted and cache it. If the variable is then cleared and MLX routes to the
+    same folder, every other component of the key is identical, so the cached
+    result comes back without the trust test or the package scan running again
+    and strict mode accepts it after all.
+    """
+    llama_cpp = _load("llama_cpp_trust_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    folder = tmp_path / "llama.cpp"
+    folder.mkdir()
+    script = folder / "convert_hf_to_gguf.py"
+    script.write_text("import gguf\n", encoding = "utf-8")
+    info = (str(script), os.stat(script).st_mtime_ns, os.stat(script).st_size)
+
+    seen = []
+
+    def record(name, local_info, conversion_info, scan_mode = None, trusted = False):
+        seen.append(trusted)
+        return "patched"
+
+    monkeypatch.setattr(
+        llama_cpp, "_download_convert_hf_to_gguf_cached", record,
+    )
+    monkeypatch.setattr(llama_cpp, "_resolve_local_convert_script", lambda: info)
+    monkeypatch.setattr(llama_cpp, "_patch_tensor_mapping_for_qwen35", lambda *a, **k: None)
+
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(folder))
+    llama_cpp._download_convert_hf_to_gguf()
+
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+    with llama_cpp.internal_scripts_dir_pin(str(folder)):
+        llama_cpp._download_convert_hf_to_gguf()
+
+    # Same folder, same file, same switches: only provenance differs, and if it
+    # does not reach the key then lru_cache serves the trusted answer to both.
+    assert seen == [True, False], seen
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"
