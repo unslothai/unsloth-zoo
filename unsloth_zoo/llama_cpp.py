@@ -1924,7 +1924,7 @@ def _conversion_sibling_info(llama_cpp_dir):
         names, complete = _conversion_package_modules(
             package_dir,
             file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
-            entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES,
+            entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
         )
         if names is None:
             names, complete = ["__init__.py", "base.py"], False
@@ -2269,11 +2269,13 @@ def _scan_conversion_package(llama_cpp_dir):
 
 def _scan_imported_package(package_dir):
     """Read every module in one imported package, or report why it could not be."""
-    # One past the cap: enough to establish it was crossed, and no more.
+    # One past each cap: enough to establish it was crossed, and no more. Both
+    # limits, because stopping AT the limit reports a package of exactly that
+    # many entries as holding more than it does, which strict mode then refuses.
     names, complete = _conversion_package_modules(
         package_dir,
         file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
-        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES,
+        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
     )
     if names is None:
         return

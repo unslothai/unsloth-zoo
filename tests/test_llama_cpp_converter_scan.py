@@ -1463,15 +1463,48 @@ def test_one_wide_directory_cannot_outrun_the_entry_budget(tmp_path, monkeypatch
     names, complete = llama_cpp._conversion_package_modules(
         str(conversion),
         file_limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1,
-        entry_limit = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES,
+        entry_limit = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES + 1,
     )
 
     assert complete is False
-    # The bound is on entries TOUCHED, which is the claim the budget makes.
-    assert len(seen) <= llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES, (
+    # The bound is on entries TOUCHED, which is the claim the budget makes. One
+    # past the limit, because seeing that many is how the limit is known crossed.
+    assert len(seen) <= llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES + 1, (
         f"touched {len(seen)} of {entries} entries in one directory"
     )
     assert len(names) <= llama_cpp.MAX_CONVERSION_PACKAGE_FILES
+
+
+@pytest.mark.parametrize("over", [0, 1], ids = ["exactly at the limit", "one past it"])
+def test_a_package_at_exactly_the_entry_limit_is_not_called_oversized(
+    tmp_path, monkeypatch, caplog, over
+):
+    """Stopping AT the limit reported a package of exactly that many entries as
+    holding more than it does, and strict mode then refused a package that was
+    fully within its budget. The file cap already asks for one extra for this
+    reason; the entry budget has to as well.
+    """
+    llama_cpp = _load(f"llama_cpp_entry_edge_probe_{over}", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+    (conversion / "base.py").write_text("Y = 1\n", encoding = "utf-8")
+    # Two modules already, so pad to exactly the limit (or one past it).
+    for index in range(llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES - 2 + over):
+        (conversion / f"blob_{index:05d}.bin").write_bytes(b"")
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    if over:
+        with pytest.raises(llama_cpp.ConverterScanError, match = "directory entries"):
+            llama_cpp._scan_conversion_package(str(root))
+    else:
+        with caplog.at_level(logging.WARNING):
+            llama_cpp._scan_conversion_package(str(root))      # must not raise
+        assert caplog.records == [], [r.message for r in caplog.records]
 
 
 def test_no_single_module_is_read_whole(tmp_path, monkeypatch, caplog):
