@@ -1372,6 +1372,75 @@ def test_gguf_export_respects_preexisting_scripts_dir_override(
     assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == custom
 
 
+def test_gguf_export_does_not_synthesize_a_scripts_dir_over_a_converter_pin(
+    monkeypatch, tmp_path
+):
+    """UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG, which
+    is right for a value the user set and wrong for one this wrapper makes up. Setting
+    it unconditionally made the documented escape hatch inert on the MLX path: the
+    installed converter answered, so an architecture needing a newer one kept failing
+    with no way out."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    seen = {}
+
+    def fake_download():
+        seen["env"] = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        patched = tmp_path / "llama.cpp" / "unsloth_convert_hf_to_gguf.py"
+        patched.write_text("# patched", encoding="utf-8")
+        return str(patched), {"LlamaForCausalLM"}, set()
+
+    monkeypatch.setattr(llama_cpp, "_download_convert_hf_to_gguf", fake_download)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising=False)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b11037")
+
+    model = types.SimpleNamespace(_hf_repo="org/PinnedModel")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=tmp_path / "out",
+        quantization_method="not_quantized",
+        first_conversion="f16",
+    )
+    assert seen["env"] is None, (
+        "a synthesized scripts dir outranked the revision pin, so staging was "
+        "never reached and the escape hatch did nothing"
+    )
+    assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") is None
+
+
+def test_a_user_scripts_dir_still_wins_over_a_converter_pin(monkeypatch, tmp_path):
+    """The negative half. A directory the USER named is the more specific answer and
+    keeps outranking the pin; only the synthesized one steps aside."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    seen = {}
+
+    def fake_download():
+        seen["env"] = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        patched = tmp_path / "llama.cpp" / "unsloth_convert_hf_to_gguf.py"
+        patched.write_text("# patched", encoding="utf-8")
+        return str(patched), {"LlamaForCausalLM"}, set()
+
+    monkeypatch.setattr(llama_cpp, "_download_convert_hf_to_gguf", fake_download)
+    custom = str(tmp_path / "user_override")
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", custom)
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b11037")
+
+    model = types.SimpleNamespace(_hf_repo="org/BothSet")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer=object(),
+        save_directory=tmp_path / "out",
+        quantization_method="not_quantized",
+        first_conversion="f16",
+    )
+    assert seen["env"] == custom
+    assert os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR") == custom
+
+
 _PACKAGE_ENTRYPOINT = b"""\
 #!/usr/bin/env python3
 import argparse
