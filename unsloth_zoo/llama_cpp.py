@@ -1867,6 +1867,15 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None, recursive = Tru
                         return stuck
                     try:
                         if entry.is_dir():
+                            # Containment, unlike the scan: the scan FOLLOWS a
+                            # symlink out of the tree because the converter's
+                            # import would, and reading is harmless. Deleting is
+                            # not. A checkout can carry a symlink pointing at an
+                            # unrelated directory, and removing caches there would
+                            # rewrite something that has nothing to do with this
+                            # export, before strict mode ever gets to refuse.
+                            if not _stays_within(package_dir, entry.path):
+                                continue
                             if recursive:
                                 pending.append(entry.path)
                             elif entry.name == "__pycache__" and root == package_dir:
@@ -2021,6 +2030,19 @@ def _purge_imported_package_bytecode(llama_cpp_dir, is_local_copy = False):
     return tuple(sorted(stuck))
 
 
+def _stays_within(root, path):
+    """Whether `path` resolves to somewhere still under `root`."""
+    try:
+        resolved_root = os.path.realpath(root)
+        resolved = os.path.realpath(path)
+    except OSError:
+        return False
+    return (
+        resolved == resolved_root
+        or resolved.startswith(resolved_root.rstrip(os.sep) + os.sep)
+    )
+
+
 def _has_a_source(root, name):
     """Whether this cache has a .py beside it that Python can rebuild it from."""
     if os.path.basename(root) == "__pycache__":
@@ -2031,7 +2053,7 @@ def _has_a_source(root, name):
     return os.path.isfile(os.path.join(root, name[: -len(suffix)] + ".py"))
 
 
-def _counts_as_a_module(root, name):
+def _counts_as_a_module(root, name, purged = True):
     """Whether this file is one the scan has to account for.
 
     A .py is read; a native extension and a sourceless .pyc cannot be read and so
@@ -2053,6 +2075,13 @@ def _counts_as_a_module(root, name):
     # A cache with a source is deleted before the converter runs and rebuilt by
     # Python from the .py this scan read, so it is not a module of its own. One
     # without a source is, and gets reported.
+    #
+    # Unless nothing was deleted. For a pinned checkout this scan does not touch
+    # the user's files, and a cache left in place executes instead of the source
+    # beside it, whatever that source says. Then it is exactly what it looks
+    # like: code this scan cannot read, reported like any other.
+    if not purged:
+        return True
     return not _has_a_source(root, name)
 
 
@@ -2423,6 +2452,7 @@ def _conversion_package_modules(
     entry_limit = None,
     recursive = True,
     skip_names = (),
+    purged = True,
 ):
     """`(names, complete)` for the .py files under `conversion_dir`, nested included.
 
@@ -2497,7 +2527,7 @@ def _conversion_package_modules(
                         continue      # this scan's own output, where it writes it
                     if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
                         continue
-                    if not _counts_as_a_module(root, name):
+                    if not _counts_as_a_module(root, name, purged = purged):
                         continue
                     found.append(
                         os.path.relpath(entry.path, conversion_dir).replace(os.sep, "/")
@@ -2599,6 +2629,7 @@ def _scan_imported_package(
         entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
         recursive = recursive,
         skip_names = skip_names,
+        purged = not is_local_copy,
     )
     names, complete = walk.names, walk.complete
     if walk.unreadable:

