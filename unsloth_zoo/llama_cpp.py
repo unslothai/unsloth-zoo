@@ -1772,11 +1772,71 @@ MAX_CONVERSION_PACKAGE_FILES = 64
 # next to any real converter package, which is dozens of entries.
 MAX_CONVERSION_PACKAGE_ENTRIES = 4096
 
+# Everything beside the entrypoint that the entrypoint puts on sys.path and
+# imports, and so executes with exactly the privileges of the converter itself.
+# gguf-py is copied out of the same source tarball as conversion/, and that
+# tarball arrives with no digest at all, so scanning only conversion/ left a
+# payload in gguf-py/gguf/__init__.py running under a clean entrypoint and a
+# clean conversion/, strict mode included.
+IMPORTED_PACKAGE_SUBDIRS = ("conversion", "gguf-py/gguf")
+
+# Files Python will execute that a source scan cannot read. Native extensions
+# are dlopened; a .pyc in a module's own place, with no source beside it, is a
+# sourceless import and CPython runs the bytecode as the module.
+NATIVE_MODULE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib")
+BYTECODE_SUFFIXES = (".pyc", ".pyo")
+COLLECTED_MODULE_SUFFIXES = (".py",) + BYTECODE_SUFFIXES + NATIVE_MODULE_SUFFIXES
+
+
+def _bytecode_is_authoritative(path):
+    """Whether CPython would run this .pyc without checking it against a source.
+
+    A timestamp cache and a checked-hash cache are both validated against the .py
+    beside them, which is the file the scan read, so they cannot say anything the
+    source does not. An UNCHECKED-hash cache (PEP 552) is loaded as-is: its
+    bytecode is what executes no matter what the .py contains. That one is a
+    payload the scan cannot see.
+    """
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(8)
+    except OSError:
+        # Cannot tell, so do not report it as harmless.
+        return True
+    if len(header) < 8:
+        return True
+    flags = int.from_bytes(header[4:8], "little")
+    hash_based, checks_source = bool(flags & 0b01), bool(flags & 0b10)
+    return hash_based and not checks_source
+
+
+def _unscannable_modules(package_dir, names):
+    """The collected names Python can execute and `warn_on_suspicious_converter` cannot read."""
+    sources = set(names)
+    found = []
+    for name in names:
+        suffix = os.path.splitext(name)[1].lower()
+        if suffix in NATIVE_MODULE_SUFFIXES:
+            found.append(name)
+        elif suffix in BYTECODE_SUFFIXES:
+            if "__pycache__" in name.split("/"):
+                # The compiled form of a .py this scan already read, unless it is
+                # the one kind of cache CPython never checks against that source.
+                if _bytecode_is_authoritative(os.path.join(package_dir, *name.split("/"))):
+                    found.append(name)
+            elif name[: -len(suffix)] + ".py" not in sources:
+                found.append(name)
+    return found
+
 
 def _conversion_sibling_info(llama_cpp_dir):
-    """Hashable (path, mtime, size) tuples for EVERY module in conversion/,
+    """Hashable (path, digest) pairs for EVERY module the converter imports,
     folded into the patcher cache key so re-pulled checkouts re-patch and
     re-scan. None on the monolithic layout.
+
+    Every package in IMPORTED_PACKAGE_SUBDIRS, not just conversion/: the key is
+    what decides whether the scan runs again, so a package it does not cover is
+    one a long-lived process will re-import without rescanning.
 
     Every module, not the three the patcher edits. The key also decides whether
     _scan_conversion_package runs again, and that reads the whole directory: with
@@ -1807,20 +1867,25 @@ def _conversion_sibling_info(llama_cpp_dir):
                 return (p, hashlib.sha256(handle.read()).hexdigest())
         except OSError:
             return (p, "")
-    names, complete = _conversion_package_modules(
-        conv_dir,
-        file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
-        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES,
-    )
-    if names is None:
-        names, complete = ["__init__.py", "base.py"], False
+    header, entries = [], []
+    for subdir in IMPORTED_PACKAGE_SUBDIRS:
+        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
+        names, complete = _conversion_package_modules(
+            package_dir,
+            file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
+            entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES,
+        )
+        if names is None:
+            names, complete = ["__init__.py", "base.py"], False
+        header.append((subdir, len(names), complete))
+        entries.extend(
+            _identity(os.path.join(package_dir, *name.split("/")))
+            for name in names[:MAX_CONVERSION_PACKAGE_FILES]
+        )
     # The header is ONE element, however much it comes to carry: callers read the
     # per-module entries as info[1:], so widening it in place silently fed them a
     # count or a flag where they expected a (path, digest) pair.
-    return ((len(names), complete),) + tuple(
-        _identity(os.path.join(conv_dir, *name.split("/")))
-        for name in names[:MAX_CONVERSION_PACKAGE_FILES]
-    )
+    return (tuple(header),) + tuple(entries)
 pass
 
 
@@ -2100,7 +2165,7 @@ def _conversion_package_modules(
                 seen_directories.add(identity)
             entries += len(dirs) + len(files)
             for name in files:
-                if not name.endswith(".py"):
+                if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
                     continue
                 full = os.path.join(root, name)
                 found.append(os.path.relpath(full, conversion_dir).replace(os.sep, "/"))
@@ -2116,20 +2181,27 @@ def _conversion_package_modules(
 
 
 def _scan_conversion_package(llama_cpp_dir):
-    """Scan the conversion/ package beside an unverified converter.
+    """Scan every package the converter imports, beside an unverified converter.
 
     Same warn-or-raise contract as the entrypoint: these files are imported and
     executed by it, so leaving them unscanned let a clean entrypoint front a
-    payload in conversion/__init__.py, or in a nested module below it.
+    payload in conversion/__init__.py, or in a nested module below it, or in
+    gguf-py/gguf, which arrives in the same undigested tarball and which the
+    entrypoint puts on sys.path itself.
     """
     if not llama_cpp_dir:
         return
-    conversion_dir = os.path.join(llama_cpp_dir, "conversion")
-    if not os.path.isdir(conversion_dir):
-        return
+    for subdir in IMPORTED_PACKAGE_SUBDIRS:
+        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
+        if os.path.isdir(package_dir):
+            _scan_imported_package(package_dir)
+
+
+def _scan_imported_package(package_dir):
+    """Read every module in one imported package, or report why it could not be."""
     # One past the cap: enough to establish it was crossed, and no more.
     names, complete = _conversion_package_modules(
-        conversion_dir,
+        package_dir,
         file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
         entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES,
     )
@@ -2139,7 +2211,7 @@ def _scan_conversion_package(llama_cpp_dir):
         # Stopped on the traversal budget rather than the file cap: few enough
         # modules, far too many entries to have walked. Unread either way.
         _refuse_unscannable_conversion_package(
-            conversion_dir,
+            package_dir,
             f"holds more than the {MAX_CONVERSION_PACKAGE_ENTRIES} directory "
             f"entries this scan walks",
         )
@@ -2150,13 +2222,26 @@ def _scan_conversion_package(llama_cpp_dir):
         # stays, because an attacker must not get to choose how much work this
         # does, so exceeding it becomes the finding rather than a quiet skip.
         _refuse_unscannable_conversion_package(
-            conversion_dir,
+            package_dir,
             f"holds more than the {MAX_CONVERSION_PACKAGE_FILES} Python files "
             f"this scan reads",
         )
         names = names[:MAX_CONVERSION_PACKAGE_FILES]
+    opaque = _unscannable_modules(package_dir, names)
+    if opaque:
+        # Reporting is the whole answer available here: this scan reads source,
+        # and these are the files it provably cannot. Passing over them quietly
+        # is what let bytecode and native modules ride in under a clean package.
+        shown = ", ".join(opaque[:5]) + ("..." if len(opaque) > 5 else "")
+        _refuse_unscannable_conversion_package(
+            package_dir,
+            f"holds {len(opaque)} file(s) Python will execute but this scan "
+            f"cannot read ({shown})",
+        )
     for name in names:
-        path = os.path.join(conversion_dir, *name.split("/"))
+        if os.path.splitext(name)[1].lower() != ".py":
+            continue
+        path = os.path.join(package_dir, *name.split("/"))
         try:
             with open(path, "rb") as handle:
                 content = handle.read()

