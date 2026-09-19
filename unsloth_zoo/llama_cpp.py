@@ -393,7 +393,19 @@ def _resolve_monolith_bundle_convert_script(require_gguf_py = True):
                     f"and registers no model architectures, so it is damaged rather "
                     f"than self-contained."
                 )
-                return None
+                continue
+            # Registrations alone are not enough here either, for the reason they are
+            # not enough in _staged_sources_are_complete: a file truncated after a
+            # complete registered class still has them and still cannot be driven, and
+            # this row answers BEFORE staging, so accepting it means the damaged
+            # install is never repaired.
+            if not _CONVERTER_ADD_ARGUMENT_RE.search(source):
+                logger.info(
+                    f"Unsloth: Ignoring {candidate}: it registers model architectures "
+                    f"but defines no command line arguments, so it cannot be driven as "
+                    f"a converter."
+                )
+                continue
             stat = os.stat(candidate)
         except OSError:
             continue

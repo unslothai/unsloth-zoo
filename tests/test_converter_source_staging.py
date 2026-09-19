@@ -2036,3 +2036,45 @@ def test_a_real_monolith_is_still_accepted(mod, tmp_path):
     }))
     assert mod._converter_stage_is_usable(
         str(stage), repo = "ggml-org/llama.cpp", tag = "b9000") is True
+
+
+def test_an_installed_monolith_without_a_parser_is_left_to_staging(mod, tmp_path, monkeypatch):
+    """This row answers before staging, so accepting a converter that cannot be
+    driven means the damaged install is never repaired. Registrations survive a
+    truncation after a complete registered class; the parser does not."""
+    bundle = tmp_path / "truncated_install"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(
+        b"@ModelBase.register(\"LlamaForCausalLM\")\nclass LlamaModel:\n    pass\n"
+    )
+    _write_sibling_gguf_py(bundle)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_an_installed_monolith_with_a_parser_is_still_taken(mod, tmp_path, monkeypatch):
+    """The negative half: a real pre-split install is unaffected."""
+    bundle = tmp_path / "good_install"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    _write_sibling_gguf_py(bundle)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    info = mod._resolve_monolith_bundle_convert_script()
+    assert info is not None
+    assert Path(info[0]) == bundle / "convert_hf_to_gguf.py"
+
+
+def test_a_driveable_second_spelling_wins_over_an_undriveable_first(mod, tmp_path, monkeypatch):
+    """The two fixes together: the first name registers architectures but has no
+    parser, so the loop has to move on rather than stop at it."""
+    bundle = tmp_path / "mixed_names"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(
+        b"@ModelBase.register(\"LlamaForCausalLM\")\nclass LlamaModel:\n    pass\n"
+    )
+    (bundle / "convert-hf-to-gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    _write_sibling_gguf_py(bundle)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    info = mod._resolve_monolith_bundle_convert_script()
+    assert info is not None
+    assert Path(info[0]).name == "convert-hf-to-gguf.py"
