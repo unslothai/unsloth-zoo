@@ -592,18 +592,28 @@ def _has_anchor(alternative):
 def _build_evaluator(pattern):
     """Compile `pattern` into alternatives of ordered, individually bounded segments.
 
-    Returns `(alternatives, per_line)`. `per_line` says the caller must apply the
-    segments to one line at a time: a non-DOTALL `.*` cannot cross a newline, so
-    that is what the pattern already meant, and it is the only thing that bounds
-    the span when the file is one enormous line. Bounding by "a line" was the
-    original reasoning here and it is only true when lines are short; a crafted
-    352 KB single line took over five seconds through RE_PERSISTENCE.
+    Returns `(alternatives, per_line_flags)`, one flag per alternative. A set
+    flag says the caller must apply that alternative's segments to one line at a
+    time: a non-DOTALL `.*` cannot cross a newline, so that is what the pattern
+    already meant, and it is the only thing that bounds the span when the file is
+    one enormous line. Bounding by "a line" was the original reasoning here and it
+    is only true when lines are short; a crafted 352 KB single line took over five
+    seconds through RE_PERSISTENCE.
+
+    Per alternative, not per pattern. One flag for the whole pattern meant a
+    single `.*` alternative put every OTHER alternative on the line-at-a-time
+    path, including ones that legitimately span lines through `\\s*`: in
+    RE_ENV_HARVEST the last two alternatives carry the `.*` and the third is
+    `json.dumps(\\s*os.environ`, so `json.dumps(\\n    os.environ\\n)` matched
+    re.search and not _matches. Paired with a network send that is a finding the
+    scan silently dropped, in strict mode too.
     """
     dotall = bool(pattern.flags & re.DOTALL)
     alternatives = []
-    per_line = False
+    per_line_flags = []
     for alternative in _split_top_level_alternatives(pattern.pattern):
         segments = None
+        per_line = False
         if ".*" in (
             alternative.decode("latin-1") if isinstance(alternative, bytes) else alternative
         ):
@@ -619,7 +629,8 @@ def _build_evaluator(pattern):
         alternatives.append(
             [re.compile(_bound_class_repeats(s), pattern.flags) for s in segments]
         )
-    return alternatives, per_line
+        per_line_flags.append(per_line)
+    return alternatives, per_line_flags
 
 
 _EVALUATORS = {}
@@ -630,7 +641,7 @@ def _evaluator(pattern):
         try:
             _EVALUATORS[pattern] = _build_evaluator(pattern)
         except Exception:
-            _EVALUATORS[pattern] = ([[pattern]], False)
+            _EVALUATORS[pattern] = ([[pattern]], [False])
     return _EVALUATORS[pattern]
 
 
@@ -647,11 +658,14 @@ def _segments_match(segments, text, start = 0, end = None):
 
 def _matches(pattern, text):
     """`bool(pattern.search(text))`, without the backtracking blowup."""
-    alternatives, per_line = _evaluator(pattern)
-    if not per_line:
-        for segments in alternatives:
-            if _segments_match(segments, text):
-                return True
+    alternatives, per_line_flags = _evaluator(pattern)
+    line_bound = []
+    for segments, per_line in zip(alternatives, per_line_flags):
+        if per_line:
+            line_bound.append(segments)
+        elif _segments_match(segments, text):
+            return True
+    if not line_bound:
         return False
     # Walk line spans in place rather than materialising them: the whole match
     # has to sit inside one line for a non-DOTALL pattern anyway.
@@ -662,7 +676,7 @@ def _matches(pattern, text):
         stop = text.find(newline, start)
         if stop == -1:
             stop = length
-        for segments in alternatives:
+        for segments in line_bound:
             if _segments_match(segments, text, start, stop):
                 return True
         start = stop + 1

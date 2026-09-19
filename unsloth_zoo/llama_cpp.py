@@ -30,6 +30,7 @@ __all__ = [
 ]
 
 import errno
+import hashlib
 import subprocess
 import sys
 import os
@@ -1764,6 +1765,12 @@ pass
 # Enough to cover the package a converter imports without walking a tree an
 # attacker chooses the size of.
 MAX_CONVERSION_PACKAGE_FILES = 64
+# The same bound on the traversal itself. Counting only .py files bounded what
+# gets READ but not what gets WALKED: a tree with sixty modules and a million
+# empty directories never reaches the file cap, so the whole attacker-sized
+# directory was still traversed, once per export through the cache key. Generous
+# next to any real converter package, which is dozens of entries.
+MAX_CONVERSION_PACKAGE_ENTRIES = 4096
 
 
 def _conversion_sibling_info(llama_cpp_dir):
@@ -1787,19 +1794,28 @@ def _conversion_sibling_info(llama_cpp_dir):
     base_py  = os.path.join(conv_dir, "base.py")
     if not (os.path.isfile(init_py) and os.path.isfile(base_py)):
         return None
-    def _stat(p):
+    def _identity(p):
+        # The bytes, not (mtime, size): a module replaced with same-sized content
+        # under a preserved mtime left the key identical, so the next export
+        # returned the cached converter without rescanning and the subprocess
+        # imported bytes nothing had read. That is a metadata copy away from
+        # deliberate, and free on a coarse-timestamp filesystem. Hashing at most
+        # MAX_CONVERSION_PACKAGE_FILES small modules is nothing beside the export
+        # this key gates, and the scan reads the same bytes anyway.
         try:
-            s = os.stat(p)
-            return (p, s.st_mtime_ns, s.st_size)
+            with open(p, "rb") as handle:
+                return (p, hashlib.sha256(handle.read()).hexdigest())
         except OSError:
-            return (p, 0, 0)
-    names = _conversion_package_modules(
-        conv_dir, limit = MAX_CONVERSION_PACKAGE_FILES + 1,
+            return (p, "")
+    names, complete = _conversion_package_modules(
+        conv_dir,
+        file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
+        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES,
     )
     if names is None:
-        names = ["__init__.py", "base.py"]
-    return (len(names),) + tuple(
-        _stat(os.path.join(conv_dir, *name.split("/")))
+        names, complete = ["__init__.py", "base.py"], False
+    return (len(names), complete) + tuple(
+        _identity(os.path.join(conv_dir, *name.split("/")))
         for name in names[:MAX_CONVERSION_PACKAGE_FILES]
     )
 pass
@@ -1989,7 +2005,7 @@ def _qwen_already_handles_expert_aliases(conv_qwen_path):
 pass
 
 
-def _refuse_unscannable_conversion_package(conversion_dir):
+def _refuse_unscannable_conversion_package(conversion_dir, reason):
     """Warn, or under strict mode refuse, a conversion/ package too big to read.
 
     Mirrors warn_on_suspicious_converter's contract, but cannot go through it:
@@ -2003,8 +2019,7 @@ def _refuse_unscannable_conversion_package(conversion_dir):
     if scan_is_disabled():
         return
     message = (
-        f"Unsloth: The conversion/ package at {conversion_dir} holds more than the "
-        f"{MAX_CONVERSION_PACKAGE_FILES} Python files this scan reads, so some "
+        f"Unsloth: The conversion/ package at {conversion_dir} {reason}, so some "
         f"of the modules the converter imports have not been checked."
     )
     logger.warning(message)
@@ -2035,12 +2050,18 @@ def _directory_identity(path):
     return (info.st_dev, info.st_ino)
 
 
-def _conversion_package_modules(conversion_dir, limit = None):
-    """Up to `limit` .py files under `conversion_dir`, nested packages included, or None.
+def _conversion_package_modules(
+    conversion_dir,
+    file_limit = None,
+    entry_limit = None,
+):
+    """`(names, complete)` for the .py files under `conversion_dir`, nested included.
 
     Relative POSIX paths, sorted, so the caller's cap is stable across platforms.
-    None means the directory could not be walked, which the caller treats as
-    nothing to scan rather than as a clean package.
+    `complete` is False when a limit stopped the walk early, which is the caller's
+    signal that the package is too big to have been read, not that it is clean.
+    `names` is None when the directory could not be walked at all, which the
+    caller treats as nothing to scan rather than as a clean package.
 
     Recursive, because `os.listdir` saw immediate children only: a clean
     `conversion/__init__.py` doing `from .nested import x` fronted
@@ -2056,13 +2077,16 @@ def _conversion_package_modules(conversion_dir, limit = None):
     scanned and strict mode let the payload run. Following them means the walk
     can be sent round a loop, so a directory reached a second time is pruned.
 
-    `limit` stops the walk once that many names are in hand, which is how the
-    caller's cap becomes a bound on the WORK and not just on what gets read: the
-    directory is attacker-supplied, so traversing all of it to discover it was
-    too big hands over exactly the unbounded time and memory the cap denies.
+    The limits are how the caller's cap becomes a bound on the WORK and not just
+    on what gets read: the directory is attacker-supplied, so traversing all of it
+    to discover it was too big hands over exactly the unbounded time and memory
+    the cap denies. `file_limit` stops once that many modules are in hand;
+    `entry_limit` stops on entries visited, because a tree can be enormous while
+    holding almost no Python at all and only the second bound sees that.
     """
     found = []
     seen_directories = set()
+    entries = 0
     try:
         for root, dirs, files in os.walk(conversion_dir, followlinks = True):
             identity = _directory_identity(root)
@@ -2071,18 +2095,21 @@ def _conversion_package_modules(conversion_dir, limit = None):
                     dirs[:] = []
                     continue
                 seen_directories.add(identity)
+            entries += len(dirs) + len(files)
             for name in files:
                 if not name.endswith(".py"):
                     continue
                 full = os.path.join(root, name)
                 found.append(os.path.relpath(full, conversion_dir).replace(os.sep, "/"))
-            if limit is not None and len(found) >= limit:
+            if file_limit is not None and len(found) >= file_limit:
                 # Sorted first: which names survive stays deterministic even
                 # though which directories were reached before the stop does not.
-                return sorted(found)[:limit]
+                return sorted(found)[:file_limit], False
+            if entry_limit is not None and entries >= entry_limit:
+                return sorted(found), False
     except OSError:
-        return None
-    return sorted(found)
+        return None, False
+    return sorted(found), True
 
 
 def _scan_conversion_package(llama_cpp_dir):
@@ -2098,18 +2125,32 @@ def _scan_conversion_package(llama_cpp_dir):
     if not os.path.isdir(conversion_dir):
         return
     # One past the cap: enough to establish it was crossed, and no more.
-    names = _conversion_package_modules(
-        conversion_dir, limit = MAX_CONVERSION_PACKAGE_FILES + 1,
+    names, complete = _conversion_package_modules(
+        conversion_dir,
+        file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
+        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES,
     )
     if names is None:
         return
+    if not complete and len(names) <= MAX_CONVERSION_PACKAGE_FILES:
+        # Stopped on the traversal budget rather than the file cap: few enough
+        # modules, far too many entries to have walked. Unread either way.
+        _refuse_unscannable_conversion_package(
+            conversion_dir,
+            f"holds more than the {MAX_CONVERSION_PACKAGE_ENTRIES} directory "
+            f"entries this scan walks",
+        )
     if len(names) > MAX_CONVERSION_PACKAGE_FILES:
         # Truncating the list silently was the hole: a payload in a late-sorting
         # module (z_payload.py) imported from an otherwise clean __init__.py went
         # unscanned, and under strict mode ran with nothing reported. The cap
         # stays, because an attacker must not get to choose how much work this
         # does, so exceeding it becomes the finding rather than a quiet skip.
-        _refuse_unscannable_conversion_package(conversion_dir)
+        _refuse_unscannable_conversion_package(
+            conversion_dir,
+            f"holds more than the {MAX_CONVERSION_PACKAGE_FILES} Python files "
+            f"this scan reads",
+        )
         names = names[:MAX_CONVERSION_PACKAGE_FILES]
     for name in names:
         path = os.path.join(conversion_dir, *name.split("/"))

