@@ -589,10 +589,128 @@ def _has_anchor(alternative):
     return any(token in text for token in _ANCHOR_TOKENS)
 
 
+def _literal_prefix(branch):
+    """The leading run of `branch` that any match must contain verbatim.
+
+    Stops at the first construct that is not a literal character, and gives back
+    a character a quantifier could drop, so the result is always required.
+    """
+    out, i = [], 0
+    while i < len(branch):
+        char = branch[i]
+        if char == "\\":
+            if i + 1 >= len(branch):
+                break
+            nxt = branch[i + 1]
+            if nxt.isalnum():
+                break            # \s, \d, \b ... a class or an assertion
+            out.append(nxt)
+            i += 2
+            continue
+        if char in "[](){}|.^$":
+            break
+        if char in "*+?{":
+            # Applies to the character just read, which is therefore optional.
+            if out:
+                out.pop()
+            break
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def _literal_groups(alternative):
+    """Every `(?:a|b|c)` in `alternative` whose match is mandatory, as branch lists.
+
+    Character classes are stepped over rather than skipped: the group this exists
+    for is the credential-marker alternation, and every branch of it ends in one
+    (`\\.ssh[/\\\\]`), so a scanner that gave up at `[` never saw the only group
+    worth probing.
+    """
+    groups, i = [], 0
+    while i < len(alternative):
+        if alternative[i] == "\\":
+            i += 2
+            continue
+        if alternative[i] == "[":
+            i += 1
+            if i < len(alternative) and alternative[i] == "^":
+                i += 1
+            if i < len(alternative) and alternative[i] == "]":
+                i += 1
+            while i < len(alternative) and alternative[i] != "]":
+                i += 2 if alternative[i] == "\\" else 1
+            i += 1
+            continue
+        if not alternative.startswith("(?:", i):
+            i += 1
+            continue
+        body, j, depth = [], i + 3, 0
+        while j < len(alternative):
+            char = alternative[j]
+            if char == "\\":
+                body.append(alternative[j:j + 2])
+                j += 2
+                continue
+            if char == "[":
+                k = j + 1
+                if k < len(alternative) and alternative[k] == "^":
+                    k += 1
+                if k < len(alternative) and alternative[k] == "]":
+                    k += 1
+                while k < len(alternative) and alternative[k] != "]":
+                    k += 2 if alternative[k] == "\\" else 1
+                body.append(alternative[j:k + 1])
+                j = k + 1
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            body.append(char)
+            j += 1
+        if j >= len(alternative):
+            break
+        # A group a quantifier can skip is not required.
+        if j + 1 >= len(alternative) or alternative[j + 1] not in "?*{":
+            groups.append("".join(body).split("|"))
+        i = j + 1
+    return groups
+
+
+def _required_literal_probes(alternative, flags):
+    """Regexes matching literals that EVERY match of `alternative` must contain.
+
+    Bounding the negated class made this pattern's cost linear in the input, but
+    the number of candidate starts stays attacker-controlled: RE_CRED_ACCESS over
+    a single line of repeated `open(` ran about 3.2s per MB, so roughly 26s at the
+    8 MiB scan cap, synchronously and before the converter runs. A credential rule
+    cannot match without one of its credential markers, and that is one literal
+    pass, so a file carrying none is rejected up front instead of being walked
+    once per call prefix.
+
+    Every qualifying group, not the most promising one: the marker group and the
+    call-prefix group are both required, so probing both is both exact and more
+    selective than either. Exact rather than heuristic throughout, so nothing that
+    would have matched is skipped.
+    """
+    probes = []
+    for branches in _literal_groups(alternative):
+        if len(branches) < 2:
+            continue
+        prefixes = [_literal_prefix(branch) for branch in branches]
+        if not all(len(prefix) >= 3 for prefix in prefixes):
+            continue         # too short to be worth a pass, or not all literal
+        probes.append(re.compile("|".join(re.escape(x) for x in prefixes), flags))
+    return probes
+
+
 def _build_evaluator(pattern):
     """Compile `pattern` into alternatives of ordered, individually bounded segments.
 
-    Returns `(alternatives, per_line_flags)`, one flag per alternative. A set
+    Returns `(alternatives, per_line_flags, probes)`, one of each per alternative. A set
     flag says the caller must apply that alternative's segments to one line at a
     time: a non-DOTALL `.*` cannot cross a newline, so that is what the pattern
     already meant, and it is the only thing that bounds the span when the file is
@@ -611,9 +729,14 @@ def _build_evaluator(pattern):
     dotall = bool(pattern.flags & re.DOTALL)
     alternatives = []
     per_line_flags = []
+    probes = []
     for alternative in _split_top_level_alternatives(pattern.pattern):
         segments = None
         per_line = False
+        probes.append(_required_literal_probes(
+            alternative.decode("latin-1") if isinstance(alternative, bytes) else alternative,
+            pattern.flags,
+        ))
         if ".*" in (
             alternative.decode("latin-1") if isinstance(alternative, bytes) else alternative
         ):
@@ -630,7 +753,7 @@ def _build_evaluator(pattern):
             [re.compile(_bound_class_repeats(s), pattern.flags) for s in segments]
         )
         per_line_flags.append(per_line)
-    return alternatives, per_line_flags
+    return alternatives, per_line_flags, probes
 
 
 _EVALUATORS = {}
@@ -641,7 +764,7 @@ def _evaluator(pattern):
         try:
             _EVALUATORS[pattern] = _build_evaluator(pattern)
         except Exception:
-            _EVALUATORS[pattern] = ([[pattern]], [False])
+            _EVALUATORS[pattern] = ([[pattern]], [False], [[]])
     return _EVALUATORS[pattern]
 
 
@@ -658,9 +781,11 @@ def _segments_match(segments, text, start = 0, end = None):
 
 def _matches(pattern, text):
     """`bool(pattern.search(text))`, without the backtracking blowup."""
-    alternatives, per_line_flags = _evaluator(pattern)
+    alternatives, per_line_flags, probes = _evaluator(pattern)
     line_bound = []
-    for segments, per_line in zip(alternatives, per_line_flags):
+    for segments, per_line, probe in zip(alternatives, per_line_flags, probes):
+        if any(not required.search(text) for required in probe):
+            continue      # a literal this alternative requires is nowhere in the file
         if per_line:
             line_bound.append(segments)
         elif _segments_match(segments, text):

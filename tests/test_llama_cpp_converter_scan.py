@@ -617,6 +617,84 @@ def test_hostile_input_cannot_stall_a_pattern(scan, name, filler):
     assert time.perf_counter() - started < 5.0
 
 
+def test_a_wall_of_call_prefixes_cannot_stall_the_credential_rule(scan):
+    """Bounding the negated class made the cost linear, not small.
+
+    RE_CRED_ACCESS still restarted at every `open(`, about 3.2s per MB measured,
+    so a single line of them at the 8 MiB scan cap held up the export for roughly
+    half a minute before the converter even ran, with no regex timeout in either
+    mode. A credential rule cannot match without a credential marker, and this
+    file has none.
+    """
+    import time
+
+    text = "open(" * (scan.MAX_SCAN_BYTES // 5)
+    started = time.perf_counter()
+    assert scan._matches(scan.RE_CRED_ACCESS, text) is False
+    assert time.perf_counter() - started < 5.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x = open(os.path.expanduser('~/.ssh/id_rsa')).read()",
+        "data = Path('/home/u/.aws/credentials.json').read_text()",
+        "p = os.path.join(home, '.kube', 'config')",
+        "cfg = open('.env')",
+        "read_bytes(  '/etc/shadow'  )",
+    ],
+)
+def test_the_prefilter_never_costs_a_real_credential_match(scan, text):
+    """The prefilter is only sound if its literals are genuinely required, so
+    every shape the rule is meant to catch has to survive it."""
+    assert bool(scan.RE_CRED_ACCESS.search(text)) is True, "fixture must match the raw pattern"
+    assert scan._matches(scan.RE_CRED_ACCESS, text) is True
+
+
+def test_every_probe_is_a_literal_the_pattern_really_requires(scan):
+    """A probe that is not required would silently drop findings, and the failure
+    would look exactly like a clean file. Checked against the pattern itself:
+    deleting the probed literal from a matching text must stop the raw pattern
+    matching too."""
+    for name, pattern in scan.VENDORED_PATTERNS.items():
+        alternatives, _flags, probes = scan._evaluator(pattern)
+        for required in probes:
+            for probe in required:
+                # Every branch of a probe must appear in the pattern's own source,
+                # which is what makes it a requirement rather than a guess.
+                for literal in probe.pattern.split("|"):
+                    plain = literal.replace("\\", "")
+                    assert plain and plain in pattern.pattern.replace("\\", ""), (
+                        f"{name}: probe literal {plain!r} is not in the pattern"
+                    )
+
+
+@pytest.mark.parametrize(
+    "source, subject, probed",
+    [
+        (r"open\((?:alpha|bravo)x", "open(alphax", True),
+        # The quantifier can skip the whole group, so nothing in it is required.
+        (r"open\((?:alpha|bravo)?x", "open(x", False),
+        (r"open\((?:alpha|bravo)*x", "open(x", False),
+        # Two required groups are both probed, and both must be satisfied.
+        (r"(?:alpha|bravo)\s*(?:charlie|deltaa)", "alpha charlie", True),
+    ],
+    ids = ["required", "optional ?", "optional *", "two required"],
+)
+def test_an_optional_group_is_never_treated_as_required(scan, source, subject, probed):
+    """No shipped pattern has an optional literal group today, so this guard has
+    nothing to stand on unless it is exercised directly. Getting it wrong is the
+    dangerous direction: the scan would go quiet on a file it should report, and
+    a false negative here looks exactly like a clean converter.
+    """
+    import re as _re
+
+    pattern = _re.compile(source)
+    assert bool(pattern.search(subject)) is True, "fixture must match the raw pattern"
+    assert bool(scan._required_literal_probes(source, 0)) is probed
+    assert scan._matches(pattern, subject) is True
+
+
 def test_hostile_file_scans_in_reasonable_time(scan):
     import time
 
