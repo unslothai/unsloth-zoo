@@ -48,7 +48,6 @@ import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
 from functools import lru_cache
-import inspect
 import contextlib
 import importlib.util
 import tempfile
@@ -277,6 +276,15 @@ def _resolve_bundle_convert_script():
 pass
 
 
+# `sys.path` and `sys.modules` are process-global, so two conversions swapping different
+# gguf trees at once would interleave: one read back parses with the other's package, and
+# whichever cleanup runs last restores a temporary package over the process's own. Nothing
+# stopped that before, and the read back now runs on every export rather than only when a
+# caller asked for it, so the swap is serialised. Reentrant, since the body of one swap
+# can reach code that opens another with the same tree.
+_GGUF_MODULE_SWAP_LOCK = threading.RLock()
+
+
 @contextlib.contextmanager
 def use_local_gguf(gguf_py_path = None):
     """Context manager to temporarily use llama.cpp's local gguf-py
@@ -286,7 +294,15 @@ def use_local_gguf(gguf_py_path = None):
     existing caller gets. `convert_to_gguf` passes the tree it actually
     resolved for the converter child, so the file is read back with the same
     `gguf` that wrote it rather than with whatever the parent happens to have.
+
+    Only one swap runs at a time: see `_GGUF_MODULE_SWAP_LOCK`.
     """
+    with _GGUF_MODULE_SWAP_LOCK:
+        yield from _use_local_gguf(gguf_py_path)
+
+
+def _use_local_gguf(gguf_py_path):
+    """The swap itself, run under `_GGUF_MODULE_SWAP_LOCK`."""
     # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())

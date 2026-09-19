@@ -1252,6 +1252,50 @@ def test_the_named_tree_takes_precedence_over_every_other_path_entry(llama_cpp, 
         _sys.path[:] = original
 
 
+def test_two_threads_cannot_swap_gguf_trees_at_once(llama_cpp, tmp_path):
+    """`sys.path` and `sys.modules` are process-global, so two conversions swapping
+    different gguf trees at once would interleave: one read back parses with the other's
+    package, and whichever cleanup runs last restores a temporary package over the
+    process's own. The read back now runs on every export rather than only when a caller
+    asked for it, so the swap has to be serialised.
+    """
+    import threading
+
+    first, _location = _fake_gguf_tree(tmp_path / "one")
+    second, _location = _fake_gguf_tree(tmp_path / "two")
+
+    inside = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    def hold():
+        with llama_cpp.use_local_gguf(first):
+            inside.set()
+            release.wait(timeout = 10)
+            seen.append(("holder", sys.path[0]))
+
+    def overlap():
+        inside.wait(timeout = 10)
+        # The second swap must wait: entering here while the first holds the tree would
+        # put two trees on sys.path and let either cleanup restore the other's state.
+        with llama_cpp.use_local_gguf(second):
+            seen.append(("waiter", sys.path[0]))
+
+    holder = threading.Thread(target = hold)
+    waiter = threading.Thread(target = overlap)
+    holder.start()
+    waiter.start()
+    assert inside.wait(timeout = 10), "the first swap never started"
+    waiter.join(timeout = 0.5)
+    assert waiter.is_alive(), "the second swap entered while the first still held the tree"
+    release.set()
+    holder.join(timeout = 10)
+    waiter.join(timeout = 10)
+    assert not holder.is_alive() and not waiter.is_alive()
+
+    assert seen == [("holder", first), ("waiter", second)], seen
+
+
 class _RecordingNameMap:
     """Stands in for gguf-py's TensorNameMap and records how it was sized."""
 
