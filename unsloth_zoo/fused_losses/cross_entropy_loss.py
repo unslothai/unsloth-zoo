@@ -26,8 +26,8 @@ import inspect
 import functools
 import math
 import os
-from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
-from ..device_type import DEVICE_TYPE
+from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from unsloth_zoo.device_type import DEVICE_TYPE
         
 
 TARGET_GB = os.environ.get("UNSLOTH_CE_LOSS_TARGET_GB", None)
@@ -136,41 +136,72 @@ def compute_fused_ce_loss(
 pass
 
 
+# Per (token x vocab) element over the whole eager chain: bf16 logits + float32
+# upcast + saved log_softmax + backward gradient = 14, and 16 under softcapping.
+# 4 counted the logits alone.
+_CE_BYTES_PER_LOGIT = 16.0
+
+# Cap per-chunk target: on very large GPUs half the free pool rounds to a single chunk,
+# materializing full float32 logits and dominating peak memory.
+_CE_TARGET_GB_CAP = 4.0
+
+
+def _free_target_gb():
+    """Half the memory actually available to this backend, capped.
+
+    `_default_target_gb` already answers this for every backend the zoo supports, and it
+    answers it for the reason this needed: it checks `is_available()` before asking a device
+    how much memory it has, and budgets CPU, MPS and other unified-memory backends from host
+    RAM. `DEVICE_TYPE` is legitimately "cpu" or "mlx", and on a torch built without CUDA
+    `mem_get_info` does not return a number, it raises "Torch not compiled with CUDA enabled".
+    That query sat under the ordinary forward, so a CPU or Apple Silicon run died inside a
+    memory lookup rather than on anything it was computing.
+
+    Reused rather than reimplemented: a second copy that measured something different would be
+    the same bug again, one module over.
+    """
+
+    # Absolute, not `from ..tiled_mlp`: transformers' dynamic_module_utils builds the path by
+    # joining the raw regex capture onto this directory, so the relative spelling sends it looking
+    # for fused_losses/.tiled_mlp.py and every remote-code save walking this graph fails.
+    from unsloth_zoo.tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
+
+    return min(_default_target_gb(), _CE_TARGET_GB_CAP)
+
+
 @functools.cache
-def _get_chunk_multiplier(vocab_size, target_gb = None):
+def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Find current VRAM left in the GPU, and use 50% or less of it
-        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
-        free_gb = free / 1024 / 1024 / 1024
-        free_gb = free_gb * 0.5
-        # Cap per-chunk target: on very large GPUs half the free pool rounds to a
-        # single chunk, materializing full float32 logits and dominating peak memory.
-        target_gb = min(free_gb, 4.0)
+        target_gb = _free_target_gb()
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
     if target_gb <= 1e-9: # Use a small epsilon for float comparison
         raise RuntimeError("Unsloth: No or negligible GPU memory available for fused cross entropy.")
 
-    multiplier = (vocab_size * 4 / 1024 / 1024 / 1024) / (target_gb)
+    # Unchunkable allocations share the budget; if they alone exceed the target
+    # no chunk count helps, so keep the full budget instead.
+    if 0.0 < fixed_gb < target_gb:
+        target_gb = target_gb - fixed_gb
+    pass
+
+    multiplier = (vocab_size * _CE_BYTES_PER_LOGIT / 1024 / 1024 / 1024) / (target_gb)
     multiplier = multiplier / 4 # Output only multiples of 4
     return multiplier
 pass
 
-def get_chunk_size(bsz, qlen, vocab_size, target_gb = None):
+def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0):
     """Number of chunks that fits the target max memory usage."""
-    multiplier = _get_chunk_multiplier(vocab_size, target_gb)
+    multiplier = _get_chunk_multiplier(vocab_size, target_gb, fixed_gb)
     n_splits = (bsz*qlen) * multiplier
-    # n_splits * 4 == (full float32 logits GiB) / target: the exact number of
-    # chunks needed to keep every chunk within target. Round UP to the next
-    # multiple of 4 so the target stays a real ceiling. Nearest-rounding could
-    # round down (round(0.5) -> 0) and collapse a 4-8 GiB logits transient into
-    # a single uncapped chunk; a config that already fits one chunk stays at one.
+    # n_splits * 4 == (chunk transient GiB) / target. Round UP: nearest-rounding
+    # (round(0.5) -> 0) collapses a large transient into one uncapped chunk.
     exact = n_splits * 4
     if exact <= 1.0 + 1e-9:
         return 1
-    return math.ceil(exact / 4 - 1e-9) * 4
+    n_chunks = math.ceil(exact / 4 - 1e-9) * 4
+    return min(n_chunks, bsz*qlen)
 pass
 
 class UnslothFusedLoss(torch.autograd.Function):
@@ -250,7 +281,19 @@ class UnslothFusedLoss(torch.autograd.Function):
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
-            n_chunks = get_chunk_size(bsz, qlen, vocab_size, target_gb = target_gb)
+            # Memory no chunk count can shrink. Under overwrite grad_inputs
+            # aliases hidden_states; the head gradient counts twice (per chunk).
+            fixed_bytes = 0
+            if not overwrite:
+                fixed_bytes += grad_inputs.numel() * grad_inputs.element_size()
+            if grad_lm_head is not None:
+                fixed_bytes += 2 * grad_lm_head.numel() * grad_lm_head.element_size()
+            if grad_lm_head_bias is not None:
+                fixed_bytes += 2 * grad_lm_head_bias.numel() * grad_lm_head_bias.element_size()
+            n_chunks = get_chunk_size(
+                bsz, qlen, vocab_size, target_gb = target_gb,
+                fixed_gb = fixed_bytes / 1024 / 1024 / 1024,
+            )
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Fused CE Loss [bsz={bsz}][qlen={qlen}][vocab_size={vocab_size}][n_chunks={n_chunks}]")
         __shift_labels = torch.chunk(labels,                     n_chunks, dim = 0)

@@ -30,10 +30,16 @@ __all__ = [
 import torch
 import re
 import os
+import functools
+import inspect
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
+
+# get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
+QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5")
+
 
 def _is_gemma4_config(config):
     if config is None:
@@ -311,6 +317,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
     new_config.update({"head_dim" : head_dim})
 
+    # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
+    # for the 43+ architectures that set it False (GptOss, Mamba, Bloom, GPT-J...).
     new_model = AutoModelForCausalLM.from_config(
         new_config,
         attn_implementation = "eager",
@@ -478,35 +486,62 @@ def create_empty_vision_model(config, dtype = torch.float16):
     # All Unsloth Zoo code licensed under LGPLv3
     model_type = get_model_type(config)
 
+    import transformers
+    # `architectures[0]` is a raw string off the downloaded config.json, and `getattr`
+    # on the transformers namespace followed by a call is an unbounded gadget: nothing
+    # here requires it to name a model class. Restrict it to the architectures the auto
+    # mappings actually register.
+    #
+    # Checked BEFORE the SiglipVisionModel patch below, not after. That patch replaces
+    # `_init_weights` on a class shared by the whole process and undoes it at the end of
+    # this function, so raising in between would leave every later SigLIP model skipping
+    # weight init. Validate first, then touch global state.
+    architecture = config.architectures[0]
+    if not _is_known_architecture(architecture):
+        raise ValueError(
+            f"Unsloth: config.json declares architecture `{architecture}`, which is not "
+            f"a model architecture transformers registers."
+        )
+    model_cls = getattr(transformers, architecture)
+
     from transformers.models.siglip.modeling_siglip import SiglipVisionModel
 
     # Patch SiglipVisionModel to skip weight init on meta device.
-    if not hasattr(SiglipVisionModel, "_original_initialize_weights"):
+    #
+    # `_init_weights` lives on a class shared by the whole process, so the restore has to
+    # be in a `finally`. `except Exception` does not cover KeyboardInterrupt, and
+    # cancelling a cell mid-load is an ordinary thing to do in a notebook: without this,
+    # one cancel leaves weight init disabled for every SigLIP model built afterwards,
+    # silently and far from the cause.
+    #
+    # `patched_here` rather than the sentinel alone, so a nested or re-entrant call that
+    # found the patch already installed does not restore it out from under the outer call
+    # that owns it.
+    patched_here = not hasattr(SiglipVisionModel, "_original_initialize_weights")
+    if patched_here:
         SiglipVisionModel._original_initialize_weights = SiglipVisionModel._init_weights
         def _init_weights(self, module):
             return
         SiglipVisionModel._init_weights = _init_weights
 
-    import transformers
-    model_cls = getattr(transformers, config.architectures[0])
-
     try:
-        # accelerate's init_empty_weights, not transformers.modeling_utils.
-        # Default include_buffers=False keeps buffers (e.g. Gemma 3's embed_scale)
-        # as real tensors so inference-time attribute access works.
-        from accelerate import init_empty_weights
-        with init_empty_weights():
-            original_meta_model = model_cls(config)
-    except Exception as e:
-        print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
-        import traceback
-        traceback.print_exc()
-        original_meta_model = None
-
-    # Restore original SiglipVisionModel weight init
-    if hasattr(SiglipVisionModel, "_original_initialize_weights"):
-        SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
-        del SiglipVisionModel._original_initialize_weights
+        try:
+            # accelerate's init_empty_weights, not transformers.modeling_utils.
+            # Default include_buffers=False keeps buffers (e.g. Gemma 3's embed_scale)
+            # as real tensors so inference-time attribute access works.
+            from accelerate import init_empty_weights
+            with init_empty_weights():
+                original_meta_model = model_cls(config)
+        except Exception as e:
+            print(f"Failed to create original_meta_model for {model_cls.__name__}. Error {e}")
+            import traceback
+            traceback.print_exc()
+            original_meta_model = None
+    finally:
+        # Restore original SiglipVisionModel weight init
+        if patched_here and hasattr(SiglipVisionModel, "_original_initialize_weights"):
+            SiglipVisionModel._init_weights = SiglipVisionModel._original_initialize_weights
+            del SiglipVisionModel._original_initialize_weights
 
 
     new_config = deepcopy(config)
@@ -546,7 +581,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
-    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+    if model_type in QWEN_VL_MERGED_QKV_TYPES:
         new_config.vision_config.out_hidden_size = 1
 
     num_layers = max(text_layers, vision_layers)
@@ -569,6 +604,110 @@ def create_empty_model(config, dtype = torch.float16, is_vision_model = False):
     layer_names = sum(layer_templates.values(), [])
 
     return new_model, original_meta_model, num_layers, layer_names
+
+
+@functools.lru_cache(maxsize = 1)
+def _registered_architectures():
+    """Every model class name the transformers auto mappings register.
+
+    `MODEL_*_MAPPING_NAMES` maps a model_type to a *model* class name, which is what
+    `config.architectures` holds. `CONFIG_MAPPING_NAMES` lives in the same module and
+    maps to config classes, so it is excluded by the `MODEL_` prefix.
+    """
+    from transformers.models.auto import modeling_auto
+
+    names = set()
+    for attribute in dir(modeling_auto):
+        if not (attribute.startswith("MODEL_") and attribute.endswith("_MAPPING_NAMES")):
+            continue
+        mapping = getattr(modeling_auto, attribute, None)
+        if not isinstance(mapping, dict): continue
+        for value in mapping.values():
+            if isinstance(value, str): names.add(value)
+            elif isinstance(value, (list, tuple)):
+                names.update(v for v in value if isinstance(v, str))
+    return frozenset(names)
+pass
+
+
+def _is_known_architecture(architecture):
+    """Is `architecture` a name we are willing to resolve on the transformers namespace?
+
+    `config.architectures[0]` is a raw string off a downloaded config.json, and
+    `getattr(transformers, name)` followed by a call is an unbounded gadget - nothing
+    otherwise requires it to name a model. Two ways to qualify:
+
+      - the auto mappings register it. This is the primary check and it deliberately
+        admits the lazy `Placeholder` transformers substitutes when a model's optional
+        dependency is missing, so transformers' own "install X" error still surfaces
+        instead of being masked by ours.
+      - it is a PreTrainedModel subclass. Covers a class that exists but is not in the
+        mappings on this version.
+    """
+    import transformers
+
+    if not isinstance(architecture, str) or not architecture.isidentifier():
+        return False
+    if architecture in _registered_architectures():
+        return True
+    candidate = getattr(transformers, architecture, None)
+    return isinstance(candidate, type) and issubclass(candidate, transformers.PreTrainedModel)
+pass
+
+
+# `blocks[0]` or `blocks[0][1]`: a name followed by digit-only subscripts. The name part
+# is "anything without brackets" rather than an ASCII identifier, because Python
+# identifiers are not ASCII-only and PyTorch registers a submodule under a Unicode name
+# without complaint. Only the subscripts are constrained, which is what keeps this a
+# name-and-index walk; the name itself is handed straight to getattr, exactly as the
+# eval this replaces did.
+_INDEXED_COMPONENT = re.compile(r"([^\[\]]+)((?:\[\d+\])+)")
+_INDEX = re.compile(r"\[(\d+)\]")
+
+
+def _get_module_attribute(root, path):
+    """ Reads a dotted module path, e.g. `visual.blocks.0.norm.weight`
+
+    The read counterpart of `_set_module_attribute`. Replaces `eval(f"model.{path}")`:
+    same result for every path an attribute expression could express, plus numeric
+    segments, and no way for a path component to be Python rather than a name.
+    An empty `path` returns `root`, matching what `eval("model")` used to give.
+
+    Bracket components (`blocks[0]`) are resolved as well. `peft_utils` rewrites
+    `.0.` to `[0].` before splitting, and one of its two call sites can hand back a
+    path whose last component still carries the brackets, which `eval` indexed happily
+    and a bare `getattr` cannot. Indices are digits only, so this stays a name-and-index
+    walk rather than an expression.
+    """
+    if path == "": return root
+    obj = root
+    for part in path.split("."):
+        if part.isdigit():
+            obj = obj[int(part)]
+            continue
+        match = _INDEXED_COMPONENT.fullmatch(part)
+        if match is None:
+            obj = getattr(obj, part)
+            continue
+        obj = getattr(obj, match.group(1))
+        for index in _INDEX.findall(match.group(2)):
+            obj = obj[int(index)]
+    return obj
+pass
+
+
+def _set_module_attribute(root, path, value):
+    """ Assigns `value` at a dotted module path, e.g. `visual.blocks.0.norm.weight` """
+    parts = path.split(".")
+    obj = root
+    for part in parts[:-1]:
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    last = parts[-1]
+    if last.isdigit():
+        obj[int(last)] = value
+    else:
+        setattr(obj, last, value)
+pass
 
 
 @torch.inference_mode
@@ -665,17 +804,28 @@ def set_additional_modules(new_model, quant_state_dict, config):
     print(f'Performing substitution for {additional_keys=}')
 
     for key in additional_keys:
-        # May live under new_model.model. instead of new_model.
-        for prefix in ['new_', 'new_model.']:
+        val = quant_state_dict[key]
+        val = _unwrap_tensor(val)
+        if isinstance(val, torch.Tensor):
+            val = torch.nn.Parameter(val, requires_grad = False)
+        # May live under new_model.model. instead of new_model. Walking the dotted
+        # path beats exec: exec cannot express blocks.0.weight, and a failure here
+        # is reported instead of swallowed.
+        candidates = []
+        if key.startswith("model."):
+            candidates.append(key[len("model."):])
+        candidates.append(key)
+        errors = []
+        for path in candidates:
             try:
-                val = quant_state_dict[key]
-                val = _unwrap_tensor(val)
-                if isinstance(val, torch.Tensor):
-                    val = torch.nn.Parameter(val,requires_grad=False)
-                exec(f"{prefix}{key} = val")
+                _set_module_attribute(new_model, path, val)
                 break
-            except:
-                continue
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError) as exception:
+                errors.append(f"{path}: {exception}")
+        else:
+            logger.warning(
+                f"Unsloth: could not set `{key}` on the model - tried {', '.join(errors)}"
+            )
 
     pass
 pass
@@ -745,8 +895,23 @@ def finalize_huggingface_model(
                         f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
                     )
             if hasattr(module, "rotary_pos_emb") and vision_config is not None:
-                head_dim = vision_config.hidden_size // vision_config.num_heads
-                module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+                # transformers 4 takes a positional dim, transformers 5 takes the vision
+                # config. Dispatch on the signature rather than guessing, since an int
+                # is silently accepted as a config. device= is deprecated in 5.18, so
+                # construct then move, and warn rather than abort on a signature we do
+                # not know.
+                rotary_class = module.rotary_pos_emb.__class__
+                try:
+                    if "config" in inspect.signature(rotary_class.__init__).parameters:
+                        new_rotary = rotary_class(vision_config)
+                    else:
+                        head_dim = vision_config.hidden_size // vision_config.num_heads
+                        new_rotary = rotary_class(head_dim//2)
+                    module.rotary_pos_emb = new_rotary.to(target_device)
+                except Exception as rotary_reinit_error:
+                    logger.warning(
+                        f"Unsloth: skipped rotary_pos_emb reinit for {module_name}: {rotary_reinit_error}"
+                    )
             if hasattr(module, "rotary_emb_local"):
                 if local_rope_config is None:
                     local_rope_config = deepcopy(text_config)
@@ -1074,33 +1239,36 @@ def get_model_type(config):
 def get_model_layer_counts(config):
     """Layer counts per model type (int for causal_lm, dict for VL models)."""
     model_type = get_model_type(config)
+    # get_model_type returns the vision name, so each branch matches both spellings.
+    text_config = getattr(config, "text_config", config)
+    vision_config = getattr(config, "vision_config", config)
 
-    if model_type == "mllama":
+    if model_type in ("mllama", "mllama_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
-            "global_layers": getattr(config.vision_config, "num_global_layers", 8),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
+            "global_layers": getattr(vision_config, "num_global_layers", 8),
         }
     elif model_type == "qwen2_5_vl":
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "depth", 32),
+            "vision_layers": getattr(vision_config, "depth", 32),
         }
-    elif model_type == "qwen3_vl":
+    elif model_type in ("qwen3_vl", "qwen3_vl_vision"):
         return {
             "text_layers": getattr(config, "num_hidden_layers", 36),
-            "vision_layers": getattr(config.vision_config, "depth", 27),
-            "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
+            "vision_layers": getattr(vision_config, "depth", 27),
+            "deepstack_layers": getattr(vision_config, "deepstack_depth", 3),
         }
-    elif model_type == "gemma4":
+    elif model_type in ("gemma4", "gemma4_vision", "gemma4_unified", "gemma4_unified_vision"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
         }
-    elif model_type == "gemma3":
+    elif model_type in ("gemma3", "siglip_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
         }
     else:
         # Standard causal LM
@@ -1322,7 +1490,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+                    if model_type in QWEN_VL_MERGED_QKV_TYPES:
                         # HF keeps merged qkv for these (qwen-2.5-vl, qwen-3-vl)
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:

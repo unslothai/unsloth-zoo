@@ -17,6 +17,9 @@
 __all__ = [
     "convert_to_gguf",
     "quantize_gguf",
+    "resolve_imatrix_file",
+    "quant_requires_imatrix",
+    "IMATRIX_REQUIRED_QUANTS",
     "use_local_gguf",
     "install_llama_cpp",
     "check_llama_cpp",
@@ -26,6 +29,11 @@ __all__ = [
     "IS_WINDOWS",
 ]
 
+import collections
+import errno
+import marshal
+import hashlib
+import threading
 import subprocess
 import sys
 import os
@@ -121,16 +129,63 @@ BAD_OUTCOMES = {
     "Failed "                    : "",
 }
 
-# Check environments
-keynames = "\n" + "\n".join(os.environ.keys())
-IS_COLAB_ENVIRONMENT  = "\nCOLAB_"  in keynames
-IS_KAGGLE_ENVIRONMENT = "\nKAGGLE_" in keynames
+# Detection lives in disk_utils so unsloth and unsloth_zoo cannot drift apart
+# on it, and so a KAGGLE_USERNAME exported for the Kaggle CLI on a laptop no
+# longer looks like a Kaggle kernel.
+try:
+    from .disk_utils import (
+        is_colab_environment as _is_colab_environment,
+        is_kaggle_environment as _is_kaggle_environment,
+    )
+except ImportError:
+    # Loaded as a standalone file with no package context, which is how the
+    # tests skip unsloth_zoo's import-time device detection. Load the sibling
+    # by path rather than duplicating it.
+    import importlib.util as _importlib_util
+    _disk_utils_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_disk_utils",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "disk_utils.py"),
+    )
+    _disk_utils = _importlib_util.module_from_spec(_disk_utils_spec)
+    _disk_utils_spec.loader.exec_module(_disk_utils)
+    _is_colab_environment = _disk_utils.is_colab_environment
+    _is_kaggle_environment = _disk_utils.is_kaggle_environment
+
+# Static scan of the converter we download and execute. Vendored inside the
+# package rather than left in scripts/, which pyproject excludes from the wheel.
+try:
+    from .converter_scan import (
+        RE_ARGPARSE_DEFAULT,
+        ConverterScanError,
+        scan_is_disabled,
+        scan_is_strict,
+        warn_on_suspicious_converter,
+    )
+except ImportError:
+    # Standalone file load with no package context, as above.
+    import importlib.util as _importlib_util
+    _converter_scan_spec = _importlib_util.spec_from_file_location(
+        "_unsloth_zoo_converter_scan",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "converter_scan.py"),
+    )
+    _converter_scan = _importlib_util.module_from_spec(_converter_scan_spec)
+    _converter_scan_spec.loader.exec_module(_converter_scan)
+    RE_ARGPARSE_DEFAULT = _converter_scan.RE_ARGPARSE_DEFAULT
+    ConverterScanError = _converter_scan.ConverterScanError
+    scan_is_disabled = _converter_scan.scan_is_disabled
+    scan_is_strict = _converter_scan.scan_is_strict
+    warn_on_suspicious_converter = _converter_scan.warn_on_suspicious_converter
+
+IS_COLAB_ENVIRONMENT  = _is_colab_environment()
+IS_KAGGLE_ENVIRONMENT = _is_kaggle_environment()
 IS_WINDOWS = sys.platform == "win32"
-KAGGLE_TMP = "/tmp"
-del keynames
 
 # Default llama.cpp location: ~/.unsloth/llama.cpp
 # Override with UNSLOTH_LLAMA_CPP_PATH env var to use a custom llama.cpp install
+#
+# Deliberately does NOT move on Kaggle: only /kaggle/working is small there. A
+# probe kernel measured home on the same large overlay as /tmp (1026.8GB free
+# of 8062.4GB on both), so the checkout and build tree already have room.
 UNSLOTH_HOME = os.path.join(str(Path.home()), ".unsloth")
 LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_PATH",
@@ -259,8 +314,35 @@ def use_local_gguf():
         logger.debug("Restored original Python environment")
 pass
 
+_AUTO_INSTALL_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+
+
+def _auto_install_enabled() -> bool:
+    """Read at the attempt, not at import, so setting it after `import unsloth` works."""
+    return os.environ.get("UNSLOTH_AUTO_INSTALL", "1").strip().upper() \
+        in _AUTO_INSTALL_TRUE_VALUES
+
+
+def _stdin_is_usable() -> bool:
+    """Whether sys.stdin still refers to a live descriptor we could have read from."""
+    try:
+        os.fstat(sys.stdin.fileno())
+    except Exception:
+        # None, closed, detached, or a wrapper with no real fd. All mean no one to ask.
+        return False
+    return True
+
+
 def install_package(package, sudo = False, print_output = False, print_outputs = None, system_type = "debian"):
     # All Unsloth Zoo code licensed under LGPLv3
+
+    # Checked before the platform branch. The Windows arm returns early and the Colab
+    # and Kaggle paths skip the prompt, so an opt out placed any lower would miss them.
+    if not _auto_install_enabled():
+        raise RuntimeError(
+            f"Unsloth: Installation of `{package}` was cancelled (UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
 
     if IS_WINDOWS:
         # Per-package winget config aligned with setup.ps1
@@ -321,7 +403,54 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
 
     print(f"Unsloth: Installing packages: {package}")
     if not (IS_COLAB_ENVIRONMENT or IS_KAGGLE_ENVIRONMENT):
-        acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        # input() raises in non-interactive contexts. Under `docker run` without -i, or with
+        # stdin from /dev/null, this used to propagate through save_pretrained_gguf as
+        # `RuntimeError: Unsloth: GGUF conversion failed: EOF when reading a line`.
+        try:
+            acceptance = input(f"Missing system packages. We need to execute `{install_cmd}` - do you accept? Press ENTER. Type NO if not.")
+        except (EOFError, RuntimeError, ValueError, OSError) as exception:
+            # A stdin closed AFTER interpreter start raises neither EOFError nor
+            # RuntimeError. Measured on CPython 3.13:
+            #   sys.stdin.close()  -> ValueError: I/O operation on closed file.
+            #   os.close(0)        -> OSError: [Errno 9] Bad file descriptor
+            #   sys.stdin = None   -> RuntimeError: lost sys.stdin
+            #   stdin=/dev/null    -> EOFError
+            # Daemon and process wrappers close fd 0, so without the first two a headless
+            # export still dies on the input() call this whole branch exists to survive.
+            # All four mean the same thing: there is no one to ask. The terminal check
+            # below still distinguishes Ctrl-D, and it holds for these too, since a closed
+            # sys.stdin makes isatty() raise and a closed fd 0 makes it return False.
+            #
+            # Each type is accepted only in the exact state that means "stdin is gone".
+            # An unrelated I/O error on a live stdin is not consent: EIO from a serial
+            # console, or a ValueError out of a custom stdin wrapper, must still propagate.
+            # CPython raises RuntimeError for a lost stdout or stderr too.
+            if isinstance(exception, RuntimeError) and sys.stdin is not None:
+                raise
+            # EBADF on its own is not enough. input() writes the prompt to stdout before
+            # it reads, so a closed fd 1 raises EBADF while fd 0 is open, non-tty and
+            # holding an unread answer. Reproduced on CPython: `python -u` with fd 1
+            # closed gives OSError(9) with sys.stdin.closed and isatty() both False.
+            # So ask stdin itself, not the errno.
+            if isinstance(exception, OSError) and (
+                exception.errno != errno.EBADF or _stdin_is_usable()
+            ):
+                raise
+            if isinstance(exception, ValueError) and not getattr(sys.stdin, "closed", False):
+                raise
+            # EOFError on a terminal is Ctrl-D and still cancels. EOFError with no terminal
+            # means there was never anyone to ask, which is the same implicit ENTER the
+            # prompt already documents. A stdin whose isatty() raises counts as no terminal.
+            try:
+                _stdin_is_a_tty = sys.stdin is not None and sys.stdin.isatty()
+            except Exception:
+                _stdin_is_a_tty = False
+            if _stdin_is_a_tty:
+                raise RuntimeError(
+                    f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
+                    "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+                )
+            acceptance = ""
         if "no" in str(acceptance).lower():
             raise RuntimeError(
                 f"Unsloth: Execution of `{install_cmd}` was cancelled!\n"\
@@ -981,7 +1110,7 @@ def _place_prebuilt_binaries(extracted_root, install_folder):
         raise RuntimeError("Unsloth: No executables found in the prebuilt archive.")
 
 
-def _hydrate_converter_sources(tag, install_folder, source_assets = None):
+def _hydrate_converter_sources(tag, install_folder, source_assets = None, checksums = None):
     """Copy convert_hf_to_gguf.py, conversion/ and gguf-py/ from the same-tag
     source tarball so check_llama_cpp and the converter machinery work
     without a git checkout, and tensor mappings match the binaries.
@@ -992,16 +1121,44 @@ def _hydrate_converter_sources(tag, install_folder, source_assets = None):
     (llama.cpp-source-{tag}.tar.gz, passed in via source_assets) so the converter
     exactly matches the fork build; otherwise strip the -mix-... suffix and pull
     the matching upstream tag from ggml-org. Plain ggml-org tags carry no suffix,
-    so this is a no-op for them (upstream_tag == tag)."""
+    so this is a no-op for them (upstream_tag == tag).
+
+    The archive is verified against the release's own published sha256 when the
+    release publishes one for it. These are the files the converter subprocess
+    executes, and they were arriving unverified: the sha256 in
+    _stage_prebuilt_install covers the BINARY asset, and this is a second,
+    separate download. The fork's llama-prebuilt-sha256.json does carry an entry
+    for llama.cpp-source-{tag}.tar.gz, so on that path there is something to
+    check against. The ggml-org codeload fallback publishes no digest, so it is
+    reported rather than silently trusted."""
     fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
+    expected_sha256 = None
     if source_assets and fork_source_name in source_assets:
         source_url = source_assets[fork_source_name]
+        expected_sha256 = ((checksums or {}).get(fork_source_name) or {}).get("sha256")
+        if not expected_sha256:
+            logger.warning(
+                "Unsloth: The %s release publishes no sha256 for %s, so the "
+                "converter sources it holds cannot be verified.", tag, fork_source_name,
+            )
     else:
         upstream_tag = tag.split("-mix-")[0]
         source_url = LLAMA_CPP_SOURCE_TARBALL.format(tag = upstream_tag)
+        logger.warning(
+            "Unsloth: Falling back to the ggml-org source archive for %s, which "
+            "publishes no sha256, so the converter sources cannot be verified.",
+            upstream_tag,
+        )
     with tempfile.TemporaryDirectory(dir = os.path.dirname(install_folder) or ".") as source_dir:
         archive_path = os.path.join(source_dir, "source.tar.gz")
         _download_archive(source_url, archive_path)
+        if expected_sha256:
+            actual = _sha256_file(archive_path)
+            if actual != expected_sha256:
+                raise RuntimeError(
+                    f"Unsloth: sha256 mismatch for {fork_source_name}: expected "
+                    f"{expected_sha256}, got {actual}"
+                )
         extract_dir = os.path.join(source_dir, "extracted")
         os.makedirs(extract_dir)
         _extract_archive(archive_path, extract_dir)
@@ -1032,7 +1189,7 @@ def _write_prebuilt_marker(install_folder, tag, asset_name, repo = "ggml-org/lla
         logger.warning("Unsloth: Could not write prebuilt marker (%s).", e)
 
 
-def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp", source_assets = None):
+def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp", source_assets = None, checksums = None):
     """Download one prebuilt asset, verify, hydrate, validate in staging,
     then activate into llama_cpp_folder. Raises on any failure. source_assets is
     the release's asset map, used so the converter sources hydrate from the fork's
@@ -1055,7 +1212,9 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
         staged_install = os.path.join(staging, "install")
         os.makedirs(staged_install)
         _place_prebuilt_binaries(_single_extracted_root(extract_dir), staged_install)
-        _hydrate_converter_sources(tag, staged_install, source_assets = source_assets)
+        _hydrate_converter_sources(
+            tag, staged_install, source_assets = source_assets, checksums = checksums,
+        )
         _write_prebuilt_marker(staged_install, tag, asset_name, repo = repo)
         check_llama_cpp(llama_cpp_folder = staged_install)
 
@@ -1149,6 +1308,7 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
                     expected_sha256 = (checksums.get(asset_name) or {}).get("sha256"),
                     repo = repo,
                     source_assets = source_assets,
+                    checksums = checksums,
                 )
             except Exception as e:
                 logger.warning("Unsloth: Prebuilt %s failed (%s) - trying next option.", asset_name, e)
@@ -1192,6 +1352,7 @@ def install_llama_cpp(
 
     needs_clone = False
     needs_build = False
+    needs_wipe  = False
 
     # Ensure ~/.unsloth/ exists before we try to use it
     os.makedirs(UNSLOTH_HOME, exist_ok=True)
@@ -1221,14 +1382,11 @@ def install_llama_cpp(
         is_prebuilt_install = os.path.isfile(os.path.join(llama_cpp_folder, UNSLOTH_PREBUILT_INFO_FILENAME))
         if not (is_source_checkout or is_prebuilt_install):
             print("Unsloth: llama.cpp repo appears corrupted (missing src/ggml/common) - will re-clone")
-            # C4: Only delete if the path is safe
-            if _is_safe_to_delete(llama_cpp_folder):
-                shutil.rmtree(llama_cpp_folder)
-            else:
-                raise RuntimeError(
-                    f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
-                    f"Please manually remove or fix it."
-                )
+            # Deleting is part of installing, so it waits for the opt-out check below.
+            # `llama_cpp_folder` can be a custom path holding the user's own files, and
+            # wiping it only to then report that installation was declined would be the
+            # worst of both outcomes.
+            needs_wipe = True
             needs_clone = True
             needs_build = True
         else:
@@ -1245,6 +1403,29 @@ def install_llama_cpp(
         needs_clone = True
         needs_build = True
     pass
+
+    # Everything below this point installs something: the prebuilt download, the clone, and
+    # do_we_need_sudo, which probes by RUNNING `apt-get update -y` / `pacman -Sy` / a yum
+    # check-update and then retrying under sudo. Checking the opt-out only inside
+    # install_package left all of that reachable, so UNSLOTH_AUTO_INSTALL=0 still fetched and
+    # activated a prebuilt llama.cpp, and still ran a package-manager update as root.
+    # An existing install is unaffected: that returns above without reaching here.
+    if (needs_build or needs_clone) and not _auto_install_enabled():
+        raise RuntimeError(
+            "Unsloth: llama.cpp is not installed and automatic installation was declined "
+            "(UNSLOTH_AUTO_INSTALL=0)!\n"\
+            "Please install llama.cpp manually via https://docs.unsloth.ai/basics/troubleshooting-and-faqs#how-do-i-manually-save-to-gguf"
+        )
+
+    if needs_wipe:
+        # C4: Only delete if the path is safe
+        if _is_safe_to_delete(llama_cpp_folder):
+            shutil.rmtree(llama_cpp_folder)
+        else:
+            raise RuntimeError(
+                f"Unsloth: llama.cpp at `{llama_cpp_folder}` appears corrupted but is not in a safe location to delete.\n"
+                f"Please manually remove or fix it."
+            )
 
     # Prefer official prebuilt binaries before any source-build work
     # (no system package installs, no clone, no compile).
@@ -1479,30 +1660,126 @@ def install_llama_cpp(
 pass
 
 
-def _load_module_from_path(filepath, module_name):
-    spec = importlib.util.spec_from_file_location(module_name, filepath)
-    if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load spec for module {module_name} at {filepath}")
-    module = importlib.util.module_from_spec(spec)
-    script_dir = os.path.dirname(os.path.abspath(filepath))
-    original_path = sys.path[:]
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-    # Register module before execution to handle circular imports within the script if any
-    sys.modules[module_name] = module
+def _extract_archs_from_monolith_source(source_bytes):
+    """Read (text_archs, vision_archs) out of a monolithic convert_hf_to_gguf.py.
+
+    Parsed, not imported: the file is downloaded from llama.cpp master at
+    runtime, so importing it would execute whatever the download contained.
+    Mirrors _extract_dict_keys_from_conversion_init for the package layout.
+    """
     try:
-        spec.loader.exec_module(module)
-    except Exception as e:
-        # Clean up registry if exec fails
-        del sys.modules[module_name]
-        raise ImportError(f"Failed to execute module {module_name} from {filepath}") from e
-    finally:
-        sys.path[:] = original_path
-    return module
+        tree = ast.parse(source_bytes)
+    except Exception:
+        return set(), set()
+
+    text_archs   = set()
+    vision_archs = set()
+
+    def _is_register_call(node):
+        # Matches ModelBase.register(...) / Model.register(...) / <X>.register(...)
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "register"
+            and isinstance(node.func.value, ast.Name)
+        )
+
+    def _base_names(class_node):
+        names = []
+        for base in class_node.bases:
+            if   isinstance(base, ast.Attribute): names.append(base.attr)
+            elif isinstance(base, ast.Name):      names.append(base.id)
+        return names
+
+    # class -> bases, so a class two hops below MmprojModel still counts as vision.
+    class_bases = {
+        node.name : _base_names(node)
+        for node in ast.walk(tree) if isinstance(node, ast.ClassDef)
+    }
+
+    def _inherits_mmproj(class_name, _seen = None):
+        if _seen is None: _seen = set()
+        if class_name in _seen: return False
+        _seen.add(class_name)
+        for base in class_bases.get(class_name, []):
+            if base.lower() in ("mmprojmodel", "visionmodel"): return True
+            if _inherits_mmproj(base, _seen): return True
+        return False
+
+    def _is_mmproj(class_node, call_node):
+        for keyword in call_node.keywords:
+            if keyword.arg != "model_type": continue
+            value = keyword.value
+            # model_type=ModelType.MMPROJ, or a bare MMPROJ / "mmproj"
+            name = None
+            if isinstance(value, ast.Attribute): name = value.attr
+            elif isinstance(value, ast.Name): name = value.id
+            elif isinstance(value, ast.Constant) and isinstance(value.value, str):
+                name = value.value
+            # An explicit model_type wins over the base classes.
+            if name is not None: return "mmproj" in name.lower()
+        return _inherits_mmproj(class_node.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef): continue
+        for decorator in node.decorator_list:
+            if not _is_register_call(decorator): continue
+            names = [
+                arg.value for arg in decorator.args
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+            ]
+            if not names: continue
+            if _is_mmproj(node, decorator): vision_archs.update(names)
+            else: text_archs.update(names)
+
+    # A converter may seed `_model_classes` literally instead of decorating. The
+    # import path saw those entries, so harvest them rather than report nothing.
+    def _bucket_for(key_node):
+        name = None
+        if   isinstance(key_node, ast.Attribute): name = key_node.attr
+        elif isinstance(key_node, ast.Name):      name = key_node.id
+        elif isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+            name = key_node.value
+        if name is None: return None
+        return vision_archs if "mmproj" in name.lower() else text_archs
+
+    for node in ast.walk(tree):
+        targets = node.targets if isinstance(node, ast.Assign) else \
+                  [node.target] if isinstance(node, ast.AnnAssign) else []
+        named = any(
+            (isinstance(t, ast.Name) and t.id == "_model_classes") or
+            (isinstance(t, ast.Attribute) and t.attr == "_model_classes")
+            for t in targets
+        )
+        if not named or not isinstance(node.value, ast.Dict): continue
+        for key, value in zip(node.value.keys, node.value.values):
+            bucket = _bucket_for(key)
+            if bucket is None or not isinstance(value, ast.Dict): continue
+            bucket.update(
+                k.value for k in value.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)
+            )
+    return text_archs, vision_archs
 pass
 
 
 _UNSLOTH_BRANDING_MARKER = b"# UNSLOTH_BRANDING_APPLIED"
+
+# Idempotency marker for the monolith branding patch: it edits the in-memory
+# entrypoint, so it has nowhere to put a marker comment of its own.
+_UNSLOTH_BRANDING_LINE = b"self.metadata.quantized_by = 'Unsloth'"
+
+# Same for the gguf attribute guard patch.
+_GGUF_GUARD_LINE = b"except AttributeError: gguf."
+# Reads back the names already guarded. Anchored on the `except` half: `try: gguf.X`
+# is also what the reference scan looks for, so a pattern matching both could not
+# tell "already guarded" from "needs guarding".
+_GGUF_GUARD_PATTERN = re.compile(rb"except AttributeError: gguf\.([\.A-Z_0-9]{3,}) = None")
+# The whole guard, so the reference scan can run with previous guards stripped out.
+# Otherwise it finds `gguf.X` inside its own guards and re-guards every name.
+_GGUF_GUARD_BLOCK_PATTERN = re.compile(
+    rb"try: gguf\.[\.A-Z_0-9]{3,}\r?\n?except AttributeError: gguf\.[\.A-Z_0-9]{3,} = None\r?\n?"
+)
 _BRANDING_PATTERN = re.compile(
     rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
     flags = re.MULTILINE,
@@ -1519,27 +1796,699 @@ def _get_llama_cpp_dir(local_script_info):
 pass
 
 
-def _conversion_sibling_info(llama_cpp_dir):
-    """Hashable (path, mtime, size) tuples for conversion/{__init__,base,qwen}.py,
-    folded into the patcher cache key so re-pulled checkouts re-patch. None on
-    the monolithic layout."""
-    conv_dir = os.path.join(llama_cpp_dir, "conversion")
-    init_py  = os.path.join(conv_dir, "__init__.py")
-    base_py  = os.path.join(conv_dir, "base.py")
-    qwen_py  = os.path.join(conv_dir, "qwen.py")
-    if not (os.path.isfile(init_py) and os.path.isfile(base_py)):
-        return None
-    def _stat(p):
+# Enough to cover the package a converter imports without walking a tree an
+# attacker chooses the size of. Measured against llama.cpp master: conversion/
+# holds 94 modules today, so the original 64 refused the real package on every
+# export and, under UNSLOTH_CONVERTER_SCAN_STRICT, refused the export itself.
+# A cap below the thing it is meant to read is not a safety margin.
+MAX_CONVERSION_PACKAGE_FILES = 256
+# The same bound on the traversal itself. Counting only .py files bounded what
+# gets READ but not what gets WALKED: a tree with sixty modules and a million
+# empty directories never reaches the file cap, so the whole attacker-sized
+# directory was still traversed, once per export through the cache key. Generous
+# next to any real converter package, which is dozens of entries.
+MAX_CONVERSION_PACKAGE_ENTRIES = 4096
+# And a bound on how many places get that allowance. Every root directory became
+# a location of its own, with no limit on how many there could be, so a tree with
+# thousands of top-level directories multiplied the per-location budget by
+# thousands. llama.cpp master has about twenty. Crossing this is not reported
+# separately: a root that wide trips the root location's own entry budget, which
+# already says the tree is too big to read.
+MAX_SCAN_LOCATIONS = 64
+
+# The patched converter this module writes, which for the package layout lands in
+# the llama.cpp root. It is this scan's own output, not an input: keying on it
+# meant every cache miss rewrote it, changed its mtime, and missed again on the
+# next call, so with the scan disabled each export re-fetched and re-patched the
+# converter forever. Excluded by exact name and only where it is written, never
+# by prefix: matching a prefix in every directory meant a module named
+# conversion/unsloth_convert_hf_to_gguf_payload.py was skipped by the scan and
+# the key both, which a clean __init__.py could then import and run.
+GENERATED_CONVERTER_NAME = "unsloth_convert_hf_to_gguf.py"
+
+# No single module is read whole. The converter's own entrypoint is tens of KB and
+# the scanner caps its input at 8 MiB anyway, so a module past this is one the
+# scan could not have judged in full regardless; reading it to find that out is
+# how an unverified package with one enormous or sparse module exhausted memory
+# before any finding was produced.
+MAX_MODULE_BYTES = 8 * 1024 * 1024
+MODULE_READ_CHUNK = 1024 * 1024
+
+# Everything beside the entrypoint that the entrypoint puts on sys.path and
+# imports, and so executes with exactly the privileges of the converter itself.
+# gguf-py is copied out of the same source tarball as conversion/, and that
+# tarball arrives with no digest at all, so scanning only conversion/ left a
+# payload in gguf-py/gguf/__init__.py running under a clean entrypoint and a
+# clean conversion/, strict mode included.
+IMPORTED_PACKAGE_SUBDIRS = ("conversion", "gguf-py/gguf")
+
+# The directories that end up on sys.path: the converter's own, which Python puts
+# at index 0 for the subprocess, and gguf-py, which the entrypoint inserts itself.
+# Anything directly under either is importable by its own name.
+IMPORT_ROOTS = (".", "gguf-py")
+# The packages imported by name. Only in these is a native file a Python module
+# rather than one of the prebuilt bundle's runtime libraries.
+NAMED_IMPORT_PACKAGES = frozenset(IMPORTED_PACKAGE_SUBDIRS)
+
+# Files Python will execute that a source scan cannot read. Native extensions
+# are dlopened; a .pyc in a module's own place, with no source beside it, is a
+# sourceless import and CPython runs the bytecode as the module.
+NATIVE_MODULE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib")
+BYTECODE_SUFFIXES = (".pyc", ".pyo")
+COLLECTED_MODULE_SUFFIXES = (".py",) + BYTECODE_SUFFIXES + NATIVE_MODULE_SUFFIXES
+
+
+def _purge_regenerable_bytecode(
+    package_dir, entry_limit = None, recursive = True, boundary = None,
+):
+    """Delete bytecode caches that came with an unverified package.
+
+    CPython's cache validation proves that a .pyc CLAIMS to belong to the source
+    beside it, not that its bytecode was compiled from that source: a timestamp
+    cache is accepted when the source's mtime and size match the header, and a
+    checked-hash cache when the source hashes to the value in the header. Anyone
+    who ships both files sets both, so a clean .py can be paired with arbitrary
+    marshalled code and that code is what runs. Verified directly: a
+    timestamp-validated cache whose source reads `VALUE = "clean"` imported as
+    `PWNED`. So the invalidation mode says nothing about trust, and an earlier
+    version of this file was wrong to read it that way.
+
+    Deleting is better than reporting for any cache that has a source, because
+    Python simply rebuilds it from the .py this scan did read: nothing is lost,
+    nothing legitimate breaks, and an ordinary export's own caches are removed
+    and rebuilt without a word. A sourceless .pyc is left alone and reported
+    instead, since deleting that one would break a package that needs it.
+
+    Returns the caches it could not remove, which are reported like any other
+    file Python will execute and this scan cannot read.
+    """
+    stuck = []
+    entries = 0
+    pending = [package_dir]
+    seen_directories = set()
+    while pending:
+        root = pending.pop()
+        identity = _directory_identity(root)
+        if identity is not None:
+            if identity in seen_directories:
+                continue
+            seen_directories.add(identity)
         try:
-            s = os.stat(p)
-            return (p, s.st_mtime_ns, s.st_size)
+            with os.scandir(root) as scanner:
+                for entry in scanner:
+                    entries += 1
+                    if entry_limit is not None and entries >= entry_limit:
+                        return stuck
+                    try:
+                        if entry.is_dir():
+                            # Containment, unlike the scan: the scan FOLLOWS a
+                            # symlink out of the tree because the converter's
+                            # import would, and reading is harmless. Deleting is
+                            # not. A checkout can carry a symlink pointing at an
+                            # unrelated directory, and removing caches there would
+                            # rewrite something that has nothing to do with this
+                            # export, before strict mode ever gets to refuse.
+                            if not _stays_within(boundary or package_dir, entry.path):
+                                continue
+                            if recursive:
+                                pending.append(entry.path)
+                            elif entry.name == "__pycache__" and root == package_dir:
+                                # As above: the cache belonging to this directory.
+                                pending.append(entry.path)
+                            continue
+                    except OSError:
+                        continue
+                    name = entry.name
+                    if os.path.splitext(name)[1].lower() not in BYTECODE_SUFFIXES:
+                        continue
+                    if not _has_a_source(root, name):
+                        continue        # sourceless: reported, not removed
+                    try:
+                        os.remove(entry.path)
+                    except OSError:
+                        stuck.append(
+                            os.path.relpath(entry.path, package_dir).replace(os.sep, "/")
+                        )
         except OSError:
-            return (p, 0, 0)
+            continue
+    return stuck
+
+
+# Named for the same reason PackageWalk is: this grew a field and a positional
+# read of the old shape would have been silently wrong.
+ScanLocation = collections.namedtuple("ScanLocation", "label path recursive natives skip")
+# Named too: `truncated` has to reach the caller, and a bare list could not say it.
+ScanPlan = collections.namedtuple("ScanPlan", "locations truncated")
+
+
+def _imported_top_level_names(directory, only = None, recursive = False):
+    """The top-level names imported by the modules under `directory`.
+
+    `only` names the files to read, or None for every module. `recursive` walks
+    nested packages too, because `conversion/__init__.py` can import
+    `conversion.nested.mod` and that module's own imports are just as much a part
+    of what the converter runs.
+
+    Returns None when nothing here could be parsed, which the caller reads as "do
+    not narrow anything on the strength of this": a syntax error must not be a way
+    to choose what gets looked at.
+    """
+    names, parsed_any, read = set(), False, 0
+    pending = [directory]
+    seen = set()
+    # ONE budget for the whole traversal, not one per directory. Counting per
+    # directory bounded nothing: `read` advances only for .py files, so a tree
+    # that branches without holding any modules was walked in full. A checkout
+    # with 14400 empty directories, three and a half times this budget, was
+    # traversed entirely, and nothing about that shape is hard to build at a
+    # scale that stalls the export before strict mode can refuse the checkout.
+    examined = 0
+    while pending and read < MAX_CONVERSION_PACKAGE_FILES:
+        if examined > MAX_CONVERSION_PACKAGE_ENTRIES:
+            # An early exit, not the bound. The check inside the scandir loop is
+            # what stops the walk; without this the queue would still drain, one
+            # scandir per directory that breaks on its first entry.
+            break
+        current = pending.pop()
+        identity = _directory_identity(current)
+        if identity is not None:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        try:
+            with os.scandir(current) as scanner:
+                for entry in scanner:
+                    # Iterated lazily and counted, not materialized: a checkout
+                    # with millions of entries in one directory would otherwise
+                    # exhaust memory here, before any budget was consulted, and
+                    # this runs on a tree nothing has verified yet.
+                    examined += 1
+                    if examined > MAX_CONVERSION_PACKAGE_ENTRIES:
+                        break
+                    if read >= MAX_CONVERSION_PACKAGE_FILES:
+                        break
+                    try:
+                        if recursive and entry.is_dir():
+                            if entry.name != "__pycache__":
+                                pending.append(entry.path)
+                            continue
+                    except OSError:
+                        continue
+                    if not entry.name.endswith(".py"):
+                        continue
+                    if only is not None and entry.name not in only:
+                        continue
+                    read += 1
+                    try:
+                        with open(entry.path, "rb") as handle:
+                            source = handle.read(MAX_MODULE_BYTES)
+                        tree = ast.parse(source, entry.path)
+                    except (OSError, SyntaxError, ValueError, RecursionError, MemoryError):
+                        continue
+                    parsed_any = True
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            names.update(alias.name.split(".")[0] for alias in node.names)
+                        elif (
+                            isinstance(node, ast.ImportFrom)
+                            and node.module and not node.level
+                        ):
+                            names.add(node.module.split(".")[0])
+        except OSError:
+            continue
+    return None if not parsed_any else names
+
+
+def _scanned_locations(llama_cpp_dir):
+    """Every place the converter can import from, as a ScanPlan of ScanLocations.
+
+    Two directories go on sys.path: the one the converter script sits in, which
+    Python puts at index 0 for the subprocess, and gguf-py, which the entrypoint
+    inserts at index 1 itself. Both are IMPORT ROOTS, meaning anything directly
+    under them is importable by its own name. Scanning gguf-py/gguf while leaving
+    the rest of gguf-py alone left `gguf-py/payload.py` importable as `payload`
+    from a clean-looking gguf/__init__.py, and nothing read it.
+
+    Each import root contributes its own modules, walked WITHOUT recursion, and
+    each directory under it as a location of its own. The root's subdirectories
+    are the rest of the llama.cpp checkout, which is enormous and not importable
+    as one thing; walking it whole would cross every budget on an ordinary
+    install and refuse the export. A directory that is itself an import root is
+    not also taken as a child of another, so gguf-py is walked once.
+
+    `natives` is true only for the packages the converter imports by name. A
+    prebuilt install copies the bundle's own .so and .dylib into the root and
+    beside it, so calling those Python modules refused every ordinary install.
+
+    One list, used by the scan, the bytecode purge and the cache key alike.
+    Keeping two of these in step by hand is what left gguf-py scanned but
+    unkeyed earlier in this branch.
+    """
+    if not llama_cpp_dir or not os.path.isdir(llama_cpp_dir):
+        return ScanPlan([], False)
+
+    def _path_of(label):
+        return llama_cpp_dir if label == "." else os.path.join(llama_cpp_dir, *label.split("/"))
+
+    locations, truncated = [], False
+    root_labels = [label for label in IMPORT_ROOTS if os.path.isdir(_path_of(label))]
+    # The converter's own sources, not every script in the checkout. Reading the
+    # root wholesale put `examples` back in the scan set, because llama.cpp's
+    # unrelated convert_llama_ggml_to_gguf.py imports examples.convert_legacy_llama
+    # and Unsloth never runs that script.
+    # Seeded from the entrypoint AND the packages it imports. Seeding from the
+    # entrypoint alone looks equivalent, since conversion/ and gguf-py/gguf are
+    # taken by name below and feed their own imports back, but it is not: a
+    # checkout whose entrypoint is missing, renamed or unparseable then yields
+    # nothing at all, and nothing means "widen to every directory". Reading the
+    # packages too is what keeps such a checkout narrow.
+    seeds = [(llama_cpp_dir, LLAMA_CPP_CONVERTER_FILENAMES + (GENERATED_CONVERTER_NAME,))]
+    seeds += [
+        (_path_of(label), None) for label in IMPORTED_PACKAGE_SUBDIRS
+        if os.path.isdir(_path_of(label))
+    ]
+    imported_names = set()
+    unreadable = True
+    walked = set()
+    for path, only in seeds:
+        # Recursively for the packages, and remembered: these are admitted below
+        # by name and their imports collected again there, and parsing each of
+        # them twice was 250 ms of the 560 ms this took per export on a checkout
+        # the size of llama.cpp master.
+        recursive = only is None
+        found = _imported_top_level_names(path, only = only, recursive = recursive)
+        if recursive:
+            walked.add(os.path.realpath(path))
+        if found is None:
+            continue
+        unreadable = False
+        imported_names |= found
+    if unreadable:
+        # Nothing could be parsed, so there is no closure to narrow by and every
+        # directory is a candidate again.
+        imported_names = None
+    for label in root_labels:
+        locations.append(
+            ScanLocation(
+                label,
+                _path_of(label),
+                False,
+                False,
+                (GENERATED_CONVERTER_NAME,) if label == "." else (),
+            )
+        )
+    # Every child directory of every import root, as candidates. Collected first
+    # and then filtered in passes, because the closure grows as it is walked: a
+    # directory admitted late can import the name of one passed over early, and a
+    # single scandir pass would have already skipped it. conversion/nested/mod.py
+    # importing a root `payload` package is exactly that shape.
+    candidates = []
+    for label in root_labels:
+        try:
+            with os.scandir(_path_of(label)) as scanner:
+                examined = 0
+                for entry in scanner:
+                    # Counted as they arrive. Collecting every child first and
+                    # capping afterwards meant a downloaded tree with millions of
+                    # entries in its root exhausted memory before the cap, the
+                    # truncation finding or a strict-mode refusal could say
+                    # anything at all.
+                    examined += 1
+                    if examined > MAX_CONVERSION_PACKAGE_ENTRIES:
+                        truncated = True
+                        break
+                    child = entry.name if label == "." else f"{label}/{entry.name}"
+                    if child in root_labels or entry.name == "__pycache__":
+                        # An import root is walked as itself, and a cache belongs
+                        # to the directory whose modules it holds.
+                        continue
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                    candidates.append((child, entry.name, entry.path))
+        except OSError:
+            continue
+
+    # A directory is scanned when the converter imports its name. Scanning every
+    # directory in the checkout instead read files no import can reach, and
+    # measured against a real clone of llama.cpp master that was not a
+    # theoretical cost: scripts/server-bench.py polls a /health endpoint in a
+    # while loop and examples/llama-eval/llama-eval.py spawns a process, so the
+    # scan reported both on every export and UNSLOTH_CONVERTER_SCAN_STRICT
+    # refused the export outright. A control that rejects every clean upstream
+    # checkout is not a control.
+    #
+    # Name-matched rather than skipped, because a directory called gguf or torch
+    # beside the converter SHADOWS the real package for the subprocess:
+    # llama.cpp's own directory is sys.path[0] there, so it wins over
+    # site-packages. That is the case these directories were added for, and it is
+    # the one kept.
+    taken = set()
+    progressed = True
+    while progressed and not truncated:
+        progressed = False
+        for child, name, path in candidates:
+            if child in taken:
+                continue
+            if child not in NAMED_IMPORT_PACKAGES and (
+                imported_names is not None and name not in imported_names
+            ):
+                continue
+            taken.add(child)
+            progressed = True
+            locations.append(
+                ScanLocation(child, path, True, child in NAMED_IMPORT_PACKAGES, ())
+            )
+            if imported_names is not None and os.path.realpath(path) not in walked:
+                # This directory is part of what runs, so what IT imports is too.
+                walked.add(os.path.realpath(path))
+                reached = _imported_top_level_names(path, recursive = True)
+                if reached:
+                    imported_names |= reached
+            if len(locations) > MAX_SCAN_LOCATIONS:
+                # One past, then trim: stopping AT the cap called a root of
+                # exactly that many directories truncated and refused it under
+                # strict mode, the same off-by-one the file and entry budgets
+                # avoid by asking for one more than they keep. Reported rather
+                # than dropped quietly, because a root wide enough to reach this
+                # is nowhere near the entry budget that would otherwise have said
+                # something.
+                truncated = True
+                locations = locations[:MAX_SCAN_LOCATIONS]
+                break
+    return ScanPlan(locations, truncated)
+
+
+def _purge_imported_package_bytecode(llama_cpp_dir, is_local_copy = False):
+    """Purge every imported package's supplied bytecode, and say what is stuck.
+
+    Called before the patcher cache is consulted, not only inside it. The purge
+    used to run within the cached function, so once strict mode had completed one
+    clean export in a long-lived process, dropping a fresh valid .pyc beside an
+    unchanged source left every component of the key identical: the cached result
+    came back, nothing purged it, and the next converter subprocess executed it.
+
+    The names it could not delete travel into the key, so bytecode that appears
+    and cannot be removed re-runs the scan that reports it, rather than hiding
+    behind a cache entry made when the tree was clean.
+    """
+    if not llama_cpp_dir:
+        return ()
+    if scan_is_disabled():
+        # The opt-out means this does nothing, and deleting files inside a
+        # checkout the user pinned is the last thing it should still be doing.
+        return ()
+    if is_local_copy:
+        # A pin says "I chose this directory". Reporting what is in it is fair;
+        # rewriting it is not, and a checkout someone works in has caches of its
+        # own that are none of this scan's business.
+        return ()
+    stuck = []
+    for location in _scanned_locations(llama_cpp_dir).locations:
+        stuck.extend(
+            f"{location.label}/{name}"
+            for name in _purge_regenerable_bytecode(
+                location.path,
+                entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+                recursive = location.recursive,
+                # The checkout, not this location. _scanned_locations promotes a
+                # top-level directory symlink to a location of its own, and
+                # containment measured from there calls the symlink's target
+                # internal: a checkout carrying a link to someone's source tree
+                # had that tree's caches deleted.
+                boundary = llama_cpp_dir,
+            )
+        )
+    return tuple(sorted(stuck))
+
+
+def _bytecode_matches_its_source(cache_path, source_path):
+    """Whether this cache really is the compiled form of that source.
+
+    Only asked when the cache is being left in place, which is what happens for a
+    checkout the user pinned. "A cache exists" is not a finding there: an ordinary
+    working tree has one per module, and warning about all of them on every export
+    is the false positive this module says is worse than the warning is a win.
+    Measured on a tree shaped like llama.cpp master, that was seven warnings
+    naming 215 files, every time.
+
+    "This cache disagrees with the source beside it" IS a finding, and it is the
+    whole of the attack: CPython checks the header against the source and never
+    checks that the bytecode came from it. Compiling the source and comparing is
+    exact for the interpreter that will run the converter, which is this one.
+    Anything unreadable or unparseable counts as disagreement, since then nothing
+    here can say it agrees.
+    """
+    try:
+        with open(cache_path, "rb") as handle:
+            cached = handle.read(MAX_MODULE_BYTES + 1)
+        with open(source_path, "rb") as handle:
+            source = handle.read(MAX_MODULE_BYTES + 1)
+    except OSError:
+        return False
+    if len(cached) <= 16:
+        return False
+    if cached[:4] != importlib.util.MAGIC_NUMBER:
+        # Built by a different Python. This interpreter is the one that runs the
+        # converter and it will never load this file, so it is not what executes
+        # and reporting it would warn about every checkout used with two Pythons.
+        return True
+    payload = cached[16:]
+    try:
+        # dont_inherit, as importlib's own loader compiles: otherwise the future
+        # flags in effect wherever this is called from land in the code object
+        # and every cache reads as a mismatch.
+        code = compile(source, source_path, "exec", dont_inherit = True)
+        if payload == marshal.dumps(code):
+            return True
+        # marshal tags the outermost object with FLAG_REF only when its refcount
+        # is above one at dump time, and that tag renumbers every reference after
+        # it. So the same code marshals to two byte strings depending on whether
+        # the writer was holding it: importlib was, the line above is, a writer
+        # that dumps the result of a call was not. Recompiling into that second
+        # form is what keeps this a comparison of the code rather than of who
+        # produced it. Done only on mismatch, which is the rare path.
+        del code
+        return payload == marshal.dumps(
+            compile(source, source_path, "exec", dont_inherit = True)
+        )
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        return False
+
+
+def _stays_within(root, path):
+    """Whether `path` resolves to somewhere still under `root`."""
+    try:
+        resolved_root = os.path.realpath(root)
+        resolved = os.path.realpath(path)
+    except OSError:
+        return False
     return (
-        _stat(init_py),
-        _stat(base_py),
-        _stat(qwen_py) if os.path.isfile(qwen_py) else None,
+        resolved == resolved_root
+        or resolved.startswith(resolved_root.rstrip(os.sep) + os.sep)
     )
+
+
+def _source_beside(root, name):
+    """The .py this cache would be rebuilt from, or None when there is none."""
+    if os.path.basename(root) == "__pycache__":
+        # base.cpython-313.pyc -> ../base.py
+        candidate = os.path.join(os.path.dirname(root), name.split(".")[0] + ".py")
+    else:
+        suffix = os.path.splitext(name)[1]
+        candidate = os.path.join(root, name[: -len(suffix)] + ".py")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _has_a_source(root, name):
+    """Whether this cache has a .py beside it that Python can rebuild it from."""
+    return _source_beside(root, name) is not None
+
+
+def _counts_as_a_module(root, name, purged = True, verify = True):
+    """Whether this file is one the scan has to account for.
+
+    A .py is read; a native extension and a sourceless .pyc cannot be read and so
+    are reported. Everything else here is a bytecode cache of a .py that is
+    already counted, and those must NOT count: an ordinary export leaves one per
+    module behind, so counting them made a package of 40 modules with 25 caches
+    read as 65 files, over the cap. That is a false security warning in advisory
+    mode and, under UNSLOTH_CONVERTER_SCAN_STRICT, a refusal of every export
+    after the first, which is the one outcome this scan must never produce.
+
+    Decided here rather than after the walk because the cap stops the walk, so a
+    file that does not count must not consume the budget either.
+    """
+    suffix = os.path.splitext(name)[1].lower()
+    if suffix == ".py" or suffix in NATIVE_MODULE_SUFFIXES:
+        return True
+    if suffix not in BYTECODE_SUFFIXES:
+        return False
+    # A cache with a source is deleted before the converter runs and rebuilt by
+    # Python from the .py this scan read, so it is not a module of its own. One
+    # without a source is, and gets reported.
+    #
+    # Unless nothing was deleted. For a pinned checkout this scan does not touch
+    # the user's files, and a cache left in place executes instead of the source
+    # beside it, whatever that source says. Reported then, but only when it
+    # actually disagrees with that source: every working tree carries one cache
+    # per module, and reporting those was seven warnings naming 215 files on
+    # every export of a tree shaped like llama.cpp master.
+    source = _source_beside(root, name)
+    if source is None:
+        if os.path.basename(root) == "__pycache__":
+            # Not importable, so not code that runs. CPython loads a sourceless
+            # cache only from the legacy location, mod.pyc in the package
+            # directory itself; a __pycache__ entry whose .py is gone is dead
+            # weight an upstream update leaves behind. Verified directly: with
+            # the source deleted, importing it raises ModuleNotFoundError, while
+            # the same bytes copied to the legacy path import and run.
+            return False
+        return True                 # nothing could rebuild it: reported
+    if purged:
+        return False                # deleted before the converter runs
+    if not verify:
+        # The cache key asks a different question: not "is this a finding" but
+        # "has anything the converter will execute changed since the last scan".
+        # Every cache a pin keeps answers that one, and answering it by compiling
+        # each source would put the scan's cost on every export instead of on
+        # the cache miss.
+        return True
+    # Left in place, so it is what executes. Reported only when it disagrees with
+    # the source that was scanned, which is the difference between a finding and
+    # an ordinary working tree.
+    return not _bytecode_matches_its_source(os.path.join(root, name), source)
+
+
+def _unscannable_modules(package_dir, names, natives = True):
+    """The collected names Python can execute and `warn_on_suspicious_converter` cannot read.
+
+    Native extensions, and bytecode with no source to rebuild it from. A cache
+    that HAS a source never reaches here: _purge_regenerable_bytecode removes it
+    before the converter runs, and anything it could not remove is reported by
+    that function instead.
+    """
+    found = []
+    for name in names:
+        suffix = os.path.splitext(name)[1].lower()
+        if suffix in NATIVE_MODULE_SUFFIXES:
+            if natives:
+                found.append(name)
+        elif suffix in BYTECODE_SUFFIXES:
+            found.append(name)
+    return found
+
+
+def _conversion_sibling_info(llama_cpp_dir, is_local_copy = False):
+    """Hashable (path, digest) pairs for EVERY module the converter imports,
+    folded into the patcher cache key so re-pulled checkouts re-patch and
+    re-scan. None only when there is nothing on disk to look at.
+
+    Covers the same places the scan does, the converter's own directory included.
+    A monolith checkout used to key on nothing, which is exactly where a module
+    that shadows one of the converter's imports would sit.
+
+    Every package in IMPORTED_PACKAGE_SUBDIRS, not just conversion/: the key is
+    what decides whether the scan runs again, so a package it does not cover is
+    one a long-lived process will re-import without rescanning.
+
+    Every module, not the three the patcher edits. The key also decides whether
+    _scan_conversion_package runs again, and that reads the whole directory: with
+    only __init__.py, base.py and qwen.py in the key, changing any other module
+    in a long-lived process left the key identical, so the next export returned
+    the cached converter without rescanning and then executed the changed file.
+    The same MAX_CONVERSION_PACKAGE_FILES cap applies, for the same reason it
+    applies there, and the count travels in the key so crossing the cap is itself
+    a change. The count saturates one past the cap, because the walk stops there;
+    above the cap the package is reported as unread on every pass that scans it,
+    so the key is not what protects anything there and buying a finer count would
+    cost an unbounded walk of a directory an attacker sized."""
+    # Every directory that exists is keyed, on the layout test or not. Keying
+    # conversion/ only when it holds __init__.py AND base.py was a hole of the
+    # same shape as the one that used to skip gguf-py on a monolith: the scan
+    # reads the directory either way, because the converter can import from it
+    # either way, so a conversion/ without base.py was scanned once and then
+    # recorded as an empty header with no digests at all. After the first export
+    # a changed module there left the key identical, the patcher came back from
+    # cache, and the subprocess imported the new bytes unscanned, strict mode
+    # included.
+    # With the scan off, the digest buys nothing: it exists to decide whether to
+    # re-scan, and there is no scan. The key still has to move when a checkout is
+    # re-pulled, so it falls back to the (mtime, size) identity this used before
+    # digests, which is the cheap half of the same question. Flipping the switch
+    # changes the key regardless, because _converter_scan_mode is in it too.
+    _scan_off = scan_is_disabled()
+
+    def _identity(p):
+        if _scan_off:
+            try:
+                stat = os.stat(p)
+                return (p, stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                return (p, -1, 0)
+        # The bytes, not (mtime, size): a module replaced with same-sized content
+        # under a preserved mtime left the key identical, so the next export
+        # returned the cached converter without rescanning and the subprocess
+        # imported bytes nothing had read. That is a metadata copy away from
+        # deliberate, and free on a coarse-timestamp filesystem. Hashing at most
+        # MAX_CONVERSION_PACKAGE_FILES small modules is nothing beside the export
+        # this key gates, and the scan reads the same bytes anyway.
+        try:
+            size = os.path.getsize(p)
+            digest = hashlib.sha256()
+            read = 0
+            with open(p, "rb") as handle:
+                while read < MAX_MODULE_BYTES:
+                    chunk = handle.read(min(MODULE_READ_CHUNK, MAX_MODULE_BYTES - read))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    read += len(chunk)
+            # The size travels beside the digest of the prefix, so a file too big
+            # for this scan to read still moves the key when it changes length.
+            return (p, size, digest.hexdigest())
+        except OSError:
+            return (p, -1, "")
+    header, entries = [], []
+    found_any = False
+    for location in _scanned_locations(llama_cpp_dir).locations:
+        subdir, package_dir, recursive = location.label, location.path, location.recursive
+        found_any = True
+        walk = _conversion_package_modules(
+            package_dir,
+            file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
+            entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+            recursive = recursive,
+            skip_names = location.skip,
+            # A pin's caches are deliberately left in place, so they are part of
+            # what the next converter subprocess executes. Left out of the key,
+            # a cache that changed after the first export returned the patcher
+            # from cache, skipped the scan, and ran unreported. Not verified
+            # here, only identified: the key has to move when they change, and
+            # deciding whether a change is a finding is the scan's job. Both
+            # answer the question, but this walk runs on every export, and on a
+            # tree shaped like llama.cpp master verifying costs 59ms against 6ms
+            # for identifying.
+            purged = not is_local_copy,
+            verify = False,
+        )
+        names = walk.names if walk.names is not None else ["__init__.py", "base.py"]
+        # The unreadable directories travel too: one becoming readable, or a new
+        # one appearing, changes what this scan can say and so has to re-run it.
+        header.append((subdir, len(names), walk.complete, walk.unreadable))
+        entries.extend(
+            _identity(os.path.join(package_dir, *name.split("/")))
+            for name in names[:MAX_CONVERSION_PACKAGE_FILES]
+        )
+    if not found_any:
+        # Nothing on disk at all, not even a directory to look in.
+        return None
+    # The header is ONE element, however much it comes to carry: callers read the
+    # per-module entries as info[1:], so widening it in place silently fed them a
+    # count or a flag where they expected a (path, digest) pair.
+    return (tuple(header),) + tuple(entries)
 pass
 
 
@@ -1589,6 +2538,19 @@ def _extract_dict_keys_from_conversion_init(conv_init_path, dict_name):
 pass
 
 
+def _dominant_newline(content):
+    """The line ending the file mostly uses, b"\r\n" or b"\n".
+
+    The patches below insert whole lines, so a CRLF checkout must stay CRLF rather
+    than come out mixed. A lone CR is not a line ending in Python 3, so counting
+    is enough."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    crlf = content.count(b"\r\n")
+    if crlf == 0: return b"\n"
+    return b"\r\n" if crlf >= (content.count(b"\n") - crlf) else b"\n"
+pass
+
+
 def _apply_branding_patch_to_base(conv_base_path):
     """Insert Unsloth metadata branding after `self.metadata = gguf.Metadata.load(...)`
     in conversion/base.py (idempotent via a one-line marker).
@@ -1601,15 +2563,17 @@ def _apply_branding_patch_to_base(conv_base_path):
     if _UNSLOTH_BRANDING_MARKER in content:
         return "already-applied"
 
+    eol = _dominant_newline(content)
+
     def _replace(match):
         load_call = match.group(1)
         suffix    = match.group(2)   # already starts with newline + indent
         indent    = match.group(3)
         return (
-            load_call + b"\n"
-            + indent + _UNSLOTH_BRANDING_MARKER + b"\n"
-            + indent + b"if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
-            + indent + b"if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
+            load_call + eol
+            + indent + _UNSLOTH_BRANDING_MARKER + eol
+            + indent + b"if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'" + eol
+            + indent + b"if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'" + eol
             + indent + b"if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']"
             + suffix
         )
@@ -1623,6 +2587,78 @@ def _apply_branding_patch_to_base(conv_base_path):
     except OSError:
         return "pattern-missing"
     return "applied"
+pass
+
+
+_NUM_EXPERTS_PATTERN = re.compile(
+    rb'^([ \t]*)n_experts = self\.hparams\[(["\'])num_experts\2\]'
+    rb'([ \t]*(?:\#[^\r\n]*)?)(\r?\n|$)',
+    re.MULTILINE,
+)
+
+
+def _patch_num_experts(content, eol_fallback = None):
+    """Rewrite `n_experts = self.hparams["num_experts"]` to also accept
+    num_local_experts, reusing the captured indent (the converter is not always
+    written at the same depth) and line ending. Returns (new_content, applied)."""
+    # A match on the last line carries no terminator to reuse; inherit the file's own.
+    fallback = eol_fallback or _dominant_newline(content)
+
+    def _replace(match):
+        indent, trailer, newline = match.group(1), match.group(3), match.group(4)
+        eol = newline or fallback
+        # Keep `trailer` (trailing spaces or an inline comment) so a checkout that
+        # carries one still gets patched, as it did under the old unanchored regex.
+        return (
+            indent + b"# Qwen3MoE seems to use num_local_experts instead of num_experts" + eol +
+            indent + b"n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')" +
+            trailer + newline
+        )
+    new_content = _NUM_EXPERTS_PATTERN.sub(_replace, content)
+    return new_content, (new_content != content)
+pass
+
+
+def _patched_content_parses(content):
+    """True iff the patched converter is still syntactically valid Python.
+
+    Parse the bytes, not a decoded string, so a utf-8 BOM or a PEP 263 coding
+    cookie is honoured the way CPython honours it on import."""
+    try:
+        ast.parse(content)
+        return True
+    except (SyntaxError, ValueError, RecursionError):
+        # RecursionError: deeply nested expressions can exhaust the stack.
+        return False
+pass
+
+
+def _choose_content_to_write(stages):
+    """Pick the most patched converter content that is still valid Python.
+
+    `stages` is [(label, content), ...] oldest first, starting with the
+    untouched upstream script. Returns (label, content, dropped_labels).
+
+      * Only blame our own patches: if the untouched script does not parse on
+        this interpreter, dropping them fixes nothing, so keep them all.
+      * Drop the fewest possible, by walking back one stage at a time."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    base_label, base_content = stages[0]
+    final_label, final_content = stages[-1]
+    if final_content == base_content:
+        return final_label, final_content, []
+    if _patched_content_parses(final_content):
+        return final_label, final_content, []
+    if not _patched_content_parses(base_content):
+        return final_label, final_content, []
+    for index in range(len(stages) - 2, -1, -1):
+        label, content = stages[index]
+        if _patched_content_parses(content):
+            dropped = [name for name, _ in stages[index + 1:]]
+            return label, content, dropped
+        pass
+    pass
+    return base_label, base_content, [name for name, _ in stages[1:]]
 pass
 
 
@@ -1640,6 +2676,412 @@ def _qwen_already_handles_expert_aliases(conv_qwen_path):
 pass
 
 
+def _refuse_unscannable_conversion_package(conversion_dir, reason, is_local_copy = False):
+    """Warn, or under strict mode refuse, a conversion/ package too big to read.
+
+    Mirrors warn_on_suspicious_converter's contract, but cannot go through it:
+    this is a fact about the DIRECTORY and that function takes the bytes it
+    scans. Silent when the scan is switched off entirely, as everything here is.
+
+    Says "more than", not how many: counting them all is the unbounded walk the
+    cap exists to avoid, so the walk stops one past the cap and the exact size of
+    an oversized tree is deliberately never learned.
+    """
+    if scan_is_disabled():
+        return
+    message = (
+        f"Unsloth: The converter package at {conversion_dir} {reason}, so some "
+        f"of the modules the converter imports have not been checked."
+    )
+    logger.warning(message)
+    # is_local_copy carries the same meaning it has in warn_on_suspicious_converter:
+    # the user pinned this directory, so it is reported and never refused.
+    if scan_is_strict() and not is_local_copy:
+        raise ConverterScanError(
+            f"{message} Refusing to run it with UNSLOTH_CONVERTER_SCAN_STRICT=1. Pin a "
+            f"converter you have reviewed with UNSLOTH_LLAMA_CPP_SCRIPTS_DIR, or unset "
+            f"UNSLOTH_CONVERTER_SCAN_STRICT."
+        )
+
+
+def _directory_identity(path):
+    """(device, inode) for a directory, or None when the filesystem has no usable one.
+
+    Only ever used to notice a directory reached twice. None on anything that
+    cannot answer, so an unidentifiable directory is walked rather than pruned:
+    losing the loop guard is recoverable (the cap stops it), pruning a real
+    subtree would drop modules from the scan.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    # st_ino is 0 on filesystems that do not report one; every directory would
+    # then share an identity and the first would prune all the rest.
+    if not info.st_ino:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+# Named, because this result has now grown three times and twice a caller read a
+# new field as though it were an old one.
+PackageWalk = collections.namedtuple("PackageWalk", "names complete unreadable")
+
+
+def _conversion_package_modules(
+    conversion_dir,
+    file_limit = None,
+    entry_limit = None,
+    recursive = True,
+    skip_names = (),
+    purged = True,
+    verify = True,
+):
+    """`(names, complete)` for the .py files under `conversion_dir`, nested included.
+
+    Relative POSIX paths, sorted, so the caller's cap is stable across platforms.
+    `complete` is False when a limit stopped the walk early, which is the caller's
+    signal that the package is too big to have been read, not that it is clean.
+    `names` is None when the directory could not be walked at all, which the
+    caller treats as nothing to scan rather than as a clean package.
+
+    Recursive, because `os.listdir` saw immediate children only: a clean
+    `conversion/__init__.py` doing `from .nested import x` fronted
+    `conversion/nested/__init__.py`, which was neither scanned nor counted
+    against the cap, and Python imported and ran it all the same. Subdirectories
+    are walked whether or not they hold an `__init__.py`, since a namespace
+    package imports just as well.
+
+    followlinks, because the import machinery follows directory symlinks and
+    os.walk does not. Without it a clean `conversion/__init__.py` importing
+    `conversion.linked`, where `linked` is a symlink to a directory holding the
+    payload, returned only the clean initializer: the whole package read as
+    scanned and strict mode let the payload run. Following them means the walk
+    can be sent round a loop, so a directory reached a second time is pruned.
+
+    The limits are how the caller's cap becomes a bound on the WORK and not just
+    on what gets read: the directory is attacker-supplied, so traversing all of it
+    to discover it was too big hands over exactly the unbounded time and memory
+    the cap denies. `file_limit` stops once that many modules are in hand;
+    `entry_limit` stops on entries visited, because a tree can be enormous while
+    holding almost no Python at all and only the second bound sees that.
+    """
+    found = []
+    seen_directories = set()
+    unreadable = []
+    entries = 0
+    pending = [conversion_dir]
+    while pending:
+        root = pending.pop()
+        identity = _directory_identity(root)
+        if identity is not None:
+            if identity in seen_directories:
+                continue
+            seen_directories.add(identity)
+        try:
+            # scandir rather than walk: walk hands back a whole directory's names
+            # at once, so a single directory with a great many entries was fully
+            # listed and copied before either budget was consulted, and the
+            # advertised bounds bounded nothing for it. This iterator is lazy, so
+            # the budget is checked per entry.
+            with os.scandir(root) as scanner:
+                for entry in scanner:
+                    entries += 1
+                    if entry_limit is not None and entries >= entry_limit:
+                        return PackageWalk(sorted(found), False, tuple(unreadable))
+                    try:
+                        # Follows symlinks, because the import machinery does.
+                        is_directory = entry.is_dir()
+                    except OSError:
+                        continue
+                    if is_directory:
+                        if recursive:
+                            pending.append(entry.path)
+                        elif entry.name == "__pycache__" and root == conversion_dir:
+                            # Not a subtree, the cache for THIS directory's own
+                            # modules. Skipping it left a clean root gguf.py beside
+                            # an attacker's __pycache__/gguf.<tag>.pyc, which
+                            # CPython validates and runs in place of the source
+                            # that was scanned.
+                            pending.append(entry.path)
+                        continue
+                    name = entry.name
+                    if name in skip_names and root == conversion_dir:
+                        continue      # this scan's own output, where it writes it
+                    if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
+                        continue
+                    if not _counts_as_a_module(
+                        root, name, purged = purged, verify = verify,
+                    ):
+                        continue
+                    found.append(
+                        os.path.relpath(entry.path, conversion_dir).replace(os.sep, "/")
+                    )
+                    if file_limit is not None and len(found) >= file_limit:
+                        # Sorted first: which names survive stays deterministic
+                        # even though which directories were reached does not.
+                        return PackageWalk(
+                            sorted(found)[:file_limit], False, tuple(unreadable),
+                        )
+        except OSError:
+            # One unreadable directory, not the whole package. Aborting the walk
+            # here and reporting nothing meant an unreadable directory beside a
+            # readable malicious module silenced the scan entirely, strict mode
+            # included. Keep what was collected and name what could not be read.
+            if root == conversion_dir:
+                return PackageWalk(None, False, (".",))
+            unreadable.append(
+                os.path.relpath(root, conversion_dir).replace(os.sep, "/")
+            )
+            continue
+    return PackageWalk(sorted(found), not unreadable, tuple(unreadable))
+
+
+def _scan_conversion_package(llama_cpp_dir, is_local_copy = False):
+    """Scan every package the converter imports, beside an unverified converter.
+
+    Same warn-or-raise contract as the entrypoint: these files are imported and
+    executed by it, so leaving them unscanned let a clean entrypoint front a
+    payload in conversion/__init__.py, or in a nested module below it, or in
+    gguf-py/gguf, which arrives in the same undigested tarball and which the
+    entrypoint puts on sys.path itself.
+    """
+    # Cost, measured against a real clone of llama.cpp master rather than a tree
+    # shaped like one: 3.1s for the four locations it now reads, paid inside the
+    # cached patcher, so once per process rather than per export, against an
+    # export that runs for minutes.
+    #
+    # What runs on EVERY export is the cache key, and that is no longer the 11ms
+    # it once was: it builds the scan plan, which parses the converter's import
+    # closure to decide which directories are reachable, and that is 296ms of the
+    # 314ms the key takes. Parsing each package twice, as a seed and again as an
+    # admitted location, was another 250ms on top until it was deduplicated.
+    # Memoizing the plan across exports would take it to about 1ms, since the
+    # signature that would invalidate it costs 0.3ms, and that is the thing to do
+    # if this ever needs to be cheaper.
+    #
+    # Worth re-measuring, against a real clone, before widening what gets scanned
+    # any further.
+    if not llama_cpp_dir:
+        return
+    if scan_is_disabled():
+        # Each per-file check returns early anyway, but only after the whole tree
+        # has been walked and every module read. Opting out should cost nothing.
+        return
+    plan = _scanned_locations(llama_cpp_dir)
+    if plan.truncated:
+        _refuse_unscannable_conversion_package(
+            llama_cpp_dir,
+            f"holds more than the {MAX_SCAN_LOCATIONS} directories this scan "
+            f"looks in, so the ones past that were not read",
+            is_local_copy = is_local_copy,
+        )
+    for location in plan.locations:
+        _scan_imported_package(
+            location.path,
+            recursive = location.recursive,
+            natives = location.natives,
+            is_local_copy = is_local_copy,
+            skip_names = location.skip,
+            boundary = llama_cpp_dir,
+        )
+
+
+def _scan_imported_package(
+    package_dir, recursive = True, natives = True, is_local_copy = False,
+    skip_names = (), boundary = None,
+):
+    """Read every module in one imported package, or report why it could not be.
+
+    `natives` is False outside the packages the converter imports by name. A
+    prebuilt install copies the bundle's own .so/.dylib/.dll into the llama.cpp
+    root and into directories beside it, so treating every native file there as
+    an opaque Python module warned on an ordinary prebuilt install and, under
+    strict mode, refused the export before the converter ran. Inside conversion/
+    or gguf-py/gguf a native file has no business being there and is still
+    reported. The cost of that line is stated plainly: a native file planted in
+    the root under exactly the name of a module the converter imports is not
+    reported, and refusing every prebuilt install is not a price worth paying for
+    it.
+    """
+    # First, before the walk and long before the converter runs: bytecode that
+    # came with the package executes in place of the source this scan reads, and
+    # CPython's validation does not prove otherwise. Anything with a source is
+    # removed and rebuilt from the .py; what could not be removed is reported.
+    # Not for a pin: the outer purge already declines to touch a checkout the
+    # user chose, and this path reached straight past that and rewrote it anyway.
+    stuck_bytecode = [] if is_local_copy else _purge_regenerable_bytecode(
+        package_dir,
+        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+        recursive = recursive,
+        boundary = boundary,
+    )
+    # One past each cap: enough to establish it was crossed, and no more. Both
+    # limits, because stopping AT the limit reports a package of exactly that
+    # many entries as holding more than it does, which strict mode then refuses.
+    walk = _conversion_package_modules(
+        package_dir,
+        file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
+        entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+        recursive = recursive,
+        skip_names = skip_names,
+        purged = not is_local_copy,
+    )
+    names, complete = walk.names, walk.complete
+    if walk.unreadable:
+        # Silence here was the hole: an unreadable directory beside a readable
+        # module its initializer imports meant the whole package went unscanned
+        # and unreported, under strict mode as well.
+        shown = ", ".join(walk.unreadable[:5]) + ("..." if len(walk.unreadable) > 5 else "")
+        _refuse_unscannable_conversion_package(
+            package_dir,
+            f"holds {len(walk.unreadable)} director(y/ies) this scan could not "
+            f"read ({shown})",
+            is_local_copy = is_local_copy,
+        )
+    if names is None:
+        return
+    if not complete and len(names) <= MAX_CONVERSION_PACKAGE_FILES and not walk.unreadable:
+        # Stopped on the traversal budget rather than the file cap: few enough
+        # modules, far too many entries to have walked. Unread either way.
+        _refuse_unscannable_conversion_package(
+            package_dir,
+            f"holds more than the {MAX_CONVERSION_PACKAGE_ENTRIES} directory "
+            f"entries this scan walks",
+            is_local_copy = is_local_copy,
+        )
+    if len(names) > MAX_CONVERSION_PACKAGE_FILES:
+        # Truncating the list silently was the hole: a payload in a late-sorting
+        # module (z_payload.py) imported from an otherwise clean __init__.py went
+        # unscanned, and under strict mode ran with nothing reported. The cap
+        # stays, because an attacker must not get to choose how much work this
+        # does, so exceeding it becomes the finding rather than a quiet skip.
+        _refuse_unscannable_conversion_package(
+            package_dir,
+            f"holds more than the {MAX_CONVERSION_PACKAGE_FILES} Python files "
+            f"this scan reads",
+            is_local_copy = is_local_copy,
+        )
+        names = names[:MAX_CONVERSION_PACKAGE_FILES]
+    opaque = _unscannable_modules(package_dir, names, natives = natives) + stuck_bytecode
+    if opaque:
+        # Reporting is the whole answer available here: this scan reads source,
+        # and these are the files it provably cannot. Passing over them quietly
+        # is what let bytecode and native modules ride in under a clean package.
+        shown = ", ".join(opaque[:5]) + ("..." if len(opaque) > 5 else "")
+        _refuse_unscannable_conversion_package(
+            package_dir,
+            f"holds {len(opaque)} file(s) Python will execute but this scan "
+            f"cannot read ({shown})",
+            is_local_copy = is_local_copy,
+        )
+    for name in names:
+        if os.path.splitext(name)[1].lower() != ".py":
+            continue
+        path = os.path.join(package_dir, *name.split("/"))
+        try:
+            with open(path, "rb") as handle:
+                # One byte past the ceiling, which is how a module too big to
+                # judge is told apart from one that merely fills it. Reading it
+                # whole first was the memory the ceiling exists to deny.
+                content = handle.read(MAX_MODULE_BYTES + 1)
+        except OSError:
+            continue
+        if len(content) > MAX_MODULE_BYTES:
+            content = content[:MAX_MODULE_BYTES]
+            _refuse_unscannable_conversion_package(
+                package_dir,
+                f"holds a module ({name}) larger than the {MAX_MODULE_BYTES} "
+                f"bytes this scan reads, so only its first part was checked",
+                    is_local_copy = is_local_copy,
+            )
+        warn_on_suspicious_converter(
+            content, path, is_local_copy = is_local_copy, log = logger,
+        )
+
+
+# A pin Unsloth set itself, to route the patcher at an install it has just made.
+# Not the same thing as a pin the user set to choose a converter they reviewed,
+# and only the second is a reason to skip the scan.
+_INTERNAL_SCRIPTS_DIR_LOCK = threading.Lock()
+_internal_scripts_dir_pin = None
+
+
+@contextlib.contextmanager
+def internal_scripts_dir_pin(folder):
+    """Point the patcher at `folder` without that counting as the user's choice.
+
+    MLX export installs llama.cpp itself and then sets
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR so the patcher resolves against that install.
+    Trust was read from the variable alone, so a converter Unsloth had just
+    downloaded looked exactly like one the user had pinned and reviewed:
+    UNSLOTH_CONVERTER_SCAN_STRICT only logged the entrypoint's findings instead
+    of raising, and the imported packages were not scanned at all. The whole
+    strict control was therefore off for save_pretrained_gguf.
+
+    A pin already in the environment is left untouched, because that one IS the
+    user's and carries their exemption.
+    """
+    global _internal_scripts_dir_pin
+    with _INTERNAL_SCRIPTS_DIR_LOCK:
+        existing = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        previous = _internal_scripts_dir_pin
+        if existing is None:
+            os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = folder
+            _internal_scripts_dir_pin = os.path.abspath(os.path.expanduser(folder))
+        try:
+            yield
+        finally:
+            if existing is None:
+                os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
+            else:
+                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = existing
+            _internal_scripts_dir_pin = previous
+
+
+def _converter_is_trusted_local(script_path):
+    """Whether a local converter was pinned deliberately by the user.
+
+    The strict-mode exemption means "you chose this file", so it cannot cover
+    every local path. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is an explicit pin and is the
+    only thing that is, and then only when Unsloth did not set it itself: MLX
+    export points it at the llama.cpp it has just installed, which is routing and
+    not a judgement about the converter, so internal_scripts_dir_pin marks that
+    case and it gets no exemption either. When no prebuilt is available install_llama_cpp falls
+    back to an unpinned `git clone` of upstream master, and
+    _resolve_bundle_convert_script accepts that checkout on the strength of a
+    conversion/ package alone. A converter fetched automatically from upstream is
+    not a converter the user pinned, so it gets no exemption.
+
+    UNSLOTH_PREBUILT_INFO.json is NOT accepted, though it used to be. The marker
+    reads like proof that these bytes were verified and it is not: _stage_prebuilt
+    _install checks a sha256 for the BINARY asset only, and even that only when
+    the release published one, while _hydrate_converter_sources downloads the
+    source tarball separately with no digest at all and the marker is written
+    afterwards. So a replaced source tarball wore a "verified" marker, took the
+    exemption, and skipped the conversion/ scan with it. The converter from a
+    prebuilt bundle is now scanned like any other download, which is what it is.
+    """
+    if not script_path:
+        return False
+    script_path = os.path.abspath(os.path.expanduser(script_path))
+    scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+    if not scripts_dir:
+        return False
+    # expanduser to match _resolve_local_convert_script, which accepts the pin
+    # after expanding it. Comparing an unexpanded "~/llama.cpp" against the
+    # expanded script path made a deliberate pin fail this test and be refused
+    # under strict mode as though it had been downloaded.
+    scripts_dir = os.path.abspath(os.path.expanduser(scripts_dir))
+    if _internal_scripts_dir_pin is not None and scripts_dir == _internal_scripts_dir_pin:
+        # Unsloth's own routing, not a choice anyone made about these bytes.
+        return False
+    try:
+        return os.path.commonpath([scripts_dir, script_path]) == scripts_dir
+    except ValueError:
+        return False
+
+
 def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # Resolve env vars + sibling mtimes each call; both feed the @lru_cache key
     # so re-pulled checkouts re-run the patcher. Anchor conversion/ to the
@@ -1650,16 +3092,53 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
         local_script_info = _resolve_bundle_convert_script()
     # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
     # or replaced after the first conversion still gets the Qwen3.5 aliases.
-    _patch_tensor_mapping_for_qwen35(_get_llama_cpp_dir(local_script_info))
+    _llama_cpp_dir = _get_llama_cpp_dir(local_script_info)
+    _patch_tensor_mapping_for_qwen35(_llama_cpp_dir)
+    # Before the cache is consulted and before the key is built, so the key
+    # describes the tree the converter will actually run against.
+    trusted_local = _converter_is_trusted_local(
+        local_script_info[0] if local_script_info is not None else None
+    )
+    stuck_bytecode = _purge_imported_package_bytecode(
+        _llama_cpp_dir, is_local_copy = trusted_local,
+    )
     return _download_convert_hf_to_gguf_cached(
         name,
         local_script_info,
-        _conversion_sibling_info(_get_llama_cpp_dir(local_script_info)),
+        _conversion_sibling_info(_llama_cpp_dir, is_local_copy = trusted_local),
+        _converter_scan_mode(),
+        trusted_local,
+        stuck_bytecode,
+    )
+
+
+def _converter_scan_mode():
+    """The scan switches, read at call time so they are part of the cache key.
+
+    The scan runs inside the cached patcher below, so without this a user who
+    sees a warning, sets UNSLOTH_CONVERTER_SCAN_STRICT=1 and retries in the same
+    session gets the cached converter back and no second scan, which reads as the
+    strict mode having accepted the file.
+
+    Whether the converter is a user pin travels in the key for the same reason
+    and is computed beside this one: a first call under an explicit pin could
+    accept a flagged converter as trusted and cache it, and MLX routing to that
+    same folder afterwards matched every other component of the key, so the
+    cached result came back without the trust test or the package scan running
+    again. The distinction internal_scripts_dir_pin draws is only as good as the
+    key that carries it.
+    """
+    return (
+        os.environ.get("UNSLOTH_CONVERTER_SCAN_STRICT", ""),
+        os.environ.get("UNSLOTH_DISABLE_CONVERTER_SCAN", ""),
     )
 
 
 @lru_cache(1)
-def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_info):
+def _download_convert_hf_to_gguf_cached(
+    name, _local_script_info, _conversion_info, _scan_mode = None, _trusted_local = False,
+    _stuck_bytecode = (),
+):
     # All Unsloth Zoo code licensed under LGPLv3
     # Download from llama.cpp's GitHub, or read a local copy when
     # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set. _local_script_info is
@@ -1674,8 +3153,6 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
     supported_types = set()
     text_archs = set()
     vision_archs = set()
-    temp_original_file_path = None # for the finally block
-    original_module_name = None    # Only set on the monolith branch
     # Default to 'monolith' so a failed introspection still drives the legacy
     # patches; set by introspection and read by Patch 2 + Patch 3 below.
     _layout = "monolith"
@@ -1712,6 +3189,34 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
             if original_content is None:
                 raise _last_err  # type: ignore[misc]
 
+        # 1b. Scan the bytes we are about to patch, eval defaults out of, write
+        # to disk and run. Deliberately before every one of those steps. Warns
+        # by default (see converter_scan for why it does not block), and raises
+        # ConverterScanError only under UNSLOTH_CONVERTER_SCAN_STRICT=1 on
+        # downloaded bytes.
+        # Passed in, not recomputed: it is a cache key component, so deciding it
+        # again in here could disagree with the entry that was looked up.
+        warn_on_suspicious_converter(
+            original_content,
+            _local_script if _local_script is not None else LLAMA_CPP_CONVERT_FILE,
+            is_local_copy = _trusted_local,
+            log = logger,
+        )
+        # The package entrypoint runs `from conversion import ...` on import, so
+        # those files execute too. They are covered by a sha256 only when the
+        # release published one for the SOURCE archive they came out of, which
+        # is a second download from the one the bundle's own sha256 covers. An
+        # earlier version of this comment said the bundle's digest covered them;
+        # it does not, and until that archive was verified as well nothing did.
+        # From an unpinned `git clone`, or the ggml-org codeload fallback, there
+        # is still no digest to check, and a payload can sit in
+        # conversion/__init__.py behind a clean entrypoint.
+        # Always, pinned or not. The entrypoint itself is scanned either way and
+        # only the refusal is waived for a pin; skipping the sibling packages
+        # entirely meant a stale or tampered conversion/ beside a pinned
+        # entrypoint executed without even the advisory warning.
+        _scan_conversion_package(_llama_cpp_dir, is_local_copy = _trusted_local)
+
         # 2. Detect layout BEFORE importing: the package entrypoint does
         # `from conversion import ...`, which a temp-file import resolves
         # against LLAMA_CPP_DEFAULT_DIR; with a different
@@ -1737,63 +3242,15 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     "allowlist will be empty; conversion will still attempt to run."
                 )
         else:
-            # Monolith layout: original behaviour. Write the entrypoint to a
-            # temp file under LLAMA_CPP_DEFAULT_DIR and import it to read
-            # ModelBase._model_classes.
-            with tempfile.NamedTemporaryFile(
-                mode='wb', suffix=".py", prefix="original_gguf_", dir=LLAMA_CPP_DEFAULT_DIR, delete=False
-            ) as temp_file:
-                temp_original_file_path = temp_file.name
-                temp_file.write(original_content)
-                temp_file.flush()
-
-            logger.debug(f"Loading module from temporary file: {temp_original_file_path}")
-            original_module_name = f"convert_hf_to_gguf_{os.path.basename(temp_original_file_path).split('.')[0]}"
-
-            # Set NO_LOCAL_GGUF to prevent the script from adding path again
-            old_env = os.environ.get('NO_LOCAL_GGUF')
-            os.environ['NO_LOCAL_GGUF'] = '1'
-
-            try:
-                module = _load_module_from_path(temp_original_file_path, original_module_name)
-            finally:
-                if old_env is None:
-                    os.environ.pop('NO_LOCAL_GGUF', None)
-                else:
-                    os.environ['NO_LOCAL_GGUF'] = old_env
-            ModelBase = getattr(module, 'ModelBase', None)
-            ModelType = getattr(module, 'ModelType', None)
-
-            if ModelBase is None or ModelType is None:
-                logger.warning(
-                    f"Unsloth: Failed to find 'ModelBase' or 'ModelType' in the original downloaded script. "
-                    f"Structure might have changed. Cannot determine supported architectures."
-                )
-            elif not hasattr(ModelBase, '_model_classes') or not isinstance(ModelBase._model_classes, dict):
-                 logger.warning(
-                    f"Unsloth: 'ModelBase._model_classes' not found or not a dictionary in original script."
-                     " Cannot determine supported architectures."
-                )
-            else:
-                # Check for TEXT models
-                if hasattr(ModelType, 'TEXT') and ModelType.TEXT in ModelBase._model_classes:
-                    if isinstance(ModelBase._model_classes[ModelType.TEXT], dict):
-                        text_archs = set(ModelBase._model_classes[ModelType.TEXT].keys())
-                        supported_types.update(text_archs)
-                    else:
-                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.TEXT] is not a dictionary.")
-                else:
-                    logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
-
-                # Check for VISION models
-                if hasattr(ModelType, 'MMPROJ') and ModelType.MMPROJ in ModelBase._model_classes:
-                    if isinstance(ModelBase._model_classes[ModelType.MMPROJ], dict):
-                        vision_archs = set(ModelBase._model_classes[ModelType.MMPROJ].keys())
-                        supported_types.update(vision_archs)
-                    else:
-                        logger.warning("Unsloth: ModelBase._model_classes[ModelType.MMPROJ] is not a dictionary.")
-                else:
-                     logger.info("Unsloth: No VISION model architectures found registered in the original script.")
+            # Monolith layout: read the registrations out of the entrypoint. It is
+            # downloaded from llama.cpp master at runtime, so parse, never import.
+            text_archs, vision_archs = _extract_archs_from_monolith_source(original_content)
+            supported_types.update(text_archs)
+            supported_types.update(vision_archs)
+            if not text_archs:
+                logger.info("Unsloth: No TEXT model architectures found registered in the original script.")
+            if not vision_archs:
+                logger.info("Unsloth: No VISION model architectures found registered in the original script.")
         # --- End Architecture Extraction ---
 
         # Convert final set to frozenset for immutability (good practice for cache keys/return values)
@@ -1806,41 +3263,57 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                 f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
             )
 
-        # Cleanup module reference (only set on the monolith branch)
-        if original_module_name is not None and original_module_name in sys.modules:
-             del sys.modules[original_module_name]
-
+    except ConverterScanError:
+        # A deliberate refusal under UNSLOTH_CONVERTER_SCAN_STRICT=1. Propagate it
+        # with its own message instead of relabelling it an introspection failure.
+        raise
     except Exception as e:
          logger.error(f"Unsloth: Error during loading or introspecting the original script: {e}", exc_info=True)
-         if temp_original_file_path and os.path.exists(temp_original_file_path):
-             try: os.remove(temp_original_file_path)
-             except OSError as remove_error: logger.warning(f"Could not remove temp file {temp_original_file_path}: {remove_error}")
          raise RuntimeError(f"Failed during loading/introspection of original script: {e}") from e
-    finally:
-        if temp_original_file_path and os.path.exists(temp_original_file_path):
-            try:
-                os.remove(temp_original_file_path)
-                logger.debug(f"Cleaned up temporary file: {temp_original_file_path}")
-            except OSError as remove_error:
-                logger.warning(f"Could not remove temporary file {temp_original_file_path}: {remove_error}")
 
 
     # --- Proceed with patching and saving ---
     try:
         patched_content = original_content # Start patching from original
+        # Snapshot after every patch so a patch that breaks the file can be dropped
+        # on its own instead of discarding the others (see _choose_content_to_write).
+        _patch_stages = [("unpatched upstream script", original_content)]
 
         # 3. Apply Patches (gguf attributes, metadata branding - same logic as before)
         logger.info("Unsloth: Applying patches...")
         # Patch 1: gguf Attribute Handling
         try:
-            archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", patched_content)))
+            # Scan with any previous guards stripped out: they spell `gguf.X` themselves,
+            # so a scan over the patched file re-finds every name it already covers. The
+            # old fix was to bail out on the first guard line, which left a newly
+            # referenced enum unguarded on a converter that had been patched once.
+            _unguarded_source = _GGUF_GUARD_BLOCK_PATTERN.sub(b"", patched_content)
+            archs = list(set(re.findall(rb"[\n\s]gguf\.([\.A-Z\_0-9]{3,})[\n\s\,]", _unguarded_source)))
             archs = [x.decode("utf-8") for x in archs if not x.startswith(b"_")]
-            if archs:
-                all_edits = "\n".join(f"try: gguf.{x}\nexcept AttributeError: gguf.{x} = None" for x in archs).encode("utf-8")
-                patched_content = re.sub(rb"(import gguf\s*\n)", rb"\1" + all_edits + b"\n\n", patched_content, count=1)
+            _already_guarded = {
+                name.decode("utf-8")
+                for name in _GGUF_GUARD_PATTERN.findall(patched_content)
+            }
+            # Sorted, so a re-patch writes the same bytes rather than a set's order.
+            archs = sorted(name for name in archs if name not in _already_guarded)
+            if not archs and _GGUF_GUARD_LINE in patched_content:
+                # Everything is already covered, so the file converges instead of
+                # growing one copy of the block per patch.
+                logger.info(
+                    "Unsloth: gguf attribute guards already cover every referenced "
+                    "attribute (idempotent skip)."
+                )
+            elif archs:
+                _eol = _dominant_newline(patched_content)
+                _eol_text = _eol.decode("utf-8")
+                all_edits = _eol_text.join(
+                    f"try: gguf.{x}{_eol_text}except AttributeError: gguf.{x} = None" for x in archs
+                ).encode("utf-8")
+                patched_content = re.sub(rb"(import gguf[ \t]*\r?\n)", rb"\1" + all_edits + _eol + _eol, patched_content, count=1)
                 if original_content == patched_content and archs: logger.warning("Unsloth: gguf attribute patch did not seem to apply.")
             else: logger.info("Unsloth: No specific gguf attributes found to patch.")
         except Exception as e: logger.error(f"Unsloth: Error applying gguf attribute patch: {e}", exc_info=True); raise
+        _patch_stages.append(("gguf attribute guards", patched_content))
 
 
 
@@ -1862,14 +3335,24 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                         f"Unsloth: Metadata branding patch target not found in {conv_base_py}. "
                         f"Upstream may have refactored Metadata.load again."
                     )
+            elif _UNSLOTH_BRANDING_LINE in patched_content:
+                # This patch has no marker of its own, so without this check the regex
+                # matches `Metadata.load(...)` again and appends another copy of the
+                # branding on every conversion. Upstream never ships this line, so a
+                # pristine checkout is unaffected.
+                logger.info(
+                    "Unsloth: Metadata branding patch already present in the converter "
+                    "(idempotent skip)."
+                )
             else:
                 metadata_patch_applied = False
+                _eol = _dominant_newline(patched_content)
                 new_patched_content = re.sub(
                     rb"(self\.metadata \= gguf\.Metadata\.load\(.+?\))([\n\r]+([\s\t]{4,}))",
-                    rb"\1\n"
-                    rb"\3if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"
-                    rb"\3if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"
-                    rb"\3if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"
+                    rb"\1" + _eol +
+                    rb"\3if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'" + _eol +
+                    rb"\3if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'" + _eol +
+                    rb"\3if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']" + _eol +
                     rb"\2",
                     patched_content, count=1, flags=re.MULTILINE
                 )
@@ -1878,6 +3361,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                      if re.search(rb"self\.metadata \= gguf\.Metadata\.load\(", patched_content): logger.warning("Unsloth: Metadata branding patch target found, but regex failed to apply.")
                      else: logger.warning("Unsloth: Metadata branding patch target 'self.metadata = gguf.Metadata.load(...)' not found.")
         except Exception as e: logger.error(f"Unsloth: Error applying metadata branding patch: {e}", exc_info=True); raise
+        _patch_stages.append(("metadata branding", patched_content))
 
 
         # Patch 3: Qwen2MoE / Qwen3MoE num_experts fix.
@@ -1897,15 +3381,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
                     _qwen_handled = True
 
             if not _qwen_handled:
-                # Use a single regex to handle both quote styles
-                num_experts_pattern = rb'n_experts = self\.hparams\[(["\'])num_experts\1\]'
-                replacement = (
-                    b"# Qwen3MoE seems to use num_local_experts instead of num_experts\n"
-                    b"            n_experts = self.hparams.get('num_experts', None) or self.hparams.get('num_local_experts')"
-                )
-
-                new_patched_content = re.sub(num_experts_pattern, replacement, patched_content)
-                num_experts_patch_applied = (new_patched_content != patched_content)
+                new_patched_content, num_experts_patch_applied = _patch_num_experts(patched_content)
 
                 if num_experts_patch_applied:
                     patched_content = new_patched_content
@@ -1915,6 +3391,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         except Exception as e:
             logger.error(f"Unsloth: Error applying Qwen2MoE num_experts patch: {e}", exc_info=True)
             raise
+        _patch_stages.append(("Qwen2MoE num_experts alias", patched_content))
 
 
         # 4. Write Patched File
@@ -1923,6 +3400,19 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         patched_dir = _llama_cpp_dir if _layout == "package" else LLAMA_CPP_DEFAULT_DIR
         os.makedirs(patched_dir, exist_ok=True)
         patched_filename = os.path.join(patched_dir, f"{name}.py")
+
+        # Never write a converter we just broke: fall back to the last content that
+        # still parses, rather than failing later far from the cause.
+        _kept_label, _kept_content, _dropped_labels = _choose_content_to_write(_patch_stages)
+        if _dropped_labels:
+            logger.warning(
+                f"Unsloth: Patched converter script is not valid Python - dropping "
+                f"{', '.join(_dropped_labels)} and writing the content after "
+                f"{_kept_label} instead."
+            )
+            patched_content = _kept_content
+        pass
+
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
         with open(patched_filename, "wb") as file:
             file.write(patched_content)
@@ -1931,7 +3421,11 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         logger.info("Unsloth: Parsing arguments from patched script...")
         flags = re.findall(rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"]", patched_content)
         if not flags: raise RuntimeError(f"Unsloth: Failed parsing {patched_filename} - no arguments found.")
-        defaults = re.findall(rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"][^\)]*(?:action=|default=)[\s]*([^,\s\)]+)", patched_content)
+        # The same compiled regex converter_scan vets these tokens with, so the
+        # two cannot drift apart. The scan reads the pre-patch bytes; the patches
+        # above only insert Unsloth-authored lines and never an add_argument call,
+        # so both see the same set of defaults.
+        defaults = RE_ARGPARSE_DEFAULT.findall(patched_content)
         all_flags = {}
         for flag_bytes, default_bytes in defaults:
             flag = flag_bytes.decode("utf-8").lstrip('-').replace("-", "_")
@@ -2244,6 +3738,238 @@ def _reinstall_converter_deps(python_exe, print_output = False):
     return result
 
 
+def _has_mtp_weight_tensors(input_folder, num_layers):
+    """Return whether the checkpoint's tensor names include an MTP layer."""
+    input_folder = Path(input_folder)
+    _layer_re = re.compile(r"^(?:model\.)?layers\.(\d+)\.")
+
+    def _is_mtp(name):
+        # Match the converter's TextModel.filter_tensors normalization.
+        name = name.replace("language_model.", "")
+        if name.startswith(("mtp.", "model.mtp.")):
+            return True
+        m = _layer_re.match(name)
+        return m is not None and int(m.group(1)) >= num_layers
+
+    def _inspection_error(path):
+        return RuntimeError(
+            f"Unsloth: Could not inspect `{path.name}` for MTP tensors; "
+            "`config.json` was not changed."
+        )
+
+    def _names_from_index(index_path):
+        try:
+            with index_path.open("r", encoding = "utf-8") as f:
+                index = json.load(f)
+        except Exception as error:
+            raise _inspection_error(index_path) from error
+        weight_map = index.get("weight_map") if isinstance(index, dict) else None
+        if not isinstance(weight_map, dict):
+            raise _inspection_error(index_path)
+        return weight_map.keys()
+
+    parts = sorted(input_folder.glob("model*.safetensors"))
+    if parts:
+        index_path = input_folder / "model.safetensors.index.json"
+        # llama.cpp gives the canonical index precedence whenever any
+        # safetensors part exists, including alongside model.safetensors.
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
+        from safetensors import safe_open
+
+        for part in parts:
+            try:
+                with safe_open(part, framework = "pt", device = "cpu") as f:
+                    if any(_is_mtp(name) for name in f.keys()):
+                        return True
+            except Exception as error:
+                raise _inspection_error(part) from error
+        return False
+
+    parts = sorted(input_folder.glob("pytorch_model*.bin"))
+    if parts:
+        index_path = input_folder / "pytorch_model.bin.index.json"
+        if index_path.is_file():
+            return any(_is_mtp(name) for name in _names_from_index(index_path))
+        if torch is None:
+            raise RuntimeError("Unsloth: PyTorch is required to inspect `.bin` model weights.")
+        for part in parts:
+            try:
+                state_dict = torch.load(
+                    part,
+                    map_location = "cpu",
+                    mmap = True,
+                    weights_only = True,
+                )
+            except Exception as error:
+                raise _inspection_error(part) from error
+            if isinstance(state_dict, dict) and isinstance(state_dict.get("state_dict"), dict):
+                state_dict = state_dict["state_dict"]
+            if not isinstance(state_dict, dict):
+                raise _inspection_error(part)
+            if any(_is_mtp(name) for name in state_dict):
+                return True
+    return False
+
+
+def _converter_supports_no_mtp(converter_location):
+    """Return whether the selected converter declares the `--no-mtp` option."""
+    try:
+        source = Path(converter_location).read_bytes()
+    # Missing/unreadable path, or None and NUL-bearing ones: all mean "cannot
+    # prove support", and omitting --no-mtp just restores the old behaviour.
+    except (OSError, TypeError, ValueError):
+        return False
+    return re.search(
+        rb"parser\.add_argument\([^)]*[\"']--no-mtp[\"']",
+        source,
+        flags = re.DOTALL,
+    ) is not None
+
+
+def _find_bitsandbytes_quantization(config, _path = "config.json"):
+    """Where a bitsandbytes `quantization_config` sits, or None.
+
+    Recursive: VLMs keep theirs under a sub-config like `text_config`.
+    """
+    if not isinstance(config, dict):
+        return None
+    quant = config.get("quantization_config")
+    if isinstance(quant, dict):
+        method = quant.get("quant_method")
+        # Older checkpoints omit quant_method and only carry the bnb flags.
+        if method == "bitsandbytes" or (
+            method is None
+            and ("load_in_4bit" in quant or "load_in_8bit" in quant)
+        ):
+            return _path
+    for key, value in config.items():
+        if key == "quantization_config" or not isinstance(value, dict):
+            continue
+        found = _find_bitsandbytes_quantization(value, f"{_path}[{key!r}]")
+        if found is not None:
+            return found
+    return None
+
+
+def _converter_was_oom_killed(exc):
+    """Was the converter OOM-killed (SIGKILL), rather than failing on its own?"""
+    if getattr(exc, "returncode", None) in (-9, 137):
+        return True
+    return "sigkill" in f"{exc}".lower()
+
+
+# One line only: a failure that merely names the counter must not match, and
+# `[^\S\r\n]` (not `\s`, which spans newlines) keeps the comparison off the
+# stderr/stdout join.
+_MTP_INFERENCE_ASSERTION = re.compile(
+    r"\bassert\b[^\r\n]*\bopt_num_mtp_layers[^\S\r\n]*!=[^\S\r\n]*0"
+)
+
+
+def _converter_needs_no_mtp(text):
+    """Did the converter abort while inferring an MTP head it could not find?"""
+    if not text: return False
+    return _MTP_INFERENCE_ASSERTION.search(text) is not None
+
+
+def _converter_rejected_no_mtp(text):
+    """Did the converter refuse `--no-mtp` because this architecture has no MTP?"""
+    if not text: return False
+    for line in text.splitlines():
+        low = line.lower()
+        if "--mtp" not in low and "--no-mtp" not in low and "--no-nextn" not in low:
+            continue
+        if "not supported" in low or "only supported" in low:
+            return True
+    return False
+
+
+def _drop_no_mtp(command):
+    """The same command without `--no-mtp`, or None when it has none to drop."""
+    if "--no-mtp" not in command: return None
+    return [token for token in command if token != "--no-mtp"]
+
+
+def _add_no_mtp(command):
+    """The same command with `--no-mtp`, or None when it already has it."""
+    if "--no-mtp" in command: return None
+    # The positional model directory must stay last.
+    return command[:-1] + ["--no-mtp", command[-1]]
+
+
+def _checkpoint_has_mtp_tensors(input_folder, num_layers):
+    """Does the checkpoint carry an MTP head, whatever it declares?
+
+    Unlike `_keep_mtp` this ignores the declaration, since the checkpoints that
+    reach the assertion declare nothing. Only consulted after a failure, so an
+    unreadable index answers "no evidence" and lets the retry proceed.
+    """
+    if not isinstance(num_layers, int) or isinstance(num_layers, bool) or num_layers <= 0:
+        return False
+    try:
+        return _has_mtp_weight_tensors(input_folder, num_layers)
+    except Exception:
+        return False
+
+
+def _retry_with_temp_file(command):
+    """The same command spooling tensors to disk instead of holding them in RAM.
+
+    llama.cpp refuses `--use-temp-file` alongside splitting ("Cannot use temp
+    file when splitting"), so the split options are dropped. None when the
+    command already has the flag, so the retry cannot loop.
+    """
+    if "--use-temp-file" in command:
+        return None
+    out = []
+    drop_value = False
+    for token in command:
+        if drop_value:
+            drop_value = False
+            # Only its value: a flag here means the previous one had none.
+            if not str(token).startswith("--"):
+                continue
+        if token in ("--split-max-size", "--split-max-tensors"):
+            drop_value = True
+            continue
+        out.append(token)
+    # The trailing model path must stay last.
+    return out[:-1] + ["--use-temp-file"] + out[-1:]
+
+
+def _gguf_output_paths(output_file):
+    """`output_file` plus any shards llama.cpp names after it."""
+    basename_without_gguf = os.path.splitext(output_file)[0]
+    shard_pattern = re.compile(
+        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
+    )
+    parent_dir = os.path.dirname(output_file) or '.'
+    paths = [output_file]
+    try:
+        # fullmatch, not search: these get os.remove'd, and an unanchored match
+        # would take a neighbour like "old-model.BF16-00001-of-00002".
+        paths += sorted(os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
+                        if shard_pattern.fullmatch(f))
+    except OSError:
+        pass
+    return paths
+
+
+def _remove_gguf_outputs(output_file):
+    """Delete what a failed or abandoned conversion left at `output_file`.
+
+    The writer opens every shard with "wb" before any tensor byte and cleans up
+    nothing on failure, and callers upload every save_directory/*.gguf, so a
+    truncated leftover gets published as a valid artifact.
+    """
+    for path in _gguf_output_paths(output_file):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -2276,15 +4002,63 @@ def convert_to_gguf(
     with open(config_path, "r", encoding = "utf-8") as f:
         config_file = json.load(f)
 
-    # Strip MTP / nextn config keys so the downstream convert_hf_to_gguf.py
-    # doesn't inflate block_count / inject nextn_predict_layers.
+    _bnb_where = _find_bitsandbytes_quantization(config_file)
+    if _bnb_where is not None:
+        # llama.cpp has no bitsandbytes dequantizer and only refuses after
+        # reading the whole model, so fail here instead of after a multi-GB
+        # download. Both flags are named: 8bit checkpoints hit this too.
+        raise RuntimeError(
+            f"Unsloth: `{input_folder}` still holds bitsandbytes quantized "
+            f"weights (`quantization_config` at {_bnb_where}), and llama.cpp "
+            f"cannot convert those to GGUF.\n"
+            f"GGUF export needs dequantized 16bit weights. Either load the "
+            f"model with `load_in_4bit = False` and `load_in_8bit = False` "
+            f"before saving, or merge a LoRA adapter with "
+            f"`save_method = \"merged_16bit\"`, which downloads the original "
+            f"16bit weights. Saving a quantized model that has no adapter does "
+            f"not dequantize it."
+        )
+
+    # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
+    # only when the weights still carry the MTP layer (else it crashes on the extra
+    # tensor), and strip it when they don't (else it errors on the missing one).
+    # `unsloth_fixed_mtp` is an internal marker, always dropped. Only Qwen3.5/3.6 set
+    # these keys, so other arches are untouched.
+    _tc = config_file.get("text_config")
+    if not isinstance(_tc, dict):
+        _tc = {}
+    _mtp_declared = "mtp_num_hidden_layers" in config_file or "mtp_num_hidden_layers" in _tc
+    _num_layers = _tc.get("num_hidden_layers", config_file.get("num_hidden_layers"))
+    if _mtp_declared and (
+        not isinstance(_num_layers, int)
+        or isinstance(_num_layers, bool)
+        or _num_layers <= 0
+    ):
+        raise ValueError(
+            "Unsloth: `num_hidden_layers` must be a positive integer to reconcile MTP tensors; "
+            "`config.json` was not changed."
+        )
+    _keep_mtp = _mtp_declared and _has_mtp_weight_tensors(input_folder, _num_layers)
+    _no_mtp = (
+        _mtp_declared
+        and not _keep_mtp
+        and _converter_supports_no_mtp(converter_location)
+    )
+    # Keep the declaration when `--no-mtp` carries the intent: deleting it made
+    # a retry or second export read none, omit the flag, and hit the assertion.
+    _strip_keys = (
+        ("unsloth_fixed_mtp",)
+        if _keep_mtp or _no_mtp
+        else ("unsloth_fixed_mtp", "mtp_num_hidden_layers")
+    )
     _changed = False
-    for _key in ("mtp_num_hidden_layers", "unsloth_fixed_mtp"):
-        if config_file.pop(_key, None) is not None:
-            _changed = True
-        _tc = config_file.get("text_config")
-        if _tc and _tc.pop(_key, None) is not None:
-            _changed = True
+    for _cfg in (config_file, _tc):
+        if not _cfg:
+            continue
+        for _key in _strip_keys:
+            if _key in _cfg:
+                _cfg.pop(_key)
+                _changed = True
     if _changed:
         with open(config_path, "w", encoding = "utf-8") as f:
             json.dump(config_file, f, indent = 2)
@@ -2342,7 +4116,9 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((text_args, text_output, "text model"))
+        if _no_mtp:
+            text_args["--no-mtp"] = ""
+        runs_to_do.append((text_args, text_output, "text model", True))
 
         # Vision projector conversion
         mmproj_args = {
@@ -2351,7 +4127,8 @@ def convert_to_gguf(
             "--mmproj"         : "",
             "--split-max-size" : max_shard_size,
         }
-        runs_to_do.append((mmproj_args, mmproj_output, "vision projector"))
+        # Optional: a projector failure must not discard the text GGUF above.
+        runs_to_do.append((mmproj_args, mmproj_output, "vision projector", False))
 
     else:
         if is_gpt_oss:
@@ -2377,10 +4154,37 @@ def convert_to_gguf(
                 "--outtype"        : quantization_type,
                 "--split-max-size" : max_shard_size,
             }
-        runs_to_do.append((args, final_output, "model"))
+        if _no_mtp:
+            args["--no-mtp"] = ""
+        runs_to_do.append((args, final_output, "model", True))
+
+    # A bare --outfile lands in the process CWD. On Windows that CWD is often not writable
+    # (app launched from a protected dir), so the final write failed with PermissionError
+    # [Errno 13] even though conversion succeeded. Only then redirect the bare name into
+    # input_folder; a writable CWD (Linux/Mac/Colab) is left unchanged.
+    def _dir_is_writable(d):
+        # mkstemp is exclusive: never truncates an existing file or follows a symlink.
+        try:
+            fd, probe = tempfile.mkstemp(prefix=".unsloth_write_test_", dir=d)
+            os.close(fd)
+            os.remove(probe)
+            return True
+        except Exception:
+            return False
+    _cwd_writable = _dir_is_writable(os.getcwd())
 
     # Execute conversions
-    for args, output_file, description in runs_to_do:
+    for args, output_file, description, required in runs_to_do:
+        # Redirect only a bare filename under an unwritable CWD. Absolute paths and
+        # relative paths with a directory are the caller's choice; input_folder is probed
+        # too since it may be a read-only model source.
+        if (not _cwd_writable
+                and not os.path.isabs(output_file)
+                and os.path.dirname(output_file) == ""):
+            _dst = os.path.abspath(input_folder)
+            if _dir_is_writable(_dst):
+                output_file = os.path.join(_dst, output_file)
+                args = {**args, "--outfile": output_file}
         if print_output: print(f"\nUnsloth: Converting {description}...")
         command = [sys.executable, converter_location]
         for key, value in args.items():
@@ -2394,7 +4198,12 @@ def convert_to_gguf(
         # Run the converter; self-heal and retry once if the env (not the model)
         # is broken. No cost on the happy path.
         attempted_repair = False
+        attempted_temp_file = False
+        attempted_no_mtp_drop = False
+        attempted_no_mtp_add = False
         repair_note = ""
+        no_mtp_note = ""
+        optional_failed = False
         while True:
             try:
                 # encoding/errors pinned so non-UTF8 output never crashes decoding.
@@ -2410,14 +4219,25 @@ def convert_to_gguf(
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 break
             except subprocess.CalledProcessError as e:
-                captured = ""
+                # Joined, never concatenated: an unterminated stderr line glued
+                # to stdout's first splices two harmless fragments into a line
+                # that matches a self-heal signature.
+                captured_streams = []
                 for stream in (getattr(e, "stderr", None), getattr(e, "stdout", None)):
                     if stream:
-                        captured += stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
+                        captured_streams.append(
+                            stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace"))
+                captured = "\n".join(captured_streams)
 
                 # Self-heal: reinstall the converter deps (command[0] = its
                 # interpreter) and retry once instead of failing.
-                if not attempted_repair and _looks_like_converter_dep_error(captured):
+                # `_auto_install_enabled` gates this too: the repair runs pip with
+                # --upgrade --force-reinstall, so it mutates the environment just as much
+                # as the installer does. An existing checkout returns out of
+                # install_llama_cpp before its gate, so this is the one remaining way a
+                # refusal could still reach pip.
+                if (not attempted_repair and _auto_install_enabled()
+                        and _looks_like_converter_dep_error(captured)):
                     attempted_repair = True
                     try:
                         repair = _reinstall_converter_deps(command[0], print_output = print_output)
@@ -2426,6 +4246,72 @@ def convert_to_gguf(
                         repair_note = f"\n--- dependency reinstall failed ---\n{(repair.stdout or '').strip()}"
                     except Exception as repair_error:
                         repair_note = f"\n--- dependency reinstall failed ---\n{repair_error}"
+
+                # `--no-mtp` is architecture-gated, so a config key alone cannot
+                # prove it is accepted. Retry once without it: the pre-existing
+                # behaviour, and correct for an arch with no MTP block to strip.
+                if not attempted_no_mtp_drop and _converter_rejected_no_mtp(captured):
+                    retry = _drop_no_mtp(command)
+                    if retry is not None:
+                        attempted_no_mtp_drop = True
+                        command = retry
+                        continue
+
+                # Text runs only: `--no-mtp` never belonged on the projector
+                # command, and a projector failure is degraded, not repaired.
+                if not attempted_no_mtp_add and required and _converter_needs_no_mtp(captured):
+                    retry = _add_no_mtp(command)
+                    if retry is not None and _checkpoint_has_mtp_tensors(input_folder, _num_layers):
+                        # `--no-mtp` would discard the `mtp.*` tensors that are
+                        # here and call the lossy export a success.
+                        no_mtp_note = (
+                            "\n--- unsloth ---\nThe converter could not infer this "
+                            "checkpoint's multi-token prediction (MTP) head, but the "
+                            "checkpoint does contain MTP tensors, so retrying with "
+                            "--no-mtp would silently drop them. Convert with an "
+                            "explicit `mtp_num_hidden_layers` in config.json, or "
+                            "remove the MTP tensors, and try again."
+                        )
+                        attempted_no_mtp_add = True
+                    elif retry is not None:
+                        attempted_no_mtp_add = True
+                        # The one self-heal that changes what the GGUF contains.
+                        print(
+                            "Unsloth: The GGUF converter recognised no multi-token "
+                            "prediction (MTP) head in this checkpoint. Retrying with "
+                            "--no-mtp; if it succeeds the GGUF will have no MTP head."
+                        )
+                        # The failed attempt leaves a truncated --outfile and,
+                        # when splitting, shards beside it. Callers scan the
+                        # output directory for *.gguf and would ship them.
+                        _remove_gguf_outputs(output_file)
+                        # Else a retry that fails for its own reason discards
+                        # the assertion that caused it.
+                        no_mtp_note = (
+                            f"\n--- first attempt, before retrying with --no-mtp ---\n"
+                            f"{captured.strip()}"
+                        )
+                        command = retry
+                        continue
+
+                # OOM-killed: retry once spooling to disk, the one resource
+                # these machines have. Only for a kill, so a converter that
+                # failed on its own is not quietly run twice.
+                if not attempted_temp_file and _converter_was_oom_killed(e):
+                    retry = _retry_with_temp_file(command)
+                    if retry is not None:
+                        attempted_temp_file = True
+                        print(
+                            "Unsloth: The GGUF converter ran out of host RAM "
+                            "and was killed. Retrying with --use-temp-file, "
+                            "which spools tensors to disk instead."
+                        )
+                        # The retry drops --split-max-size, so the killed
+                        # run's shards would linger beside the good file and
+                        # be uploaded with it.
+                        _remove_gguf_outputs(output_file)
+                        command = retry
+                        continue
 
                 if print_output and getattr(e, 'stdout', None):
                     print(e.stdout)
@@ -2439,7 +4325,33 @@ def convert_to_gguf(
                     text = stream if isinstance(stream, str) else stream.decode("utf-8", errors="replace")
                     text = text.strip()
                     if text: details += f"\n--- converter {label} ---\n{text}"
-                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}")
+                if not required:
+                    # Degrade like the "Converting as text-only model" path,
+                    # but for listed archs whose projector conversion fails.
+                    reason = ""
+                    for line in reversed((details or "").splitlines()):
+                        line = line.strip()
+                        if line and ("Error" in line or "Exception" in line):
+                            reason = line
+                            break
+                    # The converter truncates its --outfile at header time,
+                    # so the failed run leaves a partial projector that callers
+                    # would upload as if it were valid.
+                    _remove_gguf_outputs(output_file)
+                    is_vlm = False
+                    optional_failed = True
+                    print(
+                        f"Unsloth: Could not convert the {description} to GGUF "
+                        f"({reason or e}). The text model was converted "
+                        f"successfully and is usable; only multimodal "
+                        f"(image/audio) input is unavailable in this GGUF."
+                    )
+                    break
+                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}{no_mtp_note}")
+
+        # Its partial output was just removed, so validation would fail for nothing.
+        if optional_failed:
+            continue
 
         # Simple validation using native Python - check for main file or sharded files
         if os.path.exists(output_file):
@@ -2501,6 +4413,95 @@ def convert_to_gguf(
 pass
 
 
+# Quants tensor_requires_imatrix rejects for any transformer, measured with
+# `llama-quantize --dry-run`, not read off the ftype defaults. iq3_xs is here despite defaulting
+# to IQ3_S: the attention Q/K overrides promote to IQ3_XXS unconditionally, failing on blk.0.
+# iq3_s, iq3_m, iq4_nl, iq4_xs, q2_k, q3_k_s and tq*_0 all quantize fine without one.
+IMATRIX_REQUIRED_QUANTS = frozenset((
+    "iq1_s", "iq1_m", "iq1_xs", "iq1_xxs", "iq1_xxxs",
+    "iq2_xxs", "iq2_xs", "iq2_s", "iq2_m",
+    "iq3_xxs", "iq3_xs",
+    "q2_k_s",
+))
+
+# All three are in live use across unsloth/*-GGUF, and --imatrix reads any of them. .gguf_file is
+# a GGUF imatrix named so the Hub does not list it as a model; plain .gguf skips that guard.
+IMATRIX_UPSTREAM_NAMES = (
+    "imatrix_unsloth.dat", "imatrix_unsloth.gguf_file", "imatrix_unsloth.gguf",
+)
+
+
+def quant_requires_imatrix(quant_type):
+    return str(quant_type).strip().lower() in IMATRIX_REQUIRED_QUANTS
+
+
+def _materialize_imatrix(path, dest_dir):
+    """Copy into dest_dir (never mutate the HF cache), renaming *.gguf_file -> *.gguf."""
+    os.makedirs(dest_dir, exist_ok = True)
+    base = os.path.basename(path)
+    if base.endswith(".gguf_file"):
+        base = base[: -len(".gguf_file")] + ".gguf"
+    local = os.path.join(dest_dir, base)
+    # dest_dir can be the file's own directory: the helper is public and Studio calls it directly.
+    if os.path.exists(local) and os.path.samefile(path, local):
+        return local
+    shutil.copyfile(path, local)
+    return local
+
+
+def resolve_imatrix_file(imatrix_file, dest_dir, repo_candidates = (), token = None):
+    """Resolve imatrix_file to a local path, or None.
+
+    None/False -> None; a path -> a copy in dest_dir (*.gguf_file renamed to .gguf); True -> the
+    first upstream imatrix across repo_candidates, or a RuntimeError naming what was searched.
+    """
+    if imatrix_file is None or imatrix_file is False:
+        return None
+
+    if isinstance(imatrix_file, (str, os.PathLike)):
+        path = os.path.expanduser(os.fspath(imatrix_file))
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Unsloth: imatrix_file '{path}' does not exist.")
+        # Copy even when it is already local: an imatrix under save_directory would be uploaded
+        # and reported as an exported model, since both paths glob save_directory/*.gguf.
+        return _materialize_imatrix(path, dest_dir)
+
+    if imatrix_file is not True:
+        raise TypeError(
+            "Unsloth: imatrix_file must be None, a path string, or True "
+            f"(got {type(imatrix_file).__name__})."
+        )
+
+    from huggingface_hub import HfApi, hf_hub_download
+
+    repos = []
+    for repo in repo_candidates:
+        if repo and repo not in repos: repos.append(repo)
+    api = HfApi(token = token)
+    lookup_error = None
+    for repo in repos:
+        try:
+            files = set(api.list_repo_files(repo))
+        except Exception as error:
+            # Keep the first cause, reported only if no candidate hits: otherwise a bad token
+            # or an outage reads as "no imatrix exists".
+            if lookup_error is None: lookup_error = f"{repo}: {type(error).__name__}: {error}"
+            continue
+        for name in IMATRIX_UPSTREAM_NAMES:
+            if name not in files: continue
+            downloaded = hf_hub_download(repo_id = repo, filename = name, token = token)
+            local = _materialize_imatrix(downloaded, dest_dir)
+            print(f"Unsloth: Using imatrix '{name}' from '{repo}' -> '{local}'")
+            return local
+    raise RuntimeError(
+        "Unsloth: imatrix_file=True but no upstream Unsloth imatrix was found.\n"
+        f"  Searched repos: {repos or '(none derived from the base model)'}\n"
+        f"  Searched files: {list(IMATRIX_UPSTREAM_NAMES)}\n"
+        + (f"  First lookup failure: {lookup_error}\n" if lookup_error else "")
+        + "Pass imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
+    )
+
+
 def quantize_gguf(
     input_gguf,
     output_gguf,
@@ -2512,6 +4513,16 @@ def quantize_gguf(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Use llama-quantize for fast quantization of GGUF files.
+
+    # quant_type reaches the shell command below straight from the user facing
+    # quantization_method, and every real value is a bare token, so require one.
+    if not isinstance(quant_type, str) or \
+        re.fullmatch(r"[A-Za-z0-9_.\-]+", quant_type.strip()) is None:
+        raise ValueError(
+            f"Unsloth: Invalid quantization type `{quant_type}`. Quantization types are "
+            f"single tokens like `q4_k_m`, `q8_0`, `iq4_xs`, `bf16`."
+        )
+    quant_type = quant_type.strip()
 
     # Fix default path on Windows: binaries are in build/bin/Release/
     default_quantizer = os.path.join(LLAMA_CPP_DEFAULT_DIR, "llama-quantize")
@@ -2526,6 +4537,7 @@ def quantize_gguf(
         if n_threads is None:
             n_threads = 1
         n_threads *= 2
+    n_threads = int(n_threads)
 
     def _quote(s):
         """Quote a path for shell usage (the command runs under shell=True)."""
@@ -2565,6 +4577,8 @@ def quantize_gguf(
 
     command = (
         f"{_quote(quantizer_location)} {_extra_flags}"
+        # Validated above as a bare token, so quoting would only add a pair of
+        # quotes that cmd.exe did not see in previous releases.
         f"{_quote(input_gguf)} {_quote(output_gguf)} {quant_type} {n_threads}"
     )
 

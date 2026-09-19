@@ -138,7 +138,29 @@ def _bundled_cuda_lib_dirs():
     return dirs
 
 
-def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, base_env = None, os_name = None):
+DEFAULT_NGL = 99
+
+
+def _resolve_ngl(ngl = None, base_env = None):
+    """Layers the child offloads to GPU (its ``NGL`` knob -> llama.cpp ``n_gpu_layers``).
+
+    Explicit caller value wins, then an ``NGL`` already in the environment, else all layers.
+    Both overrides used to be impossible: the value was hardcoded to 99, so a GGUF larger than
+    VRAM died in ``cudaMalloc`` with no way to split it across GPU and RAM, even with studio's
+    GPU-layers set to 0 (unsloth#7574). The server itself defaults to 0 and handles partial
+    offload normally."""
+    if ngl is not None:
+        return max(0, int(ngl))
+    raw = (os.environ if base_env is None else base_env).get("NGL")
+    if raw is not None:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return DEFAULT_NGL
+
+
+def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, ngl = None, base_env = None, os_name = None):
     """Build the visual-server child env so it loads the CUDA backend, not CPU.
 
     Binary dir first, then bundled CUDA runtime, then the inherited path. Windows: torch/lib
@@ -148,7 +170,7 @@ def _build_subprocess_env(server_bin, gpu = "0", maxtok = 0, base_env = None, os
     name = os.name if os_name is None else os_name
     env = dict(os.environ if base_env is None else base_env)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    env["NGL"] = "99"
+    env["NGL"] = str(_resolve_ngl(ngl, base_env))
     env["MAXTOK"] = str(maxtok)
 
     bin_dir = os.path.dirname(server_bin)
@@ -180,13 +202,14 @@ def _canvas_maxtok(maxtok):
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
-    def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None):
+    def __init__(self, gguf, gpu="0", maxtok=0, server_bin=None, req_path=None, ngl=None):
         self.gguf = gguf
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
         self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
-        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok))
+        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
+        self.ngl = int(self.env["NGL"])
         self.p = None
         self._spawn()
 

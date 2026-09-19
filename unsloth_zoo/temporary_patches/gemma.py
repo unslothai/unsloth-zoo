@@ -18,8 +18,15 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
 import os
-from .common import TEMPORARY_PATCHES, torch_compile
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile,
+    flatten_for_elementwise_norm,
+    unwrap_norm_weight,
+    publish_to_modeling_module,
+)
 from .utils import (
+    compile_with_eager_fallback,
     patch_function,
     process_output_options,
     KWARGS_TYPE,
@@ -38,6 +45,142 @@ from .utils import (
 import inspect
 
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+
+
+def _storage_only_float_dtypes():
+    """float8 dtypes, which are a storage format rather than a compute dtype.
+
+    `torch.float8_e4m3fn.is_floating_point` is True, so a plain floating-point
+    test reads an FP8 checkpoint's stored weight as the dtype its Linear wants
+    its activations in. It is not: transformers' `FP8Linear` / `FbgemmFp8Linear`
+    take bfloat16 or float16 in, do their own scaled quantization, and hand back
+    the input dtype. Casting the hidden states straight to unscaled float8 would
+    throw away range before the scaling that exists to preserve it, and leave
+    the Q/K norm and SDPA downstream holding a dtype they do not support.
+
+    Built by lookup rather than hard-coded, so a torch that predates one of
+    these (or adds another) neither raises nor silently stops excluding it.
+    """
+    names = ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz",
+             "float8_e8m0fnu")
+    return frozenset(
+        dtype for dtype in (getattr(torch, name, None) for name in names)
+        if dtype is not None
+    )
+pass
+
+_STORAGE_ONLY_FLOAT_DTYPES = _storage_only_float_dtypes()
+
+
+def _linear_boundary_dtype(module, *attr_names):
+    """Dtype of the activations that the given projections expect, or None.
+
+    The UNSLOTH_FORCE_FLOAT32 Gemma3 patches run the heavy reductions (RMSNorm
+    variance, SwiGLU, attention) in float32 for fp16 overflow safety and hand a
+    float16 activation to every Linear. That hard-coded float16 silently assumes
+    the projection weights are float16 too. They are for LoRA / QLoRA, where the
+    base weights stay float16, but full finetuning upcasts the trainable weights
+    to float32, and then a float16 activation meets a float32 weight and the
+    matmul dies with "expected mat1 and mat2 to have the same dtype".
+
+    So read the dtype off the weights that will actually do the multiply. The
+    first ordinary floating-point weight wins.
+
+    A weight carrying a `quant_state` is quantized and never answers, whatever
+    its dtype says. bitsandbytes packs a 4bit weight into a blob of
+    `bnb_4bit_quant_storage`, which defaults to uint8 but is a public knob:
+    FSDP can only shard float dtypes, so FSDP-QLoRA setups are told to set it
+    to bfloat16, and `vllm_utils` / the bnb MoE loaders plumb the configured
+    value straight through. That makes `Params4bit.weight.dtype` bfloat16 while
+    the tensor is still packed 4bit, so a plain floating-point test reads a
+    storage container as the activation dtype. `Linear4bit` dequantizes to its
+    own compute dtype and hands back the caller's input dtype, so answering
+    here would cast activations and forced outputs to the storage dtype and
+    change QLoRA forward and gradient numerics. `quant_state` is the only
+    reliable discriminator, and is read with getattr so a plain `nn.Parameter`
+    or a non-bitsandbytes backend is unaffected.
+
+    None means "no weight answered, so leave the activation alone". It is not
+    float16. On a 4bit model every projection is skipped, and a float16 default
+    would narrow a bfloat16 QLoRA activation on the generic (non-forced) path
+    that the unpatched forward passed through untouched -- costing exactly the
+    exponent range bfloat16 is chosen for. Under UNSLOTH_FORCE_FLOAT32 the
+    activation reaching here is already float16 out of RMSNorm, so "leave it
+    alone" and the old float16 default are the same value on that path.
+    """
+    for name in attr_names:
+        module_or_param = getattr(module, name, None)
+        if module_or_param is None: continue
+        weight = getattr(module_or_param, "weight", module_or_param)
+        # Quantized weights describe storage, not the activation dtype. Must be
+        # tested before the dtype checks, which a float quant_storage passes.
+        if getattr(weight, "quant_state", None) is not None: continue
+        dtype = getattr(weight, "dtype", None)
+        if dtype is None or not dtype.is_floating_point: continue
+        if dtype in _STORAGE_ONLY_FLOAT_DTYPES: continue
+        return dtype
+    return None
+pass
+
+
+def _to_boundary_dtype(x, dtype):
+    """Move an *already correctly typed* activation onto a Linear's dtype.
+
+    For the input boundaries only, where x arrives as float16 out of RMSNorm.
+    float16 weights (LoRA / QLoRA) hit the identity branch on every call, so the
+    common path keeps exactly the casts it had before and its numerics are
+    unchanged. Only the float32 full-finetuning mismatch actually converts.
+
+    A None dtype means "no weight answered" and is identity, which is safe here
+    precisely because x is already the float16 these lines used to hard-code.
+    Do NOT use this at a forced output boundary, where x is a deliberately
+    upcast float32 reduction and identity would leak that float32 into the
+    projection -- use `_to_forced_output_dtype` there.
+    """
+    if dtype is None or x.dtype == dtype: return x
+    return x.to(dtype)
+pass
+
+
+def _to_forced_output_dtype(x, dtype):
+    """Downcast a forced-float32 reduction before its output projection.
+
+    The counterpart of `_to_boundary_dtype` for the two boundaries where the
+    incoming activation is the explicitly upcast float32 SwiGLU / attention
+    reduction rather than a float16 RMSNorm output. Those lines used to be a
+    bare `.to(torch.float16)`, so "no weight answered" must still mean float16,
+    not identity: on 4bit QLoRA every projection weight is a packed 4bit blob
+    and nothing answers, and bitsandbytes `Linear4bit` returns its caller's
+    input dtype, so an identity here would make `down_proj` / `o_proj` hand back
+    float32 and change the forward and gradient dtypes of the common QLoRA path.
+
+    Kept as a separate name, rather than a default argument on the helper above,
+    so the two kinds of boundary cannot be confused at the call site.
+    """
+    if dtype is None: dtype = torch.float16
+    if x.dtype == dtype: return x
+    return x.to(dtype)
+pass
+
+
+def _publish_boundary_helpers(modeling_module):
+    """Make the three boundary helpers importable from the modeling module.
+
+    The auto-compiler serializes a patched forward into unsloth_compiled_cache
+    as source text, and `create_new_function` resolves the free names it finds
+    by importing them from `transformers.models.gemma3.modeling_gemma3`. A
+    helper that lives only in this patch module is not there, so the generated
+    forward raises NameError the first time it runs and compiled Gemma3
+    training dies. The RMSNorm helpers are published for exactly this reason;
+    every forward below references these two, so they need it too.
+    """
+    publish_to_modeling_module(
+        modeling_module,
+        _linear_boundary_dtype  = _linear_boundary_dtype,
+        _to_boundary_dtype      = _to_boundary_dtype,
+        _to_forced_output_dtype = _to_forced_output_dtype,
+    )
+pass
 
 
 def _prepare_gemma3_sdpa_attention_mask(attention_mask, query_states, key_states, sliding_window=None):
@@ -415,6 +558,40 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma3TextScaledWordEmbedding)
 
 
+# Module-level so `torch.finfo` stays out of the graph.
+_GEMMA3_FP16_MAX = float(torch.finfo(torch.float16).max)
+_GEMMA3_FP16_MIN = float(torch.finfo(torch.float16).min)
+
+
+# Every Gemma3 RMSNorm shares this one kernel, so its Dynamo cache holds the product
+# of every axis its guards see. A plain Tensor weight view keeps the width dynamic
+# and a rank 2 input drops the rank axis, leaving dtype, grad mode and requires_grad.
+def _gemma3_rms_norm_float32(hidden_states_2d, weight_1d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
+    # weight may be bf16; cast for the (1.0 + weight) op.
+    output_fp32 = hidden_states_fp32 * (1.0 + weight_1d.to(torch.float32))
+    clamped_output_fp32 = torch.clamp(output_fp32, min = _GEMMA3_FP16_MIN, max = _GEMMA3_FP16_MAX)
+    return clamped_output_fp32.to(torch.float16)
+pass
+
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
+# this wrapper latches to eager instead of aborting the run.
+_gemma3_rms_norm_float32 = compile_with_eager_fallback(_gemma3_rms_norm_float32, "Gemma3RMSNorm.forward (float32)")
+
+
+def _gemma3_rms_norm_generic(hidden_states_2d, weight_1d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + eps)
+    output_fp32 = hidden_states_fp32 * (1.0 + weight_1d.to(torch.float32))
+    return output_fp32.to(hidden_states_2d.dtype)
+pass
+
+_gemma3_rms_norm_generic = compile_with_eager_fallback(_gemma3_rms_norm_generic, "Gemma3RMSNorm.forward (generic)")
+
+
 def patch_Gemma3RMSNorm():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
@@ -423,22 +600,21 @@ def patch_Gemma3RMSNorm():
     except Exception as e:
         return raise_error("Gemma3RMSNorm.forward", e)
 
+    publish_to_modeling_module(
+        transformers.models.gemma3.modeling_gemma3,
+        flatten_for_elementwise_norm = flatten_for_elementwise_norm,
+        unwrap_norm_weight           = unwrap_norm_weight,
+        _gemma3_rms_norm_float32     = _gemma3_rms_norm_float32,
+    )
+
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
-        x_fp32 = x.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
-
-        # self.weight may be bf16; cast to fp32 for the (1.0 + weight) op.
-        output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
-
-        # Clamp to fp16 range before casting back to fp16
-        fp16_max = torch.finfo(torch.float16).max
-        fp16_min = torch.finfo(torch.float16).min
-        clamped_output_fp32 = torch.clamp(output_fp32, min=fp16_min, max=fp16_max)
-
-        return clamped_output_fp32.to(torch.float16) # Output fp16
+        x_2d, shape = flatten_for_elementwise_norm(x)
+        out = _gemma3_rms_norm_float32(x_2d, unwrap_norm_weight(self.weight), self.eps)
+        return out.reshape(shape)
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
+    # No `fullgraph`: the kernel is the compiled unit; compiling this wrapper too
+    # would put `self` back into the guards.
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm)
 
@@ -451,7 +627,13 @@ def patch_Gemma3MLP():
     except Exception as e:
         return raise_error("Gemma3MLP.forward", e)
 
-    def forward(self, x): # x is fp16 from RMSNorm
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
+
+    def forward(self, x): # x is fp16 from RMSNorm, or fp32 once full finetuning upcasts
+        # RMSNorm always emits fp16. That matches fp16 projection weights (LoRA),
+        # but full finetuning upcasts these Linears to fp32, so meet them there.
+        boundary_dtype = _linear_boundary_dtype(self, "gate_proj", "up_proj", "down_proj")
+        x = _to_boundary_dtype(x, boundary_dtype)
         gate_proj_out = self.gate_proj(x)
         up_proj_out = self.up_proj(x)
 
@@ -461,9 +643,10 @@ def patch_Gemma3MLP():
         activated_fp32 = self.act_fn(gate_proj_fp32) # Activation in fp32
         intermediate_fp32 = activated_fp32 * up_proj_fp32 # Product in fp32
 
-        # Downcast and down_proj
-        intermediate_fp16 = intermediate_fp32.to(torch.float16)
-        down_proj_out = self.down_proj(intermediate_fp16)
+        # Downcast and down_proj. Forced output boundary: intermediate_fp32 is the
+        # upcast reduction, so a weight that does not answer still means fp16.
+        intermediate = _to_forced_output_dtype(intermediate_fp32, boundary_dtype)
+        down_proj_out = self.down_proj(intermediate)
         return down_proj_out
     pass
     patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3MLP, "forward", forward, fullgraph = False)
@@ -479,6 +662,8 @@ def patch_Gemma3Attention():
         from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
@@ -556,7 +741,11 @@ def patch_Gemma3Attention():
         query_hidden_shape = (bsz, q_len, num_heads, head_dim)
         kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
 
-        # 1. Projections (q, k, v) in fp16
+        # 1. Projections (q, k, v). RMSNorm hands us fp16, which matches fp16
+        # projection weights (LoRA); full finetuning upcasts them to fp32, so
+        # move the activation onto whatever dtype the weights actually are.
+        boundary_dtype = _linear_boundary_dtype(self, "q_proj", "k_proj", "v_proj", "o_proj")
+        hidden_states = _to_boundary_dtype(hidden_states, boundary_dtype)
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
         key_states_fp16   = self.k_proj(hidden_states) # output fp16
         value_states_fp16 = self.v_proj(hidden_states) # output fp16
@@ -669,7 +858,10 @@ def patch_Gemma3Attention():
 
         attn_output_fp32 = attn_output_fp32.reshape(bsz, q_len, -1)
 
-        attn_output_fp16 = attn_output_fp32.to(torch.float16)
+        # Forced output boundary: fp16 (and a 4bit weight that cannot answer)
+        # keep the exact bare cast this line always did; fp32 full-finetuning
+        # weights leave it in fp32 rather than crashing o_proj.
+        attn_output_fp16 = _to_forced_output_dtype(attn_output_fp32, boundary_dtype)
 
         # 8. Output Projection (o_proj) in fp16
         attn_output_projected = self.o_proj(attn_output_fp16) # fp16 output
@@ -695,14 +887,19 @@ def patch_Gemma3RMSNorm_generic():
     except Exception as e:
         return raise_error("Gemma3RMSNorm.forward", e)
 
+    publish_to_modeling_module(
+        transformers.models.gemma3.modeling_gemma3,
+        flatten_for_elementwise_norm = flatten_for_elementwise_norm,
+        unwrap_norm_weight           = unwrap_norm_weight,
+        _gemma3_rms_norm_generic     = _gemma3_rms_norm_generic,
+    )
+
     def forward(self, x):
-        x_fp32 = x.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        hidden_states_fp32 = x_fp32 * torch.rsqrt(variance + self.eps)
-        output_fp32 = hidden_states_fp32 * (1.0 + self.weight.to(torch.float32))
-        return output_fp32.to(x.dtype)
+        x_2d, shape = flatten_for_elementwise_norm(x)
+        out = _gemma3_rms_norm_generic(x_2d, unwrap_norm_weight(self.weight), self.eps)
+        return out.reshape(shape)
     pass
-    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward, fullgraph = True)
+    patch_function(transformers.models.gemma3.modeling_gemma3.Gemma3RMSNorm, "forward", forward)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3RMSNorm_generic)
 
@@ -716,6 +913,8 @@ def patch_Gemma3Attention_generic():
         from transformers.models.gemma3.modeling_gemma3 import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
+
+    _publish_boundary_helpers(transformers.models.gemma3.modeling_gemma3)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
@@ -792,7 +991,11 @@ def patch_Gemma3Attention_generic():
         query_hidden_shape = (bsz, q_len, num_heads, head_dim)
         kv_hidden_shape    = (bsz, q_len, num_key_value_heads, head_dim)
 
-        # 1. Projections (q, k, v) in fp16
+        # 1. Projections (q, k, v). RMSNorm hands us fp16, which matches fp16
+        # projection weights (LoRA); full finetuning upcasts them to fp32, so
+        # move the activation onto whatever dtype the weights actually are.
+        boundary_dtype = _linear_boundary_dtype(self, "q_proj", "k_proj", "v_proj", "o_proj")
+        hidden_states = _to_boundary_dtype(hidden_states, boundary_dtype)
         query_states_fp16 = self.q_proj(hidden_states) # output fp16
         key_states_fp16   = self.k_proj(hidden_states) # output fp16
         value_states_fp16 = self.v_proj(hidden_states) # output fp16

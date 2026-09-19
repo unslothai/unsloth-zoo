@@ -60,7 +60,8 @@ def mean_of_trained_tokens(model, eps = 1e-16):
     lm_head_matrix   = model.get_output_embeddings().weight.clone()
 
     # Get untrained tokens
-    indicator_untrained = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     where_untrained = torch.where(indicator_untrained)[0]
     n_untrained = where_untrained.shape[0]
     n_trained = embedding_matrix.shape[0] - n_untrained
@@ -138,24 +139,35 @@ def add_new_tokens(
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
     new_vocab_length = len(tokenizer)
+    # Some models ship an embedding that is padded LARGER than the tokenizer
+    # vocab (e.g. Gemma3: 262208 embedding rows vs 262145 tokens). Resizing to
+    # new_vocab_length would then SHRINK the matrix and silently destroy the
+    # already-trained rows past the tokenizer length. Never resize below the
+    # existing embedding: grow only when the new tokens overflow the padding.
+    # new_vocab_length already includes the freshly added tokens, so do NOT add
+    # their count again here.
+    resize_target = max(old_input_length, old_output_length, new_vocab_length)
     # Also resizes lm_head as well!
-    model.resize_token_embeddings(new_vocab_length)
+    model.resize_token_embeddings(resize_target)
 
     # If we use interpolation, we interpolate between the mean embeddings and
     # the Word2Vec sum of the other vectors
     embedding_matrix = model.get_input_embeddings ().weight
     lm_head_matrix   = model.get_output_embeddings().weight
 
-    # Confirm sizes are correct
-    if embedding_matrix.shape[0] != new_vocab_length:
+    # Confirm sizes are correct. Compare against resize_target (not
+    # new_vocab_length): for padded embeddings the matrices keep their larger
+    # row count. The old check compared against new_vocab_length, so on a padded
+    # model it either never fired (masking the silent shrink) or fired spuriously.
+    if embedding_matrix.shape[0] != resize_target:
         raise RuntimeError(
             "Unsloth: Embedding matrix size did not get resized properly. Please file a bug report!"
         )
-    if lm_head_matrix.shape[0]   != new_vocab_length:
+    if lm_head_matrix.shape[0]   != resize_target:
         raise RuntimeError(
             "Unsloth: LM Head matrix size did not get resized properly. Please file a bug report!"
         )
-    if model.config.vocab_size   != new_vocab_length:
+    if model.config.vocab_size   != resize_target:
         raise RuntimeError(
             "Unsloth: Model's config vocab_size did not get resized properly. Please file a bug report!"
         )
@@ -181,10 +193,13 @@ def add_new_tokens(
                 lm_head_matrix  [old_length+j] = mean_lm_head_token
         pass
     else:
-        # Now set the new tokens to the mean!
+        # Now set the new tokens to the mean! Only touch the genuinely-new rows
+        # [old_length:new_vocab_length]; on a padded embedding the rows past
+        # new_vocab_length are the model's original alignment padding and must be
+        # left as shipped (the old [old_length:] slice overwrote those too).
         with torch.no_grad():
-            embedding_matrix[old_length:] = mean_embedding
-            lm_head_matrix  [old_length:] = mean_lm_head
+            embedding_matrix[old_length:new_vocab_length] = mean_embedding
+            lm_head_matrix  [old_length:new_vocab_length] = mean_lm_head
     pass
 
     # We set a flag to say we need to train embeddings
@@ -195,15 +210,18 @@ def add_new_tokens(
     pass
     internal_model._need_to_train_embeddings = True
 
-    # Fix up all vocab sizes
+    # Fix up all vocab sizes. Use resize_target, not len(tokenizer): config
+    # vocab_size must equal the actual embedding / lm_head row count or the model
+    # cannot round-trip through save_pretrained/from_pretrained (state_dict shape
+    # mismatch). For a padded embedding these differ.
     current_model = model
     while hasattr(current_model, "model") and hasattr(current_model, "config"):
         if hasattr(current_model.config, "vocab_size"):
-            current_model.config.update({"vocab_size" : len(tokenizer)})
+            current_model.config.update({"vocab_size" : resize_target})
         current_model = current_model.model
     if hasattr(current_model, "model") and hasattr(current_model, "config"):
         if hasattr(current_model.config, "vocab_size"):
-            current_model.config.update({"vocab_size" : len(tokenizer)})
+            current_model.config.update({"vocab_size" : resize_target})
     pass
 
     # Must tie lm_head and embed_tokens if they are tied!
@@ -215,6 +233,34 @@ def add_new_tokens(
         gc.collect()
         torch.cuda.empty_cache()
     return
+pass
+
+
+# datasets' own Dataset.map(batched=True) default, so both paths allocate the same size.
+_COUNT_INPUT_IDS_BATCH_SIZE = 1000
+
+
+def _count_input_ids(train_dataset, mapping):
+    """Only .map is datasets specific; a plain list of rows gets this far. A row with no
+    "input_ids" is skipped, as in the checks above."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if hasattr(train_dataset, "map"):
+        train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+        return
+    pass
+    # `mapping` flattens its batch into one array, so passing the whole dataset is an
+    # O(total tokens) transient. Chunking is exactly equivalent because it accumulates into
+    # a counter and .map(batched=True) already calls it once per batch.
+    batch = []
+    for row in train_dataset:
+        if "input_ids" not in row: continue
+        batch.append(row["input_ids"])
+        if len(batch) >= _COUNT_INPUT_IDS_BATCH_SIZE:
+            mapping({"input_ids" : batch})
+            batch = []
+        pass
+    pass
+    if batch: mapping({"input_ids" : batch})
 pass
 
 
@@ -230,8 +276,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
-    # Ignore some model checks for now
-    if model.config._name_or_path in IGNORED_TOKENIZER_NAMES:
+    # Ignore some model checks for now. Normalize both the model name and caller-
+    # provided entries so the comparison is case-insensitive in either direction.
+    model_name = model.config._name_or_path
+    ignored_tokenizer_names = {
+        name.lower() for name in IGNORED_TOKENIZER_NAMES
+    }
+    if model_name is not None and model_name.lower() in ignored_tokenizer_names:
         return
     pass
 
@@ -242,11 +293,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix   = lm_head_matrix  [:min_size]
     
     # Get untrained tokens
-    indicator_untrained1 = torch.amax(embedding_matrix, axis = 1) <= eps
+    indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+        (torch.amin(embedding_matrix, axis = 1) >= -eps)
     # Check lm_head as well
 
     # Does NOT work for Llama 3.1!!
-    indicator_untrained2 = torch.amax(lm_head_matrix,   axis = 1) <= eps
+    indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
+        (torch.amin(lm_head_matrix, axis = 1) >= -eps)
 
     # We instead check for repeated vectors
     lm_head_where = torch.where(indicator_untrained1)[0]
@@ -280,7 +333,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     )
     for special_token in special_tokens:
         if hasattr(tokenizer, special_token + "_id"):
-            token_id = eval(f"tokenizer.{special_token}_id")
+            token_id = getattr(tokenizer, special_token + "_id")
             if token_id is not None and token_id < indicator_untrained.shape[0]:
                 indicator_untrained[token_id] = False
         pass
@@ -436,7 +489,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    train_dataset.map(mapping, batched = True, desc = "Counting untrained tokens")
+    _count_input_ids(train_dataset, mapping)
 
     # Get sum of all items
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)

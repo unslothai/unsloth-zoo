@@ -48,7 +48,6 @@ class FakeTokenizer:
             for t in added if t in self._vocab
         }
 
-    # ids
     @property
     def pad_token_id(self):
         return self._vocab.get(self.pad_token)
@@ -61,9 +60,16 @@ class FakeTokenizer:
         return dict(self._vocab)
 
     def __call__(self, text, add_special_tokens=False):
-        # Each known token is a single id; unknown text splits into >1 id.
         ids = [self._vocab[text]] if text in self._vocab else [0, 1]
         return type("Enc", (), {"input_ids": ids})()
+
+    def convert_ids_to_tokens(self, token_id):
+        return next(
+            (token for token, index in self._vocab.items() if index == token_id), None
+        )
+
+    def convert_tokens_to_ids(self, token):
+        return self._vocab.get(token)
 
     def add_special_tokens(self, mapping):
         tok = mapping["pad_token"]
@@ -83,17 +89,14 @@ def _qwen3_text():
 
 
 def test_is_pad_named():
-    # Bracketed pad sentinels qualify ...
     for t in ("<|vision_pad|>", "<|fim_pad|>", "[PAD]", "<pad>", "<|PAD|>"):
         assert _is_pad_named(t)
-    # ... ordinary words containing "pad" and non-pad tokens do not.
     for t in ("keypad", "padding", "Notepad", "pad",
               "<|endoftext|>", "<|im_end|>", "<unk>"):
         assert not _is_pad_named(t)
 
 
 def test_qwen3_vision_pad_is_kept():
-    # <|vision_pad|> is a pad-named token distinct from eos -> kept as-is.
     tok = _qwen3_text()
     res = fix_pad_token(tok)
     assert res["changed"] is False
@@ -120,6 +123,214 @@ def test_pad_equals_eos_picks_distinct_reserved():
     res = fix_pad_token(tok)
     assert res["reason"] == "equals_eos" and tok.pad_token == "<pad>"
     assert tok.pad_token != tok.eos_token
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_whisper_uses_existing_config_pad_token(wrapped):
+    # Whisper large-v3's tokenizer aliases pad/eos/unk to 50257 while its model
+    # config declares the existing empty token at 50256 as pad. Align to the
+    # config without adding a random token or resizing the vocabulary.
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    tok.unk_token = "<|endoftext|>"
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": "whisper",
+            "vocab_size": 51866,
+            "pad_token_id": 50256,
+            "eos_token_id": 50257,
+        },
+    )()
+    tokenizer = type("Processor", (), {"tokenizer": tok})() if wrapped else tok
+
+    res = fix_pad_token(tokenizer, model_config=cfg)
+
+    assert res == {
+        "changed": True,
+        "reason": "equals_eos",
+        "old_pad": "<|endoftext|>",
+        "new_pad": "",
+        "added": False,
+    }
+    assert tok.pad_token == ""
+    assert tok.pad_token_id == cfg.pad_token_id
+    assert tok.pad_token_id != tok.eos_token_id
+    assert len(tok.get_vocab()) == 2
+
+
+def test_whisper_does_not_use_config_pad_when_it_equals_eos():
+    tok = FakeTokenizer(
+        {"<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": "whisper",
+            "vocab_size": 51866,
+            "pad_token_id": 50257,
+            "eos_token_id": 50257,
+        },
+    )()
+
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model_config=cfg)
+
+
+def test_whisper_does_not_use_config_pad_when_it_is_in_eos_list():
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": "whisper",
+            "vocab_size": 51866,
+            "pad_token_id": 50256,
+            "eos_token_id": [50257, 50256],
+        },
+    )()
+
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model_config=cfg)
+
+
+def test_config_declared_pad_used_regardless_of_model_type():
+    # The config-declared-pad rescue is model-type agnostic: any model whose config
+    # declares a valid, distinct pad id pointing at an existing token gets it reused,
+    # so a non-string / non-whisper model_type must NOT fall back to adding a token.
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    tok.unk_token = "<|endoftext|>"
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "model_type": ["whisper"],  # not a str: the old whisper-only gate is gone
+            "vocab_size": 51866,
+            "pad_token_id": 50256,
+            "eos_token_id": 50257,
+        },
+    )()
+
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res["changed"] and res["new_pad"] == "" and res["added"] is False
+    assert tok.pad_token_id == 50256 and tok.pad_token_id != tok.eos_token_id
+    assert len(tok.get_vocab()) == 2
+
+
+def test_non_whisper_model_reuses_config_declared_pad():
+    # Generalization: a non-whisper model whose tokenizer aliases pad to eos but whose
+    # config declares a valid distinct pad id (pointing at an existing, non-reserved
+    # token the search families do not recognise) reuses it instead of adding a token.
+    tok = FakeTokenizer(
+        {"<|end|>": 7, "<extra_0>": 3},
+        pad_token="<|end|>",
+        eos_token="<|end|>",
+    )
+    cfg = type(
+        "Cfg",
+        (),
+        {"model_type": "llama", "vocab_size": 100, "pad_token_id": 3, "eos_token_id": 7},
+    )()
+
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res == {
+        "changed": True,
+        "reason": "equals_eos",
+        "old_pad": "<|end|>",
+        "new_pad": "<extra_0>",
+        "added": False,
+    }
+    assert tok.pad_token_id == 3 and tok.pad_token_id != tok.eos_token_id
+    assert len(tok.get_vocab()) == 2
+
+
+def test_valid_pad_in_generation_stop_list_is_left_alone():
+    # Qwen2/2.5 regression: the tokenizer pads with <|endoftext|> (a distinct, valid pad)
+    # while its generation config lists that id as a SECONDARY stop token alongside the
+    # real training eos <|im_end|>. A generation stop id is not the training eos, so the
+    # pad must NOT be "healed" - this stays a no-op.
+    tok = FakeTokenizer(
+        {"<|endoftext|>": 151643, "<|im_end|>": 151645, "<|vision_pad|>": 151654},
+        pad_token="<|endoftext|>",
+        eos_token="<|im_end|>",
+    )
+    model = type(
+        "Model",
+        (),
+        {
+            "config": type("Cfg", (), {
+                "model_type": "qwen2", "vocab_size": 151936,
+                "pad_token_id": 151643, "eos_token_id": 151645,
+            })(),
+            "generation_config": type("Gen", (), {
+                "eos_token_id": [151645, 151643], "pad_token_id": 151643,
+            })(),
+        },
+    )()
+
+    res = fix_pad_token(tok, model=model)
+    assert res["changed"] is False
+    assert tok.pad_token == "<|endoftext|>"
+
+
+class _NoEosIdTokenizer(FakeTokenizer):
+    """A tokenizer that exposes eos_token but not eos_token_id (some remote-code ones)."""
+
+    @property
+    def eos_token_id(self):
+        return None
+
+
+@pytest.mark.parametrize("cls", [FakeTokenizer, _NoEosIdTokenizer])
+def test_config_declared_pad_never_re_aliases_eos(cls):
+    # A config that declares pad == eos must never be honoured - that is the very bug
+    # being repaired. Caught by id normally, and by token name when the tokenizer hides
+    # eos_token_id (where the id check alone would miss it).
+    tok = cls({"</s>": 2, "<s>": 1}, pad_token="</s>", eos_token="</s>")
+    cfg = type("Cfg", (), {"vocab_size": 100, "pad_token_id": 2})()
+
+    res = fix_pad_token(tok, model_config=cfg, allow_add=False)
+    assert res["changed"] is False
+    assert tok.pad_token == "</s>"
+
+
+def test_bool_config_pad_id_is_rejected():
+    # bool subclasses int; True/False must never be accepted as a pad id.
+    tok = FakeTokenizer({"</s>": 2}, pad_token="</s>", eos_token="</s>")
+    cfg = type("Cfg", (), {"vocab_size": 100, "pad_token_id": True, "eos_token_id": 2})()
+    res = fix_pad_token(tok, model_config=cfg, allow_add=False)
+    assert res["changed"] is False and tok.pad_token == "</s>"
+
+
+def test_string_vocab_size_does_not_crash():
+    # A malformed (string) vocab_size must be treated as unknown, not raise TypeError.
+    tok = FakeTokenizer(
+        {"": 50256, "<|endoftext|>": 50257},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+    tok.unk_token = "<|endoftext|>"
+    cfg = type("Cfg", (), {
+        "model_type": "whisper", "vocab_size": "51866",
+        "pad_token_id": 50256, "eos_token_id": 50257,
+    })()
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res["changed"] and res["new_pad"] == "" and tok.pad_token_id == 50256
 
 
 def test_missing_pad_picks_reserved():
@@ -157,7 +368,7 @@ def test_zero_token_candidate_does_not_crash():
     # A reserved entry present but encoding to !=1 id must be skipped, not crash.
     class Weird(FakeTokenizer):
         def __call__(self, text, add_special_tokens=False):
-            return type("Enc", (), {"input_ids": []})()  # zero ids for everything
+            return type("Enc", (), {"input_ids": []})()
     tok = Weird({"</s>": 2, "<pad>": 0}, pad_token="</s>", eos_token="</s>")
     res = fix_pad_token(tok, allow_add=False)   # <pad> rejected (0 ids) -> defer, no IndexError
     assert res["changed"] is False
@@ -197,7 +408,6 @@ def test_in_range_valid_pad_is_noop_with_vocab_size():
 
 
 def test_vision_pad_kept_regardless_of_model_type():
-    # A pad-named modality token is kept whether or not the model is multimodal.
     tok = _qwen3_text()  # pad_token = "<|vision_pad|>"
     cfg = type("Cfg", (), {"model_type": "llava"})()
     res = fix_pad_token(tok, model_config = cfg)
@@ -216,7 +426,6 @@ def test_unk_token_fallback_when_no_reserved():
 
 
 def test_pad_equals_eos_reuses_modality_pad_when_only_option():
-    # pad == eos and only a modality pad available -> reuse it instead of adding/raising.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|vision_pad|>": 2},
                         pad_token = "<|im_end|>", eos_token = "<|im_end|>")
     res = fix_pad_token(tok)
@@ -224,15 +433,12 @@ def test_pad_equals_eos_reuses_modality_pad_when_only_option():
 
 
 def test_audio_pad_is_kept():
-    # <|audio_pad|> is pad-named and distinct from eos -> kept as-is.
     tok = FakeTokenizer({"<|im_end|>": 1, "<|audio_pad|>": 2},
                         pad_token = "<|audio_pad|>", eos_token = "<|im_end|>")
     assert fix_pad_token(tok)["changed"] is False
 
 
 def test_pad_name_fallback_ignores_bare_word_token():
-    # pad == eos; "keypad" is a bare word (not a bracketed sentinel) and must not be
-    # promoted, while the bracketed <|custom_pad|> is picked.
     tok = FakeTokenizer({"<|endoftext|>": 0, "keypad": 5, "<|custom_pad|>": 6},
                         pad_token = "<|endoftext|>", eos_token = "<|endoftext|>")
     res = fix_pad_token(tok)
@@ -257,3 +463,52 @@ def test_non_special_fim_pad_is_eligible():
                         non_special = ["<|fim_pad|>"])
     res = fix_pad_token(tok)
     assert res["changed"] and tok.pad_token == "<|fim_pad|>"
+
+
+def test_composite_model_text_vocab_size_is_used_for_pad_range():
+    """Sesame CSM: config.vocab_size is the audio codebook (2051) while the text
+    tokenizer holds 128256 ids and declares pad_token_id = 128004."""
+    tok = FakeTokenizer(
+        {"<|end_of_text|>": 128001, "<|finetune_right_pad_id|>": 128004},
+        pad_token="<|end_of_text|>",
+        eos_token="<|end_of_text|>",
+    )
+    cfg = type("Cfg", (), {
+        "model_type": "csm",
+        "vocab_size": 2051,            # audio codebook
+        "text_vocab_size": 128256,     # the tokenizer's actual range
+        "pad_token_id": 128004,
+        "eos_token_id": 128001,
+    })()
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res["added"] is False, res
+    assert res["new_pad"] == "<|finetune_right_pad_id|>", res
+    assert tok.pad_token != tok.eos_token
+
+
+def test_nested_text_config_vocab_size_is_preferred():
+    tok = FakeTokenizer(
+        {"<|eot|>": 700, "<|pad|>": 900},
+        pad_token="<|eot|>", eos_token="<|eot|>",
+    )
+    text_cfg = type("TextCfg", (), {"vocab_size": 1024})()
+    cfg = type("Cfg", (), {
+        "model_type": "multimodal", "vocab_size": 64,
+        "text_config": text_cfg, "pad_token_id": 900, "eos_token_id": 700,
+    })()
+    res = fix_pad_token(tok, model_config=cfg)
+    assert res["added"] is False, res
+    assert res["new_pad"] == "<|pad|>", res
+
+
+def test_single_vocab_models_keep_the_old_bound():
+    """No text vocab declared -> the old bound, so an out-of-range pad is rejected."""
+    tok = FakeTokenizer(
+        {"<|eot|>": 10}, pad_token="<|eot|>", eos_token="<|eot|>",
+    )
+    cfg = type("Cfg", (), {
+        "model_type": "llama", "vocab_size": 32,
+        "pad_token_id": 9999, "eos_token_id": 10,
+    })()
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model_config=cfg)

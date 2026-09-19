@@ -154,6 +154,67 @@ class Config:
 
 
 # ---------------------------------------------------------------------------
+# Names real triton exposes as CLASSES. A _Noop is an instance, not a type, so
+# isinstance/issubclass/except on one raises TypeError. torch.utils.flop_counter
+# imports triton.runtime.jit.JITFunction and isinstance()s it: with triton truly
+# absent that import fails and torch falls back to NoneType, but the stub makes
+# it succeed, so every class-valued name must be a real class.
+# ---------------------------------------------------------------------------
+class _StubMeta(type):
+    """Keeps class-valued stubs permissive: unknown class attrs stay _Noop."""
+    def __getattr__(cls, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return _Noop(f"{cls.__name__}.{name}")
+
+class _StubClass(metaclass=_StubMeta):
+    def __init__(self, *args, **kwargs): pass
+    def __class_getitem__(cls, item): return cls
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return _Noop(f"{type(self).__name__}.{name}")
+
+# triton.errors / runtime.errors / compiler.errors: `except` also demands a class.
+class TritonError(Exception, metaclass=_StubMeta): pass
+class InterpreterError(TritonError): pass
+class OutOfResources(TritonError): pass
+class PTXASError(TritonError): pass
+class AutotunerError(TritonError): pass
+# Only Intel's triton declares IntelGPUError, but torch still imports and catches it.
+class IntelGPUError(TritonError): pass
+class CompilationError(TritonError): pass
+class CompileTimeAssertionFailure(CompilationError): pass
+class UnsupportedLanguageConstruct(CompilationError): pass
+
+# triton.runtime.jit
+class KernelInterface(_StubClass): pass
+class JITCallable(_StubClass): pass
+class JITFunction(JITCallable, KernelInterface): pass
+class MockTensor(_StubClass): pass
+class TensorWrapper(_StubClass): pass
+class KernelParam(_StubClass): pass
+
+# triton.runtime.autotuner
+class Autotuner(KernelInterface): pass
+class Heuristics(KernelInterface): pass
+
+# triton.runtime.interpreter: inductor isinstance()s InterpretedFunction
+class InterpretedFunction(KernelInterface): pass
+
+# triton.compiler
+class CompiledKernel(_StubClass): pass
+class ASTSource(_StubClass): pass
+class IRSource(_StubClass): pass
+class LazyDict(_StubClass): pass
+
+# triton.backends.compiler / triton.tools.tensor_descriptor
+class GPUTarget(_StubClass): pass
+class BaseBackend(_StubClass): pass
+class TensorDescriptor(_StubClass): pass
+
+
+# ---------------------------------------------------------------------------
 # triton.language — needs constexpr/dtype for kernel annotations
 # ---------------------------------------------------------------------------
 class _ConstExpr:
@@ -163,14 +224,24 @@ class _ConstExpr:
 class dtype:
     def __init__(self, name="void"): self.name = name
 
-language = _make_module("triton.language", {
+# isinstance targets in inductor's codegen
+class tensor(_StubClass): pass
+class block_type(_StubClass): pass
+class pointer_type(_StubClass): pass
+
+_language_attrs = {
     "constexpr": _ConstExpr,
     "dtype": dtype,
+    "tensor": tensor,
+    "block_type": block_type,
+    "pointer_type": pointer_type,
     "float32": "float32", "float16": "float16", "bfloat16": "bfloat16",
     "int32": "int32", "int64": "int64", "int8": "int8",
     "uint8": "uint8", "int1": "int1",
-})
+}
+language = _make_module("triton.language", _language_attrs)
 language.math = language
+language.core = _make_module("triton.language.core", _language_attrs)
 
 # triton.runtime — needs driver.active for target detection
 class _CurrentTarget:
@@ -184,12 +255,58 @@ class _ActiveDriver:
 runtime = _make_module("triton.runtime", {
     "driver": _make_module("triton.runtime.driver", {"active": _ActiveDriver()}),
     "errors": _make_module("triton.runtime.errors", {
-        "OutOfResources": type("OutOfResources", (Exception,), {}),
+        "TritonError": TritonError, "InterpreterError": InterpreterError,
+        "OutOfResources": OutOfResources, "PTXASError": PTXASError,
+        "AutotunerError": AutotunerError, "IntelGPUError": IntelGPUError,
     }),
+    "interpreter": _make_module("triton.runtime.interpreter", {
+        "InterpretedFunction": InterpretedFunction,
+    }),
+    "jit": _make_module("triton.runtime.jit", {
+        "JITFunction": JITFunction, "JITCallable": JITCallable,
+        "KernelInterface": KernelInterface, "KernelParam": KernelParam,
+        "MockTensor": MockTensor, "TensorWrapper": TensorWrapper, "jit": jit,
+    }),
+    "autotuner": _make_module("triton.runtime.autotuner", {
+        "Autotuner": Autotuner, "Heuristics": Heuristics, "Config": Config,
+        "autotune": autotune, "heuristics": heuristics,
+        "OutOfResources": OutOfResources, "PTXASError": PTXASError,
+    }),
+    # triton.runtime re-exports the above at package level
+    "JITFunction": JITFunction, "KernelInterface": KernelInterface,
+    "MockTensor": MockTensor, "TensorWrapper": TensorWrapper,
+    "Autotuner": Autotuner, "Heuristics": Heuristics, "Config": Config,
+    "autotune": autotune, "heuristics": heuristics,
+    "OutOfResources": OutOfResources, "InterpreterError": InterpreterError,
+})
+
+errors = _make_module("triton.errors", {"TritonError": TritonError})
+
+compiler = _make_module("triton.compiler", {
+    "CompiledKernel": CompiledKernel, "ASTSource": ASTSource,
+    "IRSource": IRSource, "LazyDict": LazyDict,
+    "CompilationError": CompilationError,
+})
+compiler.compiler = _make_module("triton.compiler.compiler", {
+    "CompiledKernel": CompiledKernel, "ASTSource": ASTSource,
+    "IRSource": IRSource, "LazyDict": LazyDict,
+})
+compiler.errors = _make_module("triton.compiler.errors", {
+    "CompilationError": CompilationError,
+    "CompileTimeAssertionFailure": CompileTimeAssertionFailure,
+    "UnsupportedLanguageConstruct": UnsupportedLanguageConstruct,
 })
 
 # triton.backends — needs empty `backends` dict
 backends = _make_module("triton.backends", {"backends": {}})
+backends.compiler = _make_module("triton.backends.compiler", {
+    "GPUTarget": GPUTarget, "BaseBackend": BaseBackend,
+})
+
+tools = _make_module("triton.tools", {})
+tools.tensor_descriptor = _make_module("triton.tools.tensor_descriptor", {
+    "TensorDescriptor": TensorDescriptor,
+})
 
 
 def inject_into_sys_modules():
@@ -199,11 +316,22 @@ def inject_into_sys_modules():
 
     this = sys.modules[__name__]
     sys.modules.update({
-        "triton":                this,
-        "triton.language":       language,
-        "triton.runtime":        runtime,
-        "triton.runtime.driver": runtime.driver,
-        "triton.runtime.errors": runtime.errors,
-        "triton.backends":       backends,
+        "triton":                        this,
+        "triton.errors":                 errors,
+        "triton.language":               language,
+        "triton.language.core":          language.core,
+        "triton.runtime":                runtime,
+        "triton.runtime.driver":         runtime.driver,
+        "triton.runtime.errors":         runtime.errors,
+        "triton.runtime.jit":            runtime.jit,
+        "triton.runtime.autotuner":      runtime.autotuner,
+        "triton.runtime.interpreter":    runtime.interpreter,
+        "triton.compiler":               compiler,
+        "triton.compiler.compiler":      compiler.compiler,
+        "triton.compiler.errors":        compiler.errors,
+        "triton.backends":               backends,
+        "triton.backends.compiler":      backends.compiler,
+        "triton.tools":                  tools,
+        "triton.tools.tensor_descriptor": tools.tensor_descriptor,
     })
     # Everything else auto-created by _TritonFinder on demand

@@ -60,7 +60,6 @@ def test_returns_none_when_dir_missing(mod, monkeypatch, tmp_path):
 
 
 def test_returns_none_when_default_dir_empty_or_unset(mod, monkeypatch):
-    # An unset / empty default dir must not crash and must fall through.
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", "")
     assert mod._resolve_bundle_convert_script() is None
 

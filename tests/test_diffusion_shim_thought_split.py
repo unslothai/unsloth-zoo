@@ -27,8 +27,7 @@ that keeps marker fragments out of both channels.
 
 import pytest
 
-# The shim imports fastapi/uvicorn at module level; neither ships in the
-# [core] extras the CI runners install, so skip (not fail) collection there.
+# The shim imports fastapi/uvicorn, which the CI [core] extras do not ship.
 pytest.importorskip("fastapi")
 pytest.importorskip("uvicorn")
 
@@ -107,7 +106,7 @@ def test_holdback_covers_partial_markers():
     assert _marker_holdback("text</thin") == len("</thin")
 
 
-# ── streaming reconstruction (mirrors the shim's gen() loop) ─────────
+# Streaming reconstruction mirrors the shim's gen() loop.
 
 
 def _stream(full):

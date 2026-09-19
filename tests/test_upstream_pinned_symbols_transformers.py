@@ -94,9 +94,7 @@ def _first_match(repo: str, ref: str, paths: list[str]) -> tuple[str, str] | Non
     return None
 
 
-# Gemma3 attention surface, zoo PR #635 / #488 / #571. gemma.py imports
-# Gemma3Attention/RMSNorm/MLP/TextScaledWordEmbedding plus apply_rotary_pos_emb
-# / ALL_ATTENTION_FUNCTIONS / eager_attention_forward.
+# Gemma3 attention surface, zoo PR #635 / #488 / #571.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -146,8 +144,6 @@ def test_gemma3_apply_rotary_pos_emb_and_attention_funcs(tag: str):
 
 
 # ministral / mistral-3 forward signature, zoo PR #571 / #509 / #465.
-# ministral.py:35-103 imports apply_rotary_pos_emb / eager_attention_forward
-# / ALL_ATTENTION_FUNCTIONS from modeling_ministral, then rebinds .forward.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -174,9 +170,6 @@ def test_ministral_attention_module_present(tag: str):
 
 
 # gpt_oss MoE patch surface, zoo PR #525 / #472 / #471 / #470 / #467.
-# gpt_oss.py reads modeling_gpt_oss.{GptOssExperts, GptOssTopKRouter,
-# GptOssAttention, GptOssModel, GptOssPreTrainedModel} and reassigns
-# .GptOssExperts.forward.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -241,7 +234,6 @@ def test_qwen3_moe_required_classes(tag: str):
     )
 
 
-# transformers.modeling_utils must expose `checkpoint` and PushToHubMixin.
 # Zoo PR #549 patches modeling_utils.checkpoint directly
 # (gradient_checkpointing.py:923); unsloth_zoo/saving_utils.py:76 imports
 # PushToHubMixin and calls ._upload_modified_files / ._get_files_timestamps.
@@ -278,11 +270,6 @@ def test_modeling_utils_checkpoint_and_pushtohubmixin(tag: str):
         f"{tag}: PushToHubMixin not reachable from "
         f"transformers.modeling_utils; unsloth_zoo/saving_utils.py:76 ImportError"
     )
-
-
-# transformers.quantizers.quantizers_utils.should_convert_module, Zoo PR
-# #491 / #488 patches this on 5.x; rename silently no-ops the
-# vision_tower / audio_tower quantization-skip regression fix.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
@@ -340,10 +327,6 @@ def test_integrations_bitsandbytes_legacy_replace_fn(tag: str):
         )
 
 
-# transformers.modeling_utils.caching_allocator_warmup, Zoo PR #569:
-# hasattr-guarded wrap; fail only on likely rename (not removal).
-
-
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_caching_allocator_warmup_reachable(tag: str):
     """Zoo PR #569 wraps modeling_utils.caching_allocator_warmup with a
@@ -360,7 +343,6 @@ def test_caching_allocator_warmup_reachable(tag: str):
     has_exact = _has_def(src, "caching_allocator_warmup", "func")
     if has_exact:
         return
-    # Rename detection: any other `def *_warmup(` in the file.
     other_warmup = re.findall(r"^def\s+(\w*warmup\w*)\s*\(", src, re.MULTILINE)
     other_warmup = [n for n in other_warmup if n != "caching_allocator_warmup"]
     if other_warmup:
@@ -399,7 +381,38 @@ def test_masking_utils_create_causal_mask_names(tag: str):
     )
 
 
-# peft LoraLayer 3D-parameter (MoE) attribute surface, zoo PR #618.
+@pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
+def test_tokenization_auto_symbols_for_mlx_loader(tag: str):
+    """Zoo PR #1170: unsloth_zoo/mlx/loader.py:_load_mlx_tokenizer and
+    _tokenizer_class_for_model_type import get_tokenizer_config,
+    tokenizer_class_from_name and TOKENIZER_MAPPING_NAMES from
+    transformers.models.auto.tokenization_auto. None of the three is public
+    API, and losing one breaks every MLX tokenizer load with an ImportError
+    at call time rather than at import time."""
+    src = _fetch_text(
+        "huggingface/transformers",
+        tag,
+        "src/transformers/models/auto/tokenization_auto.py",
+    )
+    if src is None:
+        pytest.skip(f"{tag}: tokenization_auto.py not present")
+    missing = [
+        name for name in ("get_tokenizer_config", "tokenizer_class_from_name")
+        if not _has_def(src, name, "func")
+    ]
+    assert not missing, (
+        f"{tag}: transformers.models.auto.tokenization_auto {missing} missing; "
+        f"unsloth_zoo/mlx/loader.py::_load_mlx_tokenizer raises ImportError and "
+        f"every MLX tokenizer load fails"
+    )
+    assert re.search(r"^TOKENIZER_MAPPING_NAMES\s*=", src, re.MULTILINE), (
+        f"{tag}: TOKENIZER_MAPPING_NAMES missing from tokenization_auto; "
+        f"_tokenizer_class_for_model_type can no longer recover the tokenizer "
+        f"class for repos that declare none (gpt2 and relatives), so their "
+        f"bos/eos/unk silently become None"
+    )
+
+
 # Qwen MoE LoRA extractor reads wrapper.get_base_layer() + .parameter_name
 # / .hidden_dim / .intermediate_dim. Pin: peft keeps emitting ParamWrapper
 # (LoraLayer subclass) in peft/tuners/lora/layer.py.

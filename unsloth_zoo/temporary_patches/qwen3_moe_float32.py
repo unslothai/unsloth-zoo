@@ -42,8 +42,14 @@
 
 import os
 import torch
-from .common import TEMPORARY_PATCHES
-from .utils import patch_function, raise_error
+from .common import (
+    TEMPORARY_PATCHES,
+    torch_compile,
+    flatten_for_elementwise_norm,
+    unwrap_norm_weight,
+    publish_to_modeling_module,
+)
+from .utils import compile_with_eager_fallback, patch_function, raise_error
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
@@ -99,6 +105,27 @@ pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeDecoderLayer_float32)
 
 
+# Clamp bound so a large residual never becomes inf on the cast back. Module-level
+# keeps `torch.finfo` out of the graph.
+_QWEN3_MOE_FP16_MAX = float(torch.finfo(torch.float16).max)
+
+
+# Every Qwen3-MoE RMSNorm shares this one kernel, so its Dynamo cache holds the product
+# of every axis its guards see. A plain Tensor weight view and a rank 2 input drop the
+# width and rank axes, leaving dtype, grad mode and requires_grad.
+def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    normed_fp32 = x_fp32 * torch.rsqrt(variance + variance_epsilon)
+    normed_fp32 = normed_fp32 * weight_1d.to(torch.float32)
+    return torch.clamp(normed_fp32, min = -_QWEN3_MOE_FP16_MAX, max = _QWEN3_MOE_FP16_MAX).to(torch.float16)
+pass
+
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
+# this wrapper latches to eager instead of aborting the run.
+_qwen3_moe_rms_norm = compile_with_eager_fallback(_qwen3_moe_rms_norm, "Qwen3MoeRMSNorm.forward")
+
+
 def patch_Qwen3MoeRMSNorm_float32():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
     try:
@@ -107,18 +134,23 @@ def patch_Qwen3MoeRMSNorm_float32():
     except Exception as e:
         return raise_error("Qwen3MoeRMSNorm.forward", e)
 
+    publish_to_modeling_module(
+        transformers.models.qwen3_moe.modeling_qwen3_moe,
+        flatten_for_elementwise_norm = flatten_for_elementwise_norm,
+        unwrap_norm_weight           = unwrap_norm_weight,
+        _qwen3_moe_rms_norm          = _qwen3_moe_rms_norm,
+    )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Qwen3 scales by `weight` directly (no 1.0 + weight) with variance_epsilon.
-        x_fp32 = hidden_states.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim = True)
-        normed_fp32 = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
-        normed_fp32 = normed_fp32 * self.weight.to(torch.float32)
-
-        # Clamp to fp16 range before casting back so a large residual never becomes inf.
-        fp16_max = torch.finfo(torch.float16).max
-        return torch.clamp(normed_fp32, min = -fp16_max, max = fp16_max).to(torch.float16)
+        # `self` stays in eager, so it never reaches the kernel's guards.
+        hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
+        normed = _qwen3_moe_rms_norm(
+            hidden_states_2d, unwrap_norm_weight(self.weight), self.variance_epsilon,
+        )
+        return normed.reshape(shape)
     pass
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm, "forward", forward, fullgraph = True, match_level = "relaxed")
+    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm, "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeRMSNorm_float32)
 

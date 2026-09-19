@@ -21,16 +21,23 @@ __all__ = [
 import torch
 import inspect
 import os
+import sys
 import math
 import logging
-import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from unsloth_zoo.temporary_patches.common import (
+    torch_compile_options,
+    _maybe_compile,
+)
+from unsloth_zoo.log import logger
+
+
+
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -40,7 +47,7 @@ def selective_log_softmax(logits, index):
 pass
 
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
     logits,
     index,
@@ -67,7 +74,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -77,10 +84,46 @@ def chunked_hidden_states_selective_log_softmax(
     logit_scale_divide: float = 0.0,
     logit_softcapping: float = 0.0,
     temperature: float = 1.0,
+    # Rows per chunk cap. Read HERE, in the default, not in the body: the body
+    # is traced with fullgraph = True, and `os.environ` is an unsupported op
+    # there on torch 2.4 -- Dynamo raises
+    #   torch._dynamo.exc.Unsupported: const method call bytes.decode
+    # from os._Environ.__getitem__, which the eager fallback does not catch
+    # (it only catches recompile-limit and disabled-hook breaks), so the very
+    # first call would die even with the variable unset. A default is evaluated
+    # once when the def runs, which is import time, outside any traced region.
+    # It is also a plain int argument, so Dynamo guards on it instead of
+    # constant-folding an unguarded read (2.7+ never notice a later change).
+    # A non-numeric value is ignored rather than raised on, so a typo cannot
+    # break the import. 0 keeps the previous chunk boundaries exactly.
+    max_rows_per_chunk: int = (
+        int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip())
+        if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
+        else 0
+    ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
+    # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
+    # cannot have its row count silently rewritten and instead fails at the
+    # matmul below, which prints both operands. Do not swap in a bare
+    # torch._check: it reports only "Expected cond to be True", naming neither
+    # operand, and Dynamo rejects a message-carrying one. Callers dispatch on
+    # the width first -- see `compute_logprobs_chunk`, the packed path and
+    # `_pg_grad_forward`.
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
+
+    # Each chunk materialises rows x vocab logits and then a float32 copy of
+    # them, all on the device holding the output head. With a large vocabulary
+    # and a fixed chunk count that grows with the batch, so the peak scales with
+    # the batch rather than staying bounded. max_rows_per_chunk caps the rows
+    # per chunk instead, which is pure loop splitting: more, smaller chunks,
+    # same concatenated result. 0 (the default) keeps the previous chunk
+    # boundaries exactly.
+    if max_rows_per_chunk > 0:
+        n_rows = flat_hidden_states.shape[0]
+        chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
+        chunks = min(chunks, max(n_rows, 1))
 
     chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
     chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
@@ -88,7 +131,17 @@ def chunked_hidden_states_selective_log_softmax(
     all_per_token_logps = []
 
     for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
-        chunk_logits = chunk_hidden_states.to(lm_head.dtype) @ lm_head.t()
+        # When the model is dispatched over several devices, the output head can
+        # sit on a different one from the hidden states, because accelerate
+        # places the tail of the model on the last device it fills. Co-locate on
+        # the head's device before the matmul, otherwise this raises
+        #   Unhandled FakeTensor Device Propagation for aten.mm.default,
+        #   found two different devices cuda:0, cuda:1
+        # On a single device every .to() here is a no-op and the result is
+        # bit-identical to before.
+        chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+        chunk_index = chunk_index.to(lm_head.device)
+        chunk_logits = chunk_hidden_states @ lm_head.t()
 
         if logit_scale_multiply != 0.0:
             chunk_logits = chunk_logits * logit_scale_multiply
@@ -105,7 +158,9 @@ def chunked_hidden_states_selective_log_softmax(
         selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
         logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
         per_token_logps = selected_logits - logsumexp_values
-        all_per_token_logps.append(per_token_logps)
+        # Return to the caller's device so the concatenation below and every
+        # downstream consumer see the device they started on.
+        all_per_token_logps.append(per_token_logps.to(hidden_states.device))
 
     all_per_token_logps = torch.concat(all_per_token_logps)
 
@@ -409,6 +464,8 @@ def grpo_compute_loss(
     vespo_lambda_neg = kwargs.get("vespo_lambda_neg", 2.0)
     get_off_policy_mask = kwargs.get("get_off_policy_mask", None)
     off_policy_mask_threshold  = kwargs.get("off_policy_mask_threshold", None)
+    # Only direct callers see this fallback; the trainer always forwards an explicit value.
+    use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
 
     importance_sampling_ratio = None
@@ -508,7 +565,9 @@ def grpo_compute_loss(
     # Reverse KL: low-variance low-bias estimator as used in the GRPO paper.
     if beta != 0.0:
         kl_i = torch.exp(ref - new) - (ref - new) - 1.0
-
+        # TRL order: pre-clamp non-detached coef_1, before the loss_type dispatch.
+        if use_bias_correction_kl:
+            kl_i = kl_i * coef_1
     else:
         # Zeros with the correct shape.
         if importance_sampling_level == "sequence":
@@ -605,8 +664,11 @@ def grpo_compute_loss(
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
+# Same eager fallback as every other fullgraph region: a bare decorator leaves
+# cache exhaustion fatal under fullgraph.
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
-    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"\
+    f"@torch_compile_with_fallback(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
     f"{inspect.getsource(grpo_compute_loss)}"
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
@@ -673,13 +735,13 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
-        accumulate_chunk = torch.compile(
-            accumulate_chunk,
+        from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
+        accumulate_chunk = torch_compile_with_fallback(
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
             options = torch_compile_options,
-        )
+        )(accumulate_chunk)
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
         new_logps  = torch.chunk(_new_logps, chunks = n_chunks, dim = 0)
@@ -758,6 +820,495 @@ pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 
+def _warn_unsupported_grpo_options(trainer):
+    """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
+    them is not silently dropped. Only top_entropy_quantile < 1.0 (entropy masking) is
+    unimplemented; its TRL default is 1.0 in 0.22.2 through 1.12.0, so only non-defaults
+    warn. use_bias_correction_kl is supported and must never be listed here.
+    """
+    if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
+        return
+    args = getattr(trainer, "args", None)
+
+    unsupported = []
+    top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
+    if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
+        unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
+
+    if unsupported:
+        message = (
+            "Unsloth: GRPOConfig option(s) " + ", ".join(unsupported) + " are set but "
+            "are not supported by Unsloth's optimized GRPO path and will be ignored "
+            "(training proceeds as standard GRPO)."
+        )
+        try:
+            logger.warning(message)
+        except Exception:
+            import warnings as _warnings
+            _warnings.warn(message)
+        # Only latch after warning, so a config changed mid-run still gets one warning.
+        try:
+            trainer._unsloth_grpo_unsupported_warned = True
+        except Exception:
+            pass
+    return
+pass
+RL_REPLACEMENTS["_warn_unsupported_grpo_options"] = _warn_unsupported_grpo_options
+
+
+_n_chunks_deprecation_warned = False
+
+def _warn_deprecated_n_chunks(n_chunks):
+    """Warn once per process when unsloth_num_chunks is set to a non-default value.
+    The parameter stays because unsloth's generated trainer passes it, but the value
+    never reaches UnslothEfficientGRPO.apply, which is always called with 1.
+    """
+    global _n_chunks_deprecation_warned
+    if _n_chunks_deprecation_warned:
+        return
+    if n_chunks is None or n_chunks == -1 or n_chunks == 1:
+        return
+    _n_chunks_deprecation_warned = True
+    message = (
+        "Unsloth: unsloth_num_chunks is deprecated and is ignored; the GRPO loss now "
+        "always runs as a single chunk, since memory is managed by "
+        "unsloth_grpo_mini_batch and unsloth_logit_chunk_multiplier."
+    )
+    try:
+        logger.warning(message)
+    except Exception:
+        import warnings as _warnings
+        _warnings.warn(message)
+    return
+pass
+RL_REPLACEMENTS["_warn_deprecated_n_chunks"] = _warn_deprecated_n_chunks
+
+
+# The multimodal keys TRL's GRPO trainer puts in the inputs dict. Both Unsloth logprob
+# paths read this one tuple: they must forward the same inputs, or the importance ratio
+# compares two different policies. unslothai/unsloth#6960.
+GRPO_VISION_KEYS = (
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_attention_mask",
+    "image_sizes",
+    "spatial_shapes",
+    "num_tiles",
+    # One Gemma 4 field under both TRL names: pixel_position_ids in 1.0.x, renamed in
+    # 1.1.0. Only ever one of the two is present.
+    "image_position_ids",
+    "pixel_position_ids",
+    "num_images",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
+
+
+def grpo_get_vision_inputs(source):
+    """Collect the GRPO multimodal inputs out of a kwargs or inputs mapping."""
+    if source is None:
+        return {}
+    get = getattr(source, "get", None)
+    if get is None:
+        return {}
+    return {key: get(key, None) for key in GRPO_VISION_KEYS}
+pass
+RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
+
+
+# What every released unsloth up to 2026.9.4 forwards on the no-grad side, hard coded in its
+# own `_get_per_token_logps_and_entropies` replacement. The conservative answer when the
+# installed companion is present but cannot be read: forwarding MORE than this on the gradient
+# side alone is what makes the two policies differ, so an unknown companion is assumed to be
+# one of those rather than assumed to be current.
+GRPO_RELEASED_VISION_KEYS = (
+    "pixel_values",
+    "image_grid_thw",
+    "pixel_attention_mask",
+    "image_sizes",
+    "num_images",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
+
+# The names whose presence in the installed unsloth's no-grad replacement means it reads THIS
+# module's key tuple rather than a list of its own. Either one is enough: unslothai/unsloth#11031
+# collects the keys in a module level helper and names only the chunker inside the replacement.
+# One constant rather than two literals per site, because the integration test has to ask the
+# same question the gate asks and a second copy of the answer drifts.
+GRPO_SHARED_HELPER_MARKERS = ("grpo_get_vision_inputs", "grpo_vision_chunks")
+
+# Memo for grpo_companion_vision_keys. Set once per process; tests reset it to None.
+_GRPO_COMPANION_VISION_KEYS = None
+
+
+def grpo_companion_vision_keys():
+    """Which of GRPO_VISION_KEYS the installed unsloth also forwards on the no-grad side.
+
+    unsloth ships separately from this package, and up to 2026.9.4 its
+    ``_get_per_token_logps_and_entropies`` replacement, which computes the old and reference
+    logprobs, carries its own hard coded list of seven keys. Forwarding more than that on the
+    gradient side alone would let the current policy see image metadata the reference policy
+    never saw, so the importance ratio and the KL term would compare two different policies.
+    Agreeing on the smaller set is what makes the ratio meaningful, and it is still strictly
+    better than before, since the shared chunker no longer drops pixel_values outright.
+
+    Read out of the installed unsloth's source rather than its version, so an unsloth carrying
+    the companion change lifts the restriction on its own: either shared name appearing in that
+    replacement means the no-grad pass reads this module's tuple. Only sys.modules is consulted:
+    at this point unsloth is what is driving the run, and importing it from here is circular.
+    Only an answer READ off a patcher is memoized: a module that is not there yet is a call
+    that came too early, not an unsloth without the companion.
+    """
+    global _GRPO_COMPANION_VISION_KEYS
+    if _GRPO_COMPANION_VISION_KEYS is not None:
+        return _GRPO_COMPANION_VISION_KEYS
+
+    keys = GRPO_VISION_KEYS
+    module = sys.modules.get("unsloth.models.rl_replacements")
+    patcher = getattr(module, "grpo_trainer__get_per_token_logps_and_entropies", None)
+    if patcher is None:
+        # Nothing to classify yet, and an absence here is not a fact about the process: this
+        # module can be imported before unsloth installs its RL replacements, and the first
+        # caller would otherwise memoize "no companion" permanently, so the restriction could
+        # never be applied to the run that actually needs it. Treat it like the unreadable
+        # case and leave it unmemoized, so a later call gets to look again once the import has
+        # happened. The full tuple is the right answer while nothing is known to restrict it.
+        return GRPO_VISION_KEYS
+
+    source = None
+    unreadable = False
+    try:
+        source = inspect.getsource(patcher)
+    except (OSError, TypeError):
+        # Source stripped, frozen, or dynamically wrapped. The companion is THERE -- the
+        # patcher exists -- and the only thing missing is the ability to see which keys it
+        # forwards. Leaving the full tuple there was the unsafe half of the guess: the
+        # gradient pass would forward spatial_shapes, num_tiles and the position ids that
+        # every released companion omits, and the importance ratio and KL term would then
+        # compare two different policies with nothing to show for it. Assume the released
+        # set instead, which is the answer for every unsloth that does not carry the
+        # companion change, and do not memoize it: this is a failure to look, not a fact
+        # about the process, so a later call gets to look again.
+        source = None
+        unreadable = True
+    shares = source is not None and any(
+        marker in source for marker in GRPO_SHARED_HELPER_MARKERS
+    )
+    if source is not None and not shares:
+        named = tuple(
+            key for key in GRPO_VISION_KEYS
+            if '"%s"' % key in source or "'%s'" % key in source
+        )
+        # A no-grad pass that names no pixel_values at all is one this reader does not
+        # understand; leave the full set rather than silently turning vision off.
+        if "pixel_values" in named and len(named) != len(GRPO_VISION_KEYS):
+            keys = named
+            logger.warning(
+                "Unsloth: the installed unsloth computes GRPO reference logprobs without "
+                f"{', '.join(k for k in GRPO_VISION_KEYS if k not in named)}. Holding the "
+                "gradient pass to the same inputs so both policies match. Upgrade unsloth to "
+                "forward every vision kwarg on both paths."
+            )
+    if unreadable:
+        logger.warning(
+            "Unsloth: the installed unsloth's GRPO reference-logprob pass cannot be read, so "
+            "which vision kwargs it forwards is unknown. Holding the gradient pass to the "
+            "keys every released unsloth forwards, so both policies still match."
+        )
+        return GRPO_RELEASED_VISION_KEYS
+    _GRPO_COMPANION_VISION_KEYS = keys
+    return keys
+pass
+RL_REPLACEMENTS["grpo_companion_vision_keys"] = grpo_companion_vision_keys
+
+
+# Warned once per process, not per step: this is a property of the installed packages.
+_GRPO_COMPANION_PIXELS_WARNED = False
+
+
+def grpo_shared_vision_inputs(source):
+    """grpo_get_vision_inputs, restricted to what both logprob passes actually forward.
+
+    Two restrictions, not one. The key list is the first: a companion with its own hard coded
+    tuple never sees the keys outside it. The second is a SHAPE, and intersecting names cannot
+    express it -- a companion that does not share the chunker slices the pixels itself, and its
+    loop drops ``pixel_values`` outright unless ``image_grid_thw`` is there to slice them by
+    (``pixel_values_chunks.append(None)`` in its else branch). For a VLM that carries no grid,
+    which is Gemma 3, InternVL and LFM2-VL, forwarding pixels on the gradient side alone would
+    leave the current policy looking at images the reference policy never saw, and the
+    importance ratio and the KL term would compare two different policies however carefully the
+    key names were matched.
+
+    That second restriction is NOT applied here, and the layer matters. ``pixel_values`` is a
+    sentinel in the caller as well as a model input: ``grpo_accumulated_loss`` reads it to
+    decide whether to left-pack the batch (recomputing ``max_left_pad``, repacking
+    ``input_ids`` and rebuilding ``completion_mask``) and whether to take the sequence-packing
+    path. The companion chooses those on its own ``pixel_values``, which is a real tensor --
+    it appends None per chunk INSIDE its loop, after the branch is already chosen -- so
+    blanking the key here would stop the two passes disagreeing about pixels and start them
+    disagreeing about how the sequences are arranged, which is the worse comparison of the
+    two. The suppression therefore happens one layer down, in ``grpo_vision_chunks``, on the
+    chunk that is actually forwarded. See ``grpo_companion_drops_pixels``.
+    """
+    keys = grpo_companion_vision_keys()
+    if len(keys) == len(GRPO_VISION_KEYS):
+        return grpo_get_vision_inputs(source)
+    return {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
+pass
+RL_REPLACEMENTS["grpo_shared_vision_inputs"] = grpo_shared_vision_inputs
+
+
+def grpo_companion_drops_pixels(vision):
+    """Whether the installed companion's no-grad loop forwards no pixels for THIS batch.
+
+    Its else branch is ``pixel_values_chunks.append(None)``: with no ``image_grid_thw`` to
+    slice the pixels by, that loop has nothing to forward, so for a VLM that carries no grid
+    -- Gemma 3, InternVL, LFM2-VL -- the reference policy sees text where the gradient pass
+    would see images. Matching it is what keeps the importance ratio and the KL term a
+    comparison of one policy with itself.
+
+    False whenever the companion shares this module's chunker, because then both passes slice
+    with the same code and nothing needs to be given up.
+    """
+    if vision.get("pixel_values", None) is None:
+        return False
+    if vision.get("image_grid_thw", None) is not None:
+        return False
+    return len(grpo_companion_vision_keys()) != len(GRPO_VISION_KEYS)
+pass
+RL_REPLACEMENTS["grpo_companion_drops_pixels"] = grpo_companion_drops_pixels
+
+
+def grpo_vision_chunks(vision, total_samples, batch_size):
+    """Slice the GRPO multimodal inputs into per-chunk forward kwargs, one dict per chunk.
+
+    One implementation for both logprob paths, so they cannot index the same tensors
+    differently. The axis per family mirrors TRL's own ``_get_per_token_logps_and_entropies``:
+
+    * ``image_grid_thw`` (Qwen2-VL): ``pixel_values`` by patch row, the grid by image.
+    * ``image_position_ids`` (Gemma 4): both by image.
+    * ``spatial_shapes`` (LFM2-VL): ``pixel_values``, ``pixel_attention_mask`` and
+      ``spatial_shapes`` by tile, with ``num_tiles`` giving the tiles per sample.
+    * ``num_tiles`` alone (InternVL): ``pixel_values`` by tile.
+    * anything else: by image when there is one row per image, else by sample.
+
+    An unrecognised model still gets its ``pixel_values``, as stock TRL does; dropping
+    them silently recomputes the reference logprobs from the text alone.
+    """
+    def _as_int_list(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().reshape(-1).tolist()
+        try:
+            return [int(n) for n in value]
+        except TypeError:
+            return None
+
+    def _first_dim_len(value):
+        if value is None:
+            return None
+        if hasattr(value, "shape"):
+            return value.shape[0]
+        try:
+            return len(value)
+        except TypeError:
+            return None
+
+    pixel_values = vision.get("pixel_values", None)
+    image_grid_thw = vision.get("image_grid_thw", None)
+    pixel_attention_mask = vision.get("pixel_attention_mask", None)
+    image_sizes = vision.get("image_sizes", None)
+    spatial_shapes = vision.get("spatial_shapes", None)
+    # One local for both spellings, but it must leave under the name it arrived with:
+    # the model kwarg is named the same as the inputs key.
+    image_position_ids = vision.get("image_position_ids", None)
+    position_ids_key = "image_position_ids"
+    if image_position_ids is None:
+        image_position_ids = vision.get("pixel_position_ids", None)
+        position_ids_key = "pixel_position_ids"
+    token_type_ids = vision.get("token_type_ids", None)
+    mm_token_type_ids = vision.get("mm_token_type_ids", None)
+    num_images = _as_int_list(vision.get("num_images", None))
+    num_tiles = _as_int_list(vision.get("num_tiles", None))
+
+    # A count list is only a per-sample cumulative index when it has one entry per row.
+    if num_images is not None and len(num_images) != total_samples:
+        num_images = None
+    if num_tiles is not None and len(num_tiles) != total_samples:
+        num_tiles = None
+
+    cum_imgs = None if num_images is None else torch.tensor([0] + num_images).cumsum(0)
+    cum_tiles = None if num_tiles is None else torch.tensor([0] + num_tiles).cumsum(0)
+
+    cum_rows = None
+    if image_grid_thw is not None and pixel_values is not None and num_images is not None:
+        rows_per_image = image_grid_thw.prod(dim = -1)
+        rows_per_sample = torch.split(rows_per_image, num_images)
+        rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
+        # .item() in the loop below, so keep it on CPU or every chunk pays a sync.
+        cum_rows = torch.cat(
+            [
+                torch.tensor([0], device = rows_per_sample.device),
+                rows_per_sample.cumsum(0),
+            ]
+        ).cpu()
+
+    total_images = None if num_images is None else sum(num_images)
+
+    def _row_axis_is_images(value, flat_ndim):
+        """Whether this tensor's first dimension counts IMAGES rather than samples.
+
+        Equal lengths are not enough on their own. A model that pads its image tensors to the
+        widest sample -- SmolVLM, Idefics -- keeps the sample axis first, and a batch whose
+        image counts happen to sum to the number of samples (``num_images = [2, 0]`` over two
+        samples) makes the two readings numerically identical. Slicing such a batch by image
+        sends both of the first sample's rows to one chunk and an empty tensor to the next.
+
+        The layouts differ in RANK, which the counts cannot express: the padded one carries an
+        explicit per-sample image axis (``[B, max_images, C, H, W]`` for pixels,
+        ``[B, max_images, 2]`` for image sizes), one dimension more than the flattened form
+        this branch is for.
+        """
+        if value is None or total_images is None:
+            return False
+        if _first_dim_len(value) != total_images:
+            return False
+        if total_images != total_samples:
+            # The length has already settled it. Rank can only add anything inside the region
+            # where the image axis and the sample axis are the same length; outside it a
+            # genuinely flattened tensor is free to outrank flat_ndim, and LLaVA-NeXT and
+            # LLaVA-OneVision do exactly that -- they pad on the PATCH axis and store
+            # [n_images, max_patches, C, H, W], one row per image with a rank of 5. Applying
+            # the rank test there sent each sample the rows of whichever sample shares its
+            # index, and dropped the surplus images entirely.
+            return True
+        ndim = getattr(value, "ndim", None)
+        if isinstance(ndim, int) and ndim > flat_ndim:
+            return False
+        return True
+
+    def _image_sizes_slice(start, end, img_start, img_end):
+        if image_sizes is None:
+            return None
+        if img_start is not None and _row_axis_is_images(image_sizes, 2):
+            return image_sizes[img_start:img_end]
+        return image_sizes[start:end]
+
+    # Asked once per call, not per chunk: it reads the installed companion's source.
+    drop_pixels = grpo_companion_drops_pixels(vision)
+    global _GRPO_COMPANION_PIXELS_WARNED
+    if drop_pixels and not _GRPO_COMPANION_PIXELS_WARNED:
+        _GRPO_COMPANION_PIXELS_WARNED = True
+        logger.warning(
+            "Unsloth: the installed unsloth computes GRPO reference logprobs with a chunk "
+            "loop of its own, and that loop forwards no pixel_values for a model without "
+            "image_grid_thw. Holding the gradient pass to the same inputs, so both policies "
+            "match, which means this run trains on the text of these samples. Upgrade "
+            "unsloth to train on the images."
+        )
+
+    chunks = []
+    current_pixel_idx = 0
+    for start in range(0, total_samples, batch_size):
+        end = min(start + batch_size, total_samples)
+        chunk = {}
+        if token_type_ids is not None:
+            chunk["token_type_ids"] = token_type_ids[start:end]
+        if mm_token_type_ids is not None:
+            chunk["mm_token_type_ids"] = mm_token_type_ids[start:end]
+
+        img_start = img_end = None
+        if cum_imgs is not None:
+            img_start, img_end = int(cum_imgs[start]), int(cum_imgs[end])
+
+        if pixel_values is None:
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+            chunks.append(chunk)
+            continue
+
+        if image_grid_thw is not None:
+            if num_images is None:
+                grid_slice = image_grid_thw[start:end]
+                batch_pixel_count = grid_slice.prod(dim = -1).sum().item()
+                start_pixel_idx = current_pixel_idx
+                end_pixel_idx = current_pixel_idx + batch_pixel_count
+                current_pixel_idx = end_pixel_idx
+            else:
+                start_pixel_idx = cum_rows[start].item()
+                end_pixel_idx = cum_rows[end].item()
+                grid_slice = image_grid_thw[img_start:img_end]
+            chunk["image_grid_thw"] = grid_slice
+            chunk["pixel_values"] = pixel_values[start_pixel_idx:end_pixel_idx]
+            if pixel_attention_mask is not None:
+                if img_start is not None and pixel_attention_mask.shape[0] == image_grid_thw.shape[0]:
+                    chunk["pixel_attention_mask"] = pixel_attention_mask[img_start:img_end]
+                elif (
+                    pixel_attention_mask.shape[0] == pixel_values.shape[0]
+                    and pixel_attention_mask.shape[0] != total_samples
+                ):
+                    chunk["pixel_attention_mask"] = pixel_attention_mask[start_pixel_idx:end_pixel_idx]
+                else:
+                    chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        elif image_position_ids is not None:
+            if img_start is None:
+                chunk["pixel_values"] = pixel_values[start:end]
+                chunk[position_ids_key] = image_position_ids[start:end]
+            else:
+                chunk["pixel_values"] = pixel_values[img_start:img_end]
+                chunk[position_ids_key] = image_position_ids[img_start:img_end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        elif spatial_shapes is not None:
+            if cum_tiles is not None:
+                tile_start, tile_end = int(cum_tiles[start]), int(cum_tiles[end])
+            elif img_start is not None and _first_dim_len(spatial_shapes) == total_images:
+                tile_start, tile_end = img_start, img_end
+            else:
+                tile_start, tile_end = start, end
+            chunk["pixel_values"] = pixel_values[tile_start:tile_end]
+            chunk["spatial_shapes"] = spatial_shapes[tile_start:tile_end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[tile_start:tile_end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        elif cum_tiles is not None:
+            tile_start, tile_end = int(cum_tiles[start]), int(cum_tiles[end])
+            chunk["pixel_values"] = pixel_values[tile_start:tile_end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        else:
+            # Not a bare length comparison: see _row_axis_is_images. A flattened image tensor
+            # is one row per image, [N, C, H, W]; a padded one keeps the sample axis in front
+            # of it and must be sliced by sample like everything else in this chunk.
+            if img_start is not None and _row_axis_is_images(pixel_values, 4):
+                chunk["pixel_values"] = pixel_values[img_start:img_end]
+            else:
+                chunk["pixel_values"] = pixel_values[start:end]
+            if pixel_attention_mask is not None:
+                chunk["pixel_attention_mask"] = pixel_attention_mask[start:end]
+            if image_sizes is not None:
+                chunk["image_sizes"] = _image_sizes_slice(start, end, img_start, img_end)
+        if drop_pixels:
+            # Here, on the forwarded chunk, rather than on the mapping the caller branches on.
+            # The mask goes with the pixels: the companion appends None for it in the same
+            # branch, and a mask with nothing to mask is not a shape any of these models take.
+            chunk.pop("pixel_values", None)
+            chunk.pop("pixel_attention_mask", None)
+        chunks.append(chunk)
+    return chunks
+pass
+RL_REPLACEMENTS["grpo_vision_chunks"] = grpo_vision_chunks
+
+
 def grpo_accumulated_loss(
     trainer,
     input_ids,
@@ -772,20 +1323,35 @@ def grpo_accumulated_loss(
     **kwargs,
 ):
     # All Unsloth Zoo code licensed under AGPL3
-    bsz, qlen = input_ids.shape
+    # Body-local import so the copy inlined into the generated trainer cache resolves.
+    try:
+        from unsloth_zoo.rl_replacements import _warn_unsupported_grpo_options
+        _warn_unsupported_grpo_options(trainer)
+    except Exception:
+        pass
 
-    pixel_values = kwargs.get('pixel_values',None)
-    image_grid_thw = kwargs.get('image_grid_thw',None)
-    pixel_attention_mask = kwargs.get('pixel_attention_mask',None)
-    image_sizes = kwargs.get('image_sizes',None)
-    num_images = kwargs.get('num_images',None)
+    # Body-local: this source is copied into the generated trainer without its imports.
+    from unsloth_zoo.rl_replacements import (
+        grpo_shared_vision_inputs as _grpo_get_vision_inputs,
+        grpo_vision_chunks as _grpo_vision_chunks,
+    )
+    vision_inputs = _grpo_get_vision_inputs(kwargs)
+    pixel_values = vision_inputs.get('pixel_values', None)
+    image_grid_thw = vision_inputs.get('image_grid_thw', None)
+    # Released unsloth 2026.9.4 decides whether multi-image GRPO is supported by grepping
+    # inspect.getsource(grpo_accumulated_loss) for "num_images", so moving the handling into
+    # grpo_vision_chunks makes that probe answer no and raise "Please upgrade unsloth_zoo" at
+    # the user who just did. The chunker reads num_images out of vision_inputs itself; this
+    # binding is what the released probe looks for, and it keeps the name meaningful here.
+    num_images = vision_inputs.get('num_images', None)
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
-    token_type_ids = kwargs.get('token_type_ids',None)
-    mm_token_type_ids = kwargs.get('mm_token_type_ids',None)
+    token_type_ids = vision_inputs.get('token_type_ids', None)
+    mm_token_type_ids = vision_inputs.get('mm_token_type_ids', None)
     if mm_token_type_ids is not None or image_grid_thw is not None:
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
+        vision_inputs['mm_token_type_ids'] = mm_token_type_ids
     # Thread vLLM sampling logprobs when something actually consumes them: the off-policy mask
     # (off_policy_mask_threshold) or the IS ratio (vllm_importance_sampling_correction). The mask
     # needs them regardless of IS correction (matching TRL, which feeds them to get_off_policy_mask
@@ -863,12 +1429,17 @@ def grpo_accumulated_loss(
             _adapter._unsloth_wrapped = _off_policy_mask_fn
             trainer._unsloth_off_policy_mask_adapter = _adapter
         kwargs["get_off_policy_mask"] = _adapter
-    kwargs["use_vllm"] = trainer.use_vllm
+    # Read inside the compiled loss to gate the IS ratio, which the off-policy mask must not gate.
     kwargs["vllm_importance_sampling_correction"] = getattr(trainer, "vllm_importance_sampling_correction", False)
-    # Snap n_chunks to the closest divisor of bsz.
-    factors = [i for i in range(1, bsz + 1) if bsz % i == 0]
-    if n_chunks == -1: n_chunks = bsz
-    n_chunks = factors[min(np.searchsorted(factors, n_chunks), len(factors)-1)]
+    # Follows TRL's own value; older TRL has no such field and False is correct there.
+    kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
+    kwargs["use_vllm"] = trainer.use_vllm
+    # Generated trainers still pass unsloth_num_chunks; nothing downstream reads it.
+    try:
+        from unsloth_zoo.rl_replacements import _warn_deprecated_n_chunks
+        _warn_deprecated_n_chunks(n_chunks)
+    except Exception:
+        pass
 
     if kwargs["vllm_importance_sampling_clip_max"] is None and kwargs["vllm_importance_sampling_cap"] is not None:
         kwargs["vllm_importance_sampling_clip_min"] = 0
@@ -954,96 +1525,33 @@ def grpo_accumulated_loss(
 
     all_logprobs_list = []
 
-    def slice_sample_axis(value, start, end):
-        if value is None:
-            return None
-        return value[start:end]
-
     import math
     total_samples = input_ids.shape[0]
     batch_size = math.ceil(total_samples / B)
-    if isinstance(num_images, torch.Tensor):
-        num_images = num_images.detach().cpu().reshape(-1).tolist()
-    if image_grid_thw is not None and pixel_values is not None and num_images is not None:
-        rows_per_image = image_grid_thw.prod(dim=-1)
-        rows_per_sample = torch.split(rows_per_image, num_images)
-        rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
-        cum_rows = torch.cat(
-            [
-                torch.tensor([0], device=rows_per_sample.device),
-                rows_per_sample.cumsum(0),
-            ]
-        )
-        cum_imgs = torch.tensor([0] + num_images).cumsum(0)
-    else:
-        cum_rows = None
-        cum_imgs = None
-
     input_ids_chunks = []
     attention_mask_chunks = []
     completion_ids_chunks = []
-    pixel_values_chunks = []
-    image_grid_thw_chunks = []
-    pixel_attention_mask_chunks = []
-    image_sizes_chunks = []
-    token_type_ids_chunks = []
-    mm_token_type_ids_chunks = []
-
-    current_pixel_idx = 0
-    #TRL 0.23.0 batching logic
     for start in range(0, total_samples, batch_size):
         end = min(start + batch_size, total_samples)
-
         input_ids_chunks.append(input_ids[start:end])
         attention_mask_chunks.append(attention_mask[start:end])
         completion_ids_chunks.append(completion_input_ids[start:end])
-        image_sizes_chunks.append(slice_sample_axis(image_sizes, start, end))
-        token_type_ids_chunks.append(slice_sample_axis(token_type_ids, start, end))
-        mm_token_type_ids_chunks.append(
-            slice_sample_axis(mm_token_type_ids, start, end)
-        )
 
-        if image_grid_thw is not None and pixel_values is not None:
-
-            if num_images is None:
-                grid_slice = image_grid_thw[start:end]
-                batch_pixel_count = grid_slice.prod(dim=-1).sum().item()
-                start_pixel_idx = current_pixel_idx
-                end_pixel_idx = current_pixel_idx + batch_pixel_count
-                current_pixel_idx = end_pixel_idx
-            else:
-                start_pixel_idx = cum_rows[start].item()
-                end_pixel_idx = cum_rows[end].item()
-                img_start, img_end = cum_imgs[start], cum_imgs[end]
-                grid_slice = image_grid_thw[img_start:img_end]
-            image_grid_thw_chunks.append(grid_slice)
-
-            pixel_values_chunks.append(pixel_values[start_pixel_idx:end_pixel_idx])
-
-            if pixel_attention_mask is not None:
-                if pixel_attention_mask.shape[0] == pixel_values.shape[0]:
-                    pixel_attention_mask_chunks.append(pixel_attention_mask[start_pixel_idx:end_pixel_idx])
-                else:
-                    pixel_attention_mask_chunks.append(pixel_attention_mask[start:end])
-            else:
-                pixel_attention_mask_chunks.append(None)
-
-        else:
-            pixel_values_chunks.append(None)
-            image_grid_thw_chunks.append(None)
-            pixel_attention_mask_chunks.append(None)
+    # Shared with the no-grad pass, so the two cannot slice the same tensors differently.
+    vision_chunks = _grpo_vision_chunks(vision_inputs, total_samples, batch_size)
 
     zipped_inputs = zip(
         input_ids_chunks,
         attention_mask_chunks,
-        pixel_values_chunks,
-        image_grid_thw_chunks,
-        pixel_attention_mask_chunks,
-        image_sizes_chunks,
-        token_type_ids_chunks,
-        mm_token_type_ids_chunks,
-        completion_ids_chunks
+        vision_chunks,
+        completion_ids_chunks,
     )
+
+    # Bound in the body, not at module scope, for the reason spelled out just below: this
+    # function's source is copied into the generated UnslothGRPOTrainer cache without
+    # unsloth_zoo's module imports, so a module-level import reaches the import path and
+    # not the one that actually runs in production.
+    from contextlib import nullcontext
 
     if trainer._autocast_dtype is None:
         autocaster = nullcontext()
@@ -1220,11 +1728,23 @@ def grpo_accumulated_loss(
                         packed_seq_lengths = _pack_psl,
                         use_cache = False,
                     ).logits
-                    _pack_sel = chunked_hidden_states_selective_log_softmax(
-                        _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0), lm_head,
-                        _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0), _pack_chunks,
-                        logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                    )[0]
+                    # `.logits` carries hidden states only when the forward is the
+                    # Unsloth generated one honouring UNSLOTH_RETURN_HIDDEN_STATES;
+                    # otherwise it is real [T, vocab] logits and the lm_head matmul
+                    # dies. Dispatch on width, as the padded path already does.
+                    _pack_h   = _pack_hidden[0, :-1, :][_pack_ctgt].unsqueeze(0)
+                    _pack_tid = _pack_flat_ids[0, 1:][_pack_ctgt].unsqueeze(0)
+                    if _pack_h.shape[-1] == lm_head.shape[1]:
+                        _pack_sel = chunked_hidden_states_selective_log_softmax(
+                            _pack_h, lm_head, _pack_tid, _pack_chunks,
+                            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                        )[0]
+                    else:
+                        # Raw logits: the forward already applied scale/softcap.
+                        _pack_sel = chunked_selective_log_softmax(
+                            _pack_h, _pack_tid,
+                            temperature = temperature, chunks = _pack_chunks,
+                        )[0]
                 # GPT-OSS offload race guard (matches the padded loop)
                 device_synchronize()
                 # scatter each completion logprob back to its (row, col) so [:, -_pack_W:] matches padded
@@ -1250,10 +1770,19 @@ def grpo_accumulated_loss(
                             _pack_real = input_ids[_pack_i][_pack_rmask].unsqueeze(0)
                             _pack_rpos = torch.arange(_pack_ni, device = input_ids.device).unsqueeze(0)
                             _pack_rh = unwrapped_model(input_ids = _pack_real, position_ids = _pack_rpos, use_cache = False).logits
-                            _pack_rsel = chunked_hidden_states_selective_log_softmax(
-                                _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
-                                logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-                            )[0]
+                            # same width dispatch as the packed call above: this forward
+                            # returns raw logits whenever that one did, and the first
+                            # packed batch always lands here
+                            if _pack_rh.shape[-1] == lm_head.shape[1]:
+                                _pack_rsel = chunked_hidden_states_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], lm_head, _pack_real[:, 1:], 1,
+                                    logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+                                )[0]
+                            else:
+                                _pack_rsel = chunked_selective_log_softmax(
+                                    _pack_rh[:, :-1, :], _pack_real[:, 1:],
+                                    temperature = temperature, chunks = 1,
+                                )[0]
                             _pack_rcols = _pack_rmask.nonzero(as_tuple = False).squeeze(1)[1:] - (_pack_L - _pack_W)
                             _pack_rkeep = _pack_rcols >= 0
                             _pack_ref[_pack_i, _pack_rcols[_pack_rkeep]] = _pack_rsel[_pack_rkeep].to(torch.float32)
@@ -1314,8 +1843,21 @@ def grpo_accumulated_loss(
                 prefix_seg_info = _pg_layout.prefix_seg_info,
                 use_cache = False,
             ).logits
+            # Same width dispatch as the packed path and compute_logprobs_chunk.
+            # `.logits` carries hidden states only when the forward is the Unsloth
+            # generated one honouring UNSLOTH_RETURN_HIDDEN_STATES; otherwise it is
+            # real [T, vocab] logits. extract_logps always calls its helper as
+            # (hidden, lm_head, ids, chunks, ...), so pass a raw-logits helper with
+            # that same signature, which skips the lm_head matmul and the scale /
+            # softcap the forward already applied.
+            _pg_fn = chunked_hidden_states_selective_log_softmax
+            if _h.shape[-1] != lm_head.shape[1]:
+                def _pg_fn(_pg_h, _pg_lm, _pg_ids, _pg_n, _pg_lsm, _pg_lsd, _pg_lsc, _pg_t):
+                    return chunked_selective_log_softmax(
+                        _pg_h, _pg_ids, temperature = _pg_t, chunks = _pg_n,
+                    )
             _pg_lp = _pg_layout.extract_logps(
-                _h, lm_head, chunked_hidden_states_selective_log_softmax,
+                _h, lm_head, _pg_fn,
                 _pg_chunks, logit_scale_multiply, logit_scale_divide,
                 logit_softcapping, temperature,
             )  # [total_rows, W] with grad
@@ -1410,6 +1952,16 @@ def grpo_accumulated_loss(
         if tensor is None: return None
         return tensor.to(device, non_blocking=non_blocking)
 
+    def _offload_device_module(tensor_or_device):
+        # Stream/Event module for the offload copy. torch.cuda is also the HIP
+        # backend, so ROCm reports is_cuda and needs no branch of its own; XPU has
+        # its own namespace, matching gradient_checkpointing.py. Anything else
+        # (CPU, MPS, ...) returns None and takes the pageable copy.
+        device = getattr(tensor_or_device, "device", tensor_or_device)
+        if device.type == "cuda": return torch.cuda
+        if device.type == "xpu": return getattr(torch, "xpu", None)
+        return None
+
     class Unsloth_Offloaded_Log_Softmax(torch.autograd.Function):
         """Manual gradient checkpointing / CPU offloading for log softmax."""
         @staticmethod
@@ -1417,9 +1969,46 @@ def grpo_accumulated_loss(
                     logit_scale_multiply, logit_scale_divide,
                     logit_softcapping, temperature):
             # Detach so we don't keep the graph (and extra memory) on CPU.
-            ctx.saved_hidden_states = hidden_states.detach().contiguous().to("cpu", non_blocking=True)
+            detached_hidden_states = hidden_states.detach().contiguous()
             ctx.device = hidden_states.device
-            ctx.dtype = hidden_states.dtype
+            ctx.copy_event = None
+
+            # Always offload: this path only runs when the caller is already memory bound
+            # (long completions / large batches), so the win is overlapping the copy.
+            saved_hidden_states = None
+            device_module = _offload_device_module(detached_hidden_states)
+            if device_module is not None:
+                # Async D2H on a side stream; backward MUST wait on copy_event before
+                # the H2D reload or it races the copy.
+                try:
+                    pinned_buffer = torch.empty_like(detached_hidden_states, device = "cpu", pin_memory = True)
+                    if pinned_buffer is not None:
+                        current_stream = device_module.current_stream(detached_hidden_states.device)
+                        copy_stream = device_module.Stream(device = detached_hidden_states.device)
+                        copy_stream.wait_stream(current_stream)
+                        with device_module.stream(copy_stream):
+                            pinned_buffer.copy_(detached_hidden_states, non_blocking = True)
+                        # Keeps the GPU storage alive until the side-stream copy finishes.
+                        detached_hidden_states.record_stream(copy_stream)
+                        copy_event = device_module.Event()
+                        copy_event.record(copy_stream)
+                        saved_hidden_states = pinned_buffer
+                        ctx.copy_event = copy_event
+                except (RuntimeError, OSError, AttributeError):
+                    # Any accelerator that cannot do pinned side-stream copies falls
+                    # back below; correctness never depends on this path.
+                    saved_hidden_states = None
+                    ctx.copy_event = None
+            if saved_hidden_states is None:
+                # No accelerator, or the async copy is unavailable: pageable copy.
+                saved_hidden_states = detached_hidden_states.to("cpu", non_blocking = True)
+            ctx.saved_hidden_states = saved_hidden_states
+            # Drop the clone before the log-softmax below. hidden_states is usually a
+            # [:, :-1, :] slice, so .contiguous() allocated a full copy; holding the
+            # reference across the forward would keep it resident alongside the chunk
+            # logits. record_stream still blocks reuse until the D2H lands, so the
+            # allocator reclaims it mid-compute rather than at the end of forward.
+            del detached_hidden_states
 
             ctx.lm_head = lm_head
             ctx.lm_head_requires_grad = lm_head.requires_grad
@@ -1435,17 +2024,20 @@ def grpo_accumulated_loss(
 
         @staticmethod
         def backward(ctx, grad_output):
+            if ctx.copy_event is not None:
+                # The offload copy must land before the H2D reload.
+                device_module = _offload_device_module(ctx.device)
+                ctx.copy_event.wait(device_module.current_stream(ctx.device))
             hidden_states = to_device(ctx.saved_hidden_states, ctx.device)
-            hidden_states = hidden_states.to(ctx.dtype)
             hidden_states.requires_grad_(True)
 
             lm_head = ctx.lm_head
-            # #Possibly redundant lines
-            # if ctx.lm_head_requires_grad:
-            #     hidden_states.requires_grad_(True)
-            # else:
-            #     lm_head = lm_head.detach()
-
+            if ctx.lm_head_requires_grad:
+                # Recompute against a private leaf. A Tensor.register_hook on the real
+                # lm_head fires for tensors named in autograd.grad's inputs, so reusing
+                # it here would run a user's grad mask / scaler once on this local
+                # gradient and again when the returned gradient reaches lm_head.
+                lm_head = lm_head.detach().requires_grad_(True)
             index = ctx.index
 
             with torch.enable_grad():
@@ -1453,11 +2045,17 @@ def grpo_accumulated_loss(
                     hidden_states, lm_head, index, *ctx.args
                 )
 
-            torch.autograd.backward(output, grad_output)
+            # autograd.grad, not backward: backward writes into leaf .grad, which the
+            # outer AccumulateGrad would then double-count.
+            grad_inputs = torch.autograd.grad(
+                output,
+                (hidden_states, lm_head) if ctx.lm_head_requires_grad else (hidden_states,),
+                grad_output,
+            )
 
             return (
-                hidden_states.grad,
-                lm_head.grad if ctx.lm_head_requires_grad else None,
+                grad_inputs[0],
+                grad_inputs[1] if ctx.lm_head_requires_grad else None,
                 None,
                 None,
                 None,
@@ -1515,29 +2113,15 @@ def grpo_accumulated_loss(
     for (
         input_ids_chunk,
         attention_mask_chunk,
-        pixel_values_chunk,
-        image_grid_thw_chunk,
-        pixel_attention_mask_chunk,
-        image_sizes_chunk,
-        token_type_ids_chunk,
-        mm_token_type_ids_chunk,
+        vision_chunk,
         completion_ids
     ) in zipped_inputs:
-            _extra_vision_kwargs = {}
-            if token_type_ids_chunk is not None:
-                _extra_vision_kwargs["token_type_ids"] = token_type_ids_chunk
-            if mm_token_type_ids_chunk is not None:
-                _extra_vision_kwargs["mm_token_type_ids"] = mm_token_type_ids_chunk
             with autocaster:
                 if pixel_values is None:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
                         attention_mask = attention_mask_chunk,
-                        pixel_values = pixel_values_chunk,
-                        image_grid_thw = image_grid_thw_chunk,
-                        pixel_attention_mask = pixel_attention_mask_chunk,
-                        image_sizes = image_sizes_chunk,
-                        **_extra_vision_kwargs,
+                        **vision_chunk,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
@@ -1547,12 +2131,8 @@ def grpo_accumulated_loss(
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
                         attention_mask = attention_mask_chunk,
-                        pixel_values = pixel_values_chunk,
-                        image_grid_thw = image_grid_thw_chunk,
-                        pixel_attention_mask = pixel_attention_mask_chunk,
-                        image_sizes = image_sizes_chunk,
                         logits_to_keep = logits_to_keep + 1,
-                        **_extra_vision_kwargs,
+                        **vision_chunk,
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
@@ -1585,21 +2165,6 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
-    # Old non-efficient code path (dead).
-    new_logits = torch.matmul(new_hidden_states, lm_head.t())
-    new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-    old_logits = torch.matmul(old_hidden_states, lm_head.t())
-    old_logits = old_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
-    loss, completion_length, mean_kl = grpo_compute_loss(
-        old_logits,
-        new_logits,
-        completion_input_ids,
-        completion_mask,
-        trainer.beta,
-        advantages,
-    )
-    return loss, completion_length, mean_kl
-    pass
 pass
 RL_REPLACEMENTS["grpo_accumulated_loss"] = grpo_accumulated_loss
 

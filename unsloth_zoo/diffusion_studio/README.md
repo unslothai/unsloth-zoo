@@ -5,7 +5,7 @@ emitting tokens left to right, so llama.cpp serves it through a dedicated diffus
 the standard autoregressive `llama-server`. This package drives the optimized on-device visual decoder
 and exposes it as an OpenAI-compatible HTTP shim, so Unsloth Studio can serve DiffusionGemma as an
 ordinary llama.cpp model. The shim streams the committed answer text and a self-contained ```html
-artifact that replays the per-step denoising canvas; Studio auto-renders that for DiffusionGemma so you
+artifact that replays the per-step denoising canvas; Unsloth auto-renders that for DiffusionGemma so you
 watch the canvas resolve out of noise. It is an additive path - the autoregressive flow is untouched.
 
 ## What you need
@@ -36,7 +36,7 @@ python -m unsloth_zoo.diffusion_studio.shim \
 The binary also resolves from `DG_VISUAL_BIN` or from `PATH`. The model loads once; requests are
 serialized. It prints `... shim ready on http://127.0.0.1:8123`.
 
-## 2. Use it from Studio
+## 2. Use it from Unsloth
 
 Unsloth Studio detects a DiffusionGemma GGUF (`general.architecture = diffusion-gemma`) and launches this
 shim for it automatically, so selecting any quant of `unsloth/diffusiongemma-26B-A4B-it-GGUF` just works

@@ -33,13 +33,10 @@ def _install_shim():
     simulate_mlx_on_torch()
 
 
-# ---------------------------------------------------------------------------
-# 1. CCE end-to-end: forward + backward (autograd) match a numpy reference.
-# ---------------------------------------------------------------------------
 
 def _ce_reference(hidden, weight, targets, ignore_index=-100, softcap=0.0):
     """Numpy/torch reference for cross_entropy with optional logit softcap."""
-    logits = hidden @ weight.T  # (n, vocab)
+    logits = hidden @ weight.T
     if softcap > 0:
         logits = softcap * torch.tanh(logits / softcap)
     valid = targets != ignore_index
@@ -133,9 +130,6 @@ def test_cce_chunked_matches_unchunked():
                                    msg=f"mismatch at chunk_size={chunk_size}")
 
 
-# ---------------------------------------------------------------------------
-# 2. Dequantize: the affine helper round-trips correctly.
-# ---------------------------------------------------------------------------
 
 def test_dequantize_affine_roundtrip():
     """Construct a known-good packed weight and verify dequant."""
@@ -145,14 +139,14 @@ def test_dequantize_affine_roundtrip():
     # uint32, element 0 in the lowest bits.
     bits = 4
     group_size = 8
-    elements_per_word = 32 // bits  # = 8
+    elements_per_word = 32 // bits
 
     packed_value = 0
     for i, v in enumerate([0, 1, 2, 3, 4, 5, 6, 7]):
         packed_value |= v << (i * bits)
-    packed = torch.tensor([[packed_value]], dtype=torch.int32)  # shape (1, 1)
-    scales = torch.tensor([[2.0]])  # shape (1, 1) - per-group scale
-    biases = torch.tensor([[1.0]])  # shape (1, 1) - per-group bias
+    packed = torch.tensor([[packed_value]], dtype=torch.int32)
+    scales = torch.tensor([[2.0]])
+    biases = torch.tensor([[1.0]])
 
     out = dequantize_affine(packed, scales, biases, group_size=group_size, bits=bits)
     expected = torch.tensor([[0*2+1, 1*2+1, 2*2+1, 3*2+1, 4*2+1, 5*2+1, 6*2+1, 7*2+1]],
@@ -173,9 +167,6 @@ def test_dequantize_unsupported_mode_raises():
         )
 
 
-# ---------------------------------------------------------------------------
-# 3. mx.custom_function VJP cycle: forward + backward via torch.autograd.
-# ---------------------------------------------------------------------------
 
 def test_custom_function_forward_and_backward():
     """Define a simple square op with custom VJP; verify autograd traverses it."""
@@ -198,23 +189,16 @@ def test_custom_function_forward_and_backward():
     torch.testing.assert_close(x.grad, 2 * torch.tensor([1.0, 2.0, 3.0]))
 
 
-# ---------------------------------------------------------------------------
-# 4. mx.array isinstance contract that MLX trainer relies on.
-# ---------------------------------------------------------------------------
 
 def test_torch_tensor_is_mx_array():
     import mlx.core as mx
     t = torch.tensor([1.0, 2.0])
     assert isinstance(t, mx.array)
-    # Reverse contract: mx.array(...) returns torch.Tensor
     a = mx.array([1, 2, 3], dtype=mx.int32)
     assert isinstance(a, torch.Tensor)
     assert a.dtype == torch.int32
 
 
-# ---------------------------------------------------------------------------
-# 5. Tensor monkey-patches: .astype, .expand_dims, .at[].add
-# ---------------------------------------------------------------------------
 
 def test_tensor_astype():
     t = torch.tensor([1.0, 2.0])
@@ -233,7 +217,6 @@ def test_tensor_at_add_functional_update():
     t = torch.tensor([1.0, 2.0, 3.0, 4.0])
     out = t.at[1].add(10.0)
     torch.testing.assert_close(out, torch.tensor([1.0, 12.0, 3.0, 4.0]))
-    # Original unchanged
     torch.testing.assert_close(t, torch.tensor([1.0, 2.0, 3.0, 4.0]))
 
 
@@ -243,13 +226,9 @@ def test_tensor_at_set():
     torch.testing.assert_close(out, torch.tensor([99.0, 2.0, 3.0]))
 
 
-# ---------------------------------------------------------------------------
-# 6. multi-arg .transpose() = MLX permute semantics.
-# ---------------------------------------------------------------------------
 
 def test_transpose_multi_axis_is_permute():
     t = torch.zeros(2, 3, 4, 5)
-    # 4-axis transpose = full permute -> (5, 4, 3, 2)
     out = t.transpose(3, 2, 1, 0)
     assert out.shape == (5, 4, 3, 2)
 
@@ -259,3 +238,305 @@ def test_transpose_two_args_unchanged():
     t = torch.zeros(2, 3, 4)
     out = t.transpose(0, 1)
     assert out.shape == (3, 2, 4)
+
+
+
+def _stub_model(where=None, value=None):
+    class _Holder:
+        pass
+
+    model = _Holder()
+    if where == "attr":
+        model.logit_scale = value
+    elif where in ("args", "config"):
+        setattr(model, where, _Holder())
+        getattr(model, where).logit_scale = value
+    return model
+
+
+@pytest.mark.parametrize(
+    "where,value,expected",
+    [
+        (None, None, (None, False)),
+        ("attr", 0.0625, (None, False)),       # direct attr deliberately ignored
+        ("args", 0.0625, (0.0625, False)),     # mlx-lm cohere / cohere2_moe
+        ("config", 0.0625, (0.0625, False)),   # mlx-vlm aya_vision
+        ("args", 0.0, (0.0, False)),           # honored: matches model forward
+        ("args", 1.0, (None, False)),          # identity -> no-op path
+        ("args", True, (None, True)),          # bool is not a scale
+        ("args", 8.0, (None, True)),           # above supported range
+    ],
+)
+def test_get_logit_scale_normalization(where, value, expected):
+    from unsloth_zoo.mlx.utils import _get_logit_scale
+
+    assert _get_logit_scale(_stub_model(where, value)) == expected
+
+
+def _knobbed(_where="args", **attrs):
+    model = type("Model", (), {})()
+    setattr(model, _where, type("Holder", (), attrs)())
+    return model
+
+
+@pytest.mark.parametrize(
+    "attrs,status,expected",
+    [
+        # Each row mirrors its consuming forward's arithmetic and branch.
+        (dict(logits_scaling=4.0), "untied", (0.25, None)),  # granite divide
+        (dict(lm_head_multiplier=2.0, embedding_multiplier=1.0), "tied", (2.0, None)),
+        (dict(lm_head_multiplier=0.0390625, embedding_multiplier=5.656854249492381),
+         "tied", "outside the range"),  # Falcon-H1 defaults ~x0.0069 -> fallback
+        (dict(dim_model_base=16, hidden_size=32), "untied", (0.5, None)),  # minicpm, untied only
+        (dict(mup_width_multiplier=2.0), "untied", "cannot reproduce"),  # phi3small masked tail
+        (dict(logit_scale=None), "tied", "present but None"),  # malformed -> fail closed
+        (dict(logit_scale=0.0625, logits_scaling=4.0), "tied", "multiple output-transform knobs"),
+        # Muse Glimmer multiplies before the softcap, on either head status.
+        (dict(output_multiplier=0.19611613513818404), "untied",
+         (0.19611613513818404, None)),
+        (dict(output_multiplier=0.19611613513818404), "tied",
+         (0.19611613513818404, None)),
+        (dict(output_multiplier=1.0), "untied", (None, None)),  # identity -> no-op
+        (dict(output_multiplier=None), "untied", "present but None"),
+        (dict(output_multiplier=0.001), "untied", "outside the supported range"),
+        (dict(output_multiplier=0.5, logits_scaling=4.0), "untied",
+         "multiple output-transform knobs"),
+    ],
+)
+def test_detect_head_transform_rows(attrs, status, expected):
+    from unsloth_zoo.mlx.utils import _detect_head_transform
+
+    scale, problem = _detect_head_transform(_knobbed(**attrs), status)
+    if isinstance(expected, str):
+        assert problem is not None and expected in problem
+    else:
+        assert (scale, problem) == expected
+
+
+def test_output_multiplier_is_read_from_the_module_attribute():
+    """Muse Glimmer's forward reads the constructor copy, so `attr` counts."""
+    from unsloth_zoo.mlx.utils import _detect_head_transform
+
+    class _LanguageModel:
+        output_multiplier = 0.19611613513818404
+
+    assert _detect_head_transform(_LanguageModel(), "untied") == (
+        0.19611613513818404, None,
+    )
+
+
+def test_output_multiplier_drift_between_copy_and_config_fails_closed():
+    from unsloth_zoo.mlx.utils import _detect_head_transform
+
+    class _LanguageModel:
+        output_multiplier = 0.25
+
+        class args:
+            output_multiplier = 0.5
+
+    scale, problem = _detect_head_transform(_LanguageModel(), "untied")
+    assert scale is None
+    assert problem is not None and "inconsistent" in problem
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (30.0, (30.0, None)),
+        (None, (0.0, None)),   # falsy: the forward skips the cap
+        (-5.0, "positive"),
+        (True, "not a finite real scalar"),
+    ],
+)
+def test_softcap_alias_value_domain(value, expected):
+    from unsloth_zoo.mlx.utils import _detect_logit_softcap
+
+    softcap, problem = _detect_logit_softcap(_knobbed(logits_soft_cap=value))
+    if isinstance(expected, str):
+        assert problem is not None and expected in problem
+    else:
+        assert (softcap, problem) == expected
+
+
+def test_dead_tie_flag_fails_closed_to_unknown():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    head = lambda: nn.Linear(32, 96, bias=False)
+    # Qwen2-MoE hazard: True flag never referenced + unconditional lm_head call.
+    desc = U.describe_output_head(
+        _lm(nn, args_flag=True, head=head(), call_src="calls_lm_head"))
+    assert desc.status == "unknown" and desc.candidate_path == "lm_head"
+    assert U._cce_head_ineligibility(desc) is not None
+    # A referenced flag keeps tied (flag_ref pins the `not references_flag` conjunct).
+    for src in ("flag_guarded", "flag_ref_calls_lm_head"):
+        d = U.describe_output_head(_lm(nn, args_flag=True, head=head(), call_src=src))
+        assert d.status == "tied" and d.path == "model.embed_tokens"
+    assert U.describe_output_head(
+        _lm(nn, args_flag=False, head=head(), call_src="calls_lm_head")).status == "untied"
+    assert U.describe_output_head(
+        _lm(nn, args_flag=True, emb_name="tok_embeddings")).status == "tied"
+    # from_dict does not coerce, so a non-bool tie flag is read by truthiness like
+    # the forward: 1 / "true" are tied, "" stays untied, never a fall-through.
+    for truthy in (1, "true"):
+        assert U.describe_output_head(
+            _lm(nn, args_flag=truthy, head=head(), call_src="flag_guarded")).status == "tied"
+    assert U.describe_output_head(
+        _lm(nn, args_flag="", head=head(), call_src="calls_lm_head")).status == "untied"
+    cfg = _lm(nn, head=head(), call_src="calls_lm_head")
+    cfg.model, cfg.config = nn.Module(), type("C", (), {"tie_word_embeddings": True})()
+    assert U.describe_output_head(cfg).status == "unknown"
+
+
+def test_is_lm_head_trainable_follows_descriptor_path():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    # Alt-named tied embedding (InternLM2 tok_embeddings) trains under full
+    # fine-tuning: name segments used to miss it and drop the head gradient.
+    assert U._is_lm_head_trainable(
+        _lm(nn, tied_flag=True, emb_name="tok_embeddings")) is True
+    # Property-backed wrapper: language_model returns self, so the descriptor access
+    # path is not a registered prefix and module identity must find the head instead.
+    class _PropWrapped(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = nn.Linear(32, 96, bias=False)
+
+        @property
+        def language_model(self):
+            return self
+
+    assert U._is_lm_head_trainable(_PropWrapped()) is True
+    unresolved = _lm(nn)
+    unresolved.freeze()
+    assert U._is_lm_head_trainable(unresolved) is False
+
+
+def test_backboneless_text_model_selects_baseline_fallback(capsys):
+    # nanochat shape (stack under .transformer, no separable .model): the
+    # biased head would trip the eligibility gate, so seeing ONLY the topology
+    # notice pins topology as decided first, at construction not first use.
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+
+    class _BackbonelessLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.lm_head = nn.Linear(32, 96, bias=True)
+
+    fn = U.make_cce_loss_fn(_BackbonelessLM())
+    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
+    out = capsys.readouterr().out
+    assert "separable hidden-state backbone" in out and "output head" not in out
+
+
+@pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale",
+                                  "masked_tail_knob"])
+def test_vlm_cce_fallbacks_are_marked(case):
+    from unsloth_zoo.mlx.utils import make_vlm_cce_loss_fn
+
+    from unsloth_zoo.mlx import utils as U
+
+    model = _stub_model()
+    if case in ("invalid_scale", "masked_tail_knob"):
+        lm = _lm(U.nn, head=U.nn.Linear(32, 96, bias=False))
+        lm.args = type("A", (), {})()
+        if case == "invalid_scale":
+            lm.args.logit_scale = float("nan")
+        else:
+            lm.args.mup_width_multiplier = 2.0
+        model.language_model = lm
+    else:
+        model.language_model = _stub_model("args", 0.0625)
+        if case != "no_backbone":
+            model.language_model.model = object()  # separable backbone present
+    if case != "no_embeddings":
+        model.get_input_embeddings = lambda: None
+    warns = case in ("no_embeddings", "no_backbone")
+    with pytest.warns(UserWarning) if warns else _no_warning():
+        fn = make_vlm_cce_loss_fn(model)
+    assert getattr(fn, "_unsloth_cce_backend", "") == "baseline-fallback"
+
+
+def _no_warning():
+    import contextlib
+
+    return contextlib.nullcontext()
+
+
+_UNSET = object()
+
+
+def _lm(nn, tied_flag=_UNSET, args_flag=_UNSET, head=None, emb_name="embed_tokens",
+        alt=None, call_src="plain"):
+    class _Backbone(nn.Module):
+        pass
+
+    backbone = _Backbone()
+    setattr(backbone, emb_name, nn.Embedding(96, 32))
+    if alt is not None:
+        setattr(backbone, alt, nn.Linear(32, 96, bias=False))
+
+    if call_src == "as_linear":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return self.model.embed_tokens.as_linear(x)
+    elif call_src == "calls_lm_head":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return self.lm_head(x)
+    elif call_src == "flag_guarded":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                if self.args.tie_word_embeddings:
+                    return self.model.embed_tokens.as_linear(x)
+                return self.lm_head(x)
+    elif call_src == "flag_ref_calls_lm_head":
+        class _LM(nn.Module):
+            def __call__(self, x):
+                _ = self.args.tie_word_embeddings
+                return self.lm_head(x)
+    else:
+        class _LM(nn.Module):
+            def __call__(self, x):
+                return x
+
+    lm = _LM()
+    lm.model = backbone
+    if tied_flag is not _UNSET:
+        lm.tie_word_embeddings = tied_flag
+    if args_flag is not _UNSET:
+        lm.args = type("A", (), {})()
+        lm.args.tie_word_embeddings = args_flag
+    if head is not None:
+        lm.lm_head = head
+    return lm
+
+
+def test_describe_output_head_evidence_ladder():
+    from unsloth_zoo.mlx import utils as U
+
+    nn = U.nn
+    rows = [
+        (_lm(nn, head=nn.Linear(32, 96, bias=False)), "untied", "lm_head", None),
+        # Helium-style dead lm_head + True flag -> tied via embedding
+        (_lm(nn, args_flag=True, head=nn.Linear(32, 96, bias=False)),
+         "tied", "model.embed_tokens", None),
+        # flag False blocks source evidence; alt head -> candidate
+        (_lm(nn, tied_flag=False, alt="output", call_src="as_linear"),
+         "unknown", None, "model.output"),
+        # Conflicting flags fail closed; the head surfaces as an exclusion
+        # candidate (identity, not proof of tying)
+        (_lm(nn, tied_flag=True, args_flag=False, head=nn.Linear(32, 96, bias=False)),
+         "unknown", None, "lm_head"),
+        # No flag: unconditional as_linear source evidence -> tied
+        (_lm(nn, call_src="as_linear"), "tied", "model.embed_tokens", None),
+        # GPT-NeoX embed_in/embed_out shapes -> alt-name candidate
+        (_lm(nn, emb_name="embed_in", alt="embed_out"), "unknown", None, "model.embed_out"),
+    ]
+    for i, (model, status, path, cand) in enumerate(rows):
+        d = U.describe_output_head(model)
+        assert (d.status, d.path, d.candidate_path) == (status, path, cand), (i, d)

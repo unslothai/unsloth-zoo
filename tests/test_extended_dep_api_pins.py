@@ -36,10 +36,8 @@ from typing import Iterable
 import pytest
 
 
-# ---------------------------------------------------------------------------
 # Shared helpers (intentional copies of test_zoo_source_upstream_refs.py
 # helpers so this file is grep-self-contained).
-# ---------------------------------------------------------------------------
 
 
 def _resolve(dotted: str) -> object:
@@ -96,9 +94,7 @@ def _require_module(name: str):
     return pytest.importorskip(name)
 
 
-# ===========================================================================
 # accelerate
-# ===========================================================================
 
 
 def test_accelerate_init_empty_weights_signature_shape():
@@ -152,9 +148,7 @@ def test_accelerate_utils_imports_module_surface():
     ])
 
 
-# ===========================================================================
 # safetensors
-# ===========================================================================
 
 
 def test_safetensors_safe_open_top_level_exists():
@@ -240,9 +234,7 @@ def test_safetensors_torch_load_file_present():
     _resolve("safetensors.torch.load_file")
 
 
-# ===========================================================================
 # bitsandbytes
-# ===========================================================================
 
 
 def test_bnb_top_level_import_and_version_attr():
@@ -367,9 +359,7 @@ def test_bnb_nn_modules_module_path_present():
     _resolve("bitsandbytes.nn.modules")
 
 
-# ===========================================================================
 # triton
-# ===========================================================================
 
 
 def test_triton_top_level_version_attr():
@@ -444,9 +434,7 @@ def test_triton_jit_decorator_present():
         )
 
 
-# ===========================================================================
 # datasets
-# ===========================================================================
 
 
 def test_datasets_load_dataset_top_level():
@@ -524,9 +512,7 @@ def test_datasets_torchcodec_audio_decoder_present_or_absent_cleanly():
         )
 
 
-# ===========================================================================
 # huggingface_hub
-# ===========================================================================
 
 
 def test_hf_hub_top_level_save_path_symbols():
@@ -685,9 +671,7 @@ def test_hf_hub_hf_hub_download_signature_local_dir_and_repo_id():
         )
 
 
-# ===========================================================================
 # xformers
-# ===========================================================================
 # Zoo has no direct xformers imports; only re-exports if installed.
 # transformers.modeling_utils probes xformers.ops at attention-kernel
 # selection time -- a regression in xformers' module layout silently

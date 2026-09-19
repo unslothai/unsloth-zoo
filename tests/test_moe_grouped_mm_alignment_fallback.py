@@ -1,6 +1,16 @@
 import pytest
 import torch
 
+from unsloth_zoo.temporary_patches import moe_utils as M
+
+
+@pytest.fixture(autouse=True)
+def _pretend_the_kernel_is_supported(monkeypatch):
+    """These test kernel ERROR handling, so the kernel has to be reached: the new
+    capability early-return in `_grouped_mm_with_backward_fix` always fires on CPU-only
+    CI, so the monkeypatched kernel below would never be called."""
+    monkeypatch.setattr(M, "_check_torch_grouped_mm_supported", lambda: True)
+
 
 def test_grouped_mm_alignment_fallback_is_differentiable(monkeypatch):
     from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix

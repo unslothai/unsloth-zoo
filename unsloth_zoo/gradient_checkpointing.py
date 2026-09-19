@@ -19,10 +19,15 @@ import numpy as np
 from typing import Union, Optional, List, Any, Callable, Tuple
 from contextlib import contextmanager, nullcontext
 import os
+import functools
+import inspect
 import warnings
 import gc
 import threading
 from .utils import _get_dtype, Version
+# Re-exported under its old name: it lives in integrated_device.py so the import-time
+# allocator block can share the topic without importing torch.
+from .integrated_device import _any_device_integrated
 from .device_type import (
     is_hip,
     get_device_type,
@@ -55,6 +60,101 @@ INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
+
+
+@functools.cache
+def _double_buffer_disabled():
+    # Cached: computed once on the first GC init (after device selection), never at
+    # import, so it does not probe the GPU before the caller picks its device. Double
+    # buffering overlaps the H2D offload copy with compute, but on unified-memory devices
+    # (AMD APUs gfx1150/1151, NVIDIA GB10) there is no transfer to hide: pure overhead
+    # (~2x slower, no memory saved). UNSLOTH_DISABLE_DOUBLE_BUFFER=0/1 forces it; else
+    # disable when any visible device is integrated.
+    env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
+    if env is not None: return env == "1"
+    if DEVICE_TYPE not in ("cuda", "hip"): return False
+    return _any_device_integrated()
+
+
+# Pinned (page-locked) host memory is a far smaller budget than VRAM or RAM, and
+# exhausting it looks like a bare "CUDA error: out of memory" on an empty GPU. WSL2
+# caps it near 1-2GB and refuses single pinned allocations past a few MB, so fall
+# back to pageable memory (slower, no compute overlap) instead of dying. See
+# unslothai/unsloth 338, 1552, 1744, 1797 and https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications
+PINNED_MEMORY_AVAILABLE = True
+_WARNED_ABOUT_PINNED_MEMORY = False
+
+
+def _pinned_memory_disabled():
+    return os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1"
+
+
+def _is_host_alloc_oom(exception):
+    # torch >= 2.9 raises AcceleratorError, older torch RuntimeError; both subclass RuntimeError.
+    text = str(exception).lower()
+    return ("out of memory" in text) or ("cudaerrormemoryallocation" in text)
+
+
+def _warn_pinned_unavailable(detail):
+    global PINNED_MEMORY_AVAILABLE, _WARNED_ABOUT_PINNED_MEMORY
+    PINNED_MEMORY_AVAILABLE = False
+    if _WARNED_ABOUT_PINNED_MEMORY: return
+    _WARNED_ABOUT_PINNED_MEMORY = True
+    print(
+        "Unsloth: Could not allocate pinned (page-locked) host memory for gradient "
+        "checkpointing offload, so pageable host memory will be used instead. "
+        "Training continues and results are unchanged, but the offload copies no "
+        "longer overlap with compute, so each step is somewhat slower.\n"
+        f"Unsloth: The allocator reported: {detail}\n"
+        "Unsloth: This is normal under WSL2, which caps pinned memory per process. "
+        "Set UNSLOTH_DISABLE_PINNED_MEMORY=1 to skip pinning from the start."
+    )
+
+
+# Tensor.is_pinned() is a cudaPointerGetAttributes driver query, not a cached flag,
+# and the two offload copies run once per checkpointed layer per micro batch. Cache
+# the answer on the buffer itself instead of in a list parallel to CPU_BUFFERS: a
+# parallel list can drift out of step with the slot it describes and claim a pageable
+# buffer is pinned, which would issue an async copy out of pageable memory. Readers
+# use getattr(..., False), so an unmarked buffer only costs a synchronous copy.
+HOST_PINNED_ATTR = "_unsloth_is_pinned"
+
+
+def _mark_host_buffer(buffer):
+    """Record whether `buffer` is page-locked. Call wherever a host buffer is made or regrown."""
+    try:
+        pinned = buffer.is_pinned()
+    except Exception:
+        pinned = False
+    try:
+        setattr(buffer, HOST_PINNED_ATTR, pinned)
+    except AttributeError:
+        pass  # exotic tensor subclass; readers fall back to False
+    return buffer
+
+
+def _new_host_buffer(numel, dtype):
+    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled()):
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+    try:
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e): raise
+        _warn_pinned_unavailable(e)
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+
+
+def _grow_host_buffer(buffer, new_size):
+    """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
+    if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
+    try:
+        buffer.resize_(new_size)
+        return _mark_host_buffer(buffer)
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+        _warn_pinned_unavailable(e)
+        # Pinning is gone for this slot, so the cached flag has to flip with it.
+        return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
 @contextmanager
@@ -191,6 +291,42 @@ def _gradient_checkpoint_recompute_marker():
         _GC_RECOMPUTE_TLS.active = previous
 
 
+def _detach_checkpoint_args(args):
+    """Detach the differentiable tensors in ``args`` for a reentrant recompute.
+
+    ``ctx.args`` are the tensors as they were handed to ``Function.apply``; a
+    Python ``autograd.Function`` does not strip their ``grad_fn``. Re-running the
+    block on them under ``torch.enable_grad()`` and calling
+    ``torch.autograd.backward`` on the result therefore walks straight into the
+    history *behind* those tensors from inside this backward - a nested backward
+    over a graph the outer engine still intends to visit, which frees it early
+    ("Trying to backward through the graph a second time") and delivers the
+    gradient as a side effect rather than as this Function's output.
+
+    Detaching stops the traversal at the recompute boundary, exactly as
+    ``UnslothCheckpointFunction`` and torch's own reentrant checkpoint do, and
+    the caller returns the collected ``.grad`` so the engine keeps propagating.
+
+    Returns ``(recompute_args, grad_holders)`` where ``grad_holders[i]`` is the
+    detached tensor to read a gradient off, or ``None`` for inputs that take no
+    gradient.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    recompute_args = []
+    grad_holders   = []
+    for arg in args:
+        if torch.is_tensor(arg) and arg.requires_grad:
+            detached = arg.detach()
+            detached.requires_grad_(True)
+            recompute_args.append(detached)
+            grad_holders  .append(detached)
+        else:
+            recompute_args.append(arg)
+            grad_holders  .append(None)
+    return recompute_args, grad_holders
+pass
+
+
 class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
     """
     All Unsloth Zoo code licensed under LGPLv3
@@ -216,10 +352,22 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
+        recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
-            (output,) = ctx.forward_function(hidden_states, *ctx.args)
+            output = ctx.forward_function(hidden_states, *recompute_args)
+        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
+        # that return the tensor itself (Qwen2-VL's vision block, and every
+        # transformers block since the tuple returns were retired) used to raise
+        # `ValueError: too many values to unpack` here, because forward() stored
+        # whatever the layer returned while backward() insisted on a 1-tuple.
+        if isinstance(output, tuple):
+            (output,) = output
         torch.autograd.backward(output, dY)
-        return (None, hidden_states.grad,) + (None,)*len(ctx.args)
+        # Gradients for the extra inputs are returned to the engine instead of
+        # being left to accumulate as a side effect of the nested backward.
+        return (None, hidden_states.grad,) + tuple(
+            None if holder is None else holder.grad for holder in grad_holders
+        )
     pass
 pass
 
@@ -246,10 +394,22 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
+        recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
-            (output,) = ctx.forward_function(hidden_states, *ctx.args)
+            output = ctx.forward_function(hidden_states, *recompute_args)
+        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
+        # that return the tensor itself (Qwen2-VL's vision block, and every
+        # transformers block since the tuple returns were retired) used to raise
+        # `ValueError: too many values to unpack` here, because forward() stored
+        # whatever the layer returned while backward() insisted on a 1-tuple.
+        if isinstance(output, tuple):
+            (output,) = output
         torch.autograd.backward(output, dY)
-        return (None, hidden_states.grad,) + (None,)*len(ctx.args)
+        # Gradients for the extra inputs are returned to the engine instead of
+        # being left to accumulate as a side effect of the nested backward.
+        return (None, hidden_states.grad,) + tuple(
+            None if holder is None else holder.grad for holder in grad_holders
+        )
     pass
 pass
 
@@ -260,9 +420,139 @@ pass
 # pass
 
 
+# Keywords that belong to the checkpoint machinery itself rather than to the
+# wrapped function. The Unsloth reentrant checkpointers below never honoured
+# them, and that is deliberately left as-is so callers passing only these see
+# exactly today's behaviour. What must NOT happen is binding one of them onto
+# the wrapped block: the block has no such parameter and raises TypeError, so a
+# call that works against unpatched torch would start failing the moment Unsloth
+# swaps torch.utils.checkpoint.checkpoint out from under it.
+#
+# `early_stop` is the one that was missing: torch grew it as a per-call keyword
+# (present on 2.10 and 2.13 here) and documents it as ignored when
+# use_reentrant = True - which is exactly what these shims force - so dropping
+# it is the faithful behaviour.
+_TORCH_CHECKPOINT_KEYWORDS_LITERAL = frozenset({
+    "preserve_rng_state",
+    "context_fn",
+    "determinism_check",
+    "debug",
+    "early_stop",
+})
+
+
+def _torch_checkpoint_keywords():
+    """The literal set above, widened by whatever torch's own ``checkpoint``
+    actually declares.
+
+    Read off the live signature so a keyword a later torch adds (the same way it
+    added ``early_stop``) is dropped rather than bound onto the block. Falls back
+    to the literal set if the signature cannot be read, and unions rather than
+    replaces so a signature already replaced by one of the shims below can only
+    ever widen the set. ``use_reentrant`` is excluded because every shim names it
+    explicitly, so it never reaches ``**kwargs``."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    names = set(_TORCH_CHECKPOINT_KEYWORDS_LITERAL)
+    try:
+        checkpoint = getattr(
+            torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None,
+        ) or torch.utils.checkpoint.checkpoint
+        for name, parameter in inspect.signature(checkpoint).parameters.items():
+            if parameter.kind is inspect.Parameter.KEYWORD_ONLY:
+                names.add(name)
+    except Exception:
+        pass
+    names.discard("use_reentrant")
+    return frozenset(names)
+
+
+_TORCH_CHECKPOINT_KEYWORDS = _torch_checkpoint_keywords()
+
+
+class _KeywordArgumentCall:
+    """Re-form keyword arguments from trailing positional arguments.
+
+    ``functools.partial(function, **extra)`` is the obvious way to turn a
+    keyword call into the positional-only call an ``autograd.Function`` can
+    make, but a tensor closed over that way is invisible to autograd: it never
+    appears in the Function's input list, so the Function cannot return a
+    gradient for it. The reentrant checkpointers re-run the wrapped block under
+    ``torch.enable_grad()`` and then call ``torch.autograd.backward`` on the
+    recomputed output, so a captured non-leaf tensor is walked *through* - its
+    own history is traversed inside the nested backward. When that history is
+    shared (the same tensor handed to several checkpointed layers, or also
+    feeding the loss) the first nested backward frees it and the next traversal
+    raises ``Trying to backward through the graph a second time``; when it does
+    not raise, the gradient arrives as a side effect of the nested call instead
+    of as a Function output.
+
+    So tensors are passed as ordinary positional inputs to the Function - which
+    is what makes them visible to autograd - and this callable puts them back
+    into keyword position, taking them off the tail of the positional list.
+    Non-tensor keywords have no gradient and stay bound directly.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    __slots__ = ("function", "keys", "constants",)
+
+    def __init__(self, function, keys, constants):
+        self.function  = function
+        self.keys      = keys
+        self.constants = constants
+    pass
+
+    def __call__(self, *args):
+        split = len(args) - len(self.keys)
+        kwargs = dict(self.constants)
+        kwargs.update(zip(self.keys, args[split:]))
+        return self.function(*args[:split], **kwargs)
+    pass
+pass
+
+
+def _bind_checkpoint_kwargs(function, kwargs):
+    """Bind leftover keyword arguments into ``function``.
+
+    ``checkpoint(fn, *args, **kwargs)`` means "call ``fn(*args, **kwargs)``";
+    that is what torch's non-reentrant path does. The Unsloth checkpointers are
+    ``torch.autograd.Function`` subclasses and can only forward positionals, so
+    the keywords are bound into the callable instead - the same trick
+    ``transformers.modeling_layers.GradientCheckpointingLayer.__call__`` uses.
+
+    Before this, ``unsloth_gradient_checkpoint`` /
+    ``unsloth_offloaded_gradient_checkpoint`` dropped them silently (the wrapped
+    block then ran with different arguments and no diagnostic) while
+    ``unsloth_checkpoint`` raised ``Unexpected keyword arguments``. Binding makes
+    all three agree and never turns a working call into an error.
+
+    Returns ``(callable, extra_positional_args)``. The extra arguments are the
+    keyword values that require grad; the caller must append them to the
+    Function's positional inputs so autograd can see them, and
+    ``_KeywordArgumentCall`` moves them back into keyword position before the
+    block is called. Returns ``function`` unchanged with an empty tuple when
+    there is nothing to bind, so the ordinary empty-kwargs path allocates
+    nothing and the no-tensor path keeps the cheap ``functools.partial``.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not kwargs:
+        return function, ()
+    extra = {k : v for k, v in kwargs.items() if k not in _TORCH_CHECKPOINT_KEYWORDS}
+    if not extra:
+        return function, ()
+    keys = tuple(
+        k for k, v in extra.items() if torch.is_tensor(v) and v.requires_grad
+    )
+    if not keys:
+        return functools.partial(function, **extra), ()
+    constants = {k : v for k, v in extra.items() if k not in keys}
+    return _KeywordArgumentCall(function, keys, constants), \
+        tuple(extra[k] for k in keys)
+pass
+
+
 @torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
-    return Unsloth_Gradient_Checkpointer.apply(function, *args)
+    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    return Unsloth_Gradient_Checkpointer.apply(function, *args, *tensor_args)
 pass
 
 
@@ -409,15 +699,25 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             major_version, minor_version = torch.cuda.get_device_capability()
             SUPPORTS_BFLOAT16 = (major_version >= 8)
         elif DEVICE_TYPE == "hip":
-            SUPPORTS_BFLOAT16 = True
+            # Ask rather than assume: RDNA 1/2 (gfx101x, gfx103x) have no native bf16,
+            # so Triton picks a dot intrinsic LLVM cannot lower and the process dies
+            # with no Python exception (unslothai/unsloth issue 7922). Unpatched ROCm
+            # still answers True here, so this is inert until unsloth patches the probe.
+            SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
             SUPPORTS_BFLOAT16 = True
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
+    # Re-probe: an earlier model in this process may have tripped the fallback. Clear
+    # the warning latch too, otherwise a second model falls back silently.
+    global PINNED_MEMORY_AVAILABLE
+    global _WARNED_ABOUT_PINNED_MEMORY
+    PINNED_MEMORY_AVAILABLE = True
+    _WARNED_ABOUT_PINNED_MEMORY = False
     with _no_inference_mode():
-        for i in range(200):
-            x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
+        for i in range(INITIAL_CPU_BUFFER_COUNT):
+            x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
             CPU_BUFFERS.append(x)
     pass
 
@@ -427,8 +727,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     try:
         with _no_inference_mode():
             GPU_BUFFERS = tuple([torch.empty(INITIAL_GPU_BUFFER_SIZE, dtype = dtype, device = f"{DEVICE_TYPE_TORCH}:{i}") for i in range(n_gpus)])
-        # Double buffering: try to allocate buffer B (can be disabled via env var)
-        if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
+        # Double buffering: try to allocate buffer B (auto-off on unified memory, or via env var)
+        if _double_buffer_disabled():
             GPU_BUFFERS_B = None
             USE_DOUBLE_BUFFER = False
             BUFFER_EVENTS_A = None
@@ -511,10 +811,25 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         ctx.tensor_indices = []
         tensor_inputs = []
         ctx._requires_gradient = False
+        # Read unconditionally in backward, so it needs a value on every path
+        # that never takes the offload branch below.
+        ctx._saved_metadata = (None, None, None, None, None, None, None,)
         use_gpu_buffer = False
 
         for i, arg in enumerate(args):
             if torch.is_tensor(arg):
+                # ANY differentiable input means this Function has a gradient to
+                # produce, exactly as torch's own reentrant CheckpointFunction
+                # (which saves unconditionally) does. Keying this off input zero
+                # alone made backward bail out early - and it is reached, since
+                # autograd only calls backward when some input requires grad -
+                # so the engine got a single None instead of one gradient per
+                # input and raised `returned an incorrect number of gradients`.
+                # A frozen first activation next to a differentiable later one
+                # is ordinary: an untrained embedding feeding layer 0 alongside
+                # a learned positional/query tensor, or a tensor keyword routed
+                # positionally by _bind_checkpoint_kwargs.
+                if arg.requires_grad: ctx._requires_gradient = True
 
                 if i == 0 and arg.requires_grad:
                     global FIRST_PASS
@@ -528,7 +843,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    ctx._requires_gradient = True
                     new_size = arg.numel()
 
                     global MINIMUM_SIZE
@@ -574,13 +888,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
-                                x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
+                                x = _new_host_buffer(new_size, arg.dtype)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
                         shape = arg.shape
-                        if new_size > x.numel(): x.resize_(new_size)
+                        if new_size > x.numel():
+                            with _no_inference_mode():
+                                x = _grow_host_buffer(x, new_size)
+                            # Backward reads this slot by index, so store the replacement back.
+                            CPU_BUFFERS[CPU_INDEX] = x
                         if new_size > GPU_BUFFER.numel():
                             try:
                                 GPU_BUFFER.resize_(new_size)
@@ -612,13 +930,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFERS_B = None
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
 
+                        # Read the cached flag off the slot itself, before the view is
+                        # taken: a view is a fresh object and does not carry the attribute.
+                        host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
-                            x.copy_(arg, non_blocking = True)
+                            # Only a pinned destination gives a genuinely async copy.
+                            x.copy_(arg, non_blocking = host_is_pinned)
 
                         global NEXT_BUFFER_SLOT
                         buffer_slot = NEXT_BUFFER_SLOT[device_index]
@@ -685,7 +1007,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             else:
                 buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
 
-            x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
+            host_buffer = CPU_BUFFERS[CPU_INDEX]
+            host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
+            x = host_buffer[:new_size].view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
@@ -698,7 +1022,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
             with torch_gpu_stream(EXTRA_STREAM):
-                buffer.copy_(x, non_blocking = True)
+                buffer.copy_(x, non_blocking = host_is_pinned)
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
@@ -847,9 +1171,16 @@ def unsloth_checkpoint(
     # Hack to mix *args with **kwargs in a python 2.7-compliant way
     preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs and use_reentrant:
-        raise ValueError(
-            "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
-        )
+        # torch raises here, but only because *the caller* asked for the
+        # reentrant path. We force use_reentrant = True above, so raising would
+        # turn a call that works on unpatched torch (non-reentrant checkpoint
+        # forwards **kwargs straight to `function`) into a crash the moment
+        # Unsloth's smart gradient checkpointing is installed. Bind them into
+        # the callable instead - same observable behaviour, no keyword reaches
+        # UnslothCheckpointFunction. See _bind_checkpoint_kwargs.
+        function, extra_args = _bind_checkpoint_kwargs(function, kwargs)
+        args = args + extra_args
+        kwargs = {}
 
     if use_reentrant:
         if context_fn is not noop_context_fn or debug is not False:
@@ -980,6 +1311,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
         if i < INITIAL_CPU_BUFFER_COUNT:
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(INITIAL_CPU_BUFFER_SIZE)
+                # resize_ keeps the object and its pinning, but re-read rather than assume.
+                _mark_host_buffer(CPU_BUFFERS[i])
         else:
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(0)
@@ -1009,7 +1342,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
             NEXT_BUFFER_SLOT[i] = 0
 
     # Reset double buffering if buffer B still exists, or try to re-allocate
-    if os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER", "0") == "1":
+    if _double_buffer_disabled():
         if GPU_BUFFERS_B is not None:
             for i in range(len(GPU_BUFFERS_B)):
                 if GPU_BUFFERS_B[i] is not None and hasattr(GPU_BUFFERS_B[i], "resize_"):
@@ -1047,9 +1380,13 @@ pass
 @torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     global CPU_BUFFERS
-    if len(CPU_BUFFERS) == 0:
+    # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
+    # to None, which is the state this shim normally starts from, and len(None) raises.
+    if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
-    return UnslothCheckpointFunction.apply(function, *args)
+    preserve = kwargs.pop("preserve_rng_state", True)
+    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

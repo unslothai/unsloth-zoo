@@ -75,7 +75,6 @@ def test_resets_fire_before_sleep_in_order(vllm_utils, monkeypatch):
 
     fake.LLM().sleep()
 
-    # mm + encoder resets, then gc.collect, then the original sleep, in order.
     assert calls == ["reset_mm_cache", "reset_encoder_cache",
                      "gc_collect", "orig_sleep"]
 
@@ -92,7 +91,6 @@ def test_encoder_cache_absent_is_noop(vllm_utils, monkeypatch):
 
 
 def test_text_model_no_caches_is_clean_noop(vllm_utils, monkeypatch):
-    # No reset_mm_cache, no llm_engine -> only gc.collect + original sleep.
     calls = []
     fake = _make_fake_vllm(calls, has_mm=False, has_encoder=False,
                            has_engine=False)
@@ -110,7 +108,6 @@ def test_raising_reset_is_swallowed_and_sleep_still_runs(vllm_utils, monkeypatch
 
     fake.LLM().sleep()  # the RuntimeError from reset_mm_cache must be swallowed
 
-    # mm reset raised (logged+skipped), encoder still fires, sleep still runs.
     assert calls == ["reset_mm_cache", "reset_encoder_cache",
                      "gc_collect", "orig_sleep"]
 
@@ -123,7 +120,6 @@ def test_double_patch_is_idempotent(vllm_utils, monkeypatch):
     wrapped_once = fake.LLM.sleep
     assert getattr(fake.LLM, "_unsloth_reset_caches_on_sleep", False) is True
 
-    # Second application must early-return, leaving the wrapper untouched.
     vllm_utils.patch_vllm_reset_caches_on_sleep()
     assert fake.LLM.sleep is wrapped_once
 
