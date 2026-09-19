@@ -1776,6 +1776,20 @@ MAX_CONVERSION_PACKAGE_FILES = 256
 # directory was still traversed, once per export through the cache key. Generous
 # next to any real converter package, which is dozens of entries.
 MAX_CONVERSION_PACKAGE_ENTRIES = 4096
+# And a bound on how many places get that allowance. Every root directory became
+# a location of its own, with no limit on how many there could be, so a tree with
+# thousands of top-level directories multiplied the per-location budget by
+# thousands. llama.cpp master has about twenty. Crossing this is not reported
+# separately: a root that wide trips the root location's own entry budget, which
+# already says the tree is too big to read.
+MAX_SCAN_LOCATIONS = 64
+
+# The patched converter this module writes, which for the package layout lands in
+# the llama.cpp root. It is this scan's own output, not an input: keying on it
+# meant every cache miss rewrote it, changed its mtime, and missed again on the
+# next call, so with the scan disabled each export re-fetched and re-patched the
+# converter forever.
+GENERATED_CONVERTER_PREFIX = "unsloth_convert_hf_to_gguf"
 
 # No single module is read whole. The converter's own entrypoint is tens of KB and
 # the scanner caps its input at 8 MiB anyway, so a module past this is one the
@@ -1916,6 +1930,8 @@ def _scanned_locations(llama_cpp_dir):
                 # unscanned. Measured against llama.cpp master, the largest of
                 # them holds 1432 entries and 46 modules, well inside both bounds.
                 locations.append(ScanLocation(entry.name, entry.path, True, False))
+                if len(locations) >= MAX_SCAN_LOCATIONS:
+                    break
     except OSError:
         pass
     return locations
@@ -1982,7 +1998,10 @@ def _counts_as_a_module(root, name):
     Decided here rather than after the walk because the cap stops the walk, so a
     file that does not count must not consume the budget either.
     """
-    suffix = os.path.splitext(name)[1].lower()
+    stem, suffix = os.path.splitext(name)
+    suffix = suffix.lower()
+    if stem.startswith(GENERATED_CONVERTER_PREFIX):
+        return False        # this module's own output, not something it reads
     if suffix == ".py" or suffix in NATIVE_MODULE_SUFFIXES:
         return True
     if suffix not in BYTECODE_SUFFIXES:

@@ -1746,6 +1746,53 @@ def test_a_pinned_checkout_is_reported_but_never_rewritten(tmp_path, monkeypatch
     assert not theirs.exists()
 
 
+def test_the_key_ignores_the_converter_this_module_writes(tmp_path, monkeypatch):
+    """The patched converter lands in the root, which is now a keyed location.
+
+    It is this scan's own output rather than an input, so keying on it meant each
+    cache miss rewrote it, moved its mtime and missed again on the next call. With
+    the scan disabled the key is (mtime, size), so every export re-fetched and
+    re-patched the converter for ever.
+    """
+    llama_cpp = _load("llama_cpp_generated_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    generated = root / f"{llama_cpp.GENERATED_CONVERTER_PREFIX}.py"
+    generated.write_text("# patched\n", encoding = "utf-8")
+
+    for disabled in ("1", ""):
+        if disabled:
+            monkeypatch.setenv("UNSLOTH_DISABLE_CONVERTER_SCAN", disabled)
+        else:
+            monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+
+        before = llama_cpp._conversion_sibling_info(str(root))
+        # Rewritten exactly as the patcher rewrites it, on every cache miss.
+        generated.write_text("# patched\n", encoding = "utf-8")
+        os.utime(generated, ns = (0, 0))
+        assert llama_cpp._conversion_sibling_info(str(root)) == before, (
+            f"the generated converter moved the key (disabled={disabled!r})"
+        )
+
+    # And a real root module still moves it, so the exclusion is not a blanket one.
+    (root / "gguf.py").write_text("WHO = 'shadow'\n", encoding = "utf-8")
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
+
+
+def test_the_number_of_scan_locations_is_bounded(tmp_path):
+    """Every root directory became a location with its own entry allowance, and
+    nothing limited how many there could be, so a very wide root multiplied the
+    per-location budget by the number of directories."""
+    llama_cpp = _load("llama_cpp_location_bound_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    for index in range(llama_cpp.MAX_SCAN_LOCATIONS * 3):
+        (root / f"dir_{index:04d}").mkdir()
+
+    locations = llama_cpp._scanned_locations(str(root))
+    assert len(locations) <= llama_cpp.MAX_SCAN_LOCATIONS, len(locations)
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"
