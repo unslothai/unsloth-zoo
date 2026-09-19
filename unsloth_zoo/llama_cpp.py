@@ -31,6 +31,7 @@ __all__ = [
 
 import errno
 import hashlib
+import threading
 import subprocess
 import sys
 import os
@@ -2346,12 +2347,54 @@ def _scan_imported_package(package_dir):
         )
 
 
+# A pin Unsloth set itself, to route the patcher at an install it has just made.
+# Not the same thing as a pin the user set to choose a converter they reviewed,
+# and only the second is a reason to skip the scan.
+_INTERNAL_SCRIPTS_DIR_LOCK = threading.Lock()
+_internal_scripts_dir_pin = None
+
+
+@contextlib.contextmanager
+def internal_scripts_dir_pin(folder):
+    """Point the patcher at `folder` without that counting as the user's choice.
+
+    MLX export installs llama.cpp itself and then sets
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR so the patcher resolves against that install.
+    Trust was read from the variable alone, so a converter Unsloth had just
+    downloaded looked exactly like one the user had pinned and reviewed:
+    UNSLOTH_CONVERTER_SCAN_STRICT only logged the entrypoint's findings instead
+    of raising, and the imported packages were not scanned at all. The whole
+    strict control was therefore off for save_pretrained_gguf.
+
+    A pin already in the environment is left untouched, because that one IS the
+    user's and carries their exemption.
+    """
+    global _internal_scripts_dir_pin
+    with _INTERNAL_SCRIPTS_DIR_LOCK:
+        existing = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        previous = _internal_scripts_dir_pin
+        if existing is None:
+            os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = folder
+            _internal_scripts_dir_pin = os.path.abspath(os.path.expanduser(folder))
+        try:
+            yield
+        finally:
+            if existing is None:
+                os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
+            else:
+                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = existing
+            _internal_scripts_dir_pin = previous
+
+
 def _converter_is_trusted_local(script_path):
     """Whether a local converter was pinned deliberately by the user.
 
     The strict-mode exemption means "you chose this file", so it cannot cover
     every local path. UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is an explicit pin and is the
-    only thing that is. When no prebuilt is available install_llama_cpp falls
+    only thing that is, and then only when Unsloth did not set it itself: MLX
+    export points it at the llama.cpp it has just installed, which is routing and
+    not a judgement about the converter, so internal_scripts_dir_pin marks that
+    case and it gets no exemption either. When no prebuilt is available install_llama_cpp falls
     back to an unpinned `git clone` of upstream master, and
     _resolve_bundle_convert_script accepts that checkout on the strength of a
     conversion/ package alone. A converter fetched automatically from upstream is
@@ -2377,6 +2420,9 @@ def _converter_is_trusted_local(script_path):
     # expanded script path made a deliberate pin fail this test and be refused
     # under strict mode as though it had been downloaded.
     scripts_dir = os.path.abspath(os.path.expanduser(scripts_dir))
+    if _internal_scripts_dir_pin is not None and scripts_dir == _internal_scripts_dir_pin:
+        # Unsloth's own routing, not a choice anyone made about these bytes.
+        return False
     try:
         return os.path.commonpath([scripts_dir, script_path]) == scripts_dir
     except ValueError:

@@ -1260,6 +1260,56 @@ def _pyc(flags: int) -> bytes:
     return b"\x00" * 4 + flags.to_bytes(4, "little") + b"\x00" * 56
 
 
+def test_unsloths_own_routing_pin_does_not_buy_the_strict_exemption(tmp_path, monkeypatch):
+    """MLX export installs llama.cpp and then points the patcher at it.
+
+    Trust came from UNSLOTH_LLAMA_CPP_SCRIPTS_DIR alone, so a converter Unsloth
+    had just downloaded read as one the user pinned and reviewed: strict mode
+    only logged the entrypoint's findings instead of raising, and the imported
+    packages were skipped entirely. The whole control was off for
+    save_pretrained_gguf.
+    """
+    llama_cpp = _load("llama_cpp_routing_pin_probe", "unsloth_zoo/llama_cpp.py")
+
+    installed = tmp_path / "llama.cpp"
+    installed.mkdir()
+    script = installed / "convert_hf_to_gguf.py"
+    script.write_text("import gguf\n", encoding = "utf-8")
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+
+    with llama_cpp.internal_scripts_dir_pin(str(installed)):
+        # Set, so the patcher still resolves against the install...
+        assert os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] == str(installed)
+        # ...and still not the user's choice about these bytes.
+        assert llama_cpp._converter_is_trusted_local(str(script)) is False
+
+    assert "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR" not in os.environ
+
+
+def test_a_real_user_pin_still_earns_the_exemption(tmp_path, monkeypatch):
+    """The other half: a pin the user set must keep meaning "I chose this file",
+    including when MLX routing runs inside it and points somewhere else."""
+    llama_cpp = _load("llama_cpp_user_pin_probe", "unsloth_zoo/llama_cpp.py")
+
+    chosen = tmp_path / "my-llama.cpp"
+    chosen.mkdir()
+    script = chosen / "convert_hf_to_gguf.py"
+    script.write_text("import gguf\n", encoding = "utf-8")
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(chosen))
+
+    assert llama_cpp._converter_is_trusted_local(str(script)) is True
+
+    elsewhere = tmp_path / "auto-installed"
+    elsewhere.mkdir()
+    with llama_cpp.internal_scripts_dir_pin(str(elsewhere)):
+        # An existing pin is the user's and is left exactly as it is.
+        assert os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] == str(chosen)
+        assert llama_cpp._converter_is_trusted_local(str(script)) is True
+
+    assert os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] == str(chosen)
+    assert llama_cpp._converter_is_trusted_local(str(script)) is True
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"
