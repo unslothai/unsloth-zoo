@@ -359,9 +359,14 @@ def _resolve_monolith_bundle_convert_script(require_gguf_py = True):
             if not os.path.isfile(candidate):
                 continue
             if _entrypoint_needs_conversion_package(candidate):
-                # A package-era entrypoint without its package. Not self-contained,
-                # so staging (or an explicit checkout) has to supply the rest.
-                return None
+                # A package-era entrypoint without its package: not self-contained, so
+                # staging or an explicit checkout has to supply the rest. `continue`,
+                # not `return`, because the other spelling may be a complete monolith,
+                # and abandoning the loop here reported that no converter was available
+                # while a usable one sat in the same directory. Anything the loop does
+                # go on to accept still has to clear every check below, so a stale
+                # alias cannot get in on its name alone.
+                continue
             # Positive evidence, not merely the absence of the import. A truncated or
             # half-written converter also has no conversion import, and taking that
             # as proof of a monolith hands back a file that cannot convert anything:
@@ -2655,6 +2660,37 @@ def _resolve_staged_convert_script():
     return (candidate, stat.st_mtime_ns, stat.st_size)
 
 
+def _restore_owner_write(root):
+    """Add the owner write bit to `root` and everything under it, best effort.
+
+    copytree copies the source's mode last, so a copy of a read-only tree is itself
+    read-only and cannot even be renamed, and a mirror can have its permissions
+    tightened after the fact. Both need the same repair, so both call this."""
+    for parent, directories, files in os.walk(root):
+        for entry in [parent] + [os.path.join(parent, n) for n in directories + files]:
+            try:
+                os.chmod(entry, os.stat(entry).st_mode | stat_module.S_IWUSR)
+            except OSError:
+                pass
+    try:
+        os.chmod(root, os.stat(root).st_mode | stat_module.S_IWUSR)
+    except OSError:
+        pass
+
+
+def _tree_is_writable(root):
+    """Whether every directory the patcher writes into can be written to.
+
+    The patched converter lands at the top, `conversion/base.py` one level down and
+    the Qwen3.5 tensor mapping under `gguf-py/gguf`, so a writable top level on its
+    own does not mean the export can proceed."""
+    for relative in ("", "conversion", os.path.join("gguf-py", "gguf")):
+        directory = os.path.join(root, relative) if relative else root
+        if os.path.isdir(directory) and not os.access(directory, os.W_OK):
+            return False
+    return True
+
+
 def _writable_stage(stage_dir, repo, tag):
     """`stage_dir`, or a writable copy of it, or None.
 
@@ -2688,12 +2724,13 @@ def _writable_stage(stage_dir, repo, tag):
         # permissions or to a default cache root shared with another user. Returning
         # it then fails the patcher's write, which is the failure being avoided. The
         # mirror is ours, so restoring our own write bit is the first thing to try.
-        if not os.access(mirror, os.W_OK):
-            try:
-                os.chmod(mirror, os.stat(mirror).st_mode | stat_module.S_IWUSR)
-            except OSError:
-                pass
-        if os.access(mirror, os.W_OK):
+        if not os.access(mirror, os.W_OK) or not _tree_is_writable(mirror):
+            # Recursive, like the copy path: the patcher writes conversion/base.py and
+            # _patch_tensor_mapping_for_qwen35 writes under gguf-py/gguf, so a mirror
+            # whose permissions were tightened recursively is unusable even with a
+            # writable top level, and the top level alone was what got restored.
+            _restore_owner_write(mirror)
+        if os.access(mirror, os.W_OK) and _tree_is_writable(mirror):
             return mirror
         logger.warning(
             f"Unsloth: The converter sources copied to {mirror} are not writable and "
@@ -2722,12 +2759,7 @@ def _writable_stage(stage_dir, repo, tag):
         # itself read-only, and renaming a directory needs write permission ON that
         # directory. Give the copy back its owner write bit, which is the entire
         # point of making it.
-        for root, directories, files in os.walk(copied):
-            for entry in [root] + [os.path.join(root, n) for n in directories + files]:
-                try:
-                    os.chmod(entry, os.stat(entry).st_mode | stat_module.S_IWUSR)
-                except OSError:
-                    pass
+        _restore_owner_write(copied)
         if not os.path.exists(mirror):
             try:
                 # Same publication rule as staging itself: os.rename so a process that

@@ -1957,3 +1957,53 @@ def test_a_mirror_whose_write_bit_cannot_be_restored_is_reported(mod, tmp_path, 
     finally:
         monkeypatch.undo()
         os.chmod(stage, 0o755)
+
+
+def test_a_mirror_tightened_recursively_is_restored_throughout(mod, tmp_path, monkeypatch, staging_env):
+    """The patcher writes conversion/base.py, and the Qwen3.5 mapping writes under
+    gguf-py/gguf, so restoring only the top level hands back a mirror that still
+    fails partway through."""
+    stage = mod._stage_converter_sources("b9000")
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
+    _read_only(stage)
+    try:
+        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert mirror is not None
+        for relative in ("conversion", os.path.join("gguf-py", "gguf"), ""):
+            os.chmod(os.path.join(mirror, relative) if relative else mirror, 0o555)
+        again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert again == mirror
+        # Every directory the patcher writes into, not just the top one.
+        Path(again, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
+        Path(again, "conversion", "base.py").write_bytes(b"# patched\n")
+        Path(again, "gguf-py", "gguf", "probe.tmp").write_bytes(b"x")
+    finally:
+        os.chmod(stage, 0o755)
+
+
+def test_a_second_converter_filename_is_tried_when_the_first_is_a_bare_shim(mod, tmp_path, monkeypatch):
+    """An install carrying both spellings, where the preferred one is a package-era
+    shim with no package. Abandoning the loop there reported that no converter was
+    available while a complete one sat in the same directory, which offline or with
+    staging unavailable is a failed export."""
+    bundle = tmp_path / "both_names"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_SHIM_ENTRYPOINT)
+    (bundle / "convert-hf-to-gguf.py").write_bytes(_MONOLITH_ENTRYPOINT)
+    _write_sibling_gguf_py(bundle)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    info = mod._resolve_monolith_bundle_convert_script()
+    assert info is not None, "the usable second spelling was never examined"
+    assert Path(info[0]).name == "convert-hf-to-gguf.py"
+
+
+def test_a_second_filename_that_is_also_unusable_is_still_refused(mod, tmp_path, monkeypatch):
+    """Continuing past the first must not turn into accepting anything: the later
+    spelling still has to clear every check."""
+    bundle = tmp_path / "both_bad"
+    bundle.mkdir()
+    (bundle / "convert_hf_to_gguf.py").write_bytes(_SHIM_ENTRYPOINT)
+    (bundle / "convert-hf-to-gguf.py").write_bytes(b"# truncated\n")
+    _write_sibling_gguf_py(bundle)
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
+    assert mod._resolve_monolith_bundle_convert_script() is None
