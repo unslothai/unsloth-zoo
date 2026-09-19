@@ -2212,16 +2212,15 @@ def _conversion_sibling_info(llama_cpp_dir, is_local_copy = False):
     above the cap the package is reported as unread on every pass that scans it,
     so the key is not what protects anything there and buying a finer count would
     cost an unbounded walk of a directory an attacker sized."""
-    conv_dir = os.path.join(llama_cpp_dir, "conversion")
-    init_py  = os.path.join(conv_dir, "__init__.py")
-    base_py  = os.path.join(conv_dir, "base.py")
-    # The conversion/ package counts as present only on the layout that has it,
-    # which is the same structural test _detect_converter_layout makes. gguf-py
-    # is asked about separately: it ships with BOTH layouts, and gating it on
-    # conversion/ meant a monolith checkout returned None here, so after the
-    # first export a replaced gguf module left the key unchanged and the scan
-    # never re-ran while the subprocess imported it, strict mode included.
-    has_conversion = os.path.isfile(init_py) and os.path.isfile(base_py)
+    # Every directory that exists is keyed, on the layout test or not. Keying
+    # conversion/ only when it holds __init__.py AND base.py was a hole of the
+    # same shape as the one that used to skip gguf-py on a monolith: the scan
+    # reads the directory either way, because the converter can import from it
+    # either way, so a conversion/ without base.py was scanned once and then
+    # recorded as an empty header with no digests at all. After the first export
+    # a changed module there left the key identical, the patcher came back from
+    # cache, and the subprocess imported the new bytes unscanned, strict mode
+    # included.
     # With the scan off, the digest buys nothing: it exists to decide whether to
     # re-scan, and there is no scan. The key still has to move when a checkout is
     # re-pulled, so it falls back to the (mtime, size) identity this used before
@@ -2263,11 +2262,6 @@ def _conversion_sibling_info(llama_cpp_dir, is_local_copy = False):
     found_any = False
     for location in _scanned_locations(llama_cpp_dir).locations:
         subdir, package_dir, recursive = location.label, location.path, location.recursive
-        if subdir == "conversion" and not has_conversion:
-            # The directory exists but is not the package layout, so it is not
-            # the conversion package this key has always meant.
-            header.append((subdir, 0, True, ()))
-            continue
         found_any = True
         walk = _conversion_package_modules(
             package_dir,
