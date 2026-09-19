@@ -1363,7 +1363,14 @@ def _staged_sources_are_complete(stage_dir):
             ast.parse(source)
         except (SyntaxError, ValueError):
             return False
-        return True
+        # Parsing is not evidence either. A file cut down to one complete statement,
+        # `from conversion import ModelBase`, parses and imports the package, and
+        # accepting it makes the damage permanent in the same way: a warm hit on
+        # every later export while the patcher dies with "no arguments found" and
+        # staging is never asked to replace it. So require what the patcher requires.
+        # Upstream's shim is a CLI, 27 add_argument calls in the b11037 one, so this
+        # is present in every real entrypoint and absent from every truncation.
+        return bool(_CONVERTER_ADD_ARGUMENT_RE.search(source))
     # No conversion import, so this must be a pre-split monolith carrying its own
     # model classes. Presence is not enough to conclude that: an entry whose
     # entrypoint was truncated to nothing, while its manifest and gguf-py survived,
@@ -1372,6 +1379,11 @@ def _staged_sources_are_complete(stage_dir):
     # architectures out of it forever and staging is never asked to replace it.
     text_archs, vision_archs = _extract_archs_from_monolith_source(source)
     return bool(text_archs or vision_archs)
+
+
+# The patcher parses its flags with this same call, and raises "no arguments found"
+# when it matches nothing, so it is the structure a converter cannot be missing.
+_CONVERTER_ADD_ARGUMENT_RE = re.compile(rb"parser\.add_argument\(")
 
 
 def _read_converter_stage_manifest(stage_dir):

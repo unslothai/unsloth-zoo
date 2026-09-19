@@ -1166,6 +1166,18 @@ def test_a_shim_using_a_submodule_import_is_not_offered_as_self_contained(tmp_pa
 
 # --- Cache identity, publication, and where a staged monolith's patched file lands. All four of these were found by driving the staging code rather than reading it. ---
 
+# Every real entrypoint is a CLI, so a stage that is meant to pass the structural
+# checks has to carry the flags the patcher reads out of it.
+_ARGPARSE_BLOCK = b"""
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Convert a model to GGUF")
+    parser.add_argument("model", type=Path)
+    parser.add_argument("--outfile", type=Path, default=None)
+    return parser.parse_args()
+"""
+
+
 def _complete_stage(root, *, package, repo, tag, schema = None, manifest_repo = None,
                     manifest_tag = None):
     """A stage directory that passes every structural check, so the only thing
@@ -1178,9 +1190,10 @@ def _complete_stage(root, *, package, repo, tag, schema = None, manifest_repo = 
         conv = os.path.join(root, "conversion"); os.makedirs(conv, exist_ok = True)
         open(os.path.join(conv, "__init__.py"), "w").close()
         open(os.path.join(conv, "base.py"), "w").close()
-        body = b"from conversion import ModelBase\n"
+        body = b"from conversion import ModelBase\n" + _ARGPARSE_BLOCK
     else:
-        body = b"class ModelBase:\n    pass\n"
+        body = (b"@ModelBase.register(\"LlamaForCausalLM\")\nclass LlamaModel:\n    pass\n"
+                + _ARGPARSE_BLOCK)
     with open(os.path.join(root, "convert_hf_to_gguf.py"), "wb") as f: f.write(body)
     with open(os.path.join(root, llama_cpp.UNSLOTH_CONVERTER_STAGE_FILENAME), "w") as f:
         _json.dump({
@@ -1864,3 +1877,45 @@ def test_an_unpinned_export_still_falls_back_when_staging_fails(mod, tmp_path, m
         mod._download_convert_hf_to_gguf_cached.cache_clear()
     assert "LlamaForCausalLM" in text_archs
     assert Path(patched_path).parent == bundle
+
+
+def test_a_package_entrypoint_cut_to_one_statement_is_not_a_cache_hit(mod, tmp_path):
+    """Parsing is not evidence. A file cut down to a single complete statement still
+    imports conversion/ and still parses, so it was accepted, and the damage was then
+    permanent: a warm hit on every later export while the patcher dies with "no
+    arguments found" and staging is never asked to replace it. The monolith branch
+    below already demanded positive evidence; this is the same rule for the other."""
+    stage = _complete_stage(str(tmp_path / "s"), package = True,
+                            repo = "ggml-org/llama.cpp", tag = "b9000")
+    assert mod._converter_stage_is_usable(
+        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is True
+    Path(stage, "convert_hf_to_gguf.py").write_bytes(b"from conversion import ModelBase\n")
+    assert mod._converter_stage_is_usable(
+        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is False
+
+
+def test_a_damaged_package_entrypoint_is_restaged_rather_than_served_forever(mod, staging_env):
+    """Through the cache, not the predicate: the point of refusing is that the next
+    export repairs the entry instead of hitting it warm."""
+    stage = mod._stage_converter_sources("b9000")
+    Path(stage, "convert_hf_to_gguf.py").write_bytes(b"from conversion import ModelBase\n")
+    before = staging_env["downloads"]
+    repaired = mod._stage_converter_sources("b9000")
+    assert repaired == stage
+    assert staging_env["downloads"] == before + 1, "the damaged entry was served warm"
+    assert mod._CONVERTER_ADD_ARGUMENT_RE.search(
+        Path(stage, "convert_hf_to_gguf.py").read_bytes()
+    ), "the entry was not actually restaged"
+
+
+def test_a_real_shim_is_still_accepted(mod, tmp_path):
+    """The check has to pass on what upstream actually ships: its entrypoint is a
+    CLI, so requiring the parser cannot reject a genuine revision."""
+    stage = _write_source_tree(tmp_path / "real")
+    Path(stage, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
+        "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
+        "repo": "ggml-org/llama.cpp", "tag": "b9000",
+        "archive_sha256": "x", "completed": True,
+    }))
+    assert mod._converter_stage_is_usable(
+        str(stage), repo = "ggml-org/llama.cpp", tag = "b9000") is True
