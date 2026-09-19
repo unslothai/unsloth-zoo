@@ -1329,7 +1329,9 @@ def test_the_converter_cache_key_carries_whether_the_pin_was_the_users(tmp_path,
 
     seen = []
 
-    def record(name, local_info, conversion_info, scan_mode = None, trusted = False):
+    def record(
+        name, local_info, conversion_info, scan_mode = None, trusted = False, stuck = (),
+    ):
         seen.append(trusted)
         return "patched"
 
@@ -1349,6 +1351,77 @@ def test_the_converter_cache_key_carries_whether_the_pin_was_the_users(tmp_path,
     # Same folder, same file, same switches: only provenance differs, and if it
     # does not reach the key then lru_cache serves the trusted answer to both.
     assert seen == [True, False], seen
+
+
+def test_bytecode_appearing_after_a_cached_export_is_still_purged(tmp_path, monkeypatch):
+    """The purge used to live inside the cached function.
+
+    So once strict mode had completed one clean export in a long-lived process,
+    dropping a fresh valid .pyc beside an unchanged source left every component
+    of the key identical: the cached result came back, nothing purged it, and the
+    next converter subprocess executed it.
+    """
+    llama_cpp = _load("llama_cpp_purge_before_cache_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    script = root / "convert_hf_to_gguf.py"
+    script.write_text("import gguf\n", encoding = "utf-8")
+    info = (str(script), os.stat(script).st_mtime_ns, os.stat(script).st_size)
+
+    monkeypatch.setattr(llama_cpp, "_resolve_local_convert_script", lambda: info)
+    monkeypatch.setattr(llama_cpp, "_patch_tensor_mapping_for_qwen35", lambda *a, **k: None)
+    monkeypatch.setattr(
+        llama_cpp, "_download_convert_hf_to_gguf_cached", lambda *a, **k: "patched",
+    )
+
+    llama_cpp._download_convert_hf_to_gguf()          # the first, clean export
+
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    planted = cache / "base.cpython-313.pyc"
+    planted.write_bytes(_pyc(0))
+
+    llama_cpp._download_convert_hf_to_gguf()          # served from cache, and yet
+    assert not planted.exists(), "bytecode planted after a cached export survived"
+
+
+def test_bytecode_that_cannot_be_purged_reaches_the_cache_key(tmp_path, monkeypatch):
+    """Deleting is the defence; when it fails the scan has to run and say so, and
+    it will not run if the key looks the same as the clean export before it."""
+    llama_cpp = _load("llama_cpp_stuck_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    script = root / "convert_hf_to_gguf.py"
+    script.write_text("import gguf\n", encoding = "utf-8")
+    info = (str(script), os.stat(script).st_mtime_ns, os.stat(script).st_size)
+
+    seen = []
+
+    monkeypatch.setattr(llama_cpp, "_resolve_local_convert_script", lambda: info)
+    monkeypatch.setattr(llama_cpp, "_patch_tensor_mapping_for_qwen35", lambda *a, **k: None)
+    monkeypatch.setattr(
+        llama_cpp,
+        "_download_convert_hf_to_gguf_cached",
+        lambda *args, **kwargs: seen.append(args[-1]) or "patched",
+    )
+
+    llama_cpp._download_convert_hf_to_gguf()
+
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    (cache / "base.cpython-313.pyc").write_bytes(_pyc(0))
+    real_remove = os.remove
+
+    def refuse(path, *args, **kwargs):
+        if str(path).endswith(".pyc"):
+            raise PermissionError(13, "read-only file system", str(path))
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(llama_cpp.os, "remove", refuse)
+    llama_cpp._download_convert_hf_to_gguf()
+
+    assert seen[0] == ()
+    assert seen[1] == ("conversion/__pycache__/base.cpython-313.pyc",), seen[1]
 
 
 def _package_root(tmp_path):

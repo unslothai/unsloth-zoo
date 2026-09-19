@@ -1858,6 +1858,35 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None):
     return stuck
 
 
+def _purge_imported_package_bytecode(llama_cpp_dir):
+    """Purge every imported package's supplied bytecode, and say what is stuck.
+
+    Called before the patcher cache is consulted, not only inside it. The purge
+    used to run within the cached function, so once strict mode had completed one
+    clean export in a long-lived process, dropping a fresh valid .pyc beside an
+    unchanged source left every component of the key identical: the cached result
+    came back, nothing purged it, and the next converter subprocess executed it.
+
+    The names it could not delete travel into the key, so bytecode that appears
+    and cannot be removed re-runs the scan that reports it, rather than hiding
+    behind a cache entry made when the tree was clean.
+    """
+    if not llama_cpp_dir:
+        return ()
+    stuck = []
+    for subdir in IMPORTED_PACKAGE_SUBDIRS:
+        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
+        if not os.path.isdir(package_dir):
+            continue
+        stuck.extend(
+            f"{subdir}/{name}"
+            for name in _purge_regenerable_bytecode(
+                package_dir, entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
+            )
+        )
+    return tuple(sorted(stuck))
+
+
 def _has_a_source(root, name):
     """Whether this cache has a .py beside it that Python can rebuild it from."""
     if os.path.basename(root) == "__pycache__":
@@ -2490,15 +2519,20 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
         local_script_info = _resolve_bundle_convert_script()
     # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
     # or replaced after the first conversion still gets the Qwen3.5 aliases.
-    _patch_tensor_mapping_for_qwen35(_get_llama_cpp_dir(local_script_info))
+    _llama_cpp_dir = _get_llama_cpp_dir(local_script_info)
+    _patch_tensor_mapping_for_qwen35(_llama_cpp_dir)
+    # Before the cache is consulted and before the key is built, so the key
+    # describes the tree the converter will actually run against.
+    stuck_bytecode = _purge_imported_package_bytecode(_llama_cpp_dir)
     return _download_convert_hf_to_gguf_cached(
         name,
         local_script_info,
-        _conversion_sibling_info(_get_llama_cpp_dir(local_script_info)),
+        _conversion_sibling_info(_llama_cpp_dir),
         _converter_scan_mode(),
         _converter_is_trusted_local(
             local_script_info[0] if local_script_info is not None else None
         ),
+        stuck_bytecode,
     )
 
 
@@ -2527,6 +2561,7 @@ def _converter_scan_mode():
 @lru_cache(1)
 def _download_convert_hf_to_gguf_cached(
     name, _local_script_info, _conversion_info, _scan_mode = None, _trusted_local = False,
+    _stuck_bytecode = (),
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Download from llama.cpp's GitHub, or read a local copy when
