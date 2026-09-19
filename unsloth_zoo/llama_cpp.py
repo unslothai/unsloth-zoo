@@ -1921,7 +1921,7 @@ def _scanned_locations(llama_cpp_dir):
     return locations
 
 
-def _purge_imported_package_bytecode(llama_cpp_dir):
+def _purge_imported_package_bytecode(llama_cpp_dir, is_local_copy = False):
     """Purge every imported package's supplied bytecode, and say what is stuck.
 
     Called before the patcher cache is consulted, not only inside it. The purge
@@ -1939,6 +1939,11 @@ def _purge_imported_package_bytecode(llama_cpp_dir):
     if scan_is_disabled():
         # The opt-out means this does nothing, and deleting files inside a
         # checkout the user pinned is the last thing it should still be doing.
+        return ()
+    if is_local_copy:
+        # A pin says "I chose this directory". Reporting what is in it is fair;
+        # rewriting it is not, and a checkout someone works in has caches of its
+        # own that are none of this scan's business.
         return ()
     stuck = []
     for location in _scanned_locations(llama_cpp_dir):
@@ -2295,7 +2300,7 @@ def _qwen_already_handles_expert_aliases(conv_qwen_path):
 pass
 
 
-def _refuse_unscannable_conversion_package(conversion_dir, reason):
+def _refuse_unscannable_conversion_package(conversion_dir, reason, is_local_copy = False):
     """Warn, or under strict mode refuse, a conversion/ package too big to read.
 
     Mirrors warn_on_suspicious_converter's contract, but cannot go through it:
@@ -2313,7 +2318,9 @@ def _refuse_unscannable_conversion_package(conversion_dir, reason):
         f"of the modules the converter imports have not been checked."
     )
     logger.warning(message)
-    if scan_is_strict():
+    # is_local_copy carries the same meaning it has in warn_on_suspicious_converter:
+    # the user pinned this directory, so it is reported and never refused.
+    if scan_is_strict() and not is_local_copy:
         raise ConverterScanError(
             f"{message} Refusing to run it with UNSLOTH_CONVERTER_SCAN_STRICT=1. Pin a "
             f"converter you have reviewed with UNSLOTH_LLAMA_CPP_SCRIPTS_DIR, or unset "
@@ -2440,7 +2447,7 @@ def _conversion_package_modules(
     return PackageWalk(sorted(found), not unreadable, tuple(unreadable))
 
 
-def _scan_conversion_package(llama_cpp_dir):
+def _scan_conversion_package(llama_cpp_dir, is_local_copy = False):
     """Scan every package the converter imports, beside an unverified converter.
 
     Same warn-or-raise contract as the entrypoint: these files are imported and
@@ -2457,11 +2464,16 @@ def _scan_conversion_package(llama_cpp_dir):
         return
     for location in _scanned_locations(llama_cpp_dir):
         _scan_imported_package(
-            location.path, recursive = location.recursive, natives = location.natives,
+            location.path,
+            recursive = location.recursive,
+            natives = location.natives,
+            is_local_copy = is_local_copy,
         )
 
 
-def _scan_imported_package(package_dir, recursive = True, natives = True):
+def _scan_imported_package(
+    package_dir, recursive = True, natives = True, is_local_copy = False,
+):
     """Read every module in one imported package, or report why it could not be.
 
     `natives` is False outside the packages the converter imports by name. A
@@ -2503,6 +2515,7 @@ def _scan_imported_package(package_dir, recursive = True, natives = True):
             package_dir,
             f"holds {len(walk.unreadable)} director(y/ies) this scan could not "
             f"read ({shown})",
+            is_local_copy = is_local_copy,
         )
     if names is None:
         return
@@ -2513,6 +2526,7 @@ def _scan_imported_package(package_dir, recursive = True, natives = True):
             package_dir,
             f"holds more than the {MAX_CONVERSION_PACKAGE_ENTRIES} directory "
             f"entries this scan walks",
+            is_local_copy = is_local_copy,
         )
     if len(names) > MAX_CONVERSION_PACKAGE_FILES:
         # Truncating the list silently was the hole: a payload in a late-sorting
@@ -2524,6 +2538,7 @@ def _scan_imported_package(package_dir, recursive = True, natives = True):
             package_dir,
             f"holds more than the {MAX_CONVERSION_PACKAGE_FILES} Python files "
             f"this scan reads",
+            is_local_copy = is_local_copy,
         )
         names = names[:MAX_CONVERSION_PACKAGE_FILES]
     opaque = _unscannable_modules(package_dir, names, natives = natives) + stuck_bytecode
@@ -2536,6 +2551,7 @@ def _scan_imported_package(package_dir, recursive = True, natives = True):
             package_dir,
             f"holds {len(opaque)} file(s) Python will execute but this scan "
             f"cannot read ({shown})",
+            is_local_copy = is_local_copy,
         )
     for name in names:
         if os.path.splitext(name)[1].lower() != ".py":
@@ -2555,9 +2571,10 @@ def _scan_imported_package(package_dir, recursive = True, natives = True):
                 package_dir,
                 f"holds a module ({name}) larger than the {MAX_MODULE_BYTES} "
                 f"bytes this scan reads, so only its first part was checked",
+                    is_local_copy = is_local_copy,
             )
         warn_on_suspicious_converter(
-            content, path, is_local_copy = False, log = logger,
+            content, path, is_local_copy = is_local_copy, log = logger,
         )
 
 
@@ -2657,15 +2674,18 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     _patch_tensor_mapping_for_qwen35(_llama_cpp_dir)
     # Before the cache is consulted and before the key is built, so the key
     # describes the tree the converter will actually run against.
-    stuck_bytecode = _purge_imported_package_bytecode(_llama_cpp_dir)
+    trusted_local = _converter_is_trusted_local(
+        local_script_info[0] if local_script_info is not None else None
+    )
+    stuck_bytecode = _purge_imported_package_bytecode(
+        _llama_cpp_dir, is_local_copy = trusted_local,
+    )
     return _download_convert_hf_to_gguf_cached(
         name,
         local_script_info,
         _conversion_sibling_info(_llama_cpp_dir),
         _converter_scan_mode(),
-        _converter_is_trusted_local(
-            local_script_info[0] if local_script_info is not None else None
-        ),
+        trusted_local,
         stuck_bytecode,
     )
 
@@ -2765,8 +2785,11 @@ def _download_convert_hf_to_gguf_cached(
         # covered by that asset's sha256; from an unpinned `git clone` they are
         # not, and a payload can sit in conversion/__init__.py behind a clean
         # entrypoint.
-        if not _trusted_local:
-            _scan_conversion_package(_llama_cpp_dir)
+        # Always, pinned or not. The entrypoint itself is scanned either way and
+        # only the refusal is waived for a pin; skipping the sibling packages
+        # entirely meant a stale or tampered conversion/ beside a pinned
+        # entrypoint executed without even the advisory warning.
+        _scan_conversion_package(_llama_cpp_dir, is_local_copy = _trusted_local)
 
         # 2. Detect layout BEFORE importing: the package entrypoint does
         # `from conversion import ...`, which a temp-file import resolves
