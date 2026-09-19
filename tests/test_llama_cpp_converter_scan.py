@@ -1293,6 +1293,40 @@ def test_a_payload_in_gguf_py_is_scanned_too(tmp_path, monkeypatch):
         llama_cpp._scan_conversion_package(str(root))
 
 
+def test_the_cache_key_covers_gguf_py_on_a_monolith_checkout_too(tmp_path):
+    """gguf-py ships with both layouts; the key was gated on the newer one.
+
+    On a monolithic checkout conversion/ is absent, so this returned None before
+    gguf-py was ever hashed. After the first export in a long-lived process a
+    replaced gguf module left the key identical: the scan did not re-run, and the
+    converter subprocess imported it anyway, strict mode included.
+    """
+    llama_cpp = _load("llama_cpp_monolith_gguf_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    gguf = root / "gguf-py" / "gguf"
+    gguf.mkdir(parents = True)
+    module = gguf / "__init__.py"
+    module.write_text("VERSION = 1\n", encoding = "utf-8")
+    assert not (root / "conversion").exists(), "this is the monolith shape"
+
+    before = llama_cpp._conversion_sibling_info(str(root))
+    assert before is not None, "a monolith that ships gguf-py still has something to key on"
+    module.write_text("VERSION = 1  # and a payload\n", encoding = "utf-8")
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
+
+
+def test_a_checkout_with_neither_package_still_has_no_key(tmp_path):
+    """The other half: None has to keep meaning nothing is there."""
+    llama_cpp = _load("llama_cpp_no_package_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    root.mkdir()
+    (root / "convert_hf_to_gguf.py").write_text("import gguf\n", encoding = "utf-8")
+
+    assert llama_cpp._conversion_sibling_info(str(root)) is None
+
+
 def test_the_cache_key_covers_gguf_py(tmp_path):
     """The key decides whether the scan runs again, so a package it does not
     cover is one a long-lived process re-imports without rescanning."""

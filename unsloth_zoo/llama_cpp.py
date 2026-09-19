@@ -1867,7 +1867,7 @@ def _unscannable_modules(package_dir, names):
 def _conversion_sibling_info(llama_cpp_dir):
     """Hashable (path, digest) pairs for EVERY module the converter imports,
     folded into the patcher cache key so re-pulled checkouts re-patch and
-    re-scan. None on the monolithic layout.
+    re-scan. None when neither package is on disk.
 
     Every package in IMPORTED_PACKAGE_SUBDIRS, not just conversion/: the key is
     what decides whether the scan runs again, so a package it does not cover is
@@ -1887,8 +1887,13 @@ def _conversion_sibling_info(llama_cpp_dir):
     conv_dir = os.path.join(llama_cpp_dir, "conversion")
     init_py  = os.path.join(conv_dir, "__init__.py")
     base_py  = os.path.join(conv_dir, "base.py")
-    if not (os.path.isfile(init_py) and os.path.isfile(base_py)):
-        return None
+    # The conversion/ package counts as present only on the layout that has it,
+    # which is the same structural test _detect_converter_layout makes. gguf-py
+    # is asked about separately: it ships with BOTH layouts, and gating it on
+    # conversion/ meant a monolith checkout returned None here, so after the
+    # first export a replaced gguf module left the key unchanged and the scan
+    # never re-ran while the subprocess imported it, strict mode included.
+    has_conversion = os.path.isfile(init_py) and os.path.isfile(base_py)
     def _identity(p):
         # The bytes, not (mtime, size): a module replaced with same-sized content
         # under a preserved mtime left the key identical, so the next export
@@ -1914,13 +1919,16 @@ def _conversion_sibling_info(llama_cpp_dir):
         except OSError:
             return (p, -1, "")
     header, entries = [], []
+    found_any = False
     for subdir in IMPORTED_PACKAGE_SUBDIRS:
         package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
-        if not os.path.isdir(package_dir):
+        present = has_conversion if subdir == "conversion" else os.path.isdir(package_dir)
+        if not present:
             # Absent, not unreadable. A converter that ships no gguf-py is the
             # ordinary case and must not be keyed on placeholder entries.
             header.append((subdir, 0, True))
             continue
+        found_any = True
         names, complete = _conversion_package_modules(
             package_dir,
             file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
@@ -1933,6 +1941,10 @@ def _conversion_sibling_info(llama_cpp_dir):
             _identity(os.path.join(package_dir, *name.split("/")))
             for name in names[:MAX_CONVERSION_PACKAGE_FILES]
         )
+    if not found_any:
+        # Neither package on disk: nothing for this key to say, which is what the
+        # monolith-with-no-gguf-py case has always meant.
+        return None
     # The header is ONE element, however much it comes to carry: callers read the
     # per-module entries as info[1:], so widening it in place silently fed them a
     # count or a flag where they expected a (path, digest) pair.
