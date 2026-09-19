@@ -2078,3 +2078,58 @@ def test_a_driveable_second_spelling_wins_over_an_undriveable_first(mod, tmp_pat
     info = mod._resolve_monolith_bundle_convert_script()
     assert info is not None
     assert Path(info[0]).name == "convert-hf-to-gguf.py"
+
+
+def test_a_user_checkout_under_the_cache_root_is_not_treated_as_a_stage(mod, tmp_path, monkeypatch):
+    """Ancestry is not ownership. The cache root is a configurable path, so a
+    user's own UNSLOTH_LLAMA_CPP_SCRIPTS_DIR can sit beneath it, and treating it as
+    ours means writing the patched converter into their checkout: an outright
+    failure when it is read only, a silent modification when it is not."""
+    cache = tmp_path / "shared-cache"
+    checkout = cache / "my-llama.cpp"
+    _write_source_tree(checkout, entrypoint = _MONOLITH_ENTRYPOINT, conversion = False)
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(cache))
+    # Ancestry says yes, which is exactly what made this wrong.
+    assert mod._is_inside_converter_cache(str(checkout)) is True
+    assert mod._is_converter_stage_dir(str(checkout)) is False
+
+
+def test_a_real_stage_under_the_cache_root_is_still_a_stage(mod, staging_env):
+    """The negative half: a genuine stage carries the manifest only we write, so
+    anchoring the patched converter on it still happens."""
+    stage = mod._stage_converter_sources("b9000")
+    assert mod._is_converter_stage_dir(stage) is True
+
+
+def test_a_stage_whose_manifest_was_deleted_is_no_longer_claimed(mod, staging_env):
+    """The manifest is the evidence, so removing it withdraws the claim rather than
+    leaving the answer to the path."""
+    stage = mod._stage_converter_sources("b9000")
+    Path(stage, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).unlink()
+    assert mod._is_converter_stage_dir(stage) is False
+
+
+def test_a_user_checkout_under_the_cache_root_is_not_written_into(mod, tmp_path, monkeypatch):
+    """The consequence, driven rather than asserted on the predicate: the patched
+    converter must land in LLAMA_CPP_DEFAULT_DIR, not in the user's checkout, which
+    happens to sit under the cache root."""
+    cache = tmp_path / "shared-cache"
+    checkout = cache / "my-llama.cpp"
+    _write_source_tree(checkout, entrypoint = _MONOLITH_ENTRYPOINT, conversion = False)
+    default_dir = tmp_path / "default"
+    default_dir.mkdir()
+    monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(cache))
+    monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(default_dir))
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(checkout))
+    _no_network(mod, monkeypatch, "an explicit checkout must not download")
+    mod._download_convert_hf_to_gguf_cached.cache_clear()
+    try:
+        patched_path, text_archs, _ = mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
+    finally:
+        mod._download_convert_hf_to_gguf_cached.cache_clear()
+    assert "LlamaForCausalLM" in text_archs
+    assert Path(patched_path).parent == default_dir, (
+        "the patched converter was written into the user's own checkout because it "
+        "sits under the cache root"
+    )
+    assert not (checkout / "unsloth_convert_hf_to_gguf.py").exists()

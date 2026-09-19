@@ -1428,10 +1428,11 @@ def _read_converter_stage_manifest(stage_dir):
 
 
 def _is_inside_converter_cache(directory):
-    """Whether this directory is one of our own staged revisions.
+    """Whether this directory sits under the converter cache root.
 
     Read at the call rather than closed over, because tests and
-    UNSLOTH_LLAMA_CPP_CONVERTER_CACHE point the cache root elsewhere."""
+    UNSLOTH_LLAMA_CPP_CONVERTER_CACHE point the cache root elsewhere. Containment
+    alone does not make a directory ours: see _is_converter_stage_dir."""
     if not directory: return False
     try:
         root = os.path.realpath(LLAMA_CPP_CONVERTER_CACHE_DIR)
@@ -1439,6 +1440,22 @@ def _is_inside_converter_cache(directory):
     except OSError:
         return False
     return here == root or here.startswith(root + os.sep)
+
+
+def _is_converter_stage_dir(directory):
+    """Whether this directory is one of our own staged revisions.
+
+    Containment under the cache root is not enough, because the root is a
+    configurable path and a user's own checkout can sit beneath it: with
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR pointing somewhere inside a shared cache
+    hierarchy, path ancestry alone declared that checkout ours and the patched
+    converter was written into it, which fails outright when it is read only and
+    silently modifies it when it is not. Only we write the stage manifest, so it
+    is what actually identifies a stage."""
+    return (
+        _is_inside_converter_cache(directory)
+        and _read_converter_stage_manifest(directory) is not None
+    )
 
 
 def _converter_stage_is_usable(stage_dir, repo = None, tag = None):
@@ -3127,7 +3144,7 @@ def _download_convert_hf_to_gguf_cached(name, _local_script_info, _conversion_in
         # from our cache on its stage whatever the layout; the default dir already
         # resolves there and a user's pinned checkout must not be written into.
         patched_dir = _llama_cpp_dir if (
-            _layout == "package" or _is_inside_converter_cache(_llama_cpp_dir)
+            _layout == "package" or _is_converter_stage_dir(_llama_cpp_dir)
         ) else LLAMA_CPP_DEFAULT_DIR
         os.makedirs(patched_dir, exist_ok=True)
         patched_filename = os.path.join(patched_dir, f"{name}.py")
