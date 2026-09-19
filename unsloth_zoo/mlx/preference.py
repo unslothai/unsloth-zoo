@@ -10,6 +10,10 @@ import mlx.nn as nn
 import mlx.utils
 import numpy as np
 
+# Absolute, like the other cce imports in this package: transformers' remote-code walk
+# turns `from .cce.runtime_cce import x` into unsloth_zoo/mlx/cce.runtime_cce.py and dies
+# on the missing file. See tests/test_relative_imports_resolve.py.
+from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap, _chunk_matmul, _resolve_chunk_size
 from .utils import (
     _FiniteVisitMixin,
     _encode_mlx_prompt_completion,
@@ -718,9 +722,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
                 counts[key] = max(counts.get(key, 0), count)
         for (family, width), count in counts.items():
             capacity = max(256, ((count + 255) // 256) * 256)
-            tokens = family[1][0][0] * (width - 1)
-            limit = family[1][0][0] * width // 4 if kind == "orpo" else tokens // 2
-            if tokens >= 1024 and capacity <= limit:
+            if capacity < family[1][0][0] * (width - 1):
                 self._cce_capacities[family, width] = capacity
 
     def prepare_cce_batch(self, index, batch):
@@ -935,15 +937,14 @@ def _require_reference(objective, reference_policy):
         )
 
 
-def make_orpo_loss_fn(objective, *, _cce_compaction=False):
+def make_orpo_loss_fn(objective, *, _scorer=None):
     """Create an ORPO loss with exact logical-window normalization."""
     _require_kind(objective, "orpo")
     beta = objective.beta
 
     def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
         nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
-            model, batch, lengths, beta,
-            cce_indices=cce_indices if _cce_compaction else None,
+            model, batch, lengths, beta, scorer=_scorer, cce_indices=cce_indices,
         )
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * (
@@ -962,14 +963,14 @@ def make_orpo_loss_fn(objective, *, _cce_compaction=False):
 
 
 def make_orpo_cce_loss_fn(model, objective):
-    from .utils import describe_output_head
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_orpo_loss_fn(objective, _scorer=scorer), scorer)
 
-    weight = getattr(describe_output_head(model).module, "weight", None)
-    enabled = weight is not None and weight.shape[0] >= 8192
-    loss_fn = make_orpo_loss_fn(objective, _cce_compaction=enabled)
-    loss_fn._unsloth_cce_compaction = enabled
-    if enabled:
-        loss_fn._unsloth_cce_backend = "compact-native-preference"
+
+def _mark_cce_loss(loss_fn, scorer):
+    if scorer is not None:
+        loss_fn._unsloth_cce_backend = "runtime-cce"
+        loss_fn._unsloth_cce_compaction = scorer.compaction
     return loss_fn
 
 
@@ -1332,14 +1333,14 @@ def _dpo_pair_loss(objective, terms):
     return total
 
 
-def make_dpo_loss_fn(objective, *, reference_policy=None, _cce_forward=None):
+def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
     _require_kind(objective, "dpo")
     _require_reference(objective, reference_policy)
 
     def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
         terms, stats = _dpo_scores(
             model, batch, lengths, objective, reference_policy=reference_policy,
-            cce_forward=_cce_forward, cce_indices=cce_indices,
+            scorer=_scorer, cce_indices=cce_indices,
         )
         pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
@@ -1355,97 +1356,117 @@ def make_dpo_loss_fn(objective, *, reference_policy=None, _cce_forward=None):
     return loss_fn
 
 
-def _make_compact_preference_projection(head, *, frozen):
-    quantized = hasattr(head, 'scales')
-    group_size = getattr(head, 'group_size', 64)
-    bits = getattr(head, 'bits', 4)
-    mode = getattr(head, 'mode', 'affine')
+def _scatter_rows(values, indices, size):
+    values = mx.where(indices >= 0, values, mx.array(0, values.dtype))
+    return mx.zeros((size,), values.dtype).at[mx.maximum(indices, 0)].add(values)
 
-    def native(hidden, weight, scales, biases):
-        if quantized:
-            return mx.quantized_matmul(hidden, weight, scales, biases, transpose=True,
-                                       group_size=group_size, bits=bits, mode=mode)
-        return hidden @ weight.T
 
-    @mx.custom_function
-    def projection(hidden, weight, scales, biases, indices):
-        flat_hidden = hidden.reshape((-1, hidden.shape[-1]))
-        selected = mx.take(flat_hidden, mx.maximum(indices, 0), axis=0)
-        return native(selected, weight, scales, biases)
+def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
+    """Each row's logits summed over the vocabulary, one vocabulary chunk at a time.
 
-    @projection.vjp
-    def backward(primals, cotangents, output):
-        hidden, weight, scales, biases, indices = primals
-        # Preserve the native backward shape: bf16 GEMM tiling can change Adam updates.
-        compact_grad = mx.where(indices[:, None] >= 0, cotangents,
-                                mx.array(0, cotangents.dtype))
-        full_grad = mx.zeros((hidden.size // hidden.shape[-1], weight.shape[0]), compact_grad.dtype)
-        full_grad = full_grad.at[mx.maximum(indices, 0)].add(compact_grad)
-        full_grad = full_grad.reshape((*hidden.shape[:-1], weight.shape[0]))
-        if quantized or frozen:
-            _, (grad_hidden,) = mx.vjp(
-                lambda h: native(h, weight, scales, biases), (hidden,), (full_grad,),
-            )
-            grad_weight = mx.zeros_like(weight)
+    Uncapped logits are linear in the head, so their sum projects onto the summed
+    weight rows; a softcap needs the logits themselves.
+    """
+    vocab = weight.shape[0]
+    # Without a softcap a chunk holds weight rows, not a row of logits per token.
+    step = _resolve_chunk_size(
+        0, hidden.shape[0] if softcap else hidden.shape[-1], vocab,
+    )
+    total = 0.0
+    for start in range(0, vocab, step):
+        chunk = [None if value is None else value[start:start + step]
+                 for value in (weight, scales, biases)]
+        if softcap:
+            logits = _chunk_matmul(hidden, chunk[0], scales=chunk[1], biases=chunk[2],
+                                   **quantization)
+            total = total + _apply_softcap(logits.astype(mx.float32), softcap).sum(axis=-1)
+        elif scales is not None:
+            total = total + mx.dequantize(*chunk, **quantization).astype(mx.float32).sum(axis=0)
         else:
-            _, (grad_hidden, grad_weight) = mx.vjp(
-                lambda h, w: native(h, w, scales, biases), (hidden, weight), (full_grad,),
-            )
-        return (grad_hidden, grad_weight,
-                None if scales is None else mx.zeros_like(scales),
-                None if biases is None else mx.zeros_like(biases), mx.zeros_like(indices))
-
-    return projection
+            total = total + chunk[0].astype(mx.float32).sum(axis=0)
+    return total if softcap else hidden.astype(mx.float32) @ total
 
 
-def _make_dpo_cce_forward(model):
+def _make_preference_cce_scorer(model):
+    """Score preference positions from hidden states through runtime CCE.
+
+    Returns None unless the hidden states are reachable and the head is an
+    unwrapped, bias-free dense or frozen quantized projection.
+    """
     from . import utils
 
-    desc = utils.describe_output_head(model)
     tm = utils._get_text_model(model)
-    if (utils._cce_head_ineligibility(desc) is not None
-            or (getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model))):
+    if getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model):
+        return None
+    desc = utils.describe_output_head(model)
+    if utils._cce_head_ineligibility(desc) is not None:
         return None
     scale, problem = utils._detect_head_transform(model, desc.status)
-    softcap, cap_problem = utils._detect_logit_softcap(model)
-    if (problem or cap_problem or scale is not None or softcap
-            or desc.module.weight.shape[0] < 8192
-            or (desc.quantized and desc.module.trainable_parameters())):
+    softcap, softcap_problem = utils._detect_logit_softcap(model)
+    if problem is not None or softcap_problem is not None:
         return None
-
-    projection = _make_compact_preference_projection(
-        desc.module, frozen=not utils._is_lm_head_trainable(model),
-    )
-
-    def forward(model, batch, lengths, indices):
-        tokens = batch.shape[0] * (batch.shape[1] - 1)
-        if indices is None or tokens < 1024 or indices.shape[0] * 2 > tokens:
+    quantization = {}
+    if desc.quantized:
+        # The quantized kernel returns no weight gradient.
+        if desc.module.trainable_parameters():
             return None
-        targets = batch[:, 1:]
-        mask = _response_mask(targets, lengths)
-        hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
-        labels = mx.take(targets.reshape((-1,)), mx.maximum(indices, 0), axis=0)
-        head = utils._resolve_module_path(model, desc.path)
-        logits = projection(hidden, head.weight, head.get("scales"), head.get("biases"), indices)
-        ce = nn.losses.cross_entropy(logits, mx.maximum(labels, 0), reduction="none")
-        sums = _row_logit_sum(logits)
-        valid = indices >= 0
-        safe = mx.maximum(indices, 0)
-        ce = mx.zeros((targets.size,), ce.dtype).at[safe].add(mx.where(valid, ce, mx.array(0, ce.dtype)))
-        sums = mx.zeros((targets.size,), sums.dtype).at[safe].add(mx.where(valid, sums, mx.array(0, sums.dtype)))
-        return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape)), mask
+        quantization = dict(group_size=getattr(desc.module, "group_size", 64),
+                            bits=getattr(desc.module, "bits", 4),
+                            mode=getattr(desc.module, "mode", "affine"))
+    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
+                                    quantized=desc.quantized, **quantization)
+    frozen = not utils._is_lm_head_trainable(model)
 
-    return forward
+    def score(model, batch, supervised, indices=None, *, every_position=False):
+        """Token cross entropy and logit sums per position, as float32 grids.
+
+        Cross entropy is zero outside ``supervised``. ``indices`` limits the
+        kernel to those rows, which then also limits the logit sums unless
+        ``every_position``.
+        """
+        targets = batch[:, 1:]
+        hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
+        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        if scale is not None:
+            hidden = hidden * scale
+        labels = utils._normalize_cce_label_dtype(targets)
+        labels = mx.where(supervised, labels, mx.array(-100, labels.dtype))
+        rows, labels = utils._compact_cce_inputs(hidden, labels.reshape((-1,)), indices)
+        head = utils._resolve_module_path(model, desc.path)
+        weight = mx.stop_gradient(head.weight) if frozen else head.weight
+        scales = biases = None
+        if desc.quantized:
+            scales, biases = head.scales, head.get("biases")
+            if biases is None and quantization["mode"] == "affine":
+                biases = mx.zeros_like(scales)
+            ce = kernel(rows, weight, scales, biases, labels)
+        else:
+            ce = kernel(rows, weight, labels)
+        summed = hidden if every_position or indices is None else rows
+        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
+        if indices is not None:
+            ce = _scatter_rows(ce, indices, targets.size)
+            if summed is rows:
+                sums = _scatter_rows(sums, indices, targets.size)
+        return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
+
+    score.vocab = desc.module.weight.shape[0]
+    score.compaction = score.vocab >= 8192
+    return score
+
+
+def _logit_totals(sums, mask, vocab):
+    pairs = sums.shape[0] // 2
+    sums = sums * mask
+    return (sums[:pairs].sum(), sums[pairs:].sum(),
+            mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
 
 
 def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
-    forward = _make_dpo_cce_forward(model)
-    loss_fn = make_dpo_loss_fn(objective, reference_policy=reference_policy, _cce_forward=forward)
-    if forward is None:
-        return loss_fn
-    loss_fn._unsloth_cce_backend = "compact-native-preference"
-    loss_fn._unsloth_cce_compaction = True
-    return loss_fn
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_dpo_loss_fn(
+        objective, reference_policy=reference_policy, _scorer=scorer,
+    ), scorer)
 
 
 _SHARED_EVAL_METRICS = (
@@ -1577,43 +1598,41 @@ def _preference_stats(
     )
 
 
-def _preference_forward(model, batch, lengths, cce_indices=None):
+def _preference_forward(model, batch, lengths):
     """Logits, per-token cross entropy, and the response mask for one batch."""
     targets = batch[:, 1:]
     logits = _model_logits(model(batch[:, :-1]))
-    if cce_indices is None:
-        ce = nn.losses.cross_entropy(logits, targets, reduction="none")
-    else:
-        safe = mx.maximum(cce_indices, 0)
-        selected = mx.take(logits.reshape((-1, logits.shape[-1])), safe, axis=0)
-        labels = mx.take(targets.reshape((-1,)), safe, axis=0)
-        values = nn.losses.cross_entropy(selected, labels, reduction="none")
-        values = mx.where(cce_indices >= 0, values, mx.array(0, values.dtype))
-        ce = mx.zeros((targets.size,), values.dtype).at[safe].add(values)
-    return logits, ce.reshape(targets.shape), _response_mask(targets, lengths)
+    ce = nn.losses.cross_entropy(
+        logits, targets, reduction="none",
+    ).reshape(targets.shape)
+    return logits, ce, _response_mask(targets, lengths)
 
 
-def _orpo_scores(model, batch, lengths, beta, *, cce_indices=None):
+def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
-    if cce_indices is not None and (
-        batch.shape[0] * (batch.shape[1] - 1) < 1024 or cce_indices.size * 4 > batch.size
-    ):
-        cce_indices = None
-    logits, ce, mask = _preference_forward(model, batch, lengths, cce_indices)
     pairs = batch.shape[0] // 2
+    nll_mask = (
+        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+    ).astype(mx.float32)
+    logits = logit_totals = None
+    if scorer is None:
+        logits, ce, mask = _preference_forward(model, batch, lengths)
+    else:
+        mask = _response_mask(batch[:, 1:], lengths)
+        # The chosen NLL spans the whole sequence, not only the response.
+        supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
+        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
+        logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
         mask.sum(axis=1), mx.array(1.0),
     )
     chosen, rejected = response_logp[:pairs], response_logp[pairs:]
-    nll_mask = (
-        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
-    ).astype(mx.float32)
     nll_tokens = nll_mask.sum()
     nll_sum = (ce[:pairs] * nll_mask).sum()
     log_odds = _orpo_log_odds(chosen, rejected)
     ratio = _log_sigmoid(log_odds)
     stats = _preference_stats(
-        "orpo", logits, mask,
+        "orpo", logits, mask, logit_totals=logit_totals,
         chosen=chosen, rejected=rejected,
         chosen_rewards=beta * chosen, rejected_rewards=beta * rejected,
         extra=(nll_sum, ratio.sum(), log_odds.sum()),
@@ -1623,30 +1642,21 @@ def _orpo_scores(model, batch, lengths, beta, *, cce_indices=None):
 
 
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
-                cce_forward=None, cce_indices=None):
-    compact = None if cce_forward is None else cce_forward(model, batch, lengths, cce_indices)
+                scorer=None, cce_indices=None):
     pairs = batch.shape[0] // 2
-    logit_totals = None
-    if compact is None:
+    logits = logit_totals = None
+    if scorer is None:
         logits, ce, mask = _preference_forward(model, batch, lengths)
     else:
-        ce, row_sums, mask = compact
-        logits = None
-        from .utils import describe_output_head
-        vocab = describe_output_head(model).module.weight.shape[0]
-        row_sums = row_sums * mask
-        logit_totals = (row_sums[:pairs].sum(), row_sums[pairs:].sum(),
-                        mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
+        mask = _response_mask(batch[:, 1:], lengths)
+        ce, sums = scorer(model, batch, mask > 0, cce_indices)
+        logit_totals = _logit_totals(sums, mask, scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
     if objective.reference_free:
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
-    elif compact is not None and type(reference_policy) is LoRAReferencePolicy:
-        def response_scorer(model, batch, lengths):
-            result = cce_forward(model, batch, lengths, cce_indices)
-            if result is None:
-                return _response_logps(model, batch, lengths)
-            reference_ce, _, reference_mask = result
-            return -(reference_ce * reference_mask).sum(axis=1)
+    elif scorer is not None and type(reference_policy) is LoRAReferencePolicy:
+        def response_scorer(model, batch, _lengths):
+            return -(scorer(model, batch, mask > 0, cce_indices)[0] * mask).sum(axis=1)
         reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
     else:
         reference = reference_policy.forward(model, batch, lengths)
@@ -1687,23 +1697,13 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     _require_reference(objective, reference_policy)
     kind = objective.kind
     beta = objective.beta
-    forward = None
-    compact = False
-    if model is not None:
-        if kind == "dpo":
-            forward = _make_dpo_cce_forward(model)
-            compact = forward is not None
-        else:
-            from .utils import describe_output_head
-            weight = getattr(describe_output_head(model).module, "weight", None)
-            compact = weight is not None and weight.shape[0] >= 8192
+    scorer = None if model is None else _make_preference_cce_scorer(model)
 
     def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None):
         pairs = batch.shape[0] // 2
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
-                model, batch, lengths, beta,
-                cce_indices=cce_indices if compact else None,
+                model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
             )
             loss = (
                 nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
@@ -1713,7 +1713,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
             terms, stats = _dpo_scores(
                 model, batch, lengths, objective,
                 reference_policy=reference_policy,
-                cce_forward=forward, cce_indices=cce_indices,
+                scorer=scorer, cce_indices=cce_indices,
             )
             loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
@@ -1721,7 +1721,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
     eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
-    eval_fn._unsloth_cce_compaction = compact
+    eval_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
     eval_fn._unsloth_cce_kind = kind
     return eval_fn
 

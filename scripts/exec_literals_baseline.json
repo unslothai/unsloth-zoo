@@ -217,6 +217,13 @@
     },
     {
       "file": "unsloth_zoo/llama_cpp.py",
+      "sink": "compile",
+      "digest": "2b2a8c0def12fefb",
+      "count": 2,
+      "reason": "Compiles a converter source only to marshal it and compare against the .pyc beside it. The result is never executed, never stored and never returned: it is dropped at the end of the comparison, which is the one thing that tells a cache Python rebuilt from that source apart from one somebody else wrote."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
       "sink": "eval",
       "digest": "48fec3bfd1611cf8",
       "count": 1,

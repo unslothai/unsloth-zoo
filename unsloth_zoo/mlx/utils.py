@@ -4307,7 +4307,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     if use_quantized:
-        from .cce import runtime_cce
+        # Absolute: a dotted relative import is unresolvable to transformers' remote-code
+        # walk. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.mlx.cce import runtime_cce
         budget = runtime_cce._CHUNK_BUDGET or runtime_cce._get_memory_budget()
         base_chunk = max(2048, (lm_layer.weight.shape[0] + 15) // 16)
         # Keep half-capacity and 256-row projections on the same vocabulary chunks.
@@ -18251,6 +18253,7 @@ def save_pretrained_gguf(
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
+        internal_scripts_dir_pin,
     )
 
     quant_map = {
@@ -18423,17 +18426,12 @@ def save_pretrained_gguf(
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        with _LLAMA_CPP_PATCHER_ENV_LOCK:
-            old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-            if old_scripts_dir is None:
-                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
-            try:
-                result = _download_convert_hf_to_gguf()
-            finally:
-                if old_scripts_dir is None:
-                    os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
-                else:
-                    os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
+        # internal_scripts_dir_pin rather than setting the variable here: this
+        # points the patcher at an install Unsloth just made, and deriving trust
+        # from the variable alone made that converter look user-pinned, which
+        # turned UNSLOTH_CONVERTER_SCAN_STRICT off for this whole path.
+        with _LLAMA_CPP_PATCHER_ENV_LOCK, internal_scripts_dir_pin(llama_cpp_folder):
+            result = _download_convert_hf_to_gguf()
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
