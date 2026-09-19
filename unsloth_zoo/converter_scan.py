@@ -166,11 +166,7 @@ RE_SECRETISH_ENV_NAME = re.compile(
     r"SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|PRIVATE", re.IGNORECASE,
 )
 
-RE_WRITE_METHOD = re.compile(
-    r"\b(?:requests|httpx)\s*\.\s*(?:post|put|patch|delete)\b"
-    r"|\b(?:session|client)\s*\.\s*(?:post|put|patch|delete)\s*\(",
-    re.IGNORECASE,
-)
+WRITE_METHODS = frozenset(("post", "put", "patch", "delete"))
 
 RE_WHOLE_ENV = re.compile(
     r"\bos\.environ\s*\.\s*copy\s*\("
@@ -179,25 +175,64 @@ RE_WHOLE_ENV = re.compile(
 )
 
 
-def _env_names_read(tree):
-    """Every environment variable name this file names as a literal."""
-    names = set()
+def _is_os_environ(node):
+    return isinstance(node, ast.Attribute) and node.attr == "environ"
+
+
+def _env_reads(tree):
+    """`(names, dynamic)` for the environment this file reads by name.
+
+    `dynamic` is set when a read names its variable at runtime, as in
+    os.environ[SECRET_NAME]. Nothing here can say which variable that is, and an
+    unattributable read used to pass the allow-list by leaving the set empty.
+
+    Only os.environ and os.getenv count. Any object's .get() used to, so an
+    ordinary config.get("API_KEY") beside a normal hub download read as an
+    environment secret and put the false positive back.
+    """
+    names, dynamic = set(), False
     for node in ast.walk(tree):
-        if isinstance(node, ast.Subscript):
-            value, index = node.value, node.slice
-            if (
-                isinstance(value, ast.Attribute) and value.attr == "environ"
-                and isinstance(index, ast.Constant) and isinstance(index.value, str)
-            ):
+        if isinstance(node, ast.Subscript) and _is_os_environ(node.value):
+            index = node.slice
+            if isinstance(index, ast.Constant) and isinstance(index.value, str):
                 names.add(index.value)
-        elif isinstance(node, ast.Call):
+            else:
+                dynamic = True
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             func = node.func
-            attr = getattr(func, "attr", None)
-            if attr in ("get", "getenv") and node.args:
+            is_env_get = func.attr == "get" and _is_os_environ(func.value)
+            is_getenv = func.attr == "getenv" and (
+                (isinstance(func.value, ast.Name) and func.value.id == "os")
+                or (isinstance(func.value, ast.Attribute) and func.value.attr == "os")
+            )
+            if not (is_env_get or is_getenv):
+                continue
+            if node.args:
                 first = node.args[0]
                 if isinstance(first, ast.Constant) and isinstance(first.value, str):
                     names.add(first.value)
-    return names
+                else:
+                    dynamic = True
+            else:
+                dynamic = True
+    return names, dynamic
+
+
+def _writes_anything(tree):
+    """Whether this file calls a write method on anything at all.
+
+    Matching only receivers spelled `session` or `client` missed
+    `s = requests.Session(); s.post(...)`, which is the writable-hub channel
+    this is here to refuse. The real gguf-py and conversion packages contain no
+    .post, .put, .patch or .delete call at all, so refusing on any receiver
+    costs nothing upstream and needs no guess about what the receiver is.
+    """
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in WRITE_METHODS
+        for node in ast.walk(tree)
+    )
 
 
 def _authority_host(authority):
@@ -243,24 +278,30 @@ def _talks_only_to_the_model_hub(text):
     if _matches(RE_HOST_BASED_NETWORK, text):
         # A destination this allowance never looks at, so it cannot vouch for it.
         return False
-    if _matches(RE_WRITE_METHOD, text) or _matches(RE_WHOLE_ENV, text):
-        # Sending TO the hub, or reading the whole environment, is not the
-        # download this allowance is for. The hub is writable and multi-tenant:
-        # a token with write scope can create a public repository there and make
-        # it a channel anyone can read back, so "the destination is the hub" is
-        # not on its own a reason to say nothing.
+    if _matches(RE_WHOLE_ENV, text):
+        # Reading the whole environment is not the token-authenticated download
+        # this allowance is for.
         return False
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False                # cannot tell, so do not suppress anything
-    secretish = {
-        name for name in _env_names_read(tree)
-        if RE_SECRETISH_ENV_NAME.search(name)
-    }
-    if not secretish <= HUB_TOKEN_ENV_NAMES:
-        # A secret that is not the hub's own token has no business going to the
-        # hub, whatever the URL says.
+    if _writes_anything(tree):
+        # Sending TO the hub is not downloading from it. The hub is writable and
+        # multi-tenant: a token with write scope can create a public repository
+        # there and make it a channel anyone can read back, so "the destination
+        # is the hub" is not on its own a reason to say nothing.
+        return False
+    names, dynamic = _env_reads(tree)
+    if dynamic:
+        # A read whose variable is chosen at runtime cannot be attributed, and
+        # an unattributable one used to pass by leaving the set empty.
+        return False
+    secretish = {name for name in names if RE_SECRETISH_ENV_NAME.search(name)}
+    if not secretish or not secretish <= HUB_TOKEN_ENV_NAMES:
+        # Positively the hub's own token, or nothing. A secret that is not the
+        # hub's has no business going there whatever the URL says, and a harvest
+        # this cannot attribute at all is not a harvest it can vouch for.
         return False
     hosts = set()
     for node in ast.walk(tree):

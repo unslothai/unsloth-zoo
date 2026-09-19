@@ -3187,23 +3187,78 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     assert _findings(
         'requests.get(HUB, headers = {"a": os.environ["AWS_SECRET_ACCESS_KEY"]})\n'
     )
-    # Nor does the whole environment.
+    # Nor does the whole environment. Tested BESIDE a legitimate hub token,
+    # because a bare dict(os.environ) names nothing and is already refused for
+    # that reason: it is the combination that needs the whole-environment check.
     assert _findings('requests.get(HUB, params = dict(os.environ))\n')
-    # httpx is a sink the network rule recognises, so its writes count too, as
-    # do the ones made through a session or client object.
-    assert [
-        f.check for f in scan_converter_source(
-            'import os\nimport httpx\n' + hub
-            + 'httpx.post(HUB, data = os.environ["HF_TOKEN"])\n'
-        )
-    ]
-    assert [
-        f.check for f in scan_converter_source(
-            'import os\nimport requests\n' + hub
-            + 'session = requests.Session()\n'
-            + 'session.put(HUB, data = os.environ["HF_TOKEN"])\n'
-        )
-    ]
+    assert _findings(
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"Authorization": os.environ["HF_TOKEN"]},\n'
+        '    params = dict(os.environ),\n'
+        ')\n'
+    )
+    assert _findings(
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"Authorization": os.environ["HF_TOKEN"]},\n'
+        '    params = os.environ.copy(),\n'
+        ')\n'
+    )
+    # httpx is a sink the network rule recognises, so its writes count too, and
+    # so do writes through a session or client object under ANY name: matching
+    # receivers spelled "session" or "client" missed s = requests.Session();
+    # s.post(...), which is the writable-hub channel this is here to refuse.
+    for extra in (
+        'import os\nimport httpx\n' + hub
+        + 'httpx.post(HUB, data = os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 's = requests.Session()\ns.post(HUB, data = os.environ["HF_TOKEN"])\n',
+        'import os\nimport httpx\n' + hub
+        + 'c = httpx.Client()\nc.put(HUB, data = os.environ["HF_TOKEN"])\n',
+    ):
+        assert [f.check for f in scan_converter_source(extra)], extra
+
+    # A read whose variable is chosen at runtime cannot be attributed to the
+    # hub's token, and an unattributable harvest used to pass by leaving the
+    # collected set empty.
+    assert _findings(
+        'SECRET = "AWS_SECRET_ACCESS_KEY"\n'
+        'requests.get(HUB, headers = {"a": os.environ[SECRET]})\n'
+    )
+    assert _findings(
+        'SECRET = "AWS_SECRET_ACCESS_KEY"\n'
+        'requests.get(HUB, headers = {"a": os.environ.get(SECRET)})\n'
+    )
+    # A dynamic read BESIDE a legitimate hub token: the collected names are then
+    # exactly the hub's own, so only the dynamic check refuses this. Without a
+    # case like it, the empty-set check covers for it and either can be removed
+    # with every test still passing.
+    assert _findings(
+        'requests.get(HUB, headers = {\n'
+        '    "Authorization": os.environ["HF_TOKEN"],\n'
+        '    "x": os.environ[OTHER],\n'
+        '})\n'
+    )
+    # And a harvest with no secret-looking name among the literals: the rule
+    # fired on the word in the comment, nothing here can say what was actually
+    # read, and an empty set is not something this can attribute to the hub.
+    assert _findings(
+        'home = os.environ["HOME"]  # not a TOKEN\n'
+        'requests.get(HUB, headers = {"a": home})\n'
+    )
+
+    # And only os.environ counts as the environment. Any object's .get() did,
+    # so an ordinary config.get("API_KEY") beside a normal hub download read as
+    # an environment secret and put the false positive straight back.
+    assert _findings(
+        'config = {}\n'
+        'k = config.get("API_KEY")\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+    assert _findings(
+        'requests.get(HUB, headers = {"a": os.getenv("HF_TOKEN")})\n'
+    ) == []
 
     # The shape upstream has: a hub token, sent as authentication, on a read.
     assert _findings(
