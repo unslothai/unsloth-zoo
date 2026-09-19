@@ -91,22 +91,65 @@ def unpatched_quantizer(monkeypatch):
 
 
 def test_an_empty_name_list_no_longer_ends_the_import(monkeypatch, unpatched_quantizer):
-    """The reported case: nothing in dir() occurs in the source."""
+    """The reported case: nothing in dir() occurs in the source.
+
+    What the fix guarantees is that no `from ... import ()` is ever built, so
+    nothing here can raise. Whether the patch then goes on to apply depends on
+    the transformers under test: a def evaluates its annotations as it runs, so
+    on a release whose signature names a type the (now empty) import would have
+    supplied, the rewritten source cannot be defined and the patch declines
+    instead. That is a decline, not an ending, and the next test pins the
+    applying half on a source that genuinely needs no names -- which this one
+    cannot do, because the real signature changes with the release.
+    """
     auto, misc, recorded, set_module_dir = unpatched_quantizer
     # PEP 562: a module may define __dir__, which is what transformers 4.55.0
     # amounted to here, without pinning an old transformers to find out.
     set_module_dir([])
     assert dir(auto) == []
 
+    # A module global shadows the builtin inside that module's functions, so
+    # this reads exactly what the patch asked to execute.
+    execd = []
+    def recording_exec(source, *args, **kwargs):
+        execd.append(source)
+        return exec(source, *args, **kwargs)
+    monkeypatch.setattr(misc, "exec", recording_exec, raising = False)
+
     misc.patch_merge_quantization_configs()
 
-    # It still patches: the import was only ever there to supply names the
-    # rewritten source needs, and an empty list means it needs none.
+    assert execd, "the rewritten source was never reached"
+    assert not any(
+        source.lstrip().startswith("from transformers.quantizers.auto import")
+        for source in execd
+    ), "an empty name list still produced an import statement"
+
+
+def merge_quantization_configs(cls, quantization_config, quantization_config_from_args):
+    """Stands in for the real classmethod, with the one property that matters:
+    nothing in its source has to be imported before it can be defined."""
+    return quantization_config
+
+
+def test_a_rewrite_that_needs_no_names_is_still_applied(monkeypatch, unpatched_quantizer):
+    """The other half of an empty name list: the import was only ever there to
+    supply names the rewritten source needs, so needing none still patches."""
+    auto, misc, recorded, set_module_dir = unpatched_quantizer
+    monkeypatch.setattr(auto.AutoHfQuantizer, ATTRIBUTE, merge_quantization_configs)
+    set_module_dir([])
+
+    misc.patch_merge_quantization_configs()
+
     assert len(recorded) == 1
     target, attribute, replacement = recorded[0]
     assert target is auto.AutoHfQuantizer
     assert attribute == ATTRIBUTE
     assert callable(replacement)
+    # The exec'd copy, not the object this file passed in: reading the patch's
+    # own globals is what the "defined something else" guard depends on.
+    assert replacement is not merge_quantization_configs
+    assert replacement.__name__ == ATTRIBUTE
+    monkeypatch.delitem(misc.__dict__, ATTRIBUTE, raising = False)
 
 
 def test_an_import_that_fails_is_reported_not_raised(monkeypatch, unpatched_quantizer):
