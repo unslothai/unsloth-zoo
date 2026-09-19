@@ -3220,5 +3220,14 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # urlsplit and httpx resolve this to evil.example, and httpx is a sink the
     # network rule already recognises, so stopping at the backslash recorded
     # only the hub and suppressed the finding.
-    backslash_url = 'r"https://huggingface.co' + chr(92) + '@evil.example/collect"'
-    assert _beside_the_hub(backslash_url)
+    # Whatever is between the scheme and the first URL delimiter has to LOOK like
+    # a hostname. Four review rounds found five spellings that ended the match
+    # early and left only the hub recorded, so the check is no longer a list of
+    # characters to stop at: user information before an @, an uppercase scheme, a
+    # bytes literal, a backslash and a space each stay inside the authority now,
+    # where they fail to look like a host and the allowance is refused. urlsplit
+    # and httpx both resolve every one of these to evil.example.
+    for separator in (chr(92), " ", chr(9), chr(10), "%20"):
+        assert _beside_the_hub(
+            '"https://huggingface.co' + separator + '@evil.example/collect"'
+        ), f"a {separator!r} in the authority must refuse the allowance"

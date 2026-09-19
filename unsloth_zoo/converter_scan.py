@@ -131,14 +131,32 @@ RE_NETWORK = re.compile(
 # refused the export.
 MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
 
-# Case-insensitive, and backslashes are part of the URL, not a place to stop.
-# requests accepts HTTPS://evil.example/collect and normalizes it, so a
-# lowercase-only pattern let a destination be spelled past this. Stopping at a
-# backslash did the same for r"https://huggingface.co\@evil.example/collect":
-# both urlsplit and httpx resolve that to evil.example, while a pattern that
-# stopped at the backslash recorded only the hub. Every one of these left a
-# lowercase hub literal in the file and sent the token somewhere else.
-RE_URL = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+# The scheme only. The authority is taken from there to the first URL delimiter
+# and then required to BE a hostname, rather than matched by a pattern that
+# tries to know where a URL ends. Four review rounds found five spellings that
+# ended it early and left only the hub recorded: user information before an @,
+# an uppercase scheme, a bytes literal, a backslash, and a space. Each is a
+# character this now keeps inside the authority, where it fails to look like a
+# hostname and the allowance is refused. Enumerating the spellings was losing;
+# saying what an allowed destination looks like is not.
+RE_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
+RE_AUTHORITY_END = re.compile(r"[/?#]")
+RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
+
+
+def _authority_host(authority):
+    """The hostname an authority names, "" when it names none, None when unclear.
+
+    Empty is the bare "https://" that upstream's metadata.py hands to startswith:
+    it names no destination, so it says nothing either way. Anything else has to
+    look like a plain host with an optional port. If it does not, this cannot say
+    where the request goes, and not knowing is not a reason to allow it.
+    """
+    if not authority:
+        return ""
+    if not RE_HOSTNAME.match(authority):
+        return None
+    return authority.split(":")[0].lower()
 
 
 def _talks_only_to_the_model_hub(text):
@@ -148,7 +166,8 @@ def _talks_only_to_the_model_hub(text):
     links upstream carries in comments do not count as destinations. Requires at
     least one hub host: a file that names no destination at all has built it
     some other way, and that is not evidence of anything except that this cannot
-    see it.
+    see it. An authority that does not look like a plain hostname refuses the
+    allowance outright, whatever it contains.
 
     This is a deliberate narrowing of a CRITICAL rule, and the evasion is not
     hypothetical: taking upstream's utility.py and changing one call to
@@ -184,17 +203,24 @@ def _talks_only_to_the_model_hub(text):
             literal = node.value
         else:
             continue
-        for url in RE_URL.findall(literal):
-            # Parsed, not split. Taking the authority up to the first colon reads
-            # https://huggingface.co:443@evil.example/collect as huggingface.co,
-            # because everything before the @ is user information: the request
-            # goes to evil.example. That spelling turned the allowance into a way
-            # to post HF_TOKEN anywhere and have this say nothing.
-            try:
-                host = urllib.parse.urlsplit(url).hostname
-            except ValueError:
+        for match in RE_URL_SCHEME.finditer(literal):
+            rest = literal[match.end():]
+            end = RE_AUTHORITY_END.search(rest)
+            if end is None:
+                # Nothing at all after the scheme: the bare "https://" upstream's
+                # metadata.py hands to startswith, which names no destination.
+                host = _authority_host(rest)
+            elif end.start() == 0:
+                # A path with no host, as in https:///collect. requests will not
+                # send that anywhere useful, but this cannot say where it goes,
+                # and not knowing is not a reason to allow it.
+                host = None
+            else:
+                host = _authority_host(rest[: end.start()])
+            if host is None:
                 return False        # cannot tell, so do not suppress anything
-            hosts.add(host.lower() if host else "")
+            if host:
+                hosts.add(host)
     return bool(hosts) and hosts <= MODEL_HUB_HOSTS
 
 
