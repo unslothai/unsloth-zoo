@@ -1925,6 +1925,10 @@ def _purge_imported_package_bytecode(llama_cpp_dir):
     """
     if not llama_cpp_dir:
         return ()
+    if scan_is_disabled():
+        # The opt-out means this does nothing, and deleting files inside a
+        # checkout the user pinned is the last thing it should still be doing.
+        return ()
     stuck = []
     for label, package_dir, recursive in _scanned_locations(llama_cpp_dir):
         stuck.extend(
@@ -2023,7 +2027,20 @@ def _conversion_sibling_info(llama_cpp_dir):
     # first export a replaced gguf module left the key unchanged and the scan
     # never re-ran while the subprocess imported it, strict mode included.
     has_conversion = os.path.isfile(init_py) and os.path.isfile(base_py)
+    # With the scan off, the digest buys nothing: it exists to decide whether to
+    # re-scan, and there is no scan. The key still has to move when a checkout is
+    # re-pulled, so it falls back to the (mtime, size) identity this used before
+    # digests, which is the cheap half of the same question. Flipping the switch
+    # changes the key regardless, because _converter_scan_mode is in it too.
+    _scan_off = scan_is_disabled()
+
     def _identity(p):
+        if _scan_off:
+            try:
+                stat = os.stat(p)
+                return (p, stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                return (p, -1, 0)
         # The bytes, not (mtime, size): a module replaced with same-sized content
         # under a preserved mtime left the key identical, so the next export
         # returned the cached converter without rescanning and the subprocess
@@ -2419,6 +2436,10 @@ def _scan_conversion_package(llama_cpp_dir):
     entrypoint puts on sys.path itself.
     """
     if not llama_cpp_dir:
+        return
+    if scan_is_disabled():
+        # Each per-file check returns early anyway, but only after the whole tree
+        # has been walked and every module read. Opting out should cost nothing.
         return
     for _label, package_dir, recursive in _scanned_locations(llama_cpp_dir):
         _scan_imported_package(package_dir, recursive = recursive)

