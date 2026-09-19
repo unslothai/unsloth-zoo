@@ -1765,8 +1765,11 @@ pass
 
 
 # Enough to cover the package a converter imports without walking a tree an
-# attacker chooses the size of.
-MAX_CONVERSION_PACKAGE_FILES = 64
+# attacker chooses the size of. Measured against llama.cpp master: conversion/
+# holds 94 modules today, so the original 64 refused the real package on every
+# export and, under UNSLOTH_CONVERTER_SCAN_STRICT, refused the export itself.
+# A cap below the thing it is meant to read is not a safety margin.
+MAX_CONVERSION_PACKAGE_FILES = 256
 # The same bound on the traversal itself. Counting only .py files bounded what
 # gets READ but not what gets WALKED: a tree with sixty modules and a million
 # empty directories never reaches the file cap, so the whole attacker-sized
@@ -1860,6 +1863,11 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None, recursive = Tru
     return stuck
 
 
+# Named for the same reason PackageWalk is: this grew a field and a positional
+# read of the old shape would have been silently wrong.
+ScanLocation = collections.namedtuple("ScanLocation", "label path recursive natives")
+
+
 def _scanned_locations(llama_cpp_dir):
     """Every place the converter can import from, as (label, directory, recursive).
 
@@ -1885,10 +1893,10 @@ def _scanned_locations(llama_cpp_dir):
     for subdir in IMPORTED_PACKAGE_SUBDIRS:
         package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
         if os.path.isdir(package_dir):
-            locations.append((subdir, package_dir, True))
+            locations.append(ScanLocation(subdir, package_dir, True, True))
     if not os.path.isdir(llama_cpp_dir):
         return locations
-    locations.append((".", llama_cpp_dir, False))
+    locations.append(ScanLocation(".", llama_cpp_dir, False, False))
     named = {subdir.split("/")[0] for subdir in IMPORTED_PACKAGE_SUBDIRS}
     try:
         with os.scandir(llama_cpp_dir) as scanner:
@@ -1900,11 +1908,14 @@ def _scanned_locations(llama_cpp_dir):
                         continue
                 except OSError:
                     continue
-                # An __init__.py is what makes a root directory a package whose
-                # code runs on import. A namespace directory imports to an empty
-                # module and executes nothing, so it is not this hazard.
-                if os.path.isfile(os.path.join(entry.path, "__init__.py")):
-                    locations.append((entry.name, entry.path, True))
+                # Every root directory, __init__.py or not. A namespace package
+                # imports to an empty module and runs nothing by itself, which is
+                # what an earlier version of this reasoned from, but
+                # `from shadow import payload` imports the SUBMODULE and that does
+                # run, so skipping these left a payload one directory deep
+                # unscanned. Measured against llama.cpp master, the largest of
+                # them holds 1432 entries and 46 modules, well inside both bounds.
+                locations.append(ScanLocation(entry.name, entry.path, True, False))
     except OSError:
         pass
     return locations
@@ -1930,13 +1941,13 @@ def _purge_imported_package_bytecode(llama_cpp_dir):
         # checkout the user pinned is the last thing it should still be doing.
         return ()
     stuck = []
-    for label, package_dir, recursive in _scanned_locations(llama_cpp_dir):
+    for location in _scanned_locations(llama_cpp_dir):
         stuck.extend(
-            f"{label}/{name}"
+            f"{location.label}/{name}"
             for name in _purge_regenerable_bytecode(
-                package_dir,
+                location.path,
                 entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
-                recursive = recursive,
+                recursive = location.recursive,
             )
         )
     return tuple(sorted(stuck))
@@ -1977,7 +1988,7 @@ def _counts_as_a_module(root, name):
     return not _has_a_source(root, name)
 
 
-def _unscannable_modules(package_dir, names):
+def _unscannable_modules(package_dir, names, natives = True):
     """The collected names Python can execute and `warn_on_suspicious_converter` cannot read.
 
     Native extensions, and bytecode with no source to rebuild it from. A cache
@@ -1988,7 +1999,10 @@ def _unscannable_modules(package_dir, names):
     found = []
     for name in names:
         suffix = os.path.splitext(name)[1].lower()
-        if suffix in NATIVE_MODULE_SUFFIXES or suffix in BYTECODE_SUFFIXES:
+        if suffix in NATIVE_MODULE_SUFFIXES:
+            if natives:
+                found.append(name)
+        elif suffix in BYTECODE_SUFFIXES:
             found.append(name)
     return found
 
@@ -2066,7 +2080,7 @@ def _conversion_sibling_info(llama_cpp_dir):
             return (p, -1, "")
     header, entries = [], []
     found_any = False
-    for subdir, package_dir, recursive in _scanned_locations(llama_cpp_dir):
+    for subdir, package_dir, recursive, _natives in _scanned_locations(llama_cpp_dir):
         if subdir == "conversion" and not has_conversion:
             # The directory exists but is not the package layout, so it is not
             # the conversion package this key has always meant.
@@ -2441,12 +2455,26 @@ def _scan_conversion_package(llama_cpp_dir):
         # Each per-file check returns early anyway, but only after the whole tree
         # has been walked and every module read. Opting out should cost nothing.
         return
-    for _label, package_dir, recursive in _scanned_locations(llama_cpp_dir):
-        _scan_imported_package(package_dir, recursive = recursive)
+    for location in _scanned_locations(llama_cpp_dir):
+        _scan_imported_package(
+            location.path, recursive = location.recursive, natives = location.natives,
+        )
 
 
-def _scan_imported_package(package_dir, recursive = True):
-    """Read every module in one imported package, or report why it could not be."""
+def _scan_imported_package(package_dir, recursive = True, natives = True):
+    """Read every module in one imported package, or report why it could not be.
+
+    `natives` is False outside the packages the converter imports by name. A
+    prebuilt install copies the bundle's own .so/.dylib/.dll into the llama.cpp
+    root and into directories beside it, so treating every native file there as
+    an opaque Python module warned on an ordinary prebuilt install and, under
+    strict mode, refused the export before the converter ran. Inside conversion/
+    or gguf-py/gguf a native file has no business being there and is still
+    reported. The cost of that line is stated plainly: a native file planted in
+    the root under exactly the name of a module the converter imports is not
+    reported, and refusing every prebuilt install is not a price worth paying for
+    it.
+    """
     # First, before the walk and long before the converter runs: bytecode that
     # came with the package executes in place of the source this scan reads, and
     # CPython's validation does not prove otherwise. Anything with a source is
@@ -2498,7 +2526,7 @@ def _scan_imported_package(package_dir, recursive = True):
             f"this scan reads",
         )
         names = names[:MAX_CONVERSION_PACKAGE_FILES]
-    opaque = _unscannable_modules(package_dir, names) + stuck_bytecode
+    opaque = _unscannable_modules(package_dir, names, natives = natives) + stuck_bytecode
     if opaque:
         # Reporting is the whole answer available here: this scan reads source,
         # and these are the files it provably cannot. Passing over them quietly
