@@ -1814,7 +1814,10 @@ def _conversion_sibling_info(llama_cpp_dir):
     )
     if names is None:
         names, complete = ["__init__.py", "base.py"], False
-    return (len(names), complete) + tuple(
+    # The header is ONE element, however much it comes to carry: callers read the
+    # per-module entries as info[1:], so widening it in place silently fed them a
+    # count or a flag where they expected a (path, digest) pair.
+    return ((len(names), complete),) + tuple(
         _identity(os.path.join(conv_dir, *name.split("/")))
         for name in names[:MAX_CONVERSION_PACKAGE_FILES]
     )

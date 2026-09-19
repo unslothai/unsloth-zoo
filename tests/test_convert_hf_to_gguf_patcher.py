@@ -433,8 +433,13 @@ def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
     sib = llama_cpp._conversion_sibling_info(resolved)
     assert sib is not None
     # By membership, not by index: the tuple now carries every module in
-    # conversion/, so the scan is re-run when any of them changes, and its first
-    # element is the file count. What this row is about is the DIRECTORY.
+    # conversion/, so the scan is re-run when any of them changes. What this row
+    # is about is the DIRECTORY.
+    # Element 0 is the header and everything after it is one module. Pinned,
+    # because widening the header in place is what silently handed this slice a
+    # bare flag where it expected a (path, digest) pair.
+    assert isinstance(sib[0], tuple), sib[0]
+    assert all(isinstance(entry, tuple) and len(entry) == 2 for entry in sib[1:]), sib
     paths = {entry[0] for entry in sib[1:]}
     assert str(conv / "base.py") in paths, paths
     assert str(conv / "__init__.py") in paths, paths
