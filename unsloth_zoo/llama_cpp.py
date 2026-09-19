@@ -1910,37 +1910,48 @@ ScanLocation = collections.namedtuple("ScanLocation", "label path recursive nati
 ScanPlan = collections.namedtuple("ScanPlan", "locations truncated")
 
 
-def _imported_top_level_names(directories):
-    """Every top-level name the converter's own sources import.
+def _imported_top_level_names(directory, only = None, recursive = False):
+    """The top-level names imported by the modules under `directory`.
 
-    `directories` is (path, only) pairs, where `only` names the files to read or
-    is None for every module in the directory.
+    `only` names the files to read, or None for every module. `recursive` walks
+    nested packages too, because `conversion/__init__.py` can import
+    `conversion.nested.mod` and that module's own imports are just as much a part
+    of what the converter runs.
 
-    The scan follows imports, so it has to know what they are. A directory beside
-    the converter is only reachable if something imports its name: llama.cpp's
-    directory is sys.path[0] for the subprocess, so a directory called gguf or
-    torch there shadows the real package, and that is worth reading. A directory
-    called scripts or examples that nothing imports is not, and reading it is how
-    an ordinary upstream clone came to be refused.
-
-    Unparseable or unreadable sources contribute nothing rather than stopping the
-    walk: those files are reported by the scan itself, and a syntax error must not
-    be a way to narrow what gets looked at. When NOTHING could be parsed, every
-    directory is taken as a candidate, so a checkout this cannot read is scanned
-    as widely as before rather than as narrowly as possible.
+    Returns None when nothing here could be parsed, which the caller reads as "do
+    not narrow anything on the strength of this": a syntax error must not be a way
+    to choose what gets looked at.
     """
-    names, parsed_any = set(), False
-    for directory, only in directories:
+    names, parsed_any, read = set(), False, 0
+    pending = [directory]
+    seen = set()
+    while pending and read < MAX_CONVERSION_PACKAGE_FILES:
+        current = pending.pop()
+        identity = _directory_identity(current)
+        if identity is not None:
+            if identity in seen:
+                continue
+            seen.add(identity)
         try:
-            with os.scandir(directory) as scanner:
-                entries = [
-                    entry for entry in scanner
-                    if entry.name.endswith(".py")
-                    and (only is None or entry.name in only)
-                ]
+            with os.scandir(current) as scanner:
+                entries = list(scanner)
         except OSError:
             continue
-        for entry in entries[:MAX_CONVERSION_PACKAGE_FILES]:
+        for entry in entries:
+            if read >= MAX_CONVERSION_PACKAGE_FILES:
+                break
+            try:
+                if recursive and entry.is_dir():
+                    if entry.name != "__pycache__":
+                        pending.append(entry.path)
+                    continue
+            except OSError:
+                continue
+            if not entry.name.endswith(".py"):
+                continue
+            if only is not None and entry.name not in only:
+                continue
+            read += 1
             try:
                 with open(entry.path, "rb") as handle:
                     source = handle.read(MAX_MODULE_BYTES)
@@ -1993,11 +2004,31 @@ def _scanned_locations(llama_cpp_dir):
     # root wholesale put `examples` back in the scan set, because llama.cpp's
     # unrelated convert_llama_ggml_to_gguf.py imports examples.convert_legacy_llama
     # and Unsloth never runs that script.
-    imported_names = _imported_top_level_names(
-        [(llama_cpp_dir, LLAMA_CPP_CONVERTER_FILENAMES + (GENERATED_CONVERTER_NAME,))]
-        + [(_path_of(label), None) for label in IMPORTED_PACKAGE_SUBDIRS
-           if os.path.isdir(_path_of(label))]
-    )
+    # Seeded from the entrypoint AND the packages it imports. Seeding from the
+    # entrypoint alone looks equivalent, since conversion/ and gguf-py/gguf are
+    # taken by name below and feed their own imports back, but it is not: a
+    # checkout whose entrypoint is missing, renamed or unparseable then yields
+    # nothing at all, and nothing means "widen to every directory". Reading the
+    # packages too is what keeps such a checkout narrow.
+    seeds = [(llama_cpp_dir, LLAMA_CPP_CONVERTER_FILENAMES + (GENERATED_CONVERTER_NAME,))]
+    seeds += [
+        (_path_of(label), None) for label in IMPORTED_PACKAGE_SUBDIRS
+        if os.path.isdir(_path_of(label))
+    ]
+    imported_names = set()
+    unreadable = True
+    for path, only in seeds:
+        # Top level only here. Each package is admitted below by name and its
+        # whole tree read there, so walking it twice bought nothing.
+        found = _imported_top_level_names(path, only = only)
+        if found is None:
+            continue
+        unreadable = False
+        imported_names |= found
+    if unreadable:
+        # Nothing could be parsed, so there is no closure to narrow by and every
+        # directory is a candidate again.
+        imported_names = None
     for label in root_labels:
         locations.append(
             ScanLocation(
@@ -2008,9 +2039,13 @@ def _scanned_locations(llama_cpp_dir):
                 (GENERATED_CONVERTER_NAME,) if label == "." else (),
             )
         )
+    # Every child directory of every import root, as candidates. Collected first
+    # and then filtered in passes, because the closure grows as it is walked: a
+    # directory admitted late can import the name of one passed over early, and a
+    # single scandir pass would have already skipped it. conversion/nested/mod.py
+    # importing a root `payload` package is exactly that shape.
+    candidates = []
     for label in root_labels:
-        if truncated:
-            break
         try:
             with os.scandir(_path_of(label)) as scanner:
                 for entry in scanner:
@@ -2024,45 +2059,56 @@ def _scanned_locations(llama_cpp_dir):
                             continue
                     except OSError:
                         continue
-                    # A directory is scanned when the converter imports its name.
-                    # Scanning every directory in the checkout instead read files
-                    # no import can reach, and measured against a real clone of
-                    # llama.cpp master that was not a theoretical cost: scripts/
-                    # server-bench.py polls a /health endpoint in a while loop and
-                    # examples/llama-eval/llama-eval.py spawns a process, so the
-                    # scan reported both on every export and
-                    # UNSLOTH_CONVERTER_SCAN_STRICT refused the export outright.
-                    # A control that rejects every clean upstream checkout is not
-                    # a control.
-                    #
-                    # Name-matched rather than skipped, because a directory called
-                    # gguf or torch beside the converter SHADOWS the real package
-                    # for the subprocess: llama.cpp's own directory is sys.path[0]
-                    # there, so it wins over site-packages. That is the case these
-                    # directories were added for, and it is the one kept.
-                    if child not in NAMED_IMPORT_PACKAGES and (
-                        imported_names is not None
-                        and entry.name not in imported_names
-                    ):
-                        continue
-                    locations.append(
-                        ScanLocation(
-                            child, entry.path, True, child in NAMED_IMPORT_PACKAGES, (),
-                        )
-                    )
-                    if len(locations) > MAX_SCAN_LOCATIONS:
-                        # One past, then trim: stopping AT the cap called a root of
-                        # exactly that many directories truncated and refused it
-                        # under strict mode, the same off-by-one the file and entry
-                        # budgets avoid by asking for one more than they keep.
-                        # Reported rather than dropped quietly, because a root wide
-                        # enough to reach this is nowhere near the entry budget that
-                        # would otherwise have said something.
-                        truncated = True
-                        locations = locations[:MAX_SCAN_LOCATIONS]
-                        break
+                    candidates.append((child, entry.name, entry.path))
         except OSError:
             continue
+
+    # A directory is scanned when the converter imports its name. Scanning every
+    # directory in the checkout instead read files no import can reach, and
+    # measured against a real clone of llama.cpp master that was not a
+    # theoretical cost: scripts/server-bench.py polls a /health endpoint in a
+    # while loop and examples/llama-eval/llama-eval.py spawns a process, so the
+    # scan reported both on every export and UNSLOTH_CONVERTER_SCAN_STRICT
+    # refused the export outright. A control that rejects every clean upstream
+    # checkout is not a control.
+    #
+    # Name-matched rather than skipped, because a directory called gguf or torch
+    # beside the converter SHADOWS the real package for the subprocess:
+    # llama.cpp's own directory is sys.path[0] there, so it wins over
+    # site-packages. That is the case these directories were added for, and it is
+    # the one kept.
+    taken = set()
+    progressed = True
+    while progressed and not truncated:
+        progressed = False
+        for child, name, path in candidates:
+            if child in taken:
+                continue
+            if child not in NAMED_IMPORT_PACKAGES and (
+                imported_names is not None and name not in imported_names
+            ):
+                continue
+            taken.add(child)
+            progressed = True
+            locations.append(
+                ScanLocation(child, path, True, child in NAMED_IMPORT_PACKAGES, ())
+            )
+            if imported_names is not None:
+                # This directory is part of what runs, so what IT imports is too.
+                reached = _imported_top_level_names(path, recursive = True)
+                if reached:
+                    imported_names |= reached
+            if len(locations) > MAX_SCAN_LOCATIONS:
+                # One past, then trim: stopping AT the cap called a root of
+                # exactly that many directories truncated and refused it under
+                # strict mode, the same off-by-one the file and entry budgets
+                # avoid by asking for one more than they keep. Reported rather
+                # than dropped quietly, because a root wide enough to reach this
+                # is nowhere near the entry budget that would otherwise have said
+                # something.
+                truncated = True
+                locations = locations[:MAX_SCAN_LOCATIONS]
+                break
     return ScanPlan(locations, truncated)
 
 

