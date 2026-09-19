@@ -1810,6 +1810,33 @@ def _bytecode_is_authoritative(path):
     return hash_based and not checks_source
 
 
+def _counts_as_a_module(root, name, names_in_dir):
+    """Whether this file is one the scan has to account for.
+
+    A .py is read; a native extension and a sourceless .pyc cannot be read and so
+    are reported. Everything else here is a bytecode cache of a .py that is
+    already counted, and those must NOT count: an ordinary export leaves one per
+    module behind, so counting them made a package of 40 modules with 25 caches
+    read as 65 files, over the cap. That is a false security warning in advisory
+    mode and, under UNSLOTH_CONVERTER_SCAN_STRICT, a refusal of every export
+    after the first, which is the one outcome this scan must never produce.
+
+    Decided here rather than after the walk because the cap stops the walk, so a
+    file that does not count must not consume the budget either.
+    """
+    suffix = os.path.splitext(name)[1].lower()
+    if suffix == ".py" or suffix in NATIVE_MODULE_SUFFIXES:
+        return True
+    if suffix not in BYTECODE_SUFFIXES:
+        return False
+    if os.path.basename(root) == "__pycache__":
+        # base.cpython-313.pyc, the compiled form of a base.py this scan reads.
+        # Only the cache CPython never checks against that source stands alone.
+        return _bytecode_is_authoritative(os.path.join(root, name))
+    # Beside its own source, so the source is what gets imported and scanned.
+    return name[: -len(suffix)] + ".py" not in names_in_dir
+
+
 def _unscannable_modules(package_dir, names):
     """The collected names Python can execute and `warn_on_suspicious_converter` cannot read."""
     sources = set(names)
@@ -2164,8 +2191,11 @@ def _conversion_package_modules(
                     continue
                 seen_directories.add(identity)
             entries += len(dirs) + len(files)
+            names_in_dir = set(files)
             for name in files:
                 if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
+                    continue
+                if not _counts_as_a_module(root, name, names_in_dir):
                     continue
                 full = os.path.join(root, name)
                 found.append(os.path.relpath(full, conversion_dir).replace(os.sep, "/"))

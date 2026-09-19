@@ -1196,6 +1196,10 @@ def test_the_cache_key_moves_when_the_bytes_do_under_a_preserved_mtime(tmp_path)
     assert llama_cpp._conversion_sibling_info(str(root)) != before
 
 
+def _pyc(flags: int) -> bytes:
+    return b"\x00" * 4 + flags.to_bytes(4, "little") + b"\x00" * 56
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"
@@ -1282,10 +1286,6 @@ def test_a_native_extension_module_is_reported(tmp_path, monkeypatch):
         llama_cpp._scan_conversion_package(str(root))
 
 
-def _pyc(flags: int) -> bytes:
-    return b"\x00" * 4 + flags.to_bytes(4, "little") + b"\x00" * 56
-
-
 @pytest.mark.parametrize(
     "flags, reported",
     [
@@ -1317,6 +1317,50 @@ def test_only_the_pycache_entry_python_never_checks_is_a_finding(
     assert any("cannot read" in r.message for r in caplog.records) is reported, (
         [r.message for r in caplog.records]
     )
+
+
+def test_ordinary_bytecode_caches_do_not_push_a_package_over_the_cap(
+    tmp_path, monkeypatch, caplog
+):
+    """Collecting .pyc for the opaque-module check made them count as modules.
+
+    An ordinary export leaves one cache per module behind, so a package of 40
+    modules with 25 caches read as 65 files and crossed the 64 cap: a false
+    security warning in advisory mode, and under strict mode a refusal of every
+    export after the first. This module's whole contract is that a false positive
+    which refuses an export is worse than the warning is a win.
+    """
+    llama_cpp = _load("llama_cpp_cache_count_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    conversion = root / "conversion"
+    for index in range(38):                      # 40 source modules in total
+        (conversion / f"mod_{index:03d}.py").write_text("V = 1\n", encoding = "utf-8")
+    cache = conversion / "__pycache__"
+    cache.mkdir()
+    for index in range(25):
+        (cache / f"mod_{index:03d}.cpython-313.pyc").write_bytes(_pyc(0))
+
+    names, _complete = llama_cpp._conversion_package_modules(str(conversion))
+    assert len(names) == 40, sorted(names)[:5]
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))     # must not raise
+    assert caplog.records == [], [r.message for r in caplog.records]
+
+
+def test_a_pyc_beside_its_own_source_is_not_a_module_of_its_own(tmp_path):
+    """Legacy layout: with base.py present, base.pyc is not what gets imported."""
+    llama_cpp = _load("llama_cpp_sibling_pyc_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    (root / "conversion" / "base.pyc").write_bytes(_pyc(0))
+
+    names, _complete = llama_cpp._conversion_package_modules(str(root / "conversion"))
+    assert sorted(names) == ["__init__.py", "base.py"], sorted(names)
 
 
 def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch, caplog):
