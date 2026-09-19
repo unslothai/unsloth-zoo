@@ -1740,6 +1740,60 @@ def test_a_checkout_with_no_readable_entrypoint_still_narrows(tmp_path):
     assert "scripts" not in labels, sorted(labels)
 
 
+def test_import_discovery_spends_one_budget_across_the_whole_walk(tmp_path, monkeypatch):
+    """Counting entries per directory bounded nothing.
+
+    The walk stops on .py files read, and a tree that branches without holding
+    any modules never advances that counter, so a per-directory budget let it be
+    traversed in full. Measured on a checkout with 14400 empty directories,
+    three and a half times the budget: all of them were walked. Nothing about
+    that shape is hard to build at a scale that stalls an export before strict
+    mode can refuse the checkout.
+    """
+    llama_cpp = _load("llama_cpp_aggregate_budget_probe", "unsloth_zoo/llama_cpp.py")
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("import gguf\n", encoding = "utf-8")
+    # Branching, not deep: every directory stays well under the per-directory
+    # budget while the tree as a whole is far over it.
+    wide = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES // 32 + 2
+    for outer in range(wide):
+        for inner in range(32):
+            (package / f"a{outer}" / f"b{inner}").mkdir(parents = True)
+
+    handed_out = {"count": 0}
+    real_scandir = os.scandir
+
+    class _Counting:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def __iter__(self):
+            for entry in self.inner:
+                handed_out["count"] += 1
+                yield entry
+
+    monkeypatch.setattr(
+        llama_cpp.os, "scandir", lambda path: _Counting(real_scandir(path))
+    )
+    names = llama_cpp._imported_top_level_names(str(package), recursive = True)
+
+    assert handed_out["count"] <= llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES + 32, (
+        f"discovery walked {handed_out['count']} entries on one budget of "
+        f"{llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES}"
+    )
+    # Stopping early must not be silent about what it did read.
+    assert names == {"gguf"} or names is None, names
+
+
 def test_the_import_closure_reads_each_package_once(tmp_path, monkeypatch):
     """conversion/ and gguf-py/gguf are both seeded and admitted by name, so
     without a guard each is parsed twice per export. On a real clone of

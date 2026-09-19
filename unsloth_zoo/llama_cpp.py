@@ -1925,7 +1925,19 @@ def _imported_top_level_names(directory, only = None, recursive = False):
     names, parsed_any, read = set(), False, 0
     pending = [directory]
     seen = set()
+    # ONE budget for the whole traversal, not one per directory. Counting per
+    # directory bounded nothing: `read` advances only for .py files, so a tree
+    # that branches without holding any modules was walked in full. A checkout
+    # with 14400 empty directories, three and a half times this budget, was
+    # traversed entirely, and nothing about that shape is hard to build at a
+    # scale that stalls the export before strict mode can refuse the checkout.
+    examined = 0
     while pending and read < MAX_CONVERSION_PACKAGE_FILES:
+        if examined > MAX_CONVERSION_PACKAGE_ENTRIES:
+            # An early exit, not the bound. The check inside the scandir loop is
+            # what stops the walk; without this the queue would still drain, one
+            # scandir per directory that breaks on its first entry.
+            break
         current = pending.pop()
         identity = _directory_identity(current)
         if identity is not None:
@@ -1934,7 +1946,6 @@ def _imported_top_level_names(directory, only = None, recursive = False):
             seen.add(identity)
         try:
             with os.scandir(current) as scanner:
-                examined = 0
                 for entry in scanner:
                     # Iterated lazily and counted, not materialized: a checkout
                     # with millions of entries in one directory would otherwise
