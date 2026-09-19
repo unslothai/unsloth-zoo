@@ -1810,6 +1810,14 @@ MODULE_READ_CHUNK = 1024 * 1024
 # clean conversion/, strict mode included.
 IMPORTED_PACKAGE_SUBDIRS = ("conversion", "gguf-py/gguf")
 
+# The directories that end up on sys.path: the converter's own, which Python puts
+# at index 0 for the subprocess, and gguf-py, which the entrypoint inserts itself.
+# Anything directly under either is importable by its own name.
+IMPORT_ROOTS = (".", "gguf-py")
+# The packages imported by name. Only in these is a native file a Python module
+# rather than one of the prebuilt bundle's runtime libraries.
+NAMED_IMPORT_PACKAGES = frozenset(IMPORTED_PACKAGE_SUBDIRS)
+
 # Files Python will execute that a source scan cannot read. Native extensions
 # are dlopened; a .pyc in a module's own place, with no source beside it, is a
 # sourceless import and CPython runs the bytecode as the module.
@@ -1891,70 +1899,88 @@ ScanPlan = collections.namedtuple("ScanPlan", "locations truncated")
 
 
 def _scanned_locations(llama_cpp_dir):
-    """Every place the converter can import from, as (label, directory, recursive).
+    """Every place the converter can import from, as a ScanPlan of ScanLocations.
 
-    The packages it imports by name, plus the directory the converter script
-    itself sits in. That last one is sys.path[0] for the subprocess and is
-    searched BEFORE the gguf-py entry the entrypoint inserts at index 1, so a
-    root-level gguf.py shadows the whole gguf package: verified directly, a
-    root gguf.py won over gguf-py/gguf/__init__.py. Scanning only the named
-    packages left that module executing under a clean entrypoint and clean
-    packages, strict mode included.
+    Two directories go on sys.path: the one the converter script sits in, which
+    Python puts at index 0 for the subprocess, and gguf-py, which the entrypoint
+    inserts at index 1 itself. Both are IMPORT ROOTS, meaning anything directly
+    under them is importable by its own name. Scanning gguf-py/gguf while leaving
+    the rest of gguf-py alone left `gguf-py/payload.py` importable as `payload`
+    from a clean-looking gguf/__init__.py, and nothing read it.
 
-    The root is walked WITHOUT recursion. Its subdirectories are the rest of the
-    llama.cpp checkout, which is enormous and none of which is importable by
-    itself; a subdirectory that IS importable, meaning it carries an __init__.py,
-    is added as its own recursive location instead.
+    Each import root contributes its own modules, walked WITHOUT recursion, and
+    each directory under it as a location of its own. The root's subdirectories
+    are the rest of the llama.cpp checkout, which is enormous and not importable
+    as one thing; walking it whole would cross every budget on an ordinary
+    install and refuse the export. A directory that is itself an import root is
+    not also taken as a child of another, so gguf-py is walked once.
 
-    One list, used by the scan and by the cache key both. Keeping two of these in
-    step by hand is what left gguf-py scanned but unkeyed earlier in this branch.
+    `natives` is true only for the packages the converter imports by name. A
+    prebuilt install copies the bundle's own .so and .dylib into the root and
+    beside it, so calling those Python modules refused every ordinary install.
+
+    One list, used by the scan, the bytecode purge and the cache key alike.
+    Keeping two of these in step by hand is what left gguf-py scanned but
+    unkeyed earlier in this branch.
     """
-    if not llama_cpp_dir:
+    if not llama_cpp_dir or not os.path.isdir(llama_cpp_dir):
         return ScanPlan([], False)
-    locations = []
-    truncated = False
-    for subdir in IMPORTED_PACKAGE_SUBDIRS:
-        package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
-        if os.path.isdir(package_dir):
-            locations.append(ScanLocation(subdir, package_dir, True, True, ()))
-    if not os.path.isdir(llama_cpp_dir):
-        return ScanPlan(locations, False)
-    # Only here, and only this name: this is where the patched converter is written.
-    locations.append(
-        ScanLocation(".", llama_cpp_dir, False, False, (GENERATED_CONVERTER_NAME,))
-    )
-    named = {subdir.split("/")[0] for subdir in IMPORTED_PACKAGE_SUBDIRS}
-    try:
-        with os.scandir(llama_cpp_dir) as scanner:
-            for entry in scanner:
-                if entry.name in named or entry.name == "__pycache__":
-                    continue
-                try:
-                    if not entry.is_dir():
+
+    def _path_of(label):
+        return llama_cpp_dir if label == "." else os.path.join(llama_cpp_dir, *label.split("/"))
+
+    locations, truncated = [], False
+    root_labels = [label for label in IMPORT_ROOTS if os.path.isdir(_path_of(label))]
+    for label in root_labels:
+        locations.append(
+            ScanLocation(
+                label,
+                _path_of(label),
+                False,
+                False,
+                (GENERATED_CONVERTER_NAME,) if label == "." else (),
+            )
+        )
+    for label in root_labels:
+        if truncated:
+            break
+        try:
+            with os.scandir(_path_of(label)) as scanner:
+                for entry in scanner:
+                    child = entry.name if label == "." else f"{label}/{entry.name}"
+                    if child in root_labels or entry.name == "__pycache__":
+                        # An import root is walked as itself, and a cache belongs
+                        # to the directory whose modules it holds.
                         continue
-                except OSError:
-                    continue
-                # Every root directory, __init__.py or not. A namespace package
-                # imports to an empty module and runs nothing by itself, which is
-                # what an earlier version of this reasoned from, but
-                # `from shadow import payload` imports the SUBMODULE and that does
-                # run, so skipping these left a payload one directory deep
-                # unscanned. Measured against llama.cpp master, the largest of
-                # them holds 1432 entries and 46 modules, well inside both bounds.
-                locations.append(ScanLocation(entry.name, entry.path, True, False, ()))
-                if len(locations) > MAX_SCAN_LOCATIONS:
-                    # One past, then trim: stopping AT the cap called a root of
-                    # exactly that many directories truncated and refused it under
-                    # strict mode, which is the same off-by-one the file and entry
-                    # budgets already avoid by asking for one more than they keep.
-                    # Reported rather than dropped quietly, because a root wide
-                    # enough to reach this is nowhere near the entry budget that
-                    # would otherwise have said something.
-                    truncated = True
-                    locations = locations[:MAX_SCAN_LOCATIONS]
-                    break
-    except OSError:
-        pass
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
+                        continue
+                    # Every directory, __init__.py or not. A namespace package
+                    # imports to an empty module and runs nothing by itself, which
+                    # is what an earlier version of this reasoned from, but
+                    # `from shadow import payload` imports the SUBMODULE and that
+                    # does run. Measured against llama.cpp master, the largest of
+                    # them holds 1432 entries and 46 modules, inside both bounds.
+                    locations.append(
+                        ScanLocation(
+                            child, entry.path, True, child in NAMED_IMPORT_PACKAGES, (),
+                        )
+                    )
+                    if len(locations) > MAX_SCAN_LOCATIONS:
+                        # One past, then trim: stopping AT the cap called a root of
+                        # exactly that many directories truncated and refused it
+                        # under strict mode, the same off-by-one the file and entry
+                        # budgets avoid by asking for one more than they keep.
+                        # Reported rather than dropped quietly, because a root wide
+                        # enough to reach this is nowhere near the entry budget that
+                        # would otherwise have said something.
+                        truncated = True
+                        locations = locations[:MAX_SCAN_LOCATIONS]
+                        break
+        except OSError:
+            continue
     return ScanPlan(locations, truncated)
 
 
