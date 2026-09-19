@@ -1919,3 +1919,41 @@ def test_a_real_shim_is_still_accepted(mod, tmp_path):
     }))
     assert mod._converter_stage_is_usable(
         str(stage), repo = "ggml-org/llama.cpp", tag = "b9000") is True
+
+
+def test_a_cached_mirror_that_lost_its_write_bit_is_restored(mod, tmp_path, monkeypatch, staging_env):
+    """Contents are not the property this function promises. A mirror made by an
+    earlier export can have had its permissions tightened, and returning it then
+    fails the patcher's write, which is the failure the mirror exists to avoid."""
+    stage = mod._stage_converter_sources("b9000")
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
+    _read_only(stage)
+    try:
+        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert mirror is not None
+        _read_only(mirror)
+        again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert again == mirror
+        assert os.access(again, os.W_OK), "an unwritable mirror was handed back"
+        Path(again, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
+    finally:
+        os.chmod(stage, 0o755)
+
+
+def test_a_mirror_whose_write_bit_cannot_be_restored_is_reported(mod, tmp_path, monkeypatch, staging_env):
+    """When the write bit cannot be put back, because the mirror belongs to another
+    user in a shared cache root, it says so instead of returning a path the patcher
+    will fail on."""
+    stage = mod._stage_converter_sources("b9000")
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
+    _read_only(stage)
+    try:
+        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        _read_only(mirror)
+        def refuse(*a, **k):
+            raise PermissionError(1, "Operation not permitted")
+        monkeypatch.setattr(mod.os, "chmod", refuse)
+        assert mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000") is None
+    finally:
+        monkeypatch.undo()
+        os.chmod(stage, 0o755)

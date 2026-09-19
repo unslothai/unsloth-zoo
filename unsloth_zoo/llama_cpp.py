@@ -2683,7 +2683,25 @@ def _writable_stage(stage_dir, repo, tag):
         default_root, os.path.basename(_converter_stage_dir(repo, tag)),
     )
     if _converter_stage_is_usable(mirror, repo = repo, tag = tag):
-        return mirror
+        # Contents are not enough: writability is the whole property this function
+        # promises, and a mirror made earlier can have lost it, to tightened
+        # permissions or to a default cache root shared with another user. Returning
+        # it then fails the patcher's write, which is the failure being avoided. The
+        # mirror is ours, so restoring our own write bit is the first thing to try.
+        if not os.access(mirror, os.W_OK):
+            try:
+                os.chmod(mirror, os.stat(mirror).st_mode | stat_module.S_IWUSR)
+            except OSError:
+                pass
+        if os.access(mirror, os.W_OK):
+            return mirror
+        logger.warning(
+            f"Unsloth: The converter sources copied to {mirror} are not writable and "
+            f"the write bit could not be restored, so the patched converter cannot be "
+            f"written there. Remove that directory, or point "
+            f"UNSLOTH_LLAMA_CPP_CONVERTER_CACHE at a writable cache."
+        )
+        return None
     logger.info(
         f"Unsloth: {stage_dir} is not writable, so its converter sources are being "
         f"copied to {mirror} once."
