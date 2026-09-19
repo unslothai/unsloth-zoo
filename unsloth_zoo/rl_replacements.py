@@ -631,7 +631,16 @@ def grpo_compute_loss(
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type in ["cispo", "dapo", "vespo"]:
-        normalizer = num_items_in_batch/ num_processes
+        # Floor the token count at 1 like TRL does. `num_items_in_batch` is the gathered sum of the
+        # loss mask, so it is 0 whenever a whole generation batch is masked out, which is what
+        # `mask_truncated_completions` does to every truncated completion. The numerator is 0 there
+        # too, and 0/0 puts a nan in the loss and in every gradient rather than the 0 that an empty
+        # batch should contribute. Every other loss type here already clamps or divides by a count
+        # that cannot reach 0.
+        if torch.is_tensor(num_items_in_batch):
+            normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
+        else:
+            normalizer = max(float(num_items_in_batch), 1.0) / num_processes
         loss = (loss_i * mask).sum() / normalizer
     elif loss_type == "luspo":
         loss = (loss_i * mask.sum(1, keepdim=True)).mean()

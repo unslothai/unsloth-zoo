@@ -475,6 +475,47 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     ), f"{loss_type}: gradient mismatch"
 
 
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+@pytest.mark.parametrize("items", [0.0, torch.tensor(0.0)], ids=["python", "tensor"])
+def test_grpo_generation_normalizer_survives_an_empty_batch(loss_type, items):
+    """A fully masked generation batch must contribute 0, not nan.
+
+    `num_items_in_batch` is the gathered sum of the loss mask, so it is 0 when every completion
+    in the batch is masked out, which is what `mask_truncated_completions` does to a batch of
+    truncated completions. The numerator is 0 too, and dividing by an unclamped 0 puts a nan in
+    the loss and in every gradient. TRL floors the same count at 1; grpo, bnpo, dr_grpo and luspo
+    already divide by something that cannot reach 0.
+    """
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+    mask = torch.zeros_like(mask)
+    kwargs["num_items_in_batch"] = items
+
+    new = new.clone().requires_grad_(True)
+    loss = rr.grpo_compute_loss(ref, new, old, None, input_ids, mask, 0.0, advantages, **kwargs)[0]
+    assert torch.isfinite(loss), f"{loss_type}: loss is {loss.item()}"
+    assert loss.item() == 0.0
+    loss.backward()
+    assert torch.isfinite(new.grad).all(), f"{loss_type}: gradient is not finite"
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+def test_grpo_generation_normalizer_unchanged_on_a_normal_batch(loss_type):
+    """The floor must only bite at 0: a real token count still divides the sum as before."""
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+    new = new.clone().requires_grad_(True)
+    loss = rr.grpo_compute_loss(ref, new, old, None, input_ids, mask, 0.04, advantages, **kwargs)[0]
+
+    expected_denominator = max(float(kwargs["num_items_in_batch"]), 1.0) / kwargs["num_processes"]
+    assert expected_denominator > 1.0
+    torch.testing.assert_close(
+        loss * expected_denominator,
+        rr.grpo_compute_loss(
+            ref, new, old, None, input_ids, mask, 0.04, advantages,
+            **{**kwargs, "num_items_in_batch": 1.0},
+        )[0],
+    )
+
+
 # Per TRL _compute_loss (main @ f782735): kl_i *= the pre-clamp non-detached coef_1,
 # before the loss_type dispatch, feeding both the beta term and the kl metric.
 
