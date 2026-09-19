@@ -2475,6 +2475,13 @@ def _scan_conversion_package(llama_cpp_dir, is_local_copy = False):
     gguf-py/gguf, which arrives in the same undigested tarball and which the
     entrypoint puts on sys.path itself.
     """
+    # Cost, measured against a tree built from llama.cpp master's real manifest
+    # (3605 files, 374 directories): about 1.3s in total, of which conversion/ is
+    # 560ms for its 94 modules and the root plus its directories are the rest.
+    # That is paid inside the cached patcher, so once per process rather than per
+    # export, and an export runs for minutes. The two things that DO run on every
+    # export are the cache key and the bytecode purge, at about 11ms together.
+    # Worth re-measuring before widening what gets scanned any further.
     if not llama_cpp_dir:
         return
     if scan_is_disabled():
