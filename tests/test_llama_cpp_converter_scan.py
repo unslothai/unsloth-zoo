@@ -3269,6 +3269,23 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
         'home = os.environ["HOME"]  # not a TOKEN\n'
         'requests.get(HUB, headers = {"a": home})\n'
     )
+    # An os.environ that is passed around rather than subscripted here reads
+    # credentials this never sees: env = os.environ then env["AWS_..."] left a
+    # short name set that satisfied the allow-list.
+    assert _findings(
+        'env = os.environ\n'
+        't = os.environ["HF_TOKEN"]\n'
+        'requests.get(HUB, headers = {"a": t, "b": env["AWS_SECRET_ACCESS_KEY"]})\n'
+    )
+    assert _findings(
+        'def f(e):\n'
+        '    return e["AWS_SECRET_ACCESS_KEY"]\n'
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"a": os.environ["HF_TOKEN"], "b": f(os.environ)},\n'
+        ')\n'
+    )
+
     # And when the collected set is genuinely EMPTY: os.environ reached through
     # a call this does not read, with the rule firing on the comment. An empty
     # set satisfies the subset check on its own, so without the emptiness test
@@ -3297,6 +3314,33 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     assert _findings(
         'requests.head(HUB, headers = {"Authorization": os.environ.get("HF_TOKEN")})\n'
     ) == []
+
+
+def test_urllib_refuses_the_hub_allowance():
+    """urllib expresses a write as Request(..., data = ...), Request(...,
+    method = "POST") or urlopen(..., data = ...). None of those is an attribute
+    called post, so the write check cannot see them, and a request sending
+    HF_TOKEN to a writable hub endpoint kept its allowance. urllib appears
+    nowhere in the real gguf-py or conversion packages, so refusing on it costs
+    nothing upstream.
+    """
+    scan_converter_source = _load(
+        "converter_scan_urllib_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    hub = 'HUB = "https://huggingface.co/api/models"\n'
+
+    for body in (
+        'urllib.request.urlopen(HUB, data = os.environ["HF_TOKEN"].encode())\n',
+        'r = urllib.request.Request(\n'
+        '    HUB, data = os.environ["HF_TOKEN"].encode(), method = "POST",\n'
+        ')\n',
+        'urllib.request.urlopen(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport urllib.request\n' + hub + body
+            )
+        ], body
 
 
 def test_the_hub_narrowing_does_not_reach_any_other_rule():

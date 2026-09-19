@@ -57,7 +57,6 @@ import ast
 import logging
 import os
 import re
-import urllib.parse
 from dataclasses import dataclass
 
 __all__ = [
@@ -144,13 +143,23 @@ RE_AUTHORITY_END = re.compile(r"[/?#]")
 RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
 
 
-# Network APIs whose destination is a bare host, not a URL. The allowance reads
-# URLs, so it can say nothing at all about these: a file could carry a hub URL
-# and open socket.create_connection(("evil.example", 443)) beside it, and the
-# allowance would call that talking only to the hub. Their presence refuses it.
-RE_HOST_BASED_NETWORK = re.compile(
+# Network APIs the allowance cannot vouch for, so their presence refuses it.
+#
+# socket and http.client name their destination as a bare host rather than a
+# URL: a file could carry a hub URL and open socket.create_connection((
+# "evil.example", 443)) beside it, and the allowance would call that talking
+# only to the hub.
+#
+# urllib is here for the other half of the question. It expresses a write as
+# Request(..., data = ...), Request(..., method = "POST") or urlopen(..., data =
+# ...), none of which is an attribute called post, so the write check below
+# cannot see them. Neither API appears anywhere in the real gguf-py or
+# conversion packages, so refusing on them costs nothing upstream.
+RE_UNVOUCHABLE_NETWORK = re.compile(
     r"\bsocket\s*\.\s*(?:socket|create_connection)\b"
-    r"|\bhttp\.client\b",
+    r"|\bhttp\.client\b"
+    r"|\burllib\.request\b"
+    r"|\burlopen\s*\(",
 )
 
 
@@ -187,8 +196,19 @@ def _env_reads(tree):
     environment secret and put the false positive back.
     """
     names, dynamic = set(), False
+    # Every os.environ in the file, and the ones this walk actually accounts
+    # for. `env = os.environ` followed by env["AWS_SECRET_ACCESS_KEY"] reads a
+    # credential this never sees, and the short name set then satisfied the
+    # allow-list. An os.environ that is passed around rather than subscripted
+    # here is a read this cannot attribute, which is the same as a dynamic one.
+    environs = {
+        id(node) for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "environ"
+    }
+    accounted = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and _is_os_environ(node.value):
+            accounted.add(id(node.value))
             index = node.slice
             if isinstance(index, ast.Constant) and isinstance(index.value, str):
                 names.add(index.value)
@@ -201,6 +221,12 @@ def _env_reads(tree):
                 (isinstance(func.value, ast.Name) and func.value.id == "os")
                 or (isinstance(func.value, ast.Attribute) and func.value.attr == "os")
             )
+            if is_env_get:
+                accounted.add(id(func.value))
+            elif _is_os_environ(func.value):
+                # .copy(), .items() and anything else: the whole environment is
+                # reachable through it and RE_WHOLE_ENV has the ones that say so.
+                accounted.add(id(func.value))
             if not (is_env_get or is_getenv):
                 continue
             if node.args:
@@ -211,6 +237,8 @@ def _env_reads(tree):
                     dynamic = True
             else:
                 dynamic = True
+    if environs - accounted:
+        dynamic = True
     return names, dynamic
 
 
@@ -271,7 +299,7 @@ def _talks_only_to_the_model_hub(text):
     the cost of an opportunistic payload and is not a boundary; this is inside
     that claim, not a departure from it.
     """
-    if _matches(RE_HOST_BASED_NETWORK, text):
+    if _matches(RE_UNVOUCHABLE_NETWORK, text):
         # A destination this allowance never looks at, so it cannot vouch for it.
         return False
     if _matches(RE_WHOLE_ENV, text):
