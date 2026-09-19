@@ -1110,7 +1110,7 @@ def _place_prebuilt_binaries(extracted_root, install_folder):
         raise RuntimeError("Unsloth: No executables found in the prebuilt archive.")
 
 
-def _hydrate_converter_sources(tag, install_folder, source_assets = None):
+def _hydrate_converter_sources(tag, install_folder, source_assets = None, checksums = None):
     """Copy convert_hf_to_gguf.py, conversion/ and gguf-py/ from the same-tag
     source tarball so check_llama_cpp and the converter machinery work
     without a git checkout, and tensor mappings match the binaries.
@@ -1121,16 +1121,44 @@ def _hydrate_converter_sources(tag, install_folder, source_assets = None):
     (llama.cpp-source-{tag}.tar.gz, passed in via source_assets) so the converter
     exactly matches the fork build; otherwise strip the -mix-... suffix and pull
     the matching upstream tag from ggml-org. Plain ggml-org tags carry no suffix,
-    so this is a no-op for them (upstream_tag == tag)."""
+    so this is a no-op for them (upstream_tag == tag).
+
+    The archive is verified against the release's own published sha256 when the
+    release publishes one for it. These are the files the converter subprocess
+    executes, and they were arriving unverified: the sha256 in
+    _stage_prebuilt_install covers the BINARY asset, and this is a second,
+    separate download. The fork's llama-prebuilt-sha256.json does carry an entry
+    for llama.cpp-source-{tag}.tar.gz, so on that path there is something to
+    check against. The ggml-org codeload fallback publishes no digest, so it is
+    reported rather than silently trusted."""
     fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
+    expected_sha256 = None
     if source_assets and fork_source_name in source_assets:
         source_url = source_assets[fork_source_name]
+        expected_sha256 = ((checksums or {}).get(fork_source_name) or {}).get("sha256")
+        if not expected_sha256:
+            logger.warning(
+                "Unsloth: The %s release publishes no sha256 for %s, so the "
+                "converter sources it holds cannot be verified.", tag, fork_source_name,
+            )
     else:
         upstream_tag = tag.split("-mix-")[0]
         source_url = LLAMA_CPP_SOURCE_TARBALL.format(tag = upstream_tag)
+        logger.warning(
+            "Unsloth: Falling back to the ggml-org source archive for %s, which "
+            "publishes no sha256, so the converter sources cannot be verified.",
+            upstream_tag,
+        )
     with tempfile.TemporaryDirectory(dir = os.path.dirname(install_folder) or ".") as source_dir:
         archive_path = os.path.join(source_dir, "source.tar.gz")
         _download_archive(source_url, archive_path)
+        if expected_sha256:
+            actual = _sha256_file(archive_path)
+            if actual != expected_sha256:
+                raise RuntimeError(
+                    f"Unsloth: sha256 mismatch for {fork_source_name}: expected "
+                    f"{expected_sha256}, got {actual}"
+                )
         extract_dir = os.path.join(source_dir, "extracted")
         os.makedirs(extract_dir)
         _extract_archive(archive_path, extract_dir)
@@ -1161,7 +1189,7 @@ def _write_prebuilt_marker(install_folder, tag, asset_name, repo = "ggml-org/lla
         logger.warning("Unsloth: Could not write prebuilt marker (%s).", e)
 
 
-def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp", source_assets = None):
+def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp", source_assets = None, checksums = None):
     """Download one prebuilt asset, verify, hydrate, validate in staging,
     then activate into llama_cpp_folder. Raises on any failure. source_assets is
     the release's asset map, used so the converter sources hydrate from the fork's
@@ -1184,7 +1212,9 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
         staged_install = os.path.join(staging, "install")
         os.makedirs(staged_install)
         _place_prebuilt_binaries(_single_extracted_root(extract_dir), staged_install)
-        _hydrate_converter_sources(tag, staged_install, source_assets = source_assets)
+        _hydrate_converter_sources(
+            tag, staged_install, source_assets = source_assets, checksums = checksums,
+        )
         _write_prebuilt_marker(staged_install, tag, asset_name, repo = repo)
         check_llama_cpp(llama_cpp_folder = staged_install)
 
@@ -1278,6 +1308,7 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
                     expected_sha256 = (checksums.get(asset_name) or {}).get("sha256"),
                     repo = repo,
                     source_assets = source_assets,
+                    checksums = checksums,
                 )
             except Exception as e:
                 logger.warning("Unsloth: Prebuilt %s failed (%s) - trying next option.", asset_name, e)
@@ -3172,10 +3203,14 @@ def _download_convert_hf_to_gguf_cached(
             log = logger,
         )
         # The package entrypoint runs `from conversion import ...` on import, so
-        # those files execute too. When they came from a verified bundle they are
-        # covered by that asset's sha256; from an unpinned `git clone` they are
-        # not, and a payload can sit in conversion/__init__.py behind a clean
-        # entrypoint.
+        # those files execute too. They are covered by a sha256 only when the
+        # release published one for the SOURCE archive they came out of, which
+        # is a second download from the one the bundle's own sha256 covers. An
+        # earlier version of this comment said the bundle's digest covered them;
+        # it does not, and until that archive was verified as well nothing did.
+        # From an unpinned `git clone`, or the ggml-org codeload fallback, there
+        # is still no digest to check, and a payload can sit in
+        # conversion/__init__.py behind a clean entrypoint.
         # Always, pinned or not. The entrypoint itself is scanned either way and
         # only the refusal is waived for a pin; skipping the sibling packages
         # entirely meant a stale or tampered conversion/ beside a pinned
