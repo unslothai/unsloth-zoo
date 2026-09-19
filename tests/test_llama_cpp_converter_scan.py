@@ -129,6 +129,41 @@ def test_clean_live_upstream_converter_has_no_findings(scan):
     )
 
 
+_LIVE_ROOT_MODULES = (
+    "convert_hf_to_gguf_update.py",
+    "convert_llama_ggml_to_gguf.py",
+    "convert_lora_to_gguf.py",
+)
+_RAW_MASTER = "https://raw.githubusercontent.com/ggml-org/llama.cpp/master/"
+
+
+@pytest.mark.parametrize("name", _LIVE_ROOT_MODULES)
+def test_clean_live_root_modules_have_no_findings(scan, name):
+    """The converter's own directory became a scanned location, so these are read.
+
+    They are upstream's other root-level scripts and had never been through the
+    patterns before. A finding on any of them warns on every GGUF export, which
+    this module treats as worse than the warning is a win, so they are held to
+    the same bar as the entrypoint itself.
+    """
+    requests = pytest.importorskip("requests")
+    try:
+        response = requests.get(_RAW_MASTER + name, timeout = 30)
+    except requests.exceptions.RequestException as exc:
+        pytest.skip(f"network unreachable: {exc}")
+    if response.status_code in (403, 429, 500, 502, 503, 504):
+        pytest.skip(f"upstream rate-limited / unavailable: HTTP {response.status_code}")
+    if response.status_code == 404:
+        pytest.skip(f"{name} is no longer at the root of llama.cpp master")
+    assert response.status_code == 200, f"{name} returned HTTP {response.status_code}"
+
+    findings = scan.scan_converter_source(response.content, name)
+    assert findings == [], (
+        f"{name} sits beside the converter and is now scanned, so this would warn on "
+        f"every GGUF export: {[(f.severity, f.check, f.evidence) for f in findings]}"
+    )
+
+
 def test_clean_ordinary_converter_shaped_script_has_no_findings(scan):
     """A converter doing normal converter things stays quiet."""
     source = b"""
