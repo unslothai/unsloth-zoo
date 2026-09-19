@@ -3269,6 +3269,26 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
         'home = os.environ["HOME"]  # not a TOKEN\n'
         'requests.get(HUB, headers = {"a": home})\n'
     )
+    # session.request("POST", ...) is a write the named methods do not cover,
+    # and only .get() accounts for an os.environ: marking every method as
+    # accounted let .values() collect the lot and .pop() take a named one.
+    assert _findings(
+        's = requests.Session()\n'
+        's.request("POST", HUB, data = os.environ["HF_TOKEN"])\n'
+    )
+    assert _findings(
+        'requests.get(HUB, params = {\n'
+        '    "a": os.environ["HF_TOKEN"],\n'
+        '    "b": list(os.environ.values()),\n'
+        '})\n'
+    )
+    assert _findings(
+        'requests.get(HUB, params = {\n'
+        '    "a": os.environ["HF_TOKEN"],\n'
+        '    "b": os.environ.pop("AWS_SECRET_ACCESS_KEY"),\n'
+        '})\n'
+    )
+
     # An os.environ that is passed around rather than subscripted here reads
     # credentials this never sees: env = os.environ then env["AWS_..."] left a
     # short name set that satisfied the allow-list.

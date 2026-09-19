@@ -171,7 +171,11 @@ HUB_TOKEN_ENV_NAMES = frozenset((
     "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN",
 ))
 
-WRITE_METHODS = frozenset(("post", "put", "patch", "delete"))
+# `request` is here because session.request("POST", ...) is a write the named
+# methods do not cover, and reading its method argument would mean following it
+# when it is not a literal. Upstream calls .request() nowhere at all, so taking
+# every one of them as a write costs nothing there.
+WRITE_METHODS = frozenset(("post", "put", "patch", "delete", "request"))
 
 RE_WHOLE_ENV = re.compile(
     r"\bos\.environ\s*\.\s*copy\s*\("
@@ -223,10 +227,11 @@ def _env_reads(tree):
             )
             if is_env_get:
                 accounted.add(id(func.value))
-            elif _is_os_environ(func.value):
-                # .copy(), .items() and anything else: the whole environment is
-                # reachable through it and RE_WHOLE_ENV has the ones that say so.
-                accounted.add(id(func.value))
+            # Only .get(). Marking every method on os.environ as accounted for
+            # let .values() collect every secret and .pop("AWS_SECRET_ACCESS_KEY")
+            # take a named one, with the collected set still reading HF_TOKEN
+            # alone. Anything else leaves that os.environ unaccounted, which
+            # makes the reads dynamic and refuses the allowance.
             if not (is_env_get or is_getenv):
                 continue
             if node.args:
