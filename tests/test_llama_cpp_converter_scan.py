@@ -1740,6 +1740,58 @@ def test_a_checkout_with_no_readable_entrypoint_still_narrows(tmp_path):
     assert "scripts" not in labels, sorted(labels)
 
 
+def test_scan_plan_discovery_is_bounded_before_it_reads_anything(tmp_path, monkeypatch):
+    """The plan is built from an unverified tree, so discovery carries its own
+    budget. Both walks materialized the directory first and applied a limit
+    afterwards, so a checkout with a very wide root would exhaust memory before
+    the cap, the truncation finding or a strict-mode refusal could say anything.
+    """
+    llama_cpp = _load("llama_cpp_discovery_bound_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    handed_out = {"count": 0}
+    real_scandir = os.scandir
+
+    class _Endless:
+        """A directory that never stops yielding entries."""
+
+        def __init__(self, path):
+            self.path = path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def __iter__(self):
+            while True:
+                handed_out["count"] += 1
+                if handed_out["count"] > llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES * 4:
+                    raise AssertionError(
+                        "discovery kept asking for entries past its budget"
+                    )
+                yield _FakeEntry(os.path.join(self.path, f"e{handed_out['count']}"))
+
+    class _FakeEntry:
+        def __init__(self, path):
+            self.path = path
+            self.name = os.path.basename(path)
+
+        def is_dir(self):
+            return False
+
+    def _fake_scandir(path):
+        if os.path.realpath(path) == os.path.realpath(str(root)):
+            return _Endless(str(root))
+        return real_scandir(path)
+
+    monkeypatch.setattr(llama_cpp.os, "scandir", _fake_scandir)
+    plan = llama_cpp._scanned_locations(str(root))
+    assert plan.truncated is True, "a root this wide has to be reported, not walked"
+    assert handed_out["count"] <= llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES * 4
+
+
 def test_a_directory_admitted_late_can_still_reach_an_earlier_one(tmp_path):
     """The closure grows as it is walked, so one scandir pass is not enough: a
     directory admitted late imports the name of one that was already passed over,
@@ -2094,13 +2146,24 @@ def test_the_roots_own_bytecode_cache_is_not_skipped(tmp_path, monkeypatch):
     assert llama_cpp._purge_imported_package_bytecode(str(root)) == ()
     assert not planted.exists(), "the root's own cache was never reached"
 
-    # A sourceless one there cannot be rebuilt, so it is reported instead.
+    # A sourceless one HERE is not importable, so it is not code that runs and
+    # not a finding: CPython loads a sourceless cache only from the legacy
+    # location. Verified directly, with the source deleted: importing it raises
+    # ModuleNotFoundError, while the same bytes at the legacy path import and
+    # run. Reporting it refused an export over the leftovers of an ordinary
+    # upstream update that deleted a module.
     orphan = cache / "nosource.cpython-313.pyc"
     orphan.write_bytes(_pyc(0))
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    llama_cpp._scan_conversion_package(str(root))
+    assert orphan.exists()
+
+    # The legacy layout is importable, and is still reported.
+    legacy = root / "nosource.pyc"
+    legacy.write_bytes(_pyc(0))
     with pytest.raises(llama_cpp.ConverterScanError, match = "cannot read"):
         llama_cpp._scan_conversion_package(str(root))
-    assert orphan.exists()
+    assert legacy.exists()
 
 
 @pytest.mark.parametrize(

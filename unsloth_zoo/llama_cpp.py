@@ -1934,36 +1934,46 @@ def _imported_top_level_names(directory, only = None, recursive = False):
             seen.add(identity)
         try:
             with os.scandir(current) as scanner:
-                entries = list(scanner)
+                examined = 0
+                for entry in scanner:
+                    # Iterated lazily and counted, not materialized: a checkout
+                    # with millions of entries in one directory would otherwise
+                    # exhaust memory here, before any budget was consulted, and
+                    # this runs on a tree nothing has verified yet.
+                    examined += 1
+                    if examined > MAX_CONVERSION_PACKAGE_ENTRIES:
+                        break
+                    if read >= MAX_CONVERSION_PACKAGE_FILES:
+                        break
+                    try:
+                        if recursive and entry.is_dir():
+                            if entry.name != "__pycache__":
+                                pending.append(entry.path)
+                            continue
+                    except OSError:
+                        continue
+                    if not entry.name.endswith(".py"):
+                        continue
+                    if only is not None and entry.name not in only:
+                        continue
+                    read += 1
+                    try:
+                        with open(entry.path, "rb") as handle:
+                            source = handle.read(MAX_MODULE_BYTES)
+                        tree = ast.parse(source, entry.path)
+                    except (OSError, SyntaxError, ValueError, RecursionError, MemoryError):
+                        continue
+                    parsed_any = True
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            names.update(alias.name.split(".")[0] for alias in node.names)
+                        elif (
+                            isinstance(node, ast.ImportFrom)
+                            and node.module and not node.level
+                        ):
+                            names.add(node.module.split(".")[0])
         except OSError:
             continue
-        for entry in entries:
-            if read >= MAX_CONVERSION_PACKAGE_FILES:
-                break
-            try:
-                if recursive and entry.is_dir():
-                    if entry.name != "__pycache__":
-                        pending.append(entry.path)
-                    continue
-            except OSError:
-                continue
-            if not entry.name.endswith(".py"):
-                continue
-            if only is not None and entry.name not in only:
-                continue
-            read += 1
-            try:
-                with open(entry.path, "rb") as handle:
-                    source = handle.read(MAX_MODULE_BYTES)
-                tree = ast.parse(source, entry.path)
-            except (OSError, SyntaxError, ValueError, RecursionError, MemoryError):
-                continue
-            parsed_any = True
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    names.update(alias.name.split(".")[0] for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                    names.add(node.module.split(".")[0])
     return None if not parsed_any else names
 
 
@@ -2048,7 +2058,17 @@ def _scanned_locations(llama_cpp_dir):
     for label in root_labels:
         try:
             with os.scandir(_path_of(label)) as scanner:
+                examined = 0
                 for entry in scanner:
+                    # Counted as they arrive. Collecting every child first and
+                    # capping afterwards meant a downloaded tree with millions of
+                    # entries in its root exhausted memory before the cap, the
+                    # truncation finding or a strict-mode refusal could say
+                    # anything at all.
+                    examined += 1
+                    if examined > MAX_CONVERSION_PACKAGE_ENTRIES:
+                        truncated = True
+                        break
                     child = entry.name if label == "." else f"{label}/{entry.name}"
                     if child in root_labels or entry.name == "__pycache__":
                         # An import root is walked as itself, and a cache belongs
@@ -2269,6 +2289,14 @@ def _counts_as_a_module(root, name, purged = True, verify = True):
     # every export of a tree shaped like llama.cpp master.
     source = _source_beside(root, name)
     if source is None:
+        if os.path.basename(root) == "__pycache__":
+            # Not importable, so not code that runs. CPython loads a sourceless
+            # cache only from the legacy location, mod.pyc in the package
+            # directory itself; a __pycache__ entry whose .py is gone is dead
+            # weight an upstream update leaves behind. Verified directly: with
+            # the source deleted, importing it raises ModuleNotFoundError, while
+            # the same bytes copied to the legacy path import and run.
+            return False
         return True                 # nothing could rebuild it: reported
     if purged:
         return False                # deleted before the converter runs
