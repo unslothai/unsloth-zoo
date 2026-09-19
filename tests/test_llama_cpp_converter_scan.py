@@ -2131,6 +2131,72 @@ def test_an_unreadable_or_unparseable_pinned_cache_is_reported(tmp_path):
     ) is True
 
 
+def test_a_top_level_symlink_does_not_become_its_own_purge_boundary(
+    tmp_path, monkeypatch
+):
+    """Containment was measured from each scan location, and _scanned_locations
+    promotes every top-level directory to a location of its own. A checkout
+    carrying a symlink at one of them therefore measured containment from the
+    link's target, which makes that target internal by construction: someone
+    else's source tree had its caches deleted. The boundary is the checkout.
+    """
+    llama_cpp = _load("llama_cpp_top_level_escape_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    outside = tmp_path / "somebody-elses-project"
+    (outside / "__pycache__").mkdir(parents = True)
+    (outside / "mod.py").write_text("X = 1\n", encoding = "utf-8")
+    theirs = outside / "__pycache__" / "mod.cpython-313.pyc"
+    theirs.write_bytes(_pyc(0))
+    try:
+        # A location of its own, unlike a link buried inside conversion/.
+        (root / "linked").symlink_to(outside, target_is_directory = True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this filesystem does not allow creating directory symlinks")
+    assert any(
+        location.label == "linked"
+        for location in llama_cpp._scanned_locations(str(root)).locations
+    ), "this test is only meaningful while the link is promoted to a location"
+
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    llama_cpp._purge_imported_package_bytecode(str(root))
+    assert theirs.exists(), "the purge reached outside the checkout it was given"
+
+    # And through the scan, which purges per location on its own way in.
+    llama_cpp._scan_conversion_package(str(root))
+    assert theirs.exists(), "the per-location purge reached outside the checkout"
+
+
+def test_a_pins_bytecode_travels_in_the_patcher_cache_key(tmp_path, monkeypatch):
+    """A pin's caches are deliberately left in place, so they are part of what the
+    converter subprocess executes. Left out of the key, a cache changed after the
+    first export returned the patcher from cache, skipped the scan entirely, and
+    ran with nothing said.
+    """
+    llama_cpp = _load("llama_cpp_pin_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    source = root / "conversion" / "base.py"
+    cache = _real_cache(source)
+
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    before = llama_cpp._conversion_sibling_info(str(root), is_local_copy = True)
+    cache.write_bytes(
+        cache.read_bytes()[:16] + marshal.dumps(
+            compile("PWNED = 1\n", str(source), "exec", dont_inherit = True),
+        )
+    )
+    after = llama_cpp._conversion_sibling_info(str(root), is_local_copy = True)
+    assert before != after, "the key did not move when the pinned cache changed"
+
+    # A downloaded checkout purges instead, so its caches are gone before the key
+    # is built and carrying them would only churn it.
+    downloaded = llama_cpp._conversion_sibling_info(str(root), is_local_copy = False)
+    assert not any(
+        ".pyc" in entry[0] for entry in downloaded[1:]
+    ), downloaded
+
+
 def test_the_purge_does_not_follow_a_symlink_out_of_the_tree(tmp_path, monkeypatch):
     """The scan follows a symlink out of the package because the converter's
     import would, and reading is harmless. Deleting is not: a checkout can carry

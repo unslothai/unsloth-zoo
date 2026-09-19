@@ -1827,7 +1827,9 @@ BYTECODE_SUFFIXES = (".pyc", ".pyo")
 COLLECTED_MODULE_SUFFIXES = (".py",) + BYTECODE_SUFFIXES + NATIVE_MODULE_SUFFIXES
 
 
-def _purge_regenerable_bytecode(package_dir, entry_limit = None, recursive = True):
+def _purge_regenerable_bytecode(
+    package_dir, entry_limit = None, recursive = True, boundary = None,
+):
     """Delete bytecode caches that came with an unverified package.
 
     CPython's cache validation proves that a .pyc CLAIMS to belong to the source
@@ -1875,7 +1877,7 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None, recursive = Tru
                             # unrelated directory, and removing caches there would
                             # rewrite something that has nothing to do with this
                             # export, before strict mode ever gets to refuse.
-                            if not _stays_within(package_dir, entry.path):
+                            if not _stays_within(boundary or package_dir, entry.path):
                                 continue
                             if recursive:
                                 pending.append(entry.path)
@@ -2026,6 +2028,12 @@ def _purge_imported_package_bytecode(llama_cpp_dir, is_local_copy = False):
                 location.path,
                 entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
                 recursive = location.recursive,
+                # The checkout, not this location. _scanned_locations promotes a
+                # top-level directory symlink to a location of its own, and
+                # containment measured from there calls the symlink's target
+                # internal: a checkout carrying a link to someone's source tree
+                # had that tree's caches deleted.
+                boundary = llama_cpp_dir,
             )
         )
     return tuple(sorted(stuck))
@@ -2114,7 +2122,7 @@ def _has_a_source(root, name):
     return _source_beside(root, name) is not None
 
 
-def _counts_as_a_module(root, name, purged = True):
+def _counts_as_a_module(root, name, purged = True, verify = True):
     """Whether this file is one the scan has to account for.
 
     A .py is read; a native extension and a sourceless .pyc cannot be read and so
@@ -2148,6 +2156,13 @@ def _counts_as_a_module(root, name, purged = True):
         return True                 # nothing could rebuild it: reported
     if purged:
         return False                # deleted before the converter runs
+    if not verify:
+        # The cache key asks a different question: not "is this a finding" but
+        # "has anything the converter will execute changed since the last scan".
+        # Every cache a pin keeps answers that one, and answering it by compiling
+        # each source would put the scan's cost on every export instead of on
+        # the cache miss.
+        return True
     # Left in place, so it is what executes. Reported only when it disagrees with
     # the source that was scanned, which is the difference between a finding and
     # an ordinary working tree.
@@ -2173,7 +2188,7 @@ def _unscannable_modules(package_dir, names, natives = True):
     return found
 
 
-def _conversion_sibling_info(llama_cpp_dir):
+def _conversion_sibling_info(llama_cpp_dir, is_local_copy = False):
     """Hashable (path, digest) pairs for EVERY module the converter imports,
     folded into the patcher cache key so re-pulled checkouts re-patch and
     re-scan. None only when there is nothing on disk to look at.
@@ -2260,6 +2275,17 @@ def _conversion_sibling_info(llama_cpp_dir):
             entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
             recursive = recursive,
             skip_names = location.skip,
+            # A pin's caches are deliberately left in place, so they are part of
+            # what the next converter subprocess executes. Left out of the key,
+            # a cache that changed after the first export returned the patcher
+            # from cache, skipped the scan, and ran unreported. Not verified
+            # here, only identified: the key has to move when they change, and
+            # deciding whether a change is a finding is the scan's job. Both
+            # answer the question, but this walk runs on every export, and on a
+            # tree shaped like llama.cpp master verifying costs 59ms against 6ms
+            # for identifying.
+            purged = not is_local_copy,
+            verify = False,
         )
         names = walk.names if walk.names is not None else ["__init__.py", "base.py"]
         # The unreadable directories travel too: one becoming readable, or a new
@@ -2522,6 +2548,7 @@ def _conversion_package_modules(
     recursive = True,
     skip_names = (),
     purged = True,
+    verify = True,
 ):
     """`(names, complete)` for the .py files under `conversion_dir`, nested included.
 
@@ -2596,7 +2623,9 @@ def _conversion_package_modules(
                         continue      # this scan's own output, where it writes it
                     if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
                         continue
-                    if not _counts_as_a_module(root, name, purged = purged):
+                    if not _counts_as_a_module(
+                        root, name, purged = purged, verify = verify,
+                    ):
                         continue
                     found.append(
                         os.path.relpath(entry.path, conversion_dir).replace(os.sep, "/")
@@ -2658,12 +2687,13 @@ def _scan_conversion_package(llama_cpp_dir, is_local_copy = False):
             natives = location.natives,
             is_local_copy = is_local_copy,
             skip_names = location.skip,
+            boundary = llama_cpp_dir,
         )
 
 
 def _scan_imported_package(
     package_dir, recursive = True, natives = True, is_local_copy = False,
-    skip_names = (),
+    skip_names = (), boundary = None,
 ):
     """Read every module in one imported package, or report why it could not be.
 
@@ -2688,6 +2718,7 @@ def _scan_imported_package(
         package_dir,
         entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
         recursive = recursive,
+        boundary = boundary,
     )
     # One past each cap: enough to establish it was crossed, and no more. Both
     # limits, because stopping AT the limit reports a package of exactly that
@@ -2878,7 +2909,7 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     return _download_convert_hf_to_gguf_cached(
         name,
         local_script_info,
-        _conversion_sibling_info(_llama_cpp_dir),
+        _conversion_sibling_info(_llama_cpp_dir, is_local_copy = trusted_local),
         _converter_scan_mode(),
         trusted_local,
         stuck_bytecode,
