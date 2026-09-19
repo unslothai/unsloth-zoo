@@ -10,6 +10,10 @@ import mlx.nn as nn
 import mlx.utils
 import numpy as np
 
+# Absolute, like the other cce imports in this package: transformers' remote-code walk
+# turns `from .cce.runtime_cce import x` into unsloth_zoo/mlx/cce.runtime_cce.py and dies
+# on the missing file. See tests/test_relative_imports_resolve.py.
+from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap, _chunk_matmul, _resolve_chunk_size
 from .utils import (
     _FiniteVisitMixin,
     _encode_mlx_prompt_completion,
@@ -627,7 +631,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     __slots__ = (
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
-        "_visit_seed", "_visit_epoch_cache",
+        "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
     )
 
     def __init__(
@@ -640,6 +644,8 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self.max_seq_length = int(max_seq_length)
         self.pad_id = int(pad_id)
         self._shape_plan = None
+        self._cce_capacities = {}
+        self._cce_kind = "dpo"
         self._visit_policy = "identity"
         self._visit_seed = None
         self._visit_epoch_cache = None
@@ -690,6 +696,53 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
+
+    def configure_cce_compaction(self, enabled=True, *, kind="dpo"):
+        self._cce_capacities = {}
+        self._cce_kind = kind
+        if not enabled:
+            return
+        counts = {}
+        for index, row_indices in enumerate(self._schedule):
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                count = 0
+                for row_index in row_indices:
+                    row = self._rows[row_index]
+                    for branch, (values, prompt) in enumerate((
+                        (row.chosen, len(row.chosen_prompt_ids)),
+                        (row.rejected, len(row.rejected_prompt_ids)),
+                    )):
+                        start = 1 if kind == "orpo" and branch == 0 else max(1, prompt)
+                        count += max(0, min(len(values), width, self.max_seq_length) - start)
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            if capacity < family[1][0][0] * (width - 1):
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = batch[0].shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        rows = [self._rows[i] for i in self._schedule[index]]
+        for branch in (0, 1):
+            for offset, row in enumerate(rows):
+                values, prompt = ((row.chosen, len(row.chosen_prompt_ids)) if branch == 0 else
+                                  (row.rejected, len(row.rejected_prompt_ids)))
+                end = min(len(values), width, self.max_seq_length)
+                start = 1 if self._cce_kind == "orpo" and branch == 0 else max(1, prompt)
+                selected.extend((offset + branch * len(rows)) * (width - 1) + step - 1
+                                for step in range(start, end))
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch, mx.array(indices))
 
     def materialize(self, index, *, phase=None):
         indices = self._schedule[index]
@@ -884,14 +937,14 @@ def _require_reference(objective, reference_policy):
         )
 
 
-def make_orpo_loss_fn(objective):
+def make_orpo_loss_fn(objective, *, _scorer=None):
     """Create an ORPO loss with exact logical-window normalization."""
     _require_kind(objective, "orpo")
     beta = objective.beta
 
-    def loss_fn(model, batch, lengths, normalizers):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
         nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
-            model, batch, lengths, beta,
+            model, batch, lengths, beta, scorer=_scorer, cce_indices=cce_indices,
         )
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * (
@@ -906,6 +959,18 @@ def make_orpo_loss_fn(objective):
     loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["orpo"]
     loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["orpo"]
     loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["orpo"]
+    return loss_fn
+
+
+def make_orpo_cce_loss_fn(model, objective):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_orpo_loss_fn(objective, _scorer=scorer), scorer)
+
+
+def _mark_cce_loss(loss_fn, scorer):
+    if scorer is not None:
+        loss_fn._unsloth_cce_backend = "runtime-cce"
+        loss_fn._unsloth_cce_compaction = scorer.compaction
     return loss_fn
 
 
@@ -974,7 +1039,7 @@ class LoRAReferencePolicy:
         self.modules = tuple(modules)
         self.neftune_modules = tuple(neftune_modules)
 
-    def forward(self, model, batch, lengths):
+    def forward(self, model, batch, lengths, *, response_scorer=None):
         scales = [module.scale for module in self.modules]
         noise = [
             getattr(module, "_neftune_noise_enabled", True)
@@ -985,7 +1050,8 @@ class LoRAReferencePolicy:
                 module.scale = 0.0
             for module in self.neftune_modules:
                 module._neftune_noise_enabled = False
-            values = _response_logps(model, batch, lengths)
+            scorer = _response_logps if response_scorer is None else response_scorer
+            values = scorer(model, batch, lengths)
             return mx.stop_gradient(values)
         finally:
             for module, scale in zip(self.modules, scales):
@@ -1267,13 +1333,14 @@ def _dpo_pair_loss(objective, terms):
     return total
 
 
-def make_dpo_loss_fn(objective, *, reference_policy=None):
+def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
     _require_kind(objective, "dpo")
     _require_reference(objective, reference_policy)
 
-    def loss_fn(model, batch, lengths, normalizers):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
         terms, stats = _dpo_scores(
             model, batch, lengths, objective, reference_policy=reference_policy,
+            scorer=_scorer, cce_indices=cce_indices,
         )
         pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
@@ -1287,6 +1354,119 @@ def make_dpo_loss_fn(objective, *, reference_policy=None):
     loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
     loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
     return loss_fn
+
+
+def _scatter_rows(values, indices, size):
+    values = mx.where(indices >= 0, values, mx.array(0, values.dtype))
+    return mx.zeros((size,), values.dtype).at[mx.maximum(indices, 0)].add(values)
+
+
+def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
+    """Each row's logits summed over the vocabulary, one vocabulary chunk at a time.
+
+    Uncapped logits are linear in the head, so their sum projects onto the summed
+    weight rows; a softcap needs the logits themselves.
+    """
+    vocab = weight.shape[0]
+    # Without a softcap a chunk holds weight rows, not a row of logits per token.
+    step = _resolve_chunk_size(
+        0, hidden.shape[0] if softcap else hidden.shape[-1], vocab,
+    )
+    total = 0.0
+    for start in range(0, vocab, step):
+        chunk = [None if value is None else value[start:start + step]
+                 for value in (weight, scales, biases)]
+        if softcap:
+            logits = _chunk_matmul(hidden, chunk[0], scales=chunk[1], biases=chunk[2],
+                                   **quantization)
+            total = total + _apply_softcap(logits.astype(mx.float32), softcap).sum(axis=-1)
+        elif scales is not None:
+            total = total + mx.dequantize(*chunk, **quantization).astype(mx.float32).sum(axis=0)
+        else:
+            total = total + chunk[0].astype(mx.float32).sum(axis=0)
+    return total if softcap else hidden.astype(mx.float32) @ total
+
+
+def _make_preference_cce_scorer(model):
+    """Score preference positions from hidden states through runtime CCE.
+
+    Returns None unless the hidden states are reachable and the head is an
+    unwrapped, bias-free dense or frozen quantized projection.
+    """
+    from . import utils
+
+    tm = utils._get_text_model(model)
+    if getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model):
+        return None
+    desc = utils.describe_output_head(model)
+    if utils._cce_head_ineligibility(desc) is not None:
+        return None
+    scale, problem = utils._detect_head_transform(model, desc.status)
+    softcap, softcap_problem = utils._detect_logit_softcap(model)
+    if problem is not None or softcap_problem is not None:
+        return None
+    quantization = {}
+    if desc.quantized:
+        # The quantized kernel returns no weight gradient.
+        if desc.module.trainable_parameters():
+            return None
+        quantization = dict(group_size=getattr(desc.module, "group_size", 64),
+                            bits=getattr(desc.module, "bits", 4),
+                            mode=getattr(desc.module, "mode", "affine"))
+    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
+                                    quantized=desc.quantized, **quantization)
+    frozen = not utils._is_lm_head_trainable(model)
+
+    def score(model, batch, supervised, indices=None, *, every_position=False):
+        """Token cross entropy and logit sums per position, as float32 grids.
+
+        Cross entropy is zero outside ``supervised``. ``indices`` limits the
+        kernel to those rows, which then also limits the logit sums unless
+        ``every_position``.
+        """
+        targets = batch[:, 1:]
+        hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
+        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        if scale is not None:
+            hidden = hidden * scale
+        labels = utils._normalize_cce_label_dtype(targets)
+        labels = mx.where(supervised, labels, mx.array(-100, labels.dtype))
+        rows, labels = utils._compact_cce_inputs(hidden, labels.reshape((-1,)), indices)
+        head = utils._resolve_module_path(model, desc.path)
+        weight = mx.stop_gradient(head.weight) if frozen else head.weight
+        scales = biases = None
+        if desc.quantized:
+            scales, biases = head.scales, head.get("biases")
+            if biases is None and quantization["mode"] == "affine":
+                biases = mx.zeros_like(scales)
+            ce = kernel(rows, weight, scales, biases, labels)
+        else:
+            ce = kernel(rows, weight, labels)
+        summed = hidden if every_position or indices is None else rows
+        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
+        if indices is not None:
+            ce = _scatter_rows(ce, indices, targets.size)
+            if summed is rows:
+                sums = _scatter_rows(sums, indices, targets.size)
+        return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
+
+    score.vocab = desc.module.weight.shape[0]
+    score.compaction = score.vocab >= 8192
+    return score
+
+
+def _logit_totals(sums, mask, vocab):
+    pairs = sums.shape[0] // 2
+    sums = sums * mask
+    return (sums[:pairs].sum(), sums[pairs:].sum(),
+            mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
+
+
+def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_dpo_loss_fn(
+        objective, reference_policy=reference_policy, _scorer=scorer,
+    ), scorer)
 
 
 _SHARED_EVAL_METRICS = (
@@ -1382,13 +1562,15 @@ PREFERENCE_EVAL_STATS_WIDTH = {
 
 def _preference_stats(
     kind, logits, mask, *, chosen, rejected, chosen_rewards, rejected_rewards,
-    extra=(), extra_denominators=(),
+    extra=(), extra_denominators=(), logit_totals=None,
 ):
     """Numerators then denominators, all sums, so a window average is exact."""
     pairs = chosen.shape[0]
     # TRL is inconsistent between its trainers: DPOTrainer averages its logit
     # metric over completion positions, ORPOTrainer over the whole sequence.
-    if kind == "orpo":
+    if logit_totals is not None:
+        chosen_logits, rejected_logits, chosen_count, rejected_count = logit_totals
+    elif kind == "orpo":
         chosen_logits, chosen_count = _orpo_logit_sum(logits[:pairs])
         rejected_logits, rejected_count = _orpo_logit_sum(logits[pairs:])
     else:
@@ -1426,23 +1608,31 @@ def _preference_forward(model, batch, lengths):
     return logits, ce, _response_mask(targets, lengths)
 
 
-def _orpo_scores(model, batch, lengths, beta):
+def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
-    logits, ce, mask = _preference_forward(model, batch, lengths)
     pairs = batch.shape[0] // 2
+    nll_mask = (
+        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+    ).astype(mx.float32)
+    logits = logit_totals = None
+    if scorer is None:
+        logits, ce, mask = _preference_forward(model, batch, lengths)
+    else:
+        mask = _response_mask(batch[:, 1:], lengths)
+        # The chosen NLL spans the whole sequence, not only the response.
+        supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
+        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
+        logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
         mask.sum(axis=1), mx.array(1.0),
     )
     chosen, rejected = response_logp[:pairs], response_logp[pairs:]
-    nll_mask = (
-        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
-    ).astype(mx.float32)
     nll_tokens = nll_mask.sum()
     nll_sum = (ce[:pairs] * nll_mask).sum()
     log_odds = _orpo_log_odds(chosen, rejected)
     ratio = _log_sigmoid(log_odds)
     stats = _preference_stats(
-        "orpo", logits, mask,
+        "orpo", logits, mask, logit_totals=logit_totals,
         chosen=chosen, rejected=rejected,
         chosen_rewards=beta * chosen, rejected_rewards=beta * rejected,
         extra=(nll_sum, ratio.sum(), log_odds.sum()),
@@ -1451,12 +1641,23 @@ def _orpo_scores(model, batch, lengths, beta):
     return nll_sum, nll_tokens, ratio, stats
 
 
-def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
-    logits, ce, mask = _preference_forward(model, batch, lengths)
+def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
+                scorer=None, cce_indices=None):
     pairs = batch.shape[0] // 2
+    logits = logit_totals = None
+    if scorer is None:
+        logits, ce, mask = _preference_forward(model, batch, lengths)
+    else:
+        mask = _response_mask(batch[:, 1:], lengths)
+        ce, sums = scorer(model, batch, mask > 0, cce_indices)
+        logit_totals = _logit_totals(sums, mask, scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
     if objective.reference_free:
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
+    elif scorer is not None and type(reference_policy) is LoRAReferencePolicy:
+        def response_scorer(model, batch, _lengths):
+            return -(scorer(model, batch, mask > 0, cce_indices)[0] * mask).sum(axis=1)
+        reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
     else:
         reference = reference_policy.forward(model, batch, lengths)
     if objective.length_normalized:
@@ -1469,7 +1670,7 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
     # TRL adds the rewards once per loss entry, so a two-entry list reports twice
     # a one-entry list; summed in its order, not scaled by the summed weights.
     stats = _preference_stats(
-        "dpo", logits, mask,
+        "dpo", logits, mask, logit_totals=logit_totals,
         chosen=chosen, rejected=rejected,
         chosen_rewards=_weighted_rewards(
             beta * (chosen - ref_chosen), objective.weights),
@@ -1486,7 +1687,7 @@ def _dpo_scores(model, batch, lengths, objective, *, reference_policy):
     return terms, stats
 
 
-def make_preference_eval_fn(objective, *, reference_policy=None):
+def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     """Score one preference batch as ``(loss, pairs, stats)``.
 
     ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
@@ -1496,12 +1697,13 @@ def make_preference_eval_fn(objective, *, reference_policy=None):
     _require_reference(objective, reference_policy)
     kind = objective.kind
     beta = objective.beta
+    scorer = None if model is None else _make_preference_cce_scorer(model)
 
-    def eval_fn(model, batch, lengths, _normalizers=None):
+    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None):
         pairs = batch.shape[0] // 2
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
-                model, batch, lengths, beta,
+                model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
             )
             loss = (
                 nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
@@ -1511,6 +1713,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None):
             terms, stats = _dpo_scores(
                 model, batch, lengths, objective,
                 reference_policy=reference_policy,
+                scorer=scorer, cce_indices=cce_indices,
             )
             loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
@@ -1518,6 +1721,8 @@ def make_preference_eval_fn(objective, *, reference_policy=None):
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
     eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
+    eval_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
+    eval_fn._unsloth_cce_kind = kind
     return eval_fn
 
 
