@@ -1788,8 +1788,11 @@ MAX_SCAN_LOCATIONS = 64
 # the llama.cpp root. It is this scan's own output, not an input: keying on it
 # meant every cache miss rewrote it, changed its mtime, and missed again on the
 # next call, so with the scan disabled each export re-fetched and re-patched the
-# converter forever.
-GENERATED_CONVERTER_PREFIX = "unsloth_convert_hf_to_gguf"
+# converter forever. Excluded by exact name and only where it is written, never
+# by prefix: matching a prefix in every directory meant a module named
+# conversion/unsloth_convert_hf_to_gguf_payload.py was skipped by the scan and
+# the key both, which a clean __init__.py could then import and run.
+GENERATED_CONVERTER_NAME = "unsloth_convert_hf_to_gguf.py"
 
 # No single module is read whole. The converter's own entrypoint is tens of KB and
 # the scanner caps its input at 8 MiB anyway, so a module past this is one the
@@ -1879,7 +1882,9 @@ def _purge_regenerable_bytecode(package_dir, entry_limit = None, recursive = Tru
 
 # Named for the same reason PackageWalk is: this grew a field and a positional
 # read of the old shape would have been silently wrong.
-ScanLocation = collections.namedtuple("ScanLocation", "label path recursive natives")
+ScanLocation = collections.namedtuple("ScanLocation", "label path recursive natives skip")
+# Named too: `truncated` has to reach the caller, and a bare list could not say it.
+ScanPlan = collections.namedtuple("ScanPlan", "locations truncated")
 
 
 def _scanned_locations(llama_cpp_dir):
@@ -1902,15 +1907,19 @@ def _scanned_locations(llama_cpp_dir):
     step by hand is what left gguf-py scanned but unkeyed earlier in this branch.
     """
     if not llama_cpp_dir:
-        return []
+        return ScanPlan([], False)
     locations = []
+    truncated = False
     for subdir in IMPORTED_PACKAGE_SUBDIRS:
         package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
         if os.path.isdir(package_dir):
-            locations.append(ScanLocation(subdir, package_dir, True, True))
+            locations.append(ScanLocation(subdir, package_dir, True, True, ()))
     if not os.path.isdir(llama_cpp_dir):
-        return locations
-    locations.append(ScanLocation(".", llama_cpp_dir, False, False))
+        return ScanPlan(locations, False)
+    # Only here, and only this name: this is where the patched converter is written.
+    locations.append(
+        ScanLocation(".", llama_cpp_dir, False, False, (GENERATED_CONVERTER_NAME,))
+    )
     named = {subdir.split("/")[0] for subdir in IMPORTED_PACKAGE_SUBDIRS}
     try:
         with os.scandir(llama_cpp_dir) as scanner:
@@ -1929,12 +1938,17 @@ def _scanned_locations(llama_cpp_dir):
                 # run, so skipping these left a payload one directory deep
                 # unscanned. Measured against llama.cpp master, the largest of
                 # them holds 1432 entries and 46 modules, well inside both bounds.
-                locations.append(ScanLocation(entry.name, entry.path, True, False))
+                locations.append(ScanLocation(entry.name, entry.path, True, False, ()))
                 if len(locations) >= MAX_SCAN_LOCATIONS:
+                    # Reported by the caller, not dropped quietly: a root wide
+                    # enough to reach this is nowhere near the 4096-entry budget
+                    # that would otherwise have said something, so a payload in a
+                    # directory landing past the cap went unscanned in silence.
+                    truncated = True
                     break
     except OSError:
         pass
-    return locations
+    return ScanPlan(locations, truncated)
 
 
 def _purge_imported_package_bytecode(llama_cpp_dir, is_local_copy = False):
@@ -1962,7 +1976,7 @@ def _purge_imported_package_bytecode(llama_cpp_dir, is_local_copy = False):
         # own that are none of this scan's business.
         return ()
     stuck = []
-    for location in _scanned_locations(llama_cpp_dir):
+    for location in _scanned_locations(llama_cpp_dir).locations:
         stuck.extend(
             f"{location.label}/{name}"
             for name in _purge_regenerable_bytecode(
@@ -1998,10 +2012,7 @@ def _counts_as_a_module(root, name):
     Decided here rather than after the walk because the cap stops the walk, so a
     file that does not count must not consume the budget either.
     """
-    stem, suffix = os.path.splitext(name)
-    suffix = suffix.lower()
-    if stem.startswith(GENERATED_CONVERTER_PREFIX):
-        return False        # this module's own output, not something it reads
+    suffix = os.path.splitext(name)[1].lower()
     if suffix == ".py" or suffix in NATIVE_MODULE_SUFFIXES:
         return True
     if suffix not in BYTECODE_SUFFIXES:
@@ -2104,7 +2115,8 @@ def _conversion_sibling_info(llama_cpp_dir):
             return (p, -1, "")
     header, entries = [], []
     found_any = False
-    for subdir, package_dir, recursive, _natives in _scanned_locations(llama_cpp_dir):
+    for location in _scanned_locations(llama_cpp_dir).locations:
+        subdir, package_dir, recursive = location.label, location.path, location.recursive
         if subdir == "conversion" and not has_conversion:
             # The directory exists but is not the package layout, so it is not
             # the conversion package this key has always meant.
@@ -2116,6 +2128,7 @@ def _conversion_sibling_info(llama_cpp_dir):
             file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
             entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
             recursive = recursive,
+            skip_names = location.skip,
         )
         names = walk.names if walk.names is not None else ["__init__.py", "base.py"]
         # The unreadable directories travel too: one becoming readable, or a new
@@ -2376,6 +2389,7 @@ def _conversion_package_modules(
     file_limit = None,
     entry_limit = None,
     recursive = True,
+    skip_names = (),
 ):
     """`(names, complete)` for the .py files under `conversion_dir`, nested included.
 
@@ -2439,6 +2453,8 @@ def _conversion_package_modules(
                             pending.append(entry.path)
                         continue
                     name = entry.name
+                    if name in skip_names and root == conversion_dir:
+                        continue      # this scan's own output, where it writes it
                     if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
                         continue
                     if not _counts_as_a_module(root, name):
@@ -2488,17 +2504,27 @@ def _scan_conversion_package(llama_cpp_dir, is_local_copy = False):
         # Each per-file check returns early anyway, but only after the whole tree
         # has been walked and every module read. Opting out should cost nothing.
         return
-    for location in _scanned_locations(llama_cpp_dir):
+    plan = _scanned_locations(llama_cpp_dir)
+    if plan.truncated:
+        _refuse_unscannable_conversion_package(
+            llama_cpp_dir,
+            f"holds more than the {MAX_SCAN_LOCATIONS} directories this scan "
+            f"looks in, so the ones past that were not read",
+            is_local_copy = is_local_copy,
+        )
+    for location in plan.locations:
         _scan_imported_package(
             location.path,
             recursive = location.recursive,
             natives = location.natives,
             is_local_copy = is_local_copy,
+            skip_names = location.skip,
         )
 
 
 def _scan_imported_package(
     package_dir, recursive = True, natives = True, is_local_copy = False,
+    skip_names = (),
 ):
     """Read every module in one imported package, or report why it could not be.
 
@@ -2517,7 +2543,9 @@ def _scan_imported_package(
     # came with the package executes in place of the source this scan reads, and
     # CPython's validation does not prove otherwise. Anything with a source is
     # removed and rebuilt from the .py; what could not be removed is reported.
-    stuck_bytecode = _purge_regenerable_bytecode(
+    # Not for a pin: the outer purge already declines to touch a checkout the
+    # user chose, and this path reached straight past that and rewrote it anyway.
+    stuck_bytecode = [] if is_local_copy else _purge_regenerable_bytecode(
         package_dir,
         entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
         recursive = recursive,
@@ -2530,6 +2558,7 @@ def _scan_imported_package(
         file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
         entry_limit = MAX_CONVERSION_PACKAGE_ENTRIES + 1,
         recursive = recursive,
+        skip_names = skip_names,
     )
     names, complete = walk.names, walk.complete
     if walk.unreadable:

