@@ -31,6 +31,7 @@ __all__ = [
 
 import collections
 import errno
+import marshal
 import hashlib
 import threading
 import subprocess
@@ -2030,6 +2031,60 @@ def _purge_imported_package_bytecode(llama_cpp_dir, is_local_copy = False):
     return tuple(sorted(stuck))
 
 
+def _bytecode_matches_its_source(cache_path, source_path):
+    """Whether this cache really is the compiled form of that source.
+
+    Only asked when the cache is being left in place, which is what happens for a
+    checkout the user pinned. "A cache exists" is not a finding there: an ordinary
+    working tree has one per module, and warning about all of them on every export
+    is the false positive this module says is worse than the warning is a win.
+    Measured on a tree shaped like llama.cpp master, that was seven warnings
+    naming 215 files, every time.
+
+    "This cache disagrees with the source beside it" IS a finding, and it is the
+    whole of the attack: CPython checks the header against the source and never
+    checks that the bytecode came from it. Compiling the source and comparing is
+    exact for the interpreter that will run the converter, which is this one.
+    Anything unreadable or unparseable counts as disagreement, since then nothing
+    here can say it agrees.
+    """
+    try:
+        with open(cache_path, "rb") as handle:
+            cached = handle.read(MAX_MODULE_BYTES + 1)
+        with open(source_path, "rb") as handle:
+            source = handle.read(MAX_MODULE_BYTES + 1)
+    except OSError:
+        return False
+    if len(cached) <= 16:
+        return False
+    if cached[:4] != importlib.util.MAGIC_NUMBER:
+        # Built by a different Python. This interpreter is the one that runs the
+        # converter and it will never load this file, so it is not what executes
+        # and reporting it would warn about every checkout used with two Pythons.
+        return True
+    payload = cached[16:]
+    try:
+        # dont_inherit, as importlib's own loader compiles: otherwise the future
+        # flags in effect wherever this is called from land in the code object
+        # and every cache reads as a mismatch.
+        code = compile(source, source_path, "exec", dont_inherit = True)
+        if payload == marshal.dumps(code):
+            return True
+        # marshal tags the outermost object with FLAG_REF only when its refcount
+        # is above one at dump time, and that tag renumbers every reference after
+        # it. So the same code marshals to two byte strings depending on whether
+        # the writer was holding it: importlib was, the line above is, a writer
+        # that dumps the result of a call was not. Recompiling into that second
+        # form is what keeps this a comparison of the code rather than of who
+        # produced it. Done only on mismatch, which is the rare path.
+        del code
+        return payload == marshal.dumps(
+            compile(source, source_path, "exec", dont_inherit = True)
+        )
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        return False
+
+
 def _stays_within(root, path):
     """Whether `path` resolves to somewhere still under `root`."""
     try:
@@ -2043,14 +2098,20 @@ def _stays_within(root, path):
     )
 
 
-def _has_a_source(root, name):
-    """Whether this cache has a .py beside it that Python can rebuild it from."""
+def _source_beside(root, name):
+    """The .py this cache would be rebuilt from, or None when there is none."""
     if os.path.basename(root) == "__pycache__":
         # base.cpython-313.pyc -> ../base.py
-        stem = name.split(".")[0]
-        return os.path.isfile(os.path.join(os.path.dirname(root), stem + ".py"))
-    suffix = os.path.splitext(name)[1]
-    return os.path.isfile(os.path.join(root, name[: -len(suffix)] + ".py"))
+        candidate = os.path.join(os.path.dirname(root), name.split(".")[0] + ".py")
+    else:
+        suffix = os.path.splitext(name)[1]
+        candidate = os.path.join(root, name[: -len(suffix)] + ".py")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _has_a_source(root, name):
+    """Whether this cache has a .py beside it that Python can rebuild it from."""
+    return _source_beside(root, name) is not None
 
 
 def _counts_as_a_module(root, name, purged = True):
@@ -2078,11 +2139,19 @@ def _counts_as_a_module(root, name, purged = True):
     #
     # Unless nothing was deleted. For a pinned checkout this scan does not touch
     # the user's files, and a cache left in place executes instead of the source
-    # beside it, whatever that source says. Then it is exactly what it looks
-    # like: code this scan cannot read, reported like any other.
-    if not purged:
-        return True
-    return not _has_a_source(root, name)
+    # beside it, whatever that source says. Reported then, but only when it
+    # actually disagrees with that source: every working tree carries one cache
+    # per module, and reporting those was seven warnings naming 215 files on
+    # every export of a tree shaped like llama.cpp master.
+    source = _source_beside(root, name)
+    if source is None:
+        return True                 # nothing could rebuild it: reported
+    if purged:
+        return False                # deleted before the converter runs
+    # Left in place, so it is what executes. Reported only when it disagrees with
+    # the source that was scanned, which is the difference between a finding and
+    # an ordinary working tree.
+    return not _bytecode_matches_its_source(os.path.join(root, name), source)
 
 
 def _unscannable_modules(package_dir, names, natives = True):
@@ -2408,7 +2477,7 @@ def _refuse_unscannable_conversion_package(conversion_dir, reason, is_local_copy
     if scan_is_disabled():
         return
     message = (
-        f"Unsloth: The conversion/ package at {conversion_dir} {reason}, so some "
+        f"Unsloth: The converter package at {conversion_dir} {reason}, so some "
         f"of the modules the converter imports have not been checked."
     )
     logger.warning(message)

@@ -32,6 +32,9 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import pathlib
+import py_compile
+import marshal
 import os
 import sys
 from pathlib import Path
@@ -1993,33 +1996,58 @@ def test_gguf_py_is_planned_as_an_import_root_and_walked_once(tmp_path):
     assert "util.py" in walk.names
 
 
-def test_a_pinned_checkouts_bytecode_is_reported_since_it_is_not_removed(
+def _real_cache(source_path):
+    """Compile a source the way an ordinary run would, and return its cache."""
+    py_compile.compile(str(source_path), doraise = True)
+    return pathlib.Path(importlib.util.cache_from_source(str(source_path)))
+
+
+def test_a_pinned_checkouts_bytecode_is_reported_only_when_it_disagrees(
     tmp_path, monkeypatch, caplog
 ):
-    """Not deleting it does not make it harmless.
+    """Not deleting it does not make it harmless. Nor does it make it a finding.
 
     For a pin this scan leaves the user's files alone, and a cache left in place
     executes instead of the source beside it whatever that source says. Skipping
-    the deletion AND the report meant a stale or tampered pinned checkout ran
-    with nothing said at all, which is the opposite of what a pin is for.
+    the deletion AND the report meant a tampered pinned checkout ran with nothing
+    said at all. Reporting every cache instead was seven warnings naming 215
+    files on every export of a tree shaped like llama.cpp master, because an
+    ordinary working tree carries one cache per module. What separates the two is
+    whether the bytecode is what the scanned source compiles to.
     """
     llama_cpp = _load("llama_cpp_pinned_report_probe", "unsloth_zoo/llama_cpp.py")
 
     root = _package_root(tmp_path)
-    cache = root / "conversion" / "__pycache__"
-    cache.mkdir()
-    theirs = cache / "base.cpython-313.pyc"
-    theirs.write_bytes(_pyc(0))
+    source = root / "conversion" / "base.py"
+    theirs = _real_cache(source)
 
     monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
     monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root), is_local_copy = True)
+    assert not [r for r in caplog.records if "cannot read" in r.message], (
+        "an ordinary pinned working tree must export in silence: "
+        + str([r.message for r in caplog.records])
+    )
+    assert theirs.exists(), "a pinned checkout must still not be rewritten"
+
+    # Now the attack: a header CPython accepts over bytecode the source never
+    # produced. This is the whole of it, since CPython checks the header against
+    # the source and never checks that the code came from it.
+    theirs.write_bytes(
+        theirs.read_bytes()[:16] + marshal.dumps(
+            compile("PWNED = 1\n", str(source), "exec"), marshal.version,
+        )
+    )
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         # Reported, never refused: strict mode does not block a file the user chose.
         llama_cpp._scan_conversion_package(str(root), is_local_copy = True)
-    assert any("cannot read" in record.message for record in caplog.records), (
-        [r.message for r in caplog.records]
-    )
+    reported = [r.message for r in caplog.records if "cannot read" in r.message]
+    assert reported, [r.message for r in caplog.records]
+    assert "base" in reported[0], reported
     assert theirs.exists(), "a pinned checkout must still not be rewritten"
 
     # Downloaded bytes are purged instead, so there is nothing left to report.
@@ -2028,6 +2056,79 @@ def test_a_pinned_checkouts_bytecode_is_reported_since_it_is_not_removed(
         llama_cpp._scan_conversion_package(str(root), is_local_copy = False)
     assert not theirs.exists()
     assert not [r for r in caplog.records if "cannot read" in r.message]
+
+
+def test_a_pinned_cache_built_by_another_python_is_not_a_finding(tmp_path):
+    """This interpreter runs the converter, and it will never load a cache tagged
+    for a different one. Comparing it against the source would report every
+    checkout that has ever been used with two Pythons, for bytecode that cannot
+    execute here.
+    """
+    llama_cpp = _load("llama_cpp_foreign_magic_probe", "unsloth_zoo/llama_cpp.py")
+
+    source = tmp_path / "base.py"
+    source.write_text("X = 1\n", encoding = "utf-8")
+    cache = _real_cache(source)
+    # A cache another CPython built: its own magic, and its own bytecode, which
+    # is not what this interpreter compiles the source to. Only the magic makes
+    # it a non-finding, so the body has to differ or the test passes either way.
+    foreign = bytearray(cache.read_bytes())
+    foreign[:4] = b"\x00\x00\r\n"
+    cache.write_bytes(bytes(foreign[:16]) + marshal.dumps(
+        compile("X = 2\n", str(source), "exec"), marshal.version,
+    ))
+
+    assert llama_cpp._counts_as_a_module(
+        str(cache.parent), cache.name, purged = False,
+    ) is False
+
+
+def test_a_cache_marshalled_without_the_outer_ref_flag_still_matches(tmp_path):
+    """marshal tags the outermost object with FLAG_REF only when its refcount is
+    above one at dump time, so identical code marshals to two different byte
+    strings depending on who happened to be holding it. Comparing raw bytes made
+    that an accident of the writer, and reported caches that are exactly their
+    source.
+    """
+    llama_cpp = _load("llama_cpp_flag_ref_probe", "unsloth_zoo/llama_cpp.py")
+
+    source = tmp_path / "base.py"
+    source.write_text("X = 1\n", encoding = "utf-8")
+    cache = _real_cache(source)
+    header = cache.read_bytes()[:16]
+    # Dumped straight from the call, so the code object's refcount is one and
+    # marshal leaves the flag off. Same code, different bytes.
+    unflagged = marshal.dumps(
+        compile(source.read_bytes(), str(source), "exec", dont_inherit = True),
+        marshal.version,
+    )
+    assert unflagged != cache.read_bytes()[16:], (
+        "this test is only meaningful while the two spellings differ"
+    )
+    cache.write_bytes(header + unflagged)
+
+    assert llama_cpp._counts_as_a_module(
+        str(cache.parent), cache.name, purged = False,
+    ) is False
+
+
+def test_an_unreadable_or_unparseable_pinned_cache_is_reported(tmp_path):
+    """Nothing here can say it agrees with its source, and it is still what runs."""
+    llama_cpp = _load("llama_cpp_unreadable_cache_probe", "unsloth_zoo/llama_cpp.py")
+
+    source = tmp_path / "base.py"
+    source.write_text("X = 1\n", encoding = "utf-8")
+    cache = _real_cache(source)
+    cache.write_bytes(cache.read_bytes()[:20])   # truncated mid-code
+
+    assert llama_cpp._counts_as_a_module(
+        str(cache.parent), cache.name, purged = False,
+    ) is True
+
+    source.write_text("def (\n", encoding = "utf-8")   # cannot be compiled to compare
+    assert llama_cpp._counts_as_a_module(
+        str(cache.parent), cache.name, purged = False,
+    ) is True
 
 
 def test_the_purge_does_not_follow_a_symlink_out_of_the_tree(tmp_path, monkeypatch):
