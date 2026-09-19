@@ -1910,6 +1910,52 @@ ScanLocation = collections.namedtuple("ScanLocation", "label path recursive nati
 ScanPlan = collections.namedtuple("ScanPlan", "locations truncated")
 
 
+def _imported_top_level_names(directories):
+    """Every top-level name the converter's own sources import.
+
+    `directories` is (path, only) pairs, where `only` names the files to read or
+    is None for every module in the directory.
+
+    The scan follows imports, so it has to know what they are. A directory beside
+    the converter is only reachable if something imports its name: llama.cpp's
+    directory is sys.path[0] for the subprocess, so a directory called gguf or
+    torch there shadows the real package, and that is worth reading. A directory
+    called scripts or examples that nothing imports is not, and reading it is how
+    an ordinary upstream clone came to be refused.
+
+    Unparseable or unreadable sources contribute nothing rather than stopping the
+    walk: those files are reported by the scan itself, and a syntax error must not
+    be a way to narrow what gets looked at. When NOTHING could be parsed, every
+    directory is taken as a candidate, so a checkout this cannot read is scanned
+    as widely as before rather than as narrowly as possible.
+    """
+    names, parsed_any = set(), False
+    for directory, only in directories:
+        try:
+            with os.scandir(directory) as scanner:
+                entries = [
+                    entry for entry in scanner
+                    if entry.name.endswith(".py")
+                    and (only is None or entry.name in only)
+                ]
+        except OSError:
+            continue
+        for entry in entries[:MAX_CONVERSION_PACKAGE_FILES]:
+            try:
+                with open(entry.path, "rb") as handle:
+                    source = handle.read(MAX_MODULE_BYTES)
+                tree = ast.parse(source, entry.path)
+            except (OSError, SyntaxError, ValueError, RecursionError, MemoryError):
+                continue
+            parsed_any = True
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names.update(alias.name.split(".")[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    names.add(node.module.split(".")[0])
+    return None if not parsed_any else names
+
+
 def _scanned_locations(llama_cpp_dir):
     """Every place the converter can import from, as a ScanPlan of ScanLocations.
 
@@ -1943,6 +1989,15 @@ def _scanned_locations(llama_cpp_dir):
 
     locations, truncated = [], False
     root_labels = [label for label in IMPORT_ROOTS if os.path.isdir(_path_of(label))]
+    # The converter's own sources, not every script in the checkout. Reading the
+    # root wholesale put `examples` back in the scan set, because llama.cpp's
+    # unrelated convert_llama_ggml_to_gguf.py imports examples.convert_legacy_llama
+    # and Unsloth never runs that script.
+    imported_names = _imported_top_level_names(
+        [(llama_cpp_dir, LLAMA_CPP_CONVERTER_FILENAMES + (GENERATED_CONVERTER_NAME,))]
+        + [(_path_of(label), None) for label in IMPORTED_PACKAGE_SUBDIRS
+           if os.path.isdir(_path_of(label))]
+    )
     for label in root_labels:
         locations.append(
             ScanLocation(
@@ -1969,12 +2024,27 @@ def _scanned_locations(llama_cpp_dir):
                             continue
                     except OSError:
                         continue
-                    # Every directory, __init__.py or not. A namespace package
-                    # imports to an empty module and runs nothing by itself, which
-                    # is what an earlier version of this reasoned from, but
-                    # `from shadow import payload` imports the SUBMODULE and that
-                    # does run. Measured against llama.cpp master, the largest of
-                    # them holds 1432 entries and 46 modules, inside both bounds.
+                    # A directory is scanned when the converter imports its name.
+                    # Scanning every directory in the checkout instead read files
+                    # no import can reach, and measured against a real clone of
+                    # llama.cpp master that was not a theoretical cost: scripts/
+                    # server-bench.py polls a /health endpoint in a while loop and
+                    # examples/llama-eval/llama-eval.py spawns a process, so the
+                    # scan reported both on every export and
+                    # UNSLOTH_CONVERTER_SCAN_STRICT refused the export outright.
+                    # A control that rejects every clean upstream checkout is not
+                    # a control.
+                    #
+                    # Name-matched rather than skipped, because a directory called
+                    # gguf or torch beside the converter SHADOWS the real package
+                    # for the subprocess: llama.cpp's own directory is sys.path[0]
+                    # there, so it wins over site-packages. That is the case these
+                    # directories were added for, and it is the one kept.
+                    if child not in NAMED_IMPORT_PACKAGES and (
+                        imported_names is not None
+                        and entry.name not in imported_names
+                    ):
+                        continue
                     locations.append(
                         ScanLocation(
                             child, entry.path, True, child in NAMED_IMPORT_PACKAGES, (),
