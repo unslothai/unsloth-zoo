@@ -21,6 +21,10 @@ __all__ = [
     "quant_requires_imatrix",
     "IMATRIX_REQUIRED_QUANTS",
     "use_local_gguf",
+    "assert_correct_gguf",
+    "gguf_metadata_problems",
+    "gguf_metadata_warnings",
+    "gguf_tensor_problems",
     "install_llama_cpp",
     "check_llama_cpp",
     "_download_convert_hf_to_gguf",
@@ -31,8 +35,8 @@ __all__ = [
 
 import collections
 import errno
-import marshal
 import hashlib
+import marshal
 import threading
 import subprocess
 import sys
@@ -44,7 +48,6 @@ import requests
 import json
 from tqdm.auto import tqdm as ProgressBar
 from functools import lru_cache
-import inspect
 import contextlib
 import importlib.util
 import tempfile
@@ -273,20 +276,49 @@ def _resolve_bundle_convert_script():
 pass
 
 
+# `sys.path` and `sys.modules` are process-global, so two conversions swapping different
+# gguf trees at once would interleave: one read back parses with the other's package, and
+# whichever cleanup runs last restores a temporary package over the process's own. Nothing
+# stopped that before, and the read back now runs on every export rather than only when a
+# caller asked for it, so the swap is serialised. Reentrant, since the body of one swap
+# can reach code that opens another with the same tree.
+_GGUF_MODULE_SWAP_LOCK = threading.RLock()
+
+
 @contextlib.contextmanager
-def use_local_gguf():
-    """Context manager to temporarily use llama.cpp's local gguf-py"""
+def use_local_gguf(gguf_py_path = None):
+    """Context manager to temporarily use llama.cpp's local gguf-py
+
+    `gguf_py_path` names the tree to use. It defaults to the one beside the
+    default install, which is the pre-existing behaviour and what every
+    existing caller gets. `convert_to_gguf` passes the tree it actually
+    resolved for the converter child, so the file is read back with the same
+    `gguf` that wrote it rather than with whatever the parent happens to have.
+
+    Only one swap runs at a time: see `_GGUF_MODULE_SWAP_LOCK`.
+    """
+    with _GGUF_MODULE_SWAP_LOCK:
+        yield from _use_local_gguf(gguf_py_path)
+
+
+def _use_local_gguf(gguf_py_path):
+    """The swap itself, run under `_GGUF_MODULE_SWAP_LOCK`."""
     # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
-    gguf_py_path = os.path.join(LLAMA_CPP_DEFAULT_DIR, "gguf-py")
+    if gguf_py_path is None:
+        gguf_py_path = os.path.join(LLAMA_CPP_DEFAULT_DIR, "gguf-py")
 
     original_gguf_modules = {}
 
     try:
         if os.path.exists(gguf_py_path):
             logger.debug(f"Adding {gguf_py_path} to sys.path")
-            sys.path.insert(1, gguf_py_path)
+            # Index 0, ahead of the script directory Python puts there: a process
+            # launched from inside another gguf-py checkout has that checkout at
+            # sys.path[0], and the point of the read back is to parse the file with
+            # the `gguf` that wrote it.
+            sys.path.insert(0, gguf_py_path)
 
             # Drop system gguf modules to force a reimport from gguf-py
             gguf_modules = [key for key in sys.modules.keys() if key.startswith('gguf')]
@@ -961,7 +993,6 @@ def _select_gpu_assets(tag, assets, manifest, target = None):
 
 
 def _sha256_file(path):
-    import hashlib
     digest = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -3970,6 +4001,908 @@ def _remove_gguf_outputs(output_file):
             pass
 
 
+# GGUF converter / gguf-py version skew (unsloth#3581). Every converter
+# entrypoint self-locates with `sys.path.insert(1, __file__/../gguf-py)`, which
+# outranks PYTHONPATH and site-packages, so the child's gguf is decided by
+# whatever tree sits beside the entrypoint, not by `use_local_gguf()`.
+# Version numbers cannot settle which tree is right: the fork's gguf-py calls
+# itself 0.19.0 while carrying architectures PyPI 0.19.0 lacks. So probe for the
+# symbols the entrypoint needs and pin the child's gguf to the tree with them.
+
+# How many conversion/*.py files to read when collecting requirements. A cap so
+# an unexpected directory cannot turn the preflight into a filesystem walk.
+_GGUF_REQUIREMENT_SCAN_LIMIT = 200
+
+# The skew signatures seen in the wild, matched on the child's own output. Every
+# one is anchored on a `gguf`-rooted name: a bare "type object 'X' has no
+# attribute 'Y'" is the shape of an ordinary model-side AttributeError too, and
+# the `"gguf" in text` prefilter does not separate them, because the converter is
+# named convert_hf_to_gguf.py and logs every write as `INFO:gguf.gguf_writer:`.
+_GGUF_SKEW_SIGNATURES = (
+    re.compile(r"cannot import name ['\"]([^'\"]+)['\"] from ['\"](gguf[\w\.]*)['\"]"),
+    re.compile(r"module ['\"](gguf[\w\.]*)['\"] has no attribute ['\"]([^'\"]+)['\"]"),
+    re.compile(r"No module named ['\"](gguf[\w\.]*)['\"]"),
+)
+
+# `gguf.MODEL_ARCH.GEMMA4` raises "type object 'MODEL_ARCH' has no attribute
+# 'GEMMA4'", which names the class but not the package, so the class has to be
+# recognised some other way. The preflight already knows which `gguf` attribute
+# chains the converter needs, so use those: an AttributeError on a class that
+# appears in a requirement is ours, one on anything else is the model's.
+_GGUF_ATTRIBUTE_ERROR = re.compile(
+    r"(?:type object|object) ['\"]([\w]+)['\"] has no attribute ['\"]([^'\"]+)['\"]"
+)
+
+
+def _looks_like_gguf_skew(text, requirements = ()):
+    """Whether the converter's output is the gguf version-skew failure.
+
+    `requirements` is the `gguf` chains the preflight collected for this
+    converter. Without them the bare attribute-error shape is not attributed to
+    gguf at all, so a model-side AttributeError never collects the skew advice.
+    """
+    if not text:
+        return False
+    if "gguf" not in text:
+        return False
+    if any(pattern.search(text) for pattern in _GGUF_SKEW_SIGNATURES):
+        return True
+    owners = set()
+    for requirement in requirements or ():
+        # "gguf.MODEL_ARCH.GEMMA4" -> the intermediate names gguf owns.
+        parts = str(requirement).split(".")
+        owners.update(parts[1:-1])
+    if not owners:
+        return False
+    return any(
+        match.group(1) in owners for match in _GGUF_ATTRIBUTE_ERROR.finditer(text)
+    )
+
+
+def _importable_gguf_py(directory):
+    """`<directory>/gguf-py` when it really holds an importable `gguf` package.
+
+    A gguf-py directory can exist and still be useless (a wheel-layout folder
+    with no package inside, or a leftover empty dir), so require the package
+    __init__ rather than the parent.
+    """
+    if not directory:
+        return None
+    candidate = os.path.join(directory, "gguf-py")
+    if os.path.isfile(os.path.join(candidate, "gguf", "__init__.py")):
+        return candidate
+    return None
+
+
+def _gguf_requirements_from_source(source_bytes):
+    """Requirements a single module places on `gguf`, as dotted expressions.
+
+    Returns `(certain, advisory)`. Certain means it runs the moment the module is
+    imported, so its absence is a guaranteed failure: module-level
+    `import gguf...` / `from gguf... import X`, and any attribute chain rooted at
+    a bare `gguf` evaluated at module or class-body scope (a class body executes
+    on import, which is how `model_arch = gguf.MODEL_ARCH.GEMMA4` in
+    conversion/gemma.py brings the whole converter down). Advisory means it may
+    never be reached: inside a function body, or under a `try` that may be
+    guarding for exactly this. Never raises; an unparseable file contributes
+    nothing.
+    """
+    certain, advisory = set(), set()
+    try:
+        tree = ast.parse(source_bytes)
+    except Exception:
+        return certain, advisory
+
+    def chain(node):
+        """Longest dotted expression rooted at the bare name `gguf`, else None."""
+        parts = []
+        cursor = node
+        while isinstance(cursor, ast.Attribute):
+            parts.append(cursor.attr)
+            cursor = cursor.value
+        if isinstance(cursor, ast.Name) and cursor.id == "gguf" and parts:
+            return "gguf." + ".".join(reversed(parts))
+        return None
+
+    # PEP 563: with `from __future__ import annotations` every annotation is a string and
+    # nothing in it is evaluated at import time, so an annotation naming a missing symbol
+    # costs nothing. Without it, an annotation is an ordinary expression in the signature.
+    #
+    # PEP 649 makes that the default from 3.14 on: an annotation becomes a lazily built
+    # `__annotate__` function that import never calls, future import or not. The version
+    # tested is this interpreter's because the converter child is launched as
+    # `[sys.executable, converter_location]`, so the process that will evaluate these
+    # annotations is this one.
+    annotations_eager = sys.version_info < (3, 14) and not any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in getattr(tree, "body", [])
+    )
+
+    def _eagerly_evaluated_signature(function, annotations_eager):
+        """The expressions in a function's signature that run when the module is imported."""
+        pieces = []
+        pieces.extend(getattr(function, "decorator_list", []) or [])
+        arguments = getattr(function, "args", None)
+        if arguments is not None:
+            pieces.extend(arguments.defaults or [])
+            pieces.extend([item for item in (arguments.kw_defaults or []) if item is not None])
+            if annotations_eager:
+                if getattr(function, "returns", None) is not None:
+                    pieces.append(function.returns)
+                for group in ("posonlyargs", "args", "kwonlyargs"):
+                    for argument in getattr(arguments, group, []) or []:
+                        if argument.annotation is not None:
+                            pieces.append(argument.annotation)
+                for single in (arguments.vararg, arguments.kwarg):
+                    if single is not None and single.annotation is not None:
+                        pieces.append(single.annotation)
+        return pieces
+
+    def visit_expression(expression, eager):
+        """Run the walk over one expression, as if it stood on its own at this level."""
+        visit(ast.Module(body = [ast.Expr(value = expression)], type_ignores = []), eager)
+
+    def visit_body(function, eager):
+        """The statements of a function, without its signature."""
+        for statement in function.body if isinstance(function.body, list) else [
+            ast.Expr(value = function.body)
+        ]:
+            visit(ast.Module(body = [statement], type_ignores = []), eager)
+
+    def visit(node, eager):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ImportFrom):
+                module = child.module or ""
+                if module == "gguf" or module.startswith("gguf."):
+                    for alias in child.names:
+                        target = certain if eager else advisory
+                        target.add(module if alias.name == "*" else f"{module}.{alias.name}")
+                continue
+            if isinstance(child, ast.Import):
+                for alias in child.names:
+                    if alias.name == "gguf" or alias.name.startswith("gguf."):
+                        (certain if eager else advisory).add(alias.name)
+                continue
+            if isinstance(child, ast.Attribute):
+                expression = chain(child)
+                if expression is not None:
+                    (certain if eager else advisory).add(expression)
+                    # Inner Attribute nodes are prefixes of this one; the probe
+                    # resolves prefixes itself, so do not descend.
+                    continue
+            # A function body may never run, and a try body may be guarding for
+            # a missing symbol on purpose. Both demote to advisory.
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                # The SIGNATURE is not the body. `@gguf.register` and
+                # `def convert(kind = gguf.NEW_KIND)` are evaluated while the module is
+                # imported, exactly like a module-level expression, so a symbol missing
+                # from either one makes the import fail however the body is written. Only
+                # the body keeps the demotion.
+                for piece in _eagerly_evaluated_signature(child, annotations_eager):
+                    visit_expression(piece, eager)
+                visit_body(child, False)
+            elif isinstance(child, ast.Try):
+                # Body and handlers are advisory: a `try` body may be probing for a
+                # symbol on purpose. `finally` is not, since it runs on every path,
+                # so at module level a `gguf` name it reads fails the import as surely
+                # as a plain statement would. Demoting it let the resolver keep an
+                # incompatible baseline without probing a pin that would have worked.
+                for part in (child.body, child.handlers, child.orelse):
+                    for statement in part:
+                        visit(ast.Module(body = [statement], type_ignores = []), False)
+                for statement in child.finalbody:
+                    visit(ast.Module(body = [statement], type_ignores = []), eager)
+            elif isinstance(child, ast.If) and _is_type_checking_test(child.test):
+                # `if TYPE_CHECKING: from gguf... import X` is the documented way to import a
+                # name for annotations only, and the branch is FALSE at run time, so the
+                # import never executes and a `gguf` without X still imports this module
+                # fine. Counting it as certain made a working converter look unusable and
+                # could repin or abandon it for a symbol nothing reads. Advisory, like a try
+                # body. The else branch is the one that really runs, so it keeps `eager`.
+                for statement in child.body:
+                    visit(ast.Module(body = [statement], type_ignores = []), False)
+                for statement in child.orelse:
+                    visit(ast.Module(body = [statement], type_ignores = []), eager)
+            elif isinstance(child, ast.If):
+                # A module-level guard (`if sys.platform == "win32"`, a find_spec or
+                # version test) runs at most one branch, so counting both as certain let
+                # a symbol only the dead branch reads pin a different gguf. The test runs
+                # either way and stays eager; the branches are advisory unless provable
+                # above.
+                visit_expression(child.test, eager)
+                for statement in list(child.body) + list(child.orelse):
+                    visit(ast.Module(body = [statement], type_ignores = []), False)
+            else:
+                visit(child, eager)
+
+    visit(tree, True)
+    return certain, advisory - certain
+
+
+def _is_type_checking_test(test):
+    """True for an `if` whose body cannot run at import time.
+
+    `TYPE_CHECKING` is False at run time by definition, under any of the spellings the
+    converters use -- the bare name, `typing.TYPE_CHECKING`, `t.TYPE_CHECKING` -- and so is a
+    literal `if False:`. Nothing else is claimed: an `if` this cannot prove false keeps its
+    eager reading, which is the conservative direction.
+    """
+    if isinstance(test, ast.Constant):
+        return test.value is False
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    if isinstance(test, ast.Attribute):
+        return test.attr == "TYPE_CHECKING"
+    return False
+
+
+def _extract_dict_values_from_conversion_init(conv_init_path, dict_name):
+    """`{architecture: module}` out of conversion/__init__.py's TEXT_MODEL_MAP /
+    MMPROJ_MODEL_MAP. The sibling of _extract_dict_keys_from_conversion_init,
+    which needs only the keys."""
+    mapping = {}
+    try:
+        with open(conv_init_path, "rb") as f:
+            tree = ast.parse(f.read())
+    except Exception:
+        return mapping
+    def _harvest(value):
+        if not isinstance(value, ast.Dict):
+            return
+        for key, item in zip(value.keys, value.values):
+            if (isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    and isinstance(item, ast.Constant) and isinstance(item.value, str)):
+                mapping[key.value] = item.value
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == dict_name:
+                    _harvest(node.value)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == dict_name:
+                _harvest(node.value)
+    return mapping
+
+
+def _conversion_modules_for(conversion_dir, architecture, is_vlm = None):
+    """The conversion/ modules this conversion will really import.
+
+    Only these place a CERTAIN requirement on `gguf`. conversion/__init__.py
+    imports base.py eagerly, and `get_model_class` then imports the one module
+    the architecture maps to; `load_all_models` imports the rest inside a
+    per-module `try/except Exception` that only warns. So a name referenced in
+    some other architecture's module cannot break this conversion, and treating
+    it as certain downgrades a working export to an older converter for nothing.
+    An unknown architecture scopes to the two eager modules, which is the
+    conservative direction: fewer certain names means fewer reasons to switch.
+
+    `is_vlm` is which halves this call converts. A text-only export never imports
+    the projector module, so counting its names as certain would let a symbol only
+    the projector needs move a working text conversion onto another converter.
+    None means both, which is the answer when the caller does not know.
+    """
+    eager = [os.path.join(conversion_dir, "__init__.py"),
+             os.path.join(conversion_dir, "base.py")]
+    modules = [path for path in eager if os.path.isfile(path)]
+    if not architecture:
+        return modules
+    conv_init = os.path.join(conversion_dir, "__init__.py")
+    selected = set()
+    for dict_name in _conversion_maps_in_play(is_vlm):
+        module = _extract_dict_values_from_conversion_init(conv_init, dict_name).get(architecture)
+        if module:
+            selected.add(module)
+    for module in sorted(selected):
+        path = os.path.join(conversion_dir, f"{module}.py")
+        if os.path.isfile(path):
+            modules.append(path)
+    return modules
+
+
+def _conversion_maps_in_play(is_vlm):
+    """The conversion/__init__.py maps a call with this `is_vlm` really dispatches
+    through. Every export runs the text half; only a VLM export adds the projector.
+    None means the caller does not know, so both stand."""
+    if is_vlm is False:
+        return ("TEXT_MODEL_MAP",)
+    return ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP")
+
+
+def _converter_architecture_maps(script_path, architecture, is_vlm = None):
+    """Which of a converter's maps name *architecture*, as a set of dict names.
+
+    The pair is not interchangeable. ``TEXT_MODEL_MAP`` dispatches the text conversion, which
+    every export runs, and ``MMPROJ_MODEL_MAP`` dispatches the projector, which a VLM export
+    runs in addition. A fallback that maps the architecture in only one of them therefore
+    fails the other half outright, and the support check that would have caught it describes
+    the converter that was REQUESTED rather than the one substituted in.
+
+    Empty for a monolith entrypoint (no package to read) and for an unreadable __init__.py,
+    which are failures to look rather than answers.
+    """
+    if not architecture:
+        return set()
+    try:
+        with open(script_path, "rb") as f:
+            entry_source = f.read()
+    except OSError:
+        return set()
+    if b"from conversion import" not in entry_source:
+        return set()
+    conversion_dir = os.path.join(os.path.dirname(script_path) or ".", "conversion")
+    conv_init = os.path.join(conversion_dir, "__init__.py")
+    if not os.path.isfile(conv_init):
+        return set()
+    return {
+        dict_name
+        for dict_name in _conversion_maps_in_play(is_vlm)
+        if architecture in _extract_dict_values_from_conversion_init(conv_init, dict_name)
+    }
+
+
+def _converter_maps_architecture(script_path, architecture, required_maps = None):
+    """Whether this converter's OWN maps name *architecture*.
+
+    Asked of a fallback before it is chosen. The requirement scan is scoped to the modules a
+    conversion will really import, and a converter that predates the architecture maps it to
+    nothing: the scan then sees only the two eager modules, the candidate misses nothing
+    certain, and it ranks as a perfect match for a model it cannot convert at all. The support
+    check that would have caught it reads the arch sets of the converter that was REQUESTED,
+    not of the one being substituted, so it does not fire either, and the export dies on
+    "unsupported model" with a working candidate left unused further down the ranking.
+
+    ``required_maps`` is which of them have to name it, read off the converter that was
+    REQUESTED: the text map dispatches the text conversion that every export runs, the
+    projector map the mmproj half a VLM export adds, and a fallback that maps the
+    architecture in only one of them fails the other outright. Taken from the request rather
+    than from a flag, because the request is what this is falling back FROM and it already
+    knows which halves this architecture has. Absent, presence in either map stands, which is
+    the answer for a request whose own maps could not be read.
+
+    True on anything that is not positive evidence of absence: a monolith entrypoint with no
+    conversion package dispatches by class registration rather than by these maps, an
+    unreadable __init__.py is a failure to look, and no architecture to check is not a
+    question. Only a converter whose maps are readable, non-empty and do not contain the
+    architecture is refused.
+    """
+    if not architecture:
+        return True
+    # The same structural signal the requirement scan uses: a package sitting beside a
+    # monolith entrypoint (left by a newer install in the same directory, which is where every
+    # sibling candidate lives) is not that entrypoint's dispatch table, and reading it would
+    # answer for the wrong converter in both directions.
+    try:
+        with open(script_path, "rb") as f:
+            entry_source = f.read()
+    except OSError:
+        return True
+    if b"from conversion import" not in entry_source:
+        return True
+    conversion_dir = os.path.join(os.path.dirname(script_path) or ".", "conversion")
+    conv_init = os.path.join(conversion_dir, "__init__.py")
+    if not os.path.isfile(conv_init):
+        return True
+    mapped = {
+        dict_name: _extract_dict_values_from_conversion_init(conv_init, dict_name)
+        for dict_name in ("TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP")
+    }
+    if not any(mapped.values()):
+        return True
+    if required_maps:
+        return all(architecture in mapped.get(name, {}) for name in required_maps)
+    return any(architecture in one for one in mapped.values())
+
+
+def _converter_gguf_requirements(script_path, architecture = None, is_vlm = None):
+    """Everything the entrypoint and the conversion/ modules this conversion will
+    actually import need from `gguf`. Returns `(certain, advisory)` as sorted
+    tuples so the result is hashable and stable for the probe cache.
+
+    Modules that will not be imported for `architecture` still contribute, but
+    only as advisory: they cannot break this export.
+    """
+    certain, advisory = set(), set()
+    sources = [script_path]
+    advisory_sources = []
+    try:
+        with open(script_path, "rb") as f:
+            entry_source = f.read()
+    except OSError:
+        entry_source = b""
+    # A monolith entrypoint does not import conversion/, so a package sitting
+    # beside it (left by a newer install) places no requirement on it. Same
+    # structural signal _detect_converter_layout uses.
+    conversion_dir = os.path.join(os.path.dirname(script_path) or ".", "conversion")
+    if b"from conversion import" in entry_source and os.path.isdir(conversion_dir):
+        imported = _conversion_modules_for(conversion_dir, architecture, is_vlm)
+        sources.extend(imported)
+        imported_set = {os.path.abspath(path) for path in imported}
+        try:
+            names = sorted(os.listdir(conversion_dir))
+        except OSError:
+            names = []
+        for name in names[:_GGUF_REQUIREMENT_SCAN_LIMIT]:
+            path = os.path.join(conversion_dir, name)
+            if name.endswith(".py") and os.path.abspath(path) not in imported_set:
+                advisory_sources.append(path)
+    for path in sources:
+        try:
+            with open(path, "rb") as f:
+                source = f.read()
+        except OSError:
+            continue
+        module_certain, module_advisory = _gguf_requirements_from_source(source)
+        certain |= module_certain
+        advisory |= module_advisory
+    # Another architecture's module: it is imported only by load_all_models,
+    # which swallows the failure, so nothing here can break this conversion.
+    for path in advisory_sources:
+        try:
+            with open(path, "rb") as f:
+                source = f.read()
+        except OSError:
+            continue
+        module_certain, module_advisory = _gguf_requirements_from_source(source)
+        advisory |= module_certain
+        advisory |= module_advisory
+    # An attribute chain that is also a certain requirement adds nothing here.
+    return tuple(sorted(certain)), tuple(sorted(advisory - certain))
+
+
+# Resolves a dotted expression rooted at `gguf` inside the child interpreter:
+# import the longest importable module prefix, then getattr the remainder.
+_GGUF_PROBE_SOURCE = r"""
+import importlib, json, os, sys
+
+converter = sys.argv[1]
+# On stdin, not in argv. The requirement list is one name per conversion/ module
+# and grows with every architecture llama.cpp adds (462 names, 16.8 KB of argv on
+# the b10909 bundle), while Windows caps a CreateProcess command line at 32767
+# characters. stdin has no such ceiling.
+requirements = json.loads(sys.stdin.read() or "[]")
+
+# Reproduce the entrypoint's own self-location exactly, or the probe would
+# measure a different `gguf` than the real run: every llama.cpp converter (and
+# its conversion/base.py) does this before `import gguf`, and `python -c` has no
+# script directory of its own to do it for us.
+if converter and "NO_LOCAL_GGUF" not in os.environ:
+    sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(converter)), "gguf-py"))
+
+def resolve(expression):
+    parts = expression.split(".")
+    module = None
+    index = 0
+    for stop in range(len(parts), 0, -1):
+        try:
+            module = importlib.import_module(".".join(parts[:stop]))
+        except Exception:
+            continue
+        index = stop
+        break
+    if module is None:
+        return False
+    target = module
+    for attribute in parts[index:]:
+        try:
+            target = getattr(target, attribute)
+        except Exception:
+            return False
+    return True
+
+# The sentinel is what makes the report identifiable as ours. The parent reads the
+# last brace-line of stdout, and anything the converter's imports print there would
+# otherwise be parsed as a report: a dict with no "missing" key reads as "nothing
+# missing", which ranks an unprobed candidate as a perfect match and switches the
+# converter on the strength of a line we never wrote.
+report = {"unsloth_gguf_probe": 1, "missing": [], "location": None, "version": None}
+try:
+    import gguf
+    report["location"] = getattr(gguf, "__file__", None)
+except Exception as error:
+    report["error"] = "%s: %s" % (type(error).__name__, error)
+    print(json.dumps(report))
+    raise SystemExit(0)
+try:
+    import importlib.metadata as metadata
+    report["version"] = metadata.version("gguf")
+except Exception:
+    pass
+try:
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(gguf.__file__)))
+    with open(os.path.join(tree, "pyproject.toml")) as handle:
+        for line in handle:
+            if line.strip().startswith("version"):
+                report["version"] = line.split("=", 1)[1].strip().strip('"\'')
+                break
+except Exception:
+    pass
+for expression in requirements:
+    if not resolve(expression):
+        report["missing"].append(expression)
+print(json.dumps(report))
+"""
+
+
+def _probe_child_gguf(python_exe, env, requirements, converter_location = None, timeout = 120):
+    """Ask the child interpreter which `gguf` it resolves and what it cannot
+    satisfy. Returns a dict with `missing`, `location`, `version`, `error`, or
+    None when the probe itself could not run (never fail an export because a
+    diagnostic did not work)."""
+    try:
+        completed = subprocess.run(
+            [python_exe, "-c", _GGUF_PROBE_SOURCE, str(converter_location or "")],
+            # The names go on stdin so the command line stays a fixed size; see
+            # the comment in _GGUF_PROBE_SOURCE for the Windows argv ceiling.
+            input = json.dumps(list(requirements)),
+            env = env,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = timeout,
+        )
+    except Exception as error:
+        logger.debug("Unsloth: gguf preflight probe could not run (%s).", error)
+        return None
+    for line in reversed((completed.stdout or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except Exception:
+            continue
+        # Only our own report counts. Without the sentinel any JSON the converter's
+        # imports happen to print is read as a report, and one with no "missing" key
+        # scores a perfect zero, so a candidate nothing ever probed can be adopted
+        # and announced as matching.
+        if isinstance(parsed, dict) and parsed.get("unsloth_gguf_probe") == 1:
+            return parsed
+    logger.debug(
+        "Unsloth: gguf preflight probe returned no report (exit %s).", completed.returncode
+    )
+    return None
+
+
+def _converter_child_env(gguf_py_dir = None, base_env = None):
+    """The environment a converter child should run with.
+
+    Always a copy of the parent environment, so PATH, HOME, HF_*, CUDA_* and the
+    active virtualenv keep working. When `gguf_py_dir` is given it is prepended
+    to PYTHONPATH with os.pathsep (Windows uses ';'), and NO_LOCAL_GGUF is set so
+    the entrypoint stops inserting its own sibling tree ahead of our choice.
+    Idempotent: prepending a directory already at the front changes nothing.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    if not gguf_py_dir:
+        return env
+    gguf_py_dir = os.path.abspath(gguf_py_dir)
+    existing = env.get("PYTHONPATH") or ""
+    entries = [entry for entry in existing.split(os.pathsep) if entry]
+    entries = [entry for entry in entries if os.path.abspath(entry) != gguf_py_dir]
+    env["PYTHONPATH"] = os.pathsep.join([gguf_py_dir] + entries)
+    # Only meaningful together with the pin above: on its own it would demote the
+    # entrypoint to whatever site-packages happens to hold.
+    env["NO_LOCAL_GGUF"] = "1"
+    return env
+
+
+def _gguf_report_summary(report, blocking):
+    """Short human phrase for what a probe report found wrong. `blocking` is the
+    subset that certainly runs, which is what actually breaks the conversion, so
+    it is named rather than the full advisory list."""
+    if not report:
+        return "reason unknown"
+    if report.get("error"):
+        return f"gguf is not importable: {report['error']}"
+    missing = list(blocking or ())
+    if missing:
+        return "missing " + ", ".join(missing[:3])
+    return "reason unknown"
+
+
+def _gguf_blocking_missing(report, certain):
+    """The unsatisfied names that certainly run, i.e. the ones that break it."""
+    return sorted(set(report.get("missing") or ()) & set(certain or ()))
+
+
+def _installed_gguf_tree(python_exe):
+    """The directory holding the installed `gguf` package, as the child sees it with
+    the converter's own sibling tree suppressed, or None.
+
+    This is the candidate the other three cannot express. Someone who upgraded the
+    `gguf` wheel past the llama.cpp checkout on disk has a satisfying `gguf` already
+    installed, but every llama.cpp entrypoint puts its sibling `gguf-py` ahead of it
+    with `sys.path.insert(1, ...)`, so the wheel only wins if it is pinned like any
+    other tree. Discovered by asking the child rather than by importing `gguf` here:
+    the parent may resolve a different one, and importing it would be a side effect.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    env = dict(os.environ)
+    env["NO_LOCAL_GGUF"] = "1"
+    report = _probe_child_gguf(python_exe, env, ())
+    location = (report or {}).get("location")
+    if not location:
+        return None
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(location)))
+    if not os.path.isfile(os.path.join(tree, "gguf", "__init__.py")):
+        return None
+    return tree
+pass
+
+
+def _gguf_candidate_converters(converter_location):
+    """(converter, gguf_py_dir, label) candidates, best first.
+
+    0. The converter as asked for, with the environment untouched. This is the
+       pre-existing behaviour and is always tried first, so a consistent install
+       sees no change at all.
+    1. The same converter with an explicit gguf-py pinned: its own sibling tree,
+       then the installed bundle's. Keeps the newer converter, which is what we
+       want whenever a satisfying tree exists anywhere.
+    2. A sibling entrypoint co-versioned with its own gguf-py. Last resort: it
+       may be considerably older than the downloaded one, so switching to it is
+       announced rather than silent.
+    """
+    converter_dir = os.path.dirname(os.path.abspath(converter_location)) or "."
+    candidates = [(converter_location, None, "as configured")]
+
+    seen = set()
+    for directory, label in (
+        (converter_dir, "the converter's own gguf-py"),
+        (LLAMA_CPP_DEFAULT_DIR, "the installed llama.cpp gguf-py"),
+    ):
+        gguf_py = _importable_gguf_py(directory)
+        if gguf_py is None or gguf_py in seen:
+            continue
+        seen.add(gguf_py)
+        candidates.append((converter_location, gguf_py, label))
+
+    requested = os.path.abspath(converter_location)
+    for name in LLAMA_CPP_CONVERTER_FILENAMES:
+        sibling = os.path.join(converter_dir, name)
+        if not os.path.isfile(sibling) or os.path.abspath(sibling) == requested:
+            continue
+        candidates.append((
+            sibling,
+            _importable_gguf_py(converter_dir),
+            "the llama.cpp checkout's own converter",
+        ))
+    return candidates
+
+
+def _gguf_tree_of_location(location):
+    """The sys.path entry that makes the `gguf` at `location` importable, or None.
+
+    `location` is the child's `gguf.__file__`, so `<tree>/gguf/__init__.py`. Anything that
+    is not laid out as a package directory named `gguf` is rejected rather than guessed at:
+    putting the wrong directory on the parent's sys.path is worse than not reading the file
+    back with the child's tree.
+    """
+    if not isinstance(location, str) or not location:
+        return None
+    package = os.path.dirname(os.path.abspath(location))
+    if os.path.basename(package) != "gguf":
+        return None
+    if not os.path.isfile(os.path.join(package, "__init__.py")):
+        return None
+    return os.path.dirname(package)
+
+
+def _gguf_readback_tree(report):
+    """The tree to read a fresh GGUF back with: the one the converter child used.
+
+    Candidate zero -- the requested converter with the environment untouched -- is the
+    common path and deliberately pins nothing, because changing a working child's
+    environment is the one thing this resolver must not do. But the pin was also what told
+    `_verify_converted_gguf` which `gguf` wrote the file, so on that path the read-back ran
+    against whatever the PARENT happens to have. Where the parent has a different package,
+    every reader comes back None and the whole gate -- the required metadata, the tensor
+    sanity pass and the missing-shard check -- degrades into one warning and the file is
+    published unverified.
+
+    The probe report already names the package the child resolved, so the read-back tree is
+    derivable without touching the child at all.
+
+    Returned whenever it is derivable, with no version comparison. Version ordering cannot
+    establish compatibility here: llama.cpp's vendored `gguf-py` and the PyPI `gguf` wheel
+    both report their own numbers, a fork and a release can report the SAME number with
+    different contents, and a parent that omits `__version__` says nothing at all. The only
+    thing that is actually known is which package wrote the bytes, and that is what the
+    file has to be read with. It is also what the pinned path already does unconditionally,
+    so the two paths now agree rather than applying different rules to the same question.
+
+    `use_local_gguf` snapshots and restores `sys.path` and every `gguf` module, so this
+    scopes the pin to the read-back and leaves an outer caller's resolution alone.
+    """
+    return _gguf_tree_of_location((report or {}).get("location"))
+
+
+def _resolve_converter_and_gguf(converter_location, python_exe, architecture = None,
+                                is_vlm = None):
+    """Pick the (converter, gguf-py) pair whose `gguf` can satisfy the converter.
+
+    Returns `(converter_location, gguf_py_dir, report)`.
+
+    `gguf_py_dir` is the gguf-py to pin, or None to leave the child's resolution
+    exactly as it is today. A directory rather than a finished environment on
+    purpose: the launch sites build the env from the live os.environ at launch
+    time, so anything that edits it in between is still honoured.
+
+    `report` is the probe result for the pair we chose, kept for the failure
+    diagnosis.
+
+    Conservative by design, in two steps.
+
+    Candidate 0 is the requested pair with the environment untouched. If nothing
+    it CERTAINLY needs is missing we return it and change nothing, so a false
+    positive in the requirement scan can never turn a working export into a
+    refusal and an installed gguf-py that is merely one unrelated architecture
+    behind never costs anyone their converter.
+
+    Only once candidate 0 is provably broken do we look at the rest, and then we
+    rank them rather than taking the first that clears the certain bar: fewest
+    certain misses, then fewest advisory misses. The tie-break matters. A
+    candidate can satisfy every name that certainly runs and still fail on one
+    that runs in practice, because a reference inside a function body of
+    `conversion/base.py` is advisory by construction and yet executes on every
+    conversion (`gguf.LazyChunkedTensor` is exactly this). Preferring the
+    candidate with no advisory misses at all picks the genuinely co-versioned
+    tree instead of a merely plausible one.
+    """
+    requested_certain, requested_advisory = _converter_gguf_requirements(
+        converter_location, architecture, is_vlm,
+    )
+    if not requested_certain and not requested_advisory:
+        return converter_location, None, None
+
+    # Which halves of the conversion this architecture has, read off the converter that was
+    # asked for. A fallback has to serve the same ones.
+    requested_maps = _converter_architecture_maps(converter_location, architecture, is_vlm)
+    candidates = _gguf_candidate_converters(converter_location)
+    baseline_report = None
+    baseline_blocking = ()
+    ranked = []
+    for index, (candidate, gguf_py, label) in enumerate(candidates):
+        # Loop-local, so no iteration can read another candidate's requirements.
+        if candidate == converter_location:
+            certain, advisory = requested_certain, requested_advisory
+        else:
+            # Before the probe, which costs a subprocess: a converter that does not map this
+            # architecture cannot convert this model however well its gguf matches, and its
+            # empty requirement scan is exactly what makes it rank first.
+            if not _converter_maps_architecture(candidate, architecture, requested_maps):
+                continue
+            certain, advisory = _converter_gguf_requirements(candidate, architecture, is_vlm)
+        env = _converter_child_env(gguf_py)
+        report = _probe_child_gguf(
+            python_exe, env, tuple(certain) + tuple(advisory), candidate,
+        )
+        if report is None:
+            # Probe unavailable: keep today's behaviour.
+            return converter_location, None, None
+        blocking = _gguf_blocking_missing(report, certain)
+        if index == 0:
+            baseline_report = report
+            baseline_blocking = blocking
+            if not (report.get("error") or blocking):
+                # Either nothing is missing, or only names that may never be
+                # reached. Never move off the requested pair on a maybe.
+                return converter_location, gguf_py, report
+            # Only now, and only once: the installed `gguf` wheel, with the
+            # converter's sibling tree out of the way. Probing for it costs a
+            # subprocess, so it is not paid by an install that already works.
+            installed_tree = _installed_gguf_tree(python_exe)
+            known = {
+                os.path.abspath(tree) for _candidate, tree, _label in candidates if tree
+            }
+            if installed_tree and os.path.abspath(installed_tree) not in known:
+                # Ahead of the older trees: the requested converter is the newest
+                # thing here, so the newest gguf is the one most likely to match it.
+                candidates.insert(1, (
+                    converter_location, installed_tree, "the installed gguf package",
+                ))
+            continue
+        if report.get("error"):
+            continue
+        missing = set(report.get("missing") or ())
+        ranked.append((
+            len(blocking), len(missing & set(advisory)), index,
+            candidate, gguf_py, label, report,
+        ))
+
+    ranked.sort(key = lambda row: row[:3])
+    # Only a candidate that misses nothing certain is an improvement. One that
+    # still misses a certainly-executed name is no better than the request, and
+    # pinning it would change the environment for nothing.
+    if ranked and ranked[0][0] == 0:
+        _certain_miss, _advisory_miss, _index, candidate, gguf_py, label, report = ranked[0]
+        if candidate != converter_location:
+            print(
+                f"Unsloth: The GGUF converter at {converter_location} needs a newer "
+                f"gguf than this llama.cpp install provides "
+                f"({_gguf_report_summary(baseline_report, baseline_blocking)}). Falling back to "
+                f"{label} at {candidate}, which matches it. The GGUF will be produced "
+                f"by that older converter; update llama.cpp to use the newer one."
+            )
+        else:
+            logger.info(
+                "Unsloth: Pinning the GGUF converter's gguf to %s (%s).", gguf_py, label
+            )
+        return candidate, gguf_py, report
+
+    # Nothing satisfies it. Run exactly what was asked for, as before, and let
+    # the failure path attach the diagnosis.
+    return converter_location, None, baseline_report
+
+
+def _gguf_skew_diagnosis(converter_location, python_exe, report = None, architecture = None):
+    """One actionable paragraph naming the gguf the child resolved, what it could
+    not satisfy, and the remedy. Never raises."""
+    try:
+        certain, advisory = _converter_gguf_requirements(converter_location, architecture)
+        if report is None:
+            report = _probe_child_gguf(
+                python_exe, _converter_child_env(), tuple(certain) + tuple(advisory),
+                converter_location,
+            )
+        if report is None:
+            return ""
+        lines = [
+            "",
+            "--- unsloth: gguf version skew ---",
+            f"converter : {converter_location}",
+            f"gguf      : {report.get('location') or 'not importable'}"
+            + (f" (version {report['version']})" if report.get("version") else ""),
+        ]
+        if report.get("error"):
+            lines.append(f"import    : {report['error']}")
+        blocking = _gguf_blocking_missing(report, certain)
+        missing = list(blocking) or (report.get("missing") or [])
+        if missing:
+            lines.append(f"missing   : {', '.join(missing[:8])}")
+        lines.append(
+            "This converter needs a newer gguf than the one it resolved. Delete the "
+            "llama.cpp folder so Unsloth reinstalls a matching one, or point "
+            "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a llama.cpp checkout whose gguf-py "
+            "matches its convert_hf_to_gguf.py."
+        )
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _verify_run_outputs(files, description, required, quantization_type,
+                        print_output = False, gguf_py_dir = None):
+    """Read one converter run's outputs back. True to keep them, False to drop them.
+
+    A REQUIRED run raises, which is the export failing. An OPTIONAL run, i.e. the
+    projector, does not: a converter that exits 0 while writing an unreadable or
+    structurally invalid GGUF is the same outcome for the user as one that exits
+    non-zero, and that case is already handled as a text-only downgrade. Aborting
+    here instead would throw away a text model that is present and valid, which is
+    the opposite of what the optional handling exists to do. The bad projector is
+    removed so that nothing uploads it."""
+    try:
+        _verify_converted_gguf(
+            files, quantization_type, print_output = print_output,
+            gguf_py_dir = gguf_py_dir,
+        )
+        return True
+    except Exception as error:
+        if required: raise
+        for path in files: _remove_gguf_outputs(path)
+        print(
+            f"Unsloth: The {description} converted but did not pass verification "
+            f"({error}). It has been removed. The text model was converted "
+            f"successfully and is usable; only multimodal (image/audio) input is "
+            f"unavailable in this GGUF."
+        )
+        return False
+
+
 def convert_to_gguf(
     model_name,
     input_folder,
@@ -4018,6 +4951,30 @@ def convert_to_gguf(
             f"16bit weights. Saving a quantized model that has no adapter does "
             f"not dequantize it."
         )
+
+    # Decide text-only versus text-plus-projector BEFORE resolving the converter, so the
+    # resolution is scoped to the halves this call will really convert. Downgrading
+    # afterwards would leave the resolver having treated the projector module's `gguf`
+    # names as certain for a conversion that never imports it.
+    if is_vlm and supported_vision_archs is not None:
+        if "architectures" in config_file:
+            arch = config_file["architectures"][0]
+        else:
+            arch = None  # MLX-style config; skip mmproj arch check
+        if arch is not None and arch not in supported_vision_archs:
+                is_vlm = False
+                print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
+
+    # Resolve, once, which converter and which `gguf` the child will run with.
+    # Untouched when the install is consistent; see _resolve_converter_and_gguf.
+    # The architecture goes in so that only the conversion/ module this export
+    # really imports counts as a hard requirement: every other architecture's
+    # module is imported by load_all_models, which swallows the failure.
+    _architectures = config_file.get("architectures") or ()
+    _architecture = _architectures[0] if _architectures else None
+    converter_location, _gguf_py_pin, _gguf_report = _resolve_converter_and_gguf(
+        converter_location, sys.executable, _architecture, is_vlm,
+    )
 
     # The converter sizes block_count from the config, so keep `mtp_num_hidden_layers`
     # only when the weights still carry the MTP layer (else it crashes on the extra
@@ -4075,16 +5032,11 @@ def convert_to_gguf(
             )
     pass
 
-    if is_vlm and supported_vision_archs is not None:
-        if "architectures" in config_file:
-            arch = config_file["architectures"][0]
-        else:
-            arch = None  # MLX-style config; skip mmproj arch check
-        if arch is not None and arch not in supported_vision_archs:
-                is_vlm = False
-                print(f"Unsloth: {arch} is not supported for MMPROJ conversion. Converting as text-only model.")
-
     all_output_files = []
+    # Which files came from which run, and whether that run was required. The
+    # read-back below needs it: a projector is an OPTIONAL run, and its failure is
+    # already a text-only downgrade rather than an aborted export.
+    verify_groups = []
     runs_to_do = []
 
     if is_vlm:
@@ -4210,12 +5162,14 @@ def convert_to_gguf(
                 if print_output:
                     result = subprocess.run(command, shell=False, check=True,
                                           encoding="utf-8", errors="replace",
+                                          env=_converter_child_env(_gguf_py_pin),
                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                     print(result.stdout)
                 else:
                     # Capture so a failure surfaces the real traceback.
                     subprocess.run(command, shell=False, check=True,
                                    encoding="utf-8", errors="replace",
+                                   env=_converter_child_env(_gguf_py_pin),
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 break
             except subprocess.CalledProcessError as e:
@@ -4347,7 +5301,17 @@ def convert_to_gguf(
                         f"(image/audio) input is unavailable in this GGUF."
                     )
                     break
-                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}{no_mtp_note}")
+                skew_note = ""
+                # The requirements are what tell a gguf AttributeError apart from
+                # an ordinary model-side one; see _looks_like_gguf_skew.
+                if _looks_like_gguf_skew(
+                    captured,
+                    _converter_gguf_requirements(converter_location, _architecture)[0],
+                ):
+                    skew_note = _gguf_skew_diagnosis(
+                        converter_location, command[0], _gguf_report, _architecture,
+                    )
+                raise RuntimeError(f"Unsloth: Failed to convert {description} to GGUF with command `{cmd}`: {e}{details}{repair_note}{no_mtp_note}{skew_note}")
 
         # Its partial output was just removed, so validation would fail for nothing.
         if optional_failed:
@@ -4394,6 +5358,7 @@ def convert_to_gguf(
             print(f"Found {len(shard_files)} sharded output files for {description}")
             all_output_files.extend(shard_files)
             found_files = shard_files
+        verify_groups.append((list(found_files), description, required))
         pass
 
         if print_output:
@@ -4408,6 +5373,19 @@ def convert_to_gguf(
                 print(f"Unsloth: Successfully saved {description} GGUF to: {found_files[0]} (size: {size_str})")
             else:
                 print(f"Unsloth: Successfully saved {description} GGUF as {len(found_files)} shards (total size: {size_str})")
+
+    # The converter never re-reads what it wrote, so it reports success on a file
+    # no llama.cpp build can load (unsloth#6056, unsloth#8360, unsloth#8513).
+    # `_gguf_py_pin` is None whenever nothing needed pinning, so the read back derives
+    # the writer's tree from the probe report instead.
+    _readback_tree = _gguf_py_pin or _gguf_readback_tree(_gguf_report)
+    for _files, _description, _required in verify_groups:
+        if not _verify_run_outputs(
+            _files, _description, _required, quantization_type,
+            print_output = print_output, gguf_py_dir = _readback_tree,
+        ):
+            all_output_files = [f for f in all_output_files if f not in set(_files)]
+            is_vlm = False
 
     return all_output_files, is_vlm
 pass
@@ -4628,105 +5606,1027 @@ def quantize_gguf(
 pass
 
 
-def _assert_correct_gguf(model_name, model, tokenizer):
-    # All Unsloth Zoo code licensed under LGPLv3
-    # Verify if conversion is in fact correct by checking tokenizer and last tensor
-    import gguf.gguf_reader  # type: ignore
-    from gguf.gguf_reader import GGUFReader  # type: ignore
+# Post-conversion GGUF verification. The converter does not check its own
+# output, so a GGUF missing a key llama.cpp reads unconditionally is published
+# and loads nowhere (unsloth#8360, unsloth#8513: MiniMax M3 quants without
+# `{arch}.attention.indexer.head_count`). Key strings below come from
+# `src/llama-arch.cpp`'s LLM_KV_NAMES, not from a guess.
 
-    # Stop until building tensors
-    if not hasattr(GGUFReader, "__init__"):
-        raise RuntimeError("Unsloth: Failed to verify GGUF: GGUFReader has no __init__")
-    init_source = inspect.getsource(GGUFReader.__init__)
-    text = "self._build_tensors(offs, tensors_fields"
-    stop = init_source.find(text)
-    if text not in init_source:
-        raise RuntimeError(f"Unsloth: Failed to verify GGUF: Reader has no `{text}`")
-    init_source = init_source.replace(text, text + "[-1:]")
+# `general.architecture` names the arch; llama.cpp cannot choose a model
+# loader without it (src/llama-arch.cpp maps it to LLM_ARCH_*).
+GGUF_ARCHITECTURE_KEY = "general.architecture"
 
-    # Execute source and run partial GGUF reader
-    source = f"class Partial_GGUFReader(GGUFReader):\n{init_source}"
+# Read by `llama_model_base::load_hparams` (src/llama-model.cpp) with no
+# `required = false` argument, so a missing one throws before any tensor is
+# touched. `{arch}.attention.head_count` and `{arch}.feed_forward_length` are
+# deliberately NOT here: the same function reads those through
+# `get_key_or_arr(..., false)`, i.e. they are optional.
+GGUF_UNIVERSAL_REQUIRED_KEYS = (
+    "{arch}.context_length",    # ml.get_key(LLM_KV_CONTEXT_LENGTH,   hparams.n_ctx_train)
+    "{arch}.embedding_length",  # ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd)
+    "{arch}.block_count",       # ml.get_key(LLM_KV_BLOCK_COUNT,      hparams.n_layer_all)
+)
 
-    functions = dir(gguf.gguf_reader)
-    functions = [x for x in functions if x in source]
-    functions = f"from gguf.gguf_reader import ({','.join(functions)})"
-    all_functions = {}
-    exec(functions, all_functions)
-    exec(source, all_functions)
+# A tensor namespace implies the metadata namespace describing it:
+# (tensor marker, required keys, exempt architectures, why).
+# A key qualifies only if every architecture carrying the namespace reads it
+# with no trailing `false` in `src/models/*.cpp`; ones reading it optionally go
+# in the exempt set, anything weaker in GGUF_CONDITIONAL_ADVISORY_KEYS. A hit
+# here refuses to publish, and rejecting a good GGUF is worse than no gate.
+# Verified against llama.cpp b49650adb31f2e49a0d76113aeb1792134fd8413.
+GGUF_CONDITIONAL_REQUIRED_KEYS = (
+    (
+        # `blk.N.indexer.*` and `blk.N.indexer_compressor_*`
+        # (src/llama-arch.cpp LLM_TENSOR_INDEXER_*).
+        ".indexer",
+        (
+            "{arch}.attention.indexer.head_count",
+            "{arch}.attention.indexer.key_length",
+            "{arch}.attention.indexer.top_k",
+        ),
+        # src/models/hy-v4.cpp:46-48 reads all three with a trailing `false`
+        # and creates the indexer tensors only when top_k came out non-zero, so
+        # a hy_v4 file without them loads (with the indexer off) rather than
+        # failing. The arch string is src/llama-arch.cpp:126.
+        frozenset(("hy_v4",)),
+        "DeepSeek sparse attention indexer tensors. Seven architectures define "
+        "them and six read these three keys as required: deepseek32.cpp, "
+        "deepseek4.cpp, dots3note.cpp, glm-dsa.cpp, minimax-m3.cpp and "
+        "qwen4exp.cpp. The seventh, hy-v4.cpp, reads them "
+        "optionally and is exempt. The remaining indexer keys (block_size, "
+        "local_blocks, kpool, types) are read by only some of the seven, so "
+        "they are not required here.",
+    ),
+    (
+        # `blk.N.ssm_*` (src/llama-arch.cpp LLM_TENSOR_SSM_*).
+        ".ssm_",
+        ("{arch}.ssm.conv_kernel",),
+        frozenset(),
+        "State space and linear attention tensors. All fifteen architectures "
+        "that create them read ssm.conv_kernel with no `false`, checked by "
+        "grepping LLM_KV_SSM_CONV_KERNEL across src/models/. inner_size, "
+        "state_size and time_step_rank are required by most but not all, so "
+        "they are not here.",
+    ),
+)
 
-    # Check if tokenizer is the same
-    def check_gguf_tokenizer(tokenizer, reader):
-        vocab = tokenizer.get_vocab()
-        if not hasattr(reader, "fields"): return
-        if not hasattr(reader.fields, "tokenizer.ggml.tokens"): return
+# Same shape, but these are WARNINGS. llama.cpp loads the file, so refusing to
+# publish it could turn an export that works today into a hard failure; the
+# result is still likely to be wrong, so it is worth saying out loud.
+GGUF_CONDITIONAL_ADVISORY_KEYS = (
+    (
+        # `blk.N.ffn_{gate,up,down}_exps` (LLM_TENSOR_FFN_*_EXPS).
+        "_exps",
+        ("{arch}.expert_count", "{arch}.expert_used_count"),
+        frozenset(),
+        "Mixture of experts tensors. `load_hparams` reads expert_count with a "
+        "trailing `false` and defaults it to 0, so without it no architecture "
+        "creates an expert tensor and llama-model-loader.cpp logs 'model has "
+        "unused tensor ... -- ignoring' for every one of them: the model loads "
+        "and is silently wrong. Advisory rather than fatal because llama.cpp "
+        "does load it, and because a converter can legitimately reach this "
+        "state: conversion/hunyuan.py pops `num_experts` before calling "
+        "super().set_gguf_parameters() and restores it afterwards, so the key "
+        "is never written while modify_tensors still emits the `_exps` "
+        "tensors.",
+    ),
+)
 
-        field = reader.fields["tokenizer.ggml.tokens"].data
-        saved_vocab = [str(bytes(x), encoding = "utf-8") for x in field]
+# `load_hparams` returns before reading any of the above for these, so the gate
+# must not fire on a projector. "clip" is the dummy architecture every mmproj
+# file carries (gguf-py/gguf/constants.py maps MODEL_ARCH.MMPROJ to "clip",
+# src/llama-arch.cpp maps LLM_ARCH_CLIP to "clip"), and src/llama-model.cpp
+# reads `if (hparams.vocab_only || ml.get_arch() == LLM_ARCH_CLIP) return;`.
+GGUF_METADATA_EXEMPT_ARCHITECTURES = frozenset(("clip",))
 
-        vocab = [k for k, v in sorted(vocab.items(), key = lambda item: item[1])]
-        if saved_vocab != vocab:
-            raise RuntimeError("Unsloth: Failed converting to GGUF due to corrupted tokenizer.")
-    pass
+_GGUF_SHARD_PATTERN = re.compile(r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.gguf$")
 
-    # Get last tensor in file and check for exactness
-    def check_gguf_last_tensor(model, reader):
-        if not hasattr(reader, "tensors"): return
+# Default number of tensors sampled by the data checks. The first and last are
+# always added on top, so the floor is 2.
+GGUF_VERIFY_SAMPLE_DEFAULT = 8
 
-        last_tensor = reader.tensors[-1]
-        last_tensor_data = torch.tensor(last_tensor.data)
-        parameters = list(model.parameters())[-10:]
 
-        distances = torch.ones(len(parameters), device = parameters[-1].device)
-        found = False
-        for k, param in enumerate(parameters):
-            if param.shape[0] == last_tensor.shape[0]:
-                x = torch.empty_like(param)
-                x[:] = last_tensor_data[:]
-                distances[k] = torch.dist(x, param)
-                found = True
-            pass
-        pass
-        if found:
-            torch._assert(
-                distances.min() == 0,
-                "Unsloth: Failed converting to GGUF due to corrupted files."
-            )
-        pass
-    pass
+def _gguf_verify_enabled():
+    """Whether post-conversion verification runs. Read at the call, not at
+    import, so setting it after `import unsloth` works."""
+    return os.environ.get("UNSLOTH_GGUF_VERIFY", "1").strip().upper() \
+        not in ("0", "OFF", "FALSE", "NO")
 
-    Partial_GGUFReader = all_functions['Partial_GGUFReader']
-    reader = Partial_GGUFReader(model_name, "r")
-    check_gguf_last_tensor(model, reader)
-    check_gguf_tokenizer(tokenizer, reader)
 
-    # Try parsing metadata
+def _gguf_sample_size():
+    """`UNSLOTH_GGUF_VERIFY_TENSORS`, clamped to >= 0. Junk reads as the default."""
+    raw = os.environ.get("UNSLOTH_GGUF_VERIFY_TENSORS", "")
+    if not raw.strip():
+        return GGUF_VERIFY_SAMPLE_DEFAULT
     try:
-        from gguf.scripts.gguf_dump import dump_metadata_json  # type: ignore
-        class Arguments: pass
-        args = Arguments()
+        return max(0, int(raw.strip()))
+    except ValueError:
+        logger.warning(
+            f"Unsloth: UNSLOTH_GGUF_VERIFY_TENSORS='{raw}' is not an integer; "
+            f"using {GGUF_VERIFY_SAMPLE_DEFAULT}."
+        )
+        return GGUF_VERIFY_SAMPLE_DEFAULT
 
-        args.no_tensors = True
-        args.model = model_name
-        args.json_array = False
 
-        # Stop prints
-        with contextlib.redirect_stdout(open(os.devnull, "w")):
-            metadata = dump_metadata_json(reader, args)
+def _gguf_shard_siblings(path):
+    """Every shard of a split GGUF, in order, given any one of them.
+
+    Only shard 1 carries the model's KV metadata, so a gate handed shard 3
+    would find no `general.architecture` and reject a file that is in fact
+    fine. Returns `[path]` for a single file, and for a shard set the full
+    list, so the tensor names are the union across shards rather than
+    whichever slice happened to be passed in.
+    """
+    match = _GGUF_SHARD_PATTERN.match(os.path.basename(path))
+    if match is None:
+        return [path]
+    directory = os.path.dirname(path) or "."
+    stem, total = match.group("stem"), int(match.group("total"))
+    shards = []
+    for index in range(1, total + 1):
+        candidate = os.path.join(directory, f"{stem}-{index:05d}-of-{total:05d}.gguf")
+        if os.path.isfile(candidate):
+            shards.append(candidate)
+    return shards or [path]
+
+
+def _gguf_missing_shards(path):
+    """Basenames the split set declares but does not have on disk, in order.
+
+    `_gguf_shard_siblings` drops an absent shard silently, which is right for building
+    the union of tensor names but means an incomplete set is indistinguishable from a
+    complete smaller one: the count is only in the filename. Without this, shard 1 being
+    present was enough for every check below to run on whatever survived and pass, so a
+    split model missing its middle was reported ready to publish or quantize.
+    """
+    match = _GGUF_SHARD_PATTERN.match(os.path.basename(path))
+    if match is None:
+        return []
+    directory = os.path.dirname(path) or "."
+    stem, total = match.group("stem"), int(match.group("total"))
+    missing = []
+    for index in range(1, total + 1):
+        name = f"{stem}-{index:05d}-of-{total:05d}.gguf"
+        if not os.path.isfile(os.path.join(directory, name)):
+            missing.append(name)
+    return missing
+
+
+def _gguf_field_text(reader, key):
+    """A string KV value, or None when absent or not readable as one."""
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+    try:
+        value = field.contents()
+    except Exception:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return str(bytes(value), encoding = "utf-8", errors = "replace")
+    return None if value is None else str(value)
+
+
+def _gguf_field_int(reader, key):
+    """An integer KV value, or None when absent or not readable as one."""
+    field = reader.fields.get(key)
+    if field is None:
+        return None
+    try:
+        value = field.contents()
+    except Exception:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+# A block index in a parameter name: `model.layers.31.mlp...`, `transformer.h.5...`.
+_HF_BLOCK_INDEX_RE = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
+
+
+def _model_block_count(shapes):
+    """Blocks inferred from parameter names, or None. The fallback for a missing KV."""
+    highest = -1
+    for name in shapes:
+        match = _HF_BLOCK_INDEX_RE.search(name)
+        if match is None:
+            continue
+        try:
+            index = int(match.group(1))
+        except ValueError:
+            continue
+        if index > highest:
+            highest = index
+    return highest + 1 if highest >= 0 else None
+
+
+def _open_gguf_reader(path):
+    """A plain `GGUFReader`, imported at the call site.
+
+    There used to be a `Partial_GGUFReader` here, built by running
+    `inspect.getsource(GGUFReader.__init__)` through `exec` with
+    `self._build_tensors(offs, tensors_fields` rewritten to
+    `...tensors_fields[-1:]`, so only the final tensor was ever built. It was
+    removed because it bought nothing and hid everything: measured on a 542 MB
+    export the plain reader takes 6.69 s and 736 MB peak RSS against the
+    rewritten one's 7.48 s and the same 736 MB, because all of the cost is
+    `_build_fields` parsing a 262k entry vocabulary while `_build_tensors`
+    only creates lazy memmap views.
+
+    Neither the time nor the memory is free, and both are the vocabulary's
+    rather than the model's. Reading a file back costs the parent 0.8 GB of
+    anonymous heap on a 262k vocabulary and 1.5 GB on a vocab-only file of
+    15.8 MB, none of it reclaimable, and that spike lands in the parent, which
+    has no OOM retry, unlike the converter child. The tensor sample itself is
+    file-backed and reclaimable: the windowed pass touches about 16 KB per
+    tensor, flat, but a tensor in the deep sample is read whole up to
+    GGUF_VERIFY_DEEP_MAX_ELEMENTS, so the sample can fault in a gigabyte, and a
+    tensor ABOVE that cap is skipped entirely. The effect is non monotonic: a
+    model whose tensors all cross the cap gets no deep check at all. The rewrite also raised
+    `RuntimeError: Reader has no self._build_tensors(offs, tensors_fields`
+    whenever gguf-py refactored that one line.
+    """
+    from gguf.gguf_reader import GGUFReader  # type: ignore
+    return GGUFReader(path, "r")
+
+
+def _gguf_open_shards(gguf_file):
+    """`[(path, reader or None), ...]` for a GGUF and, if it is split, its siblings.
+
+    Built once and threaded through the checks below. `GGUFReader.__init__`
+    parses every KV entry eagerly, which on a 262k entry vocabulary costs 6.7 s
+    and about 1.5 GB of transient numpy views, so opening the file once per
+    check made verification cost three times what it needs to. A reader is None
+    when that shard could not be read; the caller decides whether that is a
+    problem or a warning.
+    """
+    opened = []
+    for path in _gguf_shard_siblings(gguf_file):
+        try:
+            opened.append((path, _open_gguf_reader(path)))
+        except Exception as error:
+            logger.debug(f"Unsloth: could not read {path} ({type(error).__name__}: {error})")
+            opened.append((path, None))
+    return opened
+
+
+def _gguf_metadata_scan(gguf_file, readers, conditional, include_universal):
+    """Shared body of gguf_metadata_problems and gguf_metadata_warnings.
+
+    Returns a list of strings. `conditional` is one of the two tables above;
+    `include_universal` adds the keys llama.cpp reads for every architecture,
+    which belong to the fatal pass only.
+    """
+    if readers is None:
+        readers = _gguf_open_shards(gguf_file)
+    # A file this unreadable, or a shard set this incomplete, is already a fatal
+    # problem, so only the fatal pass reports it. Saying it twice, once as a
+    # problem and once as a warning, reads like two separate faults.
+    report_structural = include_universal
+    reader = readers[0][1]
+    if reader is None:
+        if not report_structural:
+            return []
+        return [f"`{os.path.basename(readers[0][0])}` could not be read as a GGUF file"]
+
+    # Only shard 1 carries the KV metadata, so if it is not on disk every key
+    # below reads as missing. Say which file is absent instead, or the report
+    # sends the reader looking for metadata that was never supposed to be here.
+    first = _GGUF_SHARD_PATTERN.match(os.path.basename(readers[0][0]))
+    if first is not None and int(first.group("index")) != 1:
+        if not report_structural:
+            return []
+        total = int(first.group("total"))
+        return [
+            f"shard 1 of {total} (`{first.group('stem')}-00001-of-{total:05d}.gguf`) "
+            f"is not present, and it is the only shard that carries the model's "
+            f"metadata"
+        ]
+
+    # Shard 1 is here, so the metadata reads fine and every check below would run happily
+    # on the shards that remain. A later shard being absent is just as unloadable, and the
+    # only record of how many there should be is the `-of-NNNNN` in the name.
+    absent = _gguf_missing_shards(readers[0][0])
+    if absent:
+        if not report_structural:
+            return []
+        total = int(first.group("total"))
+        listed = ", ".join(f"`{name}`" for name in absent)
+        return [
+            f"{len(absent)} of the {total} shards this split model declares are not "
+            f"present ({listed}), so it is incomplete and llama.cpp cannot load it"
+        ]
+
+    architecture = _gguf_field_text(reader, GGUF_ARCHITECTURE_KEY)
+    if not architecture:
+        if not report_structural:
+            return []
+        return [
+            f"`{GGUF_ARCHITECTURE_KEY}` is missing, so llama.cpp cannot choose "
+            f"a model loader for this file"
+        ]
+    tensor_names = []
+    unreadable_shards = []
+    for path, shard_reader in readers:
+        if shard_reader is None:
+            unreadable_shards.append(os.path.basename(path))
+            logger.warning(
+                f"Unsloth: could not read shard {path} while checking GGUF "
+                f"metadata; its tensors are not part of the check."
+            )
+            continue
+        tensor_names.extend(tensor.name for tensor in shard_reader.tensors)
+
+    # BEFORE the architecture exemption, not after it. A shard that cannot be read is a
+    # structural fault, and the exemption is about which metadata KEYS a loader reads: a
+    # projector whose second shard is corrupt is as unloadable as any other model with a
+    # corrupt shard, and returning [] on the exemption first told a caller of the exported
+    # API that an unloadable projector was fine. Same for the missing-shard and unreadable
+    # first-shard answers above, which already run before it.
+    if unreadable_shards and report_structural:
+        # A later shard that cannot be read is exactly as unloadable as a missing one, and
+        # this function's documented empty list is what a caller uses to ACCEPT a downloaded
+        # split model. Logging it and returning [] told that caller the shard set was fine.
+        # Fatal pass only, like every other structural answer here: the advisory pass would
+        # otherwise report the same fault twice.
+        listed = ", ".join(f"`{name}`" for name in unreadable_shards)
+        return [
+            f"{len(unreadable_shards)} of this split model's shards could not be read "
+            f"({listed}), so llama.cpp cannot load it"
+        ]
+
+    if architecture in GGUF_METADATA_EXEMPT_ARCHITECTURES:
+        # Multimodal projector. llama.cpp returns from load_hparams before
+        # reading any of the keys below, so requiring them would reject every
+        # mmproj file Unsloth produces.
+        return []
+
+    if not any(name.startswith("blk.") for name in tensor_names):
+        # No transformer blocks: a vocabulary-only or otherwise non-model GGUF.
+        # llama.cpp skips the hparams entirely for those (the `vocab_only`
+        # half of the early return in load_hparams).
+        return []
+
+    present = reader.fields.keys()
+    problems = []
+    if include_universal:
+        for template in GGUF_UNIVERSAL_REQUIRED_KEYS:
+            key = template.format(arch = architecture)
+            if key not in present:
+                problems.append(f"`{key}` is missing (llama.cpp reads it for every architecture)")
+
+    for marker, templates, exempt, reason in conditional:
+        if architecture in exempt:
+            # This architecture's loader reads the keys optionally, so the file
+            # is valid without them and the namespace implies nothing.
+            continue
+        example = next((name for name in tensor_names if marker in name), None)
+        if example is None:
+            continue
+        for template in templates:
+            key = template.format(arch = architecture)
+            if key not in present:
+                problems.append(
+                    f"`{key}` is missing even though the file contains "
+                    f"`{example}`. {reason}"
+                )
+    return problems
+
+
+def gguf_metadata_problems(gguf_file, readers = None):
+    """Architecture-required metadata missing from a GGUF, as a list of strings.
+
+    Empty means the file carries everything llama.cpp reads unconditionally for
+    the architecture it declares and for the tensor namespaces it contains. No
+    torch model, tokenizer or source checkpoint needed, so this also runs on a
+    GGUF downloaded from anywhere.
+
+    Every entry here is something llama.cpp refuses to load without, which is
+    what makes it safe to refuse to publish the file. Keys that only make the
+    model silently wrong are reported by `gguf_metadata_warnings` instead.
+
+    Split exports are resolved to their whole shard set first, so passing any
+    shard is the same as passing the first.
+    """
+    return _gguf_metadata_scan(
+        gguf_file, readers, GGUF_CONDITIONAL_REQUIRED_KEYS, True,
+    )
+
+
+def gguf_metadata_warnings(gguf_file, readers = None):
+    """Metadata a GGUF should carry but that llama.cpp will load without.
+
+    Same shape as `gguf_metadata_problems`, and deliberately separate: these are
+    logged rather than raised, so a file llama.cpp accepts is never refused.
+    """
+    return _gguf_metadata_scan(
+        gguf_file, readers, GGUF_CONDITIONAL_ADVISORY_KEYS, False,
+    )
+
+
+def _gguf_sample_indices(count, sample_size, seed_material):
+    """`sample_size` indices into `range(count)`, plus the first and last.
+
+    Deterministic in the file it describes, so a rejection reproduces: the seed
+    comes from `seed_material` (the file's own name and tensor count) rather
+    than from the clock or `PYTHONHASHSEED`.
+    """
+    if count <= 0:
+        return []
+    if count <= sample_size + 2:
+        return list(range(count))
+    import random
+    digest = hashlib.sha256(str(seed_material).encode("utf-8")).hexdigest()
+    chosen = {0, count - 1}
+    chosen.update(random.Random(int(digest[:16], 16)).sample(range(count), sample_size))
+    return sorted(chosen)
+
+
+# Elements read from each end of every tensor by the cheap pass. 4096 floats
+# is 8 or 16 KB, so scanning every tensor in a 4000 tensor export costs tens of
+# megabytes of reads no matter how large the export is.
+GGUF_VERIFY_WINDOW_DEFAULT = 4096
+
+# A tensor above this many elements is windowed even when the deterministic
+# sample picks it, so verification never reads gigabytes. 64M elements is
+# 128 MB at two bytes each; `token_embd.weight` alone is 168M elements on a
+# 262k vocabulary, and it is always in the sample because the first and last
+# tensors always are.
+GGUF_VERIFY_DEEP_MAX_ELEMENTS = 64 * 1024 * 1024
+
+# The sublayer output projections, the only weights inside a block that a
+# published method deliberately sets to exactly zero. LLaMA Pro block expansion
+# (arXiv 2401.02415) zero-initialises o_proj and down_proj so that a copied block
+# computes the identity, and llama.cpp loads the result, so an all-zero one is not
+# evidence of a bad conversion. gguf-py's TensorNameMap spells them like this.
+GGUF_IDENTITY_INIT_SUFFIXES = (".attn_output.weight", ".ffn_down.weight")
+
+
+def _gguf_window_size():
+    """`UNSLOTH_GGUF_VERIFY_ELEMENTS`, clamped to >= 1. Junk reads as the default."""
+    raw = os.environ.get("UNSLOTH_GGUF_VERIFY_ELEMENTS", "")
+    if not raw.strip():
+        return GGUF_VERIFY_WINDOW_DEFAULT
+    try:
+        return max(1, int(raw.strip()))
+    except ValueError:
+        logger.warning(
+            f"Unsloth: UNSLOTH_GGUF_VERIFY_ELEMENTS='{raw}' is not an integer; "
+            f"using {GGUF_VERIFY_WINDOW_DEFAULT}."
+        )
+        return GGUF_VERIFY_WINDOW_DEFAULT
+
+
+# GGUF float types gguf-py returns as raw bytes, with the unsigned view exposing
+# their exponent bits. numpy has no bfloat16, so BF16 arrives as uint8 and a
+# plain `np.issubdtype(..., np.floating)` test skipped it; F32, F64 and F16 come
+# back as real float dtypes and take that fast path instead. Values from
+# gguf-py/gguf/constants.py GGMLQuantizationType.
+_GGUF_BYTEWISE_FLOAT_TYPES = {
+    30: ("uint16", 0x7F80),  # BF16: 8 exponent bits
+}
+
+
+def _gguf_float_view(tensor):
+    """`(values, exponent_mask)` for a tensor whose bits can be examined, else
+    `(None, None)`.
+
+    `exponent_mask` is None when `values` is a real float dtype and numpy can
+    answer `isfinite` directly; otherwise it is the mask that isolates the
+    exponent field of the integer view, and an all-ones exponent means NaN or
+    Inf.
+    """
+    import numpy as np
+    data = np.asarray(tensor.data)
+    if np.issubdtype(data.dtype, np.floating):
+        return data.reshape(-1), None
+    entry = _GGUF_BYTEWISE_FLOAT_TYPES.get(int(tensor.tensor_type))
+    if entry is None:
+        # A quantized block format. Its bytes are not values, so only the
+        # all-zero test below applies, on the raw bytes.
+        return None, None
+    view_dtype, mask = entry
+    return data.reshape(-1).view(view_dtype), mask
+
+
+def _gguf_degenerate_problem(tensor, sample_deeply, window, check_zero = True):
+    """Why a GGUF tensor cannot be a real weight, or None.
+
+    Two passes. Every tensor gets the cheap one: a window from each end, which
+    catches a zeroed or NaN-filled tensor with certainty because damage of that
+    kind is never confined to the middle. A tensor in the deterministic deep
+    sample is read whole, which also catches a non-finite value that happens to
+    sit away from both ends.
+
+    The all-zero test is gated by `check_zero`, because zero is legitimate
+    outside the transformer blocks: BERT-family `token_types.weight` is all
+    zeros for a single-segment model, and a projector can carry zeroed entries
+    too. It works on raw bytes, so it covers quantized types as well. The NaN
+    and Inf test needs to know where the exponent is, so it runs for F32, F64,
+    F16 and BF16 only, and it runs on every tensor because a non-finite value is
+    never legitimate anywhere.
+    """
+    import numpy as np
+    values, exponent_mask = _gguf_float_view(tensor)
+    raw = np.asarray(tensor.data).reshape(-1)
+    if raw.size == 0:
+        return None
+
+    def clip(array):
+        if array.size <= 2 * window:
+            return array, True
+        if sample_deeply and array.size <= GGUF_VERIFY_DEEP_MAX_ELEMENTS:
+            return array, True
+        return np.concatenate((array[:window], array[-window:])), False
+
+    if values is not None:
+        checked, _ = clip(values)
+        if exponent_mask is None:
+            bad = not np.isfinite(checked).all()
+        else:
+            bad = bool((checked & exponent_mask == exponent_mask).any())
+        if bad:
+            return "contains NaN or Inf"
+
+    if not check_zero:
+        return None
+    checked_raw, whole = clip(raw)
+    if checked_raw.any():
+        return None
+    if whole:
+        return "is entirely zero"
+    # The ends are zero. Confirm against the whole tensor before rejecting, so
+    # a legitimately zero-padded weight is not reported.
+    return None if raw.any() else "is entirely zero"
+
+
+def gguf_tensor_problems(
+    gguf_file, sample_size = None, readers = None, float_tensors_only = False,
+):
+    """Tensors in a GGUF that cannot be real weights, as a list of strings.
+
+    Rejects only what no architecture produces legitimately: a weight that is
+    entirely zero, or one holding NaN or Inf. Every tensor is checked through a
+    bounded window, and `sample_size` of them, chosen deterministically, are
+    read in full.
+
+    It deliberately does not compare values against the source checkpoint,
+    because the converters transform tensors on the way out
+    (`conversion/gemma.py` adds 1 to every norm weight, the llama path permutes
+    `attn_q` and `attn_k`, expert weights are concatenated) and no value
+    comparison can tell a transform from damage without reproducing each
+    architecture's `modify_tensors`.
+
+    `float_tensors_only` restricts the pass to tensors that have a float view,
+    which is what the export gate wants: one conversion writes both, so a
+    `q4_k_m` file still carries float tensors (the projector, and often
+    `token_embd` and the norms), and those are exactly the ones a value check
+    means something for. The quantized tensors in that file are then left alone
+    rather than having the all-zero test run over their block bytes. Off by
+    default so `verify_gguf` on a user's file keeps checking every tensor it
+    can, quantized blocks included.
+    """
+    if sample_size is None:
+        sample_size = _gguf_sample_size()
+    if readers is None:
+        readers = _gguf_open_shards(gguf_file)
+    window = _gguf_window_size()
+    problems = []
+    for shard, reader in readers:
+        if reader is None:
+            problems.append(f"`{os.path.basename(shard)}` could not be read as a GGUF file")
+            continue
+        tensors = reader.tensors
+        deep = set(_gguf_sample_indices(
+            len(tensors), sample_size, (os.path.basename(shard), len(tensors)),
+        ))
+        for index, tensor in enumerate(tensors):
+            if float_tensors_only:
+                try:
+                    values, _mask = _gguf_float_view(tensor)
+                except Exception:
+                    values = None
+                if values is None: continue
+            # Zero is a legitimate weight outside `blk.` (BERT `token_types.weight`,
+            # projector padding) and for a bias, so all-zero is only a defect inside
+            # a block, which is where unsloth#6056's damage lives. o_proj and
+            # down_proj are excluded too: LLaMA Pro block expansion (arXiv
+            # 2401.02415) zero-initialises them and llama.cpp loads that file.
+            # NaN and Inf stay checked everywhere.
+            check_zero = (
+                tensor.name.startswith("blk.")
+                and not tensor.name.endswith(".bias")
+                and not tensor.name.endswith(GGUF_IDENTITY_INIT_SUFFIXES)
+            )
+            try:
+                problem = _gguf_degenerate_problem(
+                    tensor, index in deep, window, check_zero,
+                )
+            except Exception as error:
+                logger.debug(
+                    f"Unsloth: could not inspect `{tensor.name}` in "
+                    f"{os.path.basename(shard)} ({type(error).__name__}: {error})"
+                )
+                continue
+            if problem is not None:
+                problems.append(f"`{tensor.name}` {problem}")
+    return problems
+
+
+def _gguf_holds_any_float_tensor(readers):
+    """Whether any tensor in this file has a float view, so a value check means something.
+
+    The export gate asks this rather than "are they all floats", because one
+    conversion writes both. A `q4_k_m` VLM still carries its projector at bf16
+    or f16, and usually `token_embd` and the norms at f32, and NaN or Inf in
+    those is exactly as fatal as it would be in a plain f16 export. Requiring
+    every tensor to be float meant a single quantized block turned the whole
+    file's value check off, which on a q4_k_m or MXFP4 export is every file
+    most people publish.
+    """
+    for _path, reader in readers:
+        if reader is None:
+            continue
+        for tensor in reader.tensors:
+            try:
+                values, _mask = _gguf_float_view(tensor)
+            except Exception:
+                continue
+            if values is not None:
+                return True
+    return False
+
+
+def _verify_converted_gguf(
+    output_files, quantization_type = None, print_output = False, gguf_py_dir = None,
+    _writer_tree_known = False,
+):
+    """The gate `convert_to_gguf` runs on what it just wrote.
+
+    Metadata always; tensor sanity only for a file whose tensors are plain
+    floats, which is the only case where a float view of the bytes means
+    anything. Raises on a problem, because the alternative is publishing the
+    file. `quantization_type` is accepted and ignored, since the file itself is
+    the authority on what it holds.
+
+    `gguf_py_dir` is the tree the converter child was pinned to. Reading the
+    file back with the same `gguf` that wrote it is what keeps the checks from
+    degrading into the "could not read it, so it was not verified" warning
+    whenever the parent's `gguf` is the older of the two. It also decides what an
+    unreadable file MEANS, which is why `_writer_tree_known` is carried into the
+    recursion below rather than re-derived there.
+    """
+    if not _gguf_verify_enabled():
+        logger.info("Unsloth: UNSLOTH_GGUF_VERIFY is off; skipping GGUF verification.")
         return
-    except:
+    if gguf_py_dir:
+        # Nesting is safe: the context manager snapshots and restores sys.path
+        # and every `gguf` module, so an outer use_local_gguf() is unaffected.
+        with use_local_gguf(gguf_py_dir):
+            return _verify_converted_gguf(
+                output_files, quantization_type, print_output = print_output,
+                _writer_tree_known = True,
+            )
+    # One entry per split set, so a 40 shard export is checked once.
+    checked = set()
+    # Separate from `checked`, which is only there to stop a 40 shard export being reopened
+    # 40 times. This one is what the closing message counts.
+    verified = set()
+    # Sets whose tensor values could not be inspected, so the closing line can say so.
+    values_skipped = set()
+    started = time.perf_counter()
+    for output_file in output_files:
+        shards = _gguf_shard_siblings(output_file)
+        if shards[0] in checked:
+            continue
+        # Say what the wait is for before paying for it. Almost all of the cost is
+        # gguf.GGUFReader parsing the vocabulary, which is seconds on a large one, and a
+        # silent stall right after "Successfully saved" reads like a hang. Measured on
+        # this design: 8 ms for a file with no vocabulary, 0.9 s at 32k entries, 15 s at
+        # 262k, and the same 15 s whether that file is 16 MB or 4.2 GB, because the cost
+        # is the vocabulary rather than the weights.
+        if not checked:
+            message = (
+                "Unsloth: Reading the GGUF back to check it before anything publishes or "
+                "quantizes it. This parses the file's metadata, which takes a few seconds "
+                "on a large vocabulary and does not grow with the model. Set "
+                "UNSLOTH_GGUF_VERIFY=0 to skip it."
+            )
+            if print_output: print(message)
+            else: logger.info(message)
         pass
-pass
+        checked.add(shards[0])
+        readers = _gguf_open_shards(output_file)
+        if any(reader is None for _, reader in readers):
+            unreadable = ", ".join(
+                os.path.basename(path) for path, reader in readers if reader is None
+            )
+            detail = ""
+            # An ImportError never reached the file's bytes, so it says nothing about
+            # the file. The reader runs in the PARENT, and `use_local_gguf` only puts
+            # the writer's directory on sys.path: it does not reproduce the child's
+            # PYTHONPATH or NO_LOCAL_GGUF, so that tree can import in the child and
+            # fail in the parent over a dependency the child had. Refusing there would
+            # reject a healthy export and offer a re-run that cannot help.
+            reader_unavailable = False
+            for path, reader in readers:
+                if reader is not None: continue
+                try:
+                    _open_gguf_reader(path)
+                except ImportError as error:
+                    reader_unavailable = True
+                    detail = f" ({type(error).__name__}: {error})"
+                except Exception as error:
+                    detail = f" ({type(error).__name__}: {error})"
+                break
+            if _writer_tree_known and not reader_unavailable:
+                # Elsewhere this is only a warning because an older installed `gguf`
+                # fails on a perfectly good export. Not here: this IS the tree the child
+                # wrote with, so a file its own writer cannot reopen is malformed, and
+                # everything above checks existence and shard numbering only.
+                raise RuntimeError(
+                    f"Unsloth: the GGUF converter wrote {unreadable}, and the same `gguf` "
+                    f"package that wrote it cannot read it back{detail}. The file is "
+                    f"malformed rather than merely newer than the reader, so it is not "
+                    f"being published. Re-run the conversion, and set "
+                    f"UNSLOTH_GGUF_VERIFY=0 if you need to keep the file anyway."
+                )
+            # Warn rather than refuse. The installed `gguf` can be older than
+            # the converter that wrote this file, in which case the reader
+            # fails on an export that is perfectly good, and refusing here
+            # would break conversions that work today. `convert_to_gguf`
+            # already rejects a missing or truncated output above.
+            logger.warning(
+                f"Unsloth: could not read {unreadable} with the installed gguf "
+                f"package{detail}, so it was not verified. Upgrade `gguf` if you want "
+                f"GGUF exports checked before they are published."
+            )
+            continue
+        # Counted here, after the unreadable check, not when the set was first seen: a set
+        # that could not be read had no metadata or tensor check run on it, and reporting
+        # it as verified tells the user a gate passed that never executed.
+        verified.add(shards[0])
+        problems = gguf_metadata_problems(output_file, readers = readers)
+        if _gguf_holds_any_float_tensor(readers):
+            problems = problems + gguf_tensor_problems(
+                output_file, readers = readers, float_tensors_only = True,
+            )
+        else:
+            # Nothing in this set has a float view, so the tensor pass has nothing to
+            # read and the set got the metadata gate only. Counted so the closing line
+            # cannot report a value check that never happened. A mixed file does not
+            # land here: its float tensors are checked and only its quantized blocks,
+            # which hold bytes rather than values, are passed over.
+            values_skipped.add(shards[0])
+        # llama.cpp loads these, so they never refuse the file.
+        for advisory in gguf_metadata_warnings(output_file, readers = readers):
+            logger.warning(
+                f"Unsloth: `{os.path.basename(output_file)}`: {advisory}"
+            )
+        if not problems:
+            continue
+        listed = "\n".join(f"  - {problem}" for problem in problems)
+        raise RuntimeError(
+            f"Unsloth: `{os.path.basename(output_file)}` did not pass post "
+            f"conversion verification, so it was not published:\n{listed}\n"
+            f"This is a problem with the conversion, not with your training "
+            f"run. Please report it with the model name at "
+            f"https://github.com/unslothai/unsloth/issues, and set "
+            f"UNSLOTH_GGUF_VERIFY=0 if you need the file anyway."
+        )
+    if print_output and verified:
+        scope = ""
+        if values_skipped:
+            scope = (f", metadata only for {len(values_skipped)} of them because a "
+                     f"quantized block format holds bytes rather than values")
+        print(f"Unsloth: Verified {len(verified)} GGUF file(s){scope} in "
+              f"{time.perf_counter() - started:.1f}s.")
+    elif print_output and checked:
+        # Every set was skipped, so there is nothing to report as verified and saying
+        # nothing at all would read as "it passed". The per-file warning above already
+        # named which ones and why.
+        print("Unsloth: No GGUF file could be read back, so none was verified.")
 
 
-def assert_correct_gguf(model_name, model, tokenizer):
+# GGUF special token id key -> the tokenizer attribute holding the same id.
+# Integers, so unlike the token strings they are not rewritten on the way out
+# and can be compared exactly. See `_gguf_tokenizer_problems` for why the
+# strings are not compared.
+_GGUF_SPECIAL_TOKEN_IDS = (
+    ("tokenizer.ggml.bos_token_id",     "bos_token_id"),
+    ("tokenizer.ggml.eos_token_id",     "eos_token_id"),
+    ("tokenizer.ggml.padding_token_id", "pad_token_id"),
+    ("tokenizer.ggml.unknown_token_id", "unk_token_id"),
+)
+
+
+def _gguf_tokenizer_problems(tokenizer, reader):
+    """Disagreements between a tokenizer and a GGUF's tokenizer metadata.
+
+    Checks the vocabulary is there at all, then compares the special token ids,
+    which is the failure people actually hit: a GGUF written with the base
+    `<eos>` instead of the instruct model's chat EOS never stops generating.
+
+    It does NOT compare the token strings. The code this replaces tried to, with
+    `saved_vocab != vocab`, and could not have worked: llama.cpp rewrites SPM
+    pieces on the way out. Measured on a flawless gemma-3-270m-it export, that
+    comparison reports 30 differences in 262144 tokens, every one a run of two
+    or more U+2581 written out as plain spaces, and normalising those away
+    leaves the lone U+2581 at id 236743 still differing because llama.cpp
+    rewrites runs but not singletons. `get_vocab()` also legitimately returns
+    one entry more than the file holds, because `<image_soft_token>` sits at id
+    262144 against a `vocab_size` of 262144. Reproducing llama.cpp's
+    per-tokenizer-type rewriting here would be a second implementation of it,
+    wrong in a different way, and every error it made would reject a correct
+    export. That is presumably why the original check was written so that
+    `hasattr` on a dict made it unreachable.
+    """
+    problems = []
+    field = reader.fields.get("tokenizer.ggml.tokens")
+    if field is None or not field.data:
+        problems.append("`tokenizer.ggml.tokens` is missing or empty, so the "
+                        "GGUF carries no vocabulary")
+        return problems
+    for key, attribute in _GGUF_SPECIAL_TOKEN_IDS:
+        gguf_field = reader.fields.get(key)
+        if gguf_field is None:
+            continue
+        expected = getattr(tokenizer, attribute, None)
+        if expected is None:
+            continue
+        try:
+            written = int(gguf_field.contents())
+        except Exception:
+            continue
+        if written != int(expected):
+            problems.append(
+                f"`{key}` is {written} in the GGUF but the tokenizer's "
+                f"{attribute} is {int(expected)}"
+            )
+    return problems
+
+
+def _model_tensor_shapes(model):
+    """`{parameter name: shape tuple}` for a model, or `{}` if it has none."""
+    try:
+        return {name: tuple(parameter.shape) for name, parameter in model.named_parameters()}
+    except Exception:
+        return {}
+
+
+def _gguf_shape_problems(model, readers, sample_size):
+    """Sampled GGUF tensors whose shape contradicts the model's, as strings.
+
+    `readers` is the whole shard set, not one file. A split export puts most of its
+    tensors in shards 1..N, so checking only shard 0 left the bulk of the model
+    unvalidated while every other check in `assert_correct_gguf` covered all of it, and a
+    tensor whose dimensions were wrong past the first shard passed verification. The
+    architecture and the name map come from the first readable shard, which is where the
+    KV block lives; the tensor walk then runs over every readable shard, sampled per shard
+    the way `gguf_tensor_problems` samples.
+
+    Matched by NAME, through gguf-py's own `TensorNameMap` inverted, rather
+    than by `shape[0]` as before: that matched `output_norm.weight` of shape
+    (640,) against a (640, 2048) parameter and then ran
+    `x = torch.empty_like(param); x[:] = tensor_data[:]`, which raised
+    `RuntimeError: The expanded size of the tensor (2048) must match the
+    existing size (640)` on a perfectly good export, which is why nothing ever
+    called this function. Values are not compared: the converters transform
+    tensors on the way out, so only the shape, which they preserve up to
+    GGUF's reversed dimension order, is decidable here.
+    """
+    shapes = _model_tensor_shapes(model)
+    if not shapes:
+        return []
+    try:
+        from gguf.constants import MODEL_ARCH_NAMES  # type: ignore
+        from gguf.tensor_mapping import TensorNameMap  # type: ignore
+    except Exception:
+        return []
+    readable = [(shard, reader) for shard, reader in readers if reader is not None]
+    if not readable:
+        # An unreadable shard set is already reported as fatal by the metadata pass, and
+        # saying it again here would only duplicate it.
+        return []
+    reader = readable[0][1]
+    architecture = _gguf_field_text(reader, GGUF_ARCHITECTURE_KEY)
+    arch_enum = next(
+        (enum for enum, name in MODEL_ARCH_NAMES.items() if name == architecture), None,
+    )
+    if arch_enum is None:
+        return []
+    # `TensorNameMap`'s second argument is the BLOCK count and it expands every
+    # per-block template once per index, so passing the parameter count instead builds
+    # hundreds of megabytes of names for layers that do not exist (an MoE with named
+    # experts has tens of thousands of parameters and a few dozen blocks). llama.cpp
+    # refuses to load without `{arch}.block_count`; parameter names are the fallback.
+    block_count = _gguf_field_int(reader, f"{architecture}.block_count")
+    if block_count is None or block_count <= 0:
+        block_count = _model_block_count(shapes)
+    if block_count is None or block_count <= 0:
+        return []
+    try:
+        name_map = TensorNameMap(arch_enum, block_count)
+    except Exception:
+        return []
+    # HF name -> GGUF name, inverted so a sampled GGUF tensor finds its parameter.
+    gguf_to_hf = {}
+    for hf_name, (_, gguf_name) in name_map.mapping.items():
+        for suffix in (".weight", ".bias", ""):
+            candidate = f"{hf_name}{suffix}"
+            if candidate in shapes:
+                gguf_to_hf.setdefault(f"{gguf_name}{suffix}", candidate)
+                break
+
+    problems = []
+    for shard, shard_reader in readable:
+        tensors = shard_reader.tensors
+        # Keyed on the shard name as well, so two shards holding the same number of
+        # tensors do not sample the same positions and leave the same gaps.
+        indices = _gguf_sample_indices(
+            len(tensors), sample_size, ("shapes", os.path.basename(shard), len(tensors)),
+        )
+        for index in indices:
+            tensor = tensors[index]
+            hf_name = gguf_to_hf.get(tensor.name)
+            if hf_name is None:
+                continue
+            # GGUF stores dimensions in reverse order.
+            gguf_shape = tuple(int(x) for x in reversed(list(tensor.shape)))
+            model_shape = shapes[hf_name]
+            if gguf_shape != model_shape:
+                problems.append(
+                    f"`{tensor.name}` has shape {gguf_shape} but the model's "
+                    f"`{hf_name}` has shape {model_shape}"
+                )
+    return problems
+
+
+def _assert_correct_gguf(model_name, model, tokenizer, sample_size = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Verify if conversion is in fact correct by checking tokenizer and last tensor
+    # Verify a conversion against the model and tokenizer it came from.
+    if sample_size is None:
+        sample_size = _gguf_sample_size()
+    readers = _gguf_open_shards(model_name)
+    reader = readers[0][1]
+    if reader is None:
+        raise RuntimeError(
+            f"Unsloth: `{os.path.basename(model_name)}` could not be read as a GGUF file."
+        )
+
+    problems = list(gguf_metadata_problems(model_name, readers = readers))
+    # Not on a projector. A VLM conversion returns the text model AND the `clip` mmproj,
+    # and callers hand that whole list straight to this function. An mmproj legitimately
+    # carries no `tokenizer.ggml.tokens` -- it holds a vision encoder, not a vocabulary --
+    # so the tokenizer pass reported a missing vocabulary and every otherwise valid
+    # multimodal conversion was rejected. Same exemption the metadata pass already applies,
+    # read from the same constant rather than re-spelled, so the two cannot drift.
+    if _gguf_field_text(reader, GGUF_ARCHITECTURE_KEY) not in GGUF_METADATA_EXEMPT_ARCHITECTURES:
+        problems += _gguf_tokenizer_problems(tokenizer, reader)
+    problems += _gguf_shape_problems(model, readers, sample_size)
+    problems += gguf_tensor_problems(model_name, sample_size = sample_size, readers = readers)
+
+    if problems:
+        listed = "\n".join(f"  - {problem}" for problem in problems)
+        raise RuntimeError(
+            f"Unsloth: `{os.path.basename(model_name)}` failed GGUF "
+            f"verification:\n{listed}"
+        )
+
+
+def assert_correct_gguf(model_name, model, tokenizer, sample_size = None):
+    """Check one or more converted GGUF files against their source model.
+
+    OPT-IN, and deliberately not wired into the export path: it needs the live
+    torch model and tokenizer, and `unsloth.save.save_to_gguf` has neither in
+    scope by the time the files exist, only a directory. Call it yourself when
+    you do hold both, for example straight after `save_pretrained_merged`.
+
+    The gate that does run on every conversion is `_verify_converted_gguf`,
+    which covers architecture-required metadata (`gguf_metadata_problems`) and
+    tensor sanity (`gguf_tensor_problems`). Neither of those needs a model, and
+    neither compares the special token ids, which is what this function adds.
+
+    Raises on the first file that does not check out.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
     if type(model_name) not in (list, tuple,):
         model_name = [model_name,]
+    # One entry per split set, as `_verify_converted_gguf` already does. `convert_to_gguf`
+    # returns the shard LIST, so handing that straight back to this function made every
+    # shard resolve to the same complete set and revalidate it: a 40 shard model was
+    # reopened and reparsed 40 times, and almost all of that cost is GGUFReader parsing
+    # shard 1's vocabulary, which is 15 s on its own at 262k entries.
+    checked = set()
     for name in model_name:
-        _assert_correct_gguf(name, model, tokenizer)
-    pass
-pass
+        shards = _gguf_shard_siblings(name)
+        if shards[0] in checked:
+            continue
+        checked.add(shards[0])
+        _assert_correct_gguf(name, model, tokenizer, sample_size = sample_size)
 
 
 def check_build_requirements():
