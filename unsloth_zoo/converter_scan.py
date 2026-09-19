@@ -123,6 +123,52 @@ RE_NETWORK = re.compile(
     r"|\bhttp\.server\b",
 )
 
+# Hosts a converter legitimately talks to. Upstream's own gguf-py/gguf/utility.py
+# reads HF_TOKEN and sends it to huggingface.co as an Authorization header, which
+# is what downloading a gated model looks like, so the env-harvest rule fired on
+# every clean checkout of llama.cpp master and UNSLOTH_CONVERTER_SCAN_STRICT
+# refused the export.
+MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
+
+RE_URL_HOST = re.compile(r"https?://([^/\s\"']+)")
+
+
+def _talks_only_to_the_model_hub(text):
+    """Whether every URL this file names in code is a model-hub host.
+
+    Read from string literals via the AST, not from the raw text, so the github
+    links upstream carries in comments do not count as destinations. Requires at
+    least one hub host: a file that names no destination at all has built it
+    some other way, and that is not evidence of anything except that this cannot
+    see it.
+
+    This is a deliberate narrowing of a CRITICAL rule, and the evasion is not
+    hypothetical: taking upstream's utility.py and changing one call to
+    `requests.get(os.environ["X"] + "/collect", ...)` leaves the hub literal in
+    place, so this suppresses the finding. Adding a literal exfil URL is caught,
+    as is a payload that names no host at all, since suppression needs a hub host
+    to be named.
+
+    Kept anyway, because the alternative measured worse: with the rule as it
+    was, UNSLOTH_CONVERTER_SCAN_STRICT refused every clean checkout of llama.cpp
+    master over upstream's own file, and a control that rejects what it is meant
+    to protect is one people switch off. The scan says of itself that it raises
+    the cost of an opportunistic payload and is not a boundary; this is inside
+    that claim, not a departure from it.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False                # cannot tell, so do not suppress anything
+    hosts = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            hosts.update(
+                host.lower().split(":")[0] for host in RE_URL_HOST.findall(node.value)
+            )
+    return bool(hosts) and hosts <= MODEL_HUB_HOSTS
+
+
 # Large base64 blob (>200 chars of contiguous base64 alphabet)
 RE_LARGE_BLOB = re.compile(r"[A-Za-z0-9+/=]{200,}")
 
@@ -1091,7 +1137,7 @@ def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
         _add(CRITICAL, "Reverse shell / bind shell pattern", RE_REVERSE_SHELL)
     if has_remote_code:
         _add(CRITICAL, "Downloads and executes remote code", RE_REMOTE_CODE)
-    if has_env_harvest and has_network:
+    if has_env_harvest and has_network and not _talks_only_to_the_model_hub(text):
         _add(CRITICAL, "Harvests environment variables/secrets AND makes network calls",
              RE_ENV_HARVEST, RE_NETWORK)
     if has_fs_enum and has_network:

