@@ -695,6 +695,36 @@ def test_an_optional_group_is_never_treated_as_required(scan, source, subject, p
     assert scan._matches(pattern, subject) is True
 
 
+def test_a_nested_wildcard_cannot_backtrack_across_the_whole_file(scan):
+    """_split_on_dot_star only splits the top-level wildcards.
+
+    RE_TEMP_EXEC's `(?:...|chmod.*\\+x)` keeps its nested one, so `/tmp/a ` then
+    a wall of `chmod ` with no `+x` restarted it at every chmod and ran to the
+    end each time: measured 0.32s / 1.27s / 5.04s at 96 / 192 / 384 KB, which is
+    hours at the 8 MiB scan cap, before the converter ever runs.
+    """
+    import time
+
+    text = "/tmp/a " + ("ch" + "mod ") * (scan.MAX_SCAN_BYTES // 6)
+    started = time.perf_counter()
+    assert scan._matches(scan.RE_TEMP_EXEC, text) is False
+    assert time.perf_counter() - started < 5.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/tmp/x.sh\nsubprocess.run(['sh', '/tmp/x.sh'])",
+        "/tmp/payload ; ch" + "mod +x /tmp/payload",
+        "/tmp/a\nos.system('sh /tmp/a')",
+        "/tmp/b\nos.popen('/tmp/b')",
+    ],
+)
+def test_bounding_the_nested_wildcard_keeps_the_real_temp_exec_matches(scan, text):
+    assert bool(scan.RE_TEMP_EXEC.search(text)) is True, "fixture must match the raw pattern"
+    assert scan._matches(scan.RE_TEMP_EXEC, text) is True
+
+
 def test_hostile_file_scans_in_reasonable_time(scan):
     import time
 
@@ -1361,6 +1391,124 @@ def test_a_pyc_beside_its_own_source_is_not_a_module_of_its_own(tmp_path):
 
     names, _complete = llama_cpp._conversion_package_modules(str(root / "conversion"))
     assert sorted(names) == ["__init__.py", "base.py"], sorted(names)
+
+
+def test_one_wide_directory_cannot_outrun_the_entry_budget(tmp_path, monkeypatch):
+    """os.walk hands back a whole directory's names at once.
+
+    So a single directory holding a great many entries was listed in full, and
+    copied, before either budget was consulted: the advertised bounds bounded
+    nothing for the shape that matters most. Streaming the directory is what
+    makes the budget a budget.
+    """
+    llama_cpp = _load("llama_cpp_wide_dir_probe", "unsloth_zoo/llama_cpp.py")
+
+    conversion = tmp_path / "llama.cpp" / "conversion"
+    conversion.mkdir(parents = True)
+    (conversion / "__init__.py").write_text("X = 1\n", encoding = "utf-8")
+    entries = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES * 3
+    for index in range(entries):
+        (conversion / f"blob_{index:05d}.bin").write_bytes(b"")
+
+    seen = []
+    real_scandir = os.scandir
+
+    class _CountingScandir:
+        def __init__(self, path):
+            self._inner = real_scandir(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._inner.close()
+            return False
+
+        def __iter__(self):
+            for entry in self._inner:
+                seen.append(entry.name)
+                yield entry
+
+    monkeypatch.setattr(llama_cpp.os, "scandir", _CountingScandir)
+    names, complete = llama_cpp._conversion_package_modules(
+        str(conversion),
+        file_limit = llama_cpp.MAX_CONVERSION_PACKAGE_FILES + 1,
+        entry_limit = llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES,
+    )
+
+    assert complete is False
+    # The bound is on entries TOUCHED, which is the claim the budget makes.
+    assert len(seen) <= llama_cpp.MAX_CONVERSION_PACKAGE_ENTRIES, (
+        f"touched {len(seen)} of {entries} entries in one directory"
+    )
+    assert len(names) <= llama_cpp.MAX_CONVERSION_PACKAGE_FILES
+
+
+def test_no_single_module_is_read_whole(tmp_path, monkeypatch, caplog):
+    """The cache key and the scan both read each module with a bare .read().
+
+    One very large or sparse module in an unverified package therefore allocated
+    the whole file before any size finding could be produced. Both reads are
+    bounded now, and the oversized module is reported rather than swallowed.
+    """
+    llama_cpp = _load("llama_cpp_big_module_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    big = root / "conversion" / "huge.py"
+    with open(big, "wb") as handle:
+        handle.truncate(llama_cpp.MAX_MODULE_BYTES * 4)      # sparse, costs no disk
+
+    largest = []
+    real_open = open
+
+    def watching_open(path, *args, **kwargs):
+        handle = real_open(path, *args, **kwargs)
+        if str(path) == str(big):
+            real_read = handle.read
+
+            def read(size = -1):
+                data = real_read(size)
+                largest.append(len(data))
+                return data
+
+            handle.read = read
+        return handle
+
+    monkeypatch.setattr("builtins.open", watching_open)
+    monkeypatch.delenv("UNSLOTH_CONVERTER_SCAN_STRICT", raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_CONVERTER_SCAN", raising = False)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        llama_cpp._conversion_sibling_info(str(root))
+        llama_cpp._scan_conversion_package(str(root))
+
+    assert largest, "the oversized module was never opened"
+    assert max(largest) <= llama_cpp.MAX_MODULE_BYTES + 1, max(largest)
+    assert any("larger than" in record.message for record in caplog.records), (
+        [r.message for r in caplog.records]
+    )
+
+
+def test_the_cache_key_still_moves_when_an_oversized_module_changes(tmp_path):
+    """Hashing only a prefix must not make a big module's edits invisible, so the
+    size travels beside the digest."""
+    llama_cpp = _load("llama_cpp_big_key_probe", "unsloth_zoo/llama_cpp.py")
+
+    root = _package_root(tmp_path)
+    big = root / "conversion" / "huge.py"
+    with open(big, "wb") as handle:
+        handle.truncate(llama_cpp.MAX_MODULE_BYTES * 2)
+
+    before = llama_cpp._conversion_sibling_info(str(root))
+    with open(big, "wb") as handle:
+        handle.truncate(llama_cpp.MAX_MODULE_BYTES * 2 + 1)
+    assert llama_cpp._conversion_sibling_info(str(root)) != before
+
+    # And a change inside the part that is read moves it too.
+    after_growth = llama_cpp._conversion_sibling_info(str(root))
+    with open(big, "r+b") as handle:
+        handle.write(b"import os  # payload\n")
+    assert llama_cpp._conversion_sibling_info(str(root)) != after_growth
 
 
 def test_a_package_within_the_cap_says_nothing_about_size(tmp_path, monkeypatch, caplog):

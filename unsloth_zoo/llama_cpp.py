@@ -1772,6 +1772,14 @@ MAX_CONVERSION_PACKAGE_FILES = 64
 # next to any real converter package, which is dozens of entries.
 MAX_CONVERSION_PACKAGE_ENTRIES = 4096
 
+# No single module is read whole. The converter's own entrypoint is tens of KB and
+# the scanner caps its input at 8 MiB anyway, so a module past this is one the
+# scan could not have judged in full regardless; reading it to find that out is
+# how an unverified package with one enormous or sparse module exhausted memory
+# before any finding was produced.
+MAX_MODULE_BYTES = 8 * 1024 * 1024
+MODULE_READ_CHUNK = 1024 * 1024
+
 # Everything beside the entrypoint that the entrypoint puts on sys.path and
 # imports, and so executes with exactly the privileges of the converter itself.
 # gguf-py is copied out of the same source tarball as conversion/, and that
@@ -1810,7 +1818,7 @@ def _bytecode_is_authoritative(path):
     return hash_based and not checks_source
 
 
-def _counts_as_a_module(root, name, names_in_dir):
+def _counts_as_a_module(root, name):
     """Whether this file is one the scan has to account for.
 
     A .py is read; a native extension and a sourceless .pyc cannot be read and so
@@ -1834,7 +1842,7 @@ def _counts_as_a_module(root, name, names_in_dir):
         # Only the cache CPython never checks against that source stands alone.
         return _bytecode_is_authoritative(os.path.join(root, name))
     # Beside its own source, so the source is what gets imported and scanned.
-    return name[: -len(suffix)] + ".py" not in names_in_dir
+    return not os.path.isfile(os.path.join(root, name[: -len(suffix)] + ".py"))
 
 
 def _unscannable_modules(package_dir, names):
@@ -1890,13 +1898,29 @@ def _conversion_sibling_info(llama_cpp_dir):
         # MAX_CONVERSION_PACKAGE_FILES small modules is nothing beside the export
         # this key gates, and the scan reads the same bytes anyway.
         try:
+            size = os.path.getsize(p)
+            digest = hashlib.sha256()
+            read = 0
             with open(p, "rb") as handle:
-                return (p, hashlib.sha256(handle.read()).hexdigest())
+                while read < MAX_MODULE_BYTES:
+                    chunk = handle.read(min(MODULE_READ_CHUNK, MAX_MODULE_BYTES - read))
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    read += len(chunk)
+            # The size travels beside the digest of the prefix, so a file too big
+            # for this scan to read still moves the key when it changes length.
+            return (p, size, digest.hexdigest())
         except OSError:
-            return (p, "")
+            return (p, -1, "")
     header, entries = [], []
     for subdir in IMPORTED_PACKAGE_SUBDIRS:
         package_dir = os.path.join(llama_cpp_dir, *subdir.split("/"))
+        if not os.path.isdir(package_dir):
+            # Absent, not unreadable. A converter that ships no gguf-py is the
+            # ordinary case and must not be keyed on placeholder entries.
+            header.append((subdir, 0, True))
+            continue
         names, complete = _conversion_package_modules(
             package_dir,
             file_limit = MAX_CONVERSION_PACKAGE_FILES + 1,
@@ -2182,29 +2206,45 @@ def _conversion_package_modules(
     found = []
     seen_directories = set()
     entries = 0
+    pending = [conversion_dir]
     try:
-        for root, dirs, files in os.walk(conversion_dir, followlinks = True):
+        while pending:
+            root = pending.pop()
             identity = _directory_identity(root)
             if identity is not None:
                 if identity in seen_directories:
-                    dirs[:] = []
                     continue
                 seen_directories.add(identity)
-            entries += len(dirs) + len(files)
-            names_in_dir = set(files)
-            for name in files:
-                if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
-                    continue
-                if not _counts_as_a_module(root, name, names_in_dir):
-                    continue
-                full = os.path.join(root, name)
-                found.append(os.path.relpath(full, conversion_dir).replace(os.sep, "/"))
-            if file_limit is not None and len(found) >= file_limit:
-                # Sorted first: which names survive stays deterministic even
-                # though which directories were reached before the stop does not.
-                return sorted(found)[:file_limit], False
-            if entry_limit is not None and entries >= entry_limit:
-                return sorted(found), False
+            # scandir rather than walk: walk hands back a whole directory's names
+            # at once, so a single directory with a great many entries was fully
+            # listed and copied before either budget was consulted, and the
+            # advertised bounds bounded nothing for it. This iterator is lazy, so
+            # the budget is checked per entry.
+            with os.scandir(root) as scanner:
+                for entry in scanner:
+                    entries += 1
+                    if entry_limit is not None and entries >= entry_limit:
+                        return sorted(found), False
+                    try:
+                        # Follows symlinks, because the import machinery does.
+                        is_directory = entry.is_dir()
+                    except OSError:
+                        continue
+                    if is_directory:
+                        pending.append(entry.path)
+                        continue
+                    name = entry.name
+                    if not name.lower().endswith(COLLECTED_MODULE_SUFFIXES):
+                        continue
+                    if not _counts_as_a_module(root, name):
+                        continue
+                    found.append(
+                        os.path.relpath(entry.path, conversion_dir).replace(os.sep, "/")
+                    )
+                    if file_limit is not None and len(found) >= file_limit:
+                        # Sorted first: which names survive stays deterministic
+                        # even though which directories were reached does not.
+                        return sorted(found)[:file_limit], False
     except OSError:
         return None, False
     return sorted(found), True
@@ -2274,9 +2314,19 @@ def _scan_imported_package(package_dir):
         path = os.path.join(package_dir, *name.split("/"))
         try:
             with open(path, "rb") as handle:
-                content = handle.read()
+                # One byte past the ceiling, which is how a module too big to
+                # judge is told apart from one that merely fills it. Reading it
+                # whole first was the memory the ceiling exists to deny.
+                content = handle.read(MAX_MODULE_BYTES + 1)
         except OSError:
             continue
+        if len(content) > MAX_MODULE_BYTES:
+            content = content[:MAX_MODULE_BYTES]
+            _refuse_unscannable_conversion_package(
+                package_dir,
+                f"holds a module ({name}) larger than the {MAX_MODULE_BYTES} "
+                f"bytes this scan reads, so only its first part was checked",
+            )
         warn_on_suspicious_converter(
             content, path, is_local_copy = False, log = logger,
         )

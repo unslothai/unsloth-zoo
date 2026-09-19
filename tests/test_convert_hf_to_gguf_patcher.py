@@ -439,7 +439,9 @@ def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
     # because widening the header in place is what silently handed this slice a
     # bare flag where it expected a (path, digest) pair.
     assert isinstance(sib[0], tuple), sib[0]
-    assert all(isinstance(entry, tuple) and len(entry) == 2 for entry in sib[1:]), sib
+    # (path, size, digest) per module. Pinned rather than open-ended, so a
+    # widening is a deliberate edit here instead of a silent shift of the slice.
+    assert all(isinstance(entry, tuple) and len(entry) == 3 for entry in sib[1:]), sib
     paths = {entry[0] for entry in sib[1:]}
     assert str(conv / "base.py") in paths, paths
     assert str(conv / "__init__.py") in paths, paths

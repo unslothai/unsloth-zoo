@@ -534,6 +534,53 @@ def _make_tail_lazy(segment):
 MAX_CLASS_SPAN = 512
 
 
+def _bound_dot_star(source, span = MAX_CLASS_SPAN):
+    """Rewrite a surviving `.*` as `.{0,span}`, and `.+` as `.{1,span}`.
+
+    _split_on_dot_star only splits the wildcards at the top level of an
+    alternative; one nested inside a group is left whole on purpose, because the
+    ordered-segment evaluation cannot represent it. That leaves it free to
+    backtrack: RE_TEMP_EXEC's `(?:...|chmod.*\\+x)` over `/tmp/a ` followed by
+    `chmod ` with no `+x` anywhere restarts the wildcard at every chmod and runs
+    to the end each time, measured quadratic at 0.32s / 1.27s / 5.04s for
+    96 / 192 / 384 KB, which is hours at the 8 MiB scan cap.
+
+    Same trade as MAX_CLASS_SPAN and for the same reason: the rule means "these
+    two near each other", a match needing more than this much between them is
+    given up, and the cost becomes linear.
+    """
+    out, i = [], 0
+    while i < len(source):
+        char = source[i]
+        if char == "\\":
+            out.append(source[i:i + 2])
+            i += 2
+            continue
+        if char == "[":
+            end = i + 1
+            if end < len(source) and source[end] == "^":
+                end += 1
+            if end < len(source) and source[end] == "]":
+                end += 1
+            while end < len(source) and source[end] != "]":
+                end += 2 if source[end] == "\\" else 1
+            out.append(source[i:end + 1])
+            i = end + 1
+            continue
+        if char == "." and i + 1 < len(source) and source[i + 1] in "*+":
+            low = 0 if source[i + 1] == "*" else 1
+            i += 2
+            lazy = ""
+            if i < len(source) and source[i] == "?":
+                lazy = "?"
+                i += 1
+            out.append(f".{{{low},{span}}}{lazy}")
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
 def _bound_class_repeats(source, span = MAX_CLASS_SPAN):
     """Rewrite `[^)]*` as `[^)]{0,span}`, preserving a lazy `?`."""
     out, i = [], 0
@@ -750,7 +797,10 @@ def _build_evaluator(pattern):
             segments = [alternative]
         segments = [_make_tail_lazy(s) for s in segments[:-1]] + segments[-1:]
         alternatives.append(
-            [re.compile(_bound_class_repeats(s), pattern.flags) for s in segments]
+            [
+                re.compile(_bound_dot_star(_bound_class_repeats(s)), pattern.flags)
+                for s in segments
+            ]
         )
         per_line_flags.append(per_line)
     return alternatives, per_line_flags, probes
