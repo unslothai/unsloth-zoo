@@ -1383,7 +1383,13 @@ def _staged_sources_are_complete(stage_dir):
     # It stays a cache hit on every later export, so the patcher fails reading
     # architectures out of it forever and staging is never asked to replace it.
     text_archs, vision_archs = _extract_archs_from_monolith_source(source)
-    return bool(text_archs or vision_archs)
+    if not (text_archs or vision_archs):
+        return False
+    # The same requirement as the package branch above, for the same reason: a
+    # truncation that happens to keep a `@ModelBase.register` decorator has the
+    # registrations and still cannot be driven, and accepting it makes that
+    # permanent. Both halves now demand the flags the patcher reads.
+    return bool(_CONVERTER_ADD_ARGUMENT_RE.search(source))
 
 
 # The patcher parses its flags with this same call, and raises "no arguments found"

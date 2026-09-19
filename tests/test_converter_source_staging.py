@@ -2007,3 +2007,32 @@ def test_a_second_filename_that_is_also_unusable_is_still_refused(mod, tmp_path,
     _write_sibling_gguf_py(bundle)
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
     assert mod._resolve_monolith_bundle_convert_script() is None
+
+
+def test_a_monolith_truncated_after_its_registrations_is_not_a_cache_hit(mod, tmp_path):
+    """The mirror of the package case. A truncation that happens to keep a
+    `@ModelBase.register` decorator has the architecture registrations and still
+    cannot be driven, so accepting it makes the damage permanent in the same way."""
+    stage = _complete_stage(str(tmp_path / "s"), package = False,
+                            repo = "ggml-org/llama.cpp", tag = "b9000")
+    assert mod._converter_stage_is_usable(
+        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is True
+    Path(stage, "convert_hf_to_gguf.py").write_bytes(
+        b"@ModelBase.register(\"LlamaForCausalLM\")\nclass LlamaModel:\n    pass\n"
+    )
+    assert mod._converter_stage_is_usable(
+        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is False
+
+
+def test_a_real_monolith_is_still_accepted(mod, tmp_path):
+    """A pre-split entrypoint is a CLI too, so requiring the parser cannot refuse a
+    genuine one."""
+    stage = _write_source_tree(tmp_path / "pre_split",
+                               entrypoint = _MONOLITH_ENTRYPOINT, conversion = False)
+    Path(stage, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
+        "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
+        "repo": "ggml-org/llama.cpp", "tag": "b9000",
+        "archive_sha256": "x", "completed": True,
+    }))
+    assert mod._converter_stage_is_usable(
+        str(stage), repo = "ggml-org/llama.cpp", tag = "b9000") is True
