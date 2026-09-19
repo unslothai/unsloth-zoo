@@ -847,10 +847,13 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
-                    if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
+                    # The staging buffers are raw storage viewed in the activation's own dtype (see
+                    # below), which needs equal element sizes; anything else simply stays on the GPU.
+                    global GPU_BUFFERS
+                    _same_width = arg.element_size() == GPU_BUFFERS[arg.device.index].element_size()
+                    if _same_width and new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
                         use_gpu_buffer = True
                         global CPU_BUFFERS
-                        global GPU_BUFFERS
                         global GPU_BUFFERS_B
                         global USE_DOUBLE_BUFFER
                         global BACKWARD_PASS
@@ -893,6 +896,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
+                        if x.element_size() != arg.element_size():
+                            # A slot first sized for another width cannot be viewed as this dtype.
+                            with _no_inference_mode():
+                                x = _new_host_buffer(new_size, arg.dtype)
+                            CPU_BUFFERS[CPU_INDEX] = x
                         shape = arg.shape
                         if new_size > x.numel():
                             with _no_inference_mode():
@@ -933,7 +941,13 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Read the cached flag off the slot itself, before the view is
                         # taken: a view is a fresh object and does not carry the attribute.
                         host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
-                        x = x[:new_size].view(shape)
+                        # Viewed, never cast: the buffers were allocated in the dtype checkpointing
+                        # was initialised with, which is not always the dtype the model runs in (a
+                        # FORCE_FLOAT32 family initialises bfloat16 and runs float16). A cast here
+                        # came back out of backward as the BUFFER's dtype, so the recompute saw
+                        # bfloat16 hidden states: a dtype mismatch at best, and on ROCm gfx10, where
+                        # Triton cannot compile bf16, an LLVM abort with no Python exception.
+                        x = x[:new_size].view(arg.dtype).view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
@@ -946,6 +960,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         buffer_slot = NEXT_BUFFER_SLOT[device_index]
                         NEXT_BUFFER_SLOT[device_index] ^= 1
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM, buffer_slot,)
+                        ctx._saved_dtype = arg.dtype
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1002,14 +1017,15 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             global BUFFER_EVENTS_A
             global BUFFER_EVENTS_B
             # Select buffer from per-device buffer_slot
+            saved_dtype = ctx._saved_dtype
             if USE_DOUBLE_BUFFER and buffer_slot == 1:
-                buffer = GPU_BUFFERS_B[device_index][:new_size].view(shape)
+                buffer = GPU_BUFFERS_B[device_index][:new_size].view(saved_dtype).view(shape)
             else:
-                buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
+                buffer = GPU_BUFFERS[device_index][:new_size].view(saved_dtype).view(shape)
 
             host_buffer = CPU_BUFFERS[CPU_INDEX]
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
-            x = host_buffer[:new_size].view(shape)
+            x = host_buffer[:new_size].view(saved_dtype).view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
