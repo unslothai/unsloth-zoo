@@ -3183,10 +3183,32 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     # Sending to the hub is not downloading from it.
     assert _findings('requests.post(HUB, data = os.environ["AWS_SECRET_ACCESS_KEY"])\n')
     assert _findings('requests.post(HUB, data = os.environ["HF_TOKEN"])\n')
-    # A secret that is not the hub's own token has no business going there.
+    # A secret that is not the hub's own token has no business going there, and
+    # that is every name, not the ones that look secret: filtering on keywords
+    # let GITHUB_PAT through, because "PAT" is not one of them, so a file
+    # reading HF_TOKEN and GITHUB_PAT and sending the second to the hub produced
+    # no finding at all. Nothing here can tell a credential from a setting by
+    # its name, so the allowance covers the hub's own token and nothing else.
     assert _findings(
         'requests.get(HUB, headers = {"a": os.environ["AWS_SECRET_ACCESS_KEY"]})\n'
     )
+    assert _findings(
+        'requests.get(HUB, headers = {\n'
+        '    "Authorization": os.environ["HF_TOKEN"],\n'
+        '    "x": os.environ["GITHUB_PAT"],\n'
+        '})\n'
+    )
+    assert _findings(
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"Authorization": os.environ["HF_TOKEN"]},\n'
+        '    timeout = int(os.environ["HTTP_TIMEOUT"]),\n'
+        ')\n'
+    )
+    # The other spellings of the hub's own token are still the hub's own token.
+    assert _findings(
+        'requests.get(HUB, headers = {"a": os.environ["HUGGING_FACE_HUB_TOKEN"]})\n'
+    ) == []
     # Nor does the whole environment. Tested BESIDE a legitimate hub token,
     # because a bare dict(os.environ) names nothing and is already refused for
     # that reason: it is the combination that needs the whole-environment check.
@@ -3246,6 +3268,14 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     assert _findings(
         'home = os.environ["HOME"]  # not a TOKEN\n'
         'requests.get(HUB, headers = {"a": home})\n'
+    )
+    # And when the collected set is genuinely EMPTY: os.environ reached through
+    # a call this does not read, with the rule firing on the comment. An empty
+    # set satisfies the subset check on its own, so without the emptiness test
+    # this is allowed.
+    assert _findings(
+        'os.environ.setdefault("HF_HOME", "/tmp")  # TOKEN\n'
+        'requests.get(HUB)\n'
     )
 
     # And only os.environ counts as the environment. Any object's .get() did,

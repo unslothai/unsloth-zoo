@@ -162,10 +162,6 @@ HUB_TOKEN_ENV_NAMES = frozenset((
     "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN",
 ))
 
-RE_SECRETISH_ENV_NAME = re.compile(
-    r"SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|PRIVATE", re.IGNORECASE,
-)
-
 WRITE_METHODS = frozenset(("post", "put", "patch", "delete"))
 
 RE_WHOLE_ENV = re.compile(
@@ -297,11 +293,14 @@ def _talks_only_to_the_model_hub(text):
         # A read whose variable is chosen at runtime cannot be attributed, and
         # an unattributable one used to pass by leaving the set empty.
         return False
-    secretish = {name for name in names if RE_SECRETISH_ENV_NAME.search(name)}
-    if not secretish or not secretish <= HUB_TOKEN_ENV_NAMES:
-        # Positively the hub's own token, or nothing. A secret that is not the
-        # hub's has no business going there whatever the URL says, and a harvest
-        # this cannot attribute at all is not a harvest it can vouch for.
+    if not names or not names <= HUB_TOKEN_ENV_NAMES:
+        # EVERY name, not the ones that look secret. Filtering on keywords let
+        # GITHUB_PAT through, because "PAT" is not one of them, and a file
+        # reading HF_TOKEN and GITHUB_PAT then sending the second one to the hub
+        # produced no finding at all. Nothing here can tell a credential from a
+        # setting by its name, so the allowance covers reading the hub's own
+        # token and nothing else. The only upstream file this applies to reads
+        # exactly HF_TOKEN.
         return False
     hosts = set()
     for node in ast.walk(tree):
