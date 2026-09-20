@@ -3544,7 +3544,6 @@ def _mlx_vlm_canonical_model_type(model_type):
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
-    # Not compile-patched, and opens with `grid_thw.tolist()`.
     "muse_glimmer",
     "glm5_next",
 })
@@ -3557,6 +3556,9 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
 # them per family is not avoidable, since a tuple raises in the towers of
 # `_VLM_ARRAY_GRID_MODEL_TYPES` above.
 _VLM_STATIC_METADATA_MODEL_TYPES = {
+    "minimax_m3_vl": ("image_grid_thw", "video_grid_thw"),
+    "muse_glimmer": ("image_grid_thw", "video_grid_thw"),
+    "kimi_k3": ("grid_thws", "image_grid_hws", "video_grid_hws"),
     # One `_as_grid_list` call reads whichever of the two the batch carries.
     "mage_vl": ("image_grid_thw", "video_grid_thw"),
     # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.
@@ -4241,6 +4243,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
 
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
+    # Kimi's processor names the same `(t, h, w)` metadata differently and emits
+    # two-element rows for stills.
+    grid_thws = _normalize_grid_thw(batch_dict.get("grid_thws"))
+    image_grid_hws = _normalize_grid_thw(batch_dict.get("image_grid_hws"))
+    video_grid_hws = _normalize_grid_thw(batch_dict.get("video_grid_hws"))
     image_sizes = _normalize_size_tuples(batch_dict.get("image_sizes"))
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
@@ -4257,6 +4264,9 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         ("spatial_shapes", spatial_shapes),
         ("image_sizes", image_sizes),
         ("images_spatial_crop", images_spatial_crop),
+        ("grid_thws", grid_thws),
+        ("image_grid_hws", image_grid_hws),
+        ("video_grid_hws", video_grid_hws),
     ):
         if normalized is not None:
             value = batch_dict[key]
