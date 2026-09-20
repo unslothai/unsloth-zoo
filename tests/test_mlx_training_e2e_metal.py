@@ -2123,6 +2123,13 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         mx.eval(loss_and_grad(model))
         floor, grads = None, None
         for _ in range(repeats):
+            # Drop the previous repeat's gradients BEFORE `resident` is sampled. Holding
+            # them would put a tree in `resident` that the assignment below releases
+            # before the measured run, so the subtraction would remove memory that was
+            # not resident during it and the repeat would read low. A floor made of
+            # readings like that is lower than the algorithmic floor, which is the one
+            # direction this must not move in.
+            grads = None
             mx.clear_cache()
             resident = mx.get_active_memory()
             mx.reset_peak_memory()
