@@ -1676,7 +1676,11 @@ def test_a_linked_index_in_the_output_is_not_written_through(tmp_path):
     with open(destination, "rb") as f:
         assert f.read() == payload
     # copystat still applies, and to the staging file, so the mode is never widened.
-    assert oct(os.stat(destination).st_mode & 0o777) == oct(0o600)
+    # Windows has no POSIX mode bits -- os.chmod there only toggles the read-only flag
+    # and st_mode reads back 0o666 -- so the mode half is POSIX-only. Containment above
+    # is the subject of this test and runs everywhere.
+    if os.name != "nt":
+        assert oct(os.stat(destination).st_mode & 0o777) == oct(0o600)
     leftovers = [n for n in os.listdir(output) if n.startswith(".unsloth-index-")]
     assert leftovers == [], f"staging files left behind: {leftovers}"
 
@@ -1734,6 +1738,10 @@ def test_a_regenerated_index_takes_the_mode_of_the_shards_beside_it(tmp_path):
     saving_utils._export_index_atomically(
         None, destination, b"{}", mode_from = donor,
     )
+    # POSIX-only: Windows os.chmod toggles the read-only flag and nothing else, so the
+    # donor is never really 0o640 there and st_mode reads back 0o666.
+    if os.name == "nt":
+        pytest.skip("Windows has no POSIX mode bits to carry over")
     assert oct(os.stat(destination).st_mode & 0o777) == oct(0o640)
 
     # A donor that is not there falls back to something readable rather than 0600.
