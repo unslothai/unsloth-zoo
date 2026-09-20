@@ -158,6 +158,36 @@ def test_nested_scopes_restore_all_modules_after_exception(native):
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_that_fails_partway_leaves_every_module_native(native, monkeypatch):
+    """A refused scope must put back the modules it had already patched."""
+    first, second = _model(native), _model(native)
+    root = nn.Sequential(first, second)
+    root.eval()
+    before = [set(module.__dict__) for module in (first, second)]
+    x, indices = _sample()
+    expected = [module(x, indices) for module in (first, second)]
+    mx.eval(expected)
+
+    native_init, built = fusion._PackedMoEGateUp.__init__, []
+
+    def refuse_the_second(self, module):
+        built.append(module)
+        if len(built) > 1:
+            raise RuntimeError("injected: no headroom")
+        native_init(self, module)
+
+    monkeypatch.setattr(fusion._PackedMoEGateUp, "__init__", refuse_the_second)
+    with pytest.raises(RuntimeError, match = "injected"):
+        with fused_moe_gate_up(root):
+            pass  # pragma: no cover
+    assert len(built) == 2
+    for module, keys, answer in zip((first, second), before, expected):
+        assert type(module) is native.SwitchGLU
+        assert set(module.__dict__) == keys
+        _equal(module(x, indices), answer)
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
 @pytest.mark.parametrize("first_exit", [0, 1])
 def test_overlapping_scopes_keep_shared_modules_patched(native, first_exit):
     modules = [_model(native), _model(native)]
@@ -445,6 +475,36 @@ def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
             partitions.clear()
             _check(block, samples)
             assert not partitions
+
+
+@pytest.mark.parametrize("native", [vlm_gemma, lm_gemma])
+def test_router_packing_that_fails_partway_leaves_every_module_native(native, monkeypatch):
+    """The router holds the same contract as the gate/up pack, through its own cleanup: it
+    builds a norm scale per Gemma module after swapping the class, so it too can fail with
+    modules already patched."""
+    first, second = _router(native), _router(native)
+    root = nn.Sequential(first, second)
+    root.eval()
+    before = [set(module.__dict__) for module in (first, second)]
+    samples = [_routing_samples(module) for module in (first, second)]
+
+    native_init, built = fusion._RouterNormScale.__init__, []
+
+    def refuse_the_second(self, module):
+        built.append(module)
+        if len(built) > 1:
+            raise RuntimeError("injected: no headroom")
+        native_init(self, module)
+
+    monkeypatch.setattr(fusion._RouterNormScale, "__init__", refuse_the_second)
+    with pytest.raises(RuntimeError, match = "injected"):
+        with fusion.fused_moe_router(root):
+            pass  # pragma: no cover
+    assert len(built) == 2
+    for module, keys, pairs in zip((first, second), before, samples):
+        assert type(module) is native.Router
+        assert set(module.__dict__) == keys
+        _check(module, pairs)
 
 
 @pytest.mark.parametrize("native, scale_dtype", [(vlm_gemma, mx.bfloat16), (lm_gemma, mx.float32)])
