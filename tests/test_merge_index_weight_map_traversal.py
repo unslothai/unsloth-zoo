@@ -1616,10 +1616,20 @@ def test_a_long_shard_basename_still_materializes(tmp_path, length):
 
     suffix = ".safetensors"
     name = ("s" * (length - len(suffix))) + suffix
-    if length > os.pathconf(output, "PC_NAME_MAX"):
+    # `os.pathconf` does not exist on Windows, the same reason the code under test
+    # guards it; 255 is the component limit there too.
+    try:
+        name_max = os.pathconf(output, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError):
+        name_max = 255
+    if length > name_max:
         pytest.skip("this filesystem cannot hold a name that long")
     shard = os.path.join(output, name)
-    os.symlink(victim, shard)
+    try:
+        os.symlink(victim, shard)
+    except (OSError, NotImplementedError) as error:
+        # Windows needs Developer Mode or admin rights to create a symlink.
+        pytest.skip(f"cannot create a symlink here: {error}")
 
     saving_utils._materialize_shard_that_resolves_outside(shard, output)
 
