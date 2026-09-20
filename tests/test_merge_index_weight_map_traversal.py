@@ -1351,7 +1351,7 @@ def test_a_failed_materialization_leaves_the_input_checkpoint_intact(tmp_path):
     assert os.path.realpath(link) == os.path.realpath(target)
     with open(target, "rb") as f:
         assert f.read() == b"the real weights", "the link target was modified"
-    leftovers = [n for n in os.listdir(output) if n.endswith(".unsloth-materializing")]
+    leftovers = [n for n in os.listdir(output) if ".unsloth-materializing" in n]
     assert leftovers == [], f"a staging file was left behind: {leftovers}"
 
 
@@ -1395,11 +1395,13 @@ def test_the_staging_path_is_never_written_through_a_symlink(tmp_path):
     shard = os.path.join(model_dir, "model.safetensors")
     os.symlink(shard_target, shard)
 
-    # A second external file, reachable only through the staging pathname.
+    # A second external file, reachable only through the staging pathname that the
+    # earlier fixed-name staging would have used.
     second = os.path.join(outside, "second_victim.bin")
     with open(second, "wb") as f:
         f.write(b"DO NOT TOUCH ME")
-    os.symlink(second, shard + ".unsloth-materializing")
+    planted = shard + ".unsloth-materializing"
+    os.symlink(second, planted)
 
     saving_utils._materialize_shard_that_resolves_outside(shard, model_dir)
 
@@ -1411,7 +1413,46 @@ def test_the_staging_path_is_never_written_through_a_symlink(tmp_path):
     assert not os.path.islink(shard)
     with open(shard, "rb") as f:
         assert f.read() == b"REAL SHARD BYTES"
-    assert not os.path.exists(shard + ".unsloth-materializing")
+    # The planted path is left exactly as it was found. Staging picks a name of its own,
+    # so there is nothing here it has to clear, and clearing it would be a deletion of
+    # someone else's file rather than a cleanup of ours.
+    assert os.path.islink(planted) and os.path.realpath(planted) == os.path.realpath(second)
+    leftovers = [
+        n for n in os.listdir(model_dir)
+        if ".unsloth-materializing" in n and os.path.join(model_dir, n) != planted
+    ]
+    assert leftovers == [], f"a staging file was left behind: {leftovers}"
+
+
+def test_a_file_sitting_at_the_old_staging_name_is_not_deleted(tmp_path):
+    """Staging used to unlink `<shard>.unsloth-materializing` before creating it, to
+    survive a leftover from an interrupted run. That unlink deletes whatever is really
+    there, and for an in-place merge of a symlinked checkpoint the directory is the
+    user's own: an unrelated file, or another shard this same index lists.
+    """
+    model_dir = os.path.join(str(tmp_path), "model")
+    os.makedirs(model_dir, exist_ok = True)
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+
+    shard_target = os.path.join(outside, "real.safetensors")
+    with open(shard_target, "wb") as f:
+        f.write(b"REAL SHARD BYTES")
+    shard = os.path.join(model_dir, "model.safetensors")
+    os.symlink(shard_target, shard)
+
+    bystander = shard + ".unsloth-materializing"
+    with open(bystander, "wb") as f:
+        f.write(b"SOMEBODY ELSE'S CHECKPOINT")
+
+    saving_utils._materialize_shard_that_resolves_outside(shard, model_dir)
+
+    assert os.path.exists(bystander), "staging deleted a file it did not create"
+    with open(bystander, "rb") as f:
+        assert f.read() == b"SOMEBODY ELSE'S CHECKPOINT"
+    assert not os.path.islink(shard)
+    with open(shard, "rb") as f:
+        assert f.read() == b"REAL SHARD BYTES"
 
 
 @pytest.mark.parametrize("name", [

@@ -3557,18 +3557,20 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     # many gigabytes, and on ENOSPC, a permission error or an interruption the unlink
     # ordering leaves the user's own checkpoint with its link gone and a partial file
     # where it was. `os.replace` is atomic and overwrites the link itself, not its target.
-    staging = file_path + ".unsloth-materializing"
+    # Created exclusively under a name nothing else can already hold, and never opened by
+    # name for writing. This path sits in the same attacker-supplied directory as the
+    # shard, so a symlink planted at a predictable name would otherwise be followed by
+    # the copy and its target overwritten: a second write sink introduced by the staging
+    # step itself. A fixed `<shard>.unsloth-materializing` also had to be unlinked first,
+    # to survive a leftover from an interrupted run, and that unlink deletes whatever is
+    # really there -- an unrelated file of the user's, or another shard this very index
+    # lists. `mkstemp` cannot collide with either, and it opens O_EXCL at 0o600, so the
+    # race the unlink used to open is closed rather than narrowed.
+    _staging_fd, staging = tempfile.mkstemp(
+        dir = os.path.dirname(file_path) or os.curdir,
+        prefix = os.path.basename(file_path) + ".unsloth-materializing-",
+    )
     try:
-        # Created exclusively, never opened by name for writing. This path sits in the
-        # same attacker-supplied directory as the shard, so a symlink planted here would
-        # otherwise be followed by the copy and its target overwritten: a second write
-        # sink introduced by the staging step itself. Unlinking first closes a leftover
-        # from an interrupted run, and O_EXCL closes the race that opens.
-        try:
-            os.remove(staging)
-        except OSError:
-            pass
-        _staging_fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(_staging_fd, "wb") as _staging_file, open(target, "rb") as _source:
             shutil.copyfileobj(_source, _staging_file)
         shutil.copystat(target, staging)
