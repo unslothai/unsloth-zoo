@@ -482,14 +482,17 @@ def patch_gpt_oss():
 
             # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
             try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.gate_up_proj_blocks, self.gate_up_proj_scales)
+                from .mxfp4 import dequantize_mxfp4_moe_blocks_scales
+
+                dequantized = dequantize_mxfp4_moe_blocks_scales(
+                    self.gate_up_proj_blocks, self.gate_up_proj_scales
+                )
                 self.__dict__["_gate_up_proj"] = dequantized
                 return dequantized
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to dequantize MXFP4 gate_up_proj: {e}. "
-                    f"Ensure transformers.integrations.mxfp4.dequantize is available."
+                    f"Ensure transformers.integrations.mxfp4 conversion hooks are available."
                 )
 
         @gate_up_proj.setter
@@ -516,8 +519,11 @@ def patch_gpt_oss():
 
             # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
             try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.down_proj_blocks, self.down_proj_scales)
+                from .mxfp4 import dequantize_mxfp4_moe_blocks_scales
+
+                dequantized = dequantize_mxfp4_moe_blocks_scales(
+                    self.down_proj_blocks, self.down_proj_scales
+                )
                 self.__dict__["_down_proj"] = dequantized
                 return dequantized
             except Exception as e:
