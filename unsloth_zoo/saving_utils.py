@@ -3639,8 +3639,20 @@ def _assert_shard_is_inside(file_path, save_directory):
     )
 
 
+def _current_umask():
+    """Read the umask without leaving it changed. There is no getter, so it has to be
+    set to read it and set straight back; a fresh export is single-threaded here."""
+    _mask = os.umask(0o022)
+    os.umask(_mask)
+    return _mask
+pass
+
+
 def _export_index_atomically(source_path, destination, payload):
     """Write `payload` at `destination` without following a link sitting there.
+
+    `source_path` is the file whose mode to carry over, or None when the index is
+    regenerated here and so has no source to copy a mode from.
 
     `open(destination, "wb")`, and `shutil.copy2` which uses it, follow a symlink at the
     destination and truncate its TARGET, so an output directory already carrying a linked
@@ -3660,7 +3672,13 @@ def _export_index_atomically(source_path, destination, payload):
     try:
         with os.fdopen(_fd, "wb") as _index_file:
             _index_file.write(payload)
-        shutil.copystat(source_path, _staging)
+        if source_path is not None:
+            shutil.copystat(source_path, _staging)
+        else:
+            # `mkstemp` opens at 0o600; a regenerated index used to be created by
+            # `open(..., "w")` and so took the process umask. Match that, or an export
+            # lands an index only its owner can read.
+            os.chmod(_staging, 0o666 & ~_current_umask())
         os.replace(_staging, destination)
     except BaseException:
         if os.path.exists(_staging):
@@ -4483,8 +4501,14 @@ def merge_and_overwrite_lora(
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
-        with open(index_path, "w", encoding = "utf-8") as f:
-            json.dump(index_data, f, indent = 4)
+        # Staged and replaced, for the same reason the copied index is: `open(path, "w")`
+        # follows a symlink sitting at that path and truncates its target, and
+        # `_final_has_nested_shard` brings a dequantizing nested singleton down this arm
+        # where it previously regenerated nothing.
+        _export_index_atomically(
+            None, index_path,
+            json.dumps(index_data, indent = 4).encode("utf-8"),
+        )
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")

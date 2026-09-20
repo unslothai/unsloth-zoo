@@ -1679,3 +1679,37 @@ def test_a_linked_index_in_the_output_is_not_written_through(tmp_path):
     assert oct(os.stat(destination).st_mode & 0o777) == oct(0o600)
     leftovers = [n for n in os.listdir(output) if n.startswith(".unsloth-index-")]
     assert leftovers == [], f"staging files left behind: {leftovers}"
+
+
+def test_a_regenerated_index_does_not_follow_a_link_either(tmp_path):
+    """Regeneration writes the index too, and used `open(path, "w")`.
+
+    `_final_has_nested_shard` brings a dequantizing nested singleton down the
+    regeneration arm, where the write followed a symlink at the destination and
+    truncated its target, exactly as the copy path did before it was staged.
+    """
+    output = os.path.join(str(tmp_path), "out")
+    os.makedirs(output, exist_ok = True)
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+    victim = os.path.join(outside, "victim.json")
+    with open(victim, "w", encoding = "utf-8") as f:
+        f.write("VICTIM CONTENT")
+    destination = os.path.join(output, "model.safetensors.index.json")
+    os.symlink(victim, destination)
+
+    payload = json.dumps(
+        {"metadata": {}, "weight_map": {"a": "weights/model.safetensors"}}, indent = 4,
+    ).encode("utf-8")
+    saving_utils._export_index_atomically(None, destination, payload)
+
+    with open(victim, encoding = "utf-8") as f:
+        assert f.read() == "VICTIM CONTENT", "the link target was written through"
+    assert not os.path.islink(destination)
+    with open(destination, "rb") as f:
+        assert json.loads(f.read()) == json.loads(payload)
+    # A regenerated index has no source to copy a mode from, and must not land 0600:
+    # `open(..., "w")` gave it the umask, and readers other than the owner need it.
+    mode = os.stat(destination).st_mode & 0o777
+    assert mode & 0o044, f"regenerated index landed unreadable: {oct(mode)}"
+    assert [n for n in os.listdir(output) if n.startswith(".unsloth-index-")] == []
