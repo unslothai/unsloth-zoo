@@ -373,7 +373,7 @@ def main():
                          "the model does not fit VRAM (else the load OOMs in cudaMalloc)")
     args = ap.parse_args()
 
-    _STATE["player"] = open(_PLAYER_TEMPLATE).read()
+    _STATE["player"] = open(_PLAYER_TEMPLATE, encoding="utf-8").read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
     print(f"gpu layers (NGL) = {_STATE['server'].ngl}", flush=True)
