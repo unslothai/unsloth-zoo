@@ -165,6 +165,45 @@ def _reference_dft(
     return (torch.exp(-weight_nll) * token_nll).sum() / divisor
 
 
+def _reference_ce(
+    hidden,
+    weight,
+    bias,
+    labels,
+    *,
+    n_items=None,
+    shift_labels=True,
+    ignore_index=-100,
+    label_smoothing=0.0,
+    logit_scale_multiply=None,
+    logit_scale_divide=None,
+    logit_softcapping=None,
+):
+    if shift_labels:
+        labels = _shift_labels(labels, ignore_index)
+    logits = torch.nn.functional.linear(
+        hidden.to(dtype=weight.dtype, device=weight.device),
+        weight,
+        bias,
+    )
+    if logit_scale_multiply not in (None, 0):
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide not in (None, 0):
+        logits = logits / logit_scale_divide
+    if logit_softcapping not in (None, 0):
+        logits = torch.tanh(logits / logit_softcapping) * logit_softcapping
+
+    reduction = "sum" if n_items is not None else "mean"
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float().contiguous(),
+        labels.reshape(-1).to(device=weight.device).contiguous(),
+        reduction=reduction,
+        ignore_index=ignore_index,
+        label_smoothing=label_smoothing,
+    )
+    return loss / n_items if n_items is not None else loss
+
+
 def _clone_leaf(tensor):
     return tensor.detach().clone().requires_grad_(True)
 
@@ -185,6 +224,24 @@ def _run_reference(hidden, weight, bias, labels, **kwargs):
     bias = _clone_leaf(bias)
     loss = _reference_dft(hidden, weight, bias, labels.detach().clone(), **kwargs)
     return _collect_result(loss, hidden, weight, bias)
+
+
+def _run_direct_ce(
+    fused_losses, hidden, weight, bias, labels, *, scaling=None, **kwargs
+):
+    hidden = _clone_leaf(hidden)
+    weight = _clone_leaf(weight)
+    bias = _clone_leaf(bias)
+    scaled_loss, (unscaled_loss,) = fused_losses.compute_fused_ce_loss(
+        hidden,
+        weight,
+        bias,
+        labels.detach().clone(),
+        scaling=scaling,
+        **kwargs,
+    )
+    result = _collect_result(scaled_loss, hidden, weight, bias)
+    return result, unscaled_loss.detach().clone()
 
 
 def _run_direct(fused_losses, hidden, weight, bias, labels, **kwargs):
@@ -235,6 +292,51 @@ def _skip_if_compile_unavailable():
         torch._dynamo.reset()
         pytest.skip(f"torch.compile toolchain unavailable: {type(error).__name__}")
     torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("n_items", [None, 5.5], ids=["mean", "explicit-divisor"])
+def test_compute_fused_ce_preserves_values_and_gradients(fused_losses, n_items):
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float64)
+    transforms = {
+        "logit_scale_multiply": 1.7,
+        "logit_scale_divide": 0.8,
+        "logit_softcapping": 2.25,
+        "label_smoothing": 0.15,
+    }
+    scaling = 7.0
+
+    reference_hidden = _clone_leaf(hidden)
+    reference_weight = _clone_leaf(weight)
+    reference_bias = _clone_leaf(bias)
+    reference_loss = _reference_ce(
+        reference_hidden,
+        reference_weight,
+        reference_bias,
+        labels.detach().clone(),
+        n_items=n_items,
+        **transforms,
+    )
+    expected = _collect_result(
+        reference_loss * scaling,
+        reference_hidden,
+        reference_weight,
+        reference_bias,
+    )
+    actual, auxiliary_loss = _run_direct_ce(
+        fused_losses,
+        hidden,
+        weight,
+        bias,
+        labels,
+        n_items=n_items,
+        scaling=scaling,
+        **transforms,
+    )
+
+    _assert_result_close(actual, expected, rtol=1e-6)
+    torch.testing.assert_close(
+        auxiliary_loss, reference_loss.detach(), rtol=1e-6, atol=1e-7
+    )
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
@@ -401,21 +503,22 @@ def test_fused_dft_compiled_matches_eager(fused_losses, ce_first):
     _skip_if_compile_unavailable()
 
     hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float32)
-    eager = _run_wrapper(
-        fused_losses.unsloth_fused_dft_loss,
-        hidden,
-        weight,
-        bias,
-        labels,
-        torch_compile=False,
-        n_chunks=2,
-        shift_labels=False,
-    )
-
+    loss_names = ("ce", "dft") if ce_first else ("dft",)
     with _compile_flag_guard(fused_losses):
-        if ce_first:
-            _run_wrapper(
-                fused_losses.unsloth_fused_ce_loss,
+        for loss_name in loss_names:
+            loss_fn = getattr(fused_losses, f"unsloth_fused_{loss_name}_loss")
+            eager = _run_wrapper(
+                loss_fn,
+                hidden,
+                weight,
+                bias,
+                labels,
+                torch_compile=False,
+                n_chunks=2,
+                shift_labels=False,
+            )
+            compiled = _run_wrapper(
+                loss_fn,
                 hidden,
                 weight,
                 bias,
@@ -426,27 +529,10 @@ def test_fused_dft_compiled_matches_eager(fused_losses, ce_first):
             )
             assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is True
             assert (
-                fused_losses.compute_fused_ce_loss
+                getattr(fused_losses, f"compute_fused_{loss_name}_loss")
                 in fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN
             )
-
-        compiled = _run_wrapper(
-            fused_losses.unsloth_fused_dft_loss,
-            hidden,
-            weight,
-            bias,
-            labels,
-            torch_compile=True,
-            n_chunks=2,
-            shift_labels=False,
-        )
-        assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is True
-        assert (
-            fused_losses.compute_fused_dft_loss
-            in fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN
-        )
-
-    _assert_result_close(compiled, eager)
+            _assert_result_close(compiled, eager)
 
 
 def test_fused_dft_rejects_label_smoothing_without_poisoning_compile(fused_losses):
@@ -474,6 +560,31 @@ def test_fused_dft_rejects_label_smoothing_without_poisoning_compile(fused_losse
                 n_chunks=2,
                 shift_labels=False,
                 label_smoothing=0.1,
+            )
+        assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is None
+        assert fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN == set()
+
+
+@pytest.mark.parametrize(
+    "loss_name", ["unsloth_fused_ce_loss", "unsloth_fused_dft_loss"]
+)
+def test_fused_loss_rejects_internal_weighting_hook_before_compile(
+    fused_losses, loss_name
+):
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float32)
+
+    with _compile_flag_guard(fused_losses):
+        with pytest.raises(TypeError, match="per_token_weight"):
+            getattr(fused_losses, loss_name)(
+                trainer=None,
+                hidden_states=hidden,
+                lm_head_weight=weight,
+                lm_head_bias=bias,
+                labels=labels,
+                torch_compile=True,
+                n_chunks=2,
+                shift_labels=False,
+                per_token_weight=lambda token_nll: token_nll,
             )
         assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is None
         assert fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN == set()
