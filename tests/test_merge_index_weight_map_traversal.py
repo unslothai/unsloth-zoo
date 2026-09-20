@@ -1640,3 +1640,42 @@ def test_a_long_shard_basename_still_materializes(tmp_path, length):
         assert f.read() == b"VICTIM BYTES", "the link target was written through"
     leftovers = [n for n in os.listdir(output) if ".unsloth-materializing" in n]
     assert leftovers == [], f"staging files left behind: {leftovers}"
+
+
+def test_a_linked_index_in_the_output_is_not_written_through(tmp_path):
+    """The index was the one write left outside the containment the shards get.
+
+    `open(destination, "wb")`, and `shutil.copy2` which uses it, follow a symlink sitting
+    at the destination and truncate its TARGET. An output directory already carrying a
+    linked `model.safetensors.index.json` therefore had that external file overwritten by
+    the export. `os.replace` swaps the directory entry instead and never follows the last
+    component, so the link is replaced rather than written through.
+    """
+    output = os.path.join(str(tmp_path), "out")
+    os.makedirs(output, exist_ok = True)
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+
+    victim = os.path.join(outside, "victim.json")
+    with open(victim, "w", encoding = "utf-8") as f:
+        f.write("VICTIM CONTENT")
+    destination = os.path.join(output, "model.safetensors.index.json")
+    os.symlink(victim, destination)
+
+    source = os.path.join(str(tmp_path), "source.index.json")
+    with open(source, "w", encoding = "utf-8") as f:
+        json.dump({"metadata": {}, "weight_map": {"a": "model.safetensors"}}, f)
+    os.chmod(source, 0o600)
+
+    payload = b'{"metadata": {}, "weight_map": {"a": "model.safetensors"}}'
+    saving_utils._export_index_atomically(source, destination, payload)
+
+    with open(victim, encoding = "utf-8") as f:
+        assert f.read() == "VICTIM CONTENT", "the link target was written through"
+    assert not os.path.islink(destination), "the link was left in place of the index"
+    with open(destination, "rb") as f:
+        assert f.read() == payload
+    # copystat still applies, and to the staging file, so the mode is never widened.
+    assert oct(os.stat(destination).st_mode & 0o777) == oct(0o600)
+    leftovers = [n for n in os.listdir(output) if n.startswith(".unsloth-index-")]
+    assert leftovers == [], f"staging files left behind: {leftovers}"

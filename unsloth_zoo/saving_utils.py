@@ -3639,6 +3639,39 @@ def _assert_shard_is_inside(file_path, save_directory):
     )
 
 
+def _export_index_atomically(source_path, destination, payload):
+    """Write `payload` at `destination` without following a link sitting there.
+
+    `open(destination, "wb")`, and `shutil.copy2` which uses it, follow a symlink at the
+    destination and truncate its TARGET, so an output directory already carrying a linked
+    `model.safetensors.index.json` had that target overwritten. It was the one write this
+    change left outside the containment every shard gets, and the nested-singleton support
+    widened it: `_has_nested_shard` enables the index copy for a layout that previously
+    carried no index at all. Staging beside it and calling `os.replace` swaps the directory
+    ENTRY, which never follows the last component, so the link is replaced rather than
+    written through.
+
+    `copystat` runs on the staging file, not on the destination, so the exported index is
+    never briefly readable under the creation mode before being narrowed to the source's.
+    """
+    _fd, _staging = tempfile.mkstemp(
+        dir = os.path.dirname(destination) or os.curdir, prefix = ".unsloth-index-",
+    )
+    try:
+        with os.fdopen(_fd, "wb") as _index_file:
+            _index_file.write(payload)
+        shutil.copystat(source_path, _staging)
+        os.replace(_staging, destination)
+    except BaseException:
+        if os.path.exists(_staging):
+            try:
+                os.remove(_staging)
+            except OSError:
+                pass
+        raise
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -4104,24 +4137,25 @@ def merge_and_overwrite_lora(
                 if os.path.exists(local_index_path):
                     _index_destination = os.path.join(save_directory, "model.safetensors.index.json")
                     try:
-                        if _validated_index_bytes is None:
-                            # Nothing was vouched for (unparseable index), so behave as before.
-                            shutil.copy2(local_index_path, _index_destination)
-                        elif os.path.exists(_index_destination) and \
+                        # Hoisted so it covers both payloads. `copy2` used to raise this
+                        # itself on the unvalidated branch, and `samefile` follows links
+                        # exactly as `copy2` does, so an in-place export still skips here.
+                        if os.path.exists(_index_destination) and \
                                 os.path.samefile(local_index_path, _index_destination):
                             raise shutil.SameFileError
+                        if _validated_index_bytes is None:
+                            # Nothing was vouched for (unparseable index), so carry the
+                            # file across as before, through the same contained write.
+                            with open(local_index_path, "rb") as _index_source:
+                                _index_payload = _index_source.read()
                         else:
                             # Export the bytes the guard read, never a second read of the
                             # file: between the two, the index can be swapped for one that
                             # traverses, and the export would carry the swapped copy.
-                            with open(_index_destination, "wb") as _index_file:
-                                _index_file.write(_validated_index_bytes)
-                            # `copy2` is copy plus copystat, and only the copy half is
-                            # replaced here. Without this the exported index takes the
-                            # creation mode instead of the source's, so a `0600` index
-                            # lands as `0644`: a widening, in the one file this change
-                            # exists to keep honest.
-                            shutil.copystat(local_index_path, _index_destination)
+                            _index_payload = _validated_index_bytes
+                        _export_index_atomically(
+                            local_index_path, _index_destination, _index_payload,
+                        )
                     except shutil.SameFileError:
                         pass
                     except Exception as e:
