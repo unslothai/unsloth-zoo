@@ -1548,3 +1548,48 @@ def test_a_linked_parent_and_linked_shard_leaves_the_external_directory_alone(tm
     # And the export still refuses, which is what should have happened all along.
     with pytest.raises(RuntimeError, match = "outside the output directory"):
         saving_utils._assert_shard_is_inside(file_path, save_directory)
+
+
+def test_an_external_parent_with_a_leaf_pointing_back_inside_is_refused(tmp_path):
+    """The entry is what a writer replaces, so resolving the leaf is not enough.
+
+    Layout, all of it something an untrusted model directory can contain:
+
+        out/merged/weights        -> ../../outside
+        outside/model.safetensors -> ../out/merged/real.safetensors
+        out/merged/real.safetensors = a real shard
+
+    `_resolves_inside` on the whole path follows the leaf and lands on
+    `out/merged/real.safetensors`, which IS inside, so the guard used to approve it.
+    `_materialize_shard_that_resolves_outside` correctly declines, because the parent
+    is external, and deliberately leaves the refusal to this check -- which then did
+    not refuse.
+
+    `os.replace`, the mxfp4 and fp8 sinks, replaces the directory ENTRY and never
+    follows the last component, so the merge wrote a new regular file into `outside/`.
+    Asserted here as the guard's contract rather than through a dequant merge, because
+    reaching those two writers needs real quantized weights the tiny base has not got.
+    """
+    save_directory = os.path.join(str(tmp_path), "out", "merged")
+    os.makedirs(save_directory, exist_ok = True)
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+
+    real = os.path.join(save_directory, "real.safetensors")
+    with open(real, "wb") as f:
+        f.write(b"INSIDE BYTES")
+    os.symlink(outside, os.path.join(save_directory, "weights"))
+    os.symlink(real, os.path.join(outside, "model.safetensors"))
+
+    file_path = os.path.join(save_directory, "weights", "model.safetensors")
+    # The leaf really does resolve inside; that is the whole trap.
+    assert saving_utils._resolves_inside(file_path, save_directory)
+    # Materialisation declines, by design, because the parent is external.
+    saving_utils._materialize_shard_that_resolves_outside(file_path, save_directory)
+
+    with pytest.raises(RuntimeError, match = "outside the output directory"):
+        saving_utils._assert_shard_is_inside(file_path, save_directory)
+
+    # Nothing may have been created in the external directory on the way to refusing.
+    assert sorted(os.listdir(outside)) == ["model.safetensors"]
+    assert os.path.islink(os.path.join(outside, "model.safetensors"))

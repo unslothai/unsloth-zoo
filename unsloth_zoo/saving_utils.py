@@ -3598,14 +3598,30 @@ def _assert_shard_is_inside(file_path, save_directory):
 
     Placed at the sinks rather than only where the name is chosen, so it holds however
     the path arrived: the local listing, the index, the Hub listing, or a later rename.
+
+    The PARENT is checked as well as the path, and that is not belt and braces. Resolving
+    the whole path follows the final component, which is what a READER of the shard sees;
+    the writers here act on the directory ENTRY instead. `os.replace` at the mxfp4 and
+    fp8 sinks replaces the entry and never follows the last component, so a layout whose
+    parent is a link OUT and whose leaf links back IN satisfied the single check -- the
+    leaf resolved inside -- while the replacement wrote a new regular file into the
+    external directory. Checking only the parent is not enough either: a plain leaf link
+    out of an otherwise contained directory is the case `_materialize_...` repairs and
+    this refuses when it cannot.
+
+    No contained layout is refused by the addition: for a flat shard the parent IS
+    `save_directory`, and for a nested one it is the subdirectory the merge created
+    under it.
     """
-    if _resolves_inside(file_path, save_directory):
+    if _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory) and \
+            _resolves_inside(file_path, save_directory):
         return
     raise RuntimeError(
-        f"Unsloth: Refusing to write {file_path} because it resolves to "
-        f"{os.path.realpath(file_path)}, outside the output directory "
-        f"{os.path.realpath(save_directory)}. A shard, or one of its parent "
-        f"directories, is a link out of the directory being exported to."
+        f"Unsloth: Refusing to write {file_path} because it, or the directory holding "
+        f"it, resolves outside the output directory {os.path.realpath(save_directory)} "
+        f"(the path resolves to {os.path.realpath(file_path)}, its directory to "
+        f"{os.path.realpath(os.path.dirname(file_path) or os.curdir)}). A shard, or one "
+        f"of its parent directories, is a link out of the directory being exported to."
     )
 
 
