@@ -7,6 +7,13 @@
   "entries": [
     {
       "file": "unsloth_zoo/compiler.py",
+      "sink": "compile",
+      "digest": "2914e5b17f944886",
+      "count": 1,
+      "reason": "The digest-verified bytes themselves, compiled in memory rather than reopened by path. Passing the path to the import machinery let a planted pyc or a <name>/__init__.py package be executed after the .py had verified clean, so the source that was checked is now the source that runs."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
       "sink": "eval",
       "digest": "03e6d133b778a53e",
       "count": 1,
@@ -169,6 +176,13 @@
     {
       "file": "unsloth_zoo/compiler.py",
       "sink": "exec",
+      "digest": "cd6fe2ffccdb5bc7",
+      "count": 1,
+      "reason": "Executes the compiled form of the digest-verified bytes into a fresh module namespace. The value is the source this function was handed and compared, never a re-read of the file, which is what closes the verify-then-reopen window."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "sink": "exec",
       "digest": "d6252fea6de677cd",
       "count": 1,
       "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
@@ -203,22 +217,15 @@
     },
     {
       "file": "unsloth_zoo/llama_cpp.py",
+      "sink": "compile",
+      "digest": "2b2a8c0def12fefb",
+      "count": 2,
+      "reason": "Compiles a converter source only to marshal it and compare against the .pyc beside it. The result is never executed, never stored and never returned: it is dropped at the end of the comparison, which is the one thing that tells a cache Python rebuilt from that source apart from one somebody else wrote."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
       "sink": "eval",
       "digest": "48fec3bfd1611cf8",
-      "count": 1,
-      "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
-    },
-    {
-      "file": "unsloth_zoo/llama_cpp.py",
-      "sink": "exec",
-      "digest": "3725bba562bb6fff",
-      "count": 1,
-      "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
-    },
-    {
-      "file": "unsloth_zoo/llama_cpp.py",
-      "sink": "exec",
-      "digest": "7330700d494b9249",
       "count": 1,
       "reason": "Runs converter helper source read from a pinned llama.cpp checkout, and reads a written-out default out of that source."
     },
@@ -403,6 +410,20 @@
       "digest": "7a5e305efb369e7f",
       "count": 1,
       "reason": "Re-imports a fixed set of transformers quantizer names, filtered against the installed source, plus source this file generated."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/moe_utils.py",
+      "sink": "compile",
+      "digest": "8a870bffbfa187e8",
+      "count": 1,
+      "reason": "The cache copy's bytes after they were compared byte for byte against this package file, compiled in memory. exec_module would reopen the path, and the comparison and that open are two moments a shared-cache writer can get between."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/moe_utils.py",
+      "sink": "exec",
+      "digest": "ae8220c2e12532bf",
+      "count": 1,
+      "reason": "Executes the compiled form of the bytes compared above, not a fresh read of the path. Same window as the compiler's loader, closed the same way."
     },
     {
       "file": "unsloth_zoo/vllm_utils.py",

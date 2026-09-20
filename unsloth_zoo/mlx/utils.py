@@ -57,7 +57,7 @@ import warnings
 import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import NamedTuple
@@ -825,6 +825,30 @@ def _detach_integer_arrays(value):
     return _detach_if_index(value)
 
 
+@mx.custom_function
+def _tie_shared_kv_cotangent(x, shared_kv):
+    return x, shared_kv
+
+
+@_tie_shared_kv_cotangent.vjp
+def _tie_shared_kv_cotangent_vjp(primals, cotangents, outputs):
+    # Only the source layer's backward consumes borrowed K/V's cotangent, and
+    # `mx.eval` defers it to there, keeping every borrowing layer's T x T
+    # attention cotangents alive; the hidden state's makes it run in place.
+    d_x, d_shared_kv = cotangents
+    return mx.depends(d_x, list(d_shared_kv)), d_shared_kv
+
+
+def _tie_to_hidden_state(args, shared_kv):
+    """Tie borrowed K/V to the layer's hidden-state input, when it has both."""
+    if (not args or not isinstance(args[0], mx.array)
+            or not isinstance(shared_kv, (tuple, list)) or not shared_kv
+            or not all(isinstance(a, mx.array) for a in shared_kv)):
+        return args, shared_kv
+    x, shared_kv = _tie_shared_kv_cotangent(args[0], tuple(shared_kv))
+    return (x, *args[1:]), shared_kv
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -834,6 +858,10 @@ def _patch_layer_class_for_gc(layer_cls):
     def checkpointed_fn(self, *args, **kwargs):
         slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
         if slot is None:
+            if "shared_kv" in kwargs:
+                args, kwargs["shared_kv"] = _tie_to_hidden_state(
+                    args, kwargs["shared_kv"])
+
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
                 args = tuple(_detach_integer_arrays(a) for a in args)
@@ -852,8 +880,9 @@ def _patch_layer_class_for_gc(layer_cls):
             out = fn(self, *args, **kwargs)
             return out, slot.recorded()
 
+        args, borrowed = _tie_to_hidden_state(args, slot.borrow())
         out, recorded = mx.checkpoint(inner_fn)(
-            self.trainable_parameters(), slot.borrow(), *args, **kwargs)
+            self.trainable_parameters(), borrowed, *args, **kwargs)
         slot.install(recorded)
         return out
 
@@ -2085,7 +2114,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -2117,6 +2146,9 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # cached kernels stay scale-independent.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -2131,7 +2163,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -2157,12 +2189,26 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     return loss_fn
+
+
+def _compact_cce_inputs(hidden, targets, indices):
+    if indices is None:
+        return hidden, targets
+    safe_indices = mx.maximum(indices, 0)
+    hidden = mx.take(hidden, safe_indices, axis=0)
+    targets = mx.take(targets, safe_indices, axis=0)
+    targets = mx.where(indices >= 0, targets, mx.array(-100, targets.dtype))
+    return hidden, targets
 
 
 def _model_logits(output):
@@ -4218,6 +4264,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Cohere2-MoE apply logit_scale in their forward tails).
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -4242,11 +4294,26 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
+    if use_quantized:
+        # Absolute: a dotted relative import is unresolvable to transformers' remote-code
+        # walk. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.mlx.cce import runtime_cce
+        budget = runtime_cce._CHUNK_BUDGET or runtime_cce._get_memory_budget()
+        base_chunk = max(2048, (lm_layer.weight.shape[0] + 15) // 16)
+        # Keep half-capacity and 256-row projections on the same vocabulary chunks.
+        loss_fn._unsloth_cce_small_capacity_limit = budget // (base_chunk * 4)
     return loss_fn
 
 
@@ -6000,6 +6067,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_seed",
         "_visit_epoch_cache",
         "_cycle_length",
+        "_cce_capacities",
     )
 
     def __init__(
@@ -6026,6 +6094,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.pad_to_multiple = int(pad_to_multiple)
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
+        self._cce_capacities = {}
         self._visit_policy = str(visit_policy)
         # Normalized eagerly so visits never depend on ambient RNG state and a
         # reconstructed plan (fresh-process resume) derives identical visits.
@@ -6127,6 +6196,70 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
+
+    def configure_cce_compaction(self, enabled=True):
+        self._cce_capacities = {}
+        if not enabled:
+            return
+        # tuple.count scans in C and a schedule revisits rows, so neither the
+        # per-label compare nor the repeat visit reaches Python. Label-masked
+        # corpora put every token of every row in this window, which is what
+        # makes the difference worth having.
+        row_counts = {}
+
+        def supervised(row_index):
+            count = row_counts.get(row_index)
+            if count is None:
+                row = self._rows[row_index]
+                end = min(len(row.input_ids), self.max_seq_length)
+                start = max(1, row.offset)
+                if row.labels is None:
+                    count = max(0, end - start)
+                else:
+                    window = row.labels[start:end]
+                    count = len(window) - window.count(-100)
+                row_counts[row_index] = count
+            return count
+
+        counts = {}
+        for index, batch_indices in enumerate(self._schedule):
+            count = sum(
+                supervised(row_index)
+                for row_index in batch_indices if row_index is not None
+            )
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        # A fixed capacity per admitted shape avoids extra compiled variants.
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            tokens = family[1][0][0] * (width - 1)
+            if capacity * 2 <= tokens:
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = batch[0].shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        for batch_row, row_index in enumerate(self._schedule[index]):
+            if row_index is None:
+                continue
+            row = self._rows[row_index]
+            end = min(len(row.input_ids), self.max_seq_length, width)
+            selected.extend(
+                batch_row * (width - 1) + position - 1
+                for position in range(max(1, row.offset), end)
+                if row.labels is None or row.labels[position] != -100
+            )
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch, mx.array(indices))
 
     def materialize(self, index, *, phase=None):
         batch_indices = self._schedule[index]
@@ -10374,6 +10507,29 @@ def _restore_vlm_row_image_handles(item, _depth=0):
     return item
 
 
+def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
+    """Attach fixed-capacity CCE indices for a VLM batch's supervised targets.
+
+    Returns None when the batch has no 2-D labels or its supervised targets
+    fill more than half of the target positions.
+    """
+    labels = batch.get("labels")
+    if labels is None or labels.ndim != 2:
+        return None
+    tokens = labels.shape[0] * (labels.shape[1] - 1)
+    capacity = tokens // 512 * 256
+    if capacity <= 0:
+        return None
+    selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
+    if len(selected) > capacity:
+        return None
+    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
+        capacity = 256
+    indices = np.full((capacity, 2), -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return {**batch, "_unsloth_cce_indices": mx.array(indices)}
+
+
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
@@ -10407,6 +10563,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_shape_plan",
         "_planned_widths",
         "_cycle_length",
+        "_cce_compaction",
+        "_cce_dense_batches",
+        "_cce_small_capacity_limit",
     )
 
     def __init__(
@@ -10457,6 +10616,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._forbidden = None
         self._shape_plan = None
         self._planned_widths = None
+        self._cce_compaction = False
+        self._cce_dense_batches = set()
+        self._cce_small_capacity_limit = 0
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -10536,6 +10698,46 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._shape_plan = shape_plan
         self._planned_widths = planned_widths
         self._mru = None
+
+    def configure_cce_compaction(self, enabled=True, *, max_variants=None, small_capacity_limit=0):
+        self._cce_compaction = bool(enabled)
+        self._cce_dense_batches.clear()
+        self._cce_small_capacity_limit = small_capacity_limit if enabled else 0
+        plan = self._shape_plan
+        if plan is None:
+            return None
+        raw = frozenset(key for key in plan.raw_catalog if not key[1].endswith((":cce", ":cce256")))
+        planned = frozenset(key for key in plan.planned_catalog if not key[1].endswith((":cce", ":cce256")))
+        max_variants = plan.report.cap if max_variants is None else max_variants
+        self._cce_compaction &= 2 * len(planned) <= max_variants
+        if not self._cce_compaction or 3 * len(planned) > max_variants:
+            self._cce_small_capacity_limit = 0
+        if self._cce_compaction:
+            if self._cce_small_capacity_limit:
+                small_raw = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in raw)
+                small_planned = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in planned)
+            else:
+                small_raw = small_planned = frozenset()
+            # Processor labels can require the dense fallback on later visits.
+            raw |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in raw)
+            planned |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in planned)
+            raw |= small_raw
+            planned |= small_planned
+        cap = max(plan.report.cap, len(planned))
+        report = replace(plan.report, raw_signatures=len(raw), planned_signatures=len(planned),
+                         cap=cap, effective_cap=cap)
+        self._shape_plan = replace(plan, raw_catalog=raw, planned_catalog=planned, report=report)
+        return report
+
+    def prepare_cce_batch(self, index, batch):
+        if not self._cce_compaction or index in self._cce_dense_batches:
+            return batch
+        compacted = _compact_vlm_cce_batch(batch, self._cce_small_capacity_limit)
+        if compacted is None:
+            # Keep dense slots off the fast path, including later stochastic rebuilds.
+            self._cce_dense_batches.add(index)
+            return batch
+        return compacted
 
     def materialize(self, index, target_width=None, *, phase=None):
         """Build one batch through the complete existing VLM builder.
@@ -18052,6 +18254,7 @@ def save_pretrained_gguf(
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
         _converter_dir_is_incomplete,
+        internal_scripts_dir_pin,
     )
 
     quant_map = {
@@ -18224,27 +18427,23 @@ def save_pretrained_gguf(
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        with _LLAMA_CPP_PATCHER_ENV_LOCK:
-            old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-            # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG,
-            # so synthesizing it unconditionally made that escape hatch inert here.
-            # A real user override still wins: it is already set, so this is skipped.
-            # An incomplete install is excluded too: pinning it as authoritative is
-            # what stops the staged resolver from repairing it.
-            _synthesize = (
-                old_scripts_dir is None
-                and not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
-                and not _converter_dir_is_incomplete(llama_cpp_folder)
-            )
-            if _synthesize:
-                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
-            try:
-                result = _download_convert_hf_to_gguf()
-            finally:
-                if _synthesize:
-                    os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
-                elif old_scripts_dir is not None:
-                    os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
+        # internal_scripts_dir_pin rather than setting the variable here: deriving
+        # trust from the variable alone made an install Unsloth had just downloaded
+        # look user-pinned, which turned UNSLOTH_CONVERTER_SCAN_STRICT off for this
+        # whole path. Pinning at all is skipped when a converter tag is set, since
+        # the pin outranks it and made that escape hatch inert, and when the install
+        # is incomplete, since pinning it is what stops the staged resolver from
+        # repairing it. A pin the USER set is left alone by the helper itself.
+        _pin_is_safe = (
+            not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
+            and not _converter_dir_is_incomplete(llama_cpp_folder)
+        )
+        _pin = (
+            internal_scripts_dir_pin(llama_cpp_folder) if _pin_is_safe
+            else contextlib.nullcontext()
+        )
+        with _LLAMA_CPP_PATCHER_ENV_LOCK, _pin:
+            result = _download_convert_hf_to_gguf()
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
