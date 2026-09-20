@@ -18253,6 +18253,7 @@ def save_pretrained_gguf(
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
+        _converter_dir_is_incomplete,
         internal_scripts_dir_pin,
     )
 
@@ -18426,11 +18427,22 @@ def save_pretrained_gguf(
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        # internal_scripts_dir_pin rather than setting the variable here: this
-        # points the patcher at an install Unsloth just made, and deriving trust
-        # from the variable alone made that converter look user-pinned, which
-        # turned UNSLOTH_CONVERTER_SCAN_STRICT off for this whole path.
-        with _LLAMA_CPP_PATCHER_ENV_LOCK, internal_scripts_dir_pin(llama_cpp_folder):
+        # internal_scripts_dir_pin rather than setting the variable here: deriving
+        # trust from the variable alone made an install Unsloth had just downloaded
+        # look user-pinned, which turned UNSLOTH_CONVERTER_SCAN_STRICT off for this
+        # whole path. Pinning at all is skipped when a converter tag is set, since
+        # the pin outranks it and made that escape hatch inert, and when the install
+        # is incomplete, since pinning it is what stops the staged resolver from
+        # repairing it. A pin the USER set is left alone by the helper itself.
+        _pin_is_safe = (
+            not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
+            and not _converter_dir_is_incomplete(llama_cpp_folder)
+        )
+        _pin = (
+            internal_scripts_dir_pin(llama_cpp_folder) if _pin_is_safe
+            else contextlib.nullcontext()
+        )
+        with _LLAMA_CPP_PATCHER_ENV_LOCK, _pin:
             result = _download_convert_hf_to_gguf()
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]

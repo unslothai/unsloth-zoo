@@ -35,6 +35,7 @@ __all__ = [
 
 import collections
 import errno
+import binascii
 import hashlib
 import marshal
 import threading
@@ -54,6 +55,7 @@ import tempfile
 import logging
 import shlex
 import shutil
+import stat as stat_module
 import tarfile
 import zipfile
 import platform
@@ -84,6 +86,7 @@ if not logger.hasHandlers():
 LLAMA_CPP_CONVERT_FILE = \
     "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
 
+_TEMP_NAME_ATTEMPTS = 16
 LLAMA_CPP_CONVERTER_FILENAMES = ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py")
 
 COMMANDS_NOT_FOUND = (
@@ -207,6 +210,81 @@ LLAMA_CPP_SOURCE_TARBALL = "https://codeload.github.com/ggml-org/llama.cpp/tar.g
 LLAMA_CPP_PREBUILT_MANIFEST_ASSET = "llama-prebuilt-manifest.json"
 LLAMA_CPP_PREBUILT_SHA256_ASSET = "llama-prebuilt-sha256.json"
 
+# Co-versioned converter sources, keyed by immutable tag so a hit needs no
+# freshness check and no network. Never garbage collected: readers hold no lock,
+# so eviction could delete a tree a concurrent export is importing from.
+UNSLOTH_CONVERTER_STAGE_FILENAME = "UNSLOTH_CONVERTER_STAGE.json"
+# Bump to re-stage entries written by an older unsloth_zoo.
+UNSLOTH_CONVERTER_STAGE_SCHEMA = 1
+LLAMA_CPP_CONVERTER_CACHE_DIR = os.environ.get(
+    "UNSLOTH_LLAMA_CPP_CONVERTER_CACHE",
+    os.path.join(UNSLOTH_HOME, "llama.cpp-converter"),
+)
+
+
+def _converter_cache_root():
+    """Where staged converters live. Read at the call, not at import, so setting
+    UNSLOTH_LLAMA_CPP_CONVERTER_CACHE after `import unsloth` works, as the sibling
+    switches already promise."""
+    return os.environ.get(
+        "UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", "",
+    ).strip() or LLAMA_CPP_CONVERTER_CACHE_DIR
+# conversion/ is absent on purpose: pre-split revisions legitimately have none, so
+# it is required only when the entrypoint imports it (_staged_sources_are_complete).
+_CONVERTER_STAGE_REQUIRED = (
+    "convert_hf_to_gguf.py",
+    os.path.join("gguf-py", "gguf", "__init__.py"),
+)
+
+_OFFLINE_TRUE_VALUES = frozenset({"1", "ON", "TRUE", "YES"})
+_STAGE_DISABLED_VALUES = frozenset({"0", "OFF", "FALSE", "NO"})
+
+
+def _converter_staging_enabled():
+    """Whether the export path may stage co-versioned converter sources.
+
+    UNSLOTH_CONVERTER_STAGE=0 restores the lone-entrypoint download. Read at the
+    call, not at import. Prebuilt installs still hydrate their own converter."""
+    return os.environ.get("UNSLOTH_CONVERTER_STAGE", "1").strip().upper() \
+        not in _STAGE_DISABLED_VALUES
+
+
+def _converter_network_allowed():
+    """Whether converter acquisition may touch the network.
+
+    Read at the call, not at import, so setting it after `import unsloth` works.
+
+    Unsloth's own switches only. HF_HUB_OFFLINE is deliberately NOT honoured: it is
+    documented as "no HTTP calls will be made to the Hugging Face Hub", and the
+    converter comes from GitHub, not the Hub. Treating it as a global network kill
+    switch stopped exports for people who set it for Hub reasons while having GitHub
+    access, and it silently disabled this repo's own converter download in any test
+    session that imported tests/_merge_e2e_helpers.py, which sets it process-wide."""
+    for name in ("UNSLOTH_LLAMA_CPP_OFFLINE", "UNSLOTH_OFFLINE"):
+        if os.environ.get(name, "").strip().upper() in _OFFLINE_TRUE_VALUES:
+            return False
+    return True
+
+
+def _converter_stage_dir(repo, tag):
+    """Cache directory for one llama.cpp revision's converter sources.
+
+    repo/tag are untrusted, so both are sanitised to stay inside the cache root.
+    Sanitising is not injective (`v/a` and `v_a` both clean to `v_a`), and two
+    revisions sharing a directory means one gets deleted as a wreck under a live
+    reader, so the exact identity is digested into the name to restore it."""
+    def _safe(text):
+        cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(text or "unknown"))
+        # A leading dot would hide the entry; "." and ".." would escape it.
+        return cleaned.lstrip(".") or "unknown"
+    # NUL separated so ("a", "b_c") and ("a_b", "c") cannot produce one digest.
+    identity = f"{repo or ''}\x00{tag or ''}".encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(identity).hexdigest()[:12]
+    return os.path.join(
+        _converter_cache_root(),
+        f"{_safe(str(repo).replace('/', '_'))}@{_safe(tag)}-{digest}",
+    )
+
 
 def _resolve_local_convert_script():
     """Return (abs_path, mtime_ns, size) for a local convert_hf_to_gguf.py if
@@ -270,6 +348,76 @@ def _resolve_bundle_convert_script():
         logger.info(
             f"Unsloth: Using bundle convert_hf_to_gguf.py from {candidate} "
             f"(co-versioned with its conversion/ package)"
+        )
+        return (candidate, stat.st_mtime_ns, stat.st_size)
+    return None
+pass
+
+
+def _resolve_monolith_bundle_convert_script(require_gguf_py = True):
+    """Last local resolver before the network: a pre-split install whose converter
+    carries its own model classes and needs no conversion/ package.
+
+    _resolve_bundle_convert_script refuses these because it cannot tell a genuine
+    monolith from a package install that lost its package; reading the entrypoint
+    settles it. Keeps that whole population offline.
+
+    `require_gguf_py`: without the sibling tree the converter's own
+    `sys.path.insert(1, __file__.parent / "gguf-py")` falls through to an unpinned
+    site-packages `gguf`, the very skew staging removes. The caller retries without
+    the demand only after staging failed, so such installs keep converting."""
+    bundle_dir = LLAMA_CPP_DEFAULT_DIR
+    if not bundle_dir or not os.path.isdir(bundle_dir):
+        return None
+    for name in LLAMA_CPP_CONVERTER_FILENAMES:
+        candidate = os.path.join(bundle_dir, name)
+        try:
+            if not os.path.isfile(candidate):
+                continue
+            if _entrypoint_needs_conversion_package(candidate):
+                # Package-era entrypoint without its package. `continue`, not
+                # `return`: another filename in this directory may be a complete
+                # monolith.
+                continue
+            # Positive evidence, not just the absence of the import: a truncated
+            # converter also has no conversion import, and accepting it means
+            # staging never gets a chance to repair the install.
+            try:
+                with open(candidate, "rb") as f: source = f.read()
+            except OSError:
+                continue
+            if require_gguf_py and not os.path.isfile(
+                os.path.join(bundle_dir, "gguf-py", "gguf", "__init__.py")
+            ):
+                logger.info(
+                    f"Unsloth: {candidate} is self-contained but has no gguf-py "
+                    f"beside it, so staging is preferred over pairing it with "
+                    f"whichever gguf the child happens to import."
+                )
+                return None
+            text_archs, vision_archs = _extract_archs_from_monolith_source(source)
+            if not text_archs and not vision_archs:
+                logger.info(
+                    f"Unsloth: Ignoring {candidate}: it imports no conversion/ package "
+                    f"and registers no model architectures, so it is damaged rather "
+                    f"than self-contained."
+                )
+                continue
+            # Registrations alone are not enough: a file truncated after a complete
+            # registered class still has them and still cannot be driven.
+            if not _CONVERTER_ADD_ARGUMENT_RE.search(source):
+                logger.info(
+                    f"Unsloth: Ignoring {candidate}: it registers model architectures "
+                    f"but defines no command line arguments, so it cannot be driven as "
+                    f"a converter."
+                )
+                continue
+            stat = os.stat(candidate)
+        except OSError:
+            continue
+        logger.info(
+            f"Unsloth: Using the installed self-contained convert_hf_to_gguf.py "
+            f"from {candidate}"
         )
         return (candidate, stat.st_mtime_ns, stat.st_size)
     return None
@@ -1048,6 +1196,49 @@ def _select_cpu_assets(tag, assets, manifest):
     ]
 
 
+def _open_new_sibling(directory, mode):
+    """Create a uniquely named file in `directory` with `mode`, returning (fd, path).
+
+    Not mkstemp, which hardcodes 0600. os.open masks `mode` with the current umask,
+    so the umask is never read: reading it means setting it to 0 and back, which two
+    threads can interleave into leaving the process at 0 forever."""
+    for _ in range(_TEMP_NAME_ATTEMPTS):
+        staged = os.path.join(
+            directory, ".unsloth_tmp_" + binascii.hexlify(os.urandom(8)).decode(),
+        )
+        try:
+            return os.open(staged, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode), staged
+        except FileExistsError:
+            continue
+    raise OSError(errno.EEXIST, f"Unsloth: could not create a temp file in {directory}")
+
+
+def _atomic_write_bytes(path, content):
+    """Write `content` to `path` so a concurrent reader never sees a partial file.
+
+    Sibling temp file plus os.replace gives a defined winner on POSIX and Windows;
+    the fsync means a crash cannot leave a truncated file under the real name."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok = True)
+    handle, staged = _open_new_sibling(directory, 0o666)
+    try:
+        with os.fdopen(handle, "wb") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        # os.replace carries the temp file's mode over, so an existing destination
+        # keeps the mode it had rather than one a fresh create would give it.
+        try:
+            os.chmod(staged, os.stat(path).st_mode & 0o7777)
+        except OSError:
+            pass
+        os.replace(staged, path)
+    except BaseException:
+        try: os.unlink(staged)
+        except OSError: pass
+        raise
+
+
 def _download_archive(url, dest_path):
     response = _requests_get_with_retries(url, headers = _github_auth_headers(), stream = True)
     with open(dest_path, "wb") as f:
@@ -1134,31 +1325,258 @@ def _place_prebuilt_binaries(extracted_root, install_folder):
         raise RuntimeError("Unsloth: No executables found in the prebuilt archive.")
 
 
-def _hydrate_converter_sources(tag, install_folder, source_assets = None, checksums = None):
-    """Copy convert_hf_to_gguf.py, conversion/ and gguf-py/ from the same-tag
-    source tarball so check_llama_cpp and the converter machinery work
-    without a git checkout, and tensor mappings match the binaries.
+def _converter_source_url(tag, source_assets = None):
+    """URL of the source tarball carrying convert_hf_to_gguf.py, conversion/ and
+    gguf-py/ for one tag.
 
-    Fork releases use "mix" tags (e.g. b9739-mix-2d6bd50) that do NOT exist on
-    ggml-org, so a verbatim ggml-org download 404s and the whole prebuilt install
-    fails into a source compile. Prefer the fork release's own source asset
-    (llama.cpp-source-{tag}.tar.gz, passed in via source_assets) so the converter
-    exactly matches the fork build; otherwise strip the -mix-... suffix and pull
-    the matching upstream tag from ggml-org. Plain ggml-org tags carry no suffix,
-    so this is a no-op for them (upstream_tag == tag).
-
-    The archive is verified against the release's own published sha256 when the
-    release publishes one for it. These are the files the converter subprocess
-    executes, and they were arriving unverified: the sha256 in
-    _stage_prebuilt_install covers the BINARY asset, and this is a second,
-    separate download. The fork's llama-prebuilt-sha256.json does carry an entry
-    for llama.cpp-source-{tag}.tar.gz, so on that path there is something to
-    check against. The ggml-org codeload fallback publishes no digest, so it is
-    reported rather than silently trusted."""
+    Fork "mix" tags (e.g. b9739-mix-2d6bd50) do not exist on ggml-org, so prefer the
+    fork release's own source asset; otherwise strip the -mix-... suffix to get the
+    matching upstream tag. A no-op for plain ggml-org tags, which carry no suffix."""
     fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
     expected_sha256 = None
     if source_assets and fork_source_name in source_assets:
-        source_url = source_assets[fork_source_name]
+        return source_assets[fork_source_name]
+    return LLAMA_CPP_SOURCE_TARBALL.format(tag = tag.split("-mix-")[0])
+
+
+def _source_imports_conversion_package(entry_content_bytes):
+    """True iff this converter source imports the conversion/ package, in any spelling.
+
+    Parsed rather than substring-matched: `import conversion`, `import conversion
+    as c` and `from conversion.base import X` need the package just as much as
+    upstream's current `from conversion import (...)`. Falls back to the substring
+    on unparseable source so it is never silently downgraded to 'monolith'."""
+    try:
+        tree = ast.parse(entry_content_bytes)
+    except (SyntaxError, ValueError):
+        return b"from conversion" in entry_content_bytes or \
+               b"import conversion" in entry_content_bytes
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            # `level` is non-zero for `from . import x`; module is None for that.
+            root = (node.module or "").split(".")[0]
+            if root == "conversion": return True
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "conversion": return True
+    return False
+
+
+def _entrypoint_needs_conversion_package(converter_path):
+    """True iff the entrypoint at this path imports the conversion/ package.
+
+    Read off the file: a pre-split revision is a self-contained monolith whose
+    staged tree legitimately has no conversion/."""
+    try:
+        with open(converter_path, "rb") as f:
+            return _source_imports_conversion_package(f.read())
+    except OSError:
+        return False
+
+
+def _staged_sources_are_complete(stage_dir):
+    """Whether stage_dir holds every tree this revision's converter needs.
+
+    Checked before publication and again on every cache probe, so a truncated or
+    hand-deleted entry is re-staged rather than served."""
+    for member in _CONVERTER_STAGE_REQUIRED:
+        if not os.path.exists(os.path.join(stage_dir, member)):
+            return False
+    converter = os.path.join(stage_dir, "convert_hf_to_gguf.py")
+    try:
+        with open(converter, "rb") as f: source = f.read()
+    except OSError:
+        return False
+    if _source_imports_conversion_package(source):
+        conversion = os.path.join(stage_dir, "conversion")
+        if not (os.path.isfile(os.path.join(conversion, "__init__.py")) and
+                os.path.isfile(os.path.join(conversion, "base.py"))):
+            return False
+        # File presence is not enough: an entrypoint truncated after its
+        # `from conversion import (` line still carries that text and would be
+        # accepted, then stay a warm-cache hit forever while every export dies.
+        try:
+            ast.parse(source)
+        except (SyntaxError, ValueError):
+            return False
+        # Parsing is not enough either: `from conversion import ModelBase` alone
+        # parses. Require what the patcher requires, a CLI it can read flags from.
+        return bool(_CONVERTER_ADD_ARGUMENT_RE.search(source))
+    # No conversion import, so this should be a pre-split monolith. An entrypoint
+    # truncated to nothing looks the same, and accepting it makes the damage
+    # permanent: a cache hit on every later export that staging never replaces.
+    text_archs, vision_archs = _extract_archs_from_monolith_source(source)
+    if not (text_archs or vision_archs):
+        return False
+    # Same flag requirement as the package branch: a truncation keeping a
+    # `@ModelBase.register` decorator still cannot be driven.
+    return bool(_CONVERTER_ADD_ARGUMENT_RE.search(source))
+
+
+# The patcher parses its flags with this same call and raises "no arguments found"
+# when it matches nothing.
+_CONVERTER_ADD_ARGUMENT_RE = re.compile(rb"parser\.add_argument\(")
+
+
+def _read_converter_stage_manifest(stage_dir):
+    """The stage manifest, or None when absent, unreadable, incomplete or written
+    by an older schema. `completed` is written last, so its absence is exactly the
+    signal that a previous attempt died part-way through."""
+    try:
+        with open(os.path.join(stage_dir, UNSLOTH_CONVERTER_STAGE_FILENAME), "r", encoding = "utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    if manifest.get("schema") != UNSLOTH_CONVERTER_STAGE_SCHEMA:
+        return None
+    if manifest.get("completed") is not True:
+        return None
+    return manifest
+
+
+def _is_inside_converter_cache(directory):
+    """Whether this directory sits under the converter cache root.
+
+    Containment alone does not make a directory ours: see _is_converter_stage_dir."""
+    if not directory: return False
+    try:
+        root = os.path.realpath(_converter_cache_root())
+        here = os.path.realpath(directory)
+    except OSError:
+        return False
+    return here == root or here.startswith(root + os.sep)
+
+
+def _is_converter_stage_dir(directory):
+    """Whether this directory is one of our own staged revisions.
+
+    Containment is not enough: the cache root is configurable, so a user's own
+    checkout can sit beneath it and must not be written into. Only we write the
+    stage manifest, so it is what identifies a stage."""
+    return (
+        _is_inside_converter_cache(directory)
+        and _read_converter_stage_manifest(directory) is not None
+    )
+
+
+def _converter_stage_is_usable(stage_dir, repo = None, tag = None):
+    """A cache hit: complete manifest, the identity we asked for, AND every
+    required tree still on disk.
+
+    The identity check is not redundant with the directory name: sanitising can map
+    distinct tags onto one directory, so without comparing the manifest we would
+    serve one revision's sources under another's. A mismatch is a miss."""
+    manifest = _read_converter_stage_manifest(stage_dir)
+    if manifest is None: return False
+    if repo is not None and manifest.get("repo") != repo: return False
+    if tag  is not None and manifest.get("tag")  != tag:  return False
+    return _staged_sources_are_complete(stage_dir)
+
+
+def _staged_converter_tag(converter_location):
+    """The llama.cpp tag a converter was staged from, or None when it was not staged.
+
+    The patched entrypoint is written beside the sources it imports, so the stage
+    manifest is its sibling."""
+    if not converter_location:
+        return None
+    try:
+        stage_dir = os.path.dirname(os.path.abspath(converter_location))
+    except (OSError, ValueError):
+        return None
+    manifest = _read_converter_stage_manifest(stage_dir)
+    if manifest is None:
+        return None
+    tag = manifest.get("tag")
+    if not isinstance(tag, str) or not tag.strip():
+        return None
+    return tag.strip()
+
+
+def _incomplete_sources_remedy(llama_cpp_dir):
+    """What to actually do about an entrypoint with no conversion/ beside it.
+
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG, so when
+    that pin is what selected this directory, telling the user to set the tag sends
+    them to a knob the pin will keep overriding: they set it, nothing changes, and
+    the same sentence comes back. Name the knob that is actually in force."""
+    pin = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", "").strip()
+    if pin:
+        try:
+            pinned = os.path.abspath(os.path.expanduser(pin))
+            selected = os.path.abspath(llama_cpp_dir)
+            pin_chose_this = os.path.commonpath([pinned, selected]) == pinned
+        except (ValueError, OSError):
+            pin_chose_this = False
+        if pin_chose_this:
+            return (
+                f"UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set to '{pin}', and it outranks "
+                f"UNSLOTH_LLAMA_CPP_CONVERTER_TAG, so setting a tag will not change "
+                f"this. Point it at a checkout that has convert_hf_to_gguf.py, "
+                f"conversion/ and gguf-py/ together, or unset it to let Unsloth stage "
+                f"a matching set itself."
+            )
+    return (
+        "Set UNSLOTH_LLAMA_CPP_CONVERTER_TAG to a llama.cpp release tag to stage a "
+        "matching set, or point UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a checkout that has "
+        "convert_hf_to_gguf.py, conversion/ and gguf-py/ together."
+    )
+
+
+def _unsupported_arch_message(arch, converter_location):
+    """The message for an architecture the converter does not know.
+
+    Sources are pinned to a single revision, so an upstream-only architecture will
+    not convert until a release cuts. The remedy is the same whichever row of the
+    ladder answered, so it is always named; only the sentence identifying the
+    revision needs a staged converter, since an installed one carries no manifest.
+    Naming the revision but withholding the remedy would leave the population this
+    PR newly routes to an installed converter with no way out."""
+    message = (
+        f"Unsloth: llama.cpp GGUF conversion does not yet support "
+        f"converting model types of `{arch}`."
+    )
+    tag = _staged_converter_tag(converter_location)
+    if tag is None:
+        provenance = (
+            f"The converter at `{converter_location}` came from the llama.cpp "
+            f"already installed, so only the architectures that copy knows can be "
+            f"converted."
+        )
+    else:
+        provenance = (
+            f"The converter, its conversion/ package and its gguf-py all came from "
+            f"llama.cpp `{tag}`, so only the architectures that revision knows can "
+            f"be converted."
+        )
+    return (
+        f"{message}\n"
+        f"{provenance}\n"
+        f"If `{arch}` is supported by a newer llama.cpp, set "
+        f"UNSLOTH_LLAMA_CPP_CONVERTER_TAG to that release tag (for example "
+        f"`UNSLOTH_LLAMA_CPP_CONVERTER_TAG=\"b9999\"`) and export again, or point "
+        f"UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a llama.cpp checkout that has "
+        f"convert_hf_to_gguf.py, conversion/ and gguf-py/ together."
+    )
+
+
+def _extract_converter_sources_into(tag, dest_folder, source_assets = None, archive_dir = None,
+                                    checksums = None):
+    """Download one source tarball for `tag` and copy the three converter trees
+    into dest_folder. Returns the archive's sha256, or None when it could not be
+    computed. Raises when the tarball does not carry the converter.
+
+    These are the files the converter subprocess executes, so the archive is checked
+    against the release's own published sha256 when there is one. Only a fork release
+    publishes a digest for its source asset; the ggml-org codeload fallback publishes
+    none, which is reported rather than silently trusted."""
+    source_url = _converter_source_url(tag, source_assets)
+    fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
+    # The same condition _converter_source_url used to pick the URL, so the digest
+    # is always looked up for the asset actually being downloaded.
+    if source_assets and fork_source_name in source_assets:
         expected_sha256 = ((checksums or {}).get(fork_source_name) or {}).get("sha256")
         if not expected_sha256:
             logger.warning(
@@ -1166,22 +1584,30 @@ def _hydrate_converter_sources(tag, install_folder, source_assets = None, checks
                 "converter sources it holds cannot be verified.", tag, fork_source_name,
             )
     else:
-        upstream_tag = tag.split("-mix-")[0]
-        source_url = LLAMA_CPP_SOURCE_TARBALL.format(tag = upstream_tag)
+        expected_sha256 = None
         logger.warning(
             "Unsloth: Falling back to the ggml-org source archive for %s, which "
             "publishes no sha256, so the converter sources cannot be verified.",
-            upstream_tag,
+            tag.split("-mix-")[0],
         )
-    with tempfile.TemporaryDirectory(dir = os.path.dirname(install_folder) or ".") as source_dir:
+    scratch_parent = archive_dir or os.path.dirname(dest_folder) or "."
+    with tempfile.TemporaryDirectory(dir = scratch_parent) as source_dir:
         archive_path = os.path.join(source_dir, "source.tar.gz")
         _download_archive(source_url, archive_path)
+        try:
+            archive_sha256 = _sha256_file(archive_path)
+        except OSError:
+            archive_sha256 = None
         if expected_sha256:
-            actual = _sha256_file(archive_path)
-            if actual != expected_sha256:
+            if archive_sha256 is None:
+                raise RuntimeError(
+                    f"Unsloth: could not read {fork_source_name} back to verify its "
+                    f"sha256, so the converter sources it holds are unverified."
+                )
+            if archive_sha256 != expected_sha256:
                 raise RuntimeError(
                     f"Unsloth: sha256 mismatch for {fork_source_name}: expected "
-                    f"{expected_sha256}, got {actual}"
+                    f"{expected_sha256}, got {archive_sha256}"
                 )
         extract_dir = os.path.join(source_dir, "extracted")
         os.makedirs(extract_dir)
@@ -1191,11 +1617,237 @@ def _hydrate_converter_sources(tag, install_folder, source_assets = None, checks
         gguf_py = os.path.join(root, "gguf-py")
         if not (os.path.isfile(converter) and os.path.isdir(gguf_py)):
             raise RuntimeError(f"Unsloth: Source tarball for {tag} is missing converter files.")
-        shutil.copy2(converter, os.path.join(install_folder, "convert_hf_to_gguf.py"))
-        shutil.copytree(gguf_py, os.path.join(install_folder, "gguf-py"), dirs_exist_ok = True)
+        os.makedirs(dest_folder, exist_ok = True)
+        shutil.copy2(converter, os.path.join(dest_folder, "convert_hf_to_gguf.py"))
+        shutil.copytree(gguf_py, os.path.join(dest_folder, "gguf-py"), dirs_exist_ok = True)
         conversion = os.path.join(root, "conversion")
         if os.path.isdir(conversion):
-            shutil.copytree(conversion, os.path.join(install_folder, "conversion"), dirs_exist_ok = True)
+            shutil.copytree(conversion, os.path.join(dest_folder, "conversion"), dirs_exist_ok = True)
+    return archive_sha256
+
+
+def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = None):
+    """Return a directory holding convert_hf_to_gguf.py, conversion/ and gguf-py/
+    all taken from the same llama.cpp revision, or None when that is impossible.
+
+    Transactional: probe, acquire into a private staging directory, validate,
+    write `completed` LAST, publish by moving the directory into place. An
+    interrupted attempt therefore leaves something that fails the probe.
+
+    No lock: entries are keyed on an immutable tag, so two processes staging the
+    same tag produce equivalent trees and whichever publishes first wins."""
+    if not tag:
+        return None
+    stage_dir = _converter_stage_dir(repo, tag)
+    if _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
+        logger.info(f"Unsloth: Using cached llama.cpp converter sources for {tag} from {stage_dir}")
+        return stage_dir
+    if not _converter_network_allowed():
+        logger.warning(
+            f"Unsloth: Offline, and no cached llama.cpp converter sources for {tag} "
+            f"at {stage_dir}. Unset UNSLOTH_LLAMA_CPP_OFFLINE / UNSLOTH_OFFLINE to "
+            f"stage them."
+        )
+        return None
+
+    parent_dir = os.path.dirname(stage_dir) or "."
+    # Its own try: an unwritable cache root is a staging MISS returning None, not an
+    # exception that would fail an export working today. It cannot live in the main
+    # try, whose `finally` removes `staging`, which a failed mkdtemp never bound.
+    try:
+        os.makedirs(parent_dir, exist_ok = True)
+        # Beside the destination so publication is a same-filesystem move, and
+        # private to this process so cleanup can never touch a live entry.
+        staging = tempfile.mkdtemp(prefix = ".llama_cpp_converter_", dir = parent_dir)
+    except OSError as e:
+        logger.warning(
+            f"Unsloth: Could not prepare the llama.cpp converter cache at {parent_dir} "
+            f"({type(e).__name__}: {e}). Set UNSLOTH_LLAMA_CPP_CONVERTER_CACHE to a "
+            f"writable directory to cache converter sources."
+        )
+        return None
+    try:
+        staged_sources = os.path.join(staging, "sources")
+        logger.info(f"Unsloth: Staging llama.cpp converter sources for {tag} ({repo})")
+        archive_sha256 = _extract_converter_sources_into(
+            tag, staged_sources, source_assets = source_assets, archive_dir = staging,
+        )
+        if not _staged_sources_are_complete(staged_sources):
+            raise RuntimeError(
+                f"Unsloth: Staged llama.cpp converter sources for {tag} are incomplete."
+            )
+        # Written last: a reader treats a stage without this manifest as absent.
+        manifest = {
+            "schema"         : UNSLOTH_CONVERTER_STAGE_SCHEMA,
+            "repo"           : repo,
+            "tag"            : tag,
+            "archive_sha256" : archive_sha256,
+            "staged_at_utc"  : time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "completed"      : True,
+        }
+        _atomic_write_bytes(
+            os.path.join(staged_sources, UNSLOTH_CONVERTER_STAGE_FILENAME),
+            json.dumps(manifest, indent = 2).encode("utf-8"),
+        )
+        if os.path.exists(stage_dir) and not _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
+            # A wreck from an attempt that died mid-publish blocks its own
+            # replacement forever, so move it into our private staging dir for the
+            # `finally` to dispose of, rather than deleting a tree in place.
+            try:
+                if _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
+                    raise _StageRepairedByAnother()
+                superseded = os.path.join(staging, "superseded")
+                # os.rename, not shutil.move: taking the entry must be one atomic
+                # step so nothing can be half moved.
+                os.rename(stage_dir, superseded)
+                # Re-check AFTER the move: a process publishing a valid replacement
+                # in between leaves us holding ITS tree, which `finally` would delete
+                # under its live export. Put a valid one straight back and adopt it.
+                if _converter_stage_is_usable(superseded, repo = repo, tag = tag):
+                    try:
+                        os.rename(superseded, stage_dir)
+                    except OSError:
+                        # A third process published into the name; same revision, so
+                        # ours is redundant.
+                        pass
+                    raise _StageRepairedByAnother()
+            except _StageRepairedByAnother:
+                pass
+            except (OSError, shutil.Error):
+                # Lost the repair race; the usability check below decides.
+                pass
+        if not os.path.exists(stage_dir):
+            try:
+                # os.rename, not shutil.move: move onto an EXISTING directory nests
+                # the source inside it silently, while rename raises, which is the
+                # signal the loser needs.
+                os.rename(staged_sources, stage_dir)
+            except OSError as exc:
+                # Another process published first; same revision, so take its tree.
+                if not _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
+                    raise RuntimeError(
+                        f"Unsloth: Could not publish llama.cpp converter sources for {tag}: {exc}"
+                    ) from exc
+        if not _converter_stage_is_usable(stage_dir, repo = repo, tag = tag):
+            raise RuntimeError(
+                f"Unsloth: Published llama.cpp converter sources for {tag} did not validate."
+            )
+        return stage_dir
+    except Exception as e:
+        logger.warning(
+            f"Unsloth: Could not stage co-versioned llama.cpp converter sources "
+            f"for {tag} ({type(e).__name__}: {e})."
+        )
+        return None
+    finally:
+        # Only the private staging directory: published entries are never collected,
+        # since readers hold no lock that would make that safe.
+        shutil.rmtree(staging, ignore_errors = True)
+
+
+def _unusable_prebuilt_marker(marker, why):
+    logger.warning(
+        f"Unsloth: Ignoring `{marker}` because {why}, so the GGUF converter cannot be "
+        f"matched to the llama.cpp binaries installed beside it and the latest release "
+        f"will be staged instead. Set UNSLOTH_LLAMA_CPP_CONVERTER_TAG to pin a revision."
+    )
+    return None, None
+
+
+def _read_prebuilt_marker(install_folder):
+    """The prebuilt marker's (repo, tag), or (None, None), so the converter can be
+    staged from the same revision as the quantizer it will feed.
+
+    A present-but-unusable marker is announced, not collapsed into the absent case:
+    falling through stages the latest release, abandoning the binary match."""
+    marker = os.path.join(install_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
+    try:
+        with open(marker, "r", encoding = "utf-8") as f:
+            info = json.load(f)
+    except OSError:
+        return None, None
+    except ValueError:
+        return _unusable_prebuilt_marker(marker, "it is not valid JSON")
+    if not isinstance(info, dict):
+        return _unusable_prebuilt_marker(marker, "its top level is not an object")
+    tag = info.get("tag")
+    if not isinstance(tag, str) or not tag.strip():
+        return _unusable_prebuilt_marker(marker, "it names no `tag`")
+    repo = info.get("repo")
+    if not isinstance(repo, str) or not repo.strip():
+        repo = "ggml-org/llama.cpp"
+    return repo, tag.strip()
+
+
+_CONVERTER_RELEASE_TAGS = {}
+
+
+def _latest_converter_release_tag(_llama_tag_pin):
+    """The release tag a fresh install would get, memoized for the process.
+
+    Otherwise a warm cache still pays a releases API round-trip per export.
+    UNSLOTH_LLAMA_TAG is the cache key, not read inside, so changing the pin
+    mid-process still re-resolves."""
+    if _llama_tag_pin in _CONVERTER_RELEASE_TAGS:
+        return _CONVERTER_RELEASE_TAGS[_llama_tag_pin]
+    release = _resolve_llama_cpp_release()
+    if release is None:
+        # Failures are NOT remembered: a tag is immutable, but a failed lookup only
+        # describes the network a second ago.
+        return None
+    _CONVERTER_RELEASE_TAGS[_llama_tag_pin] = release[0]
+    return release[0]
+
+
+_latest_converter_release_tag.cache_clear = _CONVERTER_RELEASE_TAGS.clear
+
+
+def _resolve_converter_revision(llama_cpp_dir):
+    """Which llama.cpp revision the converter sources should come from, as
+    (repo, tag), or (None, None) when the answer is "whatever is already on disk".
+
+    Precedence, highest first:
+
+      1. UNSLOTH_LLAMA_CPP_CONVERTER_TAG, the explicit escape hatch for an
+         architecture that exists upstream but not yet in the installed release.
+      2. UNSLOTH_PREBUILT_INFO.json, so the converter matches the binaries that
+         will quantize its output.
+      3. the latest release, which is the revision a fresh install would get.
+
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is NOT a row: that explicit pin is authoritative
+    and its caller returns before reaching here."""
+    pinned = os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
+    if pinned:
+        return "ggml-org/llama.cpp", pinned
+    repo, tag = _read_prebuilt_marker(llama_cpp_dir)
+    if tag:
+        return repo, tag
+    llama_tag_pin = os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()
+    if not _converter_network_allowed():
+        # A revision this process already resolved is a local fact, so a process
+        # switched offline after staging can still find its own warm cache.
+        memoized = _CONVERTER_RELEASE_TAGS.get(llama_tag_pin)
+        if memoized:
+            return "ggml-org/llama.cpp", memoized
+        return None, None
+    tag = _latest_converter_release_tag(llama_tag_pin)
+    if not tag:
+        return None, None
+    return "ggml-org/llama.cpp", tag
+
+
+def _hydrate_converter_sources(tag, install_folder, source_assets = None, checksums = None):
+    """Copy convert_hf_to_gguf.py, conversion/ and gguf-py/ from the same-tag
+    source tarball so check_llama_cpp and the converter machinery work
+    without a git checkout, and tensor mappings match the binaries.
+
+    Shares _extract_converter_sources_into with the export-time staging cache so the
+    two cannot drift on which trees count as "the converter" or on mix-tag resolution."""
+    _extract_converter_sources_into(
+        tag, install_folder, source_assets = source_assets,
+        archive_dir = os.path.dirname(install_folder) or ".",
+        checksums = checksums,
+    )
 
 
 def _write_prebuilt_marker(install_folder, tag, asset_name, repo = "ggml-org/llama.cpp"):
@@ -2516,23 +3168,62 @@ def _conversion_sibling_info(llama_cpp_dir, is_local_copy = False):
 pass
 
 
+class _StageRepairedByAnother(Exception):
+    """Another process published a valid entry while we were about to clear ours."""
+    pass
+
+
+class _ConverterSourcesIncomplete(RuntimeError):
+    """The converter entrypoint and its conversion/ package are not both present.
+
+    Its own type so the patcher's broad `except Exception` re-raises the actionable
+    message unchanged."""
+    pass
+
+
 def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
-    """Return 'package' for the new conversion/ layout, else 'monolith'.
-    Structural: entrypoint must contain `from conversion import` AND
-    conversion/__init__.py + conversion/base.py must exist on disk."""
+    """Return 'package', 'monolith' or 'incomplete' for a converter entrypoint.
+
+    Structural, never by import:
+
+      package    entrypoint imports the conversion/ package, in any spelling, AND
+                 conversion/__init__.py + conversion/base.py exist on disk.
+      monolith   entrypoint carries the model classes itself (no conversion import).
+      incomplete entrypoint imports conversion/ but the package is not on disk.
+
+    'incomplete' used to be reported as 'monolith', which silently produced empty
+    arch sets, skipped patches and a shim whose own import cannot resolve. Naming it
+    lets the caller stage co-versioned sources instead."""
     try:
-        if b"from conversion import" not in entry_content_bytes:
+        if not _source_imports_conversion_package(entry_content_bytes):
             return "monolith"
         init_py = os.path.join(llama_cpp_dir, "conversion", "__init__.py")
         base_py = os.path.join(llama_cpp_dir, "conversion", "base.py")
         if os.path.isfile(init_py) and os.path.isfile(base_py):
             return "package"
+        return "incomplete"
     except Exception:
         # Detection is best-effort; on any I/O or attribute error fall back
         # to monolith so the legacy regex patches still run.
-        pass
-    return "monolith"
+        return "monolith"
 pass
+
+
+def _converter_dir_is_incomplete(llama_cpp_dir):
+    """Whether this directory holds a converter that cannot run as it stands.
+
+    Positive evidence only: an entrypoint that imports conversion/ with no such
+    package beside it. A directory with no converter is empty, not incomplete."""
+    for filename in LLAMA_CPP_CONVERTER_FILENAMES:
+        entry = os.path.join(llama_cpp_dir, filename)
+        try:
+            with open(entry, "rb") as f:
+                content = f.read()
+        except OSError:
+            continue
+        if _detect_converter_layout(content, llama_cpp_dir) == "incomplete":
+            return True
+    return False
 
 
 def _extract_dict_keys_from_conversion_init(conv_init_path, dict_name):
@@ -2606,8 +3297,9 @@ def _apply_branding_patch_to_base(conv_base_path):
     if n == 0:
         return "pattern-missing"
     try:
-        with open(conv_base_path, "wb") as f:
-            f.write(new_content)
+        # Atomic: conversion/base.py is shared, and a partial write surfaces as a
+        # SyntaxError inside the converter child rather than here.
+        _atomic_write_bytes(conv_base_path, new_content)
     except OSError:
         return "pattern-missing"
     return "applied"
@@ -2698,6 +3390,176 @@ def _qwen_already_handles_expert_aliases(conv_qwen_path):
         return False
     return (b"num_local_experts" in content) and (b"num_experts" in content)
 pass
+
+
+def _resolve_staged_convert_script():
+    """Stage convert_hf_to_gguf.py, conversion/ and gguf-py/ from one llama.cpp
+    revision and return (path, mtime_ns, size) for the staged entrypoint, or None.
+
+    Same shape as the two resolvers above, so _get_llama_cpp_dir points at the stage
+    and every later patch lands beside the trees the child actually imports. None
+    means "could not stage" and the caller falls back to the single-file download."""
+    if not _converter_staging_enabled():
+        logger.info(
+            "Unsloth: UNSLOTH_CONVERTER_STAGE is off, so co-versioned converter "
+            "sources will not be staged."
+        )
+        return None
+    repo, tag = _resolve_converter_revision(LLAMA_CPP_DEFAULT_DIR)
+    if not tag:
+        return None
+    stage_dir = _stage_converter_sources(tag, repo = repo or "ggml-org/llama.cpp")
+    if stage_dir is None:
+        return None
+    stage_dir = _writable_stage(stage_dir, repo = repo or "ggml-org/llama.cpp", tag = tag)
+    if stage_dir is None:
+        return None
+    candidate = os.path.join(stage_dir, "convert_hf_to_gguf.py")
+    try:
+        stat = os.stat(candidate)
+    except OSError:
+        return None
+    logger.info(
+        f"Unsloth: Using llama.cpp converter sources staged at {tag} "
+        f"(co-versioned with conversion/ and gguf-py/)"
+    )
+    return (candidate, stat.st_mtime_ns, stat.st_size)
+
+
+def _restore_owner_write(root):
+    """Add the owner write bit to `root` and everything under it, best effort.
+
+    copytree copies the source's mode last, so a copy of a read-only tree is itself
+    read-only and cannot even be renamed."""
+    for parent, directories, files in os.walk(root):
+        for entry in [parent] + [os.path.join(parent, n) for n in directories + files]:
+            try:
+                os.chmod(entry, os.stat(entry).st_mode | stat_module.S_IWUSR)
+            except OSError:
+                pass
+    try:
+        os.chmod(root, os.stat(root).st_mode | stat_module.S_IWUSR)
+    except OSError:
+        pass
+
+
+def _tree_is_writable(root):
+    """Whether every directory the patcher writes into can be written to: the top
+    level, `conversion/` and `gguf-py/gguf`, so a writable top level is not enough."""
+    for relative in ("", "conversion", os.path.join("gguf-py", "gguf")):
+        directory = os.path.join(root, relative) if relative else root
+        if os.path.isdir(directory) and not os.access(directory, os.W_OK):
+            return False
+    return True
+
+
+def _writable_stage(stage_dir, repo, tag):
+    """`stage_dir`, or a writable copy of it, or None.
+
+    The patched entrypoint must land in the resolved directory, because the child
+    resolves `from conversion import ...` and its own gguf-py relative to the file
+    it runs. A read-only or shared cache would therefore fail every export, so such
+    a stage is copied once into the user's default cache root and used from there.
+
+    POSIX in practice: os.access(W_OK) does not report a read-only DIRECTORY on
+    Windows, so a read-only cache is taken as writable there and the copy below is
+    never made. The export then fails when the patch is written rather than being
+    mirrored. Detecting it properly needs an ACL check, which is why the tests for
+    this path are skipped on Windows rather than asserting a state it cannot make."""
+    if stage_dir is None: return None
+    if os.access(stage_dir, os.W_OK): return stage_dir
+    default_root = os.path.join(UNSLOTH_HOME, "llama.cpp-converter")
+    if os.path.abspath(default_root) == os.path.abspath(_converter_cache_root()):
+        logger.warning(
+            f"Unsloth: The staged converter sources at {stage_dir} are not writable "
+            f"and there is no other cache root to copy them to. Point "
+            f"UNSLOTH_LLAMA_CPP_CONVERTER_CACHE at a writable directory."
+        )
+        return None
+    mirror = os.path.join(
+        default_root, os.path.basename(_converter_stage_dir(repo, tag)),
+    )
+    if _converter_stage_is_usable(mirror, repo = repo, tag = tag):
+        # Contents are not enough: an existing mirror can have lost writability to
+        # tightened permissions or a shared cache root. It is ours, so try restoring
+        # the write bit, recursively, since the patcher writes into subdirectories.
+        if not os.access(mirror, os.W_OK) or not _tree_is_writable(mirror):
+            _restore_owner_write(mirror)
+        if os.access(mirror, os.W_OK) and _tree_is_writable(mirror):
+            return mirror
+        logger.warning(
+            f"Unsloth: The converter sources copied to {mirror} are not writable and "
+            f"the write bit could not be restored, so the patched converter cannot be "
+            f"written there. Remove that directory, or point "
+            f"UNSLOTH_LLAMA_CPP_CONVERTER_CACHE at a writable cache."
+        )
+        return None
+    logger.info(
+        f"Unsloth: {stage_dir} is not writable, so its converter sources are being "
+        f"copied to {mirror} once."
+    )
+    try:
+        os.makedirs(default_root, exist_ok = True)
+        staging = tempfile.mkdtemp(prefix = ".llama_cpp_mirror_", dir = default_root)
+    except OSError as e:
+        logger.warning(
+            f"Unsloth: Could not prepare {default_root} to hold a writable copy of "
+            f"{stage_dir} ({type(e).__name__}: {e})."
+        )
+        return None
+    try:
+        copied = os.path.join(staging, "sources")
+        shutil.copytree(stage_dir, copied)
+        # The copy of a read-only tree is itself read-only, and renaming a directory
+        # needs write permission on it.
+        _restore_owner_write(copied)
+        if not os.path.exists(mirror):
+            try:
+                # Same publication rule as staging: os.rename so a process that got
+                # there first raises rather than having its tree nested inside.
+                os.rename(copied, mirror)
+            except OSError:
+                pass
+        elif not _converter_stage_is_usable(mirror, repo = repo, tag = tag):
+            # An unusable mirror that is merely PRESENT used to block every retry
+            # forever: publication was skipped because the path existed, validation
+            # then failed, and the good copy just made was deleted on the way out.
+            # The schema constant exists to invalidate old entries on upgrade, so
+            # this is a state a release is expected to create, not damage. Move the
+            # dead tree aside and publish the replacement.
+            superseded = f"{mirror}.superseded_{binascii.hexlify(os.urandom(6)).decode()}"
+            try:
+                os.rename(mirror, superseded)
+            except OSError:
+                # Someone else is repairing it; fall through to the validation below.
+                pass
+            else:
+                # Recheck what we just took, because the usability test above and
+                # this rename are not one step: another process can publish a good
+                # mirror in between, and that tree may already carry the branding and
+                # tensor-mapping patches its own export applied. Deleting it would
+                # unpatch a live directory as well as briefly unlinking the path.
+                if _converter_stage_is_usable(superseded, repo = repo, tag = tag):
+                    try:
+                        os.rename(superseded, mirror)
+                    except OSError:
+                        shutil.rmtree(superseded, ignore_errors = True)
+                else:
+                    try:
+                        os.rename(copied, mirror)
+                    finally:
+                        shutil.rmtree(superseded, ignore_errors = True)
+        if not _converter_stage_is_usable(mirror, repo = repo, tag = tag):
+            return None
+        return mirror
+    except Exception as e:
+        logger.warning(
+            f"Unsloth: Could not copy the staged converter sources from {stage_dir} "
+            f"({type(e).__name__}: {e})."
+        )
+        return None
+    finally:
+        shutil.rmtree(staging, ignore_errors = True)
 
 
 def _refuse_unscannable_conversion_package(conversion_dir, reason, is_local_copy = False):
@@ -3112,8 +3974,39 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
     # converter being patched (matters when UNSLOTH_LLAMA_CPP_SCRIPTS_DIR points
     # at a different checkout), not always LLAMA_CPP_DEFAULT_DIR.
     local_script_info = _resolve_local_convert_script()
-    if local_script_info is None:
+    # An explicit revision pin outranks everything discovered on disk, since it is
+    # what the unsupported-architecture message tells people to set.
+    # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR still outranks the pin, being more specific.
+    _revision_pinned = bool(os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip())
+    if local_script_info is None and not _revision_pinned:
         local_script_info = _resolve_bundle_convert_script()
+    if local_script_info is None and not _revision_pinned:
+        # Answered before the network: a pre-split install already has a
+        # self-contained converter matching its binaries, so staging would download a
+        # tarball only to find no conversion/ in that revision and decline.
+        local_script_info = _resolve_monolith_bundle_convert_script()
+    if local_script_info is None:
+        # Nothing co-versioned on disk. Stage all three trees from one revision
+        # rather than pairing a lone entrypoint with whatever is around.
+        local_script_info = _resolve_staged_convert_script()
+    if local_script_info is None and not _revision_pinned:
+        # Staging could not answer, so a self-contained converter with no sibling
+        # gguf-py beats failing an export that works offline today.
+        local_script_info = _resolve_monolith_bundle_convert_script(require_gguf_py = False)
+    if local_script_info is None and _revision_pinned:
+        # Fail closed: the pin suppressed both installed-converter rows, so falling
+        # through would silently convert with the master entrypoint and the install's
+        # older gguf-py, a revision the user did not ask for.
+        raise _ConverterSourcesIncomplete(
+            f"Unsloth: UNSLOTH_LLAMA_CPP_CONVERTER_TAG is set to "
+            f"'{os.environ.get('UNSLOTH_LLAMA_CPP_CONVERTER_TAG', '').strip()}' but its "
+            f"converter sources could not be staged. Check the tag exists at "
+            f"https://github.com/ggml-org/llama.cpp/releases, that this process is not "
+            f"offline, and that the converter cache is writable. Unset the variable to "
+            f"use the revision matching the installed llama.cpp, or point "
+            f"UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a checkout holding convert_hf_to_gguf.py, "
+            f"conversion/ and gguf-py/ together."
+        )
     # Outside the cache on purpose: cheap, idempotent, and a checkout pulled
     # or replaced after the first conversion still gets the Qwen3.5 aliases.
     _llama_cpp_dir = _get_llama_cpp_dir(local_script_info)
@@ -3190,6 +4083,17 @@ def _download_convert_hf_to_gguf_cached(
             logger.info(f"Unsloth: Using local convert_hf_to_gguf.py from {_local_script}")
             with open(_local_script, "rb") as f:
                 original_content = f.read()
+        elif not _converter_network_allowed():
+            # The offline switches gate staging and must gate this too, or a process
+            # that declared itself offline still puts requests on the wire.
+            raise _ConverterSourcesIncomplete(
+                f"Unsloth: No llama.cpp converter is available locally and this "
+                f"process is offline (UNSLOTH_LLAMA_CPP_OFFLINE / UNSLOTH_OFFLINE). "
+                f"Point UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a llama.cpp "
+                f"checkout holding convert_hf_to_gguf.py, conversion/ and gguf-py/ "
+                f"together, or unset the offline switch so the converter sources can "
+                f"be staged."
+            )
         else:
             # Retry with exponential backoff: the upstream host can
             # exceed the default read timeout on slower networks.
@@ -3248,6 +4152,16 @@ def _download_convert_hf_to_gguf_cached(
         # abort before the AST-based arch extraction path.
         _layout = _detect_converter_layout(original_content, _llama_cpp_dir)
         logger.info(f"Unsloth: convert_hf_to_gguf layout detected: {_layout}")
+        if _layout == "incomplete":
+            # The entrypoint imports conversion/ and it is not there. By this point
+            # _resolve_staged_convert_script has already failed to supply a
+            # co-versioned tree, so say so rather than proceed as a monolith.
+            raise _ConverterSourcesIncomplete(
+                f"Unsloth: The llama.cpp converter at '{_llama_cpp_dir}' imports the "
+                f"conversion/ package, but that package is not in that directory. "
+                f"The entrypoint and its libraries have to come from the same llama.cpp "
+                f"revision. {_incomplete_sources_remedy(_llama_cpp_dir)}"
+            )
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
 
         if _layout == "package":
@@ -3287,6 +4201,9 @@ def _download_convert_hf_to_gguf_cached(
                 f"Unsloth: No supported architectures (TEXT or VISION) could be determined from the original script."
             )
 
+    except _ConverterSourcesIncomplete:
+        # Already actionable; wrapping it below would bury the point.
+        raise
     except ConverterScanError:
         # A deliberate refusal under UNSLOTH_CONVERTER_SCAN_STRICT=1. Propagate it
         # with its own message instead of relabelling it an introspection failure.
@@ -3419,9 +4336,14 @@ def _download_convert_hf_to_gguf_cached(
 
 
         # 4. Write Patched File
-        # Keep package-layout entrypoints beside conversion/ so subprocess
-        # execution resolves `from conversion import ...`.
-        patched_dir = _llama_cpp_dir if _layout == "package" else LLAMA_CPP_DEFAULT_DIR
+        # Package entrypoints stay beside conversion/ so the child resolves
+        # `from conversion import ...`. A staged MONOLITH needs the same for its
+        # `sys.path.insert(1, __file__.parent / 'gguf-py')`, which would otherwise
+        # resolve against the INSTALL's gguf-py. So anchor anything from our cache
+        # on its stage, whatever the layout.
+        patched_dir = _llama_cpp_dir if (
+            _layout == "package" or _is_converter_stage_dir(_llama_cpp_dir)
+        ) else LLAMA_CPP_DEFAULT_DIR
         os.makedirs(patched_dir, exist_ok=True)
         patched_filename = os.path.join(patched_dir, f"{name}.py")
 
@@ -3438,8 +4360,9 @@ def _download_convert_hf_to_gguf_cached(
         pass
 
         logger.info(f"Unsloth: Saving patched script to {patched_filename}")
-        with open(patched_filename, "wb") as file:
-            file.write(patched_content)
+        # Atomic: this path is shared across processes, so a plain write lets a
+        # concurrent reader launch a half-written converter.
+        _atomic_write_bytes(patched_filename, patched_content)
 
         # 5. Parse Flags from Patched Content (same logic as before)
         logger.info("Unsloth: Parsing arguments from patched script...")
@@ -3544,8 +4467,8 @@ def _patch_tensor_mapping_for_qwen35(llama_cpp_dir: str):
     except SyntaxError:
         logger.warning("Unsloth: Qwen3.5 tensor_mapping.py patch produced invalid syntax, leaving file unchanged.")
         return
-    with open(tensor_mapping_path, "w", encoding="utf-8") as f:
-        f.write(patched)
+    # Atomic: this runs outside the patcher cache, so two exports can reach it at once.
+    _atomic_write_bytes(tensor_mapping_path, patched.encode("utf-8"))
 
 
 def _split_str_to_n_bytes(split_str: str) -> int:
@@ -4881,8 +5804,7 @@ def convert_to_gguf(
         arch = config_file["architectures"][0]
         if arch not in supported_types:
             raise NotImplementedError(
-                f"Unsloth: llama.cpp GGUF conversion does not yet support "\
-                f"converting model types of `{arch}`."
+                _unsupported_arch_message(arch, converter_location)
             )
     pass
 

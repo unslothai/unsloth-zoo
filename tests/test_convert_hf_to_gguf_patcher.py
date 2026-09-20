@@ -184,11 +184,15 @@ def test_detect_layout_returns_monolith_for_old_tree(monolith_layout):
     assert llama_cpp._detect_converter_layout(entry_bytes, str(monolith_layout)) == "monolith"
 
 
-def test_detect_layout_falls_back_to_monolith_when_conversion_dir_missing(tmp_path):
-    """Entrypoint has the `from conversion import` anchor but the package dir is
-    absent on disk -> treat as monolith (defensive)."""
+def test_detect_layout_reports_incomplete_when_conversion_dir_missing(tmp_path):
+    """Package anchor present but conversion/ missing is "incomplete", not "monolith"."""
     llama_cpp = _load_llama_cpp_module()
-    assert llama_cpp._detect_converter_layout(_PACKAGE_ENTRYPOINT, str(tmp_path)) == "monolith"
+    assert llama_cpp._detect_converter_layout(_PACKAGE_ENTRYPOINT, str(tmp_path)) == "incomplete"
+
+
+def test_detect_layout_still_says_monolith_for_a_real_monolith(tmp_path):
+    llama_cpp = _load_llama_cpp_module()
+    assert llama_cpp._detect_converter_layout(_MONOLITH, str(tmp_path)) == "monolith"
 
 
 
