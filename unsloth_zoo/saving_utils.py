@@ -3393,9 +3393,14 @@ def _shard_name_stays_inside(name):
     # component is judged by how many dots it carries instead. Two or more reach the
     # parent once the trailing run is gone (`.. `, `.. .`), one is the current directory,
     # and none at all trims away entirely, which roots the rest of the path at the drive
-    # and is caught by the rooted test below. `...` has no meaning on Windows either --
-    # the trailing periods come off and nothing legal is left -- so it is refused with
-    # the rest of the family rather than modelled; no shard is named that.
+    # and is caught by the rooted test below. Three or more dots is the one case this
+    # deliberately judges MORE strictly than Windows does: the rule is "a segment of
+    # three or more periods isn't normalized and is actually a valid file/directory
+    # name", so `...` opens as an ordinary contained file there, and counting its dots
+    # collapses it to `..` and refuses it. That is over-strict, not unsafe: it fails
+    # closed, no shard is named that, and modelling it exactly would mean carrying a
+    # second rule for a name no checkpoint produces. Loosening it is safe if a real
+    # layout ever needs it.
     # learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats
     def _as_windows_opens_it(component):
         if component and not (set(component) - {".", " "}):
