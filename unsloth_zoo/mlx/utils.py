@@ -18229,9 +18229,8 @@ def save_pretrained_gguf(
             # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG,
             # so synthesizing it unconditionally made that escape hatch inert here.
             # A real user override still wins: it is already set, so this is skipped.
-            # An install whose entrypoint imports conversion/ without that package
-            # on disk is excluded too: pinning it as authoritative is what stops the
-            # staged resolver from repairing the very install this change is for.
+            # An incomplete install is excluded too: pinning it as authoritative is
+            # what stops the staged resolver from repairing it.
             _synthesize = (
                 old_scripts_dir is None
                 and not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()

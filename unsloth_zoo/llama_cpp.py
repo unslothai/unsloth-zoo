@@ -193,8 +193,8 @@ LLAMA_CPP_CONVERTER_CACHE_DIR = os.environ.get(
 
 def _converter_cache_root():
     """Where staged converters live. Read at the call, not at import, so setting
-    UNSLOTH_LLAMA_CPP_CONVERTER_CACHE after `import unsloth` works, which is what
-    the sibling switches already promise and a notebook always does."""
+    UNSLOTH_LLAMA_CPP_CONVERTER_CACHE after `import unsloth` works, as the sibling
+    switches already promise."""
     return os.environ.get(
         "UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", "",
     ).strip() or LLAMA_CPP_CONVERTER_CACHE_DIR
@@ -1141,11 +1141,9 @@ def _select_cpu_assets(tag, assets, manifest):
 def _open_new_sibling(directory, mode):
     """Create a uniquely named file in `directory` with `mode`, returning (fd, path).
 
-    Not mkstemp, which hardcodes 0600: os.open applies the CURRENT umask to `mode`
-    the way an ordinary create does, so the mode is right without the process umask
-    ever being read. Reading it means setting it to 0 and putting it back, which
-    two threads can interleave into leaving the process at 0 forever, and caching
-    it instead would miss a umask the application changes later."""
+    Not mkstemp, which hardcodes 0600. os.open masks `mode` with the current umask,
+    so the umask is never read: reading it means setting it to 0 and back, which two
+    threads can interleave into leaving the process at 0 forever."""
     for _ in range(_TEMP_NAME_ATTEMPTS):
         staged = os.path.join(
             directory, ".unsloth_tmp_" + binascii.hexlify(os.urandom(8)).decode(),
@@ -1170,9 +1168,8 @@ def _atomic_write_bytes(path, content):
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        # os.replace carries the temp file's mode onto the destination, so an
-        # existing file keeps the mode it already had rather than the one a fresh
-        # create would give it. A new file keeps what os.open already applied.
+        # os.replace carries the temp file's mode over, so an existing destination
+        # keeps the mode it had rather than one a fresh create would give it.
         try:
             os.chmod(staged, os.stat(path).st_mode & 0o7777)
         except OSError:
@@ -1627,10 +1624,8 @@ def _read_prebuilt_marker(install_folder):
     """The prebuilt marker's (repo, tag), or (None, None), so the converter can be
     staged from the same revision as the quantizer it will feed.
 
-    A marker that is present but unusable is announced rather than collapsed into
-    the absent case: falling through stages the latest release instead, which
-    silently abandons the match with the installed binaries that is the whole
-    point of reading this."""
+    A present-but-unusable marker is announced, not collapsed into the absent case:
+    falling through stages the latest release, abandoning the binary match."""
     marker = os.path.join(install_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
     try:
         with open(marker, "r", encoding = "utf-8") as f:
@@ -2407,9 +2402,8 @@ pass
 def _converter_dir_is_incomplete(llama_cpp_dir):
     """Whether this directory holds a converter that cannot run as it stands.
 
-    True only on positive evidence: an entrypoint is there, it imports conversion/,
-    and that package is not beside it. A directory with no converter at all is not
-    incomplete, it is empty, and the caller decides that separately."""
+    Positive evidence only: an entrypoint that imports conversion/ with no such
+    package beside it. A directory with no converter is empty, not incomplete."""
     for filename in LLAMA_CPP_CONVERTER_FILENAMES:
         entry = os.path.join(llama_cpp_dir, filename)
         try:
