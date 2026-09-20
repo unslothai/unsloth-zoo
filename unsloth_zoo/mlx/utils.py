@@ -18225,13 +18225,9 @@ def save_pretrained_gguf(
         supported_vision_archs = None
         with _LLAMA_CPP_PATCHER_ENV_LOCK:
             old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-            # why: this value is synthesized here, not supplied by the user, and
-            # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks everything including
-            # UNSLOTH_LLAMA_CPP_CONVERTER_TAG. Setting it unconditionally therefore
-            # made the documented escape hatch inert on this path: an architecture
-            # needing a newer converter kept getting the installed one and kept
-            # failing. A real user override still wins, because it is already set
-            # and this branch does not run.
+            # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG,
+            # so synthesizing it unconditionally made that escape hatch inert here.
+            # A real user override still wins: it is already set, so this is skipped.
             _synthesize = old_scripts_dir is None and not os.environ.get(
                 "UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "",
             ).strip()

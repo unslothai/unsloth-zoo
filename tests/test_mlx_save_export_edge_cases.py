@@ -1375,11 +1375,7 @@ def test_gguf_export_respects_preexisting_scripts_dir_override(
 def test_gguf_export_does_not_synthesize_a_scripts_dir_over_a_converter_pin(
     monkeypatch, tmp_path
 ):
-    """UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG, which
-    is right for a value the user set and wrong for one this wrapper makes up. Setting
-    it unconditionally made the documented escape hatch inert on the MLX path: the
-    installed converter answered, so an architecture needing a newer one kept failing
-    with no way out."""
+    """A converter tag pin must not be shadowed by a scripts dir this wrapper invents."""
     import unsloth_zoo.llama_cpp as llama_cpp
 
     mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
@@ -1411,8 +1407,6 @@ def test_gguf_export_does_not_synthesize_a_scripts_dir_over_a_converter_pin(
 
 
 def test_a_user_scripts_dir_still_wins_over_a_converter_pin(monkeypatch, tmp_path):
-    """The negative half. A directory the USER named is the more specific answer and
-    keeps outranking the pin; only the synthesized one steps aside."""
     import unsloth_zoo.llama_cpp as llama_cpp
 
     mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
