@@ -1492,21 +1492,32 @@ def _staged_converter_tag(converter_location):
 def _unsupported_arch_message(arch, converter_location):
     """The message for an architecture the converter does not know.
 
-    Sources are pinned to the installed binaries' tag, so an upstream-only
-    architecture will not convert until a release cuts; name the staged tag and the
-    knob that moves it. An unstaged converter gets the message unchanged."""
+    Sources are pinned to a single revision, so an upstream-only architecture will
+    not convert until a release cuts. The remedy is the same whichever row of the
+    ladder answered, so it is always named; only the sentence identifying the
+    revision needs a staged converter, since an installed one carries no manifest.
+    Naming the revision but withholding the remedy would leave the population this
+    PR newly routes to an installed converter with no way out."""
     message = (
         f"Unsloth: llama.cpp GGUF conversion does not yet support "
         f"converting model types of `{arch}`."
     )
     tag = _staged_converter_tag(converter_location)
     if tag is None:
-        return message
+        provenance = (
+            f"The converter at `{converter_location}` came from the llama.cpp "
+            f"already installed, so only the architectures that copy knows can be "
+            f"converted."
+        )
+    else:
+        provenance = (
+            f"The converter, its conversion/ package and its gguf-py all came from "
+            f"llama.cpp `{tag}`, so only the architectures that revision knows can "
+            f"be converted."
+        )
     return (
         f"{message}\n"
-        f"The converter, its conversion/ package and its gguf-py all came from "
-        f"llama.cpp `{tag}`, so only the architectures that revision knows can be "
-        f"converted.\n"
+        f"{provenance}\n"
         f"If `{arch}` is supported by a newer llama.cpp, set "
         f"UNSLOTH_LLAMA_CPP_CONVERTER_TAG to that release tag (for example "
         f"`UNSLOTH_LLAMA_CPP_CONVERTER_TAG=\"b9999\"`) and export again, or point "

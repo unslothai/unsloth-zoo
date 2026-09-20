@@ -988,13 +988,22 @@ def test_an_unsupported_arch_names_the_staged_tag_and_the_escape_hatch(mod, tmp_
     assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in message
 
 
-def test_an_unsupported_arch_on_an_unstaged_converter_keeps_the_short_message(mod, tmp_path):
+def test_an_unsupported_arch_on_an_unstaged_converter_still_names_the_escape_hatch(mod, tmp_path):
+    """The remedy does not depend on which row of the ladder answered.
+
+    This ladder newly prefers an installed converter over downloading master, so a
+    model that converted yesterday can stop converting today against a copy that
+    carries no manifest. Withholding the escape hatch from exactly that case leaves
+    the population this change created with no way out."""
     checkout = _write_source_tree(tmp_path / "checkout")
-    message = mod._unsupported_arch_message(
-        "BrandNewForCausalLM", str(checkout / "convert_hf_to_gguf.py"),
+    converter = str(checkout / "convert_hf_to_gguf.py")
+    message = mod._unsupported_arch_message("BrandNewForCausalLM", converter)
+    assert "BrandNewForCausalLM" in message
+    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in message, (
+        "an unstaged converter gave the user no remedy at all"
     )
-    assert message.endswith("converting model types of `BrandNewForCausalLM`.")
-    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" not in message
+    assert "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR" in message
+    assert converter in message, "the message does not say which converter answered"
 
 
 def test_convert_to_gguf_hands_the_user_the_staged_tag_and_the_escape_hatch(mod, tmp_path, monkeypatch):
