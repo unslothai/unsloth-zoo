@@ -77,6 +77,9 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma3",
     "gemma3n",
     "gemma4",
+    # A qualified parent still needs its nested `text_config` decoder
+    # qualified, so gemma4 stays on the eager path without this entry.
+    "gemma4_text",
     "glm_ocr",
     "idefics2",
     "idefics3",
@@ -213,6 +216,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma3": "verify_gemma3",
     "gemma3n": "verify_gemma3n",
     "gemma4": "verify_gemma4",
+    "gemma4_text": "verify_gemma4_text",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
     "idefics3": "verify_idefics3",

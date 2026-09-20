@@ -2531,3 +2531,40 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
     Image.fromarray(np.full((8, 8, 3), 99, dtype=np.uint8)).save(paths[2])
     with pytest.raises(ValueError, match="file backing a dataset image changed"):
         plan.materialize_all()
+
+
+def test_nested_text_decoder_qualification_decides_its_parent():
+    """A VLM reaches its decoder through `text_config`, and compile requires
+    both: an unqualified decoder keeps a qualified parent on the eager path."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        discover_architectures,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip("mlx_vlm.models.gemma4.gemma4")
+
+    def gemma4_over(decoder):
+        model = type("Model", (), {"__module__": "mlx_vlm.models.gemma4.gemma4"})()
+        model.config = SimpleNamespace(
+            model_type="gemma4", text_config=SimpleNamespace(model_type=decoder),
+        )
+        return model
+
+    policy = MLXVLMCompilePolicy(mode="best_effort")
+
+    decision = resolve_training_compile(gemma4_over("gemma4_text"), policy=policy)
+    assert decision.enabled, decision.reason
+    assert [q.arch for q in decision.backend_qualifications] == ["gemma4_text"]
+    assert all(q.training_compile for q in decision.backend_qualifications)
+
+    unqualified = sorted(set(discover_architectures()) - _VERIFIED_TRAINING_ARCHES)
+    if not unqualified:
+        pytest.skip("every discovered architecture is training-qualified")
+    refused = resolve_training_compile(gemma4_over(unqualified[0]), policy=policy)
+    assert not refused.enabled
+    assert unqualified[0] in refused.reason
