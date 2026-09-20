@@ -1539,11 +1539,12 @@ def test_a_prefill_batch_charges_each_row_its_own_prompt_and_not_the_padded_widt
 
 
 def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
-    # generation_mode enters both inference fusions for any model it is handed, and
+    # generation_mode enters every inference fusion for any model it is handed, and
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import fused_decode_conv_silu, fused_moe_gate_up
+    from unsloth_zoo.mlx.inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_router,
+                                           fused_residual_norm)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1551,5 +1552,6 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             training = False,
             named_modules = lambda: [("plain", stub)],
         )
-        with fused_moe_gate_up(model), fused_decode_conv_silu(model):
+        with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
+                fused_moe_router(model):
             pass

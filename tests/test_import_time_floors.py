@@ -38,6 +38,33 @@ import pytest
 ATTRIBUTE = "merge_quantization_configs"
 
 
+def _strip_generated_globals(namespace, before):
+    """Drop whatever an exec added to `namespace`, keeping the rest untouched."""
+    for name in set(namespace) - before:
+        del namespace[name]
+
+
+def test_a_generated_global_is_removed_rather_than_restored():
+    """Why the fixture strips them itself. `monkeypatch.delitem` called after the
+    exec records the generated object as the value to put back, so its undo
+    reinstates the very name the test asked to remove, and the next call's
+    `globals().get("merge_quantization_configs")` reads a stale callable where the
+    rewritten source defined none."""
+    namespace = {"kept": 1}
+    before = set(namespace)
+    namespace[ATTRIBUTE] = lambda *a, **k: None       # as the exec would leave it
+
+    undone = pytest.MonkeyPatch()
+    undone.delitem(namespace, ATTRIBUTE)
+    assert ATTRIBUTE not in namespace
+    undone.undo()
+    assert ATTRIBUTE in namespace, "monkeypatch put it back, which is the trap"
+
+    _strip_generated_globals(namespace, before)
+    assert ATTRIBUTE not in namespace
+    assert namespace == {"kept": 1}
+
+
 @pytest.fixture
 def unpatched_quantizer(monkeypatch):
     """transformers.quantizers.auto with nothing of ours applied to it yet.
@@ -68,6 +95,7 @@ def unpatched_quantizer(monkeypatch):
     )
     # A previous test's exec would otherwise leave the name in these globals.
     monkeypatch.delitem(misc.__dict__, ATTRIBUTE, raising = False)
+    globals_before = set(misc.__dict__)
 
     def set_module_dir(returns):
         """PEP 562 module __dir__, set by hand rather than with monkeypatch.
@@ -82,6 +110,16 @@ def unpatched_quantizer(monkeypatch):
     try:
         yield auto, misc, recorded, set_module_dir
     finally:
+        # Every name the patch exec'd into the module's globals - the function it
+        # defined, and whatever its generated import pulled in - belongs to this
+        # test alone. `monkeypatch.delitem` cannot do this job: called after the
+        # exec it records the generated object as the value to put back, so
+        # teardown reinstates exactly what it was asked to remove, and the next
+        # test's `globals().get("merge_quantization_configs")` finds a stale
+        # callable where the rewritten source defined none. Remove them outright,
+        # and leave restoring anything that was already here to monkeypatch,
+        # whose undo runs after this fixture's.
+        _strip_generated_globals(misc.__dict__, globals_before)
         auto.__dict__.pop("__dir__", None)
         for name in names:
             if name in snapshot:
@@ -91,22 +129,67 @@ def unpatched_quantizer(monkeypatch):
 
 
 def test_an_empty_name_list_no_longer_ends_the_import(monkeypatch, unpatched_quantizer):
-    """The reported case: nothing in dir() occurs in the source."""
+    """The reported case: nothing in dir() occurs in the source.
+
+    What the fix guarantees is that no `from ... import ()` is ever built, so
+    nothing here can raise. Whether the patch then goes on to apply depends on
+    the transformers under test: a def evaluates its annotations as it runs, so
+    on a release whose signature names a type the (now empty) import would have
+    supplied, the rewritten source cannot be defined and the patch declines
+    instead. That is a decline, not an ending, and the next test pins the
+    applying half on a source that genuinely needs no names -- which this one
+    cannot do, because the real signature changes with the release.
+    """
     auto, misc, recorded, set_module_dir = unpatched_quantizer
     # PEP 562: a module may define __dir__, which is what transformers 4.55.0
     # amounted to here, without pinning an old transformers to find out.
     set_module_dir([])
     assert dir(auto) == []
 
+    # A module global shadows the builtin inside that module's functions, so
+    # this reads exactly what the patch asked to execute. Set by hand: the
+    # fixture takes back every global that was not there before it, and
+    # monkeypatch's undo would then try to remove an attribute that has already
+    # gone and fail the teardown.
+    execd = []
+    def recording_exec(source, *args, **kwargs):
+        execd.append(source)
+        return exec(source, *args, **kwargs)
+    misc.__dict__["exec"] = recording_exec
+
     misc.patch_merge_quantization_configs()
 
-    # It still patches: the import was only ever there to supply names the
-    # rewritten source needs, and an empty list means it needs none.
+    assert execd, "the rewritten source was never reached"
+    assert not any(
+        source.lstrip().startswith("from transformers.quantizers.auto import")
+        for source in execd
+    ), "an empty name list still produced an import statement"
+
+
+def merge_quantization_configs(cls, quantization_config, quantization_config_from_args):
+    """Stands in for the real classmethod, with the one property that matters:
+    nothing in its source has to be imported before it can be defined."""
+    return quantization_config
+
+
+def test_a_rewrite_that_needs_no_names_is_still_applied(monkeypatch, unpatched_quantizer):
+    """The other half of an empty name list: the import was only ever there to
+    supply names the rewritten source needs, so needing none still patches."""
+    auto, misc, recorded, set_module_dir = unpatched_quantizer
+    monkeypatch.setattr(auto.AutoHfQuantizer, ATTRIBUTE, merge_quantization_configs)
+    set_module_dir([])
+
+    misc.patch_merge_quantization_configs()
+
     assert len(recorded) == 1
     target, attribute, replacement = recorded[0]
     assert target is auto.AutoHfQuantizer
     assert attribute == ATTRIBUTE
     assert callable(replacement)
+    # The exec'd copy, not the object this file passed in: reading the patch's
+    # own globals is what the "defined something else" guard depends on.
+    assert replacement is not merge_quantization_configs
+    assert replacement.__name__ == ATTRIBUTE
 
 
 def test_an_import_that_fails_is_reported_not_raised(monkeypatch, unpatched_quantizer):
@@ -144,7 +227,6 @@ def test_a_rewrite_that_defines_nothing_is_reported_not_a_name_error(
     assert recorded == []
     assert ATTRIBUTE not in misc.__dict__
     assert "_defines_another_name" in misc.__dict__
-    monkeypatch.delitem(misc.__dict__, "_defines_another_name", raising = False)
 
 
 # ---------------------------------------------------------------- #2491
