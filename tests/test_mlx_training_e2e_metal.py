@@ -2105,18 +2105,35 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         mx.eval(model.parameters())
         return model
 
-    def peak_and_grads(model):
+    def peak_and_grads(model, repeats = 3):
+        """Peak above resident, taken as the MINIMUM over `repeats` measurements.
+
+        A peak is a maximum over a run, so noise can only push it up: allocator state
+        left by whatever ran before it, a cache the runtime had not reclaimed yet. The
+        floor is the algorithmic requirement, and the floor is what the ratio below is
+        about, so the minimum of a few readings estimates it where a single reading does
+        not. One reading is what made this flake: run 35502075009 on main reported
+        shared 197663512 against unshared 151210728, a ratio of 1.307 over the 1.25
+        bound, and the same commit with the same pins passed on re-run.
+
+        The bound itself is unchanged. This makes the measurement less noisy rather than
+        the claim weaker.
+        """
         loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
         mx.eval(loss_and_grad(model))
-        mx.clear_cache()
-        resident = mx.get_active_memory()
-        mx.reset_peak_memory()
-        grads = loss_and_grad(model)[1]
-        mx.eval(grads)
-        return mx.get_peak_memory() - resident, grads
+        floor, grads = None, None
+        for _ in range(repeats):
+            mx.clear_cache()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            grads = loss_and_grad(model)[1]
+            mx.eval(grads)
+            peak = mx.get_peak_memory() - resident
+            floor = peak if floor is None else min(floor, peak)
+        return floor, grads
 
     shared, unshared = build(10), build(0)
-    _, reference = peak_and_grads(shared)
+    _, reference = peak_and_grads(shared, repeats = 1)
     mlx_utils._patch_layer_class_for_gc(DecoderLayer)
     try:
         unshared_peak, _ = peak_and_grads(unshared)
