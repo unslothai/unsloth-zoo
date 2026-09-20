@@ -1359,6 +1359,14 @@ def test_a_failed_materialization_leaves_the_input_checkpoint_intact(tmp_path):
     pytest.param(".. \\victim.safetensors",     id = "parent-plus-trailing-space"),
     pytest.param(".. /victim.safetensors",      id = "parent-plus-space-posix-sep"),
     pytest.param("   \\victim.safetensors",     id = "spaces-only-becomes-rooted"),
+    # Windows trims the trailing run of spaces AND periods, so each of these opens as
+    # `..`. Stripping only the spaces left the first two looking like ordinary names,
+    # and stripping the run with a plain rstrip(" .") takes them to the empty string,
+    # which normpath drops: either way the traversal is accepted.
+    pytest.param(".. .\\victim.safetensors",    id = "parent-space-period"),
+    pytest.param(".. ./victim.safetensors",     id = "parent-space-period-posix-sep"),
+    pytest.param("...\\victim.safetensors",     id = "three-periods"),
+    pytest.param(". .\\victim.safetensors",     id = "period-space-period"),
 ])
 def test_a_dots_and_spaces_component_is_refused(name):
     """Windows strips trailing spaces and periods from a name at the object manager
@@ -1412,18 +1420,22 @@ def test_the_staging_path_is_never_written_through_a_symlink(tmp_path):
     "a/./model.safetensors",
     "a/../model.safetensors",
     "weights/model.safetensors",
-    "...",
-    "...\\victim.safetensors",
     "a\\.. \\victim.safetensors",
     ". \\victim.safetensors",
 ])
 def test_a_contained_name_is_not_refused_by_the_windows_view(name):
     """The Windows-visible spelling must not reject names that stay inside.
 
-    `.` and `..` are relative components Windows does not strip further, and a segment
-    of three or more periods is a legal Windows name rather than a traversal, so none of
-    these is rewritten. An earlier, blunter rule that refused every dots-and-spaces
-    component rejected all of these, each of which merges on main.
+    A single `.` is the current directory however it is spelled, and an interior `..`
+    only cancels the component before it, so neither leaves the directory. An earlier,
+    blunter rule that refused every dots-and-spaces component rejected all of these,
+    each of which merges on main.
+
+    `...` used to be listed here as a legal Windows name. It is not: its trailing
+    periods come off with the rest of the trailing run and nothing legal is left, and
+    telling it apart from `.. .` after that strip is guesswork on a predicate that
+    decides whether a shard can be written outside the export. No shard is named `...`,
+    so the whole two-or-more-dots family is refused instead.
     """
     assert saving_utils._shard_name_stays_inside(name) is True
 

@@ -3381,15 +3381,31 @@ def _shard_name_stays_inside(name):
         # `C:\out\merged` + `C:..\x` lands in `C:\out\x`, and a name on another drive
         # (`Z:..\x`) leaves the output tree entirely.
         return False
-    # Windows strips trailing spaces from a path component at the object manager layer,
-    # so `.. ` is created and opened as `..` while `ntpath.normpath` preserves the space
-    # and the traversal test below never matches it. Judge the Windows-visible spelling
-    # as well as the literal one. Only trailing SPACES are stripped here: `.` and `..`
-    # are relative components Windows does not strip further, and `...` is a legal name
-    # rather than a traversal, so neither is rewritten.
+    # Windows strips the trailing run of spaces AND periods from a path component at the
+    # object manager layer, so `.. `, `.. .` and `...` are all created and opened as a
+    # component `ntpath.normpath` never sees, because it preserves the literal spelling
+    # and the traversal test below then never matches. Judge the Windows-visible spelling
+    # as well as the literal one.
+    #
+    # A component made only of dots and spaces is the whole trap, and `.rstrip(" .")` is
+    # the wrong tool for it: it takes `.. .` all the way to the empty string, which
+    # `normpath` drops, so the traversal would be accepted rather than refused. Such a
+    # component is judged by how many dots it carries instead. Two or more reach the
+    # parent once the trailing run is gone (`.. `, `.. .`), one is the current directory,
+    # and none at all trims away entirely, which roots the rest of the path at the drive
+    # and is caught by the rooted test below. `...` has no meaning on Windows either --
+    # the trailing periods come off and nothing legal is left -- so it is refused with
+    # the rest of the family rather than modelled; no shard is named that.
     # learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats
+    def _as_windows_opens_it(component):
+        if component and not (set(component) - {".", " "}):
+            _dots = component.count(".")
+            return "" if _dots == 0 else ("." if _dots == 1 else "..")
+        return component.rstrip(" .")
+
     _windows_view = "\\".join(
-        _component.rstrip(" ") for _component in name.replace("/", "\\").split("\\")
+        _as_windows_opens_it(_component)
+        for _component in name.replace("/", "\\").split("\\")
     )
     for _candidate in (name, _windows_view):
         for _module in (posixpath, ntpath):
