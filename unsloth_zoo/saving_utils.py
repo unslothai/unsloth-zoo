@@ -3639,16 +3639,7 @@ def _assert_shard_is_inside(file_path, save_directory):
     )
 
 
-def _current_umask():
-    """Read the umask without leaving it changed. There is no getter, so it has to be
-    set to read it and set straight back; a fresh export is single-threaded here."""
-    _mask = os.umask(0o022)
-    os.umask(_mask)
-    return _mask
-pass
-
-
-def _export_index_atomically(source_path, destination, payload):
+def _export_index_atomically(source_path, destination, payload, mode_from = None):
     """Write `payload` at `destination` without following a link sitting there.
 
     `source_path` is the file whose mode to carry over, or None when the index is
@@ -3675,10 +3666,22 @@ def _export_index_atomically(source_path, destination, payload):
         if source_path is not None:
             shutil.copystat(source_path, _staging)
         else:
-            # `mkstemp` opens at 0o600; a regenerated index used to be created by
-            # `open(..., "w")` and so took the process umask. Match that, or an export
-            # lands an index only its owner can read.
-            os.chmod(_staging, 0o666 & ~_current_umask())
+            # `mkstemp` opens at 0o600, and a regenerated index has no source to copy a
+            # mode from, but `open(..., "w")` gave it the umask, so shipping 0o600 would
+            # hand back an index only its owner can read. Take the mode off a file the
+            # export itself just wrote, which is both umask-correct and the better
+            # answer: the index ends up exactly as readable as the weights beside it.
+            #
+            # Deliberately NOT `os.umask` to read the umask. It has no getter, so reading
+            # means setting it and setting it back, and that toggle is process-wide: any
+            # other thread creating a file in between gets the wrong permissions.
+            _mode = 0o644
+            if mode_from is not None:
+                try:
+                    _mode = os.stat(mode_from).st_mode & 0o666
+                except OSError:
+                    pass
+            os.chmod(_staging, _mode)
         os.replace(_staging, destination)
     except BaseException:
         if os.path.exists(_staging):
@@ -4505,9 +4508,15 @@ def merge_and_overwrite_lora(
         # follows a symlink sitting at that path and truncates its target, and
         # `_final_has_nested_shard` brings a dequantizing nested singleton down this arm
         # where it previously regenerated nothing.
+        _mode_donor = next(
+            (_p for _p in (os.path.join(save_directory, _f) for _f in final_safetensors_list)
+             if os.path.exists(_p)),
+            None,
+        )
         _export_index_atomically(
             None, index_path,
             json.dumps(index_data, indent = 4).encode("utf-8"),
+            mode_from = _mode_donor,
         )
 
         if push_to_hub:

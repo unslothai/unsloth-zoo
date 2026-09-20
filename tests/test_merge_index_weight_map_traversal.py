@@ -1713,3 +1713,32 @@ def test_a_regenerated_index_does_not_follow_a_link_either(tmp_path):
     mode = os.stat(destination).st_mode & 0o777
     assert mode & 0o044, f"regenerated index landed unreadable: {oct(mode)}"
     assert [n for n in os.listdir(output) if n.startswith(".unsloth-index-")] == []
+
+
+def test_a_regenerated_index_takes_the_mode_of_the_shards_beside_it(tmp_path):
+    """Without a source to copy from, the mode comes off a file the export wrote.
+
+    Reading the umask instead would mean setting it and setting it back, and that toggle
+    is process-wide: another thread creating a file in between gets the wrong mode. A
+    shard the export just wrote already carries the umask, and matching it is also the
+    better answer, since the index ends up exactly as readable as the weights.
+    """
+    output = os.path.join(str(tmp_path), "out")
+    os.makedirs(output, exist_ok = True)
+    donor = os.path.join(output, "model.safetensors")
+    with open(donor, "wb") as f:
+        f.write(b"shard")
+    os.chmod(donor, 0o640)
+
+    destination = os.path.join(output, "model.safetensors.index.json")
+    saving_utils._export_index_atomically(
+        None, destination, b"{}", mode_from = donor,
+    )
+    assert oct(os.stat(destination).st_mode & 0o777) == oct(0o640)
+
+    # A donor that is not there falls back to something readable rather than 0600.
+    second = os.path.join(output, "other.index.json")
+    saving_utils._export_index_atomically(
+        None, second, b"{}", mode_from = os.path.join(output, "missing.safetensors"),
+    )
+    assert os.stat(second).st_mode & 0o044
