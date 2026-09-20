@@ -416,6 +416,10 @@ def test_two_nested_shards_sharing_a_basename_are_not_merged_into_one(
     `a/x.safetensors` and `b/x.safetensors` are two files; their basename is one name,
     so a shard list built from basenames holds a single entry and half the tensors are
     never merged.
+
+    Counting the shard names is what pins the collapse, but a count alone is satisfied
+    by a merge that kept both names and wrote nothing useful into either, so the
+    tensors are checked against the independent reference as well.
     """
     if not H.family_available(FAMILY):
         pytest.skip(f"{FAMILY} unavailable in this transformers")
@@ -428,7 +432,9 @@ def test_two_nested_shards_sharing_a_basename_are_not_merged_into_one(
     shards = [f for f in os.listdir(real_base) if f.endswith(".safetensors")]
     if len(shards) < 2:
         pytest.skip("the tiny base model did not shard into more than one file")
+    base_tensors = H.read_safetensors_dir(real_base)
     peft_model = H.attach_lora(model, spec, "full")
+    adapted = H.extract_adapted(peft_model)
 
     # One shard per parent directory, every parent holding the same file name.
     nested_root = os.path.join(str(tmp_path), "ns", "base")
@@ -467,6 +473,33 @@ def test_two_nested_shards_sharing_a_basename_are_not_merged_into_one(
 
     assert len(set(shard_names)) == len(set(weight_map.values())), (
         f"{len(set(weight_map.values()))} distinct shards became {set(shard_names)!r}"
+    )
+
+    # Both shards are still where the index says they are, and both really hold the
+    # merge. Without this the test passes on a run that kept two names and left half
+    # the tensors unmerged, which is the failure it exists to catch.
+    output = os.path.join(str(tmp_path), base_rel)
+    for relative in sorted(set(weight_map.values())):
+        assert os.path.exists(os.path.join(output, relative)), (
+            f"{relative!r} is missing from {output!r} after the merge"
+        )
+    # `_flattened` is no use here: both shards are named `x.safetensors`, which is the
+    # whole point of the case, so it would copy one over the other and hide exactly the
+    # loss being tested. Number them by their parent instead.
+    flat = os.path.join(str(tmp_path), "flat")
+    os.makedirs(flat, exist_ok = True)
+    for relative in sorted(set(weight_map.values())):
+        shutil.copy2(
+            os.path.join(output, relative),
+            os.path.join(flat, relative.replace("/", "_").replace(os.sep, "_")),
+        )
+    H.assert_merge_correct(
+        family       = FAMILY,
+        base_tensors = base_tensors,
+        out_dir      = flat,
+        save_dtype   = torch.float32,
+        adapted      = adapted,
+        base_dir     = real_base,
     )
 
 
