@@ -3524,13 +3524,25 @@ def _writable_stage(stage_dir, repo, tag):
             superseded = f"{mirror}.superseded_{binascii.hexlify(os.urandom(6)).decode()}"
             try:
                 os.rename(mirror, superseded)
-                os.rename(copied, mirror)
             except OSError:
-                # Another process may have replaced it in the meantime; its tree is
-                # as good as ours, so fall through to the validation below.
+                # Someone else is repairing it; fall through to the validation below.
                 pass
-            finally:
-                shutil.rmtree(superseded, ignore_errors = True)
+            else:
+                # Recheck what we just took, because the usability test above and
+                # this rename are not one step: another process can publish a good
+                # mirror in between, and that tree may already carry the branding and
+                # tensor-mapping patches its own export applied. Deleting it would
+                # unpatch a live directory as well as briefly unlinking the path.
+                if _converter_stage_is_usable(superseded, repo = repo, tag = tag):
+                    try:
+                        os.rename(superseded, mirror)
+                    except OSError:
+                        shutil.rmtree(superseded, ignore_errors = True)
+                else:
+                    try:
+                        os.rename(copied, mirror)
+                    finally:
+                        shutil.rmtree(superseded, ignore_errors = True)
         if not _converter_stage_is_usable(mirror, repo = repo, tag = tag):
             return None
         return mirror

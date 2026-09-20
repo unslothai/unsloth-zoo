@@ -2096,3 +2096,54 @@ def test_the_incomplete_remedy_names_the_knob_actually_in_force(mod, tmp_path, m
     unpinned_remedy = mod._incomplete_sources_remedy(str(pinned))
     assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in unpinned_remedy
     assert "outranks" not in unpinned_remedy
+
+
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so "
+             "os.access(W_OK) still reports it writable and the mirror this exercises "
+             "is never taken.",
+)
+def test_a_mirror_published_during_our_repair_is_adopted_not_deleted(
+    mod, tmp_path, monkeypatch, staging_env,
+):
+    """A racing repair must not delete the winner's live, possibly patched tree.
+
+    The usability test and the rename that follows it are not one step, so another
+    process can publish a good mirror in between. Taking it and deleting it would
+    unpatch a directory an export is already using."""
+    stage = mod._stage_converter_sources("b9000")
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
+    _read_only(stage)
+    try:
+        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert mirror is not None
+        marker = Path(mirror, "conversion", "base.py")
+        marker.write_text("# patched by the export that won the race\n")
+
+        real_usable = mod._converter_stage_is_usable
+        calls = {"n": 0}
+
+        def _stale_once(path, *args, **kwargs):
+            # False for the pre-rename check only, so the code proceeds to take a
+            # mirror that is in fact good, which is the race being simulated.
+            if os.path.abspath(path) == os.path.abspath(mirror):
+                calls["n"] += 1
+                # _writable_stage asks twice before the repair branch: once for the
+                # early reuse return, once for the `elif`. Both must read stale or
+                # the branch under test is never entered at all.
+                if calls["n"] <= 2:
+                    return False
+            return real_usable(path, *args, **kwargs)
+
+        monkeypatch.setattr(mod, "_converter_stage_is_usable", _stale_once)
+        again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+
+        assert again == mirror
+        assert marker.read_text() == "# patched by the export that won the race\n", (
+            "the winner's tree was replaced, discarding patches its export applied"
+        )
+        assert not list(Path(mirror).parent.glob("*.superseded_*"))
+    finally:
+        os.chmod(stage, 0o755)
