@@ -3571,9 +3571,23 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     # really there -- an unrelated file of the user's, or another shard this very index
     # lists. `mkstemp` cannot collide with either, and it opens O_EXCL at 0o600, so the
     # race the unlink used to open is closed rather than narrowed.
+    # The basename is carried only so a leftover staging file names the shard it belongs
+    # to, and it has to be BOUNDED to do that. `mkstemp` builds `prefix` + 8 random
+    # characters, so a shard whose own basename is near the filesystem's NAME_MAX made the
+    # staging component exceed it and raised ENAMETOOLONG -- on ext4, at 230 characters --
+    # failing a shard that is valid and is exactly what this function exists to
+    # materialise. `os.pathconf` reports the real limit where there is one; Windows has no
+    # `pathconf` and caps a component at 255 as well.
+    _staging_directory = os.path.dirname(file_path) or os.curdir
+    try:
+        _name_max = os.pathconf(_staging_directory, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError):
+        _name_max = 255
+    _marker = ".unsloth-materializing-"
+    _budget = max(0, _name_max - len(_marker) - 8)
     _staging_fd, staging = tempfile.mkstemp(
-        dir = os.path.dirname(file_path) or os.curdir,
-        prefix = os.path.basename(file_path) + ".unsloth-materializing-",
+        dir = _staging_directory,
+        prefix = os.path.basename(file_path)[:_budget] + _marker,
     )
     try:
         with os.fdopen(_staging_fd, "wb") as _staging_file, open(target, "rb") as _source:

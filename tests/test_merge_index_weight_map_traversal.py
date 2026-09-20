@@ -1593,3 +1593,40 @@ def test_an_external_parent_with_a_leaf_pointing_back_inside_is_refused(tmp_path
     # Nothing may have been created in the external directory on the way to refusing.
     assert sorted(os.listdir(outside)) == ["model.safetensors"]
     assert os.path.islink(os.path.join(outside, "model.safetensors"))
+
+
+@pytest.mark.parametrize("length", [200, 223, 230, 250])
+def test_a_long_shard_basename_still_materializes(tmp_path, length):
+    """The staging name must fit NAME_MAX whatever the shard is called.
+
+    `mkstemp` builds `prefix` + 8 random characters. Carrying the whole basename in the
+    prefix made the staging component exceed the filesystem's limit for a shard whose own
+    name was near it: on ext4 a 230-character basename raised
+    `OSError: [Errno 36] File name too long`, failing a shard that is valid and is exactly
+    what materialisation exists to repair. Every one of these names is legal on the
+    filesystem, which is the point: creating the shard succeeds, so materialising it must.
+    """
+    output = os.path.join(str(tmp_path), "out")
+    os.makedirs(output, exist_ok = True)
+    outside = os.path.join(str(tmp_path), "outside")
+    os.makedirs(outside, exist_ok = True)
+    victim = os.path.join(outside, "victim.safetensors")
+    with open(victim, "wb") as f:
+        f.write(b"VICTIM BYTES")
+
+    suffix = ".safetensors"
+    name = ("s" * (length - len(suffix))) + suffix
+    if length > os.pathconf(output, "PC_NAME_MAX"):
+        pytest.skip("this filesystem cannot hold a name that long")
+    shard = os.path.join(output, name)
+    os.symlink(victim, shard)
+
+    saving_utils._materialize_shard_that_resolves_outside(shard, output)
+
+    assert not os.path.islink(shard), f"a {length}-character shard was not materialized"
+    with open(shard, "rb") as f:
+        assert f.read() == b"VICTIM BYTES"
+    with open(victim, "rb") as f:
+        assert f.read() == b"VICTIM BYTES", "the link target was written through"
+    leftovers = [n for n in os.listdir(output) if ".unsloth-materializing" in n]
+    assert leftovers == [], f"staging files left behind: {leftovers}"
