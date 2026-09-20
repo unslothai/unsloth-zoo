@@ -27,7 +27,7 @@ from torch.utils.checkpoint import (
     get_device_states,
 )
 from unsloth_zoo.gradient_checkpointing import set_device_states
-from unsloth_zoo.device_type import DEVICE_TYPE
+from unsloth_zoo.device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 
 __all__ = [
     "patch_tiled_mlp",
@@ -38,8 +38,11 @@ FIRST_PASS = True
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_TILED_LOGGING = UNSLOTH_ENABLE_LOGGING and os.environ.get("UNSLOTH_ENABLE_TILED_LOGGING", "0") == "1"
 
-torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = DEVICE_TYPE)
-torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = DEVICE_TYPE)
+# torch's amp wants a device string torch itself knows. DEVICE_TYPE is ours and carries two
+# values torch does not accept the same way, which is what DEVICE_TYPE_TORCH exists to translate:
+# "mlx" (Apple silicon with mlx installed) and "hip".
+torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = DEVICE_TYPE_TORCH)
+torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = DEVICE_TYPE_TORCH)
 
 @functools.cache
 def get_max_flat_qlen(
