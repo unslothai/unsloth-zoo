@@ -1723,8 +1723,10 @@ def test_a_mirror_tightened_recursively_is_restored_throughout(mod, tmp_path, mo
     try:
         mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
         assert mirror is not None
-        for relative in ("conversion", os.path.join("gguf-py", "gguf"), ""):
-            os.chmod(os.path.join(mirror, relative) if relative else mirror, 0o555)
+        # Not the mirror root: a read-only root makes os.access short-circuit the
+        # `or`, so _tree_is_writable is never consulted and this stops testing it.
+        for relative in ("conversion", os.path.join("gguf-py", "gguf")):
+            os.chmod(os.path.join(mirror, relative), 0o555)
         again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
         assert again == mirror
         Path(again, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
