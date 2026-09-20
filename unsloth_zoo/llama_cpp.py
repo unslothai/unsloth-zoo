@@ -30,10 +30,10 @@ __all__ = [
 ]
 
 import errno
+import binascii
 import subprocess
 import sys
 import os
-import threading
 import time
 import re
 import ast
@@ -80,6 +80,7 @@ if not logger.hasHandlers():
 LLAMA_CPP_CONVERT_FILE = \
     "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
 
+_TEMP_NAME_ATTEMPTS = 16
 LLAMA_CPP_CONVERTER_FILENAMES = ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py")
 
 COMMANDS_NOT_FOUND = (
@@ -1137,25 +1138,23 @@ def _select_cpu_assets(tag, assets, manifest):
     ]
 
 
-_UMASK_LOCK = threading.Lock()
-_PROCESS_UMASK = None
+def _open_new_sibling(directory, mode):
+    """Create a uniquely named file in `directory` with `mode`, returning (fd, path).
 
-
-def _process_umask():
-    """The process umask, read once under a lock.
-
-    Reading it at all means setting it to 0 and putting it back, so two threads
-    doing that concurrently can interleave and leave the process at 0 forever,
-    creating every later file world-writable. Reading it once removes the window
-    after the first call and the lock closes it for the first."""
-    global _PROCESS_UMASK
-    if _PROCESS_UMASK is None:
-        with _UMASK_LOCK:
-            if _PROCESS_UMASK is None:
-                mask = os.umask(0)
-                os.umask(mask)
-                _PROCESS_UMASK = mask
-    return _PROCESS_UMASK
+    Not mkstemp, which hardcodes 0600: os.open applies the CURRENT umask to `mode`
+    the way an ordinary create does, so the mode is right without the process umask
+    ever being read. Reading it means setting it to 0 and putting it back, which
+    two threads can interleave into leaving the process at 0 forever, and caching
+    it instead would miss a umask the application changes later."""
+    for _ in range(_TEMP_NAME_ATTEMPTS):
+        staged = os.path.join(
+            directory, ".unsloth_tmp_" + binascii.hexlify(os.urandom(8)).decode(),
+        )
+        try:
+            return os.open(staged, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode), staged
+        except FileExistsError:
+            continue
+    raise OSError(errno.EEXIST, f"Unsloth: could not create a temp file in {directory}")
 
 
 def _atomic_write_bytes(path, content):
@@ -1165,20 +1164,19 @@ def _atomic_write_bytes(path, content):
     the fsync means a crash cannot leave a truncated file under the real name."""
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok = True)
-    handle, staged = tempfile.mkstemp(prefix = ".unsloth_tmp_", dir = directory)
+    handle, staged = _open_new_sibling(directory, 0o666)
     try:
         with os.fdopen(handle, "wb") as f:
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        # mkstemp creates 0600 and os.replace carries that mode onto the
-        # destination, so a shared 0644 converter would silently become owner-only.
-        # Keep the destination's mode, else what a create under the umask would give.
+        # os.replace carries the temp file's mode onto the destination, so an
+        # existing file keeps the mode it already had rather than the one a fresh
+        # create would give it. A new file keeps what os.open already applied.
         try:
             os.chmod(staged, os.stat(path).st_mode & 0o7777)
         except OSError:
-            try: os.chmod(staged, 0o666 & ~_process_umask())
-            except OSError: pass
+            pass
         os.replace(staged, path)
     except BaseException:
         try: os.unlink(staged)

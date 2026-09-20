@@ -1862,41 +1862,60 @@ def test_a_user_checkout_under_the_cache_root_is_not_written_into(mod, tmp_path,
     assert not (checkout / "unsloth_convert_hf_to_gguf.py").exists()
 
 
-def test_reading_the_umask_does_not_mutate_it_for_other_threads(mod, monkeypatch):
-    """The umask read is one-shot: concurrent first writes cannot strand the process at 0."""
-    import threading
+def test_atomic_writes_follow_the_current_umask_without_reading_it(mod, tmp_path, monkeypatch):
+    """The mode must track a umask the application changes, and os.umask must never be called.
 
-    monkeypatched = []
-    real_umask = os.umask
+    Reading the umask means setting it to 0 and putting it back, which two threads can
+    interleave into leaving the process at 0 forever; caching it instead goes stale."""
+    import stat
 
-    def _recording_umask(value):
-        monkeypatched.append(value)
-        return real_umask(value)
+    def _forbidden(*args, **kwargs):
+        raise AssertionError(
+            "os.umask was called: reading it is the race, caching it is the staleness"
+        )
 
-    mod._PROCESS_UMASK = None
-    try:
-        monkeypatch.setattr(os, "umask", _recording_umask)
-        barrier = threading.Barrier(8)
-        seen = []
+    monkeypatch.setattr(os, "umask", _forbidden)
 
-        def _worker():
-            barrier.wait()
-            seen.append(mod._process_umask())
-
-        threads = [threading.Thread(target = _worker) for _ in range(8)]
-        for t in threads: t.start()
-        for t in threads: t.join()
-    finally:
-        mod._PROCESS_UMASK = None
+    real_umask = os.umask.__wrapped__ if hasattr(os.umask, "__wrapped__") else None
+    for mask in (0o022, 0o077, 0o002):
         monkeypatch.undo()
+        old = os.umask(mask)
+        try:
+            monkeypatch.setattr(os, "umask", _forbidden)
+            target = tmp_path / f"fresh_{mask:o}.txt"
+            mod._atomic_write_bytes(str(target), b"payload")
+            assert target.read_bytes() == b"payload"
+            got = stat.S_IMODE(target.stat().st_mode)
+            assert got == 0o666 & ~mask, (
+                f"umask {mask:04o} produced {got:04o}, expected {0o666 & ~mask:04o}: "
+                f"the mode is not following the umask in force at the write"
+            )
+        finally:
+            monkeypatch.undo()
+            os.umask(old)
 
-    assert len(set(seen)) == 1, f"threads disagreed about the umask: {set(seen)}"
-    assert len(monkeypatched) == 2, (
-        f"os.umask was called {len(monkeypatched)} times for 8 concurrent readers; "
-        f"every extra pair is a window where another thread can observe 0"
-    )
-    assert real_umask(0) == seen[0], "the process umask was not restored"
-    real_umask(seen[0])
+
+def test_an_atomic_write_keeps_an_existing_files_mode(mod, tmp_path):
+    """Replacing a shared 0644 converter must not silently make it owner-only."""
+    import stat
+
+    target = tmp_path / "converter.py"
+    target.write_bytes(b"old")
+    os.chmod(target, 0o640)
+    mod._atomic_write_bytes(str(target), b"new")
+    assert target.read_bytes() == b"new"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_the_temp_sibling_retries_a_name_collision(mod, tmp_path, monkeypatch):
+    """A colliding random name must be retried, not raised at the caller."""
+    names = iter([b"\x01" * 8, b"\x01" * 8, b"\x02" * 8])
+    monkeypatch.setattr(os, "urandom", lambda n: next(names))
+    first_fd, first_path = mod._open_new_sibling(str(tmp_path), 0o666)
+    os.close(first_fd)
+    second_fd, second_path = mod._open_new_sibling(str(tmp_path), 0o666)
+    os.close(second_fd)
+    assert first_path != second_path
 
 
 def test_an_incomplete_install_is_not_synthesized_as_an_authoritative_pin(mod, tmp_path):
