@@ -264,7 +264,12 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
     def tiled_forward_arctic_size(self, x):
         B, S, H = x.shape
         chunk_size = max(1, H)
-        n_shards, remainder = divmod(S, chunk_size)
+        # Count the shards over the axis the forward actually splits. It flattens to (B*S, H) and
+        # appends whatever chunk_size * n_shards leaves over as one final shard, so deriving the
+        # count from S alone puts (B-1)*S rows in that final shard: a batch of 8 x 64 tokens with
+        # chunk_size 8 tiled as eight shards of 8 plus one of 448, and the memory bound the tiling
+        # exists to hold went with it. The target_gb sibling below already counts over bsz*qlen.
+        n_shards, remainder = divmod(B*S, chunk_size)
         n_shards = max(1, n_shards)
         # remainder gets added to the last shard in the forward pass
 
