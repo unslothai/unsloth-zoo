@@ -3478,6 +3478,23 @@ def _writable_stage(stage_dir, repo, tag):
                 os.rename(copied, mirror)
             except OSError:
                 pass
+        elif not _converter_stage_is_usable(mirror, repo = repo, tag = tag):
+            # An unusable mirror that is merely PRESENT used to block every retry
+            # forever: publication was skipped because the path existed, validation
+            # then failed, and the good copy just made was deleted on the way out.
+            # The schema constant exists to invalidate old entries on upgrade, so
+            # this is a state a release is expected to create, not damage. Move the
+            # dead tree aside and publish the replacement.
+            superseded = f"{mirror}.superseded_{binascii.hexlify(os.urandom(6)).decode()}"
+            try:
+                os.rename(mirror, superseded)
+                os.rename(copied, mirror)
+            except OSError:
+                # Another process may have replaced it in the meantime; its tree is
+                # as good as ours, so fall through to the validation below.
+                pass
+            finally:
+                shutil.rmtree(superseded, ignore_errors = True)
         if not _converter_stage_is_usable(mirror, repo = repo, tag = tag):
             return None
         return mirror

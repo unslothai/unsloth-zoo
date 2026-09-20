@@ -1995,3 +1995,44 @@ def test_the_converter_cache_env_var_is_read_at_the_call_not_at_import(mod, tmp_
 
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", "   ")
     assert mod._converter_cache_root() == mod.LLAMA_CPP_CONVERTER_CACHE_DIR
+
+
+def test_a_stale_mirror_is_replaced_rather_than_blocking_every_retry(
+    mod, tmp_path, monkeypatch, staging_env,
+):
+    """A mirror written under an older stage schema must not wedge the read-only path.
+
+    UNSLOTH_CONVERTER_STAGE_SCHEMA exists to invalidate entries an older unsloth_zoo
+    wrote, so an unusable mirror is a state a release is expected to create. Skipping
+    publication because the path merely exists left the good copy deleted and every
+    later call returning None."""
+    stage = mod._stage_converter_sources("b9000")
+    home = tmp_path / "home"
+    monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
+    _read_only(stage)
+    try:
+        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        assert mirror is not None
+
+        manifest = Path(mirror, mod.UNSLOTH_CONVERTER_STAGE_FILENAME)
+        stale = json.loads(manifest.read_text())
+        stale["schema"] = mod.UNSLOTH_CONVERTER_STAGE_SCHEMA + 1
+        manifest.write_text(json.dumps(stale))
+        assert not mod._converter_stage_is_usable(
+            mirror, repo = "ggml-org/llama.cpp", tag = "b9000",
+        )
+
+        for attempt in range(3):
+            again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+            assert again == mirror, (
+                f"attempt {attempt + 1} returned {again}: a stale mirror blocks the "
+                f"read-only cache path forever instead of being replaced"
+            )
+        assert mod._converter_stage_is_usable(
+            mirror, repo = "ggml-org/llama.cpp", tag = "b9000",
+        )
+        assert not list(Path(mirror).parent.glob("*.superseded_*")), (
+            "the displaced tree was left behind"
+        )
+    finally:
+        os.chmod(stage, 0o755)
