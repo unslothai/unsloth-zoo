@@ -2533,6 +2533,47 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
         plan.materialize_all()
 
 
+@pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
+def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
+    """These two need no compile patch, so only the qualification decides; the
+    source scan still reports blockers for both."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        build_compile_trait_reports,
+        get_compile_trait_report,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip(f"mlx_vlm.models.{arch}.{arch}")
+
+    def decide(name):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{name}.{name}"})()
+        model.config = SimpleNamespace(model_type=name)
+        return resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"),
+        )
+
+    assert get_compile_trait_report(arch).blocker_categories
+    decision = decide(arch)
+    assert decision.enabled, decision.reason
+    assert not decision.backend_qualifications
+
+    # The same blockers still decide it for a family that carries no entry.
+    unqualified = sorted(
+        name for name, report in build_compile_trait_reports().items()
+        if report.blocker_categories and name not in _VERIFIED_TRAINING_ARCHES
+    )
+    if not unqualified:
+        pytest.skip("every architecture the scan blocks is training-qualified")
+    refused = decide(unqualified[0])
+    assert not refused.enabled
+    assert "blockers" in refused.reason
+
+
 def test_nested_text_decoder_qualification_decides_its_parent():
     """A VLM reaches its decoder through `text_config`, and compile requires
     both: an unqualified decoder keeps a qualified parent on the eager path."""
