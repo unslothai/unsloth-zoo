@@ -72,6 +72,98 @@ def apply_autograd_function(autograd, mapping):
     ))
 pass
 
+def _dft_token_weight(token_nll):
+    return torch.exp(-token_nll.detach())
+pass
+
+
+def _compute_fused_loss(
+    hidden_states  : torch.Tensor,
+    lm_head_weight : torch.Tensor,
+    lm_head_bias   : Optional[torch.Tensor],
+    labels         : torch.Tensor,
+    n_items        : Optional[torch.Tensor] = None,
+    scaling        : Optional[float] = None,
+    shift_labels   : bool = True,
+    per_token_weight : Optional[Callable] = None,
+    **kwargs,
+) -> Tuple[torch.Tensor, Tuple[torch.Tensor,],]:
+    ignore_index = int(kwargs.get("ignore_index", -100))
+    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
+    device = lm_head_weight.device
+    if shift_labels:
+        # Get shifted labels first
+        _labels = torch.empty_like(labels, device = device)
+        _labels[..., :-1] = labels[..., 1:]
+        _labels[..., -1] = ignore_index
+        labels = _labels
+    else:
+        labels = labels.to(device = device)
+    pass
+
+    vocab_size = lm_head_weight.shape[0]
+    flat_labels = labels.reshape(-1).to(device = device)
+    valid = flat_labels != ignore_index if per_token_weight is not None else None
+    logits = torch.nn.functional.linear(
+        hidden_states.to(dtype = lm_head_weight.dtype, device = device),
+        lm_head_weight,
+        lm_head_bias,
+    )
+    if per_token_weight is not None:
+        logits.view(-1, vocab_size).masked_fill_(~valid.unsqueeze(1), 0.0)
+
+    # Apply softcapping and other functions
+    logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
+    logit_scale_divide = kwargs.get("logit_scale_divide", None)
+    logit_softcapping = kwargs.get("logit_softcapping", None)
+    if logit_scale_multiply != 0 and logit_scale_multiply is not None:
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide != 0 and logit_scale_divide is not None:
+        logits = logits / logit_scale_divide
+    if logit_softcapping != 0 and logit_softcapping is not None:
+        logits = logits / logit_softcapping
+        logits = torch.tanh(logits)
+        logits = logits * logit_softcapping
+
+    flat_logits = logits.view(-1, vocab_size).float().contiguous()
+    flat_labels = flat_labels.contiguous()
+    if per_token_weight is None:
+        reduction = "sum" if n_items is not None else "mean"
+        loss = torch.nn.functional.cross_entropy(
+            input = flat_logits,
+            target = flat_labels,
+            reduction = reduction,
+            ignore_index = ignore_index,
+            label_smoothing = label_smoothing,
+        )
+        loss = loss / n_items if n_items is not None else loss
+    else:
+        token_nll = torch.nn.functional.cross_entropy(
+            input = flat_logits,
+            target = flat_labels,
+            reduction = "none",
+            ignore_index = ignore_index,
+            label_smoothing = 0.0,
+        )
+        weighted_nll = per_token_weight(token_nll) * token_nll
+
+        if n_items is None:
+            divisor = valid.to(dtype = token_nll.dtype).sum()
+        elif torch.is_tensor(n_items):
+            divisor = n_items.to(device = device, dtype = token_nll.dtype)
+        else:
+            divisor = torch.tensor(n_items, dtype = token_nll.dtype, device = device)
+        if divisor.numel() != 1: divisor = divisor.ravel()[0]
+        divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
+        loss = weighted_nll.sum() / divisor
+
+    # Scale loss if needed for mixed precision training
+    scaled_loss = loss * scaling if scaling is not None else loss
+    # Must add .loss.detach otherwise autograd uses 2x VRAM
+    return scaled_loss, (loss.detach(),)
+pass
+
+
 def compute_fused_ce_loss(
     hidden_states  : torch.Tensor,
     lm_head_weight : torch.Tensor,
@@ -94,51 +186,19 @@ def compute_fused_ce_loss(
     4) ignore_index         (passed to F.cross_entropy; defaults to -100)
     5) label_smoothing      (passed to F.cross_entropy; defaults to 0.0)
     """
-    ignore_index = int(kwargs.get("ignore_index", -100))
-    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
-    device = lm_head_weight.device
-    if shift_labels:
-        # Get shifted labels first
-        _labels = torch.empty_like(labels, device = device)
-        _labels[..., :-1] = labels[..., 1:]
-        _labels[..., -1] = ignore_index
-        labels = _labels
-    pass
-
-    logits = torch.nn.functional.linear(
-        hidden_states.to(dtype = lm_head_weight.dtype, device = device),
+    if "per_token_weight" in kwargs:
+        raise TypeError("per_token_weight is reserved for internal fused losses")
+    return _compute_fused_loss(
+        hidden_states,
         lm_head_weight,
         lm_head_bias,
+        labels,
+        n_items,
+        scaling,
+        shift_labels,
+        per_token_weight = None,
+        **kwargs,
     )
-    vocab_size = lm_head_weight.shape[0]
-
-    # Apply softcapping and other functions
-    logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
-    logit_scale_divide = kwargs.get("logit_scale_divide", None)
-    logit_softcapping = kwargs.get("logit_softcapping", None)
-    if logit_scale_multiply != 0 and logit_scale_multiply is not None:
-        logits = logits * logit_scale_multiply
-    if logit_scale_divide != 0 and logit_scale_divide is not None:
-        logits = logits / logit_scale_divide
-    if logit_softcapping != 0 and logit_softcapping is not None:
-        logits = logits / logit_softcapping
-        logits = torch.tanh(logits)
-        logits = logits * logit_softcapping
-
-    # Calculate cross entropy loss
-    reduction = "sum" if n_items is not None else "mean"
-    loss = torch.nn.functional.cross_entropy(
-        input  = logits.view(-1, vocab_size).float().contiguous(),
-        target = labels.view(-1).to(device).contiguous(),
-        reduction = reduction,
-        ignore_index = ignore_index,
-        label_smoothing = label_smoothing,
-    )
-    loss = loss / n_items if n_items is not None else loss
-    # Scale loss if needed for mixed precision training
-    scaled_loss = loss * scaling if scaling is not None else loss
-    # Must add .loss.detach otherwise autograd uses 2x VRAM
-    return scaled_loss, (loss.detach(),)
 pass
 
 
@@ -156,66 +216,21 @@ def compute_fused_dft_loss(
     Computes stop_gradient(exp(-NLL_t)) * NLL_t over target tokens.
     The signature and return contract intentionally match compute_fused_ce_loss.
     """
-    ignore_index = int(kwargs.get("ignore_index", -100))
-    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
-    if label_smoothing != 0.0:
+    if "per_token_weight" in kwargs:
+        raise TypeError("per_token_weight is reserved for internal fused losses")
+    if float(kwargs.get("label_smoothing", 0.0)) != 0.0:
         raise ValueError("Fused DFT loss does not support label_smoothing != 0.0")
-
-    device = lm_head_weight.device
-    if shift_labels:
-        _labels = torch.empty_like(labels, device = device)
-        _labels[..., :-1] = labels[..., 1:]
-        _labels[..., -1] = ignore_index
-        labels = _labels
-    else:
-        labels = labels.to(device = device)
-    pass
-
-    vocab_size = lm_head_weight.shape[0]
-    flat_labels = labels.reshape(-1).to(device = device)
-    valid = flat_labels != ignore_index
-    logits = torch.nn.functional.linear(
-        hidden_states.to(dtype = lm_head_weight.dtype, device = device),
+    return _compute_fused_loss(
+        hidden_states,
         lm_head_weight,
         lm_head_bias,
+        labels,
+        n_items,
+        scaling,
+        shift_labels,
+        per_token_weight = _dft_token_weight,
+        **kwargs,
     )
-    logits.view(-1, vocab_size).masked_fill_(~valid.unsqueeze(1), 0.0)
-
-    # Apply the same logit transforms as fused CE before computing NLL.
-    logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
-    logit_scale_divide = kwargs.get("logit_scale_divide", None)
-    logit_softcapping = kwargs.get("logit_softcapping", None)
-    if logit_scale_multiply != 0 and logit_scale_multiply is not None:
-        logits = logits * logit_scale_multiply
-    if logit_scale_divide != 0 and logit_scale_divide is not None:
-        logits = logits / logit_scale_divide
-    if logit_softcapping != 0 and logit_softcapping is not None:
-        logits = logits / logit_softcapping
-        logits = torch.tanh(logits)
-        logits = logits * logit_softcapping
-
-    flat_logits = logits.view(-1, vocab_size).float().contiguous()
-    token_nll = torch.nn.functional.cross_entropy(
-        input = flat_logits,
-        target = flat_labels,
-        reduction = "none",
-        ignore_index = ignore_index,
-        label_smoothing = 0.0,
-    )
-    weighted_nll = torch.exp(-token_nll.detach()) * token_nll
-
-    if n_items is None:
-        divisor = valid.to(dtype = token_nll.dtype).sum()
-    elif torch.is_tensor(n_items):
-        divisor = n_items.to(device = device, dtype = token_nll.dtype)
-    else:
-        divisor = torch.tensor(n_items, dtype = token_nll.dtype, device = device)
-    if divisor.numel() != 1: divisor = divisor.ravel()[0]
-    divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
-
-    loss = weighted_nll.sum() / divisor
-    scaled_loss = loss * scaling if scaling is not None else loss
-    return scaled_loss, (loss.detach(),)
 pass
 
 
@@ -713,6 +728,8 @@ def unsloth_fused_ce_loss(
     2) logit_scale_divide   (X = X / logit_scale_divide)
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
+    if "per_token_weight" in kwargs:
+        raise TypeError("per_token_weight is reserved for internal fused losses")
     scaler = trainer.accelerator.scaler if trainer is not None else None
     # Get mixed precision scaling if seen
     scaling = scaler.get_scale() if scaler is not None else scaling
@@ -773,6 +790,8 @@ def unsloth_fused_dft_loss(
     2) logit_scale_divide   (X = X / logit_scale_divide)
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     """
+    if "per_token_weight" in kwargs:
+        raise TypeError("per_token_weight is reserved for internal fused losses")
     scaler = trainer.accelerator.scaler if trainer is not None else None
     scaling = scaler.get_scale() if scaler is not None else scaling
     if hasattr(scaling, "get_scale"): scaling = scaling.get_scale()
