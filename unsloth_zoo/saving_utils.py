@@ -2944,22 +2944,13 @@ def _remove_transformers_version(config_path: Path):
     pass
 pass
 
-# Multi-token-prediction reconciliation. Qwen3.5 / Qwen3.6 ship an MTP head as
-# top-level `mtp.*` tensors declared by `mtp_num_hidden_layers`, and transformers
-# drops those tensors on load (`_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`
-# in modeling_qwen3_5.py), so a round-tripped export declares a head it no longer
-# has. Consumers trusting the config then break: llama.cpp's converter asserts on
-# the missing layer and vLLM resolves its draft config off the same key.
-# The invariant: config and weights must agree. Never invents weights, and edits
-# the declaration only when the weights could be inspected.
+# transformers drops `mtp.*` tensors on load (Qwen3.5's
+# `_keys_to_ignore_on_load_unexpected`), so a round-tripped export declares an MTP
+# head it no longer has and llama.cpp / vLLM then break on the stale key.
 MTP_CONFIG_KEY = "mtp_num_hidden_layers"
 
-# Matches llama.cpp's converter view of an MTP tensor: a top-level `mtp.` block,
-# optionally behind the `model.` / `language_model.` prefixes the multimodal
-# checkpoints use. The prefix group is repeatable and order free on purpose:
-# Qwen3.5 writes `model.language_model.mtp.*` but the older Qwen2-VL naming is
-# `language_model.model.mtp.*`, and a name read back off someone else's
-# checkpoint is not guaranteed to have been through Unsloth's remap.
+# Prefix group is repeatable and order free: Qwen3.5 writes
+# `model.language_model.mtp.*`, older Qwen2-VL naming is `language_model.model.mtp.*`.
 _MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model)\.)*mtp\.")
 
 
@@ -2971,8 +2962,7 @@ def is_mtp_tensor_name(name):
 def _checkpoint_tensor_names(folder):
     """Every tensor name in a saved checkpoint, or None when it cannot be read.
 
-    None is not "no tensors": callers must treat it as "unknown" and leave the
-    config alone, else an unreadable shard would look like a missing MTP head.
+    None means "unknown", not "no tensors": callers must leave the config alone.
     """
     folder = Path(folder)
     if not folder.is_dir():
@@ -2998,8 +2988,7 @@ def _checkpoint_tensor_names(folder):
             except Exception:
                 return None
         if pattern.endswith(".bin"):
-            # Reading a pickle just to list names is not worth it here; the
-            # safetensors path is what every current export writes.
+            # Not worth unpickling just to list names; exports are safetensors.
             return None
         names = []
         for part in parts:
@@ -3012,11 +3001,9 @@ def _checkpoint_tensor_names(folder):
     return None
 
 
-# The other MTP spelling: DeepSeek-V3 / GLM heads are extra `layers.N` blocks past
-# `num_hidden_layers` declared by `num_nextn_predict_layers`. Deciding anything
-# there needs a layer count, so it is left to the writers that already handle it
-# (`mlx/utils.py`, `_has_mtp_weight_tensors` in `llama_cpp.py`) and detected here
-# only to keep this repair from firing on such a checkpoint.
+# The other MTP spelling: DeepSeek-V3 / GLM store the head as extra `layers.N`
+# blocks past `num_hidden_layers`. Detected only so this repair does not fire on
+# such a checkpoint; `mlx/utils.py` and `llama_cpp.py` handle those.
 _LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model)\.)*layers\.(\d+)\.")
 
 
@@ -3034,16 +3021,11 @@ def _has_layers_past(tensor_names, num_hidden_layers):
 
 
 def _config_layer_count(config, container = None):
-    """The transformer layer count for a config, looked up across the whole
-    object rather than only in the container that declares the MTP key.
+    """The transformer layer count, searched across the whole config object.
 
-    A multimodal config can declare `mtp_num_hidden_layers` at the top level
-    while keeping `num_hidden_layers` in `text_config`. Reading the count out of
-    the declaring container alone returns None there, which silently disables
-    the extra-layers check below and turns an `agrees` into a `stripped`.
-    Accepts dicts (a loaded config.json), objects (a live PretrainedConfig), and
-    a bare layer count, so a caller that already has the integer cannot pass it
-    in and silently get None back.
+    A multimodal config can declare the MTP key at the top level while keeping
+    `num_hidden_layers` in `text_config`, so the declaring container alone is not
+    enough. Accepts dicts, config objects, or a bare layer count.
     """
     for value in (container, config):
         if isinstance(value, int) and not isinstance(value, bool):
@@ -3069,13 +3051,9 @@ def _config_layer_count(config, container = None):
 def mtp_head_is_present(tensor_names, config = None, container = None):
     """Whether these tensor names carry a multi-token prediction head.
 
-    One rule for every writer, covering both spellings the ecosystem uses:
-    Qwen3.5's top-level `mtp.*` block, and the DeepSeek-V3 / GLM form that
-    stores the head as extra `layers.N` blocks past `num_hidden_layers`. The
-    second form cannot be decided without a layer count, so pass the config
-    (and, if the declaration lives in a nested one, the `container` that holds
-    it); without a count a head stored that way reads as absent. `config` and
-    `container` may be dicts or live config objects.
+    Covers both spellings: `mtp.*` blocks, and extra `layers.N` past
+    `num_hidden_layers`. The second needs a layer count, so without `config` a
+    head stored that way reads as absent.
     """
     tensor_names = list(tensor_names or ())
     if any(is_mtp_tensor_name(name) for name in tensor_names):
@@ -3086,13 +3064,9 @@ def mtp_head_is_present(tensor_names, config = None, container = None):
 def _mtp_config_containers(config):
     """Every dict inside a loaded config.json that declares the MTP key.
 
-    The nested shapes are the three `_sync_gguf_nextn_layer_config` in
-    `unsloth_zoo/mlx/utils.py` already reads, kept identical on purpose: a
-    declaration this misses is left in the exported config with no weights behind
-    it, which is the state that makes a later GGUF conversion fail on the missing
-    MTP layers. Reaching only `text_config` meant a checkpoint declaring the key
-    under `language_config` or `thinker_config.text_config` reported `not-declared`
-    and was silently left stale."""
+    Nested shapes kept identical to `_sync_gguf_nextn_layer_config` in
+    `mlx/utils.py`; a declaration missed here stays stale and fails GGUF later.
+    """
     if not isinstance(config, dict):
         return []
     thinker = config.get("thinker_config")
@@ -3106,8 +3080,7 @@ def _mtp_config_containers(config):
     for candidate in candidates:
         if not isinstance(candidate, dict) or MTP_CONFIG_KEY not in candidate:
             continue
-        # Identity, not equality: two shapes can hold equal dicts and both need
-        # rewriting, while the same dict reachable twice must be rewritten once.
+        # Identity, not equality: equal-but-distinct dicts both need rewriting.
         if any(candidate is seen for seen in containers):
             continue
         containers.append(candidate)
@@ -3115,17 +3088,11 @@ def _mtp_config_containers(config):
 
 
 def _config_is_writable(config_path) -> bool:
-    """Whether this config may be rewritten, asking the MODE as well as the access check.
+    """Whether this config may be rewritten, checking the MODE as well as access.
 
-    `os.access(..., W_OK)` answers "may this process write it", and as root the answer is
-    yes for a file whose mode is `0444`. Containers and hosted notebooks run as root by
-    default, which is where an export most often runs, so the access check alone let a
-    replacement land on a config the operator had explicitly marked read-only -- the exact
-    thing the check exists to refuse. The mode is the operator's statement of intent and the
-    access check is the filesystem's; a write needs both.
-
-    A mode that cannot be read is not a refusal: an unreadable stat is "cannot tell", and
-    falling back to the access check leaves the behaviour as it was for every ordinary user.
+    `os.access(W_OK)` returns True as root even for `0444`, and exports often run
+    as root, so the mode is consulted to honour a read-only marking. An
+    unreadable stat means "cannot tell" and falls back to the access check.
     """
     if not os.access(config_path, os.W_OK):
         return False
@@ -3140,9 +3107,8 @@ def reconcile_mtp_config(save_directory, tensor_names = None):
     """Make an exported config.json's MTP declaration agree with its weights.
 
     Returns "no-config", "not-declared", "unknown", "agrees" or "stripped".
-    Idempotent and never raises: a save must not fail because of a metadata
-    repair. Pass `tensor_names` when the writer already knows what it wrote
-    (a push_to_hub export has no local folder to inspect).
+    Idempotent and never raises: a save must not fail on a metadata repair. Pass
+    `tensor_names` when there is no local folder to inspect (push_to_hub).
     """
     try:
         config_path = os.path.join(str(save_directory), "config.json")
@@ -3159,10 +3125,7 @@ def reconcile_mtp_config(save_directory, tensor_names = None):
         if tensor_names is None:
             return "unknown"
         tensor_names = list(tensor_names)
-        # One rule, shared with `unsloth/save.py`'s dict-level stripper. A head
-        # stored as extra `layers.N` blocks rather than as `mtp.*` is still a
-        # head, and the layer count is resolved across the whole config because
-        # the declaration and the count do not have to live in the same place.
+        # Same rule as `unsloth/save.py`'s dict-level stripper.
         if any(
             mtp_head_is_present(tensor_names, config, container)
             for container in containers
@@ -3171,19 +3134,12 @@ def reconcile_mtp_config(save_directory, tensor_names = None):
 
         for container in containers:
             container.pop(MTP_CONFIG_KEY, None)
-        # Written to a sibling and moved into place, never over the original. Opening the
-        # real file "w" truncates it before the dump runs, so a dump that fails part way --
-        # a full disk at the end of an export is the realistic one -- leaves the checkpoint
-        # with an empty or half-written `config.json` and the handler below then reports
-        # "unknown" and lets the save continue. A repair that cannot succeed has to leave
-        # the valid file it found, and `os.replace` is atomic on the same filesystem.
+        # Staged to a sibling and `os.replace`d: opening the real file "w" would
+        # truncate it, leaving a half-written config if the dump fails (full disk).
         directory = os.path.dirname(config_path) or "."
         if not _config_is_writable(config_path):
-            # Asked before anything is staged, because `os.replace` only needs the
-            # DIRECTORY to be writable: without this, a config.json the user marked
-            # read-only would be replaced anyway, where the previous open("w") reported
-            # "unknown" and left it alone. Refusing to write a file the operator protected
-            # is the behaviour to keep.
+            # Checked up front: `os.replace` only needs the DIRECTORY writable, so
+            # a read-only config.json would otherwise be replaced anyway.
             raise PermissionError(f"{config_path} is not writable")
         handle, staged_path = tempfile.mkstemp(
             prefix = os.path.basename(config_path) + ".",
@@ -3191,8 +3147,8 @@ def reconcile_mtp_config(save_directory, tensor_names = None):
             dir = directory,
         )
         try:
-            # mkstemp creates 0600. The replacement must not be more restrictive than what
-            # it replaces, or an export becomes unreadable to everyone but its owner.
+            # mkstemp creates 0600; restore the original mode or the export
+            # becomes unreadable to everyone but its owner.
             try:
                 os.chmod(staged_path, stat.S_IMODE(os.stat(config_path).st_mode))
             except OSError:
@@ -3204,8 +3160,7 @@ def reconcile_mtp_config(save_directory, tensor_names = None):
                 os.fsync(f.fileno())
             os.replace(staged_path, config_path)
         except BaseException:
-            # Including the interpreter shutting down mid-write: the original is still
-            # whole, so the only thing to clean up is the staged copy.
+            # The original is untouched, so only the staged copy needs cleanup.
             try:
                 os.unlink(staged_path)
             except OSError:

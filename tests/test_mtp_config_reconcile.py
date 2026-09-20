@@ -16,13 +16,8 @@
 
 """An exported config must not declare an MTP head the weights do not contain.
 
-Qwen3.5 ships its multi-token prediction head as top-level `mtp.*` tensors and
-declares it with `mtp_num_hidden_layers`. transformers has no MTP module for
-the architecture and lists `^mtp.*` in `_keys_to_ignore_on_load_unexpected`, so
-the head is dropped the moment the model loads and no re-save can put it back.
-An export that keeps the declaration therefore promises weights that are not in
-the file, and every consumer that trusts the config goes looking for them
-(unsloth#7681).
+transformers drops Qwen3.5's `mtp.*` tensors on load, so a re-saved export keeps
+`mtp_num_hidden_layers` with no weights behind it (unsloth#7681).
 """
 
 import json
@@ -31,9 +26,7 @@ import stat
 
 import numpy as np
 import pytest
-# numpy rather than torch: nothing here needs a tensor library, only real
-# safetensors bytes on disk, and this way the file runs on a CPU only runner
-# that ships no torch wheel.
+# numpy rather than torch so this runs on a CPU-only runner with no torch wheel.
 from safetensors.numpy import save_file
 
 from unsloth_zoo.saving_utils import (
@@ -46,16 +39,13 @@ from unsloth_zoo.saving_utils import (
 
 
 def checkpoint_mtp_tensor_names(folder):
-    """The MTP names in a saved checkpoint, or None when the weights cannot be
-    read. `reconcile_mtp_config` reads the full name list once and filters it
-    itself, so this composition lives here rather than in the module, where it
-    would be an export nothing calls."""
+    """The MTP names in a saved checkpoint, or None when unreadable."""
     names = _checkpoint_tensor_names(folder)
     if names is None:
         return None
     return sorted(name for name in names if is_mtp_tensor_name(name))
 
-# The 15 names Qwen/Qwen3.5-0.8B actually ships, trimmed to the distinct shapes.
+# The names Qwen/Qwen3.5-0.8B ships, trimmed to the distinct shapes.
 QWEN35_MTP_NAMES = (
     "mtp.fc.weight",
     "mtp.norm.weight",
@@ -117,10 +107,7 @@ def _saved(folder):
     "model.mtp.norm.weight",
     "language_model.mtp.fc.weight",
     "model.language_model.mtp.fc.weight",
-    # The older Qwen2-VL prefix ordering. Unsloth's own remap rewrites it to
-    # the line above before anything is written, but a name read back off a
-    # checkpoint someone else produced has not been through that remap, so the
-    # prefix group is order free rather than a fixed `model.language_model.`.
+    # The older Qwen2-VL prefix ordering, seen in foreign checkpoints.
     "language_model.model.mtp.fc.weight",
 ])
 def test_mtp_tensor_names_are_recognised(name):
@@ -128,9 +115,7 @@ def test_mtp_tensor_names_are_recognised(name):
 
 
 @pytest.mark.parametrize("name", [
-    # A body tensor, the visual tower, and two near misses that must not match:
-    # a block whose name merely starts with the same letters, and a body layer
-    # that happens to contain the substring.
+    # Body, visual tower, then two near misses.
     "model.language_model.layers.0.mlp.up_proj.weight",
     "model.visual.blocks.0.attn.qkv.weight",
     "mtptower.fc.weight",
@@ -159,8 +144,7 @@ def test_checkpoint_with_no_mtp_reports_an_empty_list(tmp_path):
 
 
 def test_unreadable_checkpoint_is_unknown_not_empty(tmp_path):
-    """The distinction the repair turns on: no weights to read is not a missing
-    MTP head, and must never license editing the config."""
+    """Unreadable weights are not a missing MTP head."""
     assert checkpoint_mtp_tensor_names(tmp_path) is None
     (tmp_path / "model.safetensors").write_bytes(b"not a safetensors file")
     assert checkpoint_mtp_tensor_names(tmp_path) is None
@@ -177,8 +161,7 @@ def test_corrupt_shard_index_is_unknown(tmp_path):
 
 @pytest.mark.parametrize("nested", [True, False])
 def test_declaration_is_stripped_when_the_weights_have_no_mtp(tmp_path, nested):
-    """The reproduced defect: a Qwen3.5 export keeps `mtp_num_hidden_layers`
-    while the merged weights carry no `mtp.*` tensor at all."""
+    """The reproduced defect: declaration kept, no `mtp.*` tensor."""
     _write_config(tmp_path, nested = nested)
     _write_checkpoint(tmp_path, BODY_NAMES)
 
@@ -187,7 +170,6 @@ def test_declaration_is_stripped_when_the_weights_have_no_mtp(tmp_path, nested):
     saved = _saved(tmp_path)
     holder = saved["text_config"] if nested else saved
     assert MTP_CONFIG_KEY not in holder
-    # Nothing else may be disturbed.
     assert saved["architectures"] == ["Qwen3_5ForConditionalGeneration"]
     if nested:
         assert saved["text_config"]["num_hidden_layers"] == 24
@@ -241,10 +223,7 @@ def test_caller_supplied_tensor_names_are_honoured(tmp_path):
 
 
 def test_a_head_stored_as_extra_layers_is_not_stripped(tmp_path):
-    """The other MTP spelling: DeepSeek-V3 / GLM style heads live in `layers.N`
-    blocks past `num_hidden_layers` rather than under `mtp.`. A checkpoint that
-    declares MTP and stores it that way still has a head, so the declaration
-    must survive even though no `mtp.*` name is present."""
+    """DeepSeek-V3 / GLM heads live in `layers.N` past `num_hidden_layers`."""
     (tmp_path / "config.json").write_text(json.dumps({
         "text_config": {"num_hidden_layers": 2, MTP_CONFIG_KEY: 1},
     }), encoding = "utf-8")
@@ -272,10 +251,7 @@ def test_a_checkpoint_within_its_layer_count_is_still_stripped(tmp_path):
 
 
 def test_the_layer_count_is_found_outside_the_declaring_container(tmp_path):
-    """A multimodal config may declare the key at the top level while keeping
-    `num_hidden_layers` in `text_config`. Resolving the count only out of the
-    declaring container yields None there, which silently disables the
-    extra-layers check and strips a declaration the weights do back."""
+    """The key may be top level while `num_hidden_layers` sits in `text_config`."""
     (tmp_path / "config.json").write_text(json.dumps({
         MTP_CONFIG_KEY: 1,
         "text_config": {"num_hidden_layers": 2},
@@ -313,16 +289,14 @@ def test_shared_rule_sees_the_extra_layers_spelling():
 
 
 def test_shared_rule_without_a_layer_count_reports_only_the_mtp_spelling():
-    """The extra-layers form cannot be decided without a count, so a caller
-    that has no config gets the conservative answer rather than a guess."""
+    """No layer count means the conservative answer, not a guess."""
     names = ("model.layers.9.mlp.up_proj.weight",)
     assert mtp_head_is_present(names) is False
     assert mtp_head_is_present(names + ("mtp.fc.weight",)) is True
 
 
 def test_shared_rule_accepts_a_live_config_object():
-    """`unsloth/save.py`'s around-the-write guard passes a PretrainedConfig, not
-    a dict, so attribute access has to work as well as `.get`."""
+    """`unsloth/save.py` passes a PretrainedConfig, so attribute access must work."""
     import types
 
     config = types.SimpleNamespace(text_config = types.SimpleNamespace(num_hidden_layers = 2))
@@ -344,8 +318,7 @@ def test_shared_rule_accepts_a_bare_layer_count():
 
 
 def test_shared_rule_does_not_consume_a_generator_per_holder():
-    """`unsloth/save.py` evaluates this once per config holder, so a generator
-    handed in must not be exhausted by the first call."""
+    """Called once per config holder, so a generator must not be exhausted."""
     names = ("model.layers.0.mlp.up_proj.weight", "mtp.fc.weight")
     generator = (name for name in names)
     assert mtp_head_is_present(generator) is True
@@ -356,9 +329,7 @@ def test_shared_rule_does_not_consume_a_generator_per_holder():
 
 @pytest.fixture
 def real_qwen35_config():
-    """`config.json` as Qwen publishes it, so the shape this repair assumes is
-    checked against the model it was written for rather than against our own
-    fixture. Skipped cleanly when the Hub is unreachable."""
+    """`config.json` as Qwen publishes it. Skipped when the Hub is unreachable."""
     requests = pytest.importorskip("requests")
     url = "https://huggingface.co/Qwen/Qwen3.5-2B/resolve/main/config.json"
     try:
@@ -379,9 +350,7 @@ def real_qwen35_config():
 
 
 def test_the_real_published_config_is_repaired_and_only_there(tmp_path, real_qwen35_config):
-    """Qwen keeps the declaration in `text_config`. A merged export of that model
-    carries no `mtp.*` tensor, so the key must go, and nothing else in a config
-    this size may move."""
+    """Qwen declares it in `text_config`; only that key may move."""
     (tmp_path / "config.json").write_text(
         json.dumps(real_qwen35_config, indent = 2), encoding = "utf-8",
     )
@@ -409,8 +378,7 @@ def test_the_real_published_config_is_kept_when_the_head_is_there(tmp_path, real
 
 
 def test_a_config_that_cannot_be_rewritten_is_reported_not_raised(tmp_path):
-    """The repair runs after the weights are on disk, so a folder it cannot write
-    to must cost a warning, not the save."""
+    """An unwritable folder costs a warning, not the save."""
     if os.name == "nt":
         pytest.skip("read-only file permissions are not enforced the same way on Windows")
     if os.geteuid() == 0:
@@ -422,20 +390,13 @@ def test_a_config_that_cannot_be_rewritten_is_reported_not_raised(tmp_path):
     config_path.chmod(0o444)
     try:
         assert reconcile_mtp_config(tmp_path) == "unknown"
-        # Unwritable means unchanged, not half written.
         assert MTP_CONFIG_KEY in json.dumps(_saved(tmp_path))
     finally:
         config_path.chmod(0o644)
 
 
 def test_a_dump_that_fails_part_way_leaves_the_original_config(tmp_path, monkeypatch):
-    """The repair runs after the weights are on disk and promises it cannot break the export.
-
-    Opening the real file "w" truncates it before `json.dump` has written a byte, so a dump
-    that fails part way -- a disk that fills at the end of an export is the realistic one --
-    left the checkpoint with an empty or half-written config.json while the handler reported
-    "unknown" and the save carried on.
-    """
+    """A dump that fails part way must leave the original config whole."""
     import unsloth_zoo.saving_utils as saving_utils
 
     _write_config(tmp_path)
@@ -451,13 +412,11 @@ def test_a_dump_that_fails_part_way_leaves_the_original_config(tmp_path, monkeyp
     assert reconcile_mtp_config(tmp_path) == "unknown"
     assert config_path.read_bytes() == before
     assert MTP_CONFIG_KEY in json.dumps(_saved(tmp_path))
-    # And nothing is left behind in the checkpoint folder.
     assert [p.name for p in tmp_path.glob("config.json.*")] == []
 
 
 def test_the_repaired_config_keeps_the_mode_it_had(tmp_path):
-    """Staged through a temporary file, which is created 0600. A repaired export must not
-    become unreadable to everyone but the user who ran it."""
+    """Staging goes through a 0600 temp file; the original mode must survive."""
     if os.name == "nt":
         pytest.skip("POSIX file modes are not what Windows enforces")
     _write_config(tmp_path)
@@ -469,14 +428,7 @@ def test_the_repaired_config_keeps_the_mode_it_had(tmp_path):
 
 
 def test_a_read_only_config_is_left_alone_even_as_root(tmp_path, monkeypatch):
-    """`os.access(..., W_OK)` answers "may this process write it", and as root that is yes
-    for a `0444` file.
-
-    Containers and hosted notebooks run as root by default, which is where an export most
-    often runs, so the access check alone let a replacement land on a config the operator had
-    explicitly marked read-only -- the exact thing the check exists to refuse. Root is
-    simulated here rather than required, so the case is covered on an ordinary CI user too.
-    """
+    """`os.access(W_OK)` says yes to a 0444 file as root; the mode must still win."""
     if os.name == "nt":
         pytest.skip("read-only file permissions are not enforced the same way on Windows")
 
@@ -485,30 +437,24 @@ def test_a_read_only_config_is_left_alone_even_as_root(tmp_path, monkeypatch):
     config_path = tmp_path / "config.json"
     before = config_path.read_text(encoding = "utf-8")
     config_path.chmod(0o444)
-    # What root sees: the access check says yes whatever the mode says.
     monkeypatch.setattr(os, "access", lambda path, mode: True)
     try:
         assert reconcile_mtp_config(tmp_path) == "unknown"
         assert config_path.read_text(encoding = "utf-8") == before
         assert MTP_CONFIG_KEY in before
-        # And nothing staged is left beside it.
         assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("config.json.")) == []
     finally:
         config_path.chmod(0o644)
 
 
 def test_a_writable_config_is_still_rewritten(tmp_path, monkeypatch):
-    """The other half: the mode check must not refuse an ordinary file, and a mode that
-    cannot be read at all is "cannot tell" rather than a refusal."""
+    """An ordinary file is rewritten, and an unreadable mode is "cannot tell"."""
     _write_config(tmp_path)
     _write_checkpoint(tmp_path, BODY_NAMES)
     assert reconcile_mtp_config(tmp_path) == "stripped"
     assert MTP_CONFIG_KEY not in json.dumps(_saved(tmp_path))
 
-    # And a mode that cannot be read at all is "cannot tell", which falls back to the access
-    # check rather than refusing: an unreadable stat must not turn every export into a
-    # warning. Asked of the predicate directly, since `reconcile_mtp_config` stats the path
-    # for other reasons too.
+    # Asked of the predicate directly; `reconcile_mtp_config` stats for other reasons too.
     from unsloth_zoo.saving_utils import _config_is_writable
 
     config_path = tmp_path / "config.json"
@@ -523,7 +469,7 @@ def test_a_writable_config_is_still_rewritten(tmp_path, monkeypatch):
     assert _config_is_writable(config_path) is True
 
 
-# --- Nested config shapes. The three nested containers are the ones _sync_gguf_nextn_layer_config in unsloth_zoo/mlx/utils.py already reads; a declaration missed here is left in the exported config with no weights behind it, which is the state that makes a later GGUF conversion fail on missing MTP layers. ---
+# --- Nested config shapes, matching _sync_gguf_nextn_layer_config in mlx/utils.py. ---
 
 from unsloth_zoo.saving_utils import _mtp_config_containers
 
@@ -560,8 +506,7 @@ def test_a_declaration_backed_by_weights_is_kept_in_a_nested_shape(tmp_path):
 
 
 def test_the_same_container_reachable_twice_is_collected_once():
-    """Identity, not equality: two shapes can hold equal dicts and both need
-    rewriting, while one dict reachable by two paths must be collected once."""
+    """Identity, not equality: equal-but-distinct dicts both count."""
     shared = {MTP_CONFIG_KEY: 1}
     aliased = {MTP_CONFIG_KEY: 1, "text_config": shared, "language_config": shared}
     assert len(_mtp_config_containers(aliased)) == 2

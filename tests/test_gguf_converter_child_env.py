@@ -14,22 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GGUF converter child's `gguf` resolution (unsloth#3581).
-
-convert_to_gguf launches convert_hf_to_gguf.py in a child process. Every
-llama.cpp converter entrypoint self-locates its own tree with
-`sys.path.insert(1, Path(__file__).parent / "gguf-py")`, which sits ahead of
-PYTHONPATH and site-packages, and Unsloth downloads that entrypoint from
-llama.cpp master while the sibling gguf-py belongs to whatever checkout is on
-disk. A newer entrypoint against an older gguf-py fails with
-`module 'gguf.utility' has no attribute 'SafetensorsLocal'`; an entrypoint with
-no sibling tree falls through to the unpinned site-packages gguf and fails with
-`cannot import name 'MistralTokenizerType' from 'gguf.vocab'`.
-
-These tests cover the environment the child is given, the requirement scan, the
-candidate ranking and the failure diagnosis. Loads llama_cpp.py in isolation
-(spec_from_file_location), matching tests/test_convert_hf_to_gguf_patcher.py.
-No network, no GPU.
+"""The GGUF converter child's `gguf` resolution (unsloth#3581): child environment,
+requirement scan, candidate ranking and failure diagnosis. No network, no GPU.
 """
 
 from __future__ import annotations
@@ -63,7 +49,7 @@ def mod():
 
 
 def _make_gguf_py(root, *, package=True, symbols=(), version=None):
-    """A gguf-py tree. `symbols` are module-level names defined in gguf/__init__.py."""
+    """`symbols` are module-level names defined in gguf/__init__.py."""
     root = Path(root)
     gguf_py = root / "gguf-py"
     if package:
@@ -84,7 +70,6 @@ def test_child_env_is_a_copy_of_the_parent_environment(mod, monkeypatch):
     monkeypatch.setenv("UNSLOTH_CHILD_ENV_CANARY", "kept")
     env = mod._converter_child_env()
     assert env["UNSLOTH_CHILD_ENV_CANARY"] == "kept"
-    # An env built from scratch would strip PATH and break the child outright.
     assert "PATH" in env
     assert env is not os.environ
 
@@ -141,7 +126,6 @@ def test_importable_gguf_py_accepts_a_real_package(mod, tmp_path):
 
 
 def test_importable_gguf_py_rejects_a_dir_without_the_package(mod, tmp_path):
-    # A gguf-py directory can exist and hold no importable gguf at all.
     _make_gguf_py(tmp_path, package=False)
     assert mod._importable_gguf_py(str(tmp_path)) is None
 
@@ -163,8 +147,6 @@ def test_module_level_imports_are_certain(mod):
 
 
 def test_class_body_attribute_chains_are_certain(mod):
-    # conversion/gemma.py does exactly this, and it brings the converter down on
-    # import, so it must count as a hard requirement.
     source = b"import gguf\nclass Gemma4Model:\n    model_arch = gguf.MODEL_ARCH.GEMMA4\n"
     certain, _ = mod._gguf_requirements_from_source(source)
     assert "gguf.MODEL_ARCH.GEMMA4" in certain
@@ -185,10 +167,7 @@ def test_try_guarded_requirements_are_advisory(mod):
 
 
 def test_type_checking_imports_are_advisory(mod):
-    """`if TYPE_CHECKING: from gguf... import X` is the documented way to import a name for
-    annotations only, and the branch is False at run time: the import never executes, so a
-    gguf without X still imports the module. Counting it as certain made a working converter
-    look unusable and could repin or abandon it over a symbol nothing reads."""
+    """A TYPE_CHECKING branch never executes, so its imports are advisory."""
     source = (
         b"from typing import TYPE_CHECKING\n"
         b"if TYPE_CHECKING:\n"
@@ -198,7 +177,6 @@ def test_type_checking_imports_are_advisory(mod):
     assert "gguf.future.TypeOnly" in advisory
     assert not certain
 
-    # Every spelling the converters use, plus the literal that means the same thing.
     for test in (b"typing.TYPE_CHECKING", b"t.TYPE_CHECKING", b"False"):
         certain, advisory = mod._gguf_requirements_from_source(
             b"if " + test + b":\n    from gguf.future import TypeOnly\n"
@@ -206,7 +184,7 @@ def test_type_checking_imports_are_advisory(mod):
         assert "gguf.future.TypeOnly" in advisory, test
         assert not certain, test
 
-    # The ELSE branch is the one that really runs, so it stays certain.
+    # The ELSE branch really runs, so it stays certain.
     source = (
         b"if TYPE_CHECKING:\n"
         b"    from gguf.future import TypeOnly\n"
@@ -217,17 +195,12 @@ def test_type_checking_imports_are_advisory(mod):
     assert "gguf.vocab.Real" in certain
     assert "gguf.future.TypeOnly" in advisory
 
-    # An ordinary guard runs AT MOST ONE of its branches, so neither is certainly evaluated.
-    # This used to keep the eager reading, which is the wrong direction for this scan: a
-    # symbol only the inactive branch reads could pin a different gguf, or replace a converter
-    # that works perfectly well with an older fallback. The platform and version guards at the
-    # top of a converter are exactly this shape.
+    # An ordinary guard runs AT MOST ONE branch, so neither is certain.
     source = b"import os\nif os.environ.get('X'):\n    from gguf.vocab import Real\n"
     certain, advisory = mod._gguf_requirements_from_source(source)
     assert "gguf.vocab.Real" not in certain
     assert "gguf.vocab.Real" in advisory
 
-    # Both arms of one, so neither can be blamed for the other.
     source = (
         b"import sys\n"
         b"if sys.platform == 'win32':\n"
@@ -239,7 +212,7 @@ def test_type_checking_imports_are_advisory(mod):
     assert not certain, certain
     assert {"gguf.vocab.WindowsOnly", "gguf.vocab.PosixOnly"} <= set(advisory)
 
-    # The TEST is evaluated whichever way it goes, so a gguf symbol inside it stays certain.
+    # The TEST is evaluated either way, so a gguf symbol inside it stays certain.
     source = b"import gguf\nif gguf.HAS_FEATURE:\n    X = 1\n"
     certain, _ = mod._gguf_requirements_from_source(source)
     assert "gguf.HAS_FEATURE" in certain, certain
@@ -266,15 +239,14 @@ def test_conversion_package_is_scanned_only_when_imported(mod, tmp_path):
     certain, _ = mod._converter_gguf_requirements(str(package_entry))
     assert "gguf.vocab.MistralTokenizerType" in certain
 
-    # A monolith entrypoint does not import conversion/, so a package left beside
-    # it by a newer install places no requirement on it.
+    # A monolith entrypoint does not import conversion/, so it places no requirement on it.
     monolith_entry = tmp_path / "monolith_entry.py"
     monolith_entry.write_text("import gguf\n")
     certain, _ = mod._converter_gguf_requirements(str(monolith_entry))
     assert "gguf.vocab.MistralTokenizerType" not in certain
 
 
-# --- architecture scoping of the requirement scan conversion/__init__.py imports base.py eagerly and then, through get_model_class, the ONE module the architecture maps to. load_all_models imports the rest inside a per-module `try/except Exception` that only warns, and the entrypoint does not call it. So another architecture's module cannot break this conversion, and counting its names as certain would abandon a working converter for an older one. ---
+# --- architecture scoping of the requirement scan ---
 
 def _make_conversion_tree(tmp_path):
     """An entrypoint plus a conversion/ package shaped like llama.cpp's own."""
@@ -291,8 +263,6 @@ def _make_conversion_tree(tmp_path):
         }
     """))
     (conversion / "base.py").write_text("import gguf\nBASE = gguf.Metadata\n")
-    # The module this export needs, and an unrelated one that names a symbol the
-    # installed gguf-py does not have.
     (conversion / "gemma.py").write_text(
         "import gguf\n\nclass G:\n    model_arch = gguf.MODEL_ARCH.GEMMA3\n"
     )
@@ -312,7 +282,7 @@ def test_only_this_architectures_conversion_module_is_a_certain_requirement(mod,
     )
     assert "gguf.MODEL_ARCH.GEMMA3" in certain
     assert "gguf.Metadata" in certain, "conversion/base.py is imported eagerly"
-    # The load-bearing assertion: another architecture's module is advisory only.
+    # Another architecture's module is advisory only.
     assert "gguf.MODEL_ARCH.AFMOE" not in certain
     assert "gguf.MODEL_ARCH.AFMOE" in advisory
 
@@ -326,8 +296,7 @@ def test_an_mmproj_architecture_resolves_through_the_mmproj_map(mod, tmp_path):
 
 
 def test_an_unknown_architecture_scopes_to_the_eager_modules_only(mod, tmp_path):
-    """The conservative direction: fewer certain names means fewer reasons to
-    switch converters. An MLX-style config with no `architectures` lands here."""
+    """An unknown architecture scopes to the eager modules only."""
     entry = _make_conversion_tree(tmp_path)
     for architecture in (None, "SomethingNobodySupports"):
         certain, advisory = mod._converter_gguf_requirements(str(entry), architecture)
@@ -340,12 +309,8 @@ def test_an_unknown_architecture_scopes_to_the_eager_modules_only(mod, tmp_path)
 def test_an_unrelated_missing_architecture_does_not_switch_converters(
     mod, tmp_path, monkeypatch,
 ):
-    """unsloth#3581 regression, the other direction. A gguf-py one architecture
-    behind on some model nobody is converting must leave the requested converter
-    and the environment exactly as they are, or every export silently downgrades
-    to an older converter whenever upstream adds an architecture."""
-    # Neutralised so only the tree under test is in play; otherwise a complete
-    # bundle on the host rescues the run and the test passes for a second reason.
+    """unsloth#3581: a gguf-py behind on an architecture nobody is converting must
+    leave the requested converter and the environment untouched."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     entry = _make_conversion_tree(tmp_path)
     # MODEL_ARCH knows GEMMA3 but not AFMOE, and AFMOE is not in this export's path.
@@ -357,34 +322,27 @@ def test_an_unrelated_missing_architecture_does_not_switch_converters(
         class MODEL_ARCH:
             GEMMA3 = "gemma3"
     """))
-    # A sibling entrypoint exists, so a wrongly blocked candidate 0 has somewhere
-    # to fall back to; that is exactly the downgrade this test forbids.
+    # A sibling entrypoint exists, so a wrongly blocked candidate 0 could downgrade.
     (tmp_path / "convert_hf_to_gguf.py").write_text("import gguf\n")
 
     chosen, pin, _report = mod._resolve_converter_and_gguf(
         str(entry), sys.executable, "Gemma3ForCausalLM",
     )
     assert chosen == str(entry), "switched converters over an unrelated architecture"
-    # Candidate 0 is the requested pair with the environment untouched, so a
-    # clean verdict there means the launch is byte for byte what it is today.
     assert pin is None
 
 
 def test_a_missing_architecture_on_this_path_still_switches(
     mod, tmp_path, monkeypatch, capsys,
 ):
-    """The complement: when the architecture being converted is the one the
-    installed gguf-py cannot satisfy, falling back is correct and required."""
+    """When the gguf-py cannot satisfy the architecture being converted, falling
+    back is correct."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
-    # The reported host's installed `gguf` wheel does not satisfy the converter
-    # either, which is why the fallback is what has to happen. This runner's does,
-    # so it is pinned out; the case where it satisfies has its own test below.
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     entry = _make_conversion_tree(tmp_path)
     (tmp_path / "gguf-py").mkdir(exist_ok=True)
     pkg = tmp_path / "gguf-py" / "gguf"
     pkg.mkdir(parents=True, exist_ok=True)
-    # No GEMMA3 this time, so the module this export imports cannot load.
     pkg.joinpath("__init__.py").write_text(textwrap.dedent("""
         Metadata = object()
         class MODEL_ARCH:
@@ -397,8 +355,7 @@ def test_a_missing_architecture_on_this_path_still_switches(
         str(entry), sys.executable, "Gemma3ForCausalLM",
     )
     assert chosen == str(sibling)
-    # The announcement names the symbol that stopped this export's own module,
-    # not some unrelated architecture's.
+    # The announcement names the symbol that stopped this export's own module.
     announced = capsys.readouterr().out
     assert "gguf.MODEL_ARCH.GEMMA3" in announced
     assert "gguf.MODEL_ARCH.AFMOE" not in announced
@@ -407,8 +364,7 @@ def test_a_missing_architecture_on_this_path_still_switches(
 def test_the_diagnosis_names_the_symbol_that_actually_stopped_the_import(
     mod, tmp_path, monkeypatch,
 ):
-    """The branch printed missing[:3] of a 147 name architecture list, so it named
-    three irrelevant symbols. Scoped requirements name the real blocker."""
+    """Scoped requirements name the real blocker, not three irrelevant symbols."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     entry = _make_conversion_tree(tmp_path)
     pkg = tmp_path / "gguf-py" / "gguf"
@@ -430,8 +386,7 @@ def test_the_diagnosis_names_the_symbol_that_actually_stopped_the_import(
 # --- the child probe ---
 
 def test_probe_reports_the_tree_the_entrypoint_would_self_locate(mod, tmp_path):
-    """The probe must resolve gguf the way the real run does, i.e. through the
-    entrypoint's own sibling gguf-py, not through `python -c`'s empty sys.path[0]."""
+    """The probe resolves gguf through the entrypoint's own sibling gguf-py."""
     gguf_py = _make_gguf_py(tmp_path, symbols=("Present",), version="0.17.1")
     entry = tmp_path / "convert_hf_to_gguf.py"
     entry.write_text("import gguf\n")
@@ -449,13 +404,9 @@ def test_probe_reports_the_tree_the_entrypoint_would_self_locate(mod, tmp_path):
 
 
 def test_probe_ignores_json_it_did_not_write(mod, tmp_path):
-    """The parent reads the last brace-line of the child's stdout. A converter's
-    imports can print JSON there, and a dict with no `missing` key would read as
-    "nothing missing" -- a perfect score for a candidate nothing ever probed."""
+    """Foreign JSON on the child's stdout must not be read as the probe report."""
     gguf_py = _make_gguf_py(tmp_path, symbols=("Present",))
     entry = tmp_path / "convert_hf_to_gguf.py"
-    # The package prints a stray dict on import, AFTER the probe's own report is
-    # built but on the same stdout.
     (gguf_py / "gguf" / "__init__.py").write_text(
         'Present = object()\nprint("{}")\nprint(\'{"status": "ok"}\')\n'
     )
@@ -469,13 +420,11 @@ def test_probe_ignores_json_it_did_not_write(mod, tmp_path):
     )
     assert report is not None
     assert report.get("unsloth_gguf_probe") == 1
-    # The real answer, not the stray line's silence.
     assert report["missing"] == ["gguf.Absent"]
 
 
 def test_probe_returns_none_when_only_foreign_json_is_printed(mod):
-    """No report of ours means None, which the resolver treats as "could not be
-    asked" and leaves the requested converter alone."""
+    """No report of ours means None, and the resolver leaves the request alone."""
     completed = types.SimpleNamespace(stdout = '{}\n{"missing": []}\n', returncode = 0)
     with mock.patch.object(mod.subprocess, "run", return_value = completed):
         assert mod._probe_child_gguf(sys.executable, dict(os.environ), ("gguf.X",)) is None
@@ -486,12 +435,10 @@ def test_probe_reports_an_unimportable_gguf(mod, tmp_path):
     entry.write_text("import gguf\n")
     env = dict(os.environ)
     env["PYTHONPATH"] = str(tmp_path / "empty")
-    # Isolate the interpreter from any installed gguf.
     env["PYTHONNOUSERSITE"] = "1"
     report = mod._probe_child_gguf(sys.executable, env, ("gguf.Thing",), str(entry))
     assert report is not None
-    # Either gguf is absent (error set) or present from site-packages; both are
-    # valid reports, what matters is that the probe always returns one.
+    # Absent or present, what matters is that the probe always returns a report.
     assert "missing" in report
 
 
@@ -548,18 +495,15 @@ def test_resolver_leaves_a_consistent_install_alone(mod, tmp_path, monkeypatch):
 
     chosen, pin, report = mod._resolve_converter_and_gguf(str(entry), sys.executable)
     assert chosen == str(entry)
-    # No pin: the entrypoint self-locates its own tree exactly as before.
     assert pin is None
     assert "NO_LOCAL_GGUF" not in mod._converter_child_env(pin)
     assert report is not None and not report["missing"]
 
 
 def test_resolver_falls_back_to_the_co_versioned_converter(mod, tmp_path, monkeypatch, capsys):
-    """The reported case: a newer downloaded entrypoint, an older sibling gguf-py,
-    and the checkout's own matching converter sitting right next to it."""
+    """A newer downloaded entrypoint, an older sibling gguf-py, and the checkout's
+    own co-versioned converter beside it."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
-    # Same as above: on the reported host nothing installed satisfies the newer
-    # entrypoint, so the co-versioned converter beside it is the only way out.
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     _make_gguf_py(tmp_path, symbols=("Metadata",), version="0.17.1")
     (tmp_path / "convert_hf_to_gguf.py").write_text("import gguf\nX = gguf.Metadata\n")
@@ -569,14 +513,12 @@ def test_resolver_falls_back_to_the_co_versioned_converter(mod, tmp_path, monkey
     chosen, _pin, _ = mod._resolve_converter_and_gguf(str(newer), sys.executable)
     assert chosen == str(tmp_path / "convert_hf_to_gguf.py")
     message = capsys.readouterr().out
-    # The one switch that changes what produces the GGUF is announced, not silent.
     assert "Falling back" in message
     assert "gguf.SafetensorsLocal" in message
 
 
 def test_resolver_pins_a_satisfying_gguf_py_from_elsewhere(mod, tmp_path, monkeypatch):
-    """No sibling tree, so the entrypoint would fall through to whatever the
-    ambient environment resolves. The installed bundle's tree satisfies it."""
+    """With no sibling tree, the installed bundle's satisfying tree is pinned."""
     bundle = tmp_path / "bundle"
     bundle_gguf_py = _make_gguf_py(bundle, symbols=("Metadata", "SafetensorsLocal"))
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(bundle))
@@ -599,8 +541,7 @@ def test_resolver_pins_a_satisfying_gguf_py_from_elsewhere(mod, tmp_path, monkey
 
 
 def test_resolver_does_not_move_for_an_advisory_miss_only(mod, tmp_path, monkeypatch):
-    """A symbol referenced only inside a function may never be reached, so it must
-    not be allowed to switch a working install onto an older converter."""
+    """An advisory-only miss must not switch a working install onto an older converter."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     _make_gguf_py(tmp_path, symbols=("Metadata",), version="0.17.1")
     (tmp_path / "convert_hf_to_gguf.py").write_text("import gguf\nX = gguf.Metadata\n")
@@ -614,13 +555,8 @@ def test_resolver_does_not_move_for_an_advisory_miss_only(mod, tmp_path, monkeyp
 def test_the_best_candidate_wins_not_the_first_that_clears_the_certain_bar(
     mod, tmp_path, monkeypatch,
 ):
-    """A candidate can satisfy every name that CERTAINLY runs and still fail on
-    one that runs in practice: a `gguf.X` inside a function body of
-    conversion/base.py is advisory by construction yet executes on every
-    conversion (`gguf.LazyChunkedTensor` is exactly this). Taking the first
-    candidate that cleared the certain bar picked such a tree over a genuinely
-    co-versioned one, and the export then died anyway.
-    """
+    """A candidate can clear every certain name and still fail on an advisory one
+    that runs in practice, so the best candidate must win, not the first."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     conversion = tmp_path / "conversion"
     conversion.mkdir()
@@ -641,12 +577,12 @@ def test_the_best_candidate_wins_not_the_first_that_clears_the_certain_bar(
         "from conversion import get_model_class\nimport gguf\nE = gguf.OnlyNew\n"
     )
 
-    # The requested pair: missing a certain name, so candidate 0 is out.
+    # Missing a certain name, so candidate 0 is out.
     _make_gguf_py(tmp_path, symbols=("Metadata",))
-    # A plausible tree: clears every certain name but not the advisory one.
+    # Clears every certain name but not the advisory one.
     plausible = tmp_path / "plausible"
     _make_gguf_py(plausible, symbols=("Metadata", "OnlyNew"))
-    # A co-versioned tree: clears everything.
+    # Clears everything.
     coversioned = tmp_path / "coversioned"
     _make_gguf_py(coversioned, symbols=("Metadata", "OnlyNew", "RunsInPractice"))
 
@@ -684,7 +620,7 @@ def test_resolver_keeps_the_request_when_nothing_satisfies_it(mod, tmp_path, mon
     "ModuleNotFoundError: No module named 'gguf'",
 ])
 def test_skew_signatures_are_recognised(mod, text):
-    """These three name a gguf module outright, so no requirement list is needed."""
+    """These name a gguf module outright, so no requirement list is needed."""
     assert mod._looks_like_gguf_skew(text) is True
 
 
@@ -713,9 +649,8 @@ def test_an_attribute_error_on_a_required_gguf_class_is_skew(mod):
 
 
 def test_an_attribute_error_on_a_model_side_class_is_not_skew(mod):
-    """The converter is named convert_hf_to_gguf.py and logs `INFO:gguf.gguf_writer:`,
-    so "gguf" appears in every failure's output. Without this the user is told to
-    delete their llama.cpp folder over a bug in their model."""
+    """"gguf" appears in every failure's output, so a model-side AttributeError must
+    not be diagnosed as skew."""
     text = (
         "INFO:gguf.gguf_writer:gguf: This GGUF file is for Little Endian only\n"
         "AttributeError: type object 'Gemma3Config' has no attribute 'rope_local'"
@@ -749,8 +684,7 @@ def test_report_summary_handles_every_shape(mod):
     assert mod._gguf_report_summary(None, ()) == "reason unknown"
     assert "not importable" in mod._gguf_report_summary({"error": "ImportError: x"}, ())
     assert mod._gguf_report_summary({"missing": ["gguf.A"]}, ["gguf.B"]) == "missing gguf.B"
-    # Only the blocking subset is named: an advisory miss cannot be the reason,
-    # so reporting it would point at the wrong symbol.
+    # Only the blocking subset is named.
     assert mod._gguf_report_summary({"missing": ["gguf.A"]}, ()) == "reason unknown"
     assert mod._gguf_report_summary({"missing": []}, ()) == "reason unknown"
 
@@ -758,15 +692,14 @@ def test_report_summary_handles_every_shape(mod):
 # --- wiring ---
 
 def test_every_converter_launch_passes_an_explicit_env(mod):
-    """Regression guard: a launch site without env= silently reintroduces the bug."""
+    """A launch site without env= silently reintroduces the bug."""
     import inspect
     source = inspect.getsource(mod.convert_to_gguf)
     assert "_resolve_converter_and_gguf(" in source
     runs = [line for line in source.splitlines() if "subprocess.run(command" in line]
     assert runs, "no converter launch found"
     assert source.count("env=_converter_child_env(_gguf_py_pin)") == len(runs)
-    # The env must be built at launch time, never frozen at preflight time, or a
-    # later edit to os.environ (save.py's token boundary) would be dropped.
+    # Built at launch time, never frozen at preflight time.
     assert "_converter_env =" not in source
 
 
@@ -775,8 +708,7 @@ def test_failure_path_attaches_the_diagnosis(mod):
     source = inspect.getsource(mod.convert_to_gguf)
     assert "_looks_like_gguf_skew(" in source
     assert "_gguf_skew_diagnosis(" in source
-    # The requirement list is what keeps a model-side AttributeError from
-    # collecting the skew advice, so the call must pass one.
+    # The requirement list keeps a model-side AttributeError out of the skew advice.
     assert "_looks_like_gguf_skew(captured)" not in source
 
 
@@ -787,9 +719,8 @@ _MODEL = Path(os.environ.get("UNSLOTH_TEST_GGUF_MODEL") or os.devnull)
 
 
 def _staged(root, name):
-    # Path.is_file() only swallows ENOENT/ENOTDIR/EBADF/ELOOP; an unreadable
-    # parent raises EACCES, which at module scope would fail collection of the
-    # whole file rather than skip this one test.
+    # An unreadable parent raises EACCES, which at module scope would fail
+    # collection of the whole file rather than skip this one test.
     try:
         return (root / name).is_file()
     except OSError:
@@ -801,8 +732,8 @@ def _staged(root, name):
     reason="set UNSLOTH_TEST_LLAMACPP_DIR and UNSLOTH_TEST_GGUF_MODEL to run this",
 )
 def test_end_to_end_conversion_survives_a_stale_ambient_gguf(mod, tmp_path, monkeypatch):
-    """A stale gguf on PYTHONPATH used to decide the child's import. With the
-    bundle's tree pinned, the conversion completes."""
+    """With the bundle's tree pinned, a stale gguf on PYTHONPATH does not decide
+    the child's import."""
     import shutil
 
     scripts = tmp_path / "scripts"
@@ -829,14 +760,13 @@ def test_end_to_end_conversion_survives_a_stale_ambient_gguf(mod, tmp_path, monk
     )
     assert files and Path(files[0]).is_file()
     assert Path(files[0]).stat().st_size > 1024 * 1024
-    # And the stale tree is still first on the parent's PYTHONPATH, so success
+    # The stale tree is still first on the parent's PYTHONPATH, so success
     # can only have come from the pin.
     assert os.environ["PYTHONPATH"] == str(stale / "gguf-py")
 
 
 def test_the_preflight_returns_a_pin_not_a_frozen_environment(mod, tmp_path, monkeypatch):
-    """Guard the contract the launch sites rely on: a directory (or None), so the
-    environment is assembled from the live os.environ at launch."""
+    """The preflight returns a directory or None, never a frozen environment."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     _make_gguf_py(tmp_path, symbols=("Metadata",))
     entry = tmp_path / "unsloth_convert_hf_to_gguf.py"
@@ -845,16 +775,13 @@ def test_the_preflight_returns_a_pin_not_a_frozen_environment(mod, tmp_path, mon
     assert pin is None or isinstance(pin, str)
 
 
-# --- The installed gguf wheel as a candidate (verification pass) ---
+# --- The installed gguf wheel as a candidate ---
 
 def test_the_installed_gguf_wheel_is_used_when_the_sibling_tree_is_too_old(
     mod, tmp_path, monkeypatch, capsys,
 ):
-    """Someone who upgraded the `gguf` wheel past their llama.cpp checkout has a
-    satisfying gguf already installed, but the entrypoint's own
-    `sys.path.insert(1, <sibling gguf-py>)` puts the old tree first, so it never
-    gets used. The resolver must pin it and keep the newer converter rather than
-    dropping back to an older one."""
+    """An installed wheel newer than the sibling tree must be pinned, keeping the
+    newer converter rather than dropping back to an older one."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     wheel = _make_gguf_py(tmp_path / "site-packages", symbols=("Metadata", "SafetensorsLocal"))
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *a, **kw: str(wheel))
@@ -875,8 +802,7 @@ def test_the_installed_gguf_wheel_is_used_when_the_sibling_tree_is_too_old(
 def test_the_installed_wheel_is_not_probed_when_the_request_already_works(
     mod, tmp_path, monkeypatch,
 ):
-    """The extra probe is a subprocess. An install that already works must not pay
-    for it."""
+    """The extra probe is a subprocess, and a working install must not pay for it."""
     called = {"hit": False}
     def _trap(*args, **kwargs):
         called["hit"] = True
@@ -884,12 +810,8 @@ def test_the_installed_wheel_is_not_probed_when_the_request_already_works(
     monkeypatch.setattr(mod, "_installed_gguf_tree", _trap)
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
 
-    # The converter gets its own sibling gguf-py carrying the symbol it needs, which
-    # is the tree every llama.cpp entrypoint puts on sys.path ahead of anything else.
-    # Without it this test asserts on whatever `gguf` the developer's venv happens to
-    # ship: in an environment with no `gguf` wheel the requested pair does NOT work,
-    # the resolver legitimately reaches for the installed tree, and the assertion
-    # below fails for a reason that has nothing to do with the behaviour under test.
+    # Its own sibling gguf-py, so this does not assert on whatever `gguf` the
+    # developer's venv happens to ship.
     _make_gguf_py(tmp_path, symbols=("GGUFWriter",))
 
     converter = tmp_path / "convert_hf_to_gguf.py"
@@ -901,8 +823,8 @@ def test_the_installed_wheel_is_not_probed_when_the_request_already_works(
 
 
 def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tmp_path):
-    """The tree is whatever the CHILD resolves with the sibling tree suppressed, and
-    it is only accepted when a real package sits inside it."""
+    """The tree is what the CHILD resolves with the sibling tree suppressed, and only
+    when a real package sits inside it."""
     captured = {}
     tree = tmp_path / "site-packages"
     (tree / "gguf").mkdir(parents=True)
@@ -926,12 +848,8 @@ def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tm
 
 
 def test_signature_expressions_are_certain(mod):
-    """A default, a decorator and an annotation are evaluated while the module is IMPORTED.
-
-    `def convert(kind = gguf.NEW_KIND)` fails on import exactly like a module-level
-    expression would, so classifying it as advisory let `_resolve_converter_and_gguf` keep a
-    baseline package that cannot run the converter at all.
-    """
+    """A default, a decorator and an annotation are evaluated while the module is
+    IMPORTED, so they are certain."""
     source = (
         b"import gguf\n"
         b"@gguf.register\n"
@@ -943,9 +861,8 @@ def test_signature_expressions_are_certain(mod):
     assert "gguf.NEW_KIND" in certain
     assert "gguf.MODE.FAST" in certain
     if sys.version_info < (3, 14):
-        # PEP 649 defers this one from 3.14 on, which the next tests pin directly.
+        # PEP 649 defers this one from 3.14 on.
         assert "gguf.Result" in certain
-    # The body is still advisory: it may never run.
     assert "gguf.MODEL_ARCH.MAYBE" in advisory
     assert "gguf.MODEL_ARCH.MAYBE" not in certain
 
@@ -958,8 +875,7 @@ def test_a_lambda_default_is_certain_and_its_body_is_not(mod):
 
 
 def test_postponed_annotations_are_not_evaluated(mod):
-    """PEP 563 makes every annotation a string, so an annotation naming a symbol that is
-    not there costs nothing at import time. A default still does."""
+    """PEP 563 annotations cost nothing at import time. A default still does."""
     source = (
         b"from __future__ import annotations\n"
         b"import gguf\n"
@@ -971,12 +887,10 @@ def test_postponed_annotations_are_not_evaluated(mod):
     assert "gguf.Result" not in certain
 
 
-# --- PEP 649. From 3.14 an annotation is compiled into a lazily built `__annotate__` rather than evaluated in the signature, with no future import needed, so the interpreter version decides this and not just the file's own imports. The version tested is this one because the child is `[sys.executable, converter]`. ---
+# --- PEP 649: from 3.14 an annotation is deferred with no future import needed ---
 
 def test_an_annotation_is_deferred_on_314_without_the_future_import(mod, monkeypatch):
-    """No `from __future__ import annotations`, yet on 3.14 the return annotation
-    is never evaluated at import. Calling it certain makes the resolver reject a
-    gguf package that would in fact run the converter."""
+    """On 3.14 the return annotation is never evaluated at import."""
     source = (
         b"import gguf\n"
         b"def convert(kind = gguf.NEW_KIND) -> gguf.Result:\n"
@@ -989,8 +903,7 @@ def test_an_annotation_is_deferred_on_314_without_the_future_import(mod, monkeyp
 
 
 def test_the_same_annotation_is_eager_on_313(mod, monkeypatch):
-    """The negative half: below 3.14 the annotation really does run at import, so
-    the version test must not have simply turned annotations off everywhere."""
+    """Below 3.14 the annotation really does run at import."""
     source = (
         b"import gguf\n"
         b"def convert(kind = gguf.NEW_KIND) -> gguf.Result:\n"
@@ -1014,7 +927,7 @@ def test_an_argument_annotation_is_deferred_on_314(mod, monkeypatch):
 
 
 def test_a_decorator_is_still_certain_on_314(mod, monkeypatch):
-    """PEP 649 defers annotations and nothing else. A decorator still runs."""
+    """PEP 649 defers annotations and nothing else."""
     source = (
         b"import gguf\n"
         b"@gguf.register\n"
@@ -1027,7 +940,7 @@ def test_a_decorator_is_still_certain_on_314(mod, monkeypatch):
 
 
 def test_a_signature_under_a_try_is_still_advisory(mod):
-    """The try is the guard, and it covers what is inside it, signature included."""
+    """The try covers what is inside it, signature included."""
     source = (
         b"import gguf\n"
         b"try:\n"
@@ -1042,11 +955,7 @@ def test_a_signature_under_a_try_is_still_advisory(mod):
 
 
 def _make_older_sibling_converter(tmp_path, *, maps_the_architecture, mmproj_only = False):
-    """A checkout's own package-based converter, co-versioned with the sibling gguf-py.
-
-    Its maps are what decide whether it can convert this model at all, and a converter that
-    predates the architecture maps it to nothing.
-    """
+    """A checkout's own package-based converter, co-versioned with the sibling gguf-py."""
     conversion = tmp_path / "conversion"
     conversion.mkdir(exist_ok = True)
     mapped = '"Gemma3ForCausalLM": "gemma",' if maps_the_architecture else ""
@@ -1074,12 +983,8 @@ def _make_older_sibling_converter(tmp_path, *, maps_the_architecture, mmproj_onl
 def test_a_fallback_that_cannot_convert_this_architecture_is_not_taken(
     mod, tmp_path, monkeypatch, capsys,
 ):
-    """A converter that predates the architecture maps it to nothing, so the requirement scan
-    sees only the two eager modules and the candidate ranks as missing nothing certain -- a
-    perfect match for a model it cannot convert at all. The support check that would catch it
-    reads the arch sets of the converter that was REQUESTED, not of the one substituted in, so
-    the export would have died on "unsupported model" instead of on the gguf skew it really
-    has."""
+    """A candidate that ranks as missing nothing certain but cannot convert this
+    architecture at all must not be substituted in."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     _make_gguf_py(tmp_path, symbols = ("Metadata",), version = "0.17.1")
@@ -1097,8 +1002,7 @@ def test_a_fallback_that_cannot_convert_this_architecture_is_not_taken(
 def test_a_fallback_that_does_map_this_architecture_is_still_taken(
     mod, tmp_path, monkeypatch, capsys,
 ):
-    """The control, and the behaviour the fallback exists for: the same shape with the
-    architecture mapped is chosen exactly as before."""
+    """The control: the same shape with the architecture mapped is still chosen."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     _make_gguf_py(tmp_path, symbols = ("Metadata",), version = "0.17.1")
@@ -1114,13 +1018,9 @@ def test_a_fallback_that_does_map_this_architecture_is_still_taken(
 
 
 def test_the_architecture_check_only_refuses_on_evidence(mod, tmp_path):
-    """Everything that is not a readable map without this architecture in it is left alone: a
-    monolith entrypoint dispatches by class registration rather than by these maps, a package
-    beside it is not its dispatch table, an unreadable __init__.py is a failure to look, and no
-    architecture to check is not a question."""
+    """Only a readable map without this architecture in it counts as a refusal."""
     monolith = tmp_path / "unsloth_convert_hf_to_gguf.py"
     monolith.write_text("import gguf\nX = gguf.Metadata\n")
-    # A package in the same directory, which is where every sibling candidate lives.
     packaged = _make_older_sibling_converter(tmp_path, maps_the_architecture = False)
     assert mod._converter_maps_architecture(str(monolith), "Gemma3ForCausalLM") is True
     assert mod._converter_maps_architecture(str(monolith), None) is True
@@ -1131,27 +1031,16 @@ def test_the_architecture_check_only_refuses_on_evidence(mod, tmp_path):
 
 
 def test_a_fallback_that_maps_this_architecture_in_the_wrong_half_is_refused(mod, tmp_path):
-    """The two maps are not interchangeable.
-
-    TEXT_MODEL_MAP dispatches the text conversion, which every export runs; MMPROJ_MODEL_MAP
-    dispatches the projector a VLM export adds. A fallback that names the architecture only in
-    the projector map cannot run the text half at all, and presence in EITHER map used to
-    approve it.
-
-    Asserted on the predicate rather than through a resolver run, because every sibling
-    candidate lives in the requested converter's own directory and therefore reads the SAME
-    conversion package: a divergence between two converters' maps cannot be built there, and
-    a test that pretended otherwise would be testing the fixture.
-    """
+    """The two maps are not interchangeable: presence in EITHER used to approve a
+    fallback. Asserted on the predicate because every sibling candidate reads the
+    SAME conversion package, so two diverging maps cannot be built."""
     _make_older_sibling_converter(
         tmp_path, maps_the_architecture = True, mmproj_only = True
     )
     projector_only = tmp_path / "convert_hf_to_gguf.py"
-    # The half the export needs is the half this candidate does not have.
     assert mod._converter_maps_architecture(
         str(projector_only), "Gemma3ForCausalLM", {"TEXT_MODEL_MAP"}
     ) is False
-    # And it does serve the projector half, so a request that needs only that one is fine.
     assert mod._converter_maps_architecture(
         str(projector_only), "Gemma3ForCausalLM", {"MMPROJ_MODEL_MAP"}
     ) is True
@@ -1163,7 +1052,7 @@ def test_a_fallback_that_maps_this_architecture_in_the_wrong_half_is_refused(mod
 
 
 def test_the_required_halves_are_read_off_the_requested_converter(mod, tmp_path):
-    """And they are the halves that architecture really has, not a guess."""
+    """The halves that architecture really has, not a guess."""
     _make_older_sibling_converter(tmp_path, maps_the_architecture = True)
     packaged = tmp_path / "convert_hf_to_gguf.py"
     assert mod._converter_architecture_maps(str(packaged), "Gemma3ForCausalLM") == {
@@ -1204,8 +1093,7 @@ def _make_dual_mapped_tree(tmp_path):
 
 def test_a_text_only_export_does_not_require_the_projector_module(mod, tmp_path):
     """A text-only conversion never imports the projector module, so a symbol only
-    that module names must not count as certain. Counting it let a projector-only
-    miss move a working text conversion onto a different converter."""
+    that module names is not certain."""
     entry = _make_dual_mapped_tree(tmp_path)
     arch = "DualForConditionalGeneration"
 
@@ -1225,9 +1113,7 @@ def test_a_text_only_export_does_not_require_the_projector_module(mod, tmp_path)
 
 
 def test_a_text_only_fallback_is_not_rejected_for_lacking_a_projector_map(mod, tmp_path):
-    """`_converter_architecture_maps` says which halves a fallback must serve. For a
-    text-only call that is the text map alone, so a converter mapping the
-    architecture only there is a valid fallback rather than a discarded one."""
+    """For a text-only call, the text map alone is the half a fallback must serve."""
     entry = _make_dual_mapped_tree(tmp_path)
     arch = "DualForConditionalGeneration"
 
@@ -1236,7 +1122,6 @@ def test_a_text_only_fallback_is_not_rejected_for_lacking_a_projector_map(mod, t
         "TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP",
     }
 
-    # A fallback that maps the architecture for text only.
     fallback_dir = tmp_path / "fallback"
     (fallback_dir / "conversion").mkdir(parents=True)
     (fallback_dir / "conversion" / "__init__.py").write_text(
@@ -1247,15 +1132,13 @@ def test_a_text_only_fallback_is_not_rejected_for_lacking_a_projector_map(mod, t
     fallback.write_text("from conversion import get_model_class\nimport gguf\n")
 
     assert mod._converter_maps_architecture(str(fallback), arch, {"TEXT_MODEL_MAP"})
-    # and is correctly refused when the projector half is genuinely needed
     assert not mod._converter_maps_architecture(
         str(fallback), arch, {"TEXT_MODEL_MAP", "MMPROJ_MODEL_MAP"},
     )
 
 
 def test_the_conversion_is_resolved_after_the_vlm_downgrade(mod):
-    """The downgrade to text-only must happen BEFORE the resolver runs, or the
-    resolver scopes to halves the conversion will not convert."""
+    """The downgrade to text-only must happen BEFORE the resolver runs."""
     import ast, inspect
     tree = ast.parse(inspect.getsource(mod.convert_to_gguf))
     downgrade_line = resolve_line = None
@@ -1270,15 +1153,10 @@ def test_the_conversion_is_resolved_after_the_vlm_downgrade(mod):
     assert downgrade_line < resolve_line, "is_vlm is downgraded after the resolver ran"
 
 
-# --- A module-level `finally` runs on every path, so it is not guarded. ---
+# --- A module-level `finally` runs on every path, so it is not guarded ---
 
 def test_a_module_level_finally_is_certain(mod):
-    """`try` bodies and handlers are advisory because they may be probing for a
-    symbol on purpose. A `finally` is not like that: it runs on every path through
-    the statement, so at module level a gguf name it reads makes the import fail if
-    the name is absent. Demoting it with the rest reported such a name as merely
-    advisory, and the resolver then kept an incompatible baseline rather than
-    probing a pin that would have worked."""
+    """A `finally` runs on every path, so at module level its gguf names are certain."""
     certain, advisory = mod._gguf_requirements_from_source(
         b"import gguf\ntry:\n    pass\nfinally:\n    x = gguf.InFinally\n"
     )
@@ -1292,17 +1170,14 @@ def test_a_module_level_finally_is_certain(mod):
     ("else",      b"import gguf\ntry:\n    pass\nexcept Exception:\n    pass\nelse:\n    x = gguf.InElse\n", "gguf.InElse"),
 ])
 def test_the_other_try_parts_stay_advisory(mod, label, source, name):
-    """The demotion the finally change must not have widened: a body may be probing,
-    a handler runs only if something was missing, and an else runs only if nothing
-    was raised. None of the three is certain."""
+    """The finally change must not have widened: none of these three is certain."""
     certain, advisory = mod._gguf_requirements_from_source(source)
     assert name in advisory, label
     assert name not in certain, label
 
 
 def test_a_finally_inside_a_function_body_is_still_advisory(mod):
-    """The function body demotes first, and a finally inside it does not run at
-    import time at all."""
+    """The function body demotes first: a finally inside it never runs at import."""
     certain, advisory = mod._gguf_requirements_from_source(
         b"import gguf\ndef f():\n    try:\n        pass\n    finally:\n        x = gguf.InFnFinally\n"
     )
