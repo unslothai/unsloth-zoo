@@ -1773,3 +1773,84 @@ def test_image_processor_rebuild_uses_mlx_vlm_module_class(monkeypatch, tmp_path
     )
     assert isinstance(built, EdgeImageProcessor)
     assert built.size == 224
+
+
+def test_gguf_export_lets_an_incomplete_install_reach_the_staged_resolver(
+    monkeypatch, tmp_path
+):
+    """A shim install missing conversion/ must not be pinned as authoritative.
+
+    Pinning it is what makes the resolver skip staging and abort, which is the
+    pre-split install this change exists to repair."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    seen = {}
+
+    llama_root = tmp_path / "llama.cpp"
+    (llama_root / "convert_hf_to_gguf.py").write_text(
+        "from conversion import ModelBase, ModelType\n", encoding = "utf-8",
+    )
+
+    def fake_download():
+        seen["env"] = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        patched = llama_root / "unsloth_convert_hf_to_gguf.py"
+        patched.write_text("# patched", encoding = "utf-8")
+        return str(patched), {"LlamaForCausalLM"}, set()
+
+    monkeypatch.setattr(llama_cpp, "_download_convert_hf_to_gguf", fake_download)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
+
+    model = types.SimpleNamespace(_hf_repo = "org/IncompleteInstall")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer = object(),
+        save_directory = tmp_path / "out",
+        quantization_method = "not_quantized",
+        first_conversion = "f16",
+    )
+    assert seen["env"] is None, (
+        "the incomplete install was synthesized as an authoritative scripts dir, so "
+        "the staged resolver was never reached and the export aborts as `incomplete`"
+    )
+
+
+def test_gguf_export_still_pins_a_complete_install(monkeypatch, tmp_path):
+    """The synthesized pin must survive for installs that can actually convert."""
+    import unsloth_zoo.llama_cpp as llama_cpp
+
+    mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
+    seen = {}
+
+    llama_root = tmp_path / "llama.cpp"
+    (llama_root / "convert_hf_to_gguf.py").write_text(
+        "from conversion import ModelBase, ModelType\n", encoding = "utf-8",
+    )
+    conversion = llama_root / "conversion"
+    conversion.mkdir(parents = True, exist_ok = True)
+    (conversion / "__init__.py").write_text("TEXT_MODEL_MAP = {}\n", encoding = "utf-8")
+    (conversion / "base.py").write_text("class ModelBase:\n    pass\n", encoding = "utf-8")
+
+    def fake_download():
+        seen["env"] = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
+        patched = llama_root / "unsloth_convert_hf_to_gguf.py"
+        patched.write_text("# patched", encoding = "utf-8")
+        return str(patched), {"LlamaForCausalLM"}, set()
+
+    monkeypatch.setattr(llama_cpp, "_download_convert_hf_to_gguf", fake_download)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
+
+    model = types.SimpleNamespace(_hf_repo = "org/CompleteInstall")
+    mutils.save_pretrained_gguf(
+        model,
+        tokenizer = object(),
+        save_directory = tmp_path / "out",
+        quantization_method = "not_quantized",
+        first_conversion = "f16",
+    )
+    assert seen["env"] == str(llama_root), (
+        "a complete install stopped being pinned, so the MLX export can now be "
+        "answered by an unrelated converter"
+    )

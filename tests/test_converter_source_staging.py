@@ -1860,3 +1860,108 @@ def test_a_user_checkout_under_the_cache_root_is_not_written_into(mod, tmp_path,
         "sits under the cache root"
     )
     assert not (checkout / "unsloth_convert_hf_to_gguf.py").exists()
+
+
+def test_reading_the_umask_does_not_mutate_it_for_other_threads(mod, monkeypatch):
+    """The umask read is one-shot: concurrent first writes cannot strand the process at 0."""
+    import threading
+
+    monkeypatched = []
+    real_umask = os.umask
+
+    def _recording_umask(value):
+        monkeypatched.append(value)
+        return real_umask(value)
+
+    mod._PROCESS_UMASK = None
+    try:
+        monkeypatch.setattr(os, "umask", _recording_umask)
+        barrier = threading.Barrier(8)
+        seen = []
+
+        def _worker():
+            barrier.wait()
+            seen.append(mod._process_umask())
+
+        threads = [threading.Thread(target = _worker) for _ in range(8)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+    finally:
+        mod._PROCESS_UMASK = None
+        monkeypatch.undo()
+
+    assert len(set(seen)) == 1, f"threads disagreed about the umask: {set(seen)}"
+    assert len(monkeypatched) == 2, (
+        f"os.umask was called {len(monkeypatched)} times for 8 concurrent readers; "
+        f"every extra pair is a window where another thread can observe 0"
+    )
+    assert real_umask(0) == seen[0], "the process umask was not restored"
+    real_umask(seen[0])
+
+
+def test_an_incomplete_install_is_not_synthesized_as_an_authoritative_pin(mod, tmp_path):
+    """The MLX path must let a shim-without-conversion install reach the staged resolver."""
+    incomplete = _write_source_tree(tmp_path / "incomplete", conversion = False)
+    assert mod._converter_dir_is_incomplete(str(incomplete)), (
+        "a shim entrypoint with no conversion/ beside it is the case staging exists for"
+    )
+
+    complete = _write_source_tree(tmp_path / "complete", conversion = True)
+    assert not mod._converter_dir_is_incomplete(str(complete))
+
+    monolith = _write_source_tree(
+        tmp_path / "monolith", entrypoint = _MONOLITH_ENTRYPOINT, conversion = False,
+    )
+    assert not mod._converter_dir_is_incomplete(str(monolith)), (
+        "a self-contained converter needs no conversion/ and is not incomplete"
+    )
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert not mod._converter_dir_is_incomplete(str(empty)), (
+        "a directory with no converter at all is empty, not incomplete"
+    )
+
+
+def test_an_unusable_prebuilt_marker_is_announced_not_silently_ignored(mod, tmp_path, caplog):
+    """A broken marker must not silently downgrade to 'stage whatever is latest'."""
+    for name, payload in (
+        ("not_json", "{not json at all"),
+        ("not_an_object", '["b7062"]'),
+        ("no_tag", '{"repo": "ggml-org/llama.cpp"}'),
+        ("blank_tag", '{"tag": "   "}'),
+    ):
+        install = tmp_path / name
+        install.mkdir()
+        (install / mod.UNSLOTH_PREBUILT_INFO_FILENAME).write_text(payload)
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            repo, tag = mod._read_prebuilt_marker(str(install))
+        assert (repo, tag) == (None, None)
+        assert any("Ignoring" in r.message for r in caplog.records), (
+            f"a {name} marker was ignored with no warning, so the export silently "
+            f"stops matching the installed binaries"
+        )
+
+    absent = tmp_path / "absent"
+    absent.mkdir()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert mod._read_prebuilt_marker(str(absent)) == (None, None)
+    assert not caplog.records, "an absent marker is normal and must stay silent"
+
+
+def test_the_converter_cache_env_var_is_read_at_the_call_not_at_import(mod, tmp_path, monkeypatch):
+    """Setting the cache root after `import unsloth` must work, as the siblings promise."""
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", raising = False)
+    assert mod._converter_cache_root() == mod.LLAMA_CPP_CONVERTER_CACHE_DIR
+
+    late = tmp_path / "set-after-import"
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", str(late))
+    assert mod._converter_cache_root() == str(late), (
+        "the cache root was frozen at import, so a notebook that sets it in a later "
+        "cell silently keeps staging into the default location"
+    )
+
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", "   ")
+    assert mod._converter_cache_root() == mod.LLAMA_CPP_CONVERTER_CACHE_DIR

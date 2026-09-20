@@ -33,6 +33,7 @@ import errno
 import subprocess
 import sys
 import os
+import threading
 import time
 import re
 import ast
@@ -187,6 +188,15 @@ LLAMA_CPP_CONVERTER_CACHE_DIR = os.environ.get(
     "UNSLOTH_LLAMA_CPP_CONVERTER_CACHE",
     os.path.join(UNSLOTH_HOME, "llama.cpp-converter"),
 )
+
+
+def _converter_cache_root():
+    """Where staged converters live. Read at the call, not at import, so setting
+    UNSLOTH_LLAMA_CPP_CONVERTER_CACHE after `import unsloth` works, which is what
+    the sibling switches already promise and a notebook always does."""
+    return os.environ.get(
+        "UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", "",
+    ).strip() or LLAMA_CPP_CONVERTER_CACHE_DIR
 # conversion/ is absent on purpose: pre-split revisions legitimately have none, so
 # it is required only when the entrypoint imports it (_staged_sources_are_complete).
 _CONVERTER_STAGE_REQUIRED = (
@@ -233,7 +243,7 @@ def _converter_stage_dir(repo, tag):
     identity = f"{repo or ''}\x00{tag or ''}".encode("utf-8", "surrogatepass")
     digest = hashlib.sha256(identity).hexdigest()[:12]
     return os.path.join(
-        LLAMA_CPP_CONVERTER_CACHE_DIR,
+        _converter_cache_root(),
         f"{_safe(str(repo).replace('/', '_'))}@{_safe(tag)}-{digest}",
     )
 
@@ -1127,6 +1137,27 @@ def _select_cpu_assets(tag, assets, manifest):
     ]
 
 
+_UMASK_LOCK = threading.Lock()
+_PROCESS_UMASK = None
+
+
+def _process_umask():
+    """The process umask, read once under a lock.
+
+    Reading it at all means setting it to 0 and putting it back, so two threads
+    doing that concurrently can interleave and leave the process at 0 forever,
+    creating every later file world-writable. Reading it once removes the window
+    after the first call and the lock closes it for the first."""
+    global _PROCESS_UMASK
+    if _PROCESS_UMASK is None:
+        with _UMASK_LOCK:
+            if _PROCESS_UMASK is None:
+                mask = os.umask(0)
+                os.umask(mask)
+                _PROCESS_UMASK = mask
+    return _PROCESS_UMASK
+
+
 def _atomic_write_bytes(path, content):
     """Write `content` to `path` so a concurrent reader never sees a partial file.
 
@@ -1146,8 +1177,7 @@ def _atomic_write_bytes(path, content):
         try:
             os.chmod(staged, os.stat(path).st_mode & 0o7777)
         except OSError:
-            umask = os.umask(0); os.umask(umask)
-            try: os.chmod(staged, 0o666 & ~umask)
+            try: os.chmod(staged, 0o666 & ~_process_umask())
             except OSError: pass
         os.replace(staged, path)
     except BaseException:
@@ -1358,7 +1388,7 @@ def _is_inside_converter_cache(directory):
     Containment alone does not make a directory ours: see _is_converter_stage_dir."""
     if not directory: return False
     try:
-        root = os.path.realpath(LLAMA_CPP_CONVERTER_CACHE_DIR)
+        root = os.path.realpath(_converter_cache_root())
         here = os.path.realpath(directory)
     except OSError:
         return False
@@ -1586,19 +1616,36 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
         shutil.rmtree(staging, ignore_errors = True)
 
 
+def _unusable_prebuilt_marker(marker, why):
+    logger.warning(
+        f"Unsloth: Ignoring `{marker}` because {why}, so the GGUF converter cannot be "
+        f"matched to the llama.cpp binaries installed beside it and the latest release "
+        f"will be staged instead. Set UNSLOTH_LLAMA_CPP_CONVERTER_TAG to pin a revision."
+    )
+    return None, None
+
+
 def _read_prebuilt_marker(install_folder):
     """The prebuilt marker's (repo, tag), or (None, None), so the converter can be
-    staged from the same revision as the quantizer it will feed."""
+    staged from the same revision as the quantizer it will feed.
+
+    A marker that is present but unusable is announced rather than collapsed into
+    the absent case: falling through stages the latest release instead, which
+    silently abandons the match with the installed binaries that is the whole
+    point of reading this."""
+    marker = os.path.join(install_folder, UNSLOTH_PREBUILT_INFO_FILENAME)
     try:
-        with open(os.path.join(install_folder, UNSLOTH_PREBUILT_INFO_FILENAME), "r", encoding = "utf-8") as f:
+        with open(marker, "r", encoding = "utf-8") as f:
             info = json.load(f)
-    except (OSError, ValueError):
+    except OSError:
         return None, None
+    except ValueError:
+        return _unusable_prebuilt_marker(marker, "it is not valid JSON")
     if not isinstance(info, dict):
-        return None, None
+        return _unusable_prebuilt_marker(marker, "its top level is not an object")
     tag = info.get("tag")
     if not isinstance(tag, str) or not tag.strip():
-        return None, None
+        return _unusable_prebuilt_marker(marker, "it names no `tag`")
     repo = info.get("repo")
     if not isinstance(repo, str) or not repo.strip():
         repo = "ggml-org/llama.cpp"
@@ -2359,6 +2406,24 @@ def _detect_converter_layout(entry_content_bytes, llama_cpp_dir):
 pass
 
 
+def _converter_dir_is_incomplete(llama_cpp_dir):
+    """Whether this directory holds a converter that cannot run as it stands.
+
+    True only on positive evidence: an entrypoint is there, it imports conversion/,
+    and that package is not beside it. A directory with no converter at all is not
+    incomplete, it is empty, and the caller decides that separately."""
+    for filename in LLAMA_CPP_CONVERTER_FILENAMES:
+        entry = os.path.join(llama_cpp_dir, filename)
+        try:
+            with open(entry, "rb") as f:
+                content = f.read()
+        except OSError:
+            continue
+        if _detect_converter_layout(content, llama_cpp_dir) == "incomplete":
+            return True
+    return False
+
+
 def _extract_dict_keys_from_conversion_init(conv_init_path, dict_name):
     """AST-parse conversion/__init__.py for TEXT_MODEL_MAP / MMPROJ_MODEL_MAP
     keys. Used as the arch allowlist on the new layout, where
@@ -2596,7 +2661,7 @@ def _writable_stage(stage_dir, repo, tag):
     if stage_dir is None: return None
     if os.access(stage_dir, os.W_OK): return stage_dir
     default_root = os.path.join(UNSLOTH_HOME, "llama.cpp-converter")
-    if os.path.abspath(default_root) == os.path.abspath(LLAMA_CPP_CONVERTER_CACHE_DIR):
+    if os.path.abspath(default_root) == os.path.abspath(_converter_cache_root()):
         logger.warning(
             f"Unsloth: The staged converter sources at {stage_dir} are not writable "
             f"and there is no other cache root to copy them to. Point "

@@ -18051,6 +18051,7 @@ def save_pretrained_gguf(
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
+        _converter_dir_is_incomplete,
     )
 
     quant_map = {
@@ -18228,9 +18229,14 @@ def save_pretrained_gguf(
             # UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG,
             # so synthesizing it unconditionally made that escape hatch inert here.
             # A real user override still wins: it is already set, so this is skipped.
-            _synthesize = old_scripts_dir is None and not os.environ.get(
-                "UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "",
-            ).strip()
+            # An install whose entrypoint imports conversion/ without that package
+            # on disk is excluded too: pinning it as authoritative is what stops the
+            # staged resolver from repairing the very install this change is for.
+            _synthesize = (
+                old_scripts_dir is None
+                and not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
+                and not _converter_dir_is_incomplete(llama_cpp_folder)
+            )
             if _synthesize:
                 os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
             try:
