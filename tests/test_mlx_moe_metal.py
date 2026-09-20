@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import functools
+import gc
 import sys
 import threading
 from types import FunctionType, SimpleNamespace
@@ -185,6 +186,66 @@ def test_packing_that_fails_partway_leaves_every_module_native(native, monkeypat
         assert type(module) is native.SwitchGLU
         assert set(module.__dict__) == keys
         _equal(module(x, indices), answer)
+
+
+def _cache_limit():
+    current = mx.set_cache_limit(0)
+    mx.set_cache_limit(current)
+    return current
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_retains_nothing_it_replaces(native, monkeypatch):
+    """Cached rather than returned, the replaced arrays are a second copy of the packed half of
+    the model."""
+    modules = [_model(native) for _ in range(4)]
+    root = nn.Sequential(*modules)
+    root.eval()
+    one_layer = max(
+        sum(module.gate_proj[name].nbytes + module.up_proj[name].nbytes
+            for name in fusion._MOE_PROJECTION_FIELDS if module.gate_proj.get(name) is not None)
+        for module in modules
+    )
+
+    footprints = []
+    attach = fusion._PackedMoEGateUp.attach
+
+    def record(self):
+        attach(self)
+        footprints.append(mx.get_active_memory() + mx.get_cache_memory())
+
+    monkeypatch.setattr(fusion._PackedMoEGateUp, "attach", record)
+    gc.collect()
+    mx.clear_cache()
+    # room for every layer, so no inherited limit explains a flat footprint
+    previous_limit = mx.set_cache_limit(8 * one_layer)
+    try:
+        before = mx.get_active_memory() + mx.get_cache_memory()
+        with fused_moe_gate_up(root):
+            end = mx.get_active_memory() + mx.get_cache_memory()
+            fused = [type(module) for module in modules]
+    finally:
+        mx.set_cache_limit(previous_limit)
+
+    assert all(cls is not native.SwitchGLU for cls in fused)
+    assert len(footprints) == len(modules)
+    assert [footprint - before for footprint in footprints] == [0] * len(modules)
+    assert end == before
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_restores_the_cache_limit_it_borrowed(native):
+    """Process-global: left at zero it would stop MLX reusing any buffer at all."""
+    root = nn.Sequential(_model(native))
+    root.eval()
+    borrowed = 8 << 20
+    previous_limit = mx.set_cache_limit(borrowed)
+    try:
+        with fused_moe_gate_up(root):
+            assert _cache_limit() == borrowed
+        assert _cache_limit() == borrowed
+    finally:
+        mx.set_cache_limit(previous_limit)
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
