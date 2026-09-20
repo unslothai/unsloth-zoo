@@ -93,7 +93,9 @@ except:
 pass
 from transformers.modeling_utils import PushToHubMixin
 import json
+import ntpath
 import os
+import posixpath
 import stat
 from pathlib import Path
 from typing import Union, List, Optional
@@ -725,6 +727,7 @@ def _merge_and_overwrite_lora(
     pass
 
     filename_original = os.path.join(save_directory, filename)  # Original file path
+    _assert_shard_is_inside(filename_original, save_directory)
     count = 0
     # Collect keys for this shard so the caller can aggregate without re-reading the file (avoids
     # an extra safetensors pass purely for tied-embedding bookkeeping).
@@ -2177,6 +2180,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
+    _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
     count = 0
     safetensor_keys_seen = set()
@@ -2610,6 +2614,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
     filename_original = os.path.join(save_directory, filename)
+    _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
     count = 0
     safetensor_keys_seen = set()
@@ -3304,6 +3309,257 @@ def _carry_over_vocab_size(base_config, trained_config):
 pass
 
 
+def _shard_name_stays_inside(name):
+    """Whether `name` resolves under the directory it is joined onto.
+
+    Judged under POSIX and Windows rules both: the index gets exported and read back
+    elsewhere, and `..\\..\\x` is an ordinary filename on POSIX and a traversal on
+    Windows, so the host's rules alone would bless an index that escapes on the
+    machine that opens it.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if "\x00" in name:
+        # `os.path.exists` raises ValueError on NUL, which the caller swallows into a
+        # bare assert 300 lines later.
+        return False
+    if ntpath.splitdrive(name)[0]:
+        # Drive-qualified but not drive-absolute: `ntpath.isabs("C:..\\x")` is False and
+        # normpath keeps `C:` ahead of the `..`, so the leading-`..` test never sees it,
+        # while Windows resolves it against that drive's working directory.
+        return False
+    # Windows trims the trailing run of spaces and periods from a component, so `.. `
+    # and `.. .` open as `..` while `normpath` sees the literal spelling and never
+    # matches the traversal test. Judge the Windows-visible spelling too.
+    # `.rstrip(" .")` is WRONG here: it takes `.. .` to the empty string, which normpath
+    # drops, accepting the traversal. Count dots instead. Three or more is deliberately
+    # stricter than Windows, where "a segment of three or more periods isn't normalized
+    # and is actually a valid file/directory name": fails closed, no shard is named that.
+    # learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats
+    def _as_windows_opens_it(component):
+        if component and not (set(component) - {".", " "}):
+            _dots = component.count(".")
+            return "" if _dots == 0 else ("." if _dots == 1 else "..")
+        return component.rstrip(" .")
+
+    _windows_view = "\\".join(
+        _as_windows_opens_it(_component)
+        for _component in name.replace("/", "\\").split("\\")
+    )
+    for _candidate in (name, _windows_view):
+        for _module in (posixpath, ntpath):
+            if _module.isabs(_candidate):
+                return False
+            if _candidate[:1] in ("\\", "/"):
+                # Rooted but drive-relative (`\victim.safetensors`). `ntpath.isabs` says
+                # NOT absolute, correctly, since Windows resolves it against the current
+                # drive; it still lands at that drive's root.
+                return False
+            # Normalise the candidate ON ITS OWN: normpath collapses interior `..`, so a
+            # leading one survives exactly when the path escapes. Joining onto a stand-in
+            # root and testing the prefix is WRONG, because it is collidable:
+            # `../unsloth_shard_root/victim` leaves the stand-in and re-enters a sibling
+            # of the same name, normalising back under it while the real join escapes.
+            _normalized = _module.normpath(_candidate)
+            if _normalized in (_module.curdir, _module.pardir):
+                return False
+            if _normalized.startswith(_module.pardir + _module.sep):
+                return False
+    return True
+
+
+def _has_directory_component(name):
+    """Whether `name` puts its shard in a subdirectory, under EITHER separator rule.
+
+    Judged the same way the predicate that admitted the name judges: native
+    `os.path.dirname` sees no directory in `weights\\model.safetensors` on POSIX, which
+    would leave the export with neither a root shard nor an index naming the one it has.
+    """
+    return bool(posixpath.dirname(name)) or bool(ntpath.dirname(name))
+
+
+def _reject_unsafe_shard_index(index_path):
+    """Refuse an index whose weight_map points outside the directory it sits in.
+
+    Raised rather than rewritten: a quiet rewrite hands back an export whose tensors no
+    longer resolve. Returns the bytes it vouched for, so the caller exports those rather
+    than re-reading a file that can be swapped in between.
+    """
+    try:
+        with open(index_path, "rb") as file:
+            raw = file.read()
+        # Permissive, not strict UTF-8: transformers opens this in the locale encoding,
+        # so under cp1252 it parses bytes strict UTF-8 rejects, and refusing to decode
+        # would wave that index through to a reader that still follows its traversal.
+        index_data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
+    except Exception:
+        return None
+    if not isinstance(index_data, dict):
+        # `[]`, `null` and bare scalars parse fine, so the `except` never sees them. A
+        # stale one beside a model needing no index used to be ignored, and must stay so.
+        return None
+    weight_map = index_data.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return raw
+    unsafe = sorted({
+        str(value) for value in weight_map.values()
+        if not _shard_name_stays_inside(value)
+    })
+    if unsafe:
+        raise RuntimeError(
+            f"Unsloth: Refusing to export {index_path} because its weight_map names "
+            f"{len(unsafe)} shard path(s) outside the model directory: "
+            f"{', '.join(repr(name) for name in unsafe[:5])}."
+        )
+    return raw
+
+
+def _resolves_inside(path, directory):
+    """Whether `path` REALLY lands under `directory`, links resolved.
+
+    Lexical is right for a name vouched for in a file someone else opens; this judges a
+    path about to be written here, so it follows the links that exist on this machine.
+    """
+    resolved = os.path.realpath(path)
+    root = os.path.realpath(directory)
+    try:
+        # `commonpath` rather than a `root + os.sep` prefix, which is wrong at a
+        # filesystem root: realpath("/") is "/", so the prefix becomes "//" and
+        # "/model.safetensors" tests as outside the directory holding it.
+        return os.path.commonpath([resolved, root]) == root
+    except ValueError:
+        return False
+
+
+def _materialize_shard_that_resolves_outside(file_path, save_directory):
+    """Replace a shard that is a link out of `save_directory` with a real copy.
+
+    In place, nothing copies the shard first (`os.path.exists` is true THROUGH a link),
+    so the `r+b` mmap overwrite went straight into the link target, with no index
+    involved, which is why the `weight_map` guarding never caught it.
+
+    Materialised rather than refused because the layout is ordinary: a Hugging Face cache
+    snapshot is exactly this, every shard a link into shared `blobs/`. Refusing breaks
+    merging one; writing through corrupts a blob other models share.
+    """
+    if not _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory):
+        # Materialising is a write, so it must not land in a directory that is not ours.
+        return
+    if not os.path.islink(file_path):
+        # Escaping through a symlinked PARENT cannot be repaired by replacing the file,
+        # so `_assert_shard_is_inside` refuses it at the sink instead.
+        return
+    if _resolves_inside(file_path, save_directory):
+        return
+    target = os.path.realpath(file_path)
+    if not os.path.isfile(target):
+        return
+    # Copy beside it then `os.replace`, never unlink then copy: on ENOSPC or an
+    # interruption the unlink ordering leaves the user's checkpoint with its link gone
+    # and a partial file in its place. `mkstemp` rather than a fixed
+    # `<shard>.unsloth-materializing`, because this directory is attacker-supplied: a
+    # fixed name had to be unlinked first to survive a leftover, and that unlink deletes
+    # whatever is really there, while O_EXCL at 0o600 cannot collide at all.
+    # The basename is carried only to name the shard a leftover belongs to, and must be
+    # BOUNDED: `mkstemp` adds 8 random characters, so a basename near NAME_MAX pushed the
+    # staging component over it and raised ENAMETOOLONG (ext4, at 230 characters).
+    _staging_directory = os.path.dirname(file_path) or os.curdir
+    try:
+        _name_max = os.pathconf(_staging_directory, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError):
+        _name_max = 255
+    _marker = ".unsloth-materializing-"
+    _budget = max(0, _name_max - len(_marker) - 8)
+    _staging_fd, staging = tempfile.mkstemp(
+        dir = _staging_directory,
+        prefix = os.path.basename(file_path)[:_budget] + _marker,
+    )
+    try:
+        with os.fdopen(_staging_fd, "wb") as _staging_file, open(target, "rb") as _source:
+            shutil.copyfileobj(_source, _staging_file)
+        shutil.copystat(target, staging)
+        os.replace(staging, file_path)
+    except BaseException:
+        if os.path.exists(staging):
+            try:
+                os.remove(staging)
+            except OSError:
+                pass
+        raise
+    print(
+        f"Unsloth: Copied {os.path.basename(file_path)} out of the link it pointed at, "
+        f"so the merge does not write outside {save_directory}"
+    )
+
+
+def _assert_shard_is_inside(file_path, save_directory):
+    """Last check before a writer opens a shard. Every write sink calls this.
+
+    At the sinks rather than where the name is chosen, so it holds however the path
+    arrived: local listing, index, Hub listing, or a later rename.
+
+    PARENT and path both, because resolving the whole path follows the final component,
+    which is what a READER sees, while these writers act on the directory ENTRY:
+    `os.replace` at the mxfp4 and fp8 sinks never follows the last component, so a parent
+    linking OUT with a leaf linking back IN passed the path-only check while the
+    replacement wrote into the external directory. Nothing contained is refused: a flat
+    shard's parent IS `save_directory`, a nested one's is the subdirectory it created.
+    """
+    if _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory) and \
+            _resolves_inside(file_path, save_directory):
+        return
+    raise RuntimeError(
+        f"Unsloth: Refusing to write {file_path} because it, or the directory holding "
+        f"it, resolves outside the output directory {os.path.realpath(save_directory)} "
+        f"(the path resolves to {os.path.realpath(file_path)}, its directory to "
+        f"{os.path.realpath(os.path.dirname(file_path) or os.curdir)}). A shard, or one "
+        f"of its parent directories, is a link out of the directory being exported to."
+    )
+
+
+def _export_index_atomically(source_path, destination, payload, mode_from = None):
+    """Write `payload` at `destination` without following a link sitting there.
+
+    `source_path` is the file whose mode to carry over, None when the index is regenerated
+    here and has no source.
+
+    `open(destination, "wb")`, and `shutil.copy2` which uses it, follow a symlink at the
+    destination and truncate its TARGET; `os.replace` swaps the directory ENTRY and never
+    follows the last component. `copystat` runs on the staging file, so the index is never
+    briefly readable under the creation mode before being narrowed.
+    """
+    _fd, _staging = tempfile.mkstemp(
+        dir = os.path.dirname(destination) or os.curdir, prefix = ".unsloth-index-",
+    )
+    try:
+        with os.fdopen(_fd, "wb") as _index_file:
+            _index_file.write(payload)
+        if source_path is not None:
+            shutil.copystat(source_path, _staging)
+        else:
+            # `mkstemp` opens at 0o600 but `open(..., "w")` gave the umask, so shipping
+            # 0o600 hands back an index only its owner can read. The mode comes off a file
+            # the export just wrote: umask-correct, and the index ends up as readable as
+            # the weights beside it. NOT `os.umask` to read the umask -- it has no getter,
+            # so reading means a process-wide set-and-restore that races other threads.
+            _mode = 0o644
+            if mode_from is not None:
+                try:
+                    _mode = os.stat(mode_from).st_mode & 0o666
+                except OSError:
+                    pass
+            os.chmod(_staging, _mode)
+        os.replace(_staging, destination)
+    except BaseException:
+        if os.path.exists(_staging):
+            try:
+                os.remove(_staging)
+            except OSError:
+                pass
+        raise
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -3434,8 +3690,13 @@ def merge_and_overwrite_lora(
                         index_data = json.load(f)
                         # Extract file names from the index if available
                         if "weight_map" in index_data:
-                            # Get unique filenames from weight map
-                            indexed_files = set(index_data["weight_map"].values())
+                            # Drop names that escape, keep the rest exactly as written.
+                            # Filtering closes this, NOT flattening: a contained nested name
+                            # is a real file, and its basename is a path that does not exist.
+                            indexed_files = {
+                                _name for _name in index_data["weight_map"].values()
+                                if _shard_name_stays_inside(_name)
+                            }
                             # Only use these if we didn't find files directly
                             if not safetensors_list:
                                 safetensors_list = list(indexed_files)
@@ -3713,7 +3974,11 @@ def merge_and_overwrite_lora(
     copied_all_from_cache = False
     copied_tokenizer_model_from_cache = False
     is_hf_sharded = is_hf_sharded_safetensors(safetensors_list)
-    safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
+    # A lone nested shard needs its index carried too: the two conditions beside this one
+    # cover what a loader finds unaided (several shards, or HF `model-0000n-of-0000m`), and
+    # `weights/model.safetensors` is neither, leaving the export with nothing discoverable.
+    _has_nested_shard = any(_has_directory_component(_f) for _f in safetensors_list)
+    safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
     # copying it (regenerated below). FP8 only dequantizes on a merged_16bit save, so an
@@ -3721,16 +3986,40 @@ def merge_and_overwrite_lora(
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
     ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
+    # Before any branch decides whether to copy it: filtering the in-memory list is not
+    # enough, since a later from_pretrained joins the raw weight_map values itself.
+    # Outside the branch below, which a dequant or splitting export skips. Scoped to
+    # indexes that can reach the output; refusing an inert one fails a working export.
+    _validated_index_bytes = None
+    if is_local_path:
+        _local_index_path = os.path.join(model_name, "model.safetensors.index.json")
+        _exports_in_place = os.path.realpath(save_directory) == os.path.realpath(model_name)
+        if (safe_tensor_index_files or _exports_in_place) and os.path.exists(_local_index_path):
+            _validated_index_bytes = _reject_unsafe_shard_index(_local_index_path)
     # ONLY download/copy the original index if we are NOT dequantizing a quantized model
     if not _is_quant_dequant and not needs_splitting:
         if is_local_path:
             os.makedirs(save_directory, exist_ok = True)
             # Copy from local
+            local_index_path = os.path.join(model_name, "model.safetensors.index.json")
             if safe_tensor_index_files:
-                local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
+                    _index_destination = os.path.join(save_directory, "model.safetensors.index.json")
                     try:
-                        shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                        # Covers both payloads; `samefile` follows links as `copy2` did.
+                        if os.path.exists(_index_destination) and \
+                                os.path.samefile(local_index_path, _index_destination):
+                            raise shutil.SameFileError
+                        if _validated_index_bytes is None:
+                            # Unparseable: carry it across, through the same safe write.
+                            with open(local_index_path, "rb") as _index_source:
+                                _index_payload = _index_source.read()
+                        else:
+                            # The bytes the guard read: a second read can be swapped.
+                            _index_payload = _validated_index_bytes
+                        _export_index_atomically(
+                            local_index_path, _index_destination, _index_payload,
+                        )
                     except shutil.SameFileError:
                         pass
                     except Exception as e:
@@ -3799,12 +4088,21 @@ def merge_and_overwrite_lora(
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
         file_path = os.path.join(save_directory, filename)
+        _materialize_shard_that_resolves_outside(file_path, save_directory)
+        # Before the copy, not only at the writers: those run much later, so a linked
+        # output component (`save_directory/weights -> /outside`) was followed by
+        # `makedirs` and `copy2` before anything refused.
+        _assert_shard_is_inside(file_path, save_directory)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
         # For local models, copy the file if needed
         if is_local_path and not os.path.exists(file_path):
             local_file_path = os.path.join(model_name, filename)
             if os.path.exists(local_file_path):
+                # A nested name has no parent here yet, so `copy2` would raise
+                # FileNotFoundError. The name is known to stay inside LEXICALLY, no
+                # stronger: a symlinked component still resolves wherever it points.
+                os.makedirs(os.path.dirname(file_path), exist_ok = True)
                 shutil.copy2(local_file_path, file_path)
                 print(f"Copied {filename} from local model directory")
 
@@ -3855,7 +4153,12 @@ def merge_and_overwrite_lora(
     _quant_dequant_index = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
     ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
-    regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
+    # A dequant or splitting export skips the index-copy block, so regeneration is the
+    # only thing that can leave an index behind, and from_pretrained looks for exactly
+    # `model.safetensors` then the index at the ROOT, which a nested singleton is neither.
+    # Read off the FINAL list: splitting and renumbering flatten names before this point.
+    _final_has_nested_shard = any(_has_directory_component(_f) for _f in final_safetensors_list)
+    regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded or _final_has_nested_shard) and save_method != "mxfp4"
     weight_map = {}
 
     # Collect all tensor keys encountered across shards so we can reason about tied embeddings
@@ -4035,8 +4338,17 @@ def merge_and_overwrite_lora(
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
-        with open(index_path, "w", encoding = "utf-8") as f:
-            json.dump(index_data, f, indent = 4)
+        # Staged and replaced for the same reason the copied index is.
+        _mode_donor = next(
+            (_p for _p in (os.path.join(save_directory, _f) for _f in final_safetensors_list)
+             if os.path.exists(_p)),
+            None,
+        )
+        _export_index_atomically(
+            None, index_path,
+            json.dumps(index_data, indent = 4).encode("utf-8"),
+            mode_from = _mode_donor,
+        )
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")

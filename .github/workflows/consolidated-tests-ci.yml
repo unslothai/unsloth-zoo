@@ -370,6 +370,9 @@ jobs:
         # URLs: the static bypass forms and, in the rebinding file, that the fetch
         # connects to the address the guard actually validated. Neither was executed
         # by any job before, so the guard could regress while CI stayed green.
+        # test_merge_index_weight_map_traversal pins that shard names taken from a
+        # local index cannot resolve outside save_directory, neither by creating a
+        # file through copy2 nor by the in-place r+b merge of one that exists.
         #
         # The three GGUF export files are the same story once more. They gate the
         # converter child's `gguf` pin, the post conversion verification that
@@ -425,6 +428,7 @@ jobs:
             tests/test_wheel_top_level_packages.py \
             tests/test_vision_url_ssrf_guard.py \
             tests/test_vision_url_dns_rebinding.py \
+            tests/test_merge_index_weight_map_traversal.py \
             tests/test_gguf_converter_child_env.py \
             tests/test_gguf_post_conversion_validation.py \
             tests/test_mtp_config_reconcile.py \
