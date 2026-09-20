@@ -1489,6 +1489,36 @@ def _staged_converter_tag(converter_location):
     return tag.strip()
 
 
+def _incomplete_sources_remedy(llama_cpp_dir):
+    """What to actually do about an entrypoint with no conversion/ beside it.
+
+    UNSLOTH_LLAMA_CPP_SCRIPTS_DIR outranks UNSLOTH_LLAMA_CPP_CONVERTER_TAG, so when
+    that pin is what selected this directory, telling the user to set the tag sends
+    them to a knob the pin will keep overriding: they set it, nothing changes, and
+    the same sentence comes back. Name the knob that is actually in force."""
+    pin = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", "").strip()
+    if pin:
+        try:
+            pinned = os.path.abspath(os.path.expanduser(pin))
+            selected = os.path.abspath(llama_cpp_dir)
+            pin_chose_this = os.path.commonpath([pinned, selected]) == pinned
+        except (ValueError, OSError):
+            pin_chose_this = False
+        if pin_chose_this:
+            return (
+                f"UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is set to '{pin}', and it outranks "
+                f"UNSLOTH_LLAMA_CPP_CONVERTER_TAG, so setting a tag will not change "
+                f"this. Point it at a checkout that has convert_hf_to_gguf.py, "
+                f"conversion/ and gguf-py/ together, or unset it to let Unsloth stage "
+                f"a matching set itself."
+            )
+    return (
+        "Set UNSLOTH_LLAMA_CPP_CONVERTER_TAG to a llama.cpp release tag to stage a "
+        "matching set, or point UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a checkout that has "
+        "convert_hf_to_gguf.py, conversion/ and gguf-py/ together."
+    )
+
+
 def _unsupported_arch_message(arch, converter_location):
     """The message for an architecture the converter does not know.
 
@@ -4106,10 +4136,7 @@ def _download_convert_hf_to_gguf_cached(
                 f"Unsloth: The llama.cpp converter at '{_llama_cpp_dir}' imports the "
                 f"conversion/ package, but that package is not in that directory. "
                 f"The entrypoint and its libraries have to come from the same llama.cpp "
-                f"revision. Set UNSLOTH_LLAMA_CPP_CONVERTER_TAG to a llama.cpp release "
-                f"tag to stage a matching set, or point UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at "
-                f"a checkout that has convert_hf_to_gguf.py, conversion/ and gguf-py/ "
-                f"together."
+                f"revision. {_incomplete_sources_remedy(_llama_cpp_dir)}"
             )
         logger.info("Unsloth: Identifying llama.cpp gguf supported architectures...")
 

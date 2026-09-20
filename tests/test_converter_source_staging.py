@@ -670,8 +670,14 @@ def test_a_shim_without_its_package_names_the_problem(mod, tmp_path, monkeypatch
         mod._download_convert_hf_to_gguf_cached.cache_clear()
     message = str(excinfo.value)
     assert "conversion/" in message
-    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in message
     assert "same llama.cpp revision" in message
+    # The pin is what selected this directory, and it outranks the tag, so naming
+    # the tag here sends the user to a knob the pin keeps overriding.
+    assert "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR" in message
+    assert str(pinned) in message
+    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" not in message.split("outranks")[0], (
+        "the tag is offered as the remedy while the scripts dir pin outranks it"
+    )
 
 
 def test_the_incomplete_error_is_not_wrapped_in_the_generic_one(mod, tmp_path, monkeypatch):
@@ -2036,3 +2042,25 @@ def test_a_stale_mirror_is_replaced_rather_than_blocking_every_retry(
         )
     finally:
         os.chmod(stage, 0o755)
+
+
+def test_the_incomplete_remedy_names_the_knob_actually_in_force(mod, tmp_path, monkeypatch):
+    """Advice the user can follow, not advice a higher-priority knob will override."""
+    pinned = tmp_path / "pinned_incomplete"
+    pinned.mkdir()
+
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(pinned))
+    pinned_remedy = mod._incomplete_sources_remedy(str(pinned))
+    assert "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR" in pinned_remedy
+    assert "outranks" in pinned_remedy
+    assert str(pinned) in pinned_remedy
+
+    # A pin pointing somewhere else did not select this directory, so the tag is
+    # still the right advice.
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(tmp_path / "elsewhere"))
+    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in mod._incomplete_sources_remedy(str(pinned))
+
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+    unpinned_remedy = mod._incomplete_sources_remedy(str(pinned))
+    assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in unpinned_remedy
+    assert "outranks" not in unpinned_remedy
