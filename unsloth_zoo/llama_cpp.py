@@ -253,8 +253,14 @@ def _converter_network_allowed():
     """Whether converter acquisition may touch the network.
 
     Read at the call, not at import, so setting it after `import unsloth` works.
-    Honours the generic Unsloth/HF offline switches as well as its own."""
-    for name in ("UNSLOTH_LLAMA_CPP_OFFLINE", "UNSLOTH_OFFLINE", "HF_HUB_OFFLINE"):
+
+    Unsloth's own switches only. HF_HUB_OFFLINE is deliberately NOT honoured: it is
+    documented as "no HTTP calls will be made to the Hugging Face Hub", and the
+    converter comes from GitHub, not the Hub. Treating it as a global network kill
+    switch stopped exports for people who set it for Hub reasons while having GitHub
+    access, and it silently disabled this repo's own converter download in any test
+    session that imported tests/_merge_e2e_helpers.py, which sets it process-wide."""
+    for name in ("UNSLOTH_LLAMA_CPP_OFFLINE", "UNSLOTH_OFFLINE"):
         if os.environ.get(name, "").strip().upper() in _OFFLINE_TRUE_VALUES:
             return False
     return True
@@ -1639,8 +1645,8 @@ def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = N
     if not _converter_network_allowed():
         logger.warning(
             f"Unsloth: Offline, and no cached llama.cpp converter sources for {tag} "
-            f"at {stage_dir}. Unset UNSLOTH_LLAMA_CPP_OFFLINE / UNSLOTH_OFFLINE / "
-            f"HF_HUB_OFFLINE to stage them."
+            f"at {stage_dir}. Unset UNSLOTH_LLAMA_CPP_OFFLINE / UNSLOTH_OFFLINE to "
+            f"stage them."
         )
         return None
 
@@ -4082,8 +4088,8 @@ def _download_convert_hf_to_gguf_cached(
             # that declared itself offline still puts requests on the wire.
             raise _ConverterSourcesIncomplete(
                 f"Unsloth: No llama.cpp converter is available locally and this "
-                f"process is offline (UNSLOTH_LLAMA_CPP_OFFLINE / UNSLOTH_OFFLINE / "
-                f"HF_HUB_OFFLINE). Point UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a llama.cpp "
+                f"process is offline (UNSLOTH_LLAMA_CPP_OFFLINE / UNSLOTH_OFFLINE). "
+                f"Point UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a llama.cpp "
                 f"checkout holding convert_hf_to_gguf.py, conversion/ and gguf-py/ "
                 f"together, or unset the offline switch so the converter sources can "
                 f"be staged."

@@ -397,13 +397,24 @@ def test_two_sequential_stagers_converge_on_one_entry(mod, staging_env):
 
 # --- offline ------------------------------------------------------------------
 
-@pytest.mark.parametrize(
-    "var", ["UNSLOTH_LLAMA_CPP_OFFLINE", "UNSLOTH_OFFLINE", "HF_HUB_OFFLINE"],
-)
+@pytest.mark.parametrize("var", ["UNSLOTH_LLAMA_CPP_OFFLINE", "UNSLOTH_OFFLINE"])
 def test_each_offline_switch_blocks_staging(mod, staging_env, monkeypatch, var):
     monkeypatch.setenv(var, "1")
     assert mod._stage_converter_sources("b9000") is None
     assert staging_env["downloads"] == 0
+
+
+def test_hf_hub_offline_does_not_block_a_github_download(mod, staging_env, monkeypatch):
+    """HF_HUB_OFFLINE is scoped to the Hugging Face Hub; the converter is on GitHub.
+
+    Honouring it here stopped exports for people who set it for Hub reasons while
+    having GitHub access, and silently disabled staging in any test session that
+    imported tests/_merge_e2e_helpers.py, which sets it process-wide and never
+    unsets it."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert mod._converter_network_allowed() is True
+    assert mod._stage_converter_sources("b9000") is not None
+    assert staging_env["downloads"] == 1
 
 
 def test_offline_still_serves_a_complete_cache_entry(mod, staging_env, monkeypatch):
@@ -1906,6 +1917,10 @@ def test_a_user_checkout_under_the_cache_root_is_not_written_into(mod, tmp_path,
     )
     assert not (checkout / "unsloth_convert_hf_to_gguf.py").exists()
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "Windows has no POSIX mode bits and no effective umask: os.open ignores the mode argument beyond the read-only flag, so these assert a property the platform does not have. The Windows-relevant property, that the write is atomic and the content lands, is covered by the tests either side.",
+)
 
 def test_atomic_writes_follow_the_current_umask_without_reading_it(mod, tmp_path, monkeypatch):
     """The mode must track a umask the application changes, and os.umask must never be called.
@@ -1939,6 +1954,10 @@ def test_atomic_writes_follow_the_current_umask_without_reading_it(mod, tmp_path
             monkeypatch.undo()
             os.umask(old)
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "Windows has no POSIX mode bits and no effective umask: os.open ignores the mode argument beyond the read-only flag, so these assert a property the platform does not have. The Windows-relevant property, that the write is atomic and the content lands, is covered by the tests either side.",
+)
 
 def test_an_atomic_write_keeps_an_existing_files_mode(mod, tmp_path):
     """Replacing a shared 0644 converter must not silently make it owner-only."""
