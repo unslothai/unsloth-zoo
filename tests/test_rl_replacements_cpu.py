@@ -230,6 +230,40 @@ def test_warn_unsupported_grpo_options_fires_for_top_entropy_quantile(caplog):
     assert "use_bias_correction_kl" not in msgs[0]
 
 
+def test_warn_unsupported_grpo_options_fires_for_the_entropy_bonus(caplog):
+    """TRL 1.8.0+ subtracts an entropy bonus from the loss; this path computes no entropies."""
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, entropy_coef=0.01)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "entropy_coef=0.01" in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_fires_for_adaptive_entropy(caplog):
+    """Adaptive control stays on with entropy_coef at entropy_coef_min, which is 0.0 by default."""
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, entropy_coef=0.0, use_adaptive_entropy=True)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "use_adaptive_entropy=True" in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_silent_on_entropy_defaults(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, entropy_coef=0.0, use_adaptive_entropy=False)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []
+
+
+def test_the_grpo_loss_reads_no_entropy_argument():
+    """The warning is only honest while the loss really ignores the bonus: if a future change
+    starts applying it, this fails and the option comes off the unsupported list."""
+    source = inspect.getsource(rr.grpo_compute_loss)
+    assert "entropy_coef" not in source and "entropies" not in source
+
+
 def test_warn_unsupported_grpo_options_silent_for_use_bias_correction_kl(caplog):
     trainer = _make_grpo_trainer(top_entropy_quantile=1.0, use_bias_correction_kl=True)
     with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
