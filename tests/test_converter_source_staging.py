@@ -1539,6 +1539,10 @@ def test_a_monolith_without_gguf_py_is_still_used_when_staging_cannot_answer(mod
 def _read_only(path):
     os.chmod(path, 0o555)
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_a_read_only_cache_hit_is_copied_somewhere_writable(mod, tmp_path, monkeypatch, staging_env):
     stage = mod._stage_converter_sources("b9000")
@@ -1558,6 +1562,10 @@ def test_a_read_only_cache_hit_is_copied_somewhere_writable(mod, tmp_path, monke
     finally:
         os.chmod(stage, 0o755)
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_the_writable_copy_is_made_once_and_then_reused(mod, tmp_path, monkeypatch, staging_env):
     stage = mod._stage_converter_sources("b9000")
@@ -1581,6 +1589,10 @@ def test_a_writable_stage_is_returned_untouched(mod, tmp_path, monkeypatch, stag
     assert mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000") == stage
     assert not home.exists(), "a writable stage was copied anyway"
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_a_read_only_default_cache_is_reported_rather_than_copied_onto_itself(
     mod, tmp_path, monkeypatch, staging_env,
@@ -1597,6 +1609,10 @@ def test_a_read_only_default_cache_is_reported_rather_than_copied_onto_itself(
     finally:
         os.chmod(stage, 0o755)
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_the_resolver_hands_back_a_writable_directory_from_a_read_only_cache(
     mod, tmp_path, monkeypatch, staging_env,
@@ -1698,6 +1714,10 @@ def test_a_real_shim_is_still_accepted(mod, tmp_path):
     assert mod._converter_stage_is_usable(
         str(stage), repo = "ggml-org/llama.cpp", tag = "b9000") is True
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_a_cached_mirror_that_lost_its_write_bit_is_restored(mod, tmp_path, monkeypatch, staging_env):
     stage = mod._stage_converter_sources("b9000")
@@ -1714,6 +1734,10 @@ def test_a_cached_mirror_that_lost_its_write_bit_is_restored(mod, tmp_path, monk
     finally:
         os.chmod(stage, 0o755)
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_a_mirror_whose_write_bit_cannot_be_restored_is_reported(mod, tmp_path, monkeypatch, staging_env):
     stage = mod._stage_converter_sources("b9000")
@@ -1730,6 +1754,10 @@ def test_a_mirror_whose_write_bit_cannot_be_restored_is_reported(mod, tmp_path, 
         monkeypatch.undo()
         os.chmod(stage, 0o755)
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_a_mirror_tightened_recursively_is_restored_throughout(mod, tmp_path, monkeypatch, staging_env):
     stage = mod._stage_converter_sources("b9000")
@@ -2002,6 +2030,10 @@ def test_the_converter_cache_env_var_is_read_at_the_call_not_at_import(mod, tmp_
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_CACHE", "   ")
     assert mod._converter_cache_root() == mod.LLAMA_CPP_CONVERTER_CACHE_DIR
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason = "chmod 0o555 does not make a directory unwritable on Windows, so os.access(W_OK) still reports it writable and the mirror this exercises is never taken. The precondition cannot be created here, so the test would assert against a state Windows does not have.",
+)
 
 def test_a_stale_mirror_is_replaced_rather_than_blocking_every_retry(
     mod, tmp_path, monkeypatch, staging_env,

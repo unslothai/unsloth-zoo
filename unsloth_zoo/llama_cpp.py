@@ -3453,7 +3453,13 @@ def _writable_stage(stage_dir, repo, tag):
     The patched entrypoint must land in the resolved directory, because the child
     resolves `from conversion import ...` and its own gguf-py relative to the file
     it runs. A read-only or shared cache would therefore fail every export, so such
-    a stage is copied once into the user's default cache root and used from there."""
+    a stage is copied once into the user's default cache root and used from there.
+
+    POSIX in practice: os.access(W_OK) does not report a read-only DIRECTORY on
+    Windows, so a read-only cache is taken as writable there and the copy below is
+    never made. The export then fails when the patch is written rather than being
+    mirrored. Detecting it properly needs an ACL check, which is why the tests for
+    this path are skipped on Windows rather than asserting a state it cannot make."""
     if stage_dir is None: return None
     if os.access(stage_dir, os.W_OK): return stage_dir
     default_root = os.path.join(UNSLOTH_HOME, "llama.cpp-converter")
