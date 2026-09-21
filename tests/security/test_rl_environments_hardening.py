@@ -894,3 +894,23 @@ def test_a_dead_process_is_still_dead_off_process():
     # Claim a different owner so the off-process branch is the one under test.
     rl_env._OPENENV_CHILDREN[endpoint] = (gone, os.getpid() + 1)
     assert not rl_env._openenv_child_alive(*endpoint)
+
+
+def test_the_liveness_probe_does_not_kill_what_it_probes():
+    """A probe that answers correctly by killing the server has answered wrongly.
+
+    On Windows `os.kill(pid, 0)` is not a probe: CPython maps every signal but
+    CTRL_C_EVENT and CTRL_BREAK_EVENT onto TerminateProcess(handle, sig), so the
+    reused POSIX idiom terminates the very server it was asked about. Staging CI
+    caught the wrong-answer half of this on windows-latest; this covers the half
+    that destroys state rather than misreporting it.
+    """
+    alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert rl_env._openenv_pid_is_alive(alive.pid)
+        # Probed twice, because one TerminateProcess is enough to end it.
+        assert rl_env._openenv_pid_is_alive(alive.pid)
+        assert alive.poll() is None, "the liveness probe killed the process"
+    finally:
+        alive.terminate()
+        alive.wait(timeout = 10)
