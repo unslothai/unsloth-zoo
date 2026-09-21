@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -103,6 +103,68 @@ def test_gpt_oss_marker_skips_a_foreign_owned_cache_directory(tmp_path, monkeypa
 
     assert not (hostile / gpt_oss._GPT_OSS_FLAVOR_MARKER).exists(), (
         "the marker was written into a directory every local user can write"
+    )
+
+
+def test_gpt_oss_marker_survives_a_group_writable_cache(tmp_path, monkeypatch):
+    """umask 002 makes the library's own cache 0775, and that must keep working.
+
+    Group write is a deliberate sharing choice and the compiled module next to the
+    marker is written 0644 into that same directory anyway. Refusing it here bought
+    nothing and silently stopped the flavor ever being recorded.
+    """
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    parent = tmp_path / "shared"
+    parent.mkdir(mode = 0o775)
+    os.chmod(parent, 0o775)
+    cache = parent / "unsloth_compiled_cache"
+    cache.mkdir(mode = 0o775)
+    os.chmod(cache, 0o775)
+
+    monkeypatch.setattr(gpt_oss, "_gpt_oss_cache_locations", lambda: [str(cache)])
+    gpt_oss._sync_gpt_oss_compiled_flavor("stock")
+
+    assert (cache / gpt_oss._GPT_OSS_FLAVOR_MARKER).read_text() == "stock"
+
+
+def test_gpt_oss_marker_skips_a_cache_owned_by_another_user(tmp_path, monkeypatch):
+    """The attacker's `mkdir /tmp/unsloth_compiled_cache` case, by ownership."""
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    cache = tmp_path / "unsloth_compiled_cache"
+    cache.mkdir(mode = 0o755)
+    # A directory we cannot create as an unprivileged test: pretend to be someone else.
+    monkeypatch.setattr(gpt_oss.os, "geteuid", lambda: os.geteuid() + 1)
+
+    monkeypatch.setattr(gpt_oss, "_gpt_oss_cache_locations", lambda: [str(cache)])
+    gpt_oss._sync_gpt_oss_compiled_flavor("stock")
+
+    assert not (cache / gpt_oss._GPT_OSS_FLAVOR_MARKER).exists()
+
+
+def test_gpt_oss_untrusted_cache_still_forces_regeneration(tmp_path, monkeypatch):
+    """Refusing to write a marker must not also mean trusting the stale module.
+
+    The compiler applies no trust gate when it loads
+    `unsloth_compiled_module_gpt_oss.py`, so a cache directory we decline to write
+    into is still one we will import from. Ignoring it in the mismatch scan would
+    let a bnb4bit <-> stock switch reinstall the wrong router/experts layout.
+    """
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    cache = tmp_path / "unsloth_compiled_cache"
+    cache.mkdir(mode = 0o777)
+    os.chmod(cache, 0o777)  # group/world writable, so the trust check refuses it
+    module = cache / (gpt_oss._GPT_OSS_COMPILED_MODULE + ".py")
+    module.write_text("# built for bnb4bit\n")
+    (cache / gpt_oss._GPT_OSS_FLAVOR_MARKER).write_text("bnb4bit")
+
+    monkeypatch.setattr(gpt_oss, "_gpt_oss_cache_locations", lambda: [str(cache)])
+    gpt_oss._sync_gpt_oss_compiled_flavor("stock")
+
+    assert not module.exists(), (
+        "the stale compiled module survived a flavor switch in a rejected cache"
     )
 
 

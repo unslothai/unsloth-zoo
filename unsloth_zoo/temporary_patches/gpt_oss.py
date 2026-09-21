@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import functools
 import os
+import stat
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -1443,14 +1444,33 @@ def _gpt_oss_cache_location_is_trusted(loc):
     The temp candidate is a fully predictable path (`/tmp/unsloth_compiled_cache` by
     default), and nothing stops another local user creating it first. `os.path.isdir`
     answers "does it exist", which an attacker satisfies with one mkdir, not "is it
-    ours". The mega-cache in this same package already answers the real question, so
-    use its check rather than a second, weaker copy of one.
+    ours".
+
+    Deliberately weaker than `compile_cache._is_trusted_directory`, and only here:
+    that one gates LOADING executable artifacts, so it walks every ancestor and
+    refuses any group write. This gates writing a seven-byte flavor string through an
+    O_NOFOLLOW descriptor next to a compiled module the library itself writes 0644
+    into the same directory. Refusing a group-writable cache would therefore buy
+    nothing (a group member can already replace the module) while silently disabling
+    flavor invalidation for every umask 002 machine, which is the default on plenty
+    of shared systems and would leave a stale module reinstalling the wrong
+    router/experts layout.
     """
     try:
-        # Spelled absolutely: transformers' custom_object_save resolves a relative
-        # import in this package against temporary_patches/ and would fail to open it.
-        from unsloth_zoo.compile_cache import _is_trusted_directory
-        return _is_trusted_directory(loc, allow_missing = True)
+        directory_stat = os.lstat(loc)
+    except FileNotFoundError:
+        return True   # a location we are about to create ourselves
+    except Exception:
+        return False
+    try:
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            return False
+        if os.name != "posix":
+            return True
+        if directory_stat.st_uid != os.geteuid():
+            return False
+        # World-writable is never a deliberate sharing choice, group-writable is.
+        return not (directory_stat.st_mode & 0o002)
     except Exception:
         return False
 pass
@@ -1507,10 +1527,15 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
         locations = _gpt_oss_cache_locations()
         mismatch = False
         for loc in locations:
-            if not _gpt_oss_cache_location_is_trusted(loc):
-                continue
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
+                continue
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                # We refuse to write a marker here, so any marker found is not ours,
+                # and the compiler applies no such gate when it imports the module
+                # next to it. Regenerate rather than trust what a rejected directory
+                # claims the flavor is.
+                mismatch = True
                 continue
             on_disk = None
             marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
