@@ -169,6 +169,34 @@ def test_a_symlinked_converter_trusts_the_directory_it_resolves_to(
                                         str(link)) is None
 
 
+def test_the_reported_tree_is_never_resolved_twice(llama_cpp, tmp_path, monkeypatch):
+    """Resolving once is a guarantee only if nothing resolves it again. A component
+    of the reported path is the attacker's to swap, so a second realpath can land
+    inside a root the first never saw, and the string handed back still names the
+    outside tree. Driven with a realpath that moves the answer on the second call."""
+    install = tmp_path / "install"
+    inside = _gguf_package(install / "gguf-py")
+    outside = _gguf_package(tmp_path / "attacker")
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(install))
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+
+    real_realpath = os.path.realpath
+    calls = []
+
+    def moving(path, *args, **kwargs):
+        if str(path) == str(outside):
+            calls.append(str(path))
+            # Second and later answers claim the tree now sits inside the root.
+            return outside if len(calls) == 1 else inside
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", moving)
+    verdict = llama_cpp._trusted_gguf_tree(outside)
+
+    assert verdict is None, f"accepted {verdict} on a second resolution"
+    assert len(calls) == 1, f"resolved the reported tree {len(calls)} times, not once"
+
+
 def test_the_checked_path_and_the_returned_path_cannot_diverge(
         llama_cpp, tmp_path, monkeypatch):
     """The link belongs to the principal being screened, so two resolutions need not

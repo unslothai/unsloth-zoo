@@ -4692,8 +4692,20 @@ def _trusted_gguf_tree(tree, converter_location = None):
         # is the target). No wider: this is the script we run as the converter.
         roots.append(os.path.dirname(os.path.abspath(converter_location)))
         roots.append(os.path.dirname(os.path.realpath(converter_location)))
+    # Compared lexically against a separately resolved ROOT, rather than handed back
+    # to `_stays_within`, which would realpath the tree a second time. Resolving it
+    # once is only a guarantee if nothing resolves it again: a component of the
+    # reported path can be swapped between the two calls, so the check answers for
+    # one tree and the returned string still names another.
     for root in roots:
-        if root and _stays_within(os.path.expanduser(root), resolved):
+        if not root:
+            continue
+        try:
+            root_real = os.path.realpath(os.path.expanduser(root))
+        except OSError:
+            continue
+        if resolved == root_real or \
+            resolved.startswith(root_real.rstrip(os.sep) + os.sep):
             return resolved
     # Plus the tree this process would import anyway, where the swap changes nothing.
     # Both halves are load-bearing: it must WIN resolution, since promoting a
