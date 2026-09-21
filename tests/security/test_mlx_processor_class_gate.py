@@ -89,13 +89,25 @@ def test_non_processing_names_are_refused(name):
 
 
 def test_a_real_image_processor_still_builds():
-    """The gate must not break the case this code exists for."""
+    """The gate must not break the case this code exists for.
+
+    Not an exact-name assertion. `CLIPImageProcessor` is a `TorchvisionBackend` in
+    Transformers 5, and with torchvision absent the lazy module resolves that name to
+    `CLIPImageProcessorPil` instead. torchvision is not a dependency of this project,
+    and the `tests-security` job installs `.[core]` only, so the PIL class is what the
+    hard gate actually builds. Both are CLIP image processors deriving from
+    `ImageProcessingMixin`, which is what the gate under test has to keep admitting.
+    """
+    from transformers.image_processing_base import ImageProcessingMixin
+
     built = _build({
         "image_processor_type": "CLIPImageProcessor",
         "size": {"shortest_edge": 224},
     })
-    assert built is not None
-    assert type(built).__name__ == "CLIPImageProcessor"
+    assert isinstance(built, ImageProcessingMixin)
+    assert type(built).__name__ in ("CLIPImageProcessor", "CLIPImageProcessorPil")
+    # The sidecar keys still reach the constructor; the gate only filters the callee.
+    assert built.size == {"shortest_edge": 224}
 
 
 def test_repo_supplied_trust_remote_code_is_dropped():
