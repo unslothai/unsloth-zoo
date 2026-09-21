@@ -1143,10 +1143,28 @@ pass
 
 
 def _register_openenv_child(client_host, port, child):
-    """ Hand the endpoint over from the reservation to the child now holding it. """
+    """ Hand the endpoint over from the reservation to the child now holding it.
+
+    The spawning pid is recorded because poll() only means anything in the process
+    that started the child; see _openenv_child_alive.
+    """
     with _OPENENV_CHILDREN_LOCK:
-        _OPENENV_CHILDREN[(client_host, port)] = child
+        _OPENENV_CHILDREN[(client_host, port)] = (child, os.getpid())
         _OPENENV_RESERVED.discard((client_host, port))
+pass
+
+
+def _openenv_pid_is_alive(pid):
+    """ Does this pid still exist? Signal 0 asks without delivering or reaping. """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, just not ours to signal
+    except OSError:
+        return True          # unanswerable, so do not call a live server dead
+    return True
 pass
 
 
@@ -1159,7 +1177,8 @@ def _release_openenv_endpoint(client_host, port, child = None):
     with _OPENENV_CHILDREN_LOCK:
         key = (client_host, port)
         _OPENENV_RESERVED.discard(key)
-        if child is not None and _OPENENV_CHILDREN.get(key, None) is child:
+        entry = _OPENENV_CHILDREN.get(key, None)
+        if child is not None and entry is not None and entry[0] is child:
             _OPENENV_CHILDREN.pop(key, None)
 pass
 
@@ -1225,7 +1244,9 @@ def _reap_exited_openenv_children():
     suppresses the interpreter's own reaping, so an unswept registry leaves zombies.
     """
     with _OPENENV_CHILDREN_LOCK:
-        for key, child in list(_OPENENV_CHILDREN.items()):
+        for key, (child, owner_pid) in list(_OPENENV_CHILDREN.items()):
+            # Only the spawning process can poll, and so only it can reap.
+            if owner_pid != os.getpid(): continue
             if child.poll() is not None:
                 _OPENENV_CHILDREN.pop(key, None)
 pass
@@ -1243,10 +1264,22 @@ pass
 
 
 def _openenv_child_alive(client_host, port):
-    """ Is the child we spawned on this endpoint still the process holding it? """
+    """ Is the child we spawned on this endpoint still the process holding it?
+
+    A forked worker inherits this registry but is not the parent of anything in
+    it, so poll() there calls waitpid on a process that is not its child, gets
+    ECHILD, and CPython caches returncode 0 -- reporting a live server as dead.
+    The RL notebooks reach this on every move, because execute_with_time_limit
+    falls back to a forked process for a strategy with a bare except in a loop.
+    So off-process the question is put to the OS instead, and nothing is reaped
+    or removed, since neither is this process's to do.
+    """
     with _OPENENV_CHILDREN_LOCK:
-        child = _OPENENV_CHILDREN.get((client_host, port), None)
-        if child is None: return False
+        entry = _OPENENV_CHILDREN.get((client_host, port), None)
+        if entry is None: return False
+        child, owner_pid = entry
+        if owner_pid != os.getpid():
+            return _openenv_pid_is_alive(child.pid)
         if child.poll() is not None:
             _OPENENV_CHILDREN.pop((client_host, port), None)
             return False
@@ -1370,7 +1403,8 @@ def launch_openenv(
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
         with _OPENENV_CHILDREN_LOCK:
-            ours = _OPENENV_CHILDREN.get((client_host, port), None) is openenv_child
+            entry = _OPENENV_CHILDREN.get((client_host, port), None)
+            ours = entry is not None and entry[0] is openenv_child
         if not ours:
             trials += 1
             if trials == 30:

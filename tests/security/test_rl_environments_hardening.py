@@ -18,7 +18,10 @@ CPU-only; the real listeners are on 127.0.0.1, which the suite's blocker allows.
 import contextlib
 import http.server
 import io
+import multiprocessing
+import os
 import socket
+import sys
 import subprocess
 import threading
 import time
@@ -195,6 +198,20 @@ def no_leaked_children():
     yield
     for state in (registry, reserved):
         if state is not None: state.clear()
+
+
+def _owned(child):
+    """A registry entry as launch_openenv writes it: (child, spawning pid).
+
+    The pid is what lets a forked worker tell "not my child to poll" from "dead",
+    so the shape is part of the contract rather than an implementation detail.
+    """
+    return (child, os.getpid())
+
+
+def _entry_child(endpoint):
+    entry = rl_env._OPENENV_CHILDREN.get(endpoint)
+    return None if entry is None else entry[0]
 
 
 class _DeadChild:
@@ -464,7 +481,7 @@ def test_two_hosts_on_one_port_are_tracked_separately(monkeypatch, tmp_path):
 
 def test_ownership_does_not_transfer_between_addresses():
     """Our 127.0.0.1 child is not evidence that we own [::1] on the same port."""
-    rl_env._OPENENV_CHILDREN[("127.0.0.1", 47000)] = _LiveChild()
+    rl_env._OPENENV_CHILDREN[("127.0.0.1", 47000)] = _owned(_LiveChild())
     assert rl_env._openenv_child_alive("127.0.0.1", 47000)
     assert not rl_env._openenv_child_alive("::1", 47000)
     assert not rl_env._openenv_child_alive("localhost", 47000)
@@ -472,16 +489,16 @@ def test_ownership_does_not_transfer_between_addresses():
 
 def test_exited_children_are_reaped_rather_than_retained(monkeypatch, tmp_path):
     """Holding the Popen suppresses the interpreter's own reap, so sweep instead."""
-    rl_env._OPENENV_CHILDREN[("127.0.0.1", 48000)] = _DeadChild()
-    rl_env._OPENENV_CHILDREN[("::1", 48001)] = _DeadChild()
+    rl_env._OPENENV_CHILDREN[("127.0.0.1", 48000)] = _owned(_DeadChild())
+    rl_env._OPENENV_CHILDREN[("::1", 48001)] = _owned(_DeadChild())
     live = _LiveChild()
-    rl_env._OPENENV_CHILDREN[("127.0.0.1", 48002)] = live
+    rl_env._OPENENV_CHILDREN[("127.0.0.1", 48002)] = _owned(live)
     _fake_launcher(monkeypatch, ports = [49000])
     rl_env.launch_openenv(working_directory = str(tmp_path), openenv_class = _DummyClient)
     # The two exited children are gone, the live one and the new one remain.
     assert ("127.0.0.1", 48000) not in rl_env._OPENENV_CHILDREN
     assert ("::1", 48001) not in rl_env._OPENENV_CHILDREN
-    assert rl_env._OPENENV_CHILDREN[("127.0.0.1", 48002)] is live
+    assert _entry_child(("127.0.0.1", 48002)) is live
 
 
 def test_probe_advances_past_a_family_the_host_cannot_open(monkeypatch):
@@ -543,7 +560,7 @@ def _registry_guard():
 def test_reaping_survives_a_concurrent_launch():
     """Iterating while another thread registers raised 'dictionary changed size'."""
     for index in range(200):
-        rl_env._OPENENV_CHILDREN[("127.0.0.1", 50000 + index)] = _SlowPollChild(dead = index % 2 == 0)
+        rl_env._OPENENV_CHILDREN[("127.0.0.1", 50000 + index)] = _owned(_SlowPollChild(dead = index % 2 == 0))
     errors = []
 
     def reap():
@@ -555,7 +572,7 @@ def test_reaping_survives_a_concurrent_launch():
     def register():
         for index in range(400):
             with _registry_guard():
-                rl_env._OPENENV_CHILDREN[("::1", 60000 + index)] = _SlowPollChild()
+                rl_env._OPENENV_CHILDREN[("::1", 60000 + index)] = _owned(_SlowPollChild())
             time.sleep(0.0001)
 
     reaper = threading.Thread(target = reap)
@@ -564,13 +581,13 @@ def test_reaping_survives_a_concurrent_launch():
     reaper.join(); registrar.join()
     assert errors == [], f"reaping raised {errors!r}"
     # The sweep still did its job: every dead child is gone, every live one stays.
-    assert all(child.poll() is None for child in rl_env._OPENENV_CHILDREN.values())
+    assert all(child.poll() is None for child, _ in rl_env._OPENENV_CHILDREN.values())
 
 
 def test_a_liveness_check_cannot_delete_another_threads_live_child():
     """get-poll-pop is check-then-mutate: the pop must not outlive the check."""
     endpoint = ("127.0.0.1", 51000)
-    rl_env._OPENENV_CHILDREN[endpoint] = _SlowPollChild(dead = True)
+    rl_env._OPENENV_CHILDREN[endpoint] = _owned(_SlowPollChild(dead = True))
     replacement = _SlowPollChild(dead = False)
 
     def check(): rl_env._openenv_child_alive(*endpoint)
@@ -578,13 +595,13 @@ def test_a_liveness_check_cannot_delete_another_threads_live_child():
     def replace():
         time.sleep(0.0002)                  # lands inside the checker's poll()
         with _registry_guard():
-            rl_env._OPENENV_CHILDREN[endpoint] = replacement
+            rl_env._OPENENV_CHILDREN[endpoint] = _owned(replacement)
 
     checker = threading.Thread(target = check)
     replacer = threading.Thread(target = replace)
     checker.start(); replacer.start()
     checker.join(); replacer.join()
-    assert rl_env._OPENENV_CHILDREN.get(endpoint) is replacement
+    assert _entry_child(endpoint) is replacement
 
 
 def test_a_second_thread_cannot_spawn_onto_a_claimed_endpoint(monkeypatch, tmp_path):
@@ -634,12 +651,12 @@ def test_abandoning_a_child_does_not_delete_another_launchs_record():
     """The dead-child path popped whatever was stored, not what it polled."""
     endpoint = ("127.0.0.1", 54000)
     other_live = _LiveChild()
-    rl_env._OPENENV_CHILDREN[endpoint] = other_live
+    rl_env._OPENENV_CHILDREN[endpoint] = _owned(other_live)
     rl_env._release_openenv_endpoint(*endpoint, child = _DeadChild())
-    assert rl_env._OPENENV_CHILDREN.get(endpoint) is other_live
+    assert _entry_child(endpoint) is other_live
     # Our own record, though, is removed.
     mine = _DeadChild()
-    rl_env._OPENENV_CHILDREN[endpoint] = mine
+    rl_env._OPENENV_CHILDREN[endpoint] = _owned(mine)
     rl_env._release_openenv_endpoint(*endpoint, child = mine)
     assert endpoint not in rl_env._OPENENV_CHILDREN
 
@@ -826,3 +843,54 @@ def test_a_flood_cannot_evict_the_announcement_before_it_is_read():
     assert not any("Uvicorn running on" in line for line in watcher.tail)
     # ...but the verdict survives it.
     assert watcher.bound
+
+
+# --- a forked worker must still recognise the parent's server -------------------
+
+def _reuse_in_fork(endpoint, queue):
+    """Runs in a forked child: ask whether the inherited entry is alive."""
+    queue.put(rl_env._openenv_child_alive(*endpoint))
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason = "no fork on this platform")
+def test_a_forked_worker_does_not_call_the_parents_server_dead():
+    """The OpenEnv RL notebooks reach this on every move.
+
+    `execute_with_time_limit` falls back to a forked process whenever the wrapped
+    strategy has a bare except inside a loop, which the 2048 notebook's does, and
+    that strategy calls `launch_openenv` per move. In the fork, poll() waitpids a
+    process that is not its child, gets ECHILD, and CPython caches returncode 0,
+    so a port-and-poll check reports the parent's live server as dead and a new
+    uvicorn is spawned for every move -- each one a fresh game.
+    """
+    # A real process we did not spawn here, so poll() is meaningless on it: sleep
+    # is inert and long enough to outlive the assertions.
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    endpoint = ("127.0.0.1", 58000)
+    try:
+        rl_env._OPENENV_CHILDREN[endpoint] = _owned(holder)
+        assert rl_env._openenv_child_alive(*endpoint), "wrong in the parent"
+
+        context = multiprocessing.get_context("fork")
+        queue = context.Queue()
+        worker = context.Process(target = _reuse_in_fork, args = (endpoint, queue))
+        worker.start()
+        worker.join(60)
+        assert queue.get(timeout = 10) is True, (
+            "the forked worker called the parent's live server dead"
+        )
+        # And it must not have evicted the entry it does not own.
+        assert _entry_child(endpoint) is holder
+    finally:
+        holder.terminate()
+        holder.wait(timeout = 10)
+
+
+def test_a_dead_process_is_still_dead_off_process():
+    """Fork-awareness must not become 'always alive': the pid probe has to bite."""
+    gone = subprocess.Popen([sys.executable, "-c", "pass"])
+    gone.wait(timeout = 10)
+    endpoint = ("127.0.0.1", 58001)
+    # Claim a different owner so the off-process branch is the one under test.
+    rl_env._OPENENV_CHILDREN[endpoint] = (gone, os.getpid() + 1)
+    assert not rl_env._openenv_child_alive(*endpoint)
