@@ -32,7 +32,11 @@ from __future__ import annotations
 
 import importlib.util
 
+import json
+
 import os
+
+import subprocess
 
 import sys
 from pathlib import Path
@@ -187,3 +191,38 @@ def test_the_probe_environment_is_not_mutated_for_the_caller(llama_cpp, tmp_path
     env.pop("PYTHONSAFEPATH", None)
     llama_cpp._probe_child_gguf(sys.executable, env, (), None, timeout = 60)
     assert "PYTHONSAFEPATH" not in env
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11),
+                    reason = "PYTHONSAFEPATH is honored from 3.11")
+def test_the_probe_keeps_the_converter_gguf_ahead_of_pythonpath(llama_cpp, tmp_path):
+    """The real run has its script directory at sys.path[0] and the sibling tree at
+    1, so the sibling outranks all of PYTHONPATH. Safe-path mode vacates index 0, so
+    inserting at 1 there would rank the sibling BEHIND the first PYTHONPATH entry and
+    the probe would report a gguf the conversion never uses.
+
+    Run with `-S` rather than through `_probe_child_gguf`: a site-packages .pth that
+    prepends its own entry occupies index 0 anyway and would hide the inversion.
+    """
+    ambient = tmp_path / "ambient"
+    _gguf_package(ambient, body = "__version__ = 'ambient'\n")
+    install = tmp_path / "install"
+    _gguf_package(install / "gguf-py", body = "__version__ = 'sibling'\n")
+    converter = install / "convert_hf_to_gguf.py"
+    converter.write_text("# converter\n", encoding = "utf-8")
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ambient)
+    env["PYTHONSAFEPATH"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", llama_cpp._GGUF_PROBE_SOURCE, str(converter)],
+        input = "[]", env = env, stdout = subprocess.PIPE, stderr = subprocess.PIPE,
+        encoding = "utf-8", timeout = 60,
+    )
+    reports = [
+        json.loads(line) for line in (completed.stdout or "").splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert reports, completed.stderr
+    location = reports[-1].get("location") or ""
+    assert location == str(install / "gguf-py" / "gguf" / "__init__.py"), location

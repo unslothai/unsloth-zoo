@@ -4384,8 +4384,15 @@ requirements = json.loads(sys.stdin.read() or "[]")
 # measure a different `gguf` than the real run: every llama.cpp converter (and
 # its conversion/base.py) does this before `import gguf`, and `python -c` has no
 # script directory of its own to do it for us.
+# Index 1 is the converter's own slot only while something occupies index 0: the
+# real run has its script directory there, and `python -c` has the CWD. Safe-path
+# mode removes that entry, so index 1 would fall BEHIND the first PYTHONPATH entry
+# while the real run keeps the sibling tree ahead of all of PYTHONPATH.
 if converter and "NO_LOCAL_GGUF" not in os.environ:
-    sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(converter)), "gguf-py"))
+    sys.path.insert(
+        0 if getattr(sys.flags, "safe_path", False) else 1,
+        os.path.join(os.path.dirname(os.path.abspath(converter)), "gguf-py"),
+    )
 
 def resolve(expression):
     parts = expression.split(".")
