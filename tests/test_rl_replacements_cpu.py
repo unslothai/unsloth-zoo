@@ -557,6 +557,80 @@ def test_bias_correction_kl_is_not_scaled_by_the_vllm_ratio(mode, use_bias_corre
     assert torch.allclose(new_ours.grad, new_trl.grad, atol=1e-10, rtol=1e-8)
 
 
+@pytest.mark.parametrize(
+    "mode", ["token_mask", "token_truncate", "sequence_mask", "sequence_truncate"]
+)
+def test_unscored_vllm_token_does_not_nan_the_loss(mode):
+    # vLLM does not always return a logprob: `sanitize_logprob` maps the missing value to None and
+    # TRL turns that back into nan. One such token used to make the whole step's loss nan, because
+    # `nan * 0` survives the mask, `clamp` passes nan through and `nan < min` / `nan > max` are both
+    # False so the masked modes do not catch it either.
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    sampling = old - 0.01
+    kwargs.update(
+        use_vllm=True,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode=mode,
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+    )
+
+    new_clean = new.clone().requires_grad_(True)
+    clean_loss = rr.grpo_compute_loss(
+        ref, new_clean, old, sampling.clone(), input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    clean_loss.backward()
+
+    unscored = sampling.clone()
+    unscored[0, 2] = float("nan")
+    new_nan = new.clone().requires_grad_(True)
+    nan_loss = rr.grpo_compute_loss(
+        ref, new_nan, old, unscored, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    nan_loss.backward()
+
+    assert torch.isfinite(nan_loss), f"{mode}: one unscored token made the loss {nan_loss.item()}"
+    assert torch.isfinite(new_nan.grad).all(), f"{mode}: gradient is not finite"
+
+    # The unscored token gets ratio exp(0) = 1, so only its own contribution moves; every other
+    # row keeps the clean gradient.
+    assert torch.allclose(new_nan.grad[1:], new_clean.grad[1:], atol=1e-12, rtol=1e-10)
+
+
+def test_unscored_vllm_token_is_neutral_not_dropped():
+    # exp(0) = 1 means "apply no correction to this token", which is what TRL does. Zeroing the
+    # ratio instead would drop the token from the policy term entirely.
+    beta = 0.0
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    sampling = old.clone()
+    sampling[0, 2] = float("nan")
+    kwargs.update(
+        use_vllm=True,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode="token_truncate",
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+    )
+
+    new_vllm = new.clone().requires_grad_(True)
+    loss_vllm = rr.grpo_compute_loss(
+        ref, new_vllm, old, sampling, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+
+    # sampling == old everywhere else, so every other ratio is exp(0) = 1 too: the corrected loss
+    # must equal the uncorrected one.
+    new_plain = new.clone().requires_grad_(True)
+    plain_kwargs = dict(kwargs)
+    plain_kwargs["use_vllm"] = False
+    plain_kwargs["vllm_importance_sampling_correction"] = False
+    loss_plain = rr.grpo_compute_loss(
+        ref, new_plain, old, None, input_ids, mask, beta, advantages, **plain_kwargs
+    )[0]
+
+    assert torch.allclose(loss_vllm, loss_plain, atol=1e-12, rtol=1e-10)
+
+
 @pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
 @pytest.mark.parametrize("use_bias_correction_kl", [False, True])
 def test_grpo_compute_loss_bias_correction_kl_matches_trl_mirror(
