@@ -339,6 +339,50 @@ def test_visual_server_request_write_refuses_to_block_on_a_fifo(monkeypatch, tmp
         server._send([{"role": "user", "content": "hello"}], 1, 0)
 
 
+def test_visual_server_request_refuses_a_fifo_someone_is_reading(monkeypatch, tmp_path):
+    """O_NONBLOCK only refuses a FIFO with NO reader.
+
+    Held open for reading, the open succeeds and the whole conversation would go to
+    whoever is holding it, so only the fstat refuses this one.
+    """
+    import threading
+    import unsloth_zoo.diffusion_studio.visual_engine as visual_engine
+
+    monkeypatch.setattr(visual_engine.VisualServer, "_spawn", lambda self: None)
+    monkeypatch.setattr(visual_engine, "_resolve_bin", lambda b: "/bin/true")
+    monkeypatch.setattr(
+        visual_engine, "_build_subprocess_env", lambda *a, **k: {"NGL": "0"},
+    )
+
+    planted = tmp_path / "planted.req"
+    os.mkfifo(planted)
+    holder = {}
+
+    def eavesdrop():
+        holder["fd"] = os.open(str(planted), os.O_RDONLY)
+
+    reader = threading.Thread(target = eavesdrop, daemon = True)
+    reader.start()
+
+    server = visual_engine.VisualServer("model.gguf", req_path = str(planted))
+
+    class _Stdin:
+        def write(self, _): pass
+        def flush(self): pass
+
+    class _Process:
+        stdin = _Stdin()
+        def poll(self): return None
+
+    server.p = _Process()
+    try:
+        with pytest.raises(OSError):
+            server._send([{"role": "user", "content": "secret"}], 1, 0)
+    finally:
+        if "fd" in holder:
+            os.close(holder["fd"])
+
+
 def test_gpt_oss_marker_is_written_into_a_directory_we_own(tmp_path, monkeypatch):
     """The gate must not stop the ordinary case from recording the flavor."""
     from unsloth_zoo.temporary_patches import gpt_oss

@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 
@@ -288,7 +289,9 @@ class VisualServer:
         # must not be written through a link nor left world readable.
         # O_NONBLOCK so an explicit req_path pointing at a FIFO fails the request
         # instead of blocking the server forever waiting for a reader. It is a no-op
-        # on the regular file the default path always is.
+        # on the regular file the default path always is. It does NOT refuse a FIFO
+        # whose read end is already held open, which succeeds and would hand the whole
+        # conversation to whoever holds it, so the fstat below is what refuses that.
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         if not no_follow:
             # No atomic no-follow open here (Windows), and an lstat first would only
@@ -299,8 +302,15 @@ class VisualServer:
             flags |= no_follow
             flags |= getattr(os, "O_NONBLOCK", 0)
             descriptor = os.open(self.req, flags, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as f:
-                json.dump(req, f, ensure_ascii=False)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError(f"Unsloth: refusing to write the request at `{self.req}`: not a regular file.")
+                with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                    descriptor = None
+                    json.dump(req, f, ensure_ascii=False)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
         try:
             self.p.stdin.write(self.req + "\n")
             self.p.stdin.flush()
