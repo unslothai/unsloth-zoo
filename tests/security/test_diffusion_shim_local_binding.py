@@ -29,6 +29,8 @@ Everything here runs against the ASGI app in-process; no socket is opened.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 # The shim imports fastapi/uvicorn, which the CI [core] extras do not ship.
@@ -54,6 +56,14 @@ def client(monkeypatch):
 
     def _generate_visual(server, messages, **kwargs):
         calls.append(kwargs)
+        # The real server always closes a turn with STATS, and a generation that
+        # runs to its block budget reports that budget back. Standing in with no
+        # stats at all would quietly make the finish-reason tests unfailable.
+        blocks = kwargs.get("max_blocks", 8)
+        on_stats = kwargs.get("on_stats")
+        if on_stats is not None:
+            on_stats({"blocks": blocks, "predicted_n": blocks * 256, "prompt_n": 4,
+                      "wall_ms": 1.0, "decode_ms": 1.0, "canvas": 256})
         return "ok"
 
     monkeypatch.setattr(shim.V, "generate_visual", _generate_visual)
@@ -182,13 +192,74 @@ def test_max_tokens_is_clamped(client):
 
 def test_an_ordinary_request_is_not_clamped(client):
     """The default 2048 tokens, and anything under the ceiling, is untouched."""
-    assert shim._max_blocks({}) == 8
-    assert shim._max_blocks({"max_tokens": 4096}) == 16
-    assert shim._max_blocks({"max_tokens": 1}) == 1
+    assert shim._max_blocks({}) == (8, False)
+    assert shim._max_blocks({"max_tokens": 4096}) == (16, False)
+    assert shim._max_blocks({"max_tokens": 1}) == (1, False)
 
 
 def test_the_ceiling_is_configurable(client, monkeypatch):
     monkeypatch.setenv("DG_MAX_BLOCKS", "128")
-    assert shim._max_blocks({"max_tokens": 10 ** 9}) == 128
+    assert shim._max_blocks({"max_tokens": 10 ** 9}) == (128, True)
     monkeypatch.setenv("DG_MAX_BLOCKS", "not a number")
-    assert shim._max_blocks({"max_tokens": 10 ** 9}) == CEILING
+    assert shim._max_blocks({"max_tokens": 10 ** 9}) == (CEILING, True)
+
+
+# --- A reply this server cut short does not report a natural stop ---
+
+def test_a_capped_generation_reports_length(client):
+    """Without this a client cannot tell a truncated answer from a complete one, so
+    it never runs the continuation it would run against any other OpenAI server."""
+    client.calls.clear()
+    response = client.post("/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9})
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["finish_reason"] == "length"
+
+
+def test_an_uncapped_generation_still_reports_stop(client):
+    """The ceiling is the only thing this may speak for: a request inside it that
+    ends on its own finished naturally, and saying `length` there is the same bug
+    in reverse."""
+    response = client.post("/v1/chat/completions", json = BODY)
+    assert response.json()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a_capped_request_that_stops_early_still_reports_stop(client, monkeypatch):
+    """Capped is not the same as truncated. If the model committed fewer blocks than
+    the ceiling allowed, the ceiling is not what ended it."""
+    def _short(server, messages, seed = 3407, max_blocks = 8, on_frame = None,
+               on_commit = None, on_stats = None, tools = None):
+        if on_stats is not None:
+            on_stats({"blocks": 1, "predicted_n": 256, "prompt_n": 4})
+        return "done early"
+    monkeypatch.setattr(shim.V, "generate_visual", _short)
+    response = client.post("/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9})
+    assert response.json()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_a_capped_streaming_generation_reports_length(client):
+    """The streaming path emits its own terminal chunk, so it needs its own proof:
+    a client reading deltas sees only that last finish_reason."""
+    response = client.post(
+        "/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9, "stream": True},
+    )
+    assert response.status_code == 200, response.text
+    reasons = [
+        choice["finish_reason"]
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+        for choice in json.loads(line[6:]).get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert reasons == ["length"], response.text
+
+
+def test_an_uncapped_streaming_generation_reports_stop(client):
+    response = client.post("/v1/chat/completions", json = {**BODY, "stream": True})
+    reasons = [
+        choice["finish_reason"]
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+        for choice in json.loads(line[6:]).get("choices", [])
+        if choice.get("finish_reason")
+    ]
+    assert reasons == ["stop"], response.text

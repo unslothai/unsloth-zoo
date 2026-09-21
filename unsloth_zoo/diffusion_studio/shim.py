@@ -57,8 +57,8 @@ _PLAYER_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "can
 _WANT_ARTIFACT = os.environ.get("DG_ARTIFACT", "") not in ("", "0", "false", "False", "no", "off")
 
 DEFAULT_HOST = "127.0.0.1"
-# 256 tokens per canvas block, so 64 blocks is a 16384-token answer: far above the
-# 2048-token default, and low enough that one caller cannot hold _LOCK for hours.
+# 256 tokens per canvas block, so 64 blocks is a 16384-token answer, far above the
+# 2048-token default. See _max_blocks for what this does and does not bound.
 DEFAULT_MAX_BLOCKS = 64
 
 app = FastAPI()
@@ -270,7 +270,27 @@ def _max_blocks(body):
         ceiling = max(1, int(os.environ.get("DG_MAX_BLOCKS", "").strip()))
     except ValueError:
         ceiling = DEFAULT_MAX_BLOCKS
-    return max(1, min(ceiling, math.ceil(mt / V.CANVAS)))
+    asked = max(1, math.ceil(mt / V.CANVAS))
+    return min(ceiling, asked), asked > ceiling
+
+
+def _finish_reason(capped, max_blocks, stats):
+    """`length` only when the ceiling WE imposed is what ended the generation.
+
+    A caller whose own max_tokens was honoured, or whose answer stopped early with
+    blocks to spare, still finished naturally. Reporting `length` there would be as
+    wrong as the reverse, and it is the reverse that matters: without this, a reply
+    this server cut short is indistinguishable from a complete one, so a client
+    never runs its continuation path. An older visual server that reports no block
+    count leaves us unable to tell, and then today's answer stands.
+    """
+    if not capped:
+        return "stop"
+    try:
+        used = int(stats.get("blocks", 0))
+    except (TypeError, ValueError):
+        return "stop"
+    return "length" if used >= max_blocks else "stop"
 
 
 def _artifact(frames):
@@ -314,7 +334,7 @@ async def chat(req: Request):
     # forwarded to the visual server, honoring tool_choice
     tools = _tools_for_choice(body.get("tools"), body.get("tool_choice"))
     stream = bool(body.get("stream", False))
-    max_blocks = _max_blocks(body)
+    max_blocks, capped = _max_blocks(body)
     seed = int(body.get("seed", 3407))
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -344,7 +364,7 @@ async def chat(req: Request):
         return JSONResponse({
             "id": cid, "object": "chat.completion", "created": created, "model": MODEL_ID,
             "choices": [{"index": 0, "message": message,
-                         "finish_reason": "stop"}],
+                         "finish_reason": _finish_reason(capped, max_blocks, stats_box)}],
             "usage": {"prompt_tokens": P, "completion_tokens": G, "total_tokens": P + G},
         })
 
@@ -421,7 +441,8 @@ async def chat(req: Request):
                                 "usage": {"prompt_tokens": P, "completion_tokens": G,
                                           "total_tokens": P + G},
                                 "timings": timings})
-                    yield _sse(_chunk(cid, created, {}, finish="stop"))
+                    yield _sse(_chunk(cid, created, {},
+                                      finish=_finish_reason(capped, max_blocks, stats_box)))
                     yield "data: [DONE]\n\n"
                     return
             elif kind == "overflow":
