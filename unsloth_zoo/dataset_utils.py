@@ -17,6 +17,7 @@
 __all__ = [
     "train_on_responses_only",
     "get_chat_template_parts",
+    "is_trl_padding_free_collator",
     "sft_prepare_dataset",
     "standardize_data_formats",
     "patch_torchcodec_audio_decoder",
@@ -667,6 +668,24 @@ class _MediaAwareCollator:
         # so this cannot recurse through it.
         if attribute.startswith("__"): raise AttributeError(attribute)
         return getattr(self.__dict__["text"], attribute)
+pass
+
+
+def is_trl_padding_free_collator(collator):
+    """Is this TRL's `DataCollatorForLanguageModeling` in padding-free mode?
+
+    Such a collator flattens the batch, emits `position_ids` and consumes the
+    `labels` column, so replacing it costs padding-free batching and any
+    `torch_call` wrapper installed on the instance.
+
+    Matched by MRO and module prefix rather than by importing TRL: the class is
+    optional at runtime, and an unrelated collator that merely carries a truthy
+    `padding_free` must not qualify.
+    """
+    return bool(getattr(collator, "padding_free", False)) and any(
+        cls.__name__ == "DataCollatorForLanguageModeling" and cls.__module__.startswith("trl.")
+        for cls in type(collator).__mro__
+    )
 pass
 
 
@@ -2083,6 +2102,9 @@ def train_on_responses_only(
     # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
     # from a processor already returned above, so what is left here only pads.
     _collator = getattr(trainer, "data_collator", None)
+    # TRL's padding-free collator preserves labels and builds position_ids.
+    # Keep the instance so Unsloth's sequence-length wrapper survives too.
+    _padding_free_collator = is_trl_padding_free_collator(_collator)
     # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding) pads
     # through a `.pad` processors do not have, so it dies on the first batch;
     # rebuild it around the unwrapped text tokenizer. A collator holding no
@@ -2099,7 +2121,8 @@ def train_on_responses_only(
     # anything was mapped.
     if hasattr(trainer, "data_collator") and (
         _processor_backed or _bypassed_vision_collator
-        or (not isinstance(_collator, DataCollatorForSeq2Seq) and not packing_enabled)
+        or (not isinstance(_collator, DataCollatorForSeq2Seq)
+            and not packing_enabled and not _padding_free_collator)
     ):
         # Keep the caller's settings when only swapping the tokenizer on a seq2seq
         # collator; for any other class this is a replacement, not a swap, and its
