@@ -271,6 +271,53 @@ def test_the_probe_models_the_converter_script_directory(llama_cpp, tmp_path):
     assert reports[-1].get("location") == actual
 
 
+def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_path):
+    """Reached through a symlink the two slots part company: `__file__` stays the
+    link, so the entrypoint's own gguf-py insertion is link-relative, while CPython
+    prepends the resolved directory ("if it's a symbolic link, resolve symbolic
+    links", sys.path docs). Each slot has to be modelled from its own directory."""
+    target = tmp_path / "target"
+    target.mkdir()
+    resolved_gguf = _gguf_package(target, body = "__version__ = 'target'\n")
+    linkdir = tmp_path / "linkdir"
+    _gguf_package(linkdir / "gguf-py", body = "__version__ = 'link-sibling'\n")
+
+    real = target / "convert_hf_to_gguf.py"
+    real.write_text(
+        "import sys, os\n"
+        "sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gguf-py'))\n"
+        "import gguf\n"
+        "print(gguf.__file__)\n",
+        encoding = "utf-8",
+    )
+    link = linkdir / "convert_hf_to_gguf.py"
+    os.symlink(str(real), str(link))
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""
+    env.pop("PYTHONSAFEPATH", None)
+    run = subprocess.run(
+        [sys.executable, "-S", str(link)], env = env, stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
+    )
+    actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
+    assert actual.startswith(str(resolved_gguf)), f"the converter itself resolved {actual}"
+
+    probe_env = dict(env)
+    probe_env["PYTHONSAFEPATH"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", llama_cpp._GGUF_PROBE_SOURCE, str(link), "0"],
+        input = "[]", env = probe_env, stdout = subprocess.PIPE, stderr = subprocess.PIPE,
+        encoding = "utf-8", timeout = 60,
+    )
+    reports = [
+        json.loads(line) for line in (completed.stdout or "").splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert reports, completed.stderr
+    assert reports[-1].get("location") == actual
+
+
 def test_the_probe_drops_the_working_directory_without_interpreter_support(
         llama_cpp, tmp_path, monkeypatch):
     """The 3.9/3.10 case, simulated by withholding the flag the way those versions

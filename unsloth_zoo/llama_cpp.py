@@ -4410,7 +4410,12 @@ if not getattr(sys.flags, "safe_path", False):
 converter_safe = (sys.version_info >= (3, 11)
                   and len(sys.argv) > 2 and sys.argv[2] == "1")
 if converter:
+    # Two different directories whenever the converter is reached through a symlink,
+    # and each slot wants its own. The entrypoint self-locates through `__file__`,
+    # which stays the symlink's own path, while CPython prepends the script's
+    # directory "if it's a symbolic link, resolve symbolic links" (sys.path docs).
     converter_dir = os.path.dirname(os.path.abspath(converter))
+    script_dir = os.path.dirname(os.path.realpath(converter))
     if "NO_LOCAL_GGUF" not in os.environ:
         sys.path.insert(1 if converter_safe else 0,
                         os.path.join(converter_dir, "gguf-py"))
@@ -4421,7 +4426,7 @@ if converter:
     # the script's own directory off the real run's path. Safe-path mode is the one
     # case with no such entry to model.
     if not converter_safe:
-        sys.path.insert(0, converter_dir)
+        sys.path.insert(0, script_dir)
 
 def resolve(expression):
     parts = expression.split(".")
