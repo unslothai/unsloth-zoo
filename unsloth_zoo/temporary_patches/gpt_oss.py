@@ -1477,11 +1477,26 @@ pass
 
 
 def _gpt_oss_write_marker(loc, desired_flavor):
-    """Write the flavor marker without following a link out of `loc`."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    """Write the flavor marker without following a link out of `loc`.
+
+    Same flag set as `compiler._write_bytes_durably`, for the same reasons: a FIFO
+    planted here would otherwise block the model load forever waiting for a reader,
+    and one with a reader attached would swallow the marker, leaving the flavor
+    silently unrecorded. A trusted directory can still be group-writable by design.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), flags, 0o600)
-    with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
-        f.write(desired_flavor)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Unsloth: refusing to write the gpt-oss flavor marker in `{loc}`: not a regular file.")
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            f.write(desired_flavor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 pass
 
 

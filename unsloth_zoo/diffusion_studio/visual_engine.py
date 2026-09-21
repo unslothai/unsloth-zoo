@@ -260,7 +260,12 @@ class VisualServer:
             req["tools"] = tools
         # O_NOFOLLOW and 0600: the request body carries the whole conversation, so it
         # must not be written through a link nor left world readable.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        # O_NONBLOCK so an explicit req_path pointing at a FIFO fails the request
+        # instead of blocking the server forever waiting for a reader. It is a no-op
+        # on the regular file the default path always is.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
         descriptor = os.open(self.req, flags, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as f:
             json.dump(req, f, ensure_ascii=False)

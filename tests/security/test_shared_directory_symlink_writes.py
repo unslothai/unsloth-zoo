@@ -180,6 +180,53 @@ def test_gpt_oss_marker_write_does_not_follow_a_symlink(tmp_path, victim_file):
     assert victim_file.read_text() == "do not overwrite me"
 
 
+def test_gpt_oss_marker_write_refuses_a_fifo(tmp_path):
+    """A planted FIFO must not block the model load, nor silently eat the marker.
+
+    A trusted cache can still be group-writable, so a group member can create this
+    entry. Without O_NONBLOCK the open waits for a reader forever; with a reader
+    attached it succeeds and the flavor is never recorded, which is the silent
+    version of the same defect.
+    """
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    cache = tmp_path / "cache"
+    cache.mkdir(mode = 0o775)
+    marker = cache / gpt_oss._GPT_OSS_FLAVOR_MARKER
+    os.mkfifo(marker)
+
+    with pytest.raises(OSError):
+        gpt_oss._gpt_oss_write_marker(str(cache), "stock")
+    assert stat.S_ISFIFO(os.lstat(marker).st_mode), "the FIFO should be refused, not replaced"
+
+
+def test_visual_server_request_write_refuses_to_block_on_a_fifo(monkeypatch, tmp_path):
+    """An explicit req_path pointing at a FIFO must fail the request, not hang it."""
+    import unsloth_zoo.diffusion_studio.visual_engine as visual_engine
+
+    monkeypatch.setattr(visual_engine.VisualServer, "_spawn", lambda self: None)
+    monkeypatch.setattr(visual_engine, "_resolve_bin", lambda b: "/bin/true")
+    monkeypatch.setattr(
+        visual_engine, "_build_subprocess_env", lambda *a, **k: {"NGL": "0"},
+    )
+
+    planted = tmp_path / "planted.req"
+    os.mkfifo(planted)
+    server = visual_engine.VisualServer("model.gguf", req_path = str(planted))
+
+    class _Stdin:
+        def write(self, _): pass
+        def flush(self): pass
+
+    class _Process:
+        stdin = _Stdin()
+        def poll(self): return None
+
+    server.p = _Process()
+    with pytest.raises(OSError):
+        server._send([{"role": "user", "content": "hello"}], 1, 0)
+
+
 def test_gpt_oss_marker_is_written_into_a_directory_we_own(tmp_path, monkeypatch):
     """The gate must not stop the ordinary case from recording the flavor."""
     from unsloth_zoo.temporary_patches import gpt_oss
