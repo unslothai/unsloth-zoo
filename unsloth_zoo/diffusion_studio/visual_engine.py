@@ -207,7 +207,16 @@ class VisualServer:
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-        self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
+        # /dev/shm and /tmp are mode 1777, so a PID-derived name there is readable by
+        # every local user and can be pre-empted with a symlink planted ahead of time
+        # (PIDs are enumerable, and the same path is reused for every request). Give
+        # each server its own 0700 directory with an unpredictable name instead.
+        self._req_dir = None
+        if req_path:
+            self.req = req_path
+        else:
+            self._req_dir = tempfile.mkdtemp(prefix = "dg_visual_", dir = req_dir)
+            self.req = os.path.join(self._req_dir, "request.json")
         self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
         self.ngl = int(self.env["NGL"])
         self.p = None
@@ -249,7 +258,11 @@ class VisualServer:
         # for schema-correct <|tool_call> args.
         if tools:
             req["tools"] = tools
-        with open(self.req, "w", encoding="utf-8") as f:
+        # O_NOFOLLOW and 0600: the request body carries the whole conversation, so it
+        # must not be written through a link nor left world readable.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.req, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
             json.dump(req, f, ensure_ascii=False)
         try:
             self.p.stdin.write(self.req + "\n")
@@ -267,6 +280,12 @@ class VisualServer:
             self.p.wait(timeout=10)
         except Exception:
             self.p.kill()
+        finally:
+            # The request file outlived the process before this, leaving the last
+            # conversation on disk in a shared directory.
+            if self._req_dir is not None:
+                shutil.rmtree(self._req_dir, ignore_errors = True)
+                self._req_dir = None
 
 
 def _parse_stats(line):

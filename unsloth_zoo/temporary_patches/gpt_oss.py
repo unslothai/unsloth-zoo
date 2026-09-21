@@ -1437,6 +1437,34 @@ def _gpt_oss_cache_locations():
     return out
 
 
+def _gpt_oss_cache_location_is_trusted(loc):
+    """Whether this process may write the flavor marker into `loc`.
+
+    The temp candidate is a fully predictable path (`/tmp/unsloth_compiled_cache` by
+    default), and nothing stops another local user creating it first. `os.path.isdir`
+    answers "does it exist", which an attacker satisfies with one mkdir, not "is it
+    ours". The mega-cache in this same package already answers the real question, so
+    use its check rather than a second, weaker copy of one.
+    """
+    try:
+        # Spelled absolutely: transformers' custom_object_save resolves a relative
+        # import in this package against temporary_patches/ and would fail to open it.
+        from unsloth_zoo.compile_cache import _is_trusted_directory
+        return _is_trusted_directory(loc, allow_missing = True)
+    except Exception:
+        return False
+pass
+
+
+def _gpt_oss_write_marker(loc, desired_flavor):
+    """Write the flavor marker without following a link out of `loc`."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+        f.write(desired_flavor)
+pass
+
+
 def _invalidate_gpt_oss_compiled_module():
     """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
     rebuilt against the CURRENT router/experts classes. The single per-model-type file
@@ -1479,6 +1507,8 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
         locations = _gpt_oss_cache_locations()
         mismatch = False
         for loc in locations:
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                continue
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
                 continue
@@ -1498,10 +1528,13 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
         for idx, loc in enumerate(locations):
             if idx != 0 and not os.path.isdir(loc):
                 continue
+            # Skip silently rather than write into a directory another user owns or
+            # can write, and never follow a link out of it.
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                continue
             try:
                 os.makedirs(loc, exist_ok = True)
-                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
-                    f.write(desired_flavor)
+                _gpt_oss_write_marker(loc, desired_flavor)
             except Exception:
                 pass
     except Exception:

@@ -34,6 +34,7 @@ import importlib.machinery
 import importlib.util
 import numpy as np
 import os
+import stat
 import torch
 import subprocess
 import types
@@ -1536,11 +1537,35 @@ def _set_mode_by_descriptor(descriptor, location, mode):
 pass
 
 def _write_bytes_durably(location, new_write_bytes):
-    """Write and fsync. Buffered, so a short write is retried rather than lost."""
-    with open(location, "wb") as file:
-        file.write(new_write_bytes)
-        file.flush()
-        os.fsync(file.fileno())
+    """Write and fsync, refusing to follow a link out of the compiled cache.
+
+    The cache path is predictable and so are the generated module names, so on a
+    shared temp directory another local user can plant a symlink at one of them and
+    have this write land on whatever it points at. O_NOFOLLOW turns that into an
+    OSError, which sends the caller to _replace_compiled_cache_file; that helper
+    replaces the link itself via mkstemp plus os.replace rather than writing through
+    it, so the in-place fast path is given up only when it is unsafe. The fstat
+    re-checks what was actually opened, since O_NOFOLLOW says nothing about a FIFO or
+    a device node. Buffered, so a short write is retried rather than lost.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    # Without this, opening a FIFO planted at the cache path blocks forever waiting
+    # for a reader, which turns the same plant into a hang instead of a bad write.
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(location, flags, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Unsloth: refusing to write `{location}`: not a regular file.")
+        with os.fdopen(descriptor, "wb") as file:
+            descriptor = None
+            file.write(new_write_bytes)
+            file.flush()
+            os.fsync(file.fileno())
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 pass
 
 def _write_compiled_cache_file(function_location, new_write_bytes):
