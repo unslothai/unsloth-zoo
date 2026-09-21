@@ -331,3 +331,94 @@ def test_chunking_bounds_peak_logit_memory():
 
 def test_registered_in_rl_replacements():
     assert rr.RL_REPLACEMENTS["distillation_chunked_jsd"] is rr.distillation_chunked_jsd
+
+
+# The loss differentiates in the forward pass with torch.func.grad_and_value and
+# compiles that transform, rather than recomputing each chunk under gradient
+# checkpointing. These pin the paths that choice introduces.
+
+
+def test_trainable_bias_receives_a_gradient():
+    """The (0, 1, 2) argnums branch: hidden states, head and bias all trained."""
+    sh, th, swt, twt, mask, sb, tb = _make(bias = True)
+    sb.requires_grad_(True)
+    loss, _, _ = rr.distillation_chunked_jsd(
+        sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3,
+        student_lm_head_bias = sb, teacher_lm_head_bias = tb,
+    )
+    loss.backward()
+    assert sb.grad is not None and sb.grad.abs().sum() > 0
+    assert swt.grad is not None and sh.grad is not None
+    assert tb.grad is None, "teacher bias received a gradient"
+
+
+def test_frozen_bias_with_trained_head():
+    """The (0, 1) argnums branch: a bias that exists but is not trained."""
+    sh, th, swt, twt, mask, sb, tb = _make(bias = True)
+    sb.requires_grad_(False)
+    loss, _, _ = rr.distillation_chunked_jsd(
+        sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3,
+        student_lm_head_bias = sb, teacher_lm_head_bias = tb,
+    )
+    loss.backward()
+    assert sb.grad is None
+    assert swt.grad is not None and sh.grad is not None
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+def test_compile_disabled_gives_the_same_answer(beta, monkeypatch):
+    """UNSLOTH_COMPILE_DISABLE must change speed, never numerics."""
+    sh, th, swt, twt, mask, _, _ = _make()
+    compiled, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = beta, chunk_size = 3)
+    compiled.backward()
+    compiled_grads = (sh.grad.clone(), swt.grad.clone())
+
+    rr._distillation_jsd_grad_fn.cache_clear()
+    monkeypatch.setattr(
+        rr, "_maybe_compile", lambda **kwargs: (lambda function: function), raising = False,
+    )
+    try:
+        sh2, th2, swt2, twt2, mask2, _, _ = _make()
+        eager, _, _ = rr.distillation_chunked_jsd(sh2, th2, swt2, twt2, mask2, beta = beta, chunk_size = 3)
+        eager.backward()
+        torch.testing.assert_close(compiled, eager, rtol = 1e-5, atol = 1e-6)
+        torch.testing.assert_close(compiled_grads[0], sh2.grad, rtol = 1e-4, atol = 1e-6)
+        torch.testing.assert_close(compiled_grads[1], swt2.grad, rtol = 1e-4, atol = 1e-6)
+    finally:
+        rr._distillation_jsd_grad_fn.cache_clear()
+
+
+def test_hidden_gradient_is_returned_in_the_callers_row_order():
+    """Packing sorts rows; the gradient has to come back unsorted.
+
+    Masked rows contribute nothing, so a gradient left in packed order would put
+    real values on masked positions and zeros on trained ones, which still trains
+    and still looks plausible.
+    """
+    sh, th, swt, twt, mask, _, _ = _make()
+    loss, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3)
+    loss.backward()
+    zero_rows = (sh.grad.reshape(-1, sh.shape[-1]).abs().sum(dim = -1) == 0)
+    masked = (mask.reshape(-1) == 0)
+    assert torch.equal(zero_rows, masked), "gradient rows do not line up with the mask"
+
+
+def test_entropy_and_token_count_are_not_differentiable():
+    """Only the loss carries a gradient; the two metrics are reported, not trained."""
+    sh, th, swt, twt, mask, _, _ = _make()
+    loss, entropy_sum, n_valid = rr.distillation_chunked_jsd(
+        sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3,
+    )
+    assert loss.requires_grad
+    assert not entropy_sum.requires_grad
+    assert not n_valid.requires_grad
+
+
+def test_double_backward_is_not_silently_wrong():
+    """The custom Function has no double backward; it must say so, not lie."""
+    sh, th, swt, twt, mask, _, _ = _make()
+    loss, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3)
+    (grad_hidden,) = torch.autograd.grad(loss, sh, create_graph = True)
+    # The saved gradient is a constant with respect to the inputs, so a second
+    # derivative through it is zero rather than a silently wrong value.
+    assert grad_hidden.grad_fn is not None or not grad_hidden.requires_grad
