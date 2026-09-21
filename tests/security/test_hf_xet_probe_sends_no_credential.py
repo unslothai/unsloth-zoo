@@ -2,14 +2,8 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 """The Xet reachability probe must not carry the user's Hugging Face token.
 
-The probe's own docstring says the route answers anonymously, so a credential buys
-nothing there. It cost two things instead. `huggingface_hub`'s client honours
-`HF_HUB_DISABLE_IMPLICIT_TOKEN` and strips `Authorization` when a redirect leaves the
-origin; a hand-rolled `urllib.request.Request` does neither, so the token followed a
-cross-host 3xx to whatever host the redirect named.
-
-Everything here runs against a loopback fixture. `tests/security/conftest.py` already
-refuses any non-loopback connect, so these tests cannot reach the real Hub.
+A hand-rolled `urllib` Request ignores `HF_HUB_DISABLE_IMPLICIT_TOKEN` and keeps
+`Authorization` across a cross-host 3xx. Loopback only, enforced by the package conftest.
 """
 
 import importlib.util
@@ -27,12 +21,9 @@ DUMMY_TOKEN = "hf_dummyTokenForTestsOnly000000000000"
 
 
 def _load_hf_xet_health():
-    """Load the module by path under a stub package.
+    """Load the module standalone: importing `unsloth_zoo` runs import-time device detection.
 
-    Importing `unsloth_zoo` would run the package's import-time device detection, so
-    the module is loaded standalone. It carries one relative import, so it needs a
-    parent package to exist: a stub package whose __path__ points at the real
-    directory satisfies that without executing unsloth_zoo/__init__.py.
+    Its one relative import needs a parent package, which the stub supplies.
     """
     import types
 
@@ -52,8 +43,6 @@ def _load_hf_xet_health():
 
 
 class _RecordingHandler(BaseHTTPRequestHandler):
-    """Records every request's Authorization header, and 302s once to a second port."""
-
     def log_message(self, *args):  # keep the pytest output clean
         pass
 
@@ -68,8 +57,7 @@ class _RecordingHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.server.status != 200:
-            # An endpoint that gates this route. The body is sent and sized so the client sees a
-            # complete response rather than a transport error, which is a different code path.
+            # Sized body: a truncated one is a transport error, which is a different code path.
             body = b'{"error": "Unauthorized"}'
             self.send_response(self.server.status)
             self.send_header("Content-Type", "application/json")
@@ -155,8 +143,8 @@ def test_probe_sends_no_authorization_across_a_cross_host_redirect(
 
 def test_probe_does_not_read_a_token_at_all(module, monkeypatch, origin):
     """No credential lookup, so HF_HUB_DISABLE_IMPLICIT_TOKEN cannot be contradicted."""
-    # HF_TOKEN must be ABSENT: with it set, the old code short-circuited before get_token, so a
-    # spy on get_token would go uncalled on the unpatched tree too and prove nothing.
+    # HF_TOKEN must be ABSENT or the old code short-circuits before get_token and the spy proves
+    # nothing on the unpatched tree either.
     monkeypatch.delenv("HF_TOKEN", raising = False)
     monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 
@@ -181,12 +169,7 @@ def test_probe_does_not_read_a_token_at_all(module, monkeypatch, origin):
 def test_a_401_is_inconclusive_and_still_carries_no_credential(
     module, monkeypatch, origin, with_env_token
 ):
-    """An endpoint that gates this route answers 401, which proves it is REACHABLE.
-
-    The probe sends nothing, so a 401 can only mean auth was never attempted. Returning a
-    demotion here would pin the machine to HTTP for 24h on the strength of a reply. Both
-    parameterizations must agree: the token is not consulted either way.
-    """
+    """A 401 proves the endpoint is REACHABLE, and both arms must agree: nothing is consulted."""
     if with_env_token:
         monkeypatch.setenv("HF_TOKEN", DUMMY_TOKEN)
     else:
@@ -196,7 +179,6 @@ def test_a_401_is_inconclusive_and_still_carries_no_credential(
     ok, reason = module._probe_cas_reachable_inner()
 
     assert origin.seen, "the probe did not reach the fixture"
-    # `is None`, not falsiness: the bug this guards returned False, which is falsy too.
     assert ok is None, reason
     assert "inconclusive" in reason
     for path, auth in origin.seen:
@@ -206,9 +188,8 @@ def test_a_401_is_inconclusive_and_still_carries_no_credential(
 def test_source_carries_no_authorization_header():
     """A lint-shaped guard: nothing in this module may add an Authorization header.
 
-    Read the EXECUTABLE strings out of the AST rather than scanning the file text. A text scan
-    has to exempt the comment that explains the removal, and that exemption then blesses every
-    other mention in the file, including a real header.
+    EXECUTABLE strings only: a text scan must exempt the comment explaining the removal, and
+    that exemption then blesses every other mention, a real header included.
     """
     import ast
 

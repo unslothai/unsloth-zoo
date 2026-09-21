@@ -262,20 +262,18 @@ def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
 
 
 def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
-    """The probe attaches no credential, so a 401 only means auth was never attempted.
+    """Nothing is sent, so a 401 only means auth was never attempted.
 
-    This is the arm the 404 test cannot reach: `or` short-circuits before the 401 half is ever
-    evaluated. An endpoint that requires auth on this route would otherwise pin the machine to
-    HTTP for 24h on the strength of a response that proves the endpoint is REACHABLE.
+    The 404 test cannot reach this arm: `or` short-circuits before the 401 half is evaluated.
+    `is None` below, not falsiness: the bug this guards returned False, which is falsy too.
     """
     import urllib.error
     import urllib.request
 
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
-    # A discoverable token, so this cannot pass by accident on a runner that has none: the
-    # previous behaviour only reached its inconclusive arm when no credential was found, so
-    # without this the whole test goes vacuous exactly where CI runs it.
+    # Without a discoverable token this goes vacuous on any CI runner: the old code reached its
+    # inconclusive arm whenever no credential was found.
     monkeypatch.setenv("HF_TOKEN", "hf_dummyTokenForTestsOnly000000000000")
 
     def _raise(*args, **kwargs):
@@ -284,7 +282,6 @@ def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _raise)
 
     ok, reason = health._probe_cas_reachable()
-    # `is None`, not falsiness: the bug this guards returned False, which is falsy too.
     assert ok is None, reason
 
     verdict = health.xet_health(force = True, probe = True)
@@ -294,11 +291,8 @@ def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
 
 
 def test_probe_429_is_inconclusive_not_a_demotion(monkeypatch):
-    """Rate limiting is not evidence that CAS is unreachable, and anonymity invites it.
-
-    This is an /api/ route: anonymously the quota is 500 per 5min shared per IP address, against
-    1,000 per user once authenticated, so one NAT, cluster or CI runner exhausts it for everyone
-    behind it while the user's own authenticated download would have succeeded.
+    """Throttling is not evidence that CAS is unreachable, and anonymity invites it: the /api/
+    quota is 500 per 5min shared PER IP against 1,000 per user (huggingface.co/docs/hub/rate-limits).
     """
     import urllib.error
     import urllib.request

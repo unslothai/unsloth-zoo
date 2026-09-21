@@ -314,12 +314,8 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
 
         url = f"{_endpoint()}/api/models/{_PROBE_REPO}/xet-read-token/main"
         request = urllib.request.Request(url, headers = {"User-Agent": "unsloth-xet-probe"})
-        # No credential is attached. The route answers anonymously (see the docstring), so the
-        # token bought nothing, and sending it here cost two things that urllib does not give
-        # back: `huggingface_hub`'s own client honours HF_HUB_DISABLE_IMPLICIT_TOKEN and drops
-        # `Authorization` when a redirect leaves the origin, while a hand-rolled Request keeps
-        # the header across a cross-host 3xx. A reachability probe must not be the one place
-        # the user's token escapes the endpoint they pointed HF_ENDPOINT at.
+        # No credential is attached: urllib ignores HF_HUB_DISABLE_IMPLICIT_TOKEN and keeps
+        # `Authorization` across a cross-host 3xx, which HF_ENDPOINT mirrors really do send.
         deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
         with urllib.request.urlopen(request, timeout = PROBE_TIMEOUT_SECONDS) as response:
             if response.status != 200:
@@ -343,13 +339,10 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
     except urllib.error.HTTPError as e:
         # The endpoint ANSWERED, which is all this probe measures.
         if e.code in (404, 401, 429):
-            # 404: the probe repo is not hosted here (mirror / on-prem), so do not pin to HTTP for
-            # 24h. 401: no credential is ever attached now, so a 401 can only mean auth was never
-            # attempted -- reachability proven, and it says nothing about Xet. 429: this is an
-            # /api/ route, and anonymously that quota is 500 per 5min SHARED PER IP against 1,000
-            # per user when authenticated (huggingface.co/docs/hub/rate-limits), so one NAT or CI
-            # runner can exhaust it while the user's own authenticated download is fine. 403/407
-            # still demote -- that is how a blocking proxy answers.
+            # 404 mirror/on-prem, 401 auth never attempted, 429 throttling: none says anything
+            # about Xet, and the anonymous /api/ quota is 500 per 5min shared PER IP against
+            # 1,000 per user (huggingface.co/docs/hub/rate-limits), so one NAT exhausts it.
+            # 403/407 still demote -- that is how a blocking proxy answers.
             return (None, "Xet probe inconclusive on this endpoint; assuming Xet")
         return (False, f"Xet token endpoint returned HTTP {e.code}")
     except Exception as e:
