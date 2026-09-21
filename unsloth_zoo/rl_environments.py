@@ -1131,6 +1131,22 @@ _OPENENV_CHILDREN_LOCK = threading.Lock()
 _OPENENV_RESERVED = set()
 
 
+def _reinit_openenv_lock_after_fork():
+    """ Replace the registry lock in a forked child.
+
+    fork copies the lock's state but not the threads, so one held by another thread
+    at fork time is inherited locked with no owner left to release it, and the
+    child's first registry call blocks forever (CPython bpo-6721). The notebook
+    path forks per move, so this is reachable whenever a second thread launches.
+    """
+    global _OPENENV_CHILDREN_LOCK
+    _OPENENV_CHILDREN_LOCK = threading.Lock()
+pass
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child = _reinit_openenv_lock_after_fork)
+pass
+
+
 def _reserve_openenv_endpoint(client_host, port):
     """ Claim this endpoint for the caller, or report that someone already has. """
     with _OPENENV_CHILDREN_LOCK:
@@ -1189,7 +1205,31 @@ def _openenv_pid_is_alive(pid):
         return True          # exists, just not ours to signal
     except OSError:
         return True          # unanswerable, so do not call a live server dead
-    return True
+    return not _openenv_pid_is_zombie(pid)
+pass
+
+
+def _openenv_pid_is_zombie(pid):
+    """ Has this pid exited without being reaped?
+
+    A sibling we cannot waitpid stays as a zombie, and a zombie still answers
+    os.kill(pid, 0) while its listening socket is long gone, so treating pid
+    existence as liveness re-opens the squatter hole a whole port away.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as file:
+            # comm sits in parentheses and may contain spaces, so split after the last ')'.
+            return file.read().rsplit(b")", 1)[-1].split()[:1] == [b"Z"]
+    except OSError:
+        pass # No procfs: macOS and the BSDs answer through ps instead
+    try:
+        state = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output = True, text = True, timeout = 10,
+        ).stdout.strip()
+    except Exception:
+        return False         # unanswerable, so do not call a live server dead
+    return state[:1] == "Z"  # multi-letter on BSD ('Z+'), so read the first only
 pass
 
 

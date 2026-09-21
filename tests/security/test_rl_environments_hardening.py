@@ -914,3 +914,66 @@ def test_the_liveness_probe_does_not_kill_what_it_probes():
     finally:
         alive.terminate()
         alive.wait(timeout = 10)
+
+
+def _touch_registry_in_fork(queue):
+    try:
+        rl_env._reap_exited_openenv_children()
+        queue.put("completed")
+    except BaseException as error:
+        queue.put(f"raised {type(error).__name__}")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason = "fork only")
+def test_a_lock_held_at_fork_does_not_wedge_the_child():
+    """fork copies the lock, not the thread holding it (CPython bpo-6721).
+
+    Inherited locked, with no owner left to release it, the child's first registry
+    call blocks until the outer timeout kills the worker: every move of the game
+    lost, silently. The after-fork hook has to hand the child a fresh lock.
+    """
+    holding = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with rl_env._OPENENV_CHILDREN_LOCK:
+            holding.set()
+            release.wait(30)
+
+    thread = threading.Thread(target = holder, daemon = True)
+    thread.start()
+    assert holding.wait(5)
+    try:
+        context = multiprocessing.get_context("fork")
+        queue = context.Queue()
+        worker = context.Process(target = _touch_registry_in_fork, args = (queue,))
+        worker.start()
+        worker.join(20)
+        alive = worker.is_alive()
+        if alive: worker.terminate(); worker.join(5)
+        assert not alive, "the forked child wedged on the lock it inherited locked"
+        assert queue.get(timeout = 5) == "completed"
+    finally:
+        release.set()
+        thread.join(5)
+
+
+def test_an_unreaped_process_is_not_alive():
+    """A zombie answers os.kill(pid, 0) while its socket is already released.
+
+    The parent's uvicorn is a SIBLING of a forked worker, which cannot waitpid it,
+    so it stays unreaped for as long as the worker runs. Reading pid existence as
+    liveness there re-opens the squatter hole one port away: the dead server's port
+    is free for any local process to bind and answer /health on.
+    """
+    zombie = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline and not rl_env._openenv_pid_is_zombie(zombie.pid):
+            time.sleep(0.05)
+        assert rl_env._openenv_pid_is_zombie(zombie.pid), "never became a zombie"
+        assert not rl_env._openenv_pid_is_alive(zombie.pid)
+    finally:
+        zombie.wait(timeout = 10)
+    # Reaped: gone outright, and still not alive.
+    assert not rl_env._openenv_pid_is_alive(zombie.pid)
