@@ -343,11 +343,6 @@ jobs:
         # runs the dtype decision alone on CPU; left to --collect-only it would prove
         # only that it imports, which is the failure this comment already lists twice.
         #
-        # test_offload_recompute_dtype is its follow-up: the buffers can still be bf16 when a
-        # FORCE_FLOAT32 load passes that dtype in, and the recompute was handed the buffer
-        # rather than the activation. The GPU case skips here; the source checks and the
-        # bit-exact view check run on CPU, which is the part a refactor can silently undo.
-        #
         # The two compiled-cache files cover create_new_function's distributed
         # protocol: the rank-local guard that let one rank skip a broadcast and
         # hang the group under torchrun, and the digest agreement that stops two
@@ -449,7 +444,6 @@ jobs:
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
-            tests/test_offload_recompute_dtype.py \
             tests/test_disabled_hook_checkpoint_guard.py \
             tests/test_conftest_module_leak_gate.py \
             tests/test_compiled_cache_collective.py \
