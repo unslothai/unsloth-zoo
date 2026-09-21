@@ -73,22 +73,53 @@ def test_match_class_pattern_chain_cannot_reach_import():
         create_locked_down_function(source)
 
 
-BOUND_NAME_ESCAPES = [
-    ("match capture", "    match A:\n        case [x] as __evil:\n            pass\n    return x\n"),
-    ("match star", "    match A:\n        case [x, *__evil]:\n            pass\n    return x\n"),
-    ("match rest", "    match A:\n        case {'a': x, **__evil}:\n            pass\n    return x\n"),
-    ("except", "    try:\n        return A[0]\n    except IndexError as __evil:\n        return 0\n"),
-    ("global", "    global __builtins__\n    return 0\n"),
-    ("keyword", "    return sorted(A, __class__=1)\n"),
-    ("import alias", "    import math as __evil\n    return 0\n"),
+# `kwd_attrs` is the only identifier-as-string field that READS an attribute.
+# Every other one just binds a name, and a bound dunder is inert because reading
+# it back is an ast.Name that the Name rule refuses. These cases pin exactly
+# that, so the reason the allowlist does not need a rule per binding form is
+# asserted rather than assumed: if the Name rule ever stopped covering a read,
+# one of these fails instead of a hole opening quietly.
+BOUND_NAME_READS = [
+    ("match capture", "    match A:\n        case [x] as __evil:\n            pass\n    return __evil\n"),
+    ("match star", "    match A:\n        case [x, *__evil]:\n            pass\n    return __evil\n"),
+    ("match rest", "    match A:\n        case {'a': x, **__evil}:\n            pass\n    return __evil\n"),
+    ("except", "    try:\n        return A[0]\n    except IndexError as __evil:\n        return str(__evil)\n"),
+    ("global", "    global __builtins__\n    __builtins__ = 1\n    return 0\n"),
+    ("keyword", "    d = dict(__class__=1)\n    return __class__\n"),
+    ("import alias", "    import math as __evil\n    return __evil.pi\n"),
+    ("parameter", "    return __class__\n"),
 ]
 
 
-@pytest.mark.parametrize("name,body", BOUND_NAME_ESCAPES, ids = [n for n, _ in BOUND_NAME_ESCAPES])
-def test_dunder_bound_as_bare_identifier_rejected(name, body):
-    """Every other place the grammar stores a name as a string, not an ast.Name."""
+@pytest.mark.parametrize("name,body", BOUND_NAME_READS, ids = [n for n, _ in BOUND_NAME_READS])
+def test_reading_a_dunder_binding_is_rejected(name, body):
+    """A dunder bound by any spelling is unusable, because the read is an ast.Name."""
     with pytest.raises(RuntimeError, match = "not allowed in generated code"):
         create_locked_down_function("def matmul(A, B):\n" + body)
+
+
+# The flip side, and the reason the binding forms are not rejected outright:
+# every one of these is a working program that a rule on the binding broke.
+BOUND_NAME_FALSE_POSITIVES = [
+    ("dict with a dunder key", "def f():\n    return dict(__class__ = 'label')\n", (), {"__class__": "label"}),
+    ("unused dunder parameter", "def f(__class__ = None):\n    return 7\n", (), 7),
+    ("star args", "def f(*__args):\n    return 7\n", (1, 2), 7),
+    ("kwargs", "def f(**__kw):\n    return 7\n", (), 7),
+    ("unused import alias", "def f():\n    import math as __m\n    return 7\n", (), 7),
+    ("unused except capture", "def f():\n    try:\n        1 / 0\n    except ZeroDivisionError as __e:\n        return 7\n", (), 7),
+    ("unused match capture", "def f(x):\n    match x:\n        case [v] as __w:\n            return v\n", ([7],), 7),
+    ("unused match star", "def f(x):\n    match x:\n        case [v, *__r]:\n            return v\n", ([7, 8],), 7),
+    ("unused match rest", "def f(x):\n    match x:\n        case {'v': v, **__r}:\n            return v\n", ({"v": 7, "o": 8},), 7),
+]
+
+
+@pytest.mark.parametrize(
+    "name,source,args,expected", BOUND_NAME_FALSE_POSITIVES,
+    ids = [n for n, _, _, _ in BOUND_NAME_FALSE_POSITIVES],
+)
+def test_binding_a_dunder_name_is_not_itself_refused(name, source, args, expected):
+    """Binding reaches nothing, so refusing it only broke generated code that worked."""
+    assert create_locked_down_function(source)(*args) == expected
 
 
 # --- none of the hardening may cost ordinary generated code ------------------

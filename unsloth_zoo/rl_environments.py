@@ -662,36 +662,6 @@ pass
 _MATCH_CLASS_NODES = tuple(
     node for node in (getattr(ast, "MatchClass", None),) if node is not None
 )
-_MATCH_CAPTURE_NODES = tuple(
-    node for node in (getattr(ast, "MatchAs", None), getattr(ast, "MatchStar", None))
-    if node is not None
-)
-_MATCH_MAPPING_NODES = tuple(
-    node for node in (getattr(ast, "MatchMapping", None),) if node is not None
-)
-
-
-def _bound_identifiers(node):
-    """
-    Names a node binds as a bare identifier string rather than an ast.Name,
-    which is the only reason the walk below cannot already see them.
-    """
-    if isinstance(node, ast.ExceptHandler):
-        return (node.name,)
-    if isinstance(node, ast.arg):
-        return (node.arg,)
-    if isinstance(node, (ast.Global, ast.Nonlocal)):
-        return tuple(node.names)
-    if isinstance(node, ast.keyword):
-        return (node.arg,)
-    if isinstance(node, ast.alias):
-        return (node.name, node.asname)
-    if _MATCH_CAPTURE_NODES and isinstance(node, _MATCH_CAPTURE_NODES):
-        return (node.name,)
-    if _MATCH_MAPPING_NODES and isinstance(node, _MATCH_MAPPING_NODES):
-        return (node.rest,)
-    return ()
-pass
 
 
 def _reject_dunder_access(tree):
@@ -728,21 +698,18 @@ def _reject_dunder_access(tree):
         # A match class-pattern getattrs the subject with the names in
         # kwd_attrs, which are strings on the node: `case object(__class__=x)`
         # is the subclasses walk with no Attribute node anywhere in the source.
+        # This is the one identifier-as-string field that reads an attribute;
+        # the others (arg.arg, keyword.arg, alias, except/match capture names,
+        # global/nonlocal) only BIND a name, and binding a dunder reaches
+        # nothing while the Name rule above refuses every read of it. Rejecting
+        # those as well cost 11 working programs -- `dict(__class__ = "label")`
+        # among them -- and closed nothing, so the rule stops here.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
             for attr in (node.kwd_attrs or []):
                 if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
                     raise RuntimeError(
                         f"Attribute '{attr}' is not allowed in generated code."
                     )
-        # The remaining identifiers the grammar stores as strings rather than
-        # Name nodes. None of them reads an attribute by itself, but each one
-        # binds a name the Name rule above would refuse, so refuse it here too
-        # instead of leaving a second spelling of the same thing.
-        for bound in _bound_identifiers(node):
-            if bound is not None and bound.startswith("__"):
-                raise RuntimeError(
-                    f"Name '{bound}' is not allowed in generated code."
-                )
 pass
 
 
@@ -1199,6 +1166,13 @@ def launch_openenv(
     is localhost, so a wider bind only publishes the training run's environment
     to the host's networks and to anything sharing its container bridge. Pass
     host yourself if a remote worker genuinely has to reach it.
+
+    `openenv_process` is only reused when this process spawned the child holding
+    `port`. A server started outside this process is therefore NOT adopted even
+    when it is healthy and genuinely yours: a second uvicorn is spawned on a new
+    port and the passed client is dropped. That is the deliberate cost of the
+    check, since /health proves only that something answered, and an externally
+    managed server is indistinguishable from a process that took the port.
     """
     # Check if OpenEnv is working first
     assert type(environment) is dict
