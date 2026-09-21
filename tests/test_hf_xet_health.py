@@ -273,6 +273,10 @@ def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
 
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+    # A discoverable token, so this cannot pass by accident on a runner that has none: the
+    # previous behaviour only reached its inconclusive arm when no credential was found, so
+    # without this the whole test goes vacuous exactly where CI runs it.
+    monkeypatch.setenv("HF_TOKEN", "hf_dummyTokenForTestsOnly000000000000")
 
     def _raise(*args, **kwargs):
         raise urllib.error.HTTPError("http://gated/x", 401, "Unauthorized", None, None)
