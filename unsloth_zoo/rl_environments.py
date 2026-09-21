@@ -1134,10 +1134,9 @@ _OPENENV_RESERVED = set()
 def _reinit_openenv_lock_after_fork():
     """ Replace the registry lock in a forked child.
 
-    fork copies the lock's state but not the threads, so one held by another thread
-    at fork time is inherited locked with no owner left to release it, and the
-    child's first registry call blocks forever (CPython bpo-6721). The notebook
-    path forks per move, so this is reachable whenever a second thread launches.
+    fork copies the lock but not the thread owning it, so one held at fork time is
+    inherited locked forever and the child's first registry call blocks (CPython
+    bpo-6721). The notebook path forks per move, so this is reachable.
     """
     global _OPENENV_CHILDREN_LOCK
     _OPENENV_CHILDREN_LOCK = threading.Lock()
@@ -1173,11 +1172,9 @@ pass
 def _openenv_pid_is_alive(pid):
     """ Does this pid still exist, without signalling or reaping it?
 
-    Windows needs its own answer. `os.kill(pid, 0)` there does not probe: CPython
-    maps every signal except CTRL_C_EVENT and CTRL_BREAK_EVENT onto
-    TerminateProcess(handle, sig), so the "probe" would kill the server it asked
-    about, and an exited process whose handle is still open reports alive anyway.
-    Ask the Win32 API what it actually wants to be asked.
+    Windows needs the Win32 API instead: CPython maps every signal except
+    CTRL_C_EVENT and CTRL_BREAK_EVENT onto TerminateProcess(handle, sig), so
+    os.kill(pid, 0) there kills the server it was asked about.
     """
     if os.name == "nt":
         import ctypes
@@ -1187,8 +1184,7 @@ def _openenv_pid_is_alive(pid):
         kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            # 87 is "no such pid". Anything else (access denied and friends) means
-            # it exists or is unanswerable, so do not call a live server dead.
+            # 87 alone means no such pid; access denied and friends mean it exists.
             return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
         try:
             code = ctypes.c_ulong()
@@ -1212,9 +1208,8 @@ pass
 def _openenv_pid_is_zombie(pid):
     """ Has this pid exited without being reaped?
 
-    A sibling we cannot waitpid stays as a zombie, and a zombie still answers
-    os.kill(pid, 0) while its listening socket is long gone, so treating pid
-    existence as liveness re-opens the squatter hole a whole port away.
+    A zombie still answers os.kill(pid, 0) while its listening socket is long
+    gone, so pid existence alone re-opens the squatter hole a port away.
     """
     try:
         with open(f"/proc/{pid}/stat", "rb") as file:

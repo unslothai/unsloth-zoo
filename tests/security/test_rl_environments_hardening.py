@@ -845,8 +845,6 @@ def test_a_flood_cannot_evict_the_announcement_before_it_is_read():
     assert watcher.bound
 
 
-# --- a forked worker must still recognise the parent's server -------------------
-
 def _reuse_in_fork(endpoint, queue):
     """Runs in a forked child: ask whether the inherited entry is alive."""
     queue.put(rl_env._openenv_child_alive(*endpoint))
@@ -854,17 +852,11 @@ def _reuse_in_fork(endpoint, queue):
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason = "no fork on this platform")
 def test_a_forked_worker_does_not_call_the_parents_server_dead():
-    """The OpenEnv RL notebooks reach this on every move.
-
-    `execute_with_time_limit` falls back to a forked process whenever the wrapped
-    strategy has a bare except inside a loop, which the 2048 notebook's does, and
-    that strategy calls `launch_openenv` per move. In the fork, poll() waitpids a
-    process that is not its child, gets ECHILD, and CPython caches returncode 0,
-    so a port-and-poll check reports the parent's live server as dead and a new
-    uvicorn is spawned for every move -- each one a fresh game.
+    """poll() in a fork waitpids a non-child, gets ECHILD, and CPython caches
+    returncode 0, so the parent's live server reads as dead and every move of the
+    2048 notebook spawns its own uvicorn on a fresh game.
     """
-    # A real process we did not spawn here, so poll() is meaningless on it: sleep
-    # is inert and long enough to outlive the assertions.
+    # Not spawned here, so poll() is meaningless on it; the sleep outlives the asserts.
     holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     endpoint = ("127.0.0.1", 58000)
     try:
@@ -897,13 +889,9 @@ def test_a_dead_process_is_still_dead_off_process():
 
 
 def test_the_liveness_probe_does_not_kill_what_it_probes():
-    """A probe that answers correctly by killing the server has answered wrongly.
-
-    On Windows `os.kill(pid, 0)` is not a probe: CPython maps every signal but
-    CTRL_C_EVENT and CTRL_BREAK_EVENT onto TerminateProcess(handle, sig), so the
-    reused POSIX idiom terminates the very server it was asked about. Staging CI
-    caught the wrong-answer half of this on windows-latest; this covers the half
-    that destroys state rather than misreporting it.
+    """On Windows CPython maps every signal but CTRL_C_EVENT and CTRL_BREAK_EVENT
+    onto TerminateProcess(handle, sig), so `os.kill(pid, 0)` kills the server it
+    was asked about rather than probing it.
     """
     alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
@@ -926,11 +914,9 @@ def _touch_registry_in_fork(queue):
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason = "fork only")
 def test_a_lock_held_at_fork_does_not_wedge_the_child():
-    """fork copies the lock, not the thread holding it (CPython bpo-6721).
-
-    Inherited locked, with no owner left to release it, the child's first registry
-    call blocks until the outer timeout kills the worker: every move of the game
-    lost, silently. The after-fork hook has to hand the child a fresh lock.
+    """fork copies the lock, not the thread holding it (CPython bpo-6721), so
+    without the after-fork hook the child blocks on its first registry call until
+    the outer timeout kills the worker.
     """
     holding = threading.Event()
     release = threading.Event()
@@ -959,12 +945,9 @@ def test_a_lock_held_at_fork_does_not_wedge_the_child():
 
 
 def test_an_unreaped_process_is_not_alive():
-    """A zombie answers os.kill(pid, 0) while its socket is already released.
-
-    The parent's uvicorn is a SIBLING of a forked worker, which cannot waitpid it,
-    so it stays unreaped for as long as the worker runs. Reading pid existence as
-    liveness there re-opens the squatter hole one port away: the dead server's port
-    is free for any local process to bind and answer /health on.
+    """A zombie answers os.kill(pid, 0) while its port is already free for anyone
+    to bind, and a forked worker cannot waitpid the parent's uvicorn (a sibling),
+    so that state lasts as long as the worker does.
     """
     zombie = subprocess.Popen([sys.executable, "-c", "pass"])
     try:
