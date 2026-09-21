@@ -117,6 +117,11 @@ def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
     return sliced
 
 
+# Triton refuses to compile a kernel that builds a tensor larger than this, so a
+# BLOCK_SIZE x BLOCK_SIZE tile is only legal up to BLOCK_SIZE = 1024.
+_TRITON_MAX_TENSOR_NUMEL = 1048576
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -270,6 +275,15 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
     bn = _ceil_div(N, q)
     if bm != bn:
         # weight_dequant_block uses a single BLOCK_SIZE; fall through to caller.
+        return None
+    if bm * bn > _TRITON_MAX_TENSOR_NUMEL:
+        # The kernel materialises a BLOCK_SIZE x BLOCK_SIZE tile, so a coarse
+        # scale makes the tile larger than any Triton tensor may be and the
+        # launch fails to compile. A per-expert per-tensor scale (p == q == 1)
+        # derives BLOCK_SIZE = M, which is how
+        # mistralai/Mistral-Small-4-119B-2603 reached
+        # "numel (16777216) exceeds triton maximum tensor numel (1048576)".
+        # The vectorized fallback in the caller handles these layouts.
         return None
 
     # Fast path: when M is exactly p*bm and both tensors are expert-major contiguous,
