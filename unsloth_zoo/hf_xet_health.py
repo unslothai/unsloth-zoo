@@ -314,17 +314,12 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
 
         url = f"{_endpoint()}/api/models/{_PROBE_REPO}/xet-read-token/main"
         request = urllib.request.Request(url, headers = {"User-Agent": "unsloth-xet-probe"})
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            # Covers `hf auth login` and the Colab secret, which a bare HF_TOKEN lookup misses.
-            try:
-                from huggingface_hub.utils import get_token
-
-                token = get_token()
-            except Exception:
-                token = None
-        if token:
-            request.add_header("Authorization", f"Bearer {token}")
+        # No credential is attached. The route answers anonymously (see the docstring), so the
+        # token bought nothing, and sending it here cost two things that urllib does not give
+        # back: `huggingface_hub`'s own client honours HF_HUB_DISABLE_IMPLICIT_TOKEN and drops
+        # `Authorization` when a redirect leaves the origin, while a hand-rolled Request keeps
+        # the header across a cross-host 3xx. A reachability probe must not be the one place
+        # the user's token escapes the endpoint they pointed HF_ENDPOINT at.
         deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
         with urllib.request.urlopen(request, timeout = PROBE_TIMEOUT_SECONDS) as response:
             if response.status != 200:
