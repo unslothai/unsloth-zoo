@@ -326,9 +326,6 @@ def _make_gemma4_cache_scope_wrapper(original):
 
     @functools.wraps(original)
     def wrapped(*args, **kwargs):
-        if not _enabled():
-            return original(*args, **kwargs)
-
         cache = kwargs.get("past_key_values", None)
         if "past_key_values" not in kwargs and signature is not None:
             try:

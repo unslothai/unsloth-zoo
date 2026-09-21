@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 import sys
 import types
@@ -275,12 +276,124 @@ def test_cache_scope_blocks_equal_length_registry_prefill(monkeypatch):
     assert fallback_calls == [True, True, True]
 
 
+def test_cache_scope_survives_carrier_wrapper_positional_cache(monkeypatch):
+    """Regression for HF 5.5 carrier wrapper hiding positional cache metadata."""
+    from unsloth_zoo.temporary_patches.gemma4 import (
+        _make_gemma4_attention_carrier_forward,
+    )
+
+    _reset_env_cache(monkeypatch)
+    monkeypatch.setattr(gg, "_is_gfx906_tensor", lambda x: True)
+    q, k, v = _cpu_qkv()
+    module = Gemma4GlobalFake()
+    fallback_calls = []
+
+    fake_kernel_module = types.SimpleNamespace(
+        gemma4_gfx906_global_attention=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("cache-bearing positional prefill reached custom kernel")
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "unsloth_zoo.temporary_patches._gemma4_gfx906_global_kernels",
+        fake_kernel_module,
+    )
+
+    def fallback(*args, **kwargs):
+        fallback_calls.append(True)
+        return "fallback", None
+
+    def hf55_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_key_values=None,
+    ):
+        assert past_key_values is not None
+        return gg._sdpa_maybe_gfx906_global(
+            self,
+            q,
+            k,
+            v,
+            None,
+            dropout=0.0,
+            scaling=1.0,
+            is_causal=True,
+            _fallback=fallback,
+        )
+
+    carrier_wrapped = _make_gemma4_attention_carrier_forward(hf55_forward)
+    # functools.wraps must preserve the HF signature for the later cache scope.
+    assert "past_key_values" in inspect.signature(carrier_wrapped).parameters
+    wrapped = gg._make_gemma4_cache_scope_wrapper(carrier_wrapped)
+
+    cache = object()
+    assert wrapped(module, None, None, None, cache) == ("fallback", None)
+    assert fallback_calls == [True]
+    assert gg._CACHE_PRESENT.get() is False
+
+
+def test_cache_scope_is_established_before_dynamic_enable_toggle(monkeypatch):
+    """Cache safety must not depend on feature state at forward entry."""
+    _reset_env_cache(monkeypatch, enabled="0")
+    monkeypatch.setattr(gg, "_is_gfx906_tensor", lambda x: True)
+    q, k, v = _cpu_qkv()
+    module = Gemma4GlobalFake()
+    fallback_calls = []
+
+    fake_kernel_module = types.SimpleNamespace(
+        gemma4_gfx906_global_attention=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("cache-bearing call engaged after dynamic enable")
+        )
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "unsloth_zoo.temporary_patches._gemma4_gfx906_global_kernels",
+        fake_kernel_module,
+    )
+
+    def fallback(*args, **kwargs):
+        fallback_calls.append(True)
+        return "fallback", None
+
+    def attention_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_key_values=None,
+    ):
+        assert past_key_values is not None
+        # Simulate dynamic opt-in changing while the attention forward is live.
+        monkeypatch.setenv("UNSLOTH_GEMMA4_GFX906_GLOBAL", "1")
+        return gg._sdpa_maybe_gfx906_global(
+            self,
+            q,
+            k,
+            v,
+            None,
+            dropout=0.0,
+            scaling=1.0,
+            is_causal=True,
+            _fallback=fallback,
+        )
+
+    wrapped = gg._make_gemma4_cache_scope_wrapper(attention_forward)
+    assert wrapped(module, None, None, None, object()) == ("fallback", None)
+    assert fallback_calls == [True]
+    assert gg._CACHE_PRESENT.get() is False
+
+
 def test_real_gemma4_empty_dynamic_cache_prefill_uses_registry_fallback(monkeypatch):
     """Exercise the Transformers call graph that originally exposed M2."""
     from transformers.cache_utils import DynamicCache
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
     from transformers.models.gemma4 import modeling_gemma4 as modeling
+    from unsloth_zoo.temporary_patches.gemma4 import (
+        _make_gemma4_attention_carrier_forward,
+    )
 
     _reset_env_cache(monkeypatch, min_seq="1")
     monkeypatch.setattr(gg, "_is_gfx906_tensor", lambda x: True)
@@ -304,10 +417,36 @@ def test_real_gemma4_empty_dynamic_cache_prefill_uses_registry_fallback(monkeypa
         "sdpa",
         gg._make_gfx906_global_wrapper(fallback),
     )
+    current_forward = modeling.Gemma4TextAttention.forward
+
+    # Model the 5.5.0-5.5.1 API shape that required Zoo's carrier patch, while
+    # still executing the real installed Gemma4TextAttention implementation.
+    # On newer builds shared_kv_states is a native positional parameter, so the
+    # adapter supplies it explicitly and exposes the older positional cache API.
+    def hf55_forward(
+        self,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_key_values=None,
+        **kwargs,
+    ):
+        return current_forward(
+            self,
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            {},
+            past_key_values,
+            **kwargs,
+        )
+
+    carrier_forward = _make_gemma4_attention_carrier_forward(hf55_forward)
+    assert "past_key_values" in inspect.signature(carrier_forward).parameters
     monkeypatch.setattr(
         modeling.Gemma4TextAttention,
         "forward",
-        gg._make_gemma4_cache_scope_wrapper(modeling.Gemma4TextAttention.forward),
+        gg._make_gemma4_cache_scope_wrapper(carrier_forward),
     )
 
     config = Gemma4TextConfig(
@@ -344,13 +483,9 @@ def test_real_gemma4_empty_dynamic_cache_prefill_uses_registry_fallback(monkeypa
         position_embeddings = rotary(hidden, position_ids, "full_attention")
 
     cache = DynamicCache(config=config)
-    output, weights = layer(
-        hidden,
-        position_embeddings=position_embeddings,
-        attention_mask=None,
-        shared_kv_states={},
-        past_key_values=cache,
-    )
+    # Cache is intentionally positional: this is the exact metadata-loss path
+    # that was previously hidden by carrier_forward(self, *args, **kwargs).
+    output, weights = layer(hidden, position_embeddings, None, cache)
 
     assert output.shape == hidden.shape
     assert weights is None
@@ -495,6 +630,27 @@ def test_kernel_runtime_error_is_not_swallowed_into_sdpa_fallback(monkeypatch):
             dropout=0.0, scaling=1.0, is_causal=True, _fallback=fallback,
         )
     assert fallback_calls == []
+
+
+def test_private_kernel_rejects_malformed_qkv_shapes_before_launch():
+    from unsloth_zoo.temporary_patches._gemma4_gfx906_global_kernels import (
+        gemma4_gfx906_global_attention,
+    )
+
+    q = torch.zeros(1, 32, 4, 512, dtype=torch.float16)
+    k = torch.zeros(1, 4, 4, 512, dtype=torch.float16)
+    v = torch.zeros(1, 4, 4, 512, dtype=torch.float16)
+
+    malformed = (
+        (q, k, torch.zeros(1, 3, 4, 512, dtype=torch.float16), "Hq=32/Hkv=4/D=512"),
+        (q, torch.zeros(1, 4, 4, 256, dtype=torch.float16), v, "Hq=32/Hkv=4/D=512"),
+        (q, k, torch.zeros(1, 4, 4, 256, dtype=torch.float16), "Hq=32/Hkv=4/D=512"),
+        (q, torch.zeros(2, 4, 4, 512, dtype=torch.float16), v, "matching Q/K/V batch size"),
+        (q, k, torch.zeros(2, 4, 4, 512, dtype=torch.float16), "matching Q/K/V batch size"),
+    )
+    for bad_q, bad_k, bad_v, message in malformed:
+        with pytest.raises(ValueError, match=message):
+            gemma4_gfx906_global_attention(bad_q, bad_k, bad_v, 1.0)
 
 
 def _runtime_is_gfx906():
@@ -732,10 +888,14 @@ def test_kernel_noncontiguous_qkv_matches_sdpa():
 
 @pytest.mark.skipif(not _runtime_is_gfx906(), reason="needs AMD gfx906")
 @pytest.mark.parametrize(
-    "dtype,tol",
-    [(torch.float16, 3e-3), (torch.float32, 5e-4)],
+    "dtype,tol,row_rtol,row_atol",
+    [
+        (torch.float16, 3e-3, 6e-3, 1.0),
+        (torch.bfloat16, 3e-2, 6e-2, 6.0),
+        (torch.float32, 5e-4, 1e-3, 2e-2),
+    ],
 )
-def test_kernel_long_1025_matches_sdpa(dtype, tol):
+def test_kernel_long_1025_matches_sdpa(dtype, tol, row_rtol, row_atol):
     """Cross many Q/KV tiles at a length just above the default 1024 threshold."""
     from unsloth_zoo.temporary_patches._gemma4_gfx906_global_kernels import (
         gemma4_gfx906_global_attention,
@@ -770,6 +930,15 @@ def test_kernel_long_1025_matches_sdpa(dtype, tol):
     assert rel(q.grad, qr.grad) < tol
     assert rel(k.grad, kr.grad) < tol
     assert rel(v.grad, vr.grad) < tol
+    for actual, expected in (
+        (out, ref),
+        (q.grad, qr.grad),
+        (k.grad, kr.grad),
+        (v.grad, vr.grad),
+    ):
+        _assert_rowwise_mixed_close(
+            actual, expected, rtol=row_rtol, atol=row_atol
+        )
     assert all(torch.isfinite(x).all() for x in (out, q.grad, k.grad, v.grad))
 
 

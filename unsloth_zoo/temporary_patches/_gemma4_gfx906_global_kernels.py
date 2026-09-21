@@ -270,8 +270,17 @@ class _Gemma4Gfx906GlobalAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, scale):
         B, HQ, N, D = q.shape
-        if HQ != _HQ or k.shape[1] != _HKV or D != _D:
+        if (
+            HQ != _HQ
+            or k.shape[1] != _HKV
+            or v.shape[1] != _HKV
+            or D != _D
+            or k.shape[3] != _D
+            or v.shape[3] != _D
+        ):
             raise ValueError("gfx906 Gemma-4 global kernel only supports Hq=32/Hkv=4/D=512")
+        if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+            raise ValueError("gfx906 Gemma-4 global kernel requires matching Q/K/V batch size")
         if q.shape[2] != k.shape[2] or q.shape[2] != v.shape[2]:
             raise ValueError("gfx906 Gemma-4 global kernel requires equal Q/K/V sequence lengths")
         if q.dtype not in (torch.float16, torch.bfloat16, torch.float32) or k.dtype != q.dtype or v.dtype != q.dtype:
