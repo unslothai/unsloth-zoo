@@ -765,6 +765,32 @@ def train_on_responses_only(
     len_Q_must = len(Q_must)
     Q_left_reversed = Q_left[::-1]
     Q_right_forward = Q_right
+
+    # A shared special-token opener delimits every role, tool and system included; a
+    # plain-text common prefix could also occur inside an answer.
+    message_start = []
+    for q, a in zip(Q_must, A_must):
+        if q != a: break
+        message_start.append(q)
+    # all_special_ids holds only the attribute specials (bos/eos/pad/unk), so the opener -
+    # <|im_start|>, <|start_header_id|>, <start_of_turn> - has to come from added_tokens_decoder.
+    # Whitespace is rejected: Nemotron's bare "\n" special would cut every span at a newline.
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    special_ids  = {i for i, t in added_tokens.items() if getattr(t, "special", False)}
+    special_ids.update(getattr(tokenizer, "all_special_ids", None) or [])
+    if not all(i in special_ids for i in message_start) or \
+        not any(getattr(added_tokens.get(i), "content", "").strip() for i in message_start):
+        message_start = []
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    # Every boundary test below fires only on one of these ids: one set lookup per token
+    # replaces four comparisons, over every token of every row.
+    boundary_first = {A_first}
+    if bos_token_id is not None: boundary_first.add(bos_token_id)
+    if eos_token_id is not None: boundary_first.add(eos_token_id)
+    if message_start: boundary_first.add(message_start[0])
+
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
@@ -805,7 +831,6 @@ def train_on_responses_only(
             n_minus_1 = n - 1
             j = 0
 
-            # Collect all (assistant_k, user_j) spans for this sample
             spans = []
             while j < n:
                 # Find <assistant>
@@ -827,10 +852,25 @@ def train_on_responses_only(
                     assistant_k = k
 
                     j = assistant_k
-                    # Find the next <user> (or the final item if assistant is last)
+                    # Keep the assistant's EOS, but never span another message/sample.
                     while j < n:
+                        token = input_ids[j]
+                        if token in boundary_first:
+                            if token == eos_token_id:
+                                spans.append((assistant_k, j + 1))
+                                break
+                            if token == bos_token_id or \
+                                (message_start and token == message_start[0] and \
+                                 input_ids[j : j + len(message_start)] == message_start) or \
+                                (token == A_first and input_ids[j : j + len_A_must] == A_must):
+                                spans.append((assistant_k, j))
+                                # Revisit the boundary so a following assistant is not skipped.
+                                j -= 1
+                                break
+                            pass
+                        pass
                         if (j == n_minus_1) or \
-                            ((input_ids[j] == Q_first) and \
+                            ((token == Q_first) and \
                              (input_ids[j : (k := j + len_Q_must)] == Q_must)):
 
                             # Extend over optional tokens, backward then forward

@@ -7,6 +7,11 @@ plain multi-turn conversation AND a reasoning conversation (final assistant turn
 carries "<think>...</think>answer"). The reasoning probe is what catches markers
 that bake in an injected empty think block and so miss the trained turn.
 
+Content-exactness alone leaves the span BOUNDARIES untested, so `_boundary_arms`
+adds the four cases that only show up at the edges of a response: last_response_only,
+force_match = False, padding that reuses the EOS id, and a second conversation packed
+into the same row.
+
 The model list is discovered dynamically from a notebooks checkout (git clone, or
 UNSLOTH_NOTEBOOKS_DIR), so a newly added notebook is picked up automatically; the
 pinned notebook_models.json is unioned in as a fallback so coverage never shrinks.
@@ -32,6 +37,11 @@ ENABLED = os.environ.get("UNSLOTH_TEST_NOTEBOOK_MODELS", "") not in ("", "0", "f
 # genuinely have no atomic role markers (e.g. zephyr-sft's multi-piece <|assistant|>); list
 # them here (substring match) so a real detection regression can never hide as a SKIP.
 KNOWN_NON_ATOMIC = ("zephyr-sft",)
+# Templates offering no message boundary at all: ERNIE's '<|end_of_sentence|>User:' and
+# 'Assistant:' share no token prefix, and <|end_of_sentence|> is not eos_token_id, so a
+# packed row has nothing to stop at and role-based labels are the documented answer.
+# Listed rather than tolerated so a boundary regression elsewhere cannot hide as a skip.
+KNOWN_NO_BOUNDARY = ("ernie-4.5",)
 CACHE = os.environ.get("UNSLOTH_NOTEBOOK_TOK_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_nb_tok"))
 ALLOW_PATTERNS = ["*.json", "*.model", "tokenizer*", "merges*", "vocab*", "*.jinja", "*.txt"]
 NOTEBOOKS_REPO = "https://github.com/unslothai/notebooks"
@@ -101,6 +111,13 @@ PLAIN = [{"role": "user", "content": USERS[0]}, {"role": "assistant", "content":
 # Reasoning probe: the final assistant turn carries a think block + answer.
 REASON = [{"role": "user", "content": "Reason user one"},
           {"role": "assistant", "content": "<think>HIDDENREASON</think>VISIBLEANSWER"}]
+# A second conversation to concatenate after PLAIN, standing in for packing. It opens
+# with a system message because that is what the old scan ran into: with no user marker
+# left in the first sample, its last span continued into the next sample's system prompt.
+NEXT_SYS, NEXT_USER, NEXT_ASST = "Ibex directive golf", "Ocelot question charlie", "Macaw answer foxtrot"
+NEXT = [{"role": "system", "content": NEXT_SYS},
+        {"role": "user", "content": NEXT_USER},
+        {"role": "assistant", "content": NEXT_ASST}]
 
 
 def _download(repo):
@@ -139,6 +156,90 @@ def _content_leak_free(t, ins, res, convo, asst_texts, user_texts):
     return True, ""
 
 
+def _piece_index(t, text):
+    """(token ids, sub -> the token indices covering it, or None if the template
+    dropped it)."""
+    enc = t(text, add_special_tokens=False, return_offsets_mapping=True)
+    offs = enc["offset_mapping"]
+
+    def idx(sub):
+        if sub not in text: return None
+        s = text.index(sub); e = s + len(sub)
+        return [k for k, (a, b) in enumerate(offs) if b > a and a < e and b > s] or None
+    return enc["input_ids"], idx
+
+
+def _mask(t, ins, res, ids, **kw):
+    from unsloth_zoo.dataset_utils import train_on_responses_only
+    fn = train_on_responses_only(None, instruction_part=ins, response_part=res,
+                                 tokenizer=t, return_function=True, **kw)
+    return fn({"input_ids": [list(ids)]})["labels"][0]
+
+
+def _all_trained(labels, idx):
+    """True if every token carries a target, False if none do, None if mixed."""
+    on = [labels[k] != -100 for k in idx]
+    return True if all(on) else (False if not any(on) else None)
+
+
+def _boundary_arms(t, repo, ins, res):
+    """The arms the plain content check cannot reach: last_response_only, force_match
+    off, padding that reuses the EOS id, and a packed second sample. Every arm is run
+    and every failure reported, so one broken arm cannot hide the rest."""
+    text = t.apply_chat_template(PLAIN, tokenize=False, add_generation_prompt=False)
+    ids, idx = _piece_index(t, text)
+    bad = []
+
+    first, last = idx(ASSTS[0]), idx(ASSTS[1])
+    if first and last:
+        labels = _mask(t, ins, res, ids, last_response_only=True)
+        if _all_trained(labels, last) is not True:
+            bad.append("last_response_only dropped the final answer")
+        if _all_trained(labels, first) is True:
+            bad.append("last_response_only retained an earlier answer")
+
+    try:
+        labels = _mask(t, ins, res, ids, force_match=False)
+    except ValueError:
+        labels = None          # no stable core without force_match; the guard's own job
+    if labels is not None:
+        for sub in ASSTS:
+            i = idx(sub)
+            if i and _all_trained(labels, i) is not True:
+                bad.append(f"force_match=False did not train {sub!r}")
+        for sub in USERS:
+            i = idx(sub)
+            if i and _all_trained(labels, i) is True:
+                bad.append(f"force_match=False leaked {sub!r}")
+
+    # Padding that reuses the EOS id. One eos may be kept as the answer's own target;
+    # the rest of the pad run must not be trained.
+    eos = getattr(t, "eos_token_id", None)
+    if eos is not None:
+        labels = _mask(t, ins, res, list(ids) + [eos] * 6)
+        trained = sum(1 for l in labels[len(ids):] if l != -100)
+        if trained > 1:
+            bad.append(f"{trained}/6 padding tokens trained")
+
+    if not any(k in repo.lower() for k in KNOWN_NO_BOUNDARY):
+        try:
+            # Templates that reject a system role skip THIS arm only: letting the
+            # exception out would demote an otherwise checkable model to SKIP.
+            tail = t.apply_chat_template(NEXT, tokenize=False, add_generation_prompt=False)
+        except Exception:
+            return (not bad), "; ".join(bad)
+        ids2, idx2 = _piece_index(t, text + tail)
+        labels = _mask(t, ins, res, ids2)
+        for sub, why in ((NEXT_SYS, "system prompt"), (NEXT_USER, "user content")):
+            i = idx2(sub)
+            if i and _all_trained(labels, i) is True:
+                bad.append(f"the next packed sample's {why} was trained")
+        answer = idx2(NEXT_ASST)
+        if answer and _all_trained(labels, answer) is not True:
+            bad.append("the packed second sample's answer was not trained")
+    return (not bad), "; ".join(bad)
+
+
 def _check(repo):
     from transformers import AutoTokenizer
     from unsloth_zoo.dataset_utils import get_chat_template_parts
@@ -166,6 +267,9 @@ def _check(repo):
             ok, why = _content_leak_free(inner, ins, res, convo, asst, users)
             if not ok:
                 return "FAIL", f"{why} (i={ins!r} r={res!r})"
+        ok, why = _boundary_arms(inner, repo, ins, res)
+        if not ok:
+            return "FAIL", f"{why} (i={ins!r} r={res!r})"
     except Exception as e:
         return "SKIP", f"verify {type(e).__name__}"
     return "PASS", ""
