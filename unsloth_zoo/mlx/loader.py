@@ -1539,6 +1539,32 @@ def _read_json_file(path):
     return data if isinstance(data, dict) else {}
 
 
+def _is_processor_like_class(obj):
+    """True only for a class Transformers itself treats as a processing component.
+
+    The name comes from a downloaded repo, and `transformers` exports non-class
+    callables too: `transformers.pipeline` takes `trust_remote_code`, so `getattr`
+    plus a call lets the repo pick the callee. `isinstance(x, type)` is not enough.
+    """
+    if not isinstance(obj, type):
+        return False
+    try:
+        from transformers.feature_extraction_utils import FeatureExtractionMixin
+        from transformers.image_processing_base import ImageProcessingMixin
+        from transformers.processing_utils import ProcessorMixin
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+    except Exception:
+        return False
+    bases = (
+        ProcessorMixin, ImageProcessingMixin, FeatureExtractionMixin,
+        PreTrainedTokenizerBase,
+    )
+    try:
+        return issubclass(obj, bases)
+    except Exception:
+        return False
+
+
 def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
     """Resolve a custom mlx-vlm or Transformers processor class by name."""
     module_model_type = (model_type or "").replace("-", "_")
@@ -1578,7 +1604,7 @@ def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
     try:
         import transformers
         processor_class = getattr(transformers, processor_class_name or "", None)
-        return processor_class if isinstance(processor_class, type) else None
+        return processor_class if _is_processor_like_class(processor_class) else None
     except Exception:
         return None
 
@@ -2003,21 +2029,25 @@ def _build_vlm_image_processor_from_config(
     image_kwargs = dict(image_config)
     image_kwargs.pop("image_processor_type", None)
     image_kwargs.pop("processor_class", None)
+    # Remote-code consent is the caller's to give, never the downloaded file's.
+    image_kwargs.pop("trust_remote_code", None)
 
-    if image_processor_type:
+    if isinstance(image_processor_type, str) and image_processor_type.isidentifier():
         try:
             import transformers
             image_processor_class = getattr(transformers, image_processor_type, None)
-            if image_processor_class is not None:
+            if _is_processor_like_class(image_processor_class):
                 return image_processor_class(**image_kwargs)
         except Exception:
             pass
-        # mlx-vlm models can ship their own image processor classes.
+        # A class is the whole bar here: mlx-vlm image processors do not always inherit
+        # a Transformers base, and the resolver only reaches installed `mlx_vlm.models.*`
+        # plus a namespace _is_processor_like_class already gates.
         try:
             image_processor_class = _resolve_mlx_vlm_processor_class(
                 model_type, image_processor_type,
             )
-            if image_processor_class is not None:
+            if isinstance(image_processor_class, type):
                 return image_processor_class(**image_kwargs)
         except Exception:
             pass
