@@ -4446,6 +4446,13 @@ def _probe_child_gguf(python_exe, env, requirements, converter_location = None, 
     """Ask the child interpreter which `gguf` it resolves and what it cannot
     satisfy. Returns a dict with `missing`, `location`, `version`, `error`, or
     None when the probe itself could not run."""
+    # `python -c` puts the WORKING DIRECTORY at the child's sys.path[0], which the
+    # real converter run never has (a script gets its own directory there), so a
+    # `gguf` package dropped in the CWD would outrank the converter's own tree and
+    # be the one this report names. PYTHONSAFEPATH drops that entry; it is ignored
+    # before 3.11, where _trusted_gguf_tree is what holds.
+    env = dict(env) if env is not None else dict(os.environ)
+    env["PYTHONSAFEPATH"] = "1"
     try:
         completed = subprocess.run(
             [python_exe, "-c", _GGUF_PROBE_SOURCE, str(converter_location or "")],
@@ -4535,7 +4542,9 @@ def _installed_gguf_tree(python_exe):
     tree = os.path.dirname(os.path.dirname(os.path.abspath(location)))
     if not os.path.isfile(os.path.join(tree, "gguf", "__init__.py")):
         return None
-    return tree
+    # A tree from here is pinned for the converter child AND swapped into this
+    # process for the read-back, so it answers to the same provenance rule.
+    return _trusted_gguf_tree(tree)
 pass
 
 
@@ -4602,6 +4611,45 @@ def _gguf_readback_tree(report):
     different contents, so all that is known is which package wrote the bytes.
     """
     return _gguf_tree_of_location((report or {}).get("location"))
+
+
+def _trusted_gguf_tree(tree, converter_location = None):
+    """`tree` when it sits inside a directory Unsloth itself chose, else None.
+
+    The tree the read-back pins comes from a path string a CHILD reported, and the
+    parent puts it at its own sys.path[0] and imports it. Shape says nothing about
+    who owns the directory, so a well-formed `gguf` package anywhere a lower-trust
+    principal can write would execute in the process holding the user's token.
+    Refusing costs nothing: it degrades to the unpinned read-back that ran before
+    the writer's tree was derived at all.
+    """
+    if not tree:
+        return None
+    roots = [LLAMA_CPP_DEFAULT_DIR, os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")]
+    if converter_location:
+        roots.append(os.path.dirname(os.path.abspath(converter_location)))
+    for root in roots:
+        if root and _stays_within(os.path.expanduser(root), tree):
+            return tree
+    # Plus the entry this process would import `gguf` from anyway, which the swap
+    # then does not change. Matched exactly rather than by containment: sys.path
+    # routinely holds a project root, and everything under one of those is not a
+    # tree we chose. Relative entries ('' or '.') resolve to the working directory,
+    # which is what this whole check exists to exclude.
+    real = os.path.realpath(tree)
+    for entry in sys.path:
+        if not entry or not os.path.isabs(entry):
+            continue
+        if os.path.realpath(entry) == real and \
+            os.path.isfile(os.path.join(entry, "gguf", "__init__.py")):
+            return tree
+    logger.warning(
+        "Unsloth: the converter resolved its `gguf` from '%s', which is not inside "
+        "a llama.cpp install Unsloth chose. Not adding it to this process's "
+        "sys.path; the GGUF is read back with the gguf already installed here.",
+        tree,
+    )
+    return None
 
 
 def _resolve_converter_and_gguf(converter_location, python_exe, architecture = None,
@@ -5230,7 +5278,11 @@ def convert_to_gguf(
     # no llama.cpp build can load (unsloth#6056, unsloth#8360, unsloth#8513).
     # `_gguf_py_pin` is None when nothing needed pinning; derive the writer's tree
     # from the probe report instead.
-    _readback_tree = _gguf_py_pin or _gguf_readback_tree(_gguf_report)
+    # The report names a directory the child chose, so it only goes on this
+    # process's sys.path when its provenance checks out.
+    _readback_tree = _gguf_py_pin or _trusted_gguf_tree(
+        _gguf_readback_tree(_gguf_report), converter_location,
+    )
     for _files, _description, _required in verify_groups:
         if not _verify_run_outputs(
             _files, _description, _required, quantization_type,
