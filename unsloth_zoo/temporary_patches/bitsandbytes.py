@@ -39,6 +39,66 @@ from textwrap import dedent
 import re
 
 
+# transformers 5.4.0 and 5.5.x drop the bnb quant_state sidecars of composite checkpoints
+_QUANT_STATE_BROKEN_TRANSFORMERS = ("5.4.0", "5.6.0")
+
+
+def _transformers_drops_prequantized_quant_state():
+    """True when the installed transformers is inside the quant_state defect window.
+
+    transformers 5.4.0 (PR #44300) made the conversion mapping recurse into
+    `PreTrainedModel` submodules, which pulled the text model's
+    `^model.language_model.` -> `^model.` `WeightRenaming` into the composite
+    model's mapping. Renamings run before the bitsandbytes converter, so
+    `weight.absmax`, `weight.quant_map`, `weight.nested_absmax`,
+    `weight.nested_quant_map` and `weight.quant_state.bitsandbytes__nf4` all
+    renamed to keys the model does not have and were discarded as unexpected,
+    while the packed `weight` was loaded raw. transformers PR #45567 fixed it in
+    5.6.0, so the window is exactly 5.4.0 and 5.5.0 through 5.5.4.
+    """
+    try:
+        from packaging.version import Version as _Version
+        from importlib.metadata import version as _version
+        parsed = _Version(_version("transformers"))
+    except Exception:
+        return False
+    low, high = _QUANT_STATE_BROKEN_TRANSFORMERS
+    try:
+        return _Version(low) <= parsed < _Version(high)
+    except Exception:
+        return False
+
+
+def _packed_weight_without_quant_state_error(module):
+    """Message for a Linear4bit whose packed weight arrived with no quant_state."""
+    try:
+        from importlib.metadata import version as _version
+        transformers_version = _version("transformers")
+    except Exception:
+        transformers_version = "unknown"
+    shape = tuple(module.weight.shape)
+    head = (
+        f"Unsloth: a bitsandbytes Linear4bit still holds its PACKED 4-bit weight "
+        f"(shape {shape}, dtype {module.weight.dtype}) but has no quant_state, so it "
+        f"cannot be dequantized. The quantization metadata was lost while loading, not "
+        f"while saving."
+    )
+    if _transformers_drops_prequantized_quant_state():
+        return (
+            f"{head}\nThis is transformers=={transformers_version}: releases 5.4.0 and "
+            f"5.5.0 to 5.5.4 discard the quant_state sidecar tensors of pre-quantized "
+            f"composite (multimodal) checkpoints. Introduced by transformers PR #44300, "
+            f"fixed by PR #45567 in 5.6.0. Do NOT regenerate the checkpoint, it is fine. "
+            f"Install transformers>=5.6.0, or fall back to 5.3.0 or 4.57.6."
+        )
+    return (
+        f"{head}\nInstalled transformers=={transformers_version}. Check that the "
+        f"checkpoint's `weight.absmax`, `weight.quant_map` and "
+        f"`weight.quant_state.bitsandbytes__nf4` tensors are present and were not "
+        f"reported as unexpected keys during loading."
+    )
+
+
 def patch_bitsandbytes_linear4bit_forward():
     # Fixes torch.compile complaining about multiple things
     try:
@@ -71,6 +131,20 @@ def patch_bitsandbytes_linear4bit_forward():
         if quant_state is None:
             bias = None if self.bias is None else self.bias
             weight = self.weight
+            # A layer that is genuinely unquantized holds an ordinary [out, in] weight,
+            # and the fallback below is correct for it. A PACKED 4-bit buffer is [N, 1]
+            # uint8, and handing that to F.linear only ever produces
+            #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (8x5120 and 1x15728640)
+            # which reads like a corrupt checkpoint and sent the reporters of unsloth
+            # #9867, #10010, #10017 and #10276 off regenerating good ones. It is not the
+            # checkpoint: transformers 5.4.0 and 5.5.x discard the quant_state sidecars of
+            # pre-quantized composite (multimodal) checkpoints while loading them. Name
+            # that instead of letting the shape error stand. Note the recovery attempt
+            # above cannot help here: fix_4bit_weight_quant_state_from_module only copies
+            # module.quant_state onto the weight, and module.quant_state is itself None
+            # because Params4bit.from_prequantized never ran.
+            if weight.dim() == 2 and weight.shape[-1] == 1:
+                raise RuntimeError(_packed_weight_without_quant_state_error(self))
             if weight.dtype != x.dtype:
                 weight = weight.to(x.dtype)
             if bias is not None and bias.dtype != x.dtype:
