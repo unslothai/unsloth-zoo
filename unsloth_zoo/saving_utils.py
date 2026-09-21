@@ -116,6 +116,104 @@ def find_skipped_quantized_modules(model):
     return skipped_modules, quantized_modules
 pass
 
+# vLLM fuses sibling projections into one module before it consults
+# `llm_int8_skip_modules`, so a leaf name like `model.layers.0.mlp.gate_proj`
+# can never match the module it actually builds (`...mlp.gate_up_proj`) and the
+# layer gets quantized anyway -- producing a packed uint8 parameter for a weight
+# that was written to disk dense, i.e. `assert param_data.shape ==
+# loaded_weight.shape` in vllm/model_executor/layers/linear.py.
+# See `is_layer_skipped_bnb` in vllm/model_executor/layers/quantization/bitsandbytes.py:
+# it matches a skip entry against a module's own dotted ancestors, so the fused
+# name has to be present verbatim.
+_VLLM_FUSED_SKIP_MODULES = (
+    (("q_proj", "k_proj", "v_proj"), "qkv_proj"),
+    (("gate_proj", "up_proj"),       "gate_up_proj"),
+)
+
+# Transformers >= 4.52 nests multimodal text stacks as `model.language_model.*`
+# while vLLM keeps the older `language_model.model.*`, so a skip entry written in
+# one namespace is invisible in the other. Same failure, same assert.
+# `_get_gemma4_bnb_skip_module_aliases` in unsloth_zoo/vllm_utils.py already does
+# this for Gemma 4 at load time; this is the generic, save-time equivalent.
+_VLLM_SKIP_MODULE_NAMESPACES = (
+    ("model.language_model.", ("language_model.model.", "model.")),
+    ("language_model.model.", ("model.language_model.", "model.")),
+    ("model.visual.",         ("visual.",)),
+    ("model.vision_tower.",   ("vision_tower.",)),
+    ("model.audio_tower.",    ("audio_tower.",)),
+)
+
+def add_vllm_namespace_skip_module_aliases(skipped_modules):
+    """Return `skipped_modules` plus the equivalent names in vLLM's namespace.
+
+    Additive and inert for Transformers: an alias only matches a module path
+    that Transformers does not have (that is the whole point of adding it).
+    """
+    if not skipped_modules: return skipped_modules
+    seen = set(skipped_modules)
+    aliases = []
+    for module_name in skipped_modules:
+        if not isinstance(module_name, str): continue
+        for prefix, replacements in _VLLM_SKIP_MODULE_NAMESPACES:
+            if not module_name.startswith(prefix): continue
+            tail = module_name[len(prefix):]
+            for replacement in replacements:
+                alias = replacement + tail
+                if alias in seen: continue
+                seen.add(alias)
+                aliases.append(alias)
+        pass
+    pass
+    if not aliases: return skipped_modules
+    return list(skipped_modules) + sorted(aliases)
+pass
+
+def add_vllm_fused_skip_module_aliases(skipped_modules):
+    """Return `skipped_modules` plus the fused-module aliases vLLM needs.
+
+    Purely additive: the returned list is a superset, and the added names
+    (`...self_attn.qkv_proj`, `...mlp.gate_up_proj`) do not exist in a
+    Transformers module tree, so Transformers-side loading is unchanged. An
+    alias is only added when *every* shard of the fused module is skipped --
+    a partially skipped fused module cannot be represented in vLLM at all, and
+    silently skipping the quantized shards too would be wrong.
+    """
+    if not skipped_modules: return skipped_modules
+
+    by_parent = {}
+    for module_name in skipped_modules:
+        if not isinstance(module_name, str) or "." not in module_name: continue
+        parent, _, leaf = module_name.rpartition(".")
+        by_parent.setdefault(parent, set()).add(leaf)
+    pass
+
+    aliases = []
+    seen = set(skipped_modules)
+    for parent, leaves in by_parent.items():
+        for shard_names, fused_name in _VLLM_FUSED_SKIP_MODULES:
+            if not set(shard_names).issubset(leaves): continue
+            alias = f"{parent}.{fused_name}"
+            if alias in seen: continue
+            seen.add(alias)
+            aliases.append(alias)
+        pass
+    pass
+    if not aliases: return skipped_modules
+    return list(skipped_modules) + sorted(aliases)
+pass
+
+def vllm_compatible_skip_modules(skipped_modules):
+    """Every spelling of `skipped_modules` that vLLM's matcher can hit.
+
+    Fused aliases first, then namespace aliases over the result, so a fused
+    alias derived from a `model.language_model.*` entry also gets its
+    `language_model.model.*` twin.
+    """
+    return add_vllm_namespace_skip_module_aliases(
+        add_vllm_fused_skip_module_aliases(skipped_modules)
+    )
+pass
+
 def create_huggingface_repo(
     model,
     repo_id,
@@ -3891,7 +3989,12 @@ def merge_and_overwrite_lora(
             # Ensure quantization_config exists before modifying
             if not hasattr(merged_model.config, "quantization_config"):
                 merged_model.config.quantization_config = {} # Initialize if somehow missing
-            merged_model.config.quantization_config["llm_int8_skip_modules"] = skipped_modules
+            # `find_skipped_quantized_modules` walks the Transformers module tree, so it
+            # reports leaf projections. vLLM only ever sees the fused modules, so without
+            # the aliases a dynamic-quant merge loads under Unsloth but dies in vLLM on
+            # `assert param_data.shape == loaded_weight.shape`.
+            merged_model.config.quantization_config["llm_int8_skip_modules"] = \
+                vllm_compatible_skip_modules(skipped_modules)
 
         print(f"Unsloth: Saving merged 4bit model to {save_directory}...")
         try:
