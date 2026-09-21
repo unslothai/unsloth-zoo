@@ -766,20 +766,15 @@ def train_on_responses_only(
     Q_left_reversed = Q_left[::-1]
     Q_right_forward = Q_right
 
-    # Shared special-token openers (ChatML, Llama, Gemma) delimit every role,
-    # including tool/system. A plain-text common prefix could also occur in an answer.
+    # A shared special-token opener delimits every role, tool and system included; a
+    # plain-text common prefix could also occur inside an answer.
     message_start = []
     for q, a in zip(Q_must, A_must):
         if q != a: break
         message_start.append(q)
-    # Every token of that opener must be a registered special token, and at least one
-    # must carry non-whitespace text. `all_special_ids` reports only the attribute
-    # specials (bos/eos/pad/unk/...), so on real tokenizers it holds none of the actual
-    # openers - <|im_start|>, <|start_header_id|>, <start_of_turn> are added tokens and
-    # have to be read from added_tokens_decoder, or this whole branch never fires.
-    # The non-whitespace requirement is what keeps a tokenizer that registers a bare
-    # "\n" as a special token (NVIDIA Nemotron) from ending every span at the first
-    # newline inside an answer.
+    # all_special_ids holds only the attribute specials (bos/eos/pad/unk), so the opener -
+    # <|im_start|>, <|start_header_id|>, <start_of_turn> - has to come from added_tokens_decoder.
+    # Whitespace is rejected: Nemotron's bare "\n" special would cut every span at a newline.
     added_tokens = getattr(tokenizer, "added_tokens_decoder", None) or {}
     special_ids  = {i for i, t in added_tokens.items() if getattr(t, "special", False)}
     special_ids.update(getattr(tokenizer, "all_special_ids", None) or [])
@@ -789,9 +784,8 @@ def train_on_responses_only(
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
 
-    # Every boundary test below fires only on one of these ids, so one set lookup per
-    # token stands in for four comparisons. The span scan walks every token of every
-    # row, and testing them one at a time cost 81 -> 176 us on a 1540 token row.
+    # Every boundary test below fires only on one of these ids: one set lookup per token
+    # replaces four comparisons, over every token of every row.
     boundary_first = {A_first}
     if bos_token_id is not None: boundary_first.add(bos_token_id)
     if eos_token_id is not None: boundary_first.add(eos_token_id)
@@ -837,7 +831,6 @@ def train_on_responses_only(
             n_minus_1 = n - 1
             j = 0
 
-            # Collect assistant spans, stopping at message or sample boundaries.
             spans = []
             while j < n:
                 # Find <assistant>

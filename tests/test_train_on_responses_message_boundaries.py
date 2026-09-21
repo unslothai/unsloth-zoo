@@ -2,37 +2,28 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """``train_on_responses_only`` must stop each response span at a message boundary.
 
-The span loop used to run from the assistant marker to the next *user* marker. A
-tool conversation has no user turn in between, so the tool result and the role
-headers around it were supervised; after packing, the last span ran on into the
-next sample's BOS and system prompt.
+The span loop used to run from the assistant marker to the next *user* marker, so a
+tool conversation - which has no user turn in between - supervised the tool result
+and the role headers around it, and after packing the last span ran on into the next
+sample's BOS and system prompt.
 
-Every fixture here deliberately gives the turn terminator an id that is NOT
-``eos_token_id``, so a span that stops in the right place proves the *message
-opener* was recognised - the EOS check cannot account for it. That matters because
-the opener is only usable if it is looked up the way real tokenizers store it:
-``all_special_ids`` reports the attribute specials (bos/eos/pad/unk) and none of
-``<|im_start|>``, ``<|start_header_id|>`` or ``<start_of_turn>``, which live in
-``added_tokens_decoder``.
-
-``test_a_whitespace_special_token_is_not_a_message_boundary`` is the other side of
-that lookup: NVIDIA Nemotron registers a bare ``"\\n"`` as a special token, and if
-the opener rule accepted it every multi-line answer would be cut at its first
-newline.
+Every fixture gives the turn terminator an id that is NOT ``eos_token_id``, so a span
+stopping in the right place proves the message opener was recognised rather than the
+EOS check having covered for it.
 
 CPU-pure and offline: the tokenizers are local stubs, no weights are loaded.
 """
@@ -79,10 +70,8 @@ class StubTokenizer:
         return _Result()
 
 
-# --- ChatML-shaped fixture -------------------------------------------------
-# <|im_start|> is an added special token but NOT an attribute special, exactly as
-# Qwen, Llama 3, Gemma and Phi-4 store their openers. <|im_end|> ends a turn and is
-# deliberately different from <|endoftext|>, the tokenizer EOS.
+# ChatML: <|im_start|> is an added special but NOT an attribute special, the way Qwen,
+# Llama 3, Gemma and Phi-4 store their openers. <|im_end|> ends a turn, <|endoftext|> is EOS.
 IM_START, IM_END, NL, EOS, BOS = 1, 7, 6, 9, 8
 USER, ASSISTANT, TOOL, SYSTEM = 2, 3, 4, 5
 CHATML_VOCAB = {
@@ -203,9 +192,8 @@ def test_existing_labels_are_preserved_inside_a_retained_span():
     assert labels == existing, "an existing label mask was overwritten"
 
 
-# --- NVIDIA Nemotron-shaped fixture ----------------------------------------
-# Its markers are not atomic, and the shared prefix of the two of them is a bare
-# "\n" that the tokenizer does register as a special token.
+# NVIDIA Nemotron: the markers are not atomic and their shared prefix is a bare "\n"
+# that the tokenizer does register as a special token.
 NEMO_NL, NEMO_USER, NEMO_ASSISTANT, NEMO_END, NEMO_EOS = 11, 12, 13, 14, 15
 NEMO_ANSWER_A, NEMO_ANSWER_B = 201, 202
 
