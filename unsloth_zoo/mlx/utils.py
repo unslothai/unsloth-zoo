@@ -469,7 +469,9 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
         elif not enabled and patched:
             setattr(mx, name, current._unsloth_index_original)
 
-    current = mx.array.__getitem__
+    current = getattr(mx.array, "__getitem__", None)
+    if current is None:
+        return
     patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
     if enabled and not patched:
         @wraps(current)
