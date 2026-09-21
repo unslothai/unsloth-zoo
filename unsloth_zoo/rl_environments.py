@@ -1102,20 +1102,31 @@ import random
 import subprocess
 
 def is_port_open(host, port):
-    """ Check if the port like localhost:8000 is open or closed """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    """ Check if the port like localhost:8000 is open or closed
+
+    The family comes from getaddrinfo, not from AF_INET: an IPv6 host is
+    unreachable over an AF_INET socket, and a dual-stack `localhost` resolves to
+    both 127.0.0.1 and ::1 with the listener on only one of them, so every
+    candidate is tried before the port is called closed.
+    """
     try:
-        sock.settimeout(1)  # Set a timeout for the connection attempt
-        result = sock.connect_ex((host, port))
-        if result == 0:
-            return True  # Port is open
-        else:
-            return False # Port is closed or connection failed
+        candidates = socket.getaddrinfo(host, port, type = socket.SOCK_STREAM)
     except socket.error as e:
         print(f"Socket error: {e}")
         return False
-    finally:
-        sock.close()
+    for family, socktype, proto, _, sockaddr in candidates:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(1)  # Set a timeout for the connection attempt
+            # sockaddr passes through unmodified: AF_INET6 carries flowinfo and
+            # scope_id, and a rebuilt (host, port) pair would drop the scope.
+            if sock.connect_ex(sockaddr) == 0:
+                return True  # Port is open
+        except socket.error as e:
+            print(f"Socket error: {e}")
+        finally:
+            sock.close()
+    return False # Port is closed or connection failed
 pass
 
 
@@ -1147,6 +1158,17 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
 # "something is listening", never "my server is listening"; the handle is the
 # only thing that can tell the two apart.
 _OPENENV_CHILDREN = {}
+
+
+def _openenv_url(client_host, port):
+    """ http://host:port, bracketing an IPv6 literal as RFC 3986 3.2.2 requires
+
+    Unbracketed, `http://::1:9000` reads as host `` with the rest as the port.
+    A colon cannot appear in a DNS name, so it identifies the literal.
+    """
+    if ":" in client_host: client_host = f"[{client_host}]"
+    return f"http://{client_host}:{port}"
+pass
 
 
 def _openenv_child_alive(port):
@@ -1193,8 +1215,10 @@ def launch_openenv(
         environment["PYTHONPATH"] = correct_pythonpath
 
     # A wildcard bind still has to be dialled through an address that resolves.
-    client_host = "localhost" if host in ("0.0.0.0", "::", "127.0.0.1", "::1") else host
-    localhost = f"http://{client_host}:{port}"
+    # Loopback literals are left alone: mapping ::1 onto localhost is what sends
+    # an IPv6-only listener's probe to 127.0.0.1.
+    client_host = "localhost" if host in ("0.0.0.0", "::") else host
+    localhost = _openenv_url(client_host, port)
 
     def check_openenv_works(process):
         if process is not None:
@@ -1226,7 +1250,7 @@ def launch_openenv(
     while openenv_process is None:
         # Port ID must be less than uint16_MAX
         port = random.randint(9000, 65535-1)
-        localhost = f"http://{client_host}:{port}"
+        localhost = _openenv_url(client_host, port)
         # Someone already holds it, so uvicorn would fail to bind and we would
         # end up talking to them instead.
         if is_port_open(client_host, port):

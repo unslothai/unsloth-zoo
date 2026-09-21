@@ -20,9 +20,11 @@ the suite's network blocker allows.
 """
 
 import http.server
+import socket
 import subprocess
 import threading
 import types
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -271,3 +273,101 @@ def test_our_own_live_child_is_reused(monkeypatch, tmp_path):
     )
     assert (again_port, again_client) == (port, client)
     assert len(calls) == 1
+
+
+# --- the readiness probe: an IPv6 bind must be probed over IPv6 --------------
+
+@pytest.fixture
+def ipv4_listener():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(5)
+    try:
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+@pytest.fixture
+def ipv6_listener():
+    """A loopback listener reachable only over IPv6, as `--host ::1` gives."""
+    if not socket.has_ipv6: pytest.skip("Python built without IPv6")
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        sock.bind(("::1", 0))
+    except OSError:
+        sock.close()
+        pytest.skip("No IPv6 loopback on this host")
+    sock.listen(5)
+    try:
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def test_ipv6_listener_is_probed_over_ipv6(ipv6_listener):
+    """AF_INET sent every ::1 probe to 127.0.0.1, so the port read as closed."""
+    assert rl_env.is_port_open("::1", ipv6_listener)
+    # Whether `localhost` also covers it is the resolver's call, not ours: this
+    # host's /etc/hosts gives ::1 to ip6-localhost only. Where it is dual stack,
+    # the probe must not stop at the first candidate that refuses.
+    dual_stack = any(
+        info[0] == socket.AF_INET6
+        for info in socket.getaddrinfo("localhost", ipv6_listener, type = socket.SOCK_STREAM)
+    )
+    if dual_stack: assert rl_env.is_port_open("localhost", ipv6_listener)
+
+
+def test_ipv4_listener_still_probes_open(ipv4_listener):
+    """The widened probe must not have cost the IPv4 path."""
+    assert rl_env.is_port_open("127.0.0.1", ipv4_listener)
+    assert rl_env.is_port_open("localhost", ipv4_listener)
+
+
+def test_closed_port_is_still_closed():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    assert not rl_env.is_port_open("127.0.0.1", port)
+
+
+def test_unresolvable_host_returns_false(monkeypatch):
+    """Resolution failure is a closed port, not a gaierror out of the probe."""
+    def boom(*args, **kwargs): raise socket.gaierror(-2, "Name or service not known")
+    monkeypatch.setattr(rl_env.socket, "getaddrinfo", boom)
+    assert not rl_env.is_port_open("unsloth-no-such-host.invalid", 9000)
+
+
+def test_ipv6_host_is_bracketed_in_the_client_url(monkeypatch, tmp_path):
+    """http://::1:9000 has no host and an unparseable port; RFC 3986 3.2.2."""
+    calls = _fake_launcher(monkeypatch, ports = [31523])
+    port, client = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient,
+        host = "::1",
+    )
+    argv = calls[0]
+    assert argv[argv.index("--host") + 1] == "::1"
+    assert client.base_url == f"http://[::1]:{port}"
+    assert urlsplit(client.base_url).hostname == "::1"
+    assert urlsplit(client.base_url).port == port
+
+
+def test_ipv6_wildcard_is_dialled_through_localhost(monkeypatch, tmp_path):
+    """`::` accepts loopback, and localhost now resolves over both families."""
+    calls = _fake_launcher(monkeypatch, ports = [31525])
+    port, client = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient,
+        host = "::",
+    )
+    assert calls[0][calls[0].index("--host") + 1] == "::"
+    assert client.base_url == f"http://localhost:{port}"
+
+
+def test_ipv4_loopback_host_is_not_bracketed(monkeypatch, tmp_path):
+    calls = _fake_launcher(monkeypatch, ports = [31527])
+    port, client = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient,
+        host = "127.0.0.1",
+    )
+    assert client.base_url == f"http://127.0.0.1:{port}"
