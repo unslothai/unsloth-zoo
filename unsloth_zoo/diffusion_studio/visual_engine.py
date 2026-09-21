@@ -239,10 +239,19 @@ class VisualServer:
         else:
             self._req_dir = tempfile.mkdtemp(prefix = "dg_visual_", dir = req_dir)
             self.req = os.path.join(self._req_dir, "request.json")
-        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
-        self.ngl = int(self.env["NGL"])
-        self.p = None
-        self._spawn()
+        try:
+            self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
+            self.ngl = int(self.env["NGL"])
+            self.p = None
+            self._spawn()
+        except BaseException:
+            # Nobody can call close() on an object __init__ never returned, so a
+            # server that fails to come up would leave its directory behind, once per
+            # supervisor retry.
+            if self._req_dir is not None:
+                shutil.rmtree(self._req_dir, ignore_errors = True)
+                self._req_dir = None
+            raise
 
     def _spawn(self):
         """Launch the subprocess and finish the READY handshake. Used at startup and by restart()

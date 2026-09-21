@@ -1477,9 +1477,30 @@ def _gpt_oss_cache_location_is_trusted(loc):
 pass
 
 
-def _gpt_oss_replace_marker(marker_path, desired_flavor):
-    """Land the marker by replacing the name: mkstemp then os.replace, so a link
-    sitting at `marker_path` is replaced rather than written through."""
+def _gpt_oss_marker_mode(loc):
+    """0664 in a cache shared with our group, 0600 in one only we can reach.
+
+    The marker records a flavor, not a secret, and in a shared cache every member has
+    to be able to read AND rewrite it. Owner-only there means the member who switched
+    flavor deletes the stale module but cannot record the new one, leaving the two
+    disagreeing.
+    """
+    try:
+        if os.name != "posix":
+            return 0o600
+        return 0o664 if (os.lstat(loc).st_mode & 0o020) else 0o600
+    except Exception:
+        return 0o600
+pass
+
+
+def _gpt_oss_replace_marker(marker_path, desired_flavor, mode = 0o600):
+    """Land the marker by replacing the name: mkstemp then os.replace.
+
+    Two things at once. A link sitting at `marker_path` is replaced rather than
+    written through, and the update needs only directory write, so a group member can
+    record a flavor into a marker file owned by whoever built the cache first.
+    """
     import tempfile
     directory = os.path.dirname(marker_path) or "."
     descriptor, temporary_path = tempfile.mkstemp(
@@ -1489,6 +1510,7 @@ def _gpt_oss_replace_marker(marker_path, desired_flavor):
         with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
             descriptor = None
             f.write(desired_flavor)
+        os.chmod(temporary_path, mode)      # mkstemp is 0600; a shared cache needs more
         os.replace(temporary_path, marker_path)
     except BaseException:
         if descriptor is not None:
@@ -1508,14 +1530,17 @@ def _gpt_oss_write_marker(loc, desired_flavor):
     attached opens fine and would swallow the marker instead.
     """
     marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+    mode = _gpt_oss_marker_mode(loc)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
-    if not no_follow:
-        # No atomic no-follow open here, and an lstat first is only a time of check.
-        return _gpt_oss_replace_marker(marker_path, desired_flavor)
+    if not no_follow or mode != 0o600:
+        # Shared: the existing marker belongs to whoever built the cache, so only a
+        # replacement can update it. Also the no-atomic-no-follow-open case, where an
+        # lstat first would be a time of check.
+        return _gpt_oss_replace_marker(marker_path, desired_flavor, mode)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= no_follow
     flags |= getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(marker_path, flags, 0o600)
+    descriptor = os.open(marker_path, flags, mode)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OSError(f"Unsloth: refusing to write the gpt-oss flavor marker in `{loc}`: not a regular file.")

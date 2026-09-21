@@ -200,6 +200,56 @@ def test_gpt_oss_rejected_candidate_does_not_invalidate_a_good_cache(tmp_path, m
     )
 
 
+def test_gpt_oss_group_member_can_update_a_marker_it_does_not_own(tmp_path, monkeypatch):
+    """B switching flavor must record it, in a marker file A created.
+
+    Owner-only there means B deletes the stale module but cannot write the new
+    flavor, and the next load pairs a fresh module with the old marker.
+    """
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    cache = tmp_path / "unsloth_compiled_cache"
+    cache.mkdir(mode = 0o775)
+    os.chmod(cache, 0o775)
+    (cache / (gpt_oss._GPT_OSS_COMPILED_MODULE + ".py")).write_text("# stock build\n")
+    marker = cache / gpt_oss._GPT_OSS_FLAVOR_MARKER
+    marker.write_text("stock")
+    os.chmod(marker, 0o400)     # what a marker owned by user A presents to user B
+
+    monkeypatch.setattr(gpt_oss, "_gpt_oss_cache_locations", lambda: [str(cache)])
+    gpt_oss._sync_gpt_oss_compiled_flavor("bnb4bit")
+
+    assert marker.read_text() == "bnb4bit", "the marker still claims the old flavor"
+    assert stat.S_IMODE(os.stat(marker).st_mode) & 0o020, (
+        "a shared marker the next group member cannot rewrite is the same bug again"
+    )
+    assert not stat.S_IMODE(os.stat(marker).st_mode) & 0o002
+
+
+def test_visual_server_cleans_its_directory_when_construction_fails(monkeypatch, tmp_path):
+    """No caller can close() an object __init__ never returned."""
+    import unsloth_zoo.diffusion_studio.visual_engine as visual_engine
+
+    monkeypatch.setattr(visual_engine, "_resolve_bin", lambda b: "/bin/true")
+    monkeypatch.setattr(
+        visual_engine, "_build_subprocess_env", lambda *a, **k: {"NGL": "0"},
+    )
+    monkeypatch.setattr(visual_engine.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(visual_engine.os.path, "isdir", lambda p: False)
+
+    def _explode(self):
+        raise RuntimeError("visual server failed to start: ''")
+
+    monkeypatch.setattr(visual_engine.VisualServer, "_spawn", _explode)
+
+    with pytest.raises(RuntimeError):
+        visual_engine.VisualServer("model.gguf")
+
+    assert not [p for p in os.listdir(tmp_path) if p.startswith("dg_visual_")], (
+        "a failed start left its private directory behind"
+    )
+
+
 def test_gpt_oss_marker_survives_a_group_writable_cache(tmp_path, monkeypatch):
     """umask 002 makes the library's own cache 0775, and that must keep working:
     the module beside the marker is 0644 in that same directory anyway."""
@@ -303,13 +353,33 @@ def test_gpt_oss_marker_write_refuses_a_fifo(tmp_path):
     from unsloth_zoo.temporary_patches import gpt_oss
 
     cache = tmp_path / "cache"
-    cache.mkdir(mode = 0o775)
+    cache.mkdir(mode = 0o700)       # owner-only, so the in-place open is the path taken
     marker = cache / gpt_oss._GPT_OSS_FLAVOR_MARKER
     os.mkfifo(marker)
 
     with pytest.raises(OSError):
         gpt_oss._gpt_oss_write_marker(str(cache), "stock")
     assert stat.S_ISFIFO(os.lstat(marker).st_mode), "the FIFO should be refused, not replaced"
+
+
+def test_gpt_oss_marker_replaces_a_fifo_in_a_shared_cache(tmp_path):
+    """A shared cache lands the marker by replacement, which removes the plant.
+
+    Refusing is right for the in-place path, where writing would mean writing INTO
+    the pipe. Replacement never touches it, so succeeding is the better outcome.
+    """
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    cache = tmp_path / "cache"
+    cache.mkdir(mode = 0o775)
+    os.chmod(cache, 0o775)
+    marker = cache / gpt_oss._GPT_OSS_FLAVOR_MARKER
+    os.mkfifo(marker)
+
+    gpt_oss._gpt_oss_write_marker(str(cache), "stock")
+
+    assert not stat.S_ISFIFO(os.lstat(marker).st_mode)
+    assert marker.read_text() == "stock"
 
 
 def test_visual_server_request_write_refuses_to_block_on_a_fifo(monkeypatch, tmp_path):
