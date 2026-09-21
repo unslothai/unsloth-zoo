@@ -356,9 +356,15 @@ def test_trainable_bias_receives_a_gradient():
 
 
 def test_frozen_bias_with_trained_head():
-    """The (0, 1) argnums branch: a bias that exists but is not trained."""
+    """The (0, 1) argnums branch: a bias that exists but is not trained.
+
+    `_make` already returns a bias with `requires_grad = False`, so the call
+    below is stating the precondition rather than changing it; assert it, or this
+    test passes for a reason it does not name.
+    """
     sh, th, swt, twt, mask, sb, tb = _make(bias = True)
     sb.requires_grad_(False)
+    assert not sb.requires_grad
     loss, _, _ = rr.distillation_chunked_jsd(
         sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3,
         student_lm_head_bias = sb, teacher_lm_head_bias = tb,
@@ -556,6 +562,65 @@ def test_models_dispatched_across_devices(student_head, teacher_hidden, teacher_
     assert grad_device == torch.device(student_head)
     assert abs(got_loss - want_loss) <= 1e-6 * max(abs(want_loss), 1e-30)
     assert abs(got_grad - want_grad) <= 1e-6 * max(abs(want_grad), 1e-30)
+
+
+def test_trained_bias_with_frozen_head():
+    """The (0, 2) argnums branch: bias-only tuning, or LoRA with bias = "all".
+
+    Enumerating the combinations by hand had this one selecting argnums = (0,)
+    while still allocating a bias gradient, so the first forward raised
+    `IndexError: tuple index out of range`.
+    """
+    sh, th, swt, twt, mask, sb, tb = _make(bias = True)
+    # `_make` hands back a bias that does NOT require grad, which is why nothing
+    # covered this branch before; ask for it explicitly.
+    sb.requires_grad_(True)
+    swt.requires_grad_(False)
+    loss, _, _ = rr.distillation_chunked_jsd(
+        sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3,
+        student_lm_head_bias = sb, teacher_lm_head_bias = tb,
+    )
+    loss.backward()
+    assert swt.grad is None
+    assert sb.grad is not None and torch.isfinite(sb.grad).all()
+    assert sh.grad is not None and torch.isfinite(sh.grad).all()
+
+    # The bias gradient must be the real one, not whatever happened to sit at
+    # that tuple position: the same run with the head trainable too must give the
+    # same bias gradient, since the bias gradient does not depend on that.
+    sh2, th2, swt2, twt2, mask2, sb2, tb2 = _make(bias = True)
+    sb2.requires_grad_(True)
+    loss2, _, _ = rr.distillation_chunked_jsd(
+        sh2, th2, swt2, twt2, mask2, beta = 0.5, chunk_size = 3,
+        student_lm_head_bias = sb2, teacher_lm_head_bias = tb2,
+    )
+    loss2.backward()
+    torch.testing.assert_close(sb.grad, sb2.grad, rtol = 1e-5, atol = 1e-7)
+
+
+@pytest.mark.parametrize("supplied", [0, 0.0])
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_a_supplied_zero_token_count_does_not_produce_nan(supplied, as_tensor):
+    """A fully masked global batch legitimately reports zero items.
+
+    Only the implicit count was clamped, so a supplied zero divided zero by zero
+    and returned a NaN loss AND NaN gradients, which poison the optimizer state
+    for the rest of the run rather than costing a single step.
+    """
+    sh, th, swt, twt, mask, _, _ = _make()
+    mask = torch.zeros_like(mask)
+    count = torch.tensor(float(supplied)) if as_tensor else supplied
+    loss, _, _ = rr.distillation_chunked_jsd(
+        sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3, num_items_in_batch = count,
+    )
+    assert torch.isfinite(loss), f"loss is {loss}"
+    assert loss.item() == 0.0
+    loss.backward()
+    # Graph-connected zero, not a detached one: every trainable parameter must
+    # still receive a gradient or the collective that follows backward hangs.
+    for name, tensor in (("hidden", sh), ("head", swt)):
+        assert tensor.grad is not None, f"{name} got no gradient"
+        assert torch.isfinite(tensor.grad).all(), f"{name} gradient is not finite"
 
 
 def test_double_backward_is_not_silently_wrong():

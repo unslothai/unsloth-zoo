@@ -2423,17 +2423,23 @@ class _UnslothDistillationJSD(torch.autograd.Function):
                 divisor = torch.tensor(
                     float(num_items_in_batch), device = flat_student.device, dtype = torch.float32,
                 )
+            # A supplied count is legitimately zero when the whole global batch is
+            # masked, and 0 / 0 is a NaN loss AND NaN gradients, which poison the
+            # optimizer state for the rest of the run rather than costing one step.
+            # Clamp it exactly as the implicit count above is clamped: the
+            # numerator is zero in that case, so the quotient is still zero.
+            divisor = divisor.clamp(min = 1.0)
 
         head_needs_grad = student_lm_head.requires_grad
         bias_needs_grad = student_lm_head_bias is not None and student_lm_head_bias.requires_grad
-        if head_needs_grad and bias_needs_grad:
-            argnums = (0, 1, 2)
-        elif head_needs_grad:
-            argnums = (0, 1)
-        else:
-            # The ordinary LoRA case: no dense (vocab, hidden) gradient is ever
-            # allocated, which is most of why this is cheap there.
-            argnums = (0,)
+        # Build the argnums from what actually needs a gradient. A frozen head with
+        # a trainable bias is a real configuration (bias-only tuning, or LoRA with
+        # bias = "all"), and enumerating the combinations by hand had missed it.
+        argnums = (0,) + ((1,) if head_needs_grad else ()) + ((2,) if bias_needs_grad else ())
+        # grads[i] answers to argnums[i], so read the positions rather than
+        # assuming the head is always index 1 and the bias always index 2.
+        head_position = argnums.index(1) if head_needs_grad else None
+        bias_position = argnums.index(2) if bias_needs_grad else None
         grad_fn = _distillation_jsd_grad_fn(argnums)
 
         grad_hidden = torch.zeros_like(flat_student)
@@ -2454,10 +2460,10 @@ class _UnslothDistillationJSD(torch.autograd.Function):
                 beta, temperature,
             )
             grad_hidden[start : stop] = grads[0]
-            if grad_head is not None:
-                grad_head.add_(grads[1])
-            if grad_bias is not None:
-                grad_bias.add_(grads[2])
+            if head_position is not None:
+                grad_head.add_(grads[head_position])
+            if bias_position is not None:
+                grad_bias.add_(grads[bias_position])
             loss = loss + chunk_loss
             entropy_sum = entropy_sum + chunk_entropy
         pass
