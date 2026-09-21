@@ -103,6 +103,30 @@ def test_a_rebound_hostname_is_refused(client):
 
 # --- An ordinary local client keeps working ---
 
+def test_an_unparseable_host_is_refused_not_a_500(client):
+    """`urlsplit` raises on a malformed bracketed literal. Uncaught that is a 500,
+    and a host nobody can parse is the one least worth trusting."""
+    response = client.post("/v1/chat/completions", json = BODY, headers = {"Host": "[oops]"})
+    assert response.status_code == 403, response.text
+
+
+def test_userinfo_in_the_host_is_refused(client):
+    """`attacker.example@localhost` is not Host syntax; `urlsplit` would read only
+    the part after the `@` and call it local."""
+    assert client.post("/v1/chat/completions", json = BODY,
+                       headers = {"Host": "evil.example@localhost"}).status_code == 403
+
+
+def test_a_second_origin_header_cannot_ride_behind_a_local_one(client):
+    """A single `.get` answers with the first value, so a foreign second one would
+    never be looked at."""
+    request = client.build_request("POST", "/v1/chat/completions", json = BODY)
+    raw = [(k, v) for k, v in request.headers.raw if k.lower() != b"origin"]
+    raw += [(b"origin", b"http://localhost:3000"), (b"origin", b"https://evil.example")]
+    request.headers = type(request.headers)(raw)
+    assert client.send(request).status_code == 403
+
+
 @pytest.mark.parametrize("spelling", ["127.1", "2130706433", "0x7f000001"])
 def test_a_short_loopback_spelling_is_still_this_machine(spelling):
     """`curl http://127.1:8123` is a user reaching their own machine. A numeric

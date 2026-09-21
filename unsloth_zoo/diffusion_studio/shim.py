@@ -87,6 +87,20 @@ def _is_local_name(hostname):
         return False
 
 
+def _hostname_of(value):
+    """The hostname `urlsplit` reads out of an authority or URL, or None when it
+    will not parse. `urlsplit` raises on a malformed bracketed literal such as
+    `[oops]`, which uncaught is a 500 rather than a refusal, and a host nobody can
+    parse is exactly the one not to trust. A `user@host` form is refused outright:
+    that is not Host syntax, and only the part after the `@` would be compared.
+    """
+    try:
+        split = urlsplit(value)
+        return None if "@" in (split.netloc or "") else split.hostname
+    except ValueError:
+        return None
+
+
 @app.middleware("http")
 async def _bind_to_local_caller(request, call_next):
     """Loopback is not an authorization boundary for a browser: any page the user
@@ -96,15 +110,18 @@ async def _bind_to_local_caller(request, call_next):
     (which is what breaks rebinding), and an Origin or Referer, when the caller
     sends one at all, must be local. An ordinary OpenAI client sends neither.
     """
-    host = urlsplit("//" + (request.headers.get("host") or "")).hostname
     # Only when we are loopback-only. A deliberate --host 0.0.0.0 is the operator
     # publishing this listener, and then the Host is whatever name they reach it by.
-    if _is_local_name(_STATE.get("host", DEFAULT_HOST)) and not _is_local_name(host):
+    if _is_local_name(_STATE.get("host", DEFAULT_HOST)) and \
+        not _is_local_name(_hostname_of("//" + (request.headers.get("host") or ""))):
         return JSONResponse({"error": "forbidden host"}, status_code = 403)
     for header in ("origin", "referer"):
-        value = request.headers.get(header)
-        if value and not _is_local_name(urlsplit(value).hostname):
-            return JSONResponse({"error": "forbidden origin"}, status_code = 403)
+        # Every value, not the first: a proxy or a hand-written client can send the
+        # header twice, and `.get` would answer with a local one while a foreign one
+        # rode along behind it.
+        for value in request.headers.getlist(header):
+            if value and not _is_local_name(_hostname_of(value)):
+                return JSONResponse({"error": "forbidden origin"}, status_code = 403)
     return await call_next(request)
 
 
