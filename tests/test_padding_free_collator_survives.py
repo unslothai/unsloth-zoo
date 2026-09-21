@@ -19,7 +19,7 @@
 Unsloth auto-enables `padding_free` and wraps `torch_call` to add
 `packed_seq_lengths`; replacing the instance dropped both while
 `args.padding_free` stayed True. Real TRL collator, not a stand-in: a mock
-would assert nothing about TRL's flattening or its use of `labels`.
+would assert nothing about its flattening or its use of `labels`.
 """
 
 import inspect
@@ -143,7 +143,6 @@ def test_a_padding_free_trl_collator_is_not_swapped_for_a_padding_one():
                                   INSTRUCTION_PART, RESPONSE_PART)
     assert out.data_collator is collator
     batch = _collate(out)
-    # Flattened, not padded: one row of 11, not two rows of 7.
     assert list(batch["input_ids"].shape) == [1, len(LONG_ROW) + len(SHORT_ROW)]
     # TRL carried position ids under `attention_mask` before 0.20, `position_ids` since.
     positions = batch.get("position_ids", batch.get("attention_mask"))
