@@ -93,6 +93,20 @@ def test_a_relative_sys_path_entry_does_not_launder_the_working_directory(
         sys.path.remove(".")
 
 
+def test_a_shadowed_sys_path_entry_is_not_the_one_we_would_import(
+        llama_cpp, tmp_path, monkeypatch):
+    """The sys.path branch is allowed only because the swap changes nothing. That
+    holds for the tree that WINS resolution, not for one sitting behind it: putting
+    a shadowed package at index 0 is what makes this process start running it."""
+    winner = _gguf_package(tmp_path / "winner")
+    shadowed = _gguf_package(tmp_path / "shadowed")
+    monkeypatch.syspath_prepend(shadowed)
+    monkeypatch.syspath_prepend(winner)      # ahead of it, so this is what imports
+
+    assert llama_cpp._trusted_gguf_tree(winner) == os.path.realpath(winner)
+    assert llama_cpp._trusted_gguf_tree(shadowed) is None
+
+
 @pytest.mark.parametrize("root", ["default_dir", "scripts_pin", "converter", "sys_path"])
 def test_a_tree_inside_a_chosen_root_is_kept(llama_cpp, tmp_path, monkeypatch, root):
     """The ordinary export must still read back with the gguf that wrote the file."""

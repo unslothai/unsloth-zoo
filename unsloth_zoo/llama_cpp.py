@@ -4620,6 +4620,24 @@ def _gguf_readback_tree(report):
     return _gguf_tree_of_location((report or {}).get("location"))
 
 
+def _importing_gguf_tree():
+    """The resolved directory this process would import `gguf` from right now, or
+    None when it would not import one. Locating a spec does not run the package."""
+    try:
+        spec = importlib.util.find_spec("gguf")
+    except Exception:
+        # A broken parent package or a finder that raises is not an answer.
+        return None
+    if spec is None:
+        return None
+    if spec.origin:
+        return os.path.realpath(os.path.dirname(os.path.dirname(spec.origin)))
+    # Namespace package: no __init__.py, so it has search locations instead.
+    for location in (spec.submodule_search_locations or ()):
+        return os.path.realpath(os.path.dirname(location))
+    return None
+
+
 def _trusted_gguf_tree(tree, converter_location = None):
     """`tree` when it sits inside a directory Unsloth itself chose, else None.
 
@@ -4643,17 +4661,20 @@ def _trusted_gguf_tree(tree, converter_location = None):
     for root in roots:
         if root and _stays_within(os.path.expanduser(root), tree):
             return resolved
-    # Plus the entry this process would import `gguf` from anyway, which the swap
-    # then does not change. Matched exactly rather than by containment: sys.path
-    # routinely holds a project root, and everything under one of those is not a
-    # tree we chose. Relative entries ('' or '.') resolve to the working directory,
-    # which is what this whole check exists to exclude.
-    for entry in sys.path:
-        if not entry or not os.path.isabs(entry):
-            continue
-        if os.path.realpath(entry) == resolved and \
-            os.path.isfile(os.path.join(entry, "gguf", "__init__.py")):
-            return resolved
+    # Plus the tree this process would import `gguf` from anyway, where the swap
+    # changes nothing. Two things have to hold together, and neither implies the
+    # other. It must be the tree that WINS resolution, since a shadowed entry is a
+    # package this process does not run and the swap puts it at index 0, which runs
+    # it. And it must be reachable by an ABSOLUTE `sys.path` entry: `find_spec`
+    # honours the relative entries ('' and '.') that an interactive parent carries,
+    # and those resolve to the working directory, which is the one thing this whole
+    # function exists to exclude. Exact match, not containment: `sys.path` routinely
+    # holds a project root and everything beneath one is not a tree we chose.
+    if _importing_gguf_tree() == resolved and any(
+        entry and os.path.isabs(entry) and os.path.realpath(entry) == resolved
+        for entry in sys.path
+    ):
+        return resolved
     logger.warning(
         "Unsloth: the converter resolved its `gguf` from '%s', which is not inside "
         "a llama.cpp install Unsloth chose. Not adding it to this process's "
