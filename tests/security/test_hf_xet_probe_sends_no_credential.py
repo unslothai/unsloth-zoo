@@ -67,6 +67,16 @@ class _RecordingHandler(BaseHTTPRequestHandler):
             self.send_header("Location", self.server.redirect_to)
             self.end_headers()
             return
+        if self.server.status != 200:
+            # An endpoint that gates this route. The body is sent and sized so the client sees a
+            # complete response rather than a transport error, which is a different code path.
+            body = b'{"error": "Unauthorized"}'
+            self.send_response(self.server.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         body = b'{"casUrl": ""}'
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -84,6 +94,7 @@ def _serve():
     server = ThreadingHTTPServer(("127.0.0.1", 0), _RecordingHandler)
     server.seen = []
     server.redirect_to = ""
+    server.status = 200
     thread = threading.Thread(target = server.serve_forever, daemon = True)
     thread.start()
     return server
@@ -144,31 +155,83 @@ def test_probe_sends_no_authorization_across_a_cross_host_redirect(
 
 def test_probe_does_not_read_a_token_at_all(module, monkeypatch, origin):
     """No credential lookup, so HF_HUB_DISABLE_IMPLICIT_TOKEN cannot be contradicted."""
-    monkeypatch.setenv("HF_TOKEN", DUMMY_TOKEN)
+    # HF_TOKEN must be ABSENT: with it set, the old code short-circuited before get_token, so a
+    # spy on get_token would go uncalled on the unpatched tree too and prove nothing.
+    monkeypatch.delenv("HF_TOKEN", raising = False)
     monkeypatch.setenv("HF_HUB_DISABLE_IMPLICIT_TOKEN", "1")
 
     called = []
-    try:
-        import huggingface_hub.utils as hub_utils
-    except Exception:
-        hub_utils = None
-    if hub_utils is not None and hasattr(hub_utils, "get_token"):
-        monkeypatch.setattr(
-            hub_utils, "get_token", lambda *a, **k: called.append(1) or DUMMY_TOKEN
-        )
+    hub_utils = pytest.importorskip(
+        "huggingface_hub.utils", reason = "the cached-token fallback needs huggingface_hub"
+    )
+    assert hasattr(hub_utils, "get_token"), "huggingface_hub.utils.get_token is the path guarded"
+    monkeypatch.setattr(
+        hub_utils, "get_token", lambda *a, **k: called.append(1) or DUMMY_TOKEN
+    )
 
     module._probe_cas_reachable_inner()
 
+    assert origin.seen, "the probe did not reach the fixture"
     assert not called, "the probe still looks up a cached token"
     for path, auth in origin.seen:
         assert auth is None, f"probe sent Authorization to {path}"
 
 
+@pytest.mark.parametrize("with_env_token", [True, False])
+def test_a_401_is_inconclusive_and_still_carries_no_credential(
+    module, monkeypatch, origin, with_env_token
+):
+    """An endpoint that gates this route answers 401, which proves it is REACHABLE.
+
+    The probe sends nothing, so a 401 can only mean auth was never attempted. Returning a
+    demotion here would pin the machine to HTTP for 24h on the strength of a reply. Both
+    parameterizations must agree: the token is not consulted either way.
+    """
+    if with_env_token:
+        monkeypatch.setenv("HF_TOKEN", DUMMY_TOKEN)
+    else:
+        monkeypatch.delenv("HF_TOKEN", raising = False)
+    origin.status = 401
+
+    ok, reason = module._probe_cas_reachable_inner()
+
+    assert origin.seen, "the probe did not reach the fixture"
+    # `is None`, not falsiness: the bug this guards returned False, which is falsy too.
+    assert ok is None, reason
+    assert "inconclusive" in reason
+    for path, auth in origin.seen:
+        assert auth is None, f"probe sent Authorization to {path}"
+
+
 def test_source_carries_no_authorization_header():
-    """A lint-shaped guard: nothing in this module may add an Authorization header."""
-    source = (REPO_ROOT / "unsloth_zoo" / "hf_xet_health.py").read_text(encoding = "utf-8")
-    lowered = source.lower()
-    assert "authorization" not in lowered or "no credential is attached" in lowered, (
-        "hf_xet_health.py names Authorization again; the probe must stay anonymous"
-    )
-    assert "bearer {" not in lowered, "hf_xet_health.py formats a Bearer credential again"
+    """A lint-shaped guard: nothing in this module may add an Authorization header.
+
+    Read the EXECUTABLE strings out of the AST rather than scanning the file text. A text scan
+    has to exempt the comment that explains the removal, and that exemption then blesses every
+    other mention in the file, including a real header.
+    """
+    import ast
+
+    path = REPO_ROOT / "unsloth_zoo" / "hf_xet_health.py"
+    tree = ast.parse(path.read_text(encoding = "utf-8"))
+
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", None)
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                docstrings.add(id(body[0].value))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        if id(node) in docstrings:
+            continue
+        lowered = node.value.lower()
+        assert "authorization" not in lowered, (
+            f"hf_xet_health.py:{node.lineno} names Authorization in code; "
+            "the probe must stay anonymous"
+        )
+        assert "bearer " not in lowered, (
+            f"hf_xet_health.py:{node.lineno} formats a Bearer credential again"
+        )

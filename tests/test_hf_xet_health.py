@@ -261,6 +261,34 @@ def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
     assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
 
 
+def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
+    """The probe attaches no credential, so a 401 only means auth was never attempted.
+
+    This is the arm the 404 test cannot reach: `or` short-circuits before the 401 half is ever
+    evaluated. An endpoint that requires auth on this route would otherwise pin the machine to
+    HTTP for 24h on the strength of a response that proves the endpoint is REACHABLE.
+    """
+    import urllib.error
+    import urllib.request
+
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+
+    def _raise(*args, **kwargs):
+        raise urllib.error.HTTPError("http://gated/x", 401, "Unauthorized", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+
+    ok, reason = health._probe_cas_reachable()
+    # `is None`, not falsiness: the bug this guards returned False, which is falsy too.
+    assert ok is None, reason
+
+    verdict = health.xet_health(force = True, probe = True)
+    assert verdict.use_xet is True
+    assert verdict.source == "default"
+    assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
+
+
 def test_probe_403_still_demotes(monkeypatch):
     """A blocking corporate proxy legitimately answers 403, and that machine should use HTTP."""
     import urllib.error
