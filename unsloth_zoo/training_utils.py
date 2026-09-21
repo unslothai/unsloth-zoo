@@ -264,6 +264,11 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
+# Sentinel for "this config had no use_cache at all", so restore_use_cache can
+# tell that apart from a config that genuinely held None.
+_ABSENT = object()
+
+
 def disable_use_cache(model):
     """Set use_cache = False on every config of the model. KV cache is unused
     under gradient checkpointing. Original values are remembered on the model
@@ -276,10 +281,19 @@ def disable_use_cache(model):
     if record:
         originals = []
     for cfg in _iter_configs(config):
-        if getattr(cfg, "use_cache", None):
-            if record:
-                originals.append((cfg, cfg.use_cache))
-            cfg.use_cache = False
+        has_use_cache = hasattr(cfg, "use_cache")
+        if has_use_cache and not cfg.use_cache:
+            continue                      # already disabled, nothing to record
+        if record:
+            # _ABSENT marks a config that never had the attribute, so restore
+            # removes it again rather than inventing a value.
+            originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
+        # Set it even when the config never declared one. A model whose forward
+        # reads self.config.use_cache then raises AttributeError under gradient
+        # checkpointing instead of running: transformers 5 sub-configs do not
+        # inherit a default, and stepfun-ai/Step-3.7-Flash ships a
+        # Step3p7TextConfig with no use_cache at all.
+        cfg.use_cache = False
     if record and originals:
         try:
             model._unsloth_use_cache_originals = originals
@@ -293,7 +307,13 @@ def restore_use_cache(model):
     disabled. The record is kept so disable_use_cache can re-disable
     without re-recording when training resumes."""
     for cfg, value in getattr(model, "_unsloth_use_cache_originals", None) or ():
-        cfg.use_cache = value
+        if value is _ABSENT:
+            try:
+                delattr(cfg, "use_cache")
+            except Exception:
+                pass
+        else:
+            cfg.use_cache = value
 
 
 @torch.no_grad
