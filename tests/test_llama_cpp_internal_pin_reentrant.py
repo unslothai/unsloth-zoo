@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""internal_scripts_dir_pin holds its lock for the whole conversion, so it has to be
-reentrant.
-
-A caller that pins around save_pretrained_gguf (Unsloth Studio's GGUF export does) has the
-MLX save path in this package entering the same pin inside that call. With a plain
-threading.Lock the second entry blocks on a lock its own thread is holding and the export
-never finishes. The nested case is also the only way the "a pin already in the environment
-is the user's" branch is reached on one thread, so it needs to run.
+"""internal_scripts_dir_pin holds its lock across the conversion, so it has to be reentrant:
+the MLX save path enters it inside a caller that already pinned around save_pretrained_gguf
+(Unsloth Studio's GGUF export), and a plain threading.Lock blocks there forever.
 """
 
 from __future__ import annotations
@@ -45,7 +40,7 @@ def _load(module_name, relative_path):
 
 
 def _run_with_deadline(target, seconds = 20.0):
-    """Run target in a thread so a deadlock is a failed assert, not a hung test run."""
+    """Thread + deadline so a deadlock is a failed assert, not a hung suite."""
     outcome = {}
 
     def _wrapped():
@@ -89,7 +84,7 @@ def test_nested_pin_completes(tmp_path, monkeypatch):
     assert seen["outer_env"] == str(installed)
     assert seen["inner_trusted"] is False
     assert seen["outer_trusted"] is False
-    # The inner pin must not take the outer one down with it when it exits.
+    # The inner exit must not drop the outer pin.
     assert "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR" not in os.environ
 
 
@@ -119,14 +114,13 @@ def test_nested_pin_leaves_a_user_pin_alone(tmp_path, monkeypatch):
 
 
 def test_a_second_thread_still_waits_its_turn(tmp_path, monkeypatch):
-    """Reentrant for the thread holding it, still exclusive for everyone else: two
-    conversions must not interleave their edits to one process-wide variable."""
+    """Reentrant for its holder, still exclusive for everyone else: two conversions must
+    not interleave edits to one process-wide variable."""
     llama_cpp = _load("llama_cpp_reentrant_exclusion_probe", "unsloth_zoo/llama_cpp.py")
 
     installed = tmp_path / "llama.cpp"
     installed.mkdir()
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
-    inside = threading.Event()
     entered_second = threading.Event()
 
     def _second():
@@ -134,7 +128,6 @@ def test_a_second_thread_still_waits_its_turn(tmp_path, monkeypatch):
             entered_second.set()
 
     with llama_cpp.internal_scripts_dir_pin(str(installed)):
-        inside.set()
         other = threading.Thread(target = _second, daemon = True)
         other.start()
         assert not entered_second.wait(1.0), "another thread entered a held pin"
