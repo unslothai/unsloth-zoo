@@ -3889,7 +3889,9 @@ def _scan_imported_package(
 # A pin Unsloth set itself, to route the patcher at an install it has just made.
 # Not the same thing as a pin the user set to choose a converter they reviewed,
 # and only the second is a reason to skip the scan.
-_INTERNAL_SCRIPTS_DIR_LOCK = threading.Lock()
+# Reentrant: held across the conversion, and the MLX save path enters this pin inside a
+# caller that already pinned around save_pretrained_gguf; a plain Lock hangs the export there.
+_INTERNAL_SCRIPTS_DIR_LOCK = threading.RLock()
 _internal_scripts_dir_pin = None
 
 
