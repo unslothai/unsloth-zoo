@@ -4386,11 +4386,20 @@ requirements = json.loads(sys.stdin.read() or "[]")
 # script directory of its own to do it for us.
 # Index 1 is the converter's own slot only while something occupies index 0: the
 # real run has its script directory there, and `python -c` has the CWD. Safe-path
-# mode removes that entry, so index 1 would fall BEHIND the first PYTHONPATH entry
-# while the real run keeps the sibling tree ahead of all of PYTHONPATH.
+# mode removes that entry, from a script run as much as from `-c`, so where the
+# sibling tree lands RELATIVE TO PYTHONPATH depends on the mode each side runs in
+# and the two sides do not always agree. The probe is always in safe-path mode;
+# the converter is only when the caller's own environment already asked for it,
+# which argv[2] reports. Both terms are needed:
+#   converter plain -> sibling ahead of all of PYTHONPATH
+#   converter safe  -> sibling behind PYTHONPATH's first entry
+probe_safe = getattr(sys.flags, "safe_path", False)
+# Same interpreter both sides, so a probe that did not honour it means a converter
+# that will not either (before 3.11 the variable is ignored).
+converter_safe = probe_safe and len(sys.argv) > 2 and sys.argv[2] == "1"
 if converter and "NO_LOCAL_GGUF" not in os.environ:
     sys.path.insert(
-        0 if getattr(sys.flags, "safe_path", False) else 1,
+        (0 if probe_safe else 1) + (1 if converter_safe else 0),
         os.path.join(os.path.dirname(os.path.abspath(converter)), "gguf-py"),
     )
 
@@ -4459,10 +4468,15 @@ def _probe_child_gguf(python_exe, env, requirements, converter_location = None, 
     # be the one this report names. PYTHONSAFEPATH drops that entry; it is ignored
     # before 3.11, where _trusted_gguf_tree is what holds.
     env = dict(env) if env is not None else dict(os.environ)
+    # Read BEFORE we set our own: this is the converter child's environment, so a
+    # caller who already runs in safe-path mode gets a converter that does too, and
+    # the probe has to place the sibling tree where THAT run will place it.
+    converter_safe = "1" if env.get("PYTHONSAFEPATH") else "0"
     env["PYTHONSAFEPATH"] = "1"
     try:
         completed = subprocess.run(
-            [python_exe, "-c", _GGUF_PROBE_SOURCE, str(converter_location or "")],
+            [python_exe, "-c", _GGUF_PROBE_SOURCE,
+             str(converter_location or ""), converter_safe],
             # On stdin for the Windows argv ceiling; see _GGUF_PROBE_SOURCE.
             input = json.dumps(list(requirements)),
             env = env,

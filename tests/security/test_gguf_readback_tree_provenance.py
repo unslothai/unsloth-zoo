@@ -232,6 +232,61 @@ def test_the_probe_environment_is_not_mutated_for_the_caller(llama_cpp, tmp_path
 
 @pytest.mark.skipif(sys.version_info < (3, 11),
                     reason = "PYTHONSAFEPATH is honored from 3.11")
+@pytest.mark.parametrize("caller_safe_path", [False, True])
+def test_the_probe_reports_the_tree_the_converter_will_actually_use(
+        llama_cpp, tmp_path, caller_safe_path):
+    """Safe-path mode drops the leading entry from a SCRIPT run too, so a caller who
+    already exports PYTHONSAFEPATH gets a converter whose own `insert(1, ...)` lands
+    the sibling tree BEHIND PYTHONPATH. The probe has to match whichever side it is
+    measuring, not assume the converter runs the way it does."""
+    ambient = tmp_path / "ambient"
+    _gguf_package(ambient, body = "__version__ = 'ambient'\n")
+    install = tmp_path / "install"
+    _gguf_package(install / "gguf-py", body = "__version__ = 'sibling'\n")
+    converter = install / "convert_hf_to_gguf.py"
+    converter.write_text(
+        "import sys, os\n"
+        "sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gguf-py'))\n"
+        "import gguf\n"
+        "print(gguf.__file__)\n",
+        encoding = "utf-8",
+    )
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ambient)
+    env.pop("PYTHONSAFEPATH", None)
+    if caller_safe_path:
+        env["PYTHONSAFEPATH"] = "1"
+
+    # What the real converter resolves, run exactly as convert_to_gguf runs it.
+    run = subprocess.run(
+        [sys.executable, "-S", str(converter)], env = env,
+        stdout = subprocess.PIPE, stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
+    )
+    actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
+    assert actual, run.stderr
+
+    # What the probe reports, through the shipped probe source with the same env.
+    probe_env = dict(env)
+    converter_safe = "1" if probe_env.get("PYTHONSAFEPATH") else "0"
+    probe_env["PYTHONSAFEPATH"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", llama_cpp._GGUF_PROBE_SOURCE, str(converter), converter_safe],
+        input = "[]", env = probe_env, stdout = subprocess.PIPE, stderr = subprocess.PIPE,
+        encoding = "utf-8", timeout = 60,
+    )
+    reports = [
+        json.loads(line) for line in (completed.stdout or "").splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert reports, completed.stderr
+    assert reports[-1].get("location") == actual, (
+        f"probe reported {reports[-1].get('location')}, converter used {actual}"
+    )
+
+
+@pytest.mark.skipif(sys.version_info < (3, 11),
+                    reason = "PYTHONSAFEPATH is honored from 3.11")
 def test_the_probe_keeps_the_converter_gguf_ahead_of_pythonpath(llama_cpp, tmp_path):
     """The real run has its script directory at sys.path[0] and the sibling tree at
     1, so the sibling outranks all of PYTHONPATH. Safe-path mode vacates index 0, so
