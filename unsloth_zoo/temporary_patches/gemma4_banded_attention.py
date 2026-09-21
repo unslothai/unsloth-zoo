@@ -68,12 +68,22 @@ def _mask_is_plain_band(mask, S, w, _block=1024):
     element is verified (not a sampled subset), so packed or padded masks, whose
     extra segment boundaries neither path can honour, are always rejected. Per-head
     (shape[1] > 1) masks are rejected as well: the banded kernel applies one block
-    mask to every head, so it cannot honour them. The verdict is stashed on the
-    tensor itself, so it can never collide with a recycled object id.
+    mask to every head, so it cannot honour them.
+
+    A successful verdict may be cached on the tensor, but the cache key includes
+    S, w, shape/dtype/device and PyTorch's mutation version counter. This prevents
+    a verdict computed for one window or pre-mutation tensor contents from being
+    reused for a semantically different mask.
     """
     if mask is None:
         return True
     if not torch.is_tensor(mask) or mask.dim() != 4:
+        return False
+    if mask.requires_grad:
+        # The fast paths do not take the mask as an autograd input. Routing a
+        # differentiable additive mask here would silently discard its gradient.
+        return False
+    if mask.dtype != torch.bool and not torch.is_floating_point(mask):
         return False
     # Under torch.compile the band verdict drives Python control flow via .item()
     # (a data-dependent graph break -> hard error under fullgraph) and mutates a
@@ -81,9 +91,31 @@ def _mask_is_plain_band(mask, S, w, _block=1024):
     # while compiling so the graph stays intact; correctness is unchanged.
     if torch.compiler.is_compiling():
         return False
-    cached = getattr(mask, "_unsloth_plain_band", None)
-    if cached is not None:
-        return cached
+
+    # Inference tensors can lack a version counter. In that case simply skip the
+    # cache rather than accepting a verdict that cannot be invalidated safely.
+    try:
+        version = int(mask._version)
+    except Exception:
+        version = None
+    cache_key = None
+    if version is not None:
+        cache_key = (
+            int(S),
+            int(w),
+            tuple(mask.shape),
+            mask.dtype,
+            mask.device,
+            version,
+        )
+        cached = getattr(mask, "_unsloth_plain_band", None)
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] == cache_key
+        ):
+            return bool(cached[1])
+
     # Reject per-head masks (shape[1] > 1): a single block mask / window is
     # applied to every head, so a distinct per-head mask cannot be honoured.
     if mask.shape[1] != 1 or mask.shape[-2] != S or mask.shape[-1] != S:
@@ -98,7 +130,9 @@ def _mask_is_plain_band(mask, S, w, _block=1024):
         # plus its comparison: at 16k/32k that is gigabytes of transient GPU
         # memory. Each block only builds a (block, S) band. A float mask must
         # additionally carry no in-band bias (exactly 0), else the banded path
-        # would replace it with a boolean mask and silently drop the bias.
+        # would replace it with a boolean mask and silently drop the bias. Its
+        # blocked entries must be actual negative infinity: finite values such as
+        # -1e4 are still additive logits with real semantics.
         is_bool = m.dtype == torch.bool
         idx = torch.arange(S, device=m.device)
         ok = True
@@ -106,14 +140,19 @@ def _mask_is_plain_band(mask, S, w, _block=1024):
             rows = idx[start : start + _block]                                       # (br,)
             band = (idx[None, :] <= rows[:, None]) & (idx[None, :] > rows[:, None] - w)  # (br, S)
             msl = m[:, start : start + _block, :]                                     # (B, br, S)
-            match = (msl == band) if is_bool else torch.where(band, msl == 0, msl <= -1e4)
+            match = (
+                (msl == band)
+                if is_bool
+                else torch.where(band, msl == 0, torch.isneginf(msl))
+            )
             if not bool(match.all().item()):
                 ok = False
                 break
-    try:
-        mask._unsloth_plain_band = ok
-    except Exception:
-        pass
+    if cache_key is not None:
+        try:
+            mask._unsloth_plain_band = (cache_key, ok)
+        except Exception:
+            pass
     return ok
 
 

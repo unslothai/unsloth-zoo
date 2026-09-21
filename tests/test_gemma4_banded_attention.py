@@ -169,6 +169,32 @@ def test_mask_is_plain_band_rejects_inband_bias():
     assert _mask_is_plain_band(clean, S, w)
 
 
+def test_mask_is_plain_band_cache_is_window_and_mutation_safe():
+    S = 64
+    mask = _band_mask_full(S, 16)[None, None].clone()
+
+    assert _mask_is_plain_band(mask, S, 16)
+    # A cached w=16 verdict must not be reused for a different window.
+    assert not _mask_is_plain_band(mask, S, 32)
+
+    # A normal in-place mutation increments Tensor._version and invalidates the
+    # cached verdict for the original window.
+    mask[..., 40, 39] = False
+    assert not _mask_is_plain_band(mask, S, 16)
+
+
+def test_mask_is_plain_band_rejects_finite_block_bias_and_mask_grad():
+    S, w = 64, 16
+    band = _band_mask_full(S, w)
+
+    finite_block = torch.where(band, 0.0, -10000.0).to(torch.float32)[None, None]
+    assert not _mask_is_plain_band(finite_block, S, w)
+
+    exact = torch.where(band, 0.0, float("-inf")).to(torch.float32)[None, None]
+    assert _mask_is_plain_band(exact, S, w)
+    assert not _mask_is_plain_band(exact.clone().requires_grad_(True), S, w)
+
+
 def test_mask_is_plain_band_chunked_equals_single_block():
     # Row-chunked verification must agree with a single-block scan on every mask.
     S, w = 96, 16

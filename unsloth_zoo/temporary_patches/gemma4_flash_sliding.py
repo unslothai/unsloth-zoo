@@ -87,7 +87,8 @@ def _force_banded():
 
 
 def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
-                              dropout=0.0, scaling=None, is_causal=None, **kwargs):
+                              dropout=0.0, scaling=None, is_causal=None,
+                              _fallback=None, **kwargs):
     # Shared layer + band gate for both fast kernels (no _HAS_FA2 / dtype clause
     # here, so the banded fallback is reachable without flash-attn).
     if (_enabled()
@@ -152,8 +153,37 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
                 return out, None                      # (B, S, H, D), no weights
             except Exception as e:
                 logger.warning_once(f"Unsloth: gemma-4 banded sliding fell back to SDPA ({e})")
-    return _ORIG_SDPA[0](module, query, key, value, attention_mask,
-                         dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs)
+    fallback = _fallback if _fallback is not None else _ORIG_SDPA[0]
+    if fallback is None:
+        raise RuntimeError("gemma-4 sliding SDPA wrapper has no fallback backend")
+    return fallback(module, query, key, value, attention_mask,
+                    dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs)
+
+
+def _make_flash_sliding_wrapper(original):
+    """Capture the wrapped backend per install instead of using mutable global state."""
+    router = _sdpa_maybe_flash_sliding
+
+    @functools.wraps(original)
+    def wrapped(module, query, key, value, attention_mask,
+                dropout=0.0, scaling=None, is_causal=None, **kwargs):
+        return router(
+            module, query, key, value, attention_mask,
+            dropout=dropout, scaling=scaling, is_causal=is_causal,
+            _fallback=original, **kwargs,
+        )
+
+    # Preserve sentinels from already-installed wrappers so repeated patch phases
+    # are idempotent regardless of global/sliding installation order.
+    try:
+        for name, value in vars(original).items():
+            if name.startswith("_unsloth_"):
+                setattr(wrapped, name, value)
+    except Exception:
+        pass
+    wrapped._unsloth_gemma4_flash = True
+    wrapped._unsloth_gemma4_flash_original = original
+    return wrapped
 
 
 def patch_gemma4_flash_sliding():
@@ -170,10 +200,9 @@ def patch_gemma4_flash_sliding():
     if getattr(current, "_unsloth_gemma4_flash", False):
         return
     _ORIG_SDPA[0] = current
-    _sdpa_maybe_flash_sliding._unsloth_gemma4_flash = True
     # Direct assignment: AttentionInterface.register() does not update the
     # global mapping that layers read via ALL_ATTENTION_FUNCTIONS["sdpa"].
-    ALL_ATTENTION_FUNCTIONS["sdpa"] = _sdpa_maybe_flash_sliding
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = _make_flash_sliding_wrapper(current)
 
 
 TEMPORARY_PATCHES.append(patch_gemma4_flash_sliding)

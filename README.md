@@ -166,6 +166,31 @@ pip install unsloth
 6. Double check that your versions of Python, CUDA, CUDNN, `torch`, `triton`, and `xformers` are compatible with one another. The [PyTorch Compatibility Matrix](https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix) may be useful. 
 5. Finally, install `bitsandbytes` and check it with `python -m bitsandbytes`
 
+#### AMD gfx906 Gemma 4 31B long-context fallback
+
+On AMD `gfx906` (for example MI50), Gemma 4 31B global attention has
+`head_dim=512`. If the normal SDPA backend uses too much VRAM for long-context
+training, an opt-in tiled Triton fallback is available with Triton **3.8+**:
+
+```bash
+export UNSLOTH_GEMMA4_GFX906_GLOBAL=1
+# Optional memory-policy threshold. This is not a speed crossover point.
+export UNSLOTH_GEMMA4_GFX906_GLOBAL_MIN_SEQ=1024
+```
+
+The fallback is memory-oriented and can be substantially slower than SDPA. It
+runs only for the narrow Gemma 4 D=512 global-attention training shape on
+`gfx906`, including reentrant gradient-checkpoint pack/recompute forwards.
+Eval/inference, unsupported compiler versions, sliding attention, dropout,
+unequal Q/K/V sequence lengths, and the FORCE_FLOAT32 path when a cache object
+is present keep the existing backend.
+
+Explicit masks must be exactly dense causal: boolean, or float with `0` on
+allowed positions and `-inf` on blocked positions. Padded, packed, per-head,
+finite-bias, or differentiable masks fall back to the existing backend. Runtime
+kernel failures after selection are surfaced rather than retried through SDPA.
+The environment variables above are read dynamically.
+
 ### Conda Installation (Optional)
 `⚠️Only use Conda if you have it. If not, use Pip`. Select either `pytorch-cuda=11.8,12.1` for CUDA 11.8 or CUDA 12.1. We support `python=3.10,3.11,3.12`.
 ```bash
