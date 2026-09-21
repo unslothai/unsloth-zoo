@@ -157,6 +157,12 @@ def add_vllm_namespace_skip_module_aliases(skipped_modules):
         for prefix, replacements in _VLLM_SKIP_MODULE_NAMESPACES:
             if not module_name.startswith(prefix): continue
             tail = module_name[len(prefix):]
+            # An entry that is exactly the prefix would alias to a bare namespace
+            # root, and a bare root matches every module under it: transformers'
+            # `should_convert_module` would then leave the whole model unquantized.
+            # `find_skipped_quantized_modules` never emits one, so this only guards
+            # a hand-built list, but the cost of being wrong here is the entire model.
+            if not tail: continue
             for replacement in replacements:
                 alias = replacement + tail
                 if alias in seen: continue

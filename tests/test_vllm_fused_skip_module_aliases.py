@@ -206,3 +206,51 @@ def test_combined_is_additive_and_idempotent():
     once = vllm_compatible_skip_modules(QWEN3VL_SKIP_MODULES)
     assert set(QWEN3VL_SKIP_MODULES).issubset(set(once))
     assert vllm_compatible_skip_modules(once) == once
+
+
+def test_merge_path_actually_writes_the_vllm_compatible_names():
+    """The call site is the only production change; everything else is a helper.
+
+    Reverting just `vllm_compatible_skip_modules(...)` back to `skipped_modules`
+    at the merge writer leaves every helper and every other test in this file
+    passing, so without this test a refactor that drops the wiring ships green
+    and silently re-introduces the vLLM shape assertion.
+
+    Asserted against the source of the writer rather than a full merge, which
+    needs a real model on a GPU.
+    """
+    import inspect
+    from unsloth_zoo import saving_utils
+
+    source = inspect.getsource(saving_utils)
+    marker = 'quantization_config["llm_int8_skip_modules"]'
+    assignments = [
+        line.strip() for line in source.splitlines() if marker in line
+    ]
+    assert assignments, "the merge writer no longer sets llm_int8_skip_modules"
+    for line in assignments:
+        assert "vllm_compatible_skip_modules" in line or line.endswith("\\"), (
+            f"llm_int8_skip_modules written without the vLLM aliases: {line}"
+        )
+
+    # And the continuation form, which is what the writer currently uses.
+    idx = source.index(marker)
+    window = source[idx : idx + 200]
+    assert "vllm_compatible_skip_modules" in window, (
+        "the merge writer does not pass skipped modules through "
+        "vllm_compatible_skip_modules"
+    )
+
+
+def test_namespace_alias_never_emits_a_bare_namespace_root():
+    """A bare root matches every module beneath it, unquantizing the whole model."""
+    from unsloth_zoo.saving_utils import vllm_compatible_skip_modules
+
+    for entry in ("model.language_model.", "model.", "language_model.model."):
+        out = vllm_compatible_skip_modules([entry])
+        # The caller's own entries are passed through untouched; only the names
+        # this helper adds are its responsibility.
+        added = [name for name in out if name != entry]
+        for name in added:
+            assert name.strip(), f"empty alias from {entry!r}"
+            assert not name.endswith("."), f"bare namespace root {name!r} from {entry!r}"
