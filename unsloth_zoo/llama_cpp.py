@@ -4398,9 +4398,12 @@ requirements = json.loads(sys.stdin.read() or "[]")
 # whatever `./gguf/__init__.py` it found, with the parent's environment and token.
 # So drop the entry here as well, which needs no interpreter support. A script run
 # never has the working directory on its path either, so nothing faithful is lost.
-if not getattr(sys.flags, "safe_path", False):
-    while sys.path and sys.path[0] in ("", ".", os.getcwd()):
-        del sys.path[0]
+# Exactly one entry, and only the implicit one. A caller who put '.' on PYTHONPATH
+# meant it, and the real converter honours it, so deleting those too would report a
+# tree the conversion does not use -- the same fault as reporting one it cannot see.
+if not getattr(sys.flags, "safe_path", False) and sys.path and \
+    sys.path[0] in ("", os.getcwd()):
+    del sys.path[0]
 # Either way sys.path now begins with PYTHONPATH, which is the shape safe-path mode
 # gives. The converter is a different question: it is a SCRIPT, so it has its own
 # directory at index 0 and its `insert(1, ...)` puts the sibling tree ahead of all

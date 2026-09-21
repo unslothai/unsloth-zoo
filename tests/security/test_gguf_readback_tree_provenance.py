@@ -380,6 +380,46 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
     assert reports[-1].get("location") == actual
 
 
+def test_an_explicit_cwd_on_pythonpath_survives_the_drop(llama_cpp, tmp_path):
+    """Dropping the implicit `-c` slot must not take a caller's own '.' with it. The
+    converter honours PYTHONPATH, so a package reached that way is one the conversion
+    really uses, and refusing to see it reports the wrong tree just as surely."""
+    cwd = tmp_path / "cwd"
+    _gguf_package(cwd, body = "__version__ = 'from-pythonpath'\n")
+    install = tmp_path / "install"
+    install.mkdir()
+    converter = install / "convert_hf_to_gguf.py"       # deliberately no gguf-py
+    converter.write_text(
+        "import sys, os\n"
+        "sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gguf-py'))\n"
+        "import gguf\n"
+        "print(gguf.__file__)\n",
+        encoding = "utf-8",
+    )
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "."
+    env.pop("PYTHONSAFEPATH", None)
+    run = subprocess.run(
+        [sys.executable, "-S", str(converter)], cwd = str(cwd), env = env,
+        stdout = subprocess.PIPE, stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
+    )
+    actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
+    assert actual.startswith(str(cwd)), f"the converter itself resolved {actual}"
+
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", llama_cpp._GGUF_PROBE_SOURCE, str(converter), "0"],
+        input = "[]", cwd = str(cwd), env = env, stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
+    )
+    reports = [
+        json.loads(line) for line in (completed.stdout or "").splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert reports, completed.stderr
+    assert reports[-1].get("location") == actual
+
+
 def test_the_probe_drops_the_working_directory_without_interpreter_support(
         llama_cpp, tmp_path, monkeypatch):
     """The 3.9/3.10 case, simulated by withholding the flag the way those versions
