@@ -644,7 +644,11 @@ def grpo_compute_loss(
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
     elif loss_type == "luspo":
-        loss = (loss_i * mask.sum(1, keepdim=True)).mean()
+        # `loss_i` is (B, 1) only when importance_sampling_level is "sequence" and beta is 0.
+        # The token level (the TRL default), the KL term, token level vLLM importance ratios
+        # and the off policy mask each broadcast it to (B, T), so mask before aggregating or
+        # the padded columns join the sum and every row is weighted by its own token count.
+        loss = (loss_i * mask).sum(-1).mean()
         normalizer = current_gradient_accumulation_steps
         loss = loss / normalizer
     else:
