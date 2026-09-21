@@ -656,6 +656,44 @@ def _allowlist_builtins():
 pass
 
 
+# Match statement nodes only exist on 3.10+ and this module still has to
+# import on 3.9, so they are looked up instead of named. An empty tuple makes
+# every isinstance below simply false.
+_MATCH_CLASS_NODES = tuple(
+    node for node in (getattr(ast, "MatchClass", None),) if node is not None
+)
+_MATCH_CAPTURE_NODES = tuple(
+    node for node in (getattr(ast, "MatchAs", None), getattr(ast, "MatchStar", None))
+    if node is not None
+)
+_MATCH_MAPPING_NODES = tuple(
+    node for node in (getattr(ast, "MatchMapping", None),) if node is not None
+)
+
+
+def _bound_identifiers(node):
+    """
+    Names a node binds as a bare identifier string rather than an ast.Name,
+    which is the only reason the walk below cannot already see them.
+    """
+    if isinstance(node, ast.ExceptHandler):
+        return (node.name,)
+    if isinstance(node, ast.arg):
+        return (node.arg,)
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return tuple(node.names)
+    if isinstance(node, ast.keyword):
+        return (node.arg,)
+    if isinstance(node, ast.alias):
+        return (node.name, node.asname)
+    if _MATCH_CAPTURE_NODES and isinstance(node, _MATCH_CAPTURE_NODES):
+        return (node.name,)
+    if _MATCH_MAPPING_NODES and isinstance(node, _MATCH_MAPPING_NODES):
+        return (node.rest,)
+    return ()
+pass
+
+
 def _reject_dunder_access(tree):
     """
     Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
@@ -687,6 +725,24 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
             )
+        # A match class-pattern getattrs the subject with the names in
+        # kwd_attrs, which are strings on the node: `case object(__class__=x)`
+        # is the subclasses walk with no Attribute node anywhere in the source.
+        if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            for attr in (node.kwd_attrs or []):
+                if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
+                    raise RuntimeError(
+                        f"Attribute '{attr}' is not allowed in generated code."
+                    )
+        # The remaining identifiers the grammar stores as strings rather than
+        # Name nodes. None of them reads an attribute by itself, but each one
+        # binds a name the Name rule above would refuse, so refuse it here too
+        # instead of leaving a second spelling of the same thing.
+        for bound in _bound_identifiers(node):
+            if bound is not None and bound.startswith("__"):
+                raise RuntimeError(
+                    f"Name '{bound}' is not allowed in generated code."
+                )
 pass
 
 
@@ -1086,6 +1142,25 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
+# Ports this process actually spawned an OpenEnv child on, keyed to the Popen
+# handle. /health is unauthenticated and its body is a fixed word, so it says
+# "something is listening", never "my server is listening"; the handle is the
+# only thing that can tell the two apart.
+_OPENENV_CHILDREN = {}
+
+
+def _openenv_child_alive(port):
+    """ Is the child we spawned on this port still the process holding it? """
+    child = _OPENENV_CHILDREN.get(port, None)
+    if child is None: return False
+    if child.poll() is not None:
+        # It exited, so the port is free for anyone else to take.
+        _OPENENV_CHILDREN.pop(port, None)
+        return False
+    return True
+pass
+
+
 def launch_openenv(
     port : int = 8111,
     openenv_process = None,
@@ -1093,14 +1168,23 @@ def launch_openenv(
     server : str = "envs.openspiel_env.server.app:app",
     environment = {},
     openenv_class = None,
+    host : str = "127.0.0.1",
 ):
-    """ Finds a new port or checks if the old open port actually works """
+    """ Finds a new port or checks if the old open port actually works
+
+    `host` is the interface the environment server binds. It defaults to
+    loopback because the OpenEnv app authenticates nobody and every URL below
+    is localhost, so a wider bind only publishes the training run's environment
+    to the host's networks and to anything sharing its container bridge. Pass
+    host yourself if a remote worker genuinely has to reach it.
+    """
     # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
     assert openenv_class is not None
     assert type(server) is str
+    assert type(host) is str and host != ""
 
     # Auto-fix PYTHONPATH for OpenEnv compatibility
     correct_pythonpath = _get_openenv_pythonpath(working_directory)
@@ -1108,10 +1192,21 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    localhost = f"http://localhost:{port}"
+    # A wildcard bind still has to be dialled through an address that resolves.
+    client_host = "localhost" if host in ("0.0.0.0", "::", "127.0.0.1", "::1") else host
+    localhost = f"http://{client_host}:{port}"
 
     def check_openenv_works(process):
         if process is not None:
+            # A health check only proves someone answered. Unless that someone
+            # is the child we started, it is a local process that took the port
+            # after ours exited, and adopting it hands the training loop its
+            # observations and rewards.
+            if not _openenv_child_alive(port):
+                if hasattr(process, "close"):
+                    try: process.close()
+                    except: pass
+                return None
             try:
                 request = requests.get(f"{localhost}/health", timeout = 0.1).content
                 if b"healthy" not in request and hasattr(process, "close"):
@@ -1131,19 +1226,31 @@ def launch_openenv(
     while openenv_process is None:
         # Port ID must be less than uint16_MAX
         port = random.randint(9000, 65535-1)
-        localhost = f"http://localhost:{port}"
+        localhost = f"http://{client_host}:{port}"
+        # Someone already holds it, so uvicorn would fail to bind and we would
+        # end up talking to them instead.
+        if is_port_open(client_host, port):
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
-        openenv_process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", server, "--host", "0.0.0.0", "--port", str(port)],
+        openenv_child = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", server, "--host", host, "--port", str(port)],
             env = environment,
             stdout = subprocess.PIPE,
             stderr = subprocess.PIPE,
             text = True,
             cwd = working_directory,
         )
+        _OPENENV_CHILDREN[port] = openenv_child
         # Wait until port is open
         wait_trials = 0
-        while not is_port_open("localhost", port):
+        while not is_port_open(client_host, port):
+            # A child that died cannot be the one that opens this port later.
+            if openenv_child.poll() is not None:
+                _OPENENV_CHILDREN.pop(port, None)
+                break
             time.sleep(0.01)
             if wait_trials % 10 == 0:
                 print(".", end = "")
@@ -1151,6 +1258,11 @@ def launch_openenv(
             if wait_trials == 6000:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
+        if _OPENENV_CHILDREN.get(port, None) is not openenv_child:
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         openenv_process = openenv_class(base_url = localhost)
         openenv_process = check_openenv_works(openenv_process)
         if openenv_process is not None: break
