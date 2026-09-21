@@ -133,6 +133,38 @@ def test_a_tree_inside_a_chosen_root_is_kept(llama_cpp, tmp_path, monkeypatch, r
     assert llama_cpp._trusted_gguf_tree(tree, converter_location) == os.path.realpath(tree)
 
 
+def test_the_checked_path_and_the_returned_path_cannot_diverge(
+        llama_cpp, tmp_path, monkeypatch):
+    """Resolving separately for the check and for the return is not the same rule
+    twice: the link belongs to the principal being screened, so the two resolutions
+    need not agree, and the value that matters is the one handed back to be imported.
+    Driven with a realpath that answers differently the first time, which is the race
+    made deterministic."""
+    install = tmp_path / "install"
+    inside = _gguf_package(install / "gguf-py")
+    outside = _gguf_package(tmp_path / "attacker")
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(install))
+
+    link = tmp_path / "link"
+    os.symlink(outside, str(link))
+
+    real_realpath = os.path.realpath
+    seen = {"n": 0}
+
+    def flipping(path, *args, **kwargs):
+        if str(path) == str(link):
+            seen["n"] += 1
+            # First answer: outside. By the second, the link has "moved" inside.
+            return outside if seen["n"] == 1 else inside
+        return real_realpath(path, *args, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", flipping)
+    verdict = llama_cpp._trusted_gguf_tree(str(link))
+
+    assert verdict != outside, "returned a tree the containment check never approved"
+    assert seen["n"] == 1, f"resolved the attacker's link {seen['n']} times, not once"
+
+
 def test_a_symlink_into_a_chosen_root_is_returned_resolved(llama_cpp, tmp_path, monkeypatch):
     """Accepting a link and handing back the link is a check that can be undone: the
     caller puts the returned string on sys.path and imports it, so a link the lower-

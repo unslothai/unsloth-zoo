@@ -4689,16 +4689,19 @@ def _trusted_gguf_tree(tree, converter_location = None):
     """
     if not tree:
         return None
-    # Resolved, and it is the RESOLVED path that is returned: the check below asks
-    # where `tree` points, so handing the caller back the unresolved string would
-    # let a symlink that passed the check be re-pointed before the import that
-    # consumes it, which is the substitution this whole function exists to refuse.
+    # Resolved ONCE, and it is that one result which is both checked and returned.
+    # A symlink here is the lower-trust principal's to move, so resolving separately
+    # for the check and for the return lets the two disagree: the check answers for
+    # a tree inside a chosen root while the value returned is the one outside, and
+    # that is what the caller then puts on sys.path and imports. Passing `resolved`
+    # to `_stays_within` also stops it re-traversing the link, since realpath of an
+    # already-resolved path is itself.
     resolved = os.path.realpath(tree)
     roots = [LLAMA_CPP_DEFAULT_DIR, os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")]
     if converter_location:
         roots.append(os.path.dirname(os.path.abspath(converter_location)))
     for root in roots:
-        if root and _stays_within(os.path.expanduser(root), tree):
+        if root and _stays_within(os.path.expanduser(root), resolved):
             return resolved
     # Plus the tree this process would import `gguf` from anyway, where the swap
     # changes nothing. Two things have to hold together, and neither implies the
