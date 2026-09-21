@@ -944,6 +944,7 @@ def test_a_lock_held_at_fork_does_not_wedge_the_child():
         thread.join(5)
 
 
+@pytest.mark.skipif(os.name == "nt", reason = "Windows has no zombie state")
 def test_an_unreaped_process_is_not_alive():
     """A zombie answers os.kill(pid, 0) while its port is already free for anyone
     to bind, and a forked worker cannot waitpid the parent's uvicorn (a sibling),

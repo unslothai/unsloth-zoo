@@ -1210,7 +1210,9 @@ def _openenv_pid_is_zombie(pid):
 
     A zombie still answers os.kill(pid, 0) while its listening socket is long
     gone, so pid existence alone re-opens the squatter hole a port away.
+    Windows has no such state, and would pay a `ps` process to learn that.
     """
+    if os.name == "nt": return False
     try:
         with open(f"/proc/{pid}/stat", "rb") as file:
             # comm sits in parentheses and may contain spaces, so split after the last ')'.
