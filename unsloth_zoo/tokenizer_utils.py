@@ -273,16 +273,19 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    # A composite checkpoint may have no single input embedding to repair.
-    # `hasattr` does not answer this: transformers 5 defines
-    # get_input_embeddings on every PreTrainedModel and has the base
-    # implementation raise NotImplementedError, so Qwen3-Omni, which carries a
-    # thinker and a talker, raises here. Nothing to reset in that case, so skip
-    # the pass instead of failing the run before training starts.
+    # Not every checkpoint can hand back a single embedding matrix, and
+    # `hasattr` does not answer the question. transformers 5 defines
+    # get_input_embeddings on every PreTrainedModel with a base implementation
+    # that raises NotImplementedError, so Qwen3-Omni, which carries a thinker
+    # and a talker, raises here; and remote code can declare a non-standard
+    # signature that cannot be called at all (stepfun-ai/Step-3.7-Flash defines
+    # get_input_embeddings(self, input_ids), which raises TypeError). There is
+    # nothing to reset in either case, so skip the pass instead of failing the
+    # run before training starts.
     try:
         embedding_matrix = model.get_input_embeddings ().weight
         lm_head_matrix   = model.get_output_embeddings().weight
-    except NotImplementedError:
+    except (NotImplementedError, TypeError):
         logger.info(
             f"Unsloth: Skipping the untrained token fix for "
             f"{type(model).__name__}, which does not expose a single input "
