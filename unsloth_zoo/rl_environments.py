@@ -1189,6 +1189,52 @@ def _release_openenv_endpoint(client_host, port, child = None):
 pass
 
 
+# An open port plus a live child is not proof that the child opened the port: a
+# process that takes the endpoint between the availability check and uvicorn's own
+# bind satisfies both while owning the listener itself, and uvicorn does not exit
+# the instant it loses the bind. uvicorn announcing its own socket is proof from
+# the process we started, and needs no per-platform socket ownership inspection.
+_UVICORN_BOUND = ("Uvicorn running on",)
+_UVICORN_BIND_FAILED = ("address already in use", "error while attempting to bind")
+# How long to keep waiting for that announcement while the endpoint is already
+# open, before falling back to the weaker open-port signal. Only a uvicorn that
+# has reworded its startup log reaches the fallback, and failing a legitimate
+# launch to close a race is the worse trade, so the fallback stays.
+_UVICORN_BOUND_GRACE_TRIALS = 300
+
+
+def _watch_openenv_child_output(child):
+    """ Collect the child's stderr in a thread, returning the growing line list.
+
+    Draining matters on its own: stderr is a pipe nobody reads, so a chatty
+    uvicorn would eventually block on a full one.
+    """
+    lines = []
+    def read():
+        # getattr, not attribute access: a child object without a stderr pipe is
+        # not an error here, and an exception in this thread would be unhandled.
+        stream = getattr(child, "stderr", None)
+        if stream is None: return
+        try:
+            for line in stream: lines.append(line)
+        except Exception:
+            pass
+    thread = threading.Thread(target = read, daemon = True)
+    thread.start()
+    return lines
+
+
+def _child_announced_its_socket(lines):
+    """ Did the child say it bound, or that it could not? (bound, failed) """
+    joined = "".join(lines)
+    lowered = joined.lower()
+    return (
+        any(marker in joined for marker in _UVICORN_BOUND),
+        any(marker in lowered for marker in _UVICORN_BIND_FAILED),
+    )
+pass
+
+
 def _reap_exited_openenv_children():
     """ Drop and reap every registered child that has already exited.
 
@@ -1337,12 +1383,20 @@ def launch_openenv(
             _release_openenv_endpoint(client_host, port)
             raise
         _register_openenv_child(client_host, port, openenv_child)
-        # Wait until port is open
+        # Wait until OUR child says it is the one listening
+        child_output = _watch_openenv_child_output(openenv_child)
         wait_trials = 0
-        while not is_port_open(client_host, port):
-            # A child that died cannot be the one that opens this port later.
-            if openenv_child.poll() is not None:
+        while True:
+            announced, bind_failed = _child_announced_its_socket(child_output)
+            if announced: break
+            # A child that died cannot be the one that opens this port later, and
+            # a child that reported losing the bind never will.
+            if bind_failed or openenv_child.poll() is not None:
                 _release_openenv_endpoint(client_host, port, openenv_child)
+                break
+            if is_port_open(client_host, port) and wait_trials >= _UVICORN_BOUND_GRACE_TRIALS:
+                # Unrecognised startup log. Accept the open port as before rather
+                # than fail a launch that is probably fine.
                 break
             time.sleep(0.01)
             if wait_trials % 10 == 0:

@@ -21,6 +21,7 @@ the suite's network blocker allows.
 
 import contextlib
 import http.server
+import io
 import socket
 import subprocess
 import threading
@@ -664,3 +665,137 @@ def test_a_failed_spawn_does_not_strand_the_reservation(monkeypatch, tmp_path):
     with pytest.raises(OSError):
         rl_env.launch_openenv(working_directory = str(tmp_path), openenv_class = _DummyClient)
     assert rl_env._OPENENV_RESERVED == set()
+
+
+# --- readiness must come from OUR child, not from the port being open ----------
+
+class _AnnouncingChild:
+    """A uvicorn that writes its own startup log, like the real one."""
+    def __init__(self, lines, alive = True):
+        self.stderr = io.StringIO("".join(lines))
+        self._alive = alive
+    def poll(self): return None if self._alive else 1
+
+
+def _squatter_launcher(monkeypatch, child, port, real_sleep = False):
+    """The endpoint reads FREE at the availability check and OPEN afterwards.
+
+    That ordering is the race: a foreign process takes the port in the window
+    between the check and uvicorn's own bind.
+    """
+    seen = {"checked": False}
+
+    def probe(host, prt):
+        if prt != port: return False
+        if not seen["checked"]:
+            seen["checked"] = True
+            return False
+        return True
+
+    monkeypatch.setattr(rl_env, "subprocess", types.SimpleNamespace(
+        Popen = lambda argv, **kwargs: child, PIPE = subprocess.PIPE,
+    ))
+    monkeypatch.setattr(rl_env, "random", types.SimpleNamespace(randint = lambda a, b: port))
+    monkeypatch.setattr(rl_env, "is_port_open", probe)
+    monkeypatch.setattr(rl_env, "requests", types.SimpleNamespace(
+        get = lambda url, **kwargs: types.SimpleNamespace(content = b'{"status":"healthy"}'),
+    ))
+    # A test about elapsed time needs time to elapse: with sleep stubbed out the
+    # grace expires in microseconds and the fallback fires before the child can
+    # say anything, which makes the race untestable.
+    monkeypatch.setattr(rl_env, "time", types.SimpleNamespace(
+        sleep = (lambda seconds: time.sleep(0.001)) if real_sleep else (lambda seconds: None),
+    ))
+
+
+class _LosesTheBindChild:
+    """Alive and silent at first, then reports the bind failure and exits.
+
+    That is the real squatter timeline, and the reason the old check failed: it
+    left the readiness loop on the foreign socket during the silent window, while
+    poll() still said alive, and never revisited the question. stderr is a single
+    lazy stream because that is what a pipe is: read once, to EOF.
+    """
+    def __init__(self, port, silent_seconds = 0.05):
+        self._exited = threading.Event()
+
+        def stream():
+            time.sleep(silent_seconds)          # uvicorn starting, nothing said yet
+            yield (
+                f"ERROR:    [Errno 98] error while attempting to bind on address "
+                f"('127.0.0.1', {port}): address already in use\n"
+            )
+            self._exited.set()
+
+        self.stderr = stream()
+
+    def poll(self): return 1 if self._exited.is_set() else None
+
+
+def test_a_foreign_listener_is_not_adopted_while_our_child_starts(monkeypatch, tmp_path):
+    """Port open + child alive is not proof the child opened the port."""
+    child = _LosesTheBindChild(57000)
+    _squatter_launcher(monkeypatch, child, 57000, real_sleep = True)
+    # Grace generous enough that the child's own verdict lands first, which is
+    # the real ordering: uvicorn reports a lost bind in milliseconds.
+    monkeypatch.setattr(rl_env, "_UVICORN_BOUND_GRACE_TRIALS", 500)
+    with pytest.raises(TimeoutError):
+        rl_env.launch_openenv(
+            working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
+        )
+    assert ("127.0.0.1", 57000) not in rl_env._OPENENV_CHILDREN
+
+
+def test_our_childs_own_announcement_is_what_readiness_waits_for(monkeypatch, tmp_path):
+    """The legitimate path: uvicorn says it bound, and we believe our own child."""
+    child = _AnnouncingChild(["INFO:     Uvicorn running on http://127.0.0.1:57001\n"])
+    _squatter_launcher(monkeypatch, child, 57001)
+    port, client = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
+    )
+    assert port == 57001
+    assert client.base_url == "http://127.0.0.1:57001"
+
+
+def test_a_child_that_reports_losing_the_bind_is_abandoned(monkeypatch, tmp_path):
+    """uvicorn says the address is taken, so the open port is somebody else's."""
+    child = _AnnouncingChild(
+        ["ERROR:    [Errno 98] error while attempting to bind on address "
+         "('127.0.0.1', 57002): address already in use\n"],
+    )
+    _squatter_launcher(monkeypatch, child, 57002)
+    with pytest.raises(TimeoutError):
+        rl_env.launch_openenv(
+            working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
+        )
+    assert ("127.0.0.1", 57002) not in rl_env._OPENENV_CHILDREN
+
+
+def test_an_unrecognised_startup_log_still_falls_back_to_the_open_port(monkeypatch, tmp_path):
+    """Closing a race must not fail a launch whose uvicorn reworded its log.
+
+    This is also the residual, stated rather than hidden: a child that stays alive
+    and never announces anything is indistinguishable from one that bound, so the
+    open port is accepted. Real uvicorn always announces one way or the other;
+    eliminating the window entirely means binding the socket in the parent and
+    handing it over with uvicorn --fd, which is not portable to Windows.
+    """
+    child = _AnnouncingChild(["INFO:     serving, probably, who can say\n"])
+    _squatter_launcher(monkeypatch, child, 57003)
+    port, client = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
+    )
+    assert port == 57003
+
+
+def test_child_stderr_is_drained_rather_than_left_to_fill(monkeypatch, tmp_path):
+    """Nothing read the pipe before, so a chatty uvicorn could block on it."""
+    chatty = ["INFO:     noise line %d\n" % index for index in range(500)]
+    chatty.append("INFO:     Uvicorn running on http://127.0.0.1:57004\n")
+    child = _AnnouncingChild(chatty)
+    _squatter_launcher(monkeypatch, child, 57004)
+    port, _ = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
+    )
+    assert port == 57004
+    assert child.stderr.read() == "", "the pipe was not drained to the end"
