@@ -3,20 +3,16 @@
 
 """Two boundaries in `rl_environments.py`, both of them load bearing.
 
-`create_locked_down_function` is handed source the user did not write (a model
-or an RL environment did), so the allowlist policy is the only thing between
-that source and `__import__`. `_reject_dunder_access` enforces it by walking
-the AST, which means any construct that spells an attribute as a plain
-identifier string rather than an `ast.Attribute` node is invisible to it. A
-PEP 634 class pattern is exactly that: `case object(__class__=x)` is a getattr.
+`create_locked_down_function` compiles source a model wrote, so the allowlist is
+all that stands between it and `__import__`. `_reject_dunder_access` walks the
+AST, so any construct spelling an attribute as a bare identifier string is
+invisible to it: `case object(__class__=x)` is a getattr with no Attribute node.
 
-`launch_openenv` spawns the OpenEnv server the trainer exchanges observations,
-actions and rewards with. It must bind loopback rather than every interface,
-and it must not accept any local process that happens to answer `/health` as
-that server.
+`launch_openenv` spawns the server the trainer exchanges observations and rewards
+with. It must bind loopback, and must not accept any process that answers
+`/health` as that server.
 
-CPU-only and network-free; the one real listener here is on 127.0.0.1, which
-the suite's network blocker allows.
+CPU-only; the real listeners are on 127.0.0.1, which the suite's blocker allows.
 """
 
 import contextlib
@@ -76,12 +72,9 @@ def test_match_class_pattern_chain_cannot_reach_import():
         create_locked_down_function(source)
 
 
-# `kwd_attrs` is the only identifier-as-string field that READS an attribute.
-# Every other one just binds a name, and a bound dunder is inert because reading
-# it back is an ast.Name that the Name rule refuses. These cases pin exactly
-# that, so the reason the allowlist does not need a rule per binding form is
-# asserted rather than assumed: if the Name rule ever stopped covering a read,
-# one of these fails instead of a hole opening quietly.
+# Why no rule is needed per binding form, asserted rather than assumed: reading a
+# bound dunder back is an ast.Name, which the Name rule refuses. If that ever
+# stopped holding, one of these fails instead of a hole opening quietly.
 BOUND_NAME_READS = [
     ("match capture", "    match A:\n        case [x] as __evil:\n            pass\n    return __evil\n"),
     ("match star", "    match A:\n        case [x, *__evil]:\n            pass\n    return __evil\n"),
@@ -101,8 +94,7 @@ def test_reading_a_dunder_binding_is_rejected(name, body):
         create_locked_down_function("def matmul(A, B):\n" + body)
 
 
-# The flip side, and the reason the binding forms are not rejected outright:
-# every one of these is a working program that a rule on the binding broke.
+# The flip side: each is a working program that a rule on the binding broke.
 BOUND_NAME_FALSE_POSITIVES = [
     ("dict with a dunder key", "def f():\n    return dict(__class__ = 'label')\n", (), {"__class__": "label"}),
     ("unused dunder parameter", "def f(__class__ = None):\n    return 7\n", (), 7),
@@ -534,12 +526,11 @@ class _SlowPollChild:
 
 @contextlib.contextmanager
 def _registry_guard():
-    """Whatever serialization the module offers, which is the point of the test.
+    """Whatever serialization the module offers, which is what keeps these falsifiable.
 
-    Taking the real lock when it exists and nothing when it does not is what keeps
-    these two falsifiable: a helper that required the lock would raise inside its
-    own thread on unlocked code, the contended access would never happen, and the
-    test would pass by doing nothing.
+    A helper that required the lock would raise inside its own thread on unlocked
+    code, the contended access would never happen, and the test would pass by
+    doing nothing.
     """
     lock = getattr(rl_env, "_OPENENV_CHILDREN_LOCK", None)
     if lock is None:
@@ -678,11 +669,8 @@ class _AnnouncingChild:
 
 
 def _squatter_launcher(monkeypatch, child, port, real_sleep = False):
-    """The endpoint reads FREE at the availability check and OPEN afterwards.
-
-    That ordering is the race: a foreign process takes the port in the window
-    between the check and uvicorn's own bind.
-    """
+    """FREE at the availability check, OPEN afterwards: a foreign process takes the
+    port in the window between the check and uvicorn's own bind."""
     seen = {"checked": False}
 
     def probe(host, prt):
@@ -711,10 +699,9 @@ def _squatter_launcher(monkeypatch, child, port, real_sleep = False):
 class _LosesTheBindChild:
     """Alive and silent at first, then reports the bind failure and exits.
 
-    That is the real squatter timeline, and the reason the old check failed: it
-    left the readiness loop on the foreign socket during the silent window, while
-    poll() still said alive, and never revisited the question. stderr is a single
-    lazy stream because that is what a pipe is: read once, to EOF.
+    The real squatter timeline: the old check left the readiness loop on the
+    foreign socket during the silent window, while poll() still said alive. stderr
+    is one lazy stream because that is what a pipe is: read once, to EOF.
     """
     def __init__(self, port, silent_seconds = 0.05):
         self._exited = threading.Event()
@@ -774,11 +761,9 @@ def test_a_child_that_reports_losing_the_bind_is_abandoned(monkeypatch, tmp_path
 def test_an_unrecognised_startup_log_still_falls_back_to_the_open_port(monkeypatch, tmp_path):
     """Closing a race must not fail a launch whose uvicorn reworded its log.
 
-    This is also the residual, stated rather than hidden: a child that stays alive
-    and never announces anything is indistinguishable from one that bound, so the
-    open port is accepted. Real uvicorn always announces one way or the other;
-    eliminating the window entirely means binding the socket in the parent and
-    handing it over with uvicorn --fd, which is not portable to Windows.
+    Also the residual, stated rather than hidden: a child that stays alive and
+    never announces is indistinguishable from one that bound, so the open port is
+    accepted. Eliminating the window means uvicorn --fd, which Windows lacks.
     """
     child = _AnnouncingChild(["INFO:     serving, probably, who can say\n"])
     _squatter_launcher(monkeypatch, child, 57003)

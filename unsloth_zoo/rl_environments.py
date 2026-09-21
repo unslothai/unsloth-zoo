@@ -657,9 +657,8 @@ def _allowlist_builtins():
 pass
 
 
-# Match statement nodes only exist on 3.10+ and this module still has to
-# import on 3.9, so they are looked up instead of named. An empty tuple makes
-# every isinstance below simply false.
+# ast.Match* is 3.10+, this module imports on 3.9; an empty tuple makes the
+# isinstance below false.
 _MATCH_CLASS_NODES = tuple(
     node for node in (getattr(ast, "MatchClass", None),) if node is not None
 )
@@ -696,15 +695,9 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
             )
-        # A match class-pattern getattrs the subject with the names in
-        # kwd_attrs, which are strings on the node: `case object(__class__=x)`
-        # is the subclasses walk with no Attribute node anywhere in the source.
-        # This is the one identifier-as-string field that reads an attribute;
-        # the others (arg.arg, keyword.arg, alias, except/match capture names,
-        # global/nonlocal) only BIND a name, and binding a dunder reaches
-        # nothing while the Name rule above refuses every read of it. Rejecting
-        # those as well cost 11 working programs -- `dict(__class__ = "label")`
-        # among them -- and closed nothing, so the rule stops here.
+        # `case object(__class__=x)` is a getattr with no Attribute node anywhere.
+        # kwd_attrs is the only identifier-as-string field that READS an attribute;
+        # every other one merely binds, and the Name rule above refuses the read.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
             for attr in (node.kwd_attrs or []):
                 if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
@@ -1072,10 +1065,9 @@ import subprocess
 def is_port_open(host, port):
     """ Check if the port like localhost:8000 is open or closed
 
-    The family comes from getaddrinfo, not from AF_INET: an IPv6 host is
-    unreachable over an AF_INET socket, and a dual-stack `localhost` resolves to
-    both 127.0.0.1 and ::1 with the listener on only one of them, so every
-    candidate is tried before the port is called closed.
+    Family comes from getaddrinfo, not AF_INET, and every candidate is tried: an
+    IPv6 host is unreachable over AF_INET, and a dual-stack `localhost` resolves
+    to both families with the listener on only one.
     """
     try:
         candidates = socket.getaddrinfo(host, port, type = socket.SOCK_STREAM)
@@ -1083,16 +1075,13 @@ def is_port_open(host, port):
         print(f"Socket error: {e}")
         return False
     for family, socktype, proto, _, sockaddr in candidates:
-        # Constructing the socket is inside the try because it is itself a
-        # candidate-specific failure: an AF_INET6 address on a build or a
-        # container without IPv6 raises EAFNOSUPPORT here, and raising out of
-        # the loop would skip a reachable AF_INET candidate behind it.
+        # In the try: AF_INET6 without IPv6 raises EAFNOSUPPORT, and raising would
+        # skip a reachable candidate behind it.
         sock = None
         try:
             sock = socket.socket(family, socktype, proto)
             sock.settimeout(1)  # Set a timeout for the connection attempt
-            # sockaddr passes through unmodified: AF_INET6 carries flowinfo and
-            # scope_id, and a rebuilt (host, port) pair would drop the scope.
+            # Unmodified: rebuilding (host, port) would drop an AF_INET6 scope_id.
             if sock.connect_ex(sockaddr) == 0:
                 return True  # Port is open
         except socket.error as e:
@@ -1126,34 +1115,19 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
-# Endpoints this process actually spawned an OpenEnv child on, keyed to the
-# Popen handle. /health is unauthenticated and its body is a fixed word, so it
-# says "something is listening", never "my server is listening"; the handle is
-# the only thing that can tell the two apart.
-#
-# The key is (host, port), not port alone: two children CAN hold the same port
-# on different addresses, and a port-only key both loses the first of them and
-# lets a launch on one address claim ownership of a child bound to another,
-# which is the confusion this registry exists to prevent.
+# Endpoint -> the Popen we spawned on it. /health says "something is listening",
+# never "mine is". Keyed on (host, port): two children can hold one port on
+# different addresses.
 _OPENENV_CHILDREN = {}
 
-# Every read and write of the registry holds this. poll() calls waitpid, which
-# releases the GIL, so a bare `for k, child in _OPENENV_CHILDREN.items() if
-# child.poll() ...` lets a second thread's launch resize the dict mid-iteration
-# and raises "dictionary changed size during iteration" -- the same shape as
-# CPython's own bug in _ExecutorManagerThread (python/cpython#87664). The
-# get-poll-pop and get-compare sequences below are check-then-mutate for the
-# same reason, so one thread could delete another's live child record.
-# WNOHANG waitpid does not block, so holding the lock across poll() is cheap.
+# Held for every registry access: poll() calls waitpid, which releases the GIL, so
+# iteration can be resized under us and get-poll-pop is check-then-mutate
+# (python/cpython#87664). WNOHANG does not block, so holding it across poll() is cheap.
 _OPENENV_CHILDREN_LOCK = threading.Lock()
 
-# Endpoints a launch has claimed but not yet spawned a child onto. The lock makes
-# each registry operation atomic, which is not the same as making
-# check-then-spawn-then-register atomic: two threads could both find one port
-# closed, both spawn, and the later registration would drop the earlier child,
-# leaving a bound uvicorn nobody tracks while the other launch adopted it. A
-# reservation is what the availability check alone cannot express, since the
-# endpoint is not yet open and no child record exists for it.
+# Endpoints claimed but not yet spawned onto. The lock makes each operation atomic,
+# not check-then-spawn-then-register: without a claim two launches both find a port
+# closed, both spawn, and the later registration orphans the earlier child.
 _OPENENV_RESERVED = set()
 
 
@@ -1179,8 +1153,8 @@ pass
 def _release_openenv_endpoint(client_host, port, child = None):
     """ Give the endpoint up, removing the child record only if it is still `child`.
 
-    Compare-and-delete, because an unconditional pop removes whatever is stored,
-    which after a lost spawn race is another launch's live child.
+    Compare-and-delete: an unconditional pop removes whatever is stored, which
+    after a lost spawn race is another launch's live child.
     """
     with _OPENENV_CHILDREN_LOCK:
         key = (client_host, port)
@@ -1190,17 +1164,14 @@ def _release_openenv_endpoint(client_host, port, child = None):
 pass
 
 
-# An open port plus a live child is not proof that the child opened the port: a
-# process that takes the endpoint between the availability check and uvicorn's own
-# bind satisfies both while owning the listener itself, and uvicorn does not exit
-# the instant it loses the bind. uvicorn announcing its own socket is proof from
-# the process we started, and needs no per-platform socket ownership inspection.
+# An open port plus a live child is not proof the child opened it: a process taking
+# the endpoint before uvicorn binds satisfies both, and uvicorn does not exit the
+# instant it loses a bind. The child's own announcement is the proof.
 _UVICORN_BOUND = ("Uvicorn running on",)
 _UVICORN_BIND_FAILED = ("address already in use", "error while attempting to bind")
-# How long to keep waiting for that announcement while the endpoint is already
-# open, before falling back to the weaker open-port signal. Only a uvicorn that
-# has reworded its startup log reaches the fallback, and failing a legitimate
-# launch to close a race is the worse trade, so the fallback stays.
+# Trials to wait for that announcement on an already-open port before falling back.
+# Only a reworded startup log gets here, and failing a legitimate launch to close a
+# race is the worse trade.
 _UVICORN_BOUND_GRACE_TRIALS = 300
 
 
@@ -1216,12 +1187,10 @@ def _watch_openenv_child_output(child):
 class _OpenEnvChildOutput:
     """ Drain the child's stderr for its whole life, keeping only a bounded tail.
 
-    Draining matters on its own, since stderr is a pipe nobody read before and a
-    chatty uvicorn would block on a full one. But the reader outlives
-    launch_openenv, so retaining every line for a training run would trade that
-    bounded backpressure for unbounded memory and eventually an OOM. The startup
-    verdict is latched by the reader itself rather than re-scanned, so a flood of
-    application logging cannot evict the announcement before it is read.
+    Draining stops a chatty uvicorn blocking on a full pipe, but the reader
+    outlives launch_openenv, so retaining every line would trade that bounded
+    backpressure for an OOM. The verdict is latched as each line arrives rather
+    than re-scanned, so a flood cannot evict the announcement before it is read.
     """
     def __init__(self, child, keep_lines = 50):
         self.bound = False
@@ -1231,8 +1200,7 @@ class _OpenEnvChildOutput:
         thread.start()
 
     def _read(self, child):
-        # getattr, not attribute access: a child object without a stderr pipe is
-        # not an error here, and an exception in this thread would be unhandled.
+        # A child with no stderr pipe is not an error; a raise here would be unhandled.
         stream = getattr(child, "stderr", None)
         if stream is None: return
         try:
@@ -1252,10 +1220,9 @@ pass
 def _reap_exited_openenv_children():
     """ Drop and reap every registered child that has already exited.
 
-    poll() is what reaps, and without this sweep a child is only ever polled if
-    its own endpoint comes up again, which usually never happens. Holding the
-    Popen also suppresses the interpreter's own opportunistic reaping, so an
-    unswept registry turns exited children into zombies that outlive them.
+    poll() is what reaps, and an entry is otherwise only polled if its own
+    endpoint comes up again, which usually never happens. Holding the Popen also
+    suppresses the interpreter's own reaping, so an unswept registry leaves zombies.
     """
     with _OPENENV_CHILDREN_LOCK:
         for key, child in list(_OPENENV_CHILDREN.items()):
@@ -1281,7 +1248,6 @@ def _openenv_child_alive(client_host, port):
         child = _OPENENV_CHILDREN.get((client_host, port), None)
         if child is None: return False
         if child.poll() is not None:
-            # It exited, so the endpoint is free for anyone else to take.
             _OPENENV_CHILDREN.pop((client_host, port), None)
             return False
         return True
@@ -1299,18 +1265,15 @@ def launch_openenv(
 ):
     """ Finds a new port or checks if the old open port actually works
 
-    `host` is the interface the environment server binds. It defaults to
-    loopback because the OpenEnv app authenticates nobody and every URL below
-    is localhost, so a wider bind only publishes the training run's environment
-    to the host's networks and to anything sharing its container bridge. Pass
-    host yourself if a remote worker genuinely has to reach it.
+    `host` is the interface the server binds, defaulting to loopback because the
+    OpenEnv app authenticates nobody, so a wider bind publishes the training run's
+    environment to every network the host is on. Pass it if a remote worker must
+    reach the server.
 
-    `openenv_process` is only reused when this process spawned the child holding
-    `port`. A server started outside this process is therefore NOT adopted even
-    when it is healthy and genuinely yours: a second uvicorn is spawned on a new
-    port and the passed client is dropped. That is the deliberate cost of the
-    check, since /health proves only that something answered, and an externally
-    managed server is indistinguishable from a process that took the port.
+    `openenv_process` is reused ONLY when this process spawned the child holding
+    `port`. An externally managed server is therefore not adopted even when it is
+    healthy and yours: a second uvicorn is spawned and the passed client dropped.
+    /health cannot distinguish it from a process that took the port.
     """
     # Check if OpenEnv is working first
     assert type(environment) is dict
@@ -1326,22 +1289,16 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    # A wildcard bind has to be dialled through a real address, and it must be
-    # one of the SAME family: asyncio's create_server sets IPV6_V6ONLY on every
-    # AF_INET6 listener unconditionally, so a `::` server answers on ::1 and not
-    # on 127.0.0.1 even where the host is dual stack. `localhost` cannot be that
-    # address, since which family it resolves to is the resolver's choice.
+    # Same family, and never `localhost`: asyncio's create_server sets IPV6_V6ONLY
+    # unconditionally, so a `::` server answers on ::1 and not 127.0.0.1 even on a
+    # dual stack host, and which family `localhost` resolves to is not ours to pick.
     client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
     localhost = _openenv_url(client_host, port)
-    # Anything that exited since the last call is reaped here rather than never.
     _reap_exited_openenv_children()
 
     def check_openenv_works(process):
         if process is not None:
-            # A health check only proves someone answered. Unless that someone
-            # is the child we started, it is a local process that took the port
-            # after ours exited, and adopting it hands the training loop its
-            # observations and rewards.
+            # Adopting a stranger hands it the training loop's rewards.
             if not _openenv_child_alive(client_host, port):
                 if hasattr(process, "close"):
                     try: process.close()
@@ -1367,15 +1324,13 @@ def launch_openenv(
         # Port ID must be less than uint16_MAX
         port = random.randint(9000, 65535-1)
         localhost = _openenv_url(client_host, port)
-        # Someone already holds it, so uvicorn would fail to bind and we would
-        # end up talking to them instead.
+        # Held already: uvicorn could not bind and we would talk to the holder.
         if is_port_open(client_host, port):
             trials += 1
             if trials == 30:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
             continue
-        # A closed port says nothing about another thread of ours already being
-        # on its way to binding it, so claim the endpoint before spawning.
+        # A closed port says nothing about another launch of ours heading there.
         if not _reserve_openenv_endpoint(client_host, port):
             trials += 1
             if trials == 30:
@@ -1392,24 +1347,20 @@ def launch_openenv(
                 cwd = working_directory,
             )
         except BaseException:
-            # Otherwise the reservation outlives the call and blocks the endpoint
-            # for the rest of the process.
+            # Else the claim outlives the call and blocks the endpoint forever.
             _release_openenv_endpoint(client_host, port)
             raise
         _register_openenv_child(client_host, port, openenv_child)
-        # Wait until OUR child says it is the one listening
         child_output = _watch_openenv_child_output(openenv_child)
         wait_trials = 0
         while True:
             if child_output.bound: break
-            # A child that died cannot be the one that opens this port later, and
-            # a child that reported losing the bind never will.
+            # A dead child, or one that reported losing the bind, never will.
             if child_output.bind_failed or openenv_child.poll() is not None:
                 _release_openenv_endpoint(client_host, port, openenv_child)
                 break
             if is_port_open(client_host, port) and wait_trials >= _UVICORN_BOUND_GRACE_TRIALS:
-                # Unrecognised startup log. Accept the open port as before rather
-                # than fail a launch that is probably fine.
+                # Unrecognised startup log: accept the open port as before.
                 break
             time.sleep(0.01)
             if wait_trials % 10 == 0:
