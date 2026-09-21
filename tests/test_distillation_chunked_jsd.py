@@ -125,8 +125,11 @@ def _make(batch = 2, seq = 7, student_hidden = 16, teacher_hidden = 24, vocab = 
     twt = torch.randn(vocab, teacher_hidden, generator = generator) * 0.05
     mask = torch.ones(batch, seq, dtype = torch.long)
     # Ragged on purpose, so masking is actually exercised rather than assumed.
-    mask[0, -2:] = 0
-    mask[1, -1] = 0
+    # Guarded on the shape so the helper also serves the single-row cases.
+    if seq >= 3:
+        mask[0, -2:] = 0
+    if batch >= 2 and seq >= 2:
+        mask[1, -1] = 0
     sb = torch.randn(vocab, generator = generator) if bias else None
     tb = torch.randn(vocab, generator = generator) if bias else None
     return sh, th, swt, twt, mask, sb, tb
@@ -412,6 +415,54 @@ def test_entropy_and_token_count_are_not_differentiable():
     assert loss.requires_grad
     assert not entropy_sum.requires_grad
     assert not n_valid.requires_grad
+
+
+@pytest.mark.parametrize("batch,seq,chunk_size", [(1, 5, 4), (3, 7, 4), (2, 9, 256), (1, 1, 8)])
+def test_row_count_not_a_multiple_of_chunk_size(batch, seq, chunk_size):
+    """The packed rows are padded out to whole chunks, so every chunk is the same
+    shape. That has to leave the answer alone."""
+    sh, th, swt, twt, mask, _, _ = _make(batch = batch, seq = seq)
+    got, _, got_n = rr.distillation_chunked_jsd(
+        sh, th, swt, twt, mask, beta = 0.5, chunk_size = chunk_size,
+    )
+    want, _, want_n = _dense_reference(sh, th, swt, twt, mask, beta = 0.5)
+    assert got_n == want_n
+    torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-6)
+    got.backward()
+    assert sh.grad.shape == sh.shape, "padding rows leaked into the returned gradient"
+
+
+def test_padding_rows_do_not_reach_the_gradient():
+    """A padded chunk carries valid = 0, so it must contribute nothing."""
+    sh, th, swt, twt, mask, _, _ = _make(batch = 1, seq = 5)
+    loss, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = 0.5, chunk_size = 4)
+    loss.backward()
+    zero_rows = (sh.grad.reshape(-1, sh.shape[-1]).abs().sum(dim = -1) == 0)
+    assert torch.equal(zero_rows, mask.reshape(-1) == 0)
+
+
+def test_every_chunk_is_the_same_width():
+    """What lets the compiled region be traced for static shapes.
+
+    Counted rather than inferred: a ragged tail would show up as a second width
+    here, and as a second Dynamo trace in a real run.
+    """
+    widths = []
+    original = rr._distillation_project_logits
+
+    def counting(hidden_states, lm_head, *args, **kwargs):
+        widths.append(hidden_states.shape[0])
+        return original(hidden_states, lm_head, *args, **kwargs)
+
+    rr._distillation_project_logits = counting
+    try:
+        sh, th, swt, twt, mask, _, _ = _make(batch = 3, seq = 7)  # 21 rows, not a multiple of 4
+        rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = 0.5, chunk_size = 4)
+    finally:
+        rr._distillation_project_logits = original
+
+    assert widths, "the projection was never called"
+    assert set(widths) == {4}, f"chunk widths were {sorted(set(widths))}, expected only 4"
 
 
 def test_double_backward_is_not_silently_wrong():

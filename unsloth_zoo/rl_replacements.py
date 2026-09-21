@@ -2309,8 +2309,13 @@ def _distillation_jsd_grad_fn(argnums):
     eager = torch.func.grad_and_value(
         _distillation_jsd_chunk, argnums = argnums, has_aux = True,
     )
+    # dynamic = False, unlike the other compiled regions here, because the caller
+    # pads every chunk to exactly chunk_size: the traced shapes never move, and
+    # asking for dynamic shapes anyway measured 18.0 ms against 11.4 ms on a B200
+    # at a 151936 token vocabulary. Only chunk_size, the hidden width and the
+    # vocabulary reach the trace, and none of those change within a run.
     return _maybe_compile(
-        dynamic = True, fullgraph = True, options = torch_compile_options,
+        dynamic = False, fullgraph = True, options = torch_compile_options,
     )(eager)
 pass
 
@@ -2354,6 +2359,24 @@ class _UnslothDistillationJSD(torch.autograd.Function):
         flat_teacher = flat_teacher[order]
         sorted_valid = valid[order]
 
+        # At least one chunk always runs: a fully masked batch still has to reach
+        # every trainable parameter, or backward and the gradient sync that
+        # follows it hang.
+        n_padded = int(max(1, -(-int(n_valid) // chunk_size)) * chunk_size)
+        # Pad the packed rows out to a whole number of chunks so every chunk is
+        # exactly chunk_size and the compiled region sees one static shape. The
+        # tail would otherwise be short whenever batch * seq is not a multiple of
+        # chunk_size, and a second shape means a second Dynamo trace on the first
+        # step plus another on every sequence length after that. The padding rows
+        # carry valid = 0, so they contribute nothing to either the loss or the
+        # gradient; at most chunk_size extra rows are ever added.
+        n_rows = flat_student.shape[0]
+        if n_rows < n_padded:
+            pad = n_padded - n_rows
+            flat_student = torch.cat([flat_student, flat_student.new_zeros(pad, flat_student.shape[-1])])
+            flat_teacher = torch.cat([flat_teacher, flat_teacher.new_zeros(pad, flat_teacher.shape[-1])])
+            sorted_valid = torch.cat([sorted_valid, sorted_valid.new_zeros(pad)])
+
         # Divide inside the chunk so the accumulated gradient needs no rescale.
         if num_items_in_batch is None:
             # Clamped for the same reason a chunk always runs below: a fully
@@ -2386,10 +2409,6 @@ class _UnslothDistillationJSD(torch.autograd.Function):
         loss = flat_student.new_zeros((), dtype = torch.float32)
         entropy_sum = flat_student.new_zeros((), dtype = torch.float32)
 
-        # At least one chunk always runs: a fully masked batch still has to reach
-        # every trainable parameter, or backward and the gradient sync that
-        # follows it hang.
-        n_padded = int(max(1, -(-int(n_valid) // chunk_size)) * chunk_size)
         for start in range(0, n_padded, chunk_size):
             stop = start + chunk_size
             grads, (chunk_loss, (chunk_entropy,)) = grad_fn(
@@ -2409,7 +2428,9 @@ class _UnslothDistillationJSD(torch.autograd.Function):
             entropy_sum = entropy_sum + chunk_entropy
         pass
 
-        # Undo the packing so the caller gets its own row order back.
+        # Undo the packing so the caller gets its own row order back, dropping the
+        # padding rows first: they have no counterpart in the caller's tensor.
+        grad_hidden = grad_hidden[: n_rows]
         unsorted = torch.zeros_like(grad_hidden)
         unsorted[order] = grad_hidden
 
@@ -2476,8 +2497,8 @@ def distillation_chunked_jsd(
     ------------------  ----------------------  ----------------------
     ..                  time        peak        time        peak
     ==================  ==========  ==========  ==========  ==========
-    frozen (LoRA)       32.0 ms     19.68 GB    18.7 ms     2.20 GB
-    trained (full FT)   29.9 ms     19.68 GB    20.9 ms     2.82 GB
+    frozen (LoRA)       31.9 ms     19.68 GB    11.6 ms     2.20 GB
+    trained (full FT)   29.9 ms     19.68 GB    13.7 ms     2.82 GB
     ==================  ==========  ==========  ==========  ==========
 
     Student and teacher must share a vocabulary but not a hidden width: each is
