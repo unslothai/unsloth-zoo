@@ -35,6 +35,7 @@ import types
 import __future__
 import builtins as _py_builtins
 import os, gc, time, statistics
+import collections
 import numpy as np
 import signal
 from contextlib import contextmanager
@@ -1209,29 +1210,42 @@ def _watch_openenv_child_output(child):
     Draining matters on its own: stderr is a pipe nobody reads, so a chatty
     uvicorn would eventually block on a full one.
     """
-    lines = []
-    def read():
+    return _OpenEnvChildOutput(child)
+
+
+class _OpenEnvChildOutput:
+    """ Drain the child's stderr for its whole life, keeping only a bounded tail.
+
+    Draining matters on its own, since stderr is a pipe nobody read before and a
+    chatty uvicorn would block on a full one. But the reader outlives
+    launch_openenv, so retaining every line for a training run would trade that
+    bounded backpressure for unbounded memory and eventually an OOM. The startup
+    verdict is latched by the reader itself rather than re-scanned, so a flood of
+    application logging cannot evict the announcement before it is read.
+    """
+    def __init__(self, child, keep_lines = 50):
+        self.bound = False
+        self.bind_failed = False
+        self.tail = collections.deque(maxlen = keep_lines)
+        thread = threading.Thread(target = self._read, args = (child,), daemon = True)
+        thread.start()
+
+    def _read(self, child):
         # getattr, not attribute access: a child object without a stderr pipe is
         # not an error here, and an exception in this thread would be unhandled.
         stream = getattr(child, "stderr", None)
         if stream is None: return
         try:
-            for line in stream: lines.append(line)
+            for line in stream:
+                self.tail.append(line)
+                if not self.bound and any(m in line for m in _UVICORN_BOUND):
+                    self.bound = True
+                if not self.bind_failed:
+                    lowered = line.lower()
+                    if any(m in lowered for m in _UVICORN_BIND_FAILED):
+                        self.bind_failed = True
         except Exception:
             pass
-    thread = threading.Thread(target = read, daemon = True)
-    thread.start()
-    return lines
-
-
-def _child_announced_its_socket(lines):
-    """ Did the child say it bound, or that it could not? (bound, failed) """
-    joined = "".join(lines)
-    lowered = joined.lower()
-    return (
-        any(marker in joined for marker in _UVICORN_BOUND),
-        any(marker in lowered for marker in _UVICORN_BIND_FAILED),
-    )
 pass
 
 
@@ -1387,11 +1401,10 @@ def launch_openenv(
         child_output = _watch_openenv_child_output(openenv_child)
         wait_trials = 0
         while True:
-            announced, bind_failed = _child_announced_its_socket(child_output)
-            if announced: break
+            if child_output.bound: break
             # A child that died cannot be the one that opens this port later, and
             # a child that reported losing the bind never will.
-            if bind_failed or openenv_child.poll() is not None:
+            if child_output.bind_failed or openenv_child.poll() is not None:
                 _release_openenv_endpoint(client_host, port, openenv_child)
                 break
             if is_port_open(client_host, port) and wait_trials >= _UVICORN_BOUND_GRACE_TRIALS:

@@ -799,3 +799,45 @@ def test_child_stderr_is_drained_rather_than_left_to_fill(monkeypatch, tmp_path)
     )
     assert port == 57004
     assert child.stderr.read() == "", "the pipe was not drained to the end"
+
+
+def test_child_output_retention_is_bounded():
+    """Draining must not trade pipe backpressure for an unbounded list and an OOM."""
+    chatty = ["INFO:     application log line %d\n" % index for index in range(20000)]
+
+    class _Chatty:
+        def __init__(self): self.stderr = iter(chatty)
+        def poll(self): return None
+
+    watcher = rl_env._watch_openenv_child_output(_Chatty())
+    deadline = time.time() + 5
+    while len(watcher.tail) == 0 and time.time() < deadline:
+        time.sleep(0.01)
+    # Let the reader consume the whole stream.
+    while time.time() < deadline:
+        if watcher.tail and watcher.tail[-1] == chatty[-1]: break
+        time.sleep(0.01)
+    assert watcher.tail[-1] == chatty[-1], "the stream was not drained to the end"
+    assert len(watcher.tail) <= 50, f"retained {len(watcher.tail)} lines, unbounded"
+
+
+def test_a_flood_cannot_evict_the_announcement_before_it_is_read():
+    """The verdict is latched by the reader, not re-scanned out of a lossy buffer."""
+    lines = (
+        ["INFO:     Uvicorn running on http://127.0.0.1:57005\n"]
+        + ["INFO:     request %d\n" % index for index in range(5000)]
+    )
+
+    class _Flooding:
+        def __init__(self): self.stderr = iter(lines)
+        def poll(self): return None
+
+    watcher = rl_env._watch_openenv_child_output(_Flooding())
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if watcher.tail and watcher.tail[-1] == lines[-1]: break
+        time.sleep(0.01)
+    # The announcement has long since been evicted from the tail...
+    assert not any("Uvicorn running on" in line for line in watcher.tail)
+    # ...but the verdict survives it.
+    assert watcher.bound
