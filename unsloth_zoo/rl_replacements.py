@@ -20,7 +20,6 @@ __all__ = [
 
 import torch
 import inspect
-import functools
 import os
 import sys
 import math
@@ -2297,15 +2296,26 @@ except Exception:
 # Keyed by argnums: which of hidden states, head and bias need a gradient decides
 # the transform, and there are only three shapes of that. Compiling once per shape
 # rather than once per call keeps Dynamo from re-tracing every step.
-@functools.lru_cache(maxsize = 4)
+_DISTILLATION_JSD_GRAD_FNS = {}
+
+
 def _distillation_jsd_grad_fn(argnums):
     """``grad_and_value`` over one chunk, compiled the way the other chunked
     losses in this repo are.
 
-    ``_maybe_compile`` honours ``UNSLOTH_COMPILE_DISABLE`` and, under fullgraph,
+    ``_maybe_compile`` reads the compile-disable flag for us and, under fullgraph,
     routes through ``torch_compile_with_fallback`` so cache exhaustion degrades to
     eager instead of raising mid step.
+
+    Memoized through a module dict rather than ``functools.lru_cache``: the
+    compiler copies a function's decorators verbatim into the generated trainer
+    modules and emits no ``import functools`` for them, so the decorator form
+    becomes a ``NameError`` in the generated module the moment anything splices
+    this in (tests/test_generated_trainer_is_installed.py).
     """
+    cached = _DISTILLATION_JSD_GRAD_FNS.get(argnums)
+    if cached is not None:
+        return cached
     eager = torch.func.grad_and_value(
         _distillation_jsd_chunk, argnums = argnums, has_aux = True,
     )
@@ -2314,10 +2324,18 @@ def _distillation_jsd_grad_fn(argnums):
     # asking for dynamic shapes anyway measured 18.0 ms against 11.4 ms on a B200
     # at a 151936 token vocabulary. Only chunk_size, the hidden width and the
     # vocabulary reach the trace, and none of those change within a run.
-    return _maybe_compile(
+    compiled = _maybe_compile(
         dynamic = False, fullgraph = True, options = torch_compile_options,
     )(eager)
+    _DISTILLATION_JSD_GRAD_FNS[argnums] = compiled
+    return compiled
 pass
+
+
+# Keep ``lru_cache``'s one useful method so callers that need a fresh compile
+# decision, notably anything toggling the compile-disable flag mid process, do
+# not have to know the memo is a dict now.
+_distillation_jsd_grad_fn.cache_clear = _DISTILLATION_JSD_GRAD_FNS.clear
 
 
 class _UnslothDistillationJSD(torch.autograd.Function):
