@@ -1082,8 +1082,13 @@ def is_port_open(host, port):
         print(f"Socket error: {e}")
         return False
     for family, socktype, proto, _, sockaddr in candidates:
-        sock = socket.socket(family, socktype, proto)
+        # Constructing the socket is inside the try because it is itself a
+        # candidate-specific failure: an AF_INET6 address on a build or a
+        # container without IPv6 raises EAFNOSUPPORT here, and raising out of
+        # the loop would skip a reachable AF_INET candidate behind it.
+        sock = None
         try:
+            sock = socket.socket(family, socktype, proto)
             sock.settimeout(1)  # Set a timeout for the connection attempt
             # sockaddr passes through unmodified: AF_INET6 carries flowinfo and
             # scope_id, and a rebuilt (host, port) pair would drop the scope.
@@ -1092,7 +1097,7 @@ def is_port_open(host, port):
         except socket.error as e:
             print(f"Socket error: {e}")
         finally:
-            sock.close()
+            if sock is not None: sock.close()
     return False # Port is closed or connection failed
 pass
 
@@ -1120,11 +1125,29 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
-# Ports this process actually spawned an OpenEnv child on, keyed to the Popen
-# handle. /health is unauthenticated and its body is a fixed word, so it says
-# "something is listening", never "my server is listening"; the handle is the
-# only thing that can tell the two apart.
+# Endpoints this process actually spawned an OpenEnv child on, keyed to the
+# Popen handle. /health is unauthenticated and its body is a fixed word, so it
+# says "something is listening", never "my server is listening"; the handle is
+# the only thing that can tell the two apart.
+#
+# The key is (host, port), not port alone: two children CAN hold the same port
+# on different addresses, and a port-only key both loses the first of them and
+# lets a launch on one address claim ownership of a child bound to another,
+# which is the confusion this registry exists to prevent.
 _OPENENV_CHILDREN = {}
+
+
+def _reap_exited_openenv_children():
+    """ Drop and reap every registered child that has already exited.
+
+    poll() is what reaps, and without this sweep a child is only ever polled if
+    its own endpoint comes up again, which usually never happens. Holding the
+    Popen also suppresses the interpreter's own opportunistic reaping, so an
+    unswept registry turns exited children into zombies that outlive them.
+    """
+    for key in [k for k, child in _OPENENV_CHILDREN.items() if child.poll() is not None]:
+        _OPENENV_CHILDREN.pop(key, None)
+pass
 
 
 def _openenv_url(client_host, port):
@@ -1138,13 +1161,13 @@ def _openenv_url(client_host, port):
 pass
 
 
-def _openenv_child_alive(port):
-    """ Is the child we spawned on this port still the process holding it? """
-    child = _OPENENV_CHILDREN.get(port, None)
+def _openenv_child_alive(client_host, port):
+    """ Is the child we spawned on this endpoint still the process holding it? """
+    child = _OPENENV_CHILDREN.get((client_host, port), None)
     if child is None: return False
     if child.poll() is not None:
-        # It exited, so the port is free for anyone else to take.
-        _OPENENV_CHILDREN.pop(port, None)
+        # It exited, so the endpoint is free for anyone else to take.
+        _OPENENV_CHILDREN.pop((client_host, port), None)
         return False
     return True
 pass
@@ -1195,6 +1218,8 @@ def launch_openenv(
     # address, since which family it resolves to is the resolver's choice.
     client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
     localhost = _openenv_url(client_host, port)
+    # Anything that exited since the last call is reaped here rather than never.
+    _reap_exited_openenv_children()
 
     def check_openenv_works(process):
         if process is not None:
@@ -1202,7 +1227,7 @@ def launch_openenv(
             # is the child we started, it is a local process that took the port
             # after ours exited, and adopting it hands the training loop its
             # observations and rewards.
-            if not _openenv_child_alive(port):
+            if not _openenv_child_alive(client_host, port):
                 if hasattr(process, "close"):
                     try: process.close()
                     except: pass
@@ -1243,13 +1268,13 @@ def launch_openenv(
             text = True,
             cwd = working_directory,
         )
-        _OPENENV_CHILDREN[port] = openenv_child
+        _OPENENV_CHILDREN[(client_host, port)] = openenv_child
         # Wait until port is open
         wait_trials = 0
         while not is_port_open(client_host, port):
             # A child that died cannot be the one that opens this port later.
             if openenv_child.poll() is not None:
-                _OPENENV_CHILDREN.pop(port, None)
+                _OPENENV_CHILDREN.pop((client_host, port), None)
                 break
             time.sleep(0.01)
             if wait_trials % 10 == 0:
@@ -1258,7 +1283,7 @@ def launch_openenv(
             if wait_trials == 6000:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
-        if _OPENENV_CHILDREN.get(port, None) is not openenv_child:
+        if _OPENENV_CHILDREN.get((client_host, port), None) is not openenv_child:
             trials += 1
             if trials == 30:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")

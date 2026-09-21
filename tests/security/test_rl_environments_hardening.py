@@ -422,3 +422,95 @@ def test_ipv4_loopback_host_is_not_bracketed(monkeypatch, tmp_path):
         host = "127.0.0.1",
     )
     assert client.base_url == f"http://127.0.0.1:{port}"
+
+
+# --- the registry identifies an endpoint, not a port number -------------------
+
+def test_two_hosts_on_one_port_are_tracked_separately(monkeypatch, tmp_path):
+    """A port-only key lost one of two live children and misassigned the other."""
+    listening = set()
+    spawned = []
+    dialled = {"0.0.0.0": "127.0.0.1", "::": "::1"}
+
+    def fake_popen(argv, **kwargs):
+        host = argv[argv.index("--host") + 1]
+        port = int(argv[argv.index("--port") + 1])
+        spawned.append((host, port))
+        # uvicorn on a wildcard answers on the loopback of that same family.
+        listening.add((dialled.get(host, host), port))
+        return _LiveChild()
+
+    monkeypatch.setattr(rl_env, "subprocess", types.SimpleNamespace(
+        Popen = fake_popen, PIPE = subprocess.PIPE,
+    ))
+    monkeypatch.setattr(rl_env, "random", types.SimpleNamespace(randint = lambda a, b: 45000))
+    monkeypatch.setattr(rl_env, "is_port_open", lambda host, port: (host, port) in listening)
+    monkeypatch.setattr(rl_env, "requests", types.SimpleNamespace(
+        get = lambda url, **kwargs: types.SimpleNamespace(content = b"healthy"),
+    ))
+    monkeypatch.setattr(rl_env, "time", types.SimpleNamespace(sleep = lambda seconds: None))
+
+    port_v4, client_v4 = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
+    )
+    port_v6, client_v6 = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient, host = "::",
+    )
+    assert port_v4 == port_v6 == 45000
+    assert client_v4.base_url == "http://127.0.0.1:45000"
+    assert client_v6.base_url == "http://[::1]:45000"
+    assert len(spawned) == 2
+    # Both live children are still tracked; neither overwrote the other.
+    assert set(rl_env._OPENENV_CHILDREN) == {("127.0.0.1", 45000), ("::1", 45000)}
+
+
+def test_ownership_does_not_transfer_between_addresses():
+    """Our 127.0.0.1 child is not evidence that we own [::1] on the same port."""
+    rl_env._OPENENV_CHILDREN[("127.0.0.1", 47000)] = _LiveChild()
+    assert rl_env._openenv_child_alive("127.0.0.1", 47000)
+    assert not rl_env._openenv_child_alive("::1", 47000)
+    assert not rl_env._openenv_child_alive("localhost", 47000)
+
+
+def test_exited_children_are_reaped_rather_than_retained(monkeypatch, tmp_path):
+    """Holding the Popen suppresses the interpreter's own reap, so sweep instead."""
+    rl_env._OPENENV_CHILDREN[("127.0.0.1", 48000)] = _DeadChild()
+    rl_env._OPENENV_CHILDREN[("::1", 48001)] = _DeadChild()
+    live = _LiveChild()
+    rl_env._OPENENV_CHILDREN[("127.0.0.1", 48002)] = live
+    _fake_launcher(monkeypatch, ports = [49000])
+    rl_env.launch_openenv(working_directory = str(tmp_path), openenv_class = _DummyClient)
+    # The two exited children are gone, the live one and the new one remain.
+    assert ("127.0.0.1", 48000) not in rl_env._OPENENV_CHILDREN
+    assert ("::1", 48001) not in rl_env._OPENENV_CHILDREN
+    assert rl_env._OPENENV_CHILDREN[("127.0.0.1", 48002)] is live
+
+
+def test_probe_advances_past_a_family_the_host_cannot_open(monkeypatch):
+    """A container without IPv6 raises EAFNOSUPPORT on socket(); try the next one."""
+    reached = []
+
+    class _Connected:
+        def settimeout(self, timeout): pass
+        def connect_ex(self, address):
+            reached.append(address)
+            return 0
+        def close(self): pass
+
+    def refuse_ipv6(family, socktype, proto):
+        if family == socket.AF_INET6:
+            raise OSError(97, "Address family not supported by protocol")
+        return _Connected()
+
+    monkeypatch.setattr(rl_env, "socket", types.SimpleNamespace(
+        getaddrinfo = lambda *a, **k: [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 9000, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9000)),
+        ],
+        socket = refuse_ipv6,
+        SOCK_STREAM = socket.SOCK_STREAM,
+        AF_INET = socket.AF_INET, AF_INET6 = socket.AF_INET6,
+        error = OSError, gaierror = socket.gaierror,
+    ))
+    assert rl_env.is_port_open("localhost", 9000)
+    assert reached == [("127.0.0.1", 9000)]
