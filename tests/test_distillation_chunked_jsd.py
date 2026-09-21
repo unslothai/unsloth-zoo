@@ -15,10 +15,9 @@ gradient as the straight-line version, so the bulk of this file is parity
 against a dense reference written inline below.
 
 The reference is written here rather than imported because implementations
-disagree on the objective: some blend a hard cross-entropy term, some apply a
-`T**2` gradient rescale, and Liger mirrors the mixture interpolation relative to
-TRL. Pinning ours against an inline reference states the convention instead of
-inheriting whichever one a dependency happens to ship.
+disagree on the objective: some blend a hard cross-entropy term and some apply a
+`T**2` gradient rescale. Pinning ours against an inline reference states the
+convention instead of inheriting whichever one a dependency happens to ship.
 
 Covers:
   - chunked equals dense in value and gradient, every beta, every chunk size
@@ -474,16 +473,7 @@ def test_every_chunk_is_the_same_width():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("beta", [0.0, 0.25, 0.5, 0.75, 1.0])
 def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
-    """The divergence runs in float32 even when the model is bf16 or fp16.
-
-    This is the expensive half of the loss and it is worth the memory. The
-    mixture is a logsumexp of two nearly equal terms and the outer combination
-    then subtracts them, so in bfloat16 the interior betas lose most of their
-    significant digits. Scored against a float64 oracle built from the same
-    low-precision inputs, computing the divergence in the input dtype instead of
-    float32 costs three orders of magnitude of relative accuracy, which is why
-    this is pinned rather than left to whatever the caller's dtype happens to be.
-    """
+    """The divergence runs in float32 even for a bf16 or fp16 model: the mixture is a logsumexp of two nearly equal terms that the outer combination subtracts, so the interior betas lose most of their significant digits in the input dtype."""
     torch.manual_seed(0)
     batch, seq, hidden_s, hidden_t, vocab = 1, 64, 32, 48, 4096
     sh = torch.randn(batch, seq, hidden_s, dtype = dtype)
@@ -526,14 +516,7 @@ def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
     ],
 )
 def test_models_dispatched_across_devices(student_head, teacher_hidden, teacher_head, mask):
-    """An accelerate dispatch can put the two models on different devices.
-
-    `_distillation_project_logits` co-locates each model's hidden states with its
-    OWN head, so the two log-probability tensors then live on different devices
-    and the divergence, the mask multiply and the accumulator all raise. Placement
-    must not change the answer either, so every cell is compared against a
-    single-device reference computed from the same values.
-    """
+    """The projection co-locates each model with its OWN head, so a dispatch that splits them left the two log-probability tensors on different devices. Placement must not move the answer either, hence the single-device reference."""
     torch.manual_seed(0)
     batch, seq, hidden, vocab = 1, 16, 8, 64
     sh = torch.randn(batch, seq, hidden)
@@ -565,12 +548,7 @@ def test_models_dispatched_across_devices(student_head, teacher_hidden, teacher_
 
 
 def test_trained_bias_with_frozen_head():
-    """The (0, 2) argnums branch: bias-only tuning, or LoRA with bias = "all".
-
-    Enumerating the combinations by hand had this one selecting argnums = (0,)
-    while still allocating a bias gradient, so the first forward raised
-    `IndexError: tuple index out of range`.
-    """
+    """The (0, 2) argnums branch: bias-only tuning, or LoRA with bias = "all". Enumerating the combinations by hand missed it, so the first forward raised IndexError."""
     sh, th, swt, twt, mask, sb, tb = _make(bias = True)
     # `_make` hands back a bias that does NOT require grad, which is why nothing
     # covered this branch before; ask for it explicitly.
@@ -601,12 +579,7 @@ def test_trained_bias_with_frozen_head():
 @pytest.mark.parametrize("supplied", [0, 0.0])
 @pytest.mark.parametrize("as_tensor", [False, True])
 def test_a_supplied_zero_token_count_does_not_produce_nan(supplied, as_tensor):
-    """A fully masked global batch legitimately reports zero items.
-
-    Only the implicit count was clamped, so a supplied zero divided zero by zero
-    and returned a NaN loss AND NaN gradients, which poison the optimizer state
-    for the rest of the run rather than costing a single step.
-    """
+    """A fully masked global batch legitimately reports zero items, and only the implicit count was clamped: 0/0 gave a NaN loss AND NaN gradients, which poison the optimizer state rather than costing one step."""
     sh, th, swt, twt, mask, _, _ = _make()
     mask = torch.zeros_like(mask)
     count = torch.tensor(float(supplied)) if as_tensor else supplied
