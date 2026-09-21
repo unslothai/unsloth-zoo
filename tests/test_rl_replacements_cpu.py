@@ -1176,3 +1176,22 @@ def test_sampling_logps_gated_on_actual_consumer():
     assert 'getattr(trainer.args,"off_policy_mask_threshold",None)isnotNone' in flat
     # The gate must actually condition the read (not keep sampling unconditionally).
     assert 'kwargs.get("sampling_per_token_logps",None)if_sampling_logps_usedelseNone' in flat
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.1])
+@pytest.mark.parametrize("all_masked", [False, True])
+def test_grpo_kl_metric_with_fully_masked_completions(beta, all_masked):
+    new = torch.tensor([[-1.0, -2.0], [-0.5, -1.5]], requires_grad=True)
+    ref = new.detach() + 0.5
+    mask = torch.tensor([[0, 0], [0, 0] if all_masked else [1, 1]])
+    loss, completion_length, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros_like(mask), mask,
+        beta, torch.tensor([1.0, -1.0]),
+    )
+    expected_kl = 0.0 if all_masked or beta == 0.0 else (math.exp(0.5) - 1.5) / 2
+    assert mean_kl.item() == pytest.approx(expected_kl, abs=1e-7)
+    assert completion_length.item() == (0.0 if all_masked else 1.0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(new.grad).all()
+    assert torch.equal(new.grad[mask == 0], torch.zeros_like(new.grad[mask == 0]))
