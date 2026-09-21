@@ -31,6 +31,11 @@ import pytest
 
 @pytest.fixture(autouse = True, scope = "module")
 def _install_shim():
+    # The MLX simulation shim is torch-backed, and `[core]` does not install torch on
+    # darwin/arm64. Every `tests/test_mlx_*.py` calls this unguarded, which is fine for
+    # a Linux-only file; this one sits in the security suite, so an absent torch has to
+    # come out as a skip and not as a collection ERROR that reds the gate wholesale.
+    pytest.importorskip("torch", reason = "the MLX simulation shim is torch-backed")
     from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
 
