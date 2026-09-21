@@ -4699,7 +4699,15 @@ def _trusted_gguf_tree(tree, converter_location = None):
     resolved = os.path.realpath(tree)
     roots = [LLAMA_CPP_DEFAULT_DIR, os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")]
     if converter_location:
+        # Both directories, because a symlinked converter has two and each can hold
+        # the tree the conversion actually used: the entrypoint self-locates its
+        # gguf-py through `__file__` (the link's own directory) while the script
+        # slot CPython prepends is the resolved target. Trusting only one refuses a
+        # writer tree we did resolve, which costs the read-back its same-writer gguf.
+        # No wider either way: this is the directory of the script we are about to
+        # execute as the converter.
         roots.append(os.path.dirname(os.path.abspath(converter_location)))
+        roots.append(os.path.dirname(os.path.realpath(converter_location)))
     for root in roots:
         if root and _stays_within(os.path.expanduser(root), resolved):
             return resolved

@@ -133,6 +133,36 @@ def test_a_tree_inside_a_chosen_root_is_kept(llama_cpp, tmp_path, monkeypatch, r
     assert llama_cpp._trusted_gguf_tree(tree, converter_location) == os.path.realpath(tree)
 
 
+def test_a_symlinked_converter_trusts_the_directory_it_resolves_to(
+        llama_cpp, tmp_path, monkeypatch):
+    """A symlinked converter has two directories and the writer tree can be in
+    either: gguf-py beside the link, or the package beside the resolved script.
+    Trusting only the link's side refuses a tree the conversion really used, and
+    the read-back then silently drops to whatever gguf this process happens to have."""
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unrelated"))
+    monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
+
+    target = tmp_path / "target"
+    target.mkdir()
+    real = target / "convert_hf_to_gguf.py"
+    real.write_text("# converter\n", encoding = "utf-8")
+    linkdir = tmp_path / "linkdir"
+    linkdir.mkdir()
+    link = linkdir / "convert_hf_to_gguf.py"
+    os.symlink(str(real), str(link))
+
+    resolved_side = _gguf_package(target)
+    link_side = _gguf_package(linkdir / "gguf-py")
+
+    assert llama_cpp._trusted_gguf_tree(resolved_side, str(link)) == \
+        os.path.realpath(resolved_side)
+    assert llama_cpp._trusted_gguf_tree(link_side, str(link)) == \
+        os.path.realpath(link_side)
+    # Still nothing outside either of them.
+    assert llama_cpp._trusted_gguf_tree(_gguf_package(tmp_path / "elsewhere"),
+                                        str(link)) is None
+
+
 def test_the_checked_path_and_the_returned_path_cannot_diverge(
         llama_cpp, tmp_path, monkeypatch):
     """Resolving separately for the check and for the return is not the same rule
