@@ -4565,6 +4565,14 @@ def _installed_gguf_tree(python_exe):
     # All Unsloth Zoo code licensed under LGPLv3
     env = dict(os.environ)
     env["NO_LOCAL_GGUF"] = "1"
+    # This probe asks what is INSTALLED; it is not emulating a converter, so it has
+    # no reason to honour a relative PYTHONPATH entry. Those mean the working
+    # directory, and a `gguf` planted there would execute in a child holding the
+    # parent's credentials -- refusing its tree afterwards does not unrun it.
+    env["PYTHONPATH"] = os.pathsep.join(
+        entry for entry in env.get("PYTHONPATH", "").split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    )
     report = _probe_child_gguf(python_exe, env, ())
     location = (report or {}).get("location")
     if not location:

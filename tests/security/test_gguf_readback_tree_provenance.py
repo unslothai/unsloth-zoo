@@ -58,6 +58,14 @@ def llama_cpp():
     return module
 
 
+def _ran(planted_dir):
+    """Whether a package planted by PROBE_PAYLOAD executed. Keyed on the package's
+    own directory: the marker has to land somewhere the payload can reach without
+    knowing the test's layout, and an assertion against a path it never writes is
+    one that cannot fail."""
+    return (Path(planted_dir) / "gguf" / "EXECUTED").exists()
+
+
 def _gguf_package(directory, body = "# gguf\n"):
     """A well-formed, importable `gguf` package under `directory`. Returns the tree."""
     package = Path(directory) / "gguf"
@@ -237,7 +245,7 @@ def test_the_conversion_screens_the_tree_before_the_verifier_gets_it(llama_cpp):
 
 PROBE_PAYLOAD = """
 import os
-open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "EXECUTED"), "a").close()
+open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "EXECUTED"), "a").close()
 """
 
 
@@ -260,7 +268,7 @@ def test_the_probe_does_not_resolve_gguf_from_the_working_directory(
     assert report is not None
     location = report.get("location") or ""
     assert not str(location).startswith(str(cwd)), location
-    assert not (tmp_path / "EXECUTED").exists(), "the planted package ran in the child"
+    assert not _ran(cwd), "the planted package ran in the child"
 
 
 def test_the_probe_still_finds_the_converter_own_gguf_py(llama_cpp, tmp_path):
@@ -373,6 +381,24 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
     assert reports[-1].get("location") == actual
 
 
+@pytest.mark.parametrize("pythonpath", [".", "", "/abs/one:"])
+def test_the_installed_probe_does_not_honour_a_relative_pythonpath(
+        llama_cpp, tmp_path, monkeypatch, pythonpath):
+    """That probe asks what is installed, not what the converter will see, so a
+    relative entry buys nothing and costs a child execution in the parent's
+    environment. Empty and trailing elements mean the working directory too."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    _gguf_package(cwd, body = PROBE_PAYLOAD)
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("PYTHONPATH", pythonpath.replace("/abs/one", str(tmp_path / "abs")))
+
+    tree = llama_cpp._installed_gguf_tree(sys.executable)
+
+    assert not _ran(cwd), "the planted package ran in the child"
+    assert tree is None or not str(tree).startswith(str(cwd)), tree
+
+
 def test_an_explicit_cwd_on_pythonpath_survives_the_drop(llama_cpp, tmp_path):
     """Dropping the implicit `-c` slot must not take a caller's own '.' with it: the
     converter honours PYTHONPATH, so that package is one the conversion really uses."""
@@ -436,7 +462,7 @@ def test_the_probe_drops_the_working_directory_without_interpreter_support(
     assert reports, completed.stderr
     location = reports[-1].get("location") or ""
     assert not str(location).startswith(str(cwd)), location
-    assert not (tmp_path / "EXECUTED").exists(), "the planted package ran in the child"
+    assert not _ran(cwd), "the planted package ran in the child"
 
 
 @pytest.mark.skipif(sys.version_info < (3, 11),
