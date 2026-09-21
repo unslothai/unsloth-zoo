@@ -230,6 +230,47 @@ def test_the_probe_environment_is_not_mutated_for_the_caller(llama_cpp, tmp_path
     assert "PYTHONSAFEPATH" not in env
 
 
+def test_the_probe_models_the_converter_script_directory(llama_cpp, tmp_path):
+    """A script run has its own directory at sys.path[0], so a `gguf` sitting beside
+    the converter outranks the sibling gguf-py it inserts at 1. The probe has to
+    report that one, because it is the one the conversion will use."""
+    install = tmp_path / "install"
+    _gguf_package(install / "gguf-py", body = "__version__ = 'sibling'\n")
+    beside = _gguf_package(install, body = "__version__ = 'beside'\n")
+    converter = install / "convert_hf_to_gguf.py"
+    converter.write_text(
+        "import sys, os\n"
+        "sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'gguf-py'))\n"
+        "import gguf\n"
+        "print(gguf.__file__)\n",
+        encoding = "utf-8",
+    )
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""
+    env.pop("PYTHONSAFEPATH", None)
+    run = subprocess.run(
+        [sys.executable, "-S", str(converter)], env = env, stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
+    )
+    actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
+    assert actual.startswith(str(beside)), f"the converter itself resolved {actual}"
+
+    probe_env = dict(env)
+    probe_env["PYTHONSAFEPATH"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", llama_cpp._GGUF_PROBE_SOURCE, str(converter), "0"],
+        input = "[]", env = probe_env, stdout = subprocess.PIPE, stderr = subprocess.PIPE,
+        encoding = "utf-8", timeout = 60,
+    )
+    reports = [
+        json.loads(line) for line in (completed.stdout or "").splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert reports, completed.stderr
+    assert reports[-1].get("location") == actual
+
+
 def test_the_probe_drops_the_working_directory_without_interpreter_support(
         llama_cpp, tmp_path, monkeypatch):
     """The 3.9/3.10 case, simulated by withholding the flag the way those versions

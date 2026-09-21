@@ -4409,11 +4409,19 @@ if not getattr(sys.flags, "safe_path", False):
 # argv[2] reports which, and before 3.11 the answer is always "plain".
 converter_safe = (sys.version_info >= (3, 11)
                   and len(sys.argv) > 2 and sys.argv[2] == "1")
-if converter and "NO_LOCAL_GGUF" not in os.environ:
-    sys.path.insert(
-        1 if converter_safe else 0,
-        os.path.join(os.path.dirname(os.path.abspath(converter)), "gguf-py"),
-    )
+if converter:
+    converter_dir = os.path.dirname(os.path.abspath(converter))
+    if "NO_LOCAL_GGUF" not in os.environ:
+        sys.path.insert(1 if converter_safe else 0,
+                        os.path.join(converter_dir, "gguf-py"))
+    # The script directory itself, which a script run has at sys.path[0] and which
+    # therefore outranks the sibling tree whenever the converter's own directory
+    # holds an importable `gguf` (custom and editable layouts do). Modelled outside
+    # the NO_LOCAL_GGUF branch because suppressing the sibling insert does not take
+    # the script's own directory off the real run's path. Safe-path mode is the one
+    # case with no such entry to model.
+    if not converter_safe:
+        sys.path.insert(0, converter_dir)
 
 def resolve(expression):
     parts = expression.split(".")
