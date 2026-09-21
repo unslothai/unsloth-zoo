@@ -33,7 +33,10 @@ from transformers import DataCollatorForSeq2Seq  # noqa: E402
 from transformers import DataCollatorForLanguageModeling as HFLanguageModeling  # noqa: E402
 from datasets import Dataset  # noqa: E402
 
-from unsloth_zoo.dataset_utils import train_on_responses_only  # noqa: E402
+from unsloth_zoo.dataset_utils import (  # noqa: E402
+    is_trl_padding_free_collator,
+    train_on_responses_only,
+)
 
 TRLLanguageModeling = sft_trainer.DataCollatorForLanguageModeling
 
@@ -212,3 +215,25 @@ def test_an_ordinary_subclass_is_exempted_through_its_ancestor():
     out = train_on_responses_only(StubTrainer(collator, _rows()),
                                   INSTRUCTION_PART, RESPONSE_PART)
     assert out.data_collator is collator
+
+
+# The predicate on its own, so a shim can import it instead of re-deriving the
+# MRO walk, and so these cases do not need a trainer to reach it.
+@needs_padding_free
+def test_the_predicate_accepts_only_trls_padding_free_collator():
+    class NotATrlCollator:
+        padding_free = True
+
+    class UsersOwnCollator(TRLLanguageModeling):
+        pass
+
+    hf = HFLanguageModeling(tokenizer = StubTokenizer(), mlm = False)
+    hf.padding_free = True
+
+    assert is_trl_padding_free_collator(_trl_collator()) is True
+    assert is_trl_padding_free_collator(_trl_collator(cls = UsersOwnCollator)) is True
+    assert is_trl_padding_free_collator(_trl_collator(padding_free = False)) is False
+    assert is_trl_padding_free_collator(NotATrlCollator()) is False
+    assert is_trl_padding_free_collator(hf) is False
+    assert is_trl_padding_free_collator(None) is False
+    assert is_trl_padding_free_collator(DataCollatorForSeq2Seq(StubTokenizer())) is False
