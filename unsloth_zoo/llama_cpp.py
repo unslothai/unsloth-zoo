@@ -3889,7 +3889,12 @@ def _scan_imported_package(
 # A pin Unsloth set itself, to route the patcher at an install it has just made.
 # Not the same thing as a pin the user set to choose a converter they reviewed,
 # and only the second is a reason to skip the scan.
-_INTERNAL_SCRIPTS_DIR_LOCK = threading.Lock()
+# Reentrant: the lock is held for the whole conversion, and a caller that pins around
+# save_pretrained_gguf has unsloth_zoo's own MLX save path entering this pin again inside
+# it. With a plain Lock that second entry never returns, so the export hangs instead of
+# converting. Nesting is also what the "a pin already there is the user's" branch below is
+# written for, and it could not be reached on one thread.
+_INTERNAL_SCRIPTS_DIR_LOCK = threading.RLock()
 _internal_scripts_dir_pin = None
 
 
