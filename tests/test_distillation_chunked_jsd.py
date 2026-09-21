@@ -508,6 +508,56 @@ def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+    reason = "needs two CUDA devices to place the two models apart",
+)
+@pytest.mark.parametrize(
+    "student_head, teacher_hidden, teacher_head, mask", [
+        ("cuda:0", "cuda:0", "cuda:1", "cuda:0"),   # heads split, the accelerate case
+        ("cuda:0", "cuda:1", "cuda:1", "cuda:0"),   # the whole teacher on the far device
+        ("cuda:0", "cuda:0", "cuda:0", "cuda:1"),   # only the mask elsewhere
+    ],
+)
+def test_models_dispatched_across_devices(student_head, teacher_hidden, teacher_head, mask):
+    """An accelerate dispatch can put the two models on different devices.
+
+    `_distillation_project_logits` co-locates each model's hidden states with its
+    OWN head, so the two log-probability tensors then live on different devices
+    and the divergence, the mask multiply and the accumulator all raise. Placement
+    must not change the answer either, so every cell is compared against a
+    single-device reference computed from the same values.
+    """
+    torch.manual_seed(0)
+    batch, seq, hidden, vocab = 1, 16, 8, 64
+    sh = torch.randn(batch, seq, hidden)
+    th = torch.randn(batch, seq, hidden)
+    swt = torch.randn(vocab, hidden)
+    twt = torch.randn(vocab, hidden)
+    mk = torch.ones(batch, seq, dtype = torch.long)
+    mk[0, -3:] = 0
+
+    def run(sh_d, th_d, sw_d, tw_d, mk_d):
+        s = sh.clone().to(sh_d).requires_grad_(True)
+        w = swt.clone().to(sw_d).requires_grad_(True)
+        loss, _, _ = rr.distillation_chunked_jsd(
+            s, th.clone().to(th_d), w, twt.clone().to(tw_d), mk.clone().to(mk_d),
+            beta = 0.5, chunk_size = 8,
+        )
+        loss.backward()
+        return loss.item(), s.grad.double().norm().item(), loss.device, s.grad.device
+
+    want_loss, want_grad, _, _ = run("cuda:0", "cuda:0", "cuda:0", "cuda:0", "cuda:0")
+    got_loss, got_grad, loss_device, grad_device = run(
+        student_head, teacher_hidden, student_head, teacher_head, mask,
+    )
+    # The student's device owns the reduction: its gradient accumulates there.
+    assert loss_device == torch.device(student_head)
+    assert grad_device == torch.device(student_head)
+    assert abs(got_loss - want_loss) <= 1e-6 * max(abs(want_loss), 1e-30)
+    assert abs(got_grad - want_grad) <= 1e-6 * max(abs(want_grad), 1e-30)
+
+
 def test_double_backward_is_not_silently_wrong():
     """The custom Function has no double backward; it must say so, not lie."""
     sh, th, swt, twt, mask, _, _ = _make()

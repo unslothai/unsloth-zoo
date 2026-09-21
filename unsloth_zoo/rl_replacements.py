@@ -2270,6 +2270,17 @@ def _distillation_jsd_chunk(
     student_log_probs = torch.nn.functional.log_softmax(student_logits, dim = -1)
     teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim = -1)
 
+    # Reduce on the STUDENT head's device. Each projection above left its result
+    # on its own head's device, which under an accelerate dispatch that splits
+    # the two models is not the same device, and the divergence then raises. The
+    # student's side is the right target because the gradient accumulates there.
+    # Both moves are no-ops when the heads are co-located, which is every
+    # single-device run.
+    if teacher_log_probs.device != student_log_probs.device:
+        teacher_log_probs = teacher_log_probs.to(student_log_probs.device)
+    if valid.device != student_log_probs.device:
+        valid = valid.to(student_log_probs.device)
+
     jsd = _distillation_generalized_jsd(student_log_probs, teacher_log_probs, beta)
 
     # The final chunk's tail holds positions packed out of the valid prefix.
@@ -2365,7 +2376,10 @@ class _UnslothDistillationJSD(torch.autograd.Function):
     ):
         flat_student = student_hidden_states.reshape(-1, student_hidden_states.shape[-1])
         flat_teacher = teacher_hidden_states.reshape(-1, teacher_hidden_states.shape[-1])
-        valid = completion_mask.reshape(-1) != 0
+        # The mask decides the packing order for BOTH models, so it has to answer
+        # on the student's device; a dispatched model leaves it wherever the
+        # batch was built, and indexing rejects an index from another device.
+        valid = completion_mask.reshape(-1).to(flat_student.device) != 0
         n_valid = valid.sum()
 
         # Pack the valid positions to the front so the masked ones form whole
@@ -2374,7 +2388,9 @@ class _UnslothDistillationJSD(torch.autograd.Function):
         # dependent and cannot be traced.
         order = valid.to(torch.int8).argsort(descending = True, stable = True)
         flat_student = flat_student[order]
-        flat_teacher = flat_teacher[order]
+        # The teacher can sit on another device entirely; index it with its own
+        # copy of the order rather than dragging its hidden states across.
+        flat_teacher = flat_teacher[order.to(flat_teacher.device)]
         sorted_valid = valid[order]
 
         # At least one chunk always runs: a fully masked batch still has to reach
