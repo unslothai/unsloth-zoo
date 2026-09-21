@@ -494,7 +494,15 @@ def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
         sh.double(), th.double(), swt.double(), twt.double(), mask, beta = beta,
     )
     relative_error = (got.double() - reference).abs().item() / reference.abs().item()
-    assert relative_error < 1e-4, (
+    # The threshold separates two measured populations rather than pinning one
+    # machine's number. Dropping the upcast in exactly this configuration gives
+    # 4.6e-01, 4.6e-01, 4.5e-01 (bfloat16) and 1.7e-02, 5.6e-02, 2.9e-01
+    # (float16) at the interior betas, which is where the mixture subtracts two
+    # nearly equal terms and the precision actually decides the answer. With the
+    # upcast the same cells are 1e-05 or better here. An earlier 1e-4 bound was
+    # tuned against this box and failed on a CPU-only runner at 1.1e-04 and
+    # 1.3e-04, so it was measuring the host, not the dtype.
+    assert relative_error < 1e-3, (
         f"{dtype} beta={beta} relative error {relative_error:.3e}; the divergence "
         "is no longer being computed in float32"
     )
