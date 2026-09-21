@@ -465,6 +465,41 @@ def test_every_chunk_is_the_same_width():
     assert set(widths) == {4}, f"chunk widths were {sorted(set(widths))}, expected only 4"
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("beta", [0.0, 0.25, 0.5, 0.75, 1.0])
+def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
+    """The divergence runs in float32 even when the model is bf16 or fp16.
+
+    This is the expensive half of the loss and it is worth the memory. The
+    mixture is a logsumexp of two nearly equal terms and the outer combination
+    then subtracts them, so in bfloat16 the interior betas lose most of their
+    significant digits. Scored against a float64 oracle built from the same
+    low-precision inputs, computing the divergence in the input dtype instead of
+    float32 costs three orders of magnitude of relative accuracy, which is why
+    this is pinned rather than left to whatever the caller's dtype happens to be.
+    """
+    torch.manual_seed(0)
+    batch, seq, hidden_s, hidden_t, vocab = 1, 64, 32, 48, 4096
+    sh = torch.randn(batch, seq, hidden_s, dtype = dtype)
+    th = torch.randn(batch, seq, hidden_t, dtype = dtype)
+    swt = (torch.randn(vocab, hidden_s, dtype = dtype) * 0.02)
+    twt = (torch.randn(vocab, hidden_t, dtype = dtype) * 0.02)
+    mask = torch.ones(batch, seq, dtype = torch.long)
+    mask[0, -3:] = 0
+
+    got, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = beta, chunk_size = 16)
+
+    # Same inputs, every operation in float64.
+    reference, _, _ = _dense_reference(
+        sh.double(), th.double(), swt.double(), twt.double(), mask, beta = beta,
+    )
+    relative_error = (got.double() - reference).abs().item() / reference.abs().item()
+    assert relative_error < 1e-4, (
+        f"{dtype} beta={beta} relative error {relative_error:.3e}; the divergence "
+        "is no longer being computed in float32"
+    )
+
+
 def test_double_backward_is_not_silently_wrong():
     """The custom Function has no double backward; it must say so, not lie."""
     sh, th, swt, twt, mask, _, _ = _make()
