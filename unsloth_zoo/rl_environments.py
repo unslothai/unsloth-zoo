@@ -1214,10 +1214,12 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    # A wildcard bind still has to be dialled through an address that resolves.
-    # Loopback literals are left alone: mapping ::1 onto localhost is what sends
-    # an IPv6-only listener's probe to 127.0.0.1.
-    client_host = "localhost" if host in ("0.0.0.0", "::") else host
+    # A wildcard bind has to be dialled through a real address, and it must be
+    # one of the SAME family: asyncio's create_server sets IPV6_V6ONLY on every
+    # AF_INET6 listener unconditionally, so a `::` server answers on ::1 and not
+    # on 127.0.0.1 even where the host is dual stack. `localhost` cannot be that
+    # address, since which family it resolves to is the resolver's choice.
+    client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
     localhost = _openenv_url(client_host, port)
 
     def check_openenv_works(process):

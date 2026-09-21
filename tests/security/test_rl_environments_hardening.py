@@ -230,8 +230,8 @@ def test_explicit_host_is_still_honoured(monkeypatch, tmp_path):
     )
     argv = calls[0]
     assert argv[argv.index("--host") + 1] == "0.0.0.0"
-    # A wildcard bind is still dialled through an address that resolves.
-    assert client.base_url == f"http://localhost:{port}"
+    # A wildcard bind is still dialled through a real address of its own family.
+    assert client.base_url == f"http://127.0.0.1:{port}"
 
 
 def test_foreign_listener_answering_healthy_is_not_adopted(foreign_listener, monkeypatch, tmp_path):
@@ -353,15 +353,35 @@ def test_ipv6_host_is_bracketed_in_the_client_url(monkeypatch, tmp_path):
     assert urlsplit(client.base_url).port == port
 
 
-def test_ipv6_wildcard_is_dialled_through_localhost(monkeypatch, tmp_path):
-    """`::` accepts loopback, and localhost now resolves over both families."""
+def test_ipv6_wildcard_is_dialled_through_ipv6_loopback(monkeypatch, tmp_path):
+    """asyncio sets IPV6_V6ONLY on every AF_INET6 listener, so `::` is not on 127.0.0.1."""
     calls = _fake_launcher(monkeypatch, ports = [31525])
     port, client = rl_env.launch_openenv(
         working_directory = str(tmp_path), openenv_class = _DummyClient,
         host = "::",
     )
     assert calls[0][calls[0].index("--host") + 1] == "::"
-    assert client.base_url == f"http://localhost:{port}"
+    assert client.base_url == f"http://[::1]:{port}"
+
+
+def test_asyncio_really_makes_an_ipv6_wildcard_listener_v6_only():
+    """The premise above, measured rather than assumed: CPython base_events.create_server
+    calls setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, True) whatever net.ipv6.bindv6only says."""
+    if not socket.has_ipv6: pytest.skip("Python built without IPv6")
+    import asyncio
+
+    async def bind():
+        server = await asyncio.start_server(lambda r, w: w.close(), "::", 0)
+        try:
+            sock = server.sockets[0]
+            return sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+        finally:
+            server.close()
+
+    try:
+        assert asyncio.run(bind()) == 1
+    except OSError:
+        pytest.skip("No IPv6 loopback on this host")
 
 
 def test_ipv4_loopback_host_is_not_bracketed(monkeypatch, tmp_path):
