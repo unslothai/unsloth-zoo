@@ -342,11 +342,14 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
         return (True, "Xet CAS reachable")
     except urllib.error.HTTPError as e:
         # The endpoint ANSWERED, which is all this probe measures.
-        if e.code in (404, 401):
+        if e.code in (404, 401, 429):
             # 404: the probe repo is not hosted here (mirror / on-prem), so do not pin to HTTP for
             # 24h. 401: no credential is ever attached now, so a 401 can only mean auth was never
-            # attempted -- reachability proven, and it says nothing about Xet. 403/407 still
-            # demote -- that is how a blocking proxy answers.
+            # attempted -- reachability proven, and it says nothing about Xet. 429: this is an
+            # /api/ route, and anonymously that quota is 500 per 5min SHARED PER IP against 1,000
+            # per user when authenticated (huggingface.co/docs/hub/rate-limits), so one NAT or CI
+            # runner can exhaust it while the user's own authenticated download is fine. 403/407
+            # still demote -- that is how a blocking proxy answers.
             return (None, "Xet probe inconclusive on this endpoint; assuming Xet")
         return (False, f"Xet token endpoint returned HTTP {e.code}")
     except Exception as e:

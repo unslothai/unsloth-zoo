@@ -293,6 +293,33 @@ def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
     assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
 
 
+def test_probe_429_is_inconclusive_not_a_demotion(monkeypatch):
+    """Rate limiting is not evidence that CAS is unreachable, and anonymity invites it.
+
+    This is an /api/ route: anonymously the quota is 500 per 5min shared per IP address, against
+    1,000 per user once authenticated, so one NAT, cluster or CI runner exhausts it for everyone
+    behind it while the user's own authenticated download would have succeeded.
+    """
+    import urllib.error
+    import urllib.request
+
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+
+    def _raise(*args, **kwargs):
+        raise urllib.error.HTTPError("http://hf/x", 429, "Too Many Requests", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+
+    ok, reason = health._probe_cas_reachable()
+    assert ok is None, reason
+
+    verdict = health.xet_health(force = True, probe = True)
+    assert verdict.use_xet is True
+    assert verdict.source == "default"
+    assert not health.health_state_path().exists(), "a throttled probe must not persist a demotion"
+
+
 def test_probe_403_still_demotes(monkeypatch):
     """A blocking corporate proxy legitimately answers 403, and that machine should use HTTP."""
     import urllib.error
