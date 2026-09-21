@@ -99,8 +99,146 @@ def _is_expert_module(module: nn.Module) -> bool:
 
 
 # ============================================================================
+# Quantization of oversized expert stacks
+# ============================================================================
+
+# bitsandbytes counts elements with a signed 32-bit int inside the 4-bit
+# quantize kernel, so handing it a tensor of 2**31 elements or more does not
+# raise: csrc/ops.cu prints "Error invalid argument at line 74" and the process
+# dies. One stacked MoE expert parameter crosses that line easily.
+# thinkingmachines/Inkling-Small ships gate_up_proj as (256, 6144, 4096), about
+# 6.4e9 elements, three times over. Quantize such a stack in expert-major
+# slices and splice the results instead.
+_BNB_MAX_QUANTIZE_NUMEL = 2 ** 31
+
+
+def _quantize_expert_stack_in_slices(value, blocksize, quant_type):
+    """Params4bit for a stack too large for one bitsandbytes quantize call.
+
+    Each slice holds whole experts, and one expert is a whole number of blocks
+    for every MoE shape shipped so far, so the packed bytes and the absmax
+    blocks concatenate exactly and nothing is requantized. Returns None when
+    that does not hold, leaving the caller on the unsliced path.
+    """
+    from bitsandbytes.functional import QuantState
+
+    if value.ndim < 2:
+        return None
+    per_expert = value[0].numel()
+    if per_expert == 0 or per_expert % blocksize != 0:
+        return None
+    experts_per_slice = (_BNB_MAX_QUANTIZE_NUMEL - 1) // per_expert
+    if experts_per_slice < 1:
+        # A single expert already overflows, which slicing by expert cannot fix.
+        return None
+
+    packed, absmax, code, dtype = [], [], None, None
+    for start in range(0, value.shape[0], experts_per_slice):
+        data, qs = bnb.functional.quantize_4bit(
+            value[start : start + experts_per_slice].contiguous(),
+            blocksize = blocksize,
+            quant_type = quant_type,
+            # Double quantization nests absmax per call, and the nested states
+            # of separate calls do not concatenate. Keep the slices flat; the
+            # absmax of one expert stack is small next to its weights.
+            compress_statistics = False,
+        )
+        packed.append(data.reshape(-1))
+        absmax.append(_quantstate_absmax_fp32(qs))
+        code, dtype = qs.code, qs.dtype
+
+    quant_state = QuantState(
+        absmax = torch.cat(absmax),
+        shape = value.shape,
+        code = code,
+        blocksize = blocksize,
+        quant_type = quant_type,
+        dtype = dtype,
+    )
+    new_param = torch.Tensor._make_subclass(Params4bit, torch.cat(packed).unsqueeze(-1))
+    new_param.requires_grad = False
+    new_param.quant_state = quant_state
+    new_param.blocksize = blocksize
+    new_param.compress_statistics = False
+    new_param.quant_type = quant_type
+    new_param.quant_storage = new_param.dtype
+    new_param.bnb_quantized = True
+    return new_param
+
+
+def _make_expert_params4bit(value, **kwargs):
+    """Params4bit on the value's own device, slicing the quantization when the
+    stack is too large for bitsandbytes to count in 32 bits."""
+    if value.numel() >= _BNB_MAX_QUANTIZE_NUMEL and value.is_cuda:
+        sliced = _quantize_expert_stack_in_slices(
+            value,
+            blocksize = kwargs.get("blocksize") or 64,
+            quant_type = kwargs.get("quant_type") or "nf4",
+        )
+        if sliced is not None:
+            return sliced
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(
+                f"Unsloth: expert stack of {value.numel()} elements cannot be "
+                "sliced for bitsandbytes; quantizing it in one call, which may "
+                "abort inside bitsandbytes."
+            )
+    return Params4bit(value, **kwargs).to(value.device)
+
+
+# ============================================================================
 # Dequantization
 # ============================================================================
+
+def _dequantize_4bit_in_slices(weight):
+    """Dequantize an expert stack whose element count overflows bitsandbytes'
+    32-bit counter, in expert-major slices. Returns None when the stack is
+    small enough for one call, or when it cannot be split on a block boundary,
+    so the caller keeps the ordinary path.
+
+    The quantize kernel is not the only one that counts in 32 bits: dequantize
+    aborts the same way, at csrc/ops.cu line 93, and it runs on every forward
+    rather than once at load.
+    """
+    import math
+    from bitsandbytes.functional import QuantState
+
+    quant_state = weight.quant_state
+    shape = tuple(getattr(weight, "_original_shape", None) or quant_state.shape)
+    numel = math.prod(shape) if shape else 0
+    if numel < _BNB_MAX_QUANTIZE_NUMEL or len(shape) < 2:
+        return None
+
+    blocksize = quant_state.blocksize
+    per_expert = math.prod(shape[1:])
+    if per_expert == 0 or per_expert % blocksize != 0 or per_expert % 2 != 0:
+        return None
+    experts_per_slice = (_BNB_MAX_QUANTIZE_NUMEL - 1) // per_expert
+    if experts_per_slice < 1:
+        return None
+
+    absmax = _quantstate_absmax_fp32(quant_state)
+    flat = weight.data.reshape(-1)
+    blocks_per_expert = per_expert // blocksize
+    bytes_per_expert = per_expert // 2
+
+    out = []
+    for start in range(0, shape[0], experts_per_slice):
+        stop = min(start + experts_per_slice, shape[0])
+        sub_state = QuantState(
+            absmax = absmax[start * blocks_per_expert : stop * blocks_per_expert],
+            shape = torch.Size((stop - start,) + shape[1:]),
+            code = quant_state.code,
+            blocksize = blocksize,
+            quant_type = quant_state.quant_type,
+            dtype = quant_state.dtype,
+        )
+        out.append(bnb.functional.dequantize_4bit(
+            flat[start * bytes_per_expert : stop * bytes_per_expert].unsqueeze(-1),
+            sub_state,
+        ).reshape((stop - start,) + shape[1:]))
+    return torch.cat(out, dim = 0)
+
 
 def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """Dequantize a packed Params4bit MoE expert to its logical 3D shape at
@@ -108,7 +246,9 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """
     if not _is_bnb4bit_param(weight):
         return None
-    dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
+    dequant = _dequantize_4bit_in_slices(weight)
+    if dequant is None:
+        dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
     original_shape = getattr(weight, "_original_shape", None)
     if original_shape is not None and tuple(dequant.shape) != tuple(original_shape):
         dequant = dequant.reshape(original_shape)
@@ -297,7 +437,7 @@ def patch_bnb4bit_quantize_convert():
             if _is_expert_module(module):
                 old_value = model.get_parameter_or_buffer(full_layer_name)
                 old_dict = {k: v for k, v in old_value.__dict__.items()}
-                new_value = Params4bit(value, requires_grad=False, **old_dict).to(value.device)
+                new_value = _make_expert_params4bit(value, requires_grad=False, **old_dict)
                 # _original_shape is needed by PEFT LoRA to recover the logical 3D shape.
                 new_value._original_shape = value.shape
                 module._is_hf_initialized = True
