@@ -1460,24 +1460,16 @@ def grpo_accumulated_loss(
     vocab_dim = lm_head.shape[0]
 
     if trainer.args.unsloth_grpo_mini_batch is None:
-        if not hasattr(trainer, "_has_autotuned"):
-            trainer._has_autotuned = True
-            B, multiplier = autotune_batch_and_chunks(
-                total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
-            )
-            trainer.args.unsloth_grpo_mini_batch = max(1, total_rows//B)
-            trainer.args.unsloth_logit_chunk_multiplier = multiplier
-            B = trainer.args.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
-        elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
-            B = trainer.args.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
-            del trainer._has_autotuned
-            del trainer.args.unsloth_grpo_mini_batch
-            del trainer.args.unsloth_logit_chunk_multiplier
-        else:
-            B = trainer.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
+        # Size the plan from the batch in hand on every call, the way unsloth's own copy of this
+        # function does (unsloth/models/rl_replacements.py). Caching the first step's answer in
+        # `trainer.args` froze it for the whole run: the `elif` meant to refresh it could not run,
+        # because it needed `unsloth_grpo_mini_batch is None` and the branch that set
+        # `_has_autotuned` had made it non-None in the same breath. GRPO completion lengths vary
+        # step to step, so a plan sized on a short first step under-chunks every later long one.
+        B, multiplier = autotune_batch_and_chunks(
+            total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
+        )
+        B = max(1, total_rows//B)
     else:
         if trainer.args.unsloth_grpo_mini_batch > total_rows:
             B = total_rows
