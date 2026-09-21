@@ -1551,16 +1551,18 @@ def _gpt_oss_write_marker(loc, desired_flavor):
 pass
 
 
-def _invalidate_gpt_oss_compiled_module():
+def _invalidate_gpt_oss_compiled_module(locations = None):
     """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
     rebuilt against the CURRENT router/experts classes. The single per-model-type file
     hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
-    wrong classes. Cleans every candidate location."""
+    wrong classes. Cleans every candidate location, or only `locations` when given: a
+    location that is stale says nothing about the others, and sweeping them all let one
+    planted candidate delete a perfectly good cache on every load."""
     try:
         import sys as _sys
         import importlib, importlib.util
         _sys.modules.pop(_GPT_OSS_COMPILED_MODULE, None)
-        for loc in _gpt_oss_cache_locations():
+        for loc in (_gpt_oss_cache_locations() if locations is None else locations):
             _f = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if os.path.isfile(_f):
                 try:
@@ -1591,7 +1593,11 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
     missing marker the stale module is dropped for the compiler to regenerate."""
     try:
         locations = _gpt_oss_cache_locations()
-        mismatch = False
+        # Per location, never global: a candidate is judged on its own module and its
+        # own marker. Marking every location stale because one of them is lets anyone
+        # who can create the predictable temp candidate delete a valid primary cache on
+        # every single load, which is a denial of service rather than a safety measure.
+        stale = []
         for loc in locations:
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
@@ -1600,8 +1606,9 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
                 # We refuse to write a marker here, so any marker found is not ours,
                 # and the compiler applies no such gate when it imports the module
                 # next to it. Regenerate rather than trust what a rejected directory
-                # claims the flavor is.
-                mismatch = True
+                # claims the flavor is. Only this location, though: removal here will
+                # usually fail anyway, and that is the correct outcome.
+                stale.append(loc)
                 continue
             on_disk = None
             marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
@@ -1612,9 +1619,9 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
                 except Exception:
                     on_disk = None
             if on_disk != desired_flavor:
-                mismatch = True
-        if mismatch:
-            _invalidate_gpt_oss_compiled_module()
+                stale.append(loc)
+        if stale:
+            _invalidate_gpt_oss_compiled_module(stale)
         # Record this load's flavor; always at the primary location, the temp fallback only if used.
         for idx, loc in enumerate(locations):
             if idx != 0 and not os.path.isdir(loc):

@@ -180,6 +180,36 @@ def test_gpt_oss_marker_skips_a_foreign_owned_cache_directory(tmp_path, monkeypa
     )
 
 
+def test_gpt_oss_rejected_candidate_does_not_invalidate_a_good_cache(tmp_path, monkeypatch):
+    """One planted candidate must not delete the cache in every other location.
+
+    The temp candidate is a predictable path anyone can create first. Treating it as
+    evidence about the primary cache let them force a recompile on every load.
+    """
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    primary = tmp_path / "unsloth_compiled_cache"
+    primary.mkdir(mode = 0o755)
+    good = primary / (gpt_oss._GPT_OSS_COMPILED_MODULE + ".py")
+    good.write_text("# valid, built for stock\n")
+    (primary / gpt_oss._GPT_OSS_FLAVOR_MARKER).write_text("stock")
+
+    decoy = tmp_path / "tmp_unsloth_compiled_cache"
+    decoy.mkdir(mode = 0o777)
+    os.chmod(decoy, 0o777)          # world writable, so the trust check refuses it
+    (decoy / (gpt_oss._GPT_OSS_COMPILED_MODULE + ".py")).write_text("# planted\n")
+
+    monkeypatch.setattr(
+        gpt_oss, "_gpt_oss_cache_locations", lambda: [str(primary), str(decoy)],
+    )
+    gpt_oss._sync_gpt_oss_compiled_flavor("stock")
+
+    assert good.exists(), "a planted candidate deleted the valid primary cache"
+    assert not (decoy / (gpt_oss._GPT_OSS_COMPILED_MODULE + ".py")).exists(), (
+        "the rejected candidate's module should still be dropped where we can"
+    )
+
+
 def test_gpt_oss_marker_survives_a_group_writable_cache(tmp_path, monkeypatch):
     """umask 002 makes the library's own cache 0775, and that must keep working.
 
