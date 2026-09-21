@@ -39,6 +39,7 @@ import ipaddress
 import json
 import math
 import os
+import socket
 import threading
 import time
 import uuid
@@ -75,6 +76,14 @@ def _is_local_name(hostname):
     try:
         return ipaddress.ip_address(hostname).is_loopback
     except ValueError:
+        pass
+    # `127.1` and the other short forms are what a user typed reaching their own
+    # machine, and inet_aton is how the Studio backend's host_policy accepts them.
+    # Widening to these costs nothing: a numeric literal cannot be rebound, so it
+    # names loopback or it fails is_loopback below.
+    try:
+        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(hostname))).is_loopback
+    except (OSError, ValueError):
         return False
 
 

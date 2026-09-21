@@ -103,6 +103,16 @@ def test_a_rebound_hostname_is_refused(client):
 
 # --- An ordinary local client keeps working ---
 
+@pytest.mark.parametrize("spelling", ["127.1", "2130706433", "0x7f000001"])
+def test_a_short_loopback_spelling_is_still_this_machine(spelling):
+    """`curl http://127.1:8123` is a user reaching their own machine. A numeric
+    literal cannot be rebound, so accepting these widens nothing, and the Studio
+    backend's own host_policy resolves them the same way (socket.inet_aton)."""
+    assert shim._is_local_name(spelling) is True
+    assert shim._is_local_name("1") is False          # 0.0.0.1, not loopback
+    assert shim._is_local_name("evil.example") is False
+
+
 def test_a_plain_local_client_is_served(client):
     """curl, the OpenAI SDK and llama.cpp clients send no Origin and a loopback Host."""
     assert client.get("/health").status_code == 200
