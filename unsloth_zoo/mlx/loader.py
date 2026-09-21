@@ -1540,15 +1540,11 @@ def _read_json_file(path):
 
 
 def _is_processor_like_class(obj):
-    """True only for a class that Transformers itself treats as a processing component.
+    """True only for a class Transformers itself treats as a processing component.
 
-    Names that select these classes come out of a downloaded repository's sidecar JSON,
-    so what the name resolves to has to be checked before it is called. `transformers`
-    exports plenty of module-level callables that are not classes at all - `pipeline`
-    is the obvious one, and it takes `trust_remote_code` as a keyword - so a bare
-    `getattr` plus a call is enough for a repository to pick the callee. Requiring a
-    real processing base class keeps the resolution to the set of things this code was
-    ever meant to build.
+    The name comes from a downloaded repo, and `transformers` exports non-class
+    callables too: `transformers.pipeline` takes `trust_remote_code`, so `getattr`
+    plus a call lets the repo pick the callee. `isinstance(x, type)` is not enough.
     """
     if not isinstance(obj, type):
         return False
@@ -2033,8 +2029,7 @@ def _build_vlm_image_processor_from_config(
     image_kwargs = dict(image_config)
     image_kwargs.pop("image_processor_type", None)
     image_kwargs.pop("processor_class", None)
-    # The remaining keys are the constructor's own arguments and come from the same
-    # untrusted JSON. Remote-code consent is the caller's to give, never the file's.
+    # Remote-code consent is the caller's to give, never the downloaded file's.
     image_kwargs.pop("trust_remote_code", None)
 
     if isinstance(image_processor_type, str) and image_processor_type.isidentifier():
@@ -2045,11 +2040,9 @@ def _build_vlm_image_processor_from_config(
                 return image_processor_class(**image_kwargs)
         except Exception:
             pass
-        # mlx-vlm models can ship their own image processor classes, and those do not
-        # always inherit a Transformers base. They are still safe to build: the
-        # resolver only returns a class, and it only looks inside installed
-        # `mlx_vlm.models.*` modules plus a Transformers namespace that is itself now
-        # gated by _is_processor_like_class.
+        # A class is the whole bar here: mlx-vlm image processors do not always inherit
+        # a Transformers base, and the resolver only reaches installed `mlx_vlm.models.*`
+        # plus a namespace _is_processor_like_class already gates.
         try:
             image_processor_class = _resolve_mlx_vlm_processor_class(
                 model_type, image_processor_type,

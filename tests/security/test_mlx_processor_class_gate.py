@@ -1,29 +1,13 @@
-# Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
 """A name out of a model repo may only select a real processing class.
 
-`_build_vlm_image_processor_from_config` takes `image_processor_type` out of the
-downloaded repo's `processor_config.json` / `preprocessor_config.json`, resolves it
-against the `transformers` top-level namespace and calls the result with the rest of
-that same JSON object as keyword arguments. `transformers` exports module-level
-functions there as well as classes, and `pipeline` is one of them: it accepts
-`trust_remote_code`, and honouring it imports the repository's own `auto_map` Python.
-So the resolved object has to be checked before it is called, on a path the user
-reached with `trust_remote_code=False`.
+`_build_vlm_image_processor_from_config` resolves `image_processor_type` from the
+repo's sidecar JSON against the `transformers` namespace and calls the result with
+the rest of that JSON as kwargs. `transformers.pipeline` is a function there that
+accepts `trust_remote_code`, which imports the repo's own `auto_map` Python on a
+path the user reached with `trust_remote_code=False`.
 """
 
 import pytest
@@ -31,10 +15,9 @@ import pytest
 
 @pytest.fixture(autouse = True, scope = "module")
 def _install_shim():
-    # The MLX simulation shim is torch-backed, and `[core]` does not install torch on
-    # darwin/arm64. Every `tests/test_mlx_*.py` calls this unguarded, which is fine for
-    # a Linux-only file; this one sits in the security suite, so an absent torch has to
-    # come out as a skip and not as a collection ERROR that reds the gate wholesale.
+    # The shim is torch-backed and `[core]` ships no torch on darwin/arm64. Unguarded
+    # (as every tests/test_mlx_*.py is) that is 7 collection ERRORs, not skips, and
+    # this file is in the security gate.
     pytest.importorskip("torch", reason = "the MLX simulation shim is torch-backed")
     from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
@@ -43,8 +26,7 @@ def _install_shim():
 def _build(preprocessor_config, processor_config = None, model_type = "llava"):
     from unsloth_zoo.mlx.loader import _build_vlm_image_processor_from_config
     return _build_vlm_image_processor_from_config(
-        # A path that does not exist, so the AutoImageProcessor fallback below the
-        # resolver cannot succeed and mask the result.
+        # Nonexistent, so the AutoImageProcessor fallback cannot mask the result.
         "/nonexistent/unsloth-zoo-test-model",
         processor_config if processor_config is not None else {},
         preprocessor_config,
@@ -96,12 +78,9 @@ def test_non_processing_names_are_refused(name):
 def test_a_real_image_processor_still_builds():
     """The gate must not break the case this code exists for.
 
-    Not an exact-name assertion. `CLIPImageProcessor` is a `TorchvisionBackend` in
-    Transformers 5, and with torchvision absent the lazy module resolves that name to
-    `CLIPImageProcessorPil` instead. torchvision is not a dependency of this project,
-    and the `tests-security` job installs `.[core]` only, so the PIL class is what the
-    hard gate actually builds. Both are CLIP image processors deriving from
-    `ImageProcessingMixin`, which is what the gate under test has to keep admitting.
+    Not an exact-name assertion: `CLIPImageProcessor` is a `TorchvisionBackend` in
+    Transformers 5 and resolves to `CLIPImageProcessorPil` when torchvision is absent,
+    which is what `tests-security` (`.[core]`, no torchvision) actually builds.
     """
     from transformers.image_processing_base import ImageProcessingMixin
 
