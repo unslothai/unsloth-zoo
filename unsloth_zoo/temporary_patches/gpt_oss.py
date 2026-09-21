@@ -1441,28 +1441,13 @@ def _gpt_oss_cache_locations():
 def _gpt_oss_cache_location_is_trusted(loc):
     """Whether this process may write the flavor marker into `loc`.
 
-    The temp candidate is a fully predictable path (`/tmp/unsloth_compiled_cache` by
-    default), and nothing stops another local user creating it first. `os.path.isdir`
-    answers "does it exist", which an attacker satisfies with one mkdir, not "is it
-    ours".
-
-    Deliberately weaker than `compile_cache._is_trusted_directory`, and only here:
-    that one gates LOADING executable artifacts, so it walks every ancestor and
-    refuses any group write. This gates writing a seven-byte flavor string through an
-    O_NOFOLLOW descriptor next to a compiled module the library itself writes 0644
-    into the same directory. Refusing a group-writable cache would therefore buy
-    nothing (a group member can already replace the module) while silently disabling
-    flavor invalidation for every umask 002 machine, which is the default on plenty
-    of shared systems and would leave a stale module reinstalling the wrong
-    router/experts layout.
-
-    A group-shared cache is owned by whoever built it first, so ownership alone is
-    the wrong question: for user B the directory is user A's, and rejecting it there
-    made B force-regenerate on every load and unlink A's module with the group write
-    bit it was given on purpose. What the write actually needs is that everyone who
-    can create an entry here is someone the sharing group already trusts, which is
-    ownership OR group-write to a group we are in. A world-writable directory is
-    nobody's deliberate sharing choice and is still refused.
+    Deliberately weaker than `compile_cache._is_trusted_directory`, which gates
+    LOADING executable artifacts and so walks every ancestor and refuses any group
+    write: this only writes a flavor string through an O_NOFOLLOW descriptor, beside
+    a compiled module the library itself writes 0644 into the same directory.
+    Ownership alone is the wrong question, since a shared cache belongs to whoever
+    built it first. The real one is whether everyone who can create an entry here is
+    already trusted by the sharing group: ours, or group-write to a group we are in.
     """
     try:
         directory_stat = os.lstat(loc)
@@ -1479,9 +1464,7 @@ def _gpt_oss_cache_location_is_trusted(loc):
             return False
         if directory_stat.st_uid == os.geteuid():
             return True
-        # Someone else's directory, shared with a group we belong to. They could
-        # already replace the 0644 compiled module sitting next to the marker, so
-        # refusing the marker protects nothing and breaks the sharing.
+        # A group member can already replace the 0644 module beside the marker.
         if not (directory_stat.st_mode & 0o020):
             return False
         try:
@@ -1495,12 +1478,8 @@ pass
 
 
 def _gpt_oss_replace_marker(marker_path, desired_flavor):
-    """Land the marker by replacing the name, for platforms with no O_NOFOLLOW.
-
-    mkstemp creates a fresh private file nobody else has a name for, and os.replace
-    swaps it into place, so a link sitting at `marker_path` is replaced rather than
-    written through. No check-then-open window to lose.
-    """
+    """Land the marker by replacing the name: mkstemp then os.replace, so a link
+    sitting at `marker_path` is replaced rather than written through."""
     import tempfile
     directory = os.path.dirname(marker_path) or "."
     descriptor, temporary_path = tempfile.mkstemp(
@@ -1524,16 +1503,14 @@ pass
 def _gpt_oss_write_marker(loc, desired_flavor):
     """Write the flavor marker without following a link out of `loc`.
 
-    Same flag set as `compiler._write_bytes_durably`, for the same reasons: a FIFO
-    planted here would otherwise block the model load forever waiting for a reader,
-    and one with a reader attached would swallow the marker, leaving the flavor
-    silently unrecorded. A trusted directory can still be group-writable by design.
+    Same flags as `compiler._write_bytes_durably`: O_NONBLOCK because a planted FIFO
+    would otherwise block the load forever, S_ISREG because one with a reader
+    attached opens fine and would swallow the marker instead.
     """
     marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not no_follow:
-        # No atomic no-follow open on this platform, and an lstat first would only be
-        # a time of check. Land on the name instead of through it.
+        # No atomic no-follow open here, and an lstat first is only a time of check.
         return _gpt_oss_replace_marker(marker_path, desired_flavor)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= no_follow
@@ -1593,21 +1570,17 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
     missing marker the stale module is dropped for the compiler to regenerate."""
     try:
         locations = _gpt_oss_cache_locations()
-        # Per location, never global: a candidate is judged on its own module and its
-        # own marker. Marking every location stale because one of them is lets anyone
-        # who can create the predictable temp candidate delete a valid primary cache on
-        # every single load, which is a denial of service rather than a safety measure.
+        # Per location, never global: marking all of them stale because one is lets
+        # anyone who can create the predictable temp candidate delete a valid primary
+        # cache on every load.
         stale = []
         for loc in locations:
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
                 continue
             if not _gpt_oss_cache_location_is_trusted(loc):
-                # We refuse to write a marker here, so any marker found is not ours,
-                # and the compiler applies no such gate when it imports the module
-                # next to it. Regenerate rather than trust what a rejected directory
-                # claims the flavor is. Only this location, though: removal here will
-                # usually fail anyway, and that is the correct outcome.
+                # Any marker here is not ours, and the compiler imports the module
+                # beside it with no such gate, so do not trust what it claims.
                 stale.append(loc)
                 continue
             on_disk = None
@@ -1626,8 +1599,7 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
         for idx, loc in enumerate(locations):
             if idx != 0 and not os.path.isdir(loc):
                 continue
-            # Skip silently rather than write into a directory another user owns or
-            # can write, and never follow a link out of it.
+            # Never write into a directory the sharing group does not already trust.
             if not _gpt_oss_cache_location_is_trusted(loc):
                 continue
             try:

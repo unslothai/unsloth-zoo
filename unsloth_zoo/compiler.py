@@ -1539,20 +1539,14 @@ pass
 def _write_bytes_durably(location, new_write_bytes):
     """Write and fsync, refusing to follow a link out of the compiled cache.
 
-    The cache path is predictable and so are the generated module names, so on a
-    shared temp directory another local user can plant a symlink at one of them and
-    have this write land on whatever it points at. O_NOFOLLOW turns that into an
-    OSError, which sends the caller to _replace_compiled_cache_file; that helper
-    replaces the link itself via mkstemp plus os.replace rather than writing through
-    it, so the in-place fast path is given up only when it is unsafe. The fstat
-    re-checks what was actually opened, since O_NOFOLLOW says nothing about a FIFO or
-    a device node. Buffered, so a short write is retried rather than lost.
-
-    Where the constant does not exist at all (Windows) there is no atomic no-follow
-    open to be had, and an lstat first is only a time of check: the entry can become
-    a link before O_TRUNC destroys what it points at. So the in-place path is not
-    attempted there at all, and every write goes through the replacement helper,
-    which lands on the name rather than through it.
+    The cache path and the generated module names are both predictable, so a
+    co-located user can plant a symlink at one. O_NOFOLLOW turns that into an
+    OSError, which sends the caller to _replace_compiled_cache_file, and that lands
+    on the name rather than through it; the in-place path is given up only when it is
+    unsafe. The fstat is needed too, since O_NOFOLLOW says nothing about a FIFO or a
+    device node. Where the constant does not exist (Windows) there is no atomic
+    no-follow open and an lstat first is only a time of check, so the in-place path
+    is not attempted at all.
     """
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not no_follow:
@@ -1560,8 +1554,7 @@ def _write_bytes_durably(location, new_write_bytes):
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= no_follow
     flags |= getattr(os, "O_BINARY", 0)
-    # Without this, opening a FIFO planted at the cache path blocks forever waiting
-    # for a reader, which turns the same plant into a hang instead of a bad write.
+    # A FIFO planted here would otherwise block forever waiting for a reader.
     flags |= getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(location, flags, 0o644)
     try:

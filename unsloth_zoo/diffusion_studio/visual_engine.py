@@ -201,13 +201,9 @@ def _canvas_maxtok(maxtok):
 
 
 def _replace_request_file(req_path, req):
-    """Land the request by replacing the name, for platforms with no O_NOFOLLOW.
-
-    mkstemp creates a fresh 0600 file nobody else has a name for, and os.replace swaps
-    it into place, so a link planted at `req_path` is replaced rather than written
-    through. Kept local rather than imported from unsloth_zoo.compiler, which would
-    pull torch into the diffusion path.
-    """
+    """Land the request by replacing the name: mkstemp then os.replace, so a link
+    planted at `req_path` is replaced rather than written through. Local rather than
+    imported from unsloth_zoo.compiler, which would pull torch into this path."""
     directory = os.path.dirname(req_path) or "."
     descriptor, temporary_path = tempfile.mkstemp(
         prefix = f".{os.path.basename(req_path)}.", suffix = ".tmp", dir = directory,
@@ -234,10 +230,9 @@ class VisualServer:
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-        # /dev/shm and /tmp are mode 1777, so a PID-derived name there is readable by
-        # every local user and can be pre-empted with a symlink planted ahead of time
-        # (PIDs are enumerable, and the same path is reused for every request). Give
-        # each server its own 0700 directory with an unpredictable name instead.
+        # /dev/shm and /tmp are 1777 and PIDs are enumerable, so a PID-derived name
+        # there is world readable and can be pre-empted. Give each server its own
+        # 0700 directory with an unpredictable name instead.
         self._req_dir = None
         if req_path:
             self.req = req_path
@@ -285,17 +280,12 @@ class VisualServer:
         # for schema-correct <|tool_call> args.
         if tools:
             req["tools"] = tools
-        # O_NOFOLLOW and 0600: the request body carries the whole conversation, so it
-        # must not be written through a link nor left world readable.
-        # O_NONBLOCK so an explicit req_path pointing at a FIFO fails the request
-        # instead of blocking the server forever waiting for a reader. It is a no-op
-        # on the regular file the default path always is. It does NOT refuse a FIFO
-        # whose read end is already held open, which succeeds and would hand the whole
-        # conversation to whoever holds it, so the fstat below is what refuses that.
+        # The request body carries the whole conversation: no link, not world
+        # readable, and no FIFO. O_NONBLOCK refuses one with no reader; one whose read
+        # end is already held open opens fine, so the fstat is what refuses that.
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         if not no_follow:
-            # No atomic no-follow open here (Windows), and an lstat first would only
-            # be a time of check, so land on the name instead of through it.
+            # No atomic no-follow open here, and an lstat first is only a time of check.
             _replace_request_file(self.req, req)
         else:
             flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
@@ -328,8 +318,7 @@ class VisualServer:
         except Exception:
             self.p.kill()
         finally:
-            # The request file outlived the process before this, leaving the last
-            # conversation on disk in a shared directory.
+            # The request file used to outlive the process, in a shared directory.
             if self._req_dir is not None:
                 shutil.rmtree(self._req_dir, ignore_errors = True)
                 self._req_dir = None

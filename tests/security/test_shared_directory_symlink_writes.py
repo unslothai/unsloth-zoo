@@ -16,11 +16,8 @@
 
 """Writes into predictable shared directories must not follow a planted link.
 
-Three sites write to a path another local user can guess ahead of time:
-the compiled-cache module file, the gpt-oss flavor marker, and the
-diffusion-studio request body. A symlink planted at any of them used to be
-followed, giving a co-located user a truncate-and-overwrite of any file the
-victim could write.
+The compiled-cache module file, the gpt-oss flavor marker and the diffusion-studio
+request body are all at paths another local user can guess ahead of time.
 """
 
 import os
@@ -41,8 +38,6 @@ def victim_file(tmp_path):
     path.write_text("do not overwrite me")
     return path
 
-
-# ---------------------------------------------------------------- compiler.py
 
 
 def test_compiled_cache_write_does_not_follow_a_symlink(tmp_path, victim_file):
@@ -86,8 +81,8 @@ def no_o_nofollow(monkeypatch):
 def test_compiled_cache_write_refuses_a_symlink_without_o_nofollow(
     tmp_path, victim_file, no_o_nofollow,
 ):
-    """Windows has no O_NOFOLLOW, so the flag silently becomes 0 and O_TRUNC would
-    truncate the victim before the fstat ever runs."""
+    """Windows has no O_NOFOLLOW, so the flag becomes 0 and O_TRUNC would truncate
+    the victim before the fstat runs."""
     from unsloth_zoo.compiler import _write_compiled_cache_file
 
     cache = tmp_path / "unsloth_compiled_cache"
@@ -159,8 +154,6 @@ def test_compiled_cache_write_still_writes_an_ordinary_file(tmp_path):
     assert target.read_bytes() == b"x = 2\n"
 
 
-# -------------------------------------------- temporary_patches/gpt_oss.py
-
 
 def test_gpt_oss_marker_skips_a_foreign_owned_cache_directory(tmp_path, monkeypatch):
     """`os.path.isdir` is satisfied by one mkdir from any local user."""
@@ -181,11 +174,8 @@ def test_gpt_oss_marker_skips_a_foreign_owned_cache_directory(tmp_path, monkeypa
 
 
 def test_gpt_oss_rejected_candidate_does_not_invalidate_a_good_cache(tmp_path, monkeypatch):
-    """One planted candidate must not delete the cache in every other location.
-
-    The temp candidate is a predictable path anyone can create first. Treating it as
-    evidence about the primary cache let them force a recompile on every load.
-    """
+    """One planted candidate must not delete the cache in every other location:
+    the temp path is predictable, so anyone can create it first."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     primary = tmp_path / "unsloth_compiled_cache"
@@ -211,12 +201,8 @@ def test_gpt_oss_rejected_candidate_does_not_invalidate_a_good_cache(tmp_path, m
 
 
 def test_gpt_oss_marker_survives_a_group_writable_cache(tmp_path, monkeypatch):
-    """umask 002 makes the library's own cache 0775, and that must keep working.
-
-    Group write is a deliberate sharing choice and the compiled module next to the
-    marker is written 0644 into that same directory anyway. Refusing it here bought
-    nothing and silently stopped the flavor ever being recorded.
-    """
+    """umask 002 makes the library's own cache 0775, and that must keep working:
+    the module beside the marker is 0644 in that same directory anyway."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     parent = tmp_path / "shared"
@@ -233,17 +219,13 @@ def test_gpt_oss_marker_survives_a_group_writable_cache(tmp_path, monkeypatch):
 
 
 def test_gpt_oss_marker_skips_a_cache_owned_by_another_user(tmp_path, monkeypatch):
-    """The attacker's `mkdir /tmp/unsloth_compiled_cache` case, by ownership.
-
-    0755, so it is not shared with our group either: someone else's directory that
-    we were never invited into.
-    """
+    """The attacker's `mkdir /tmp/unsloth_compiled_cache` case, by ownership. 0755,
+    so not shared with our group either."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     cache = tmp_path / "unsloth_compiled_cache"
     cache.mkdir(mode = 0o755)
-    # A directory we cannot create as an unprivileged test: pretend to be someone else.
-    # The real euid is captured FIRST; a lambda calling os.geteuid() after the patch
+    # Capture the real euid FIRST: a lambda calling os.geteuid() after the patch
     # calls itself, and the RecursionError is swallowed into a False that looks like
     # the answer under test.
     other_uid = os.geteuid() + 1
@@ -256,12 +238,9 @@ def test_gpt_oss_marker_skips_a_cache_owned_by_another_user(tmp_path, monkeypatc
 
 
 def test_gpt_oss_keeps_a_group_shared_cache_built_by_another_user(tmp_path, monkeypatch):
-    """User B must not destroy user A's module in a cache shared with their group.
-
-    A 0775 cache is owned by whoever built it first, so for everyone else it fails an
-    ownership test while still being exactly the shared cache they were given write
-    access to. Rejecting it made every load unlink the module and recompile.
-    """
+    """User B must not destroy user A's module in a cache shared with their group:
+    a 0775 cache is owned by whoever built it first, so everyone else fails an
+    ownership test on the very cache they were given write access to."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     cache = tmp_path / "unsloth_compiled_cache"
@@ -286,13 +265,8 @@ def test_gpt_oss_keeps_a_group_shared_cache_built_by_another_user(tmp_path, monk
 
 
 def test_gpt_oss_untrusted_cache_still_forces_regeneration(tmp_path, monkeypatch):
-    """Refusing to write a marker must not also mean trusting the stale module.
-
-    The compiler applies no trust gate when it loads
-    `unsloth_compiled_module_gpt_oss.py`, so a cache directory we decline to write
-    into is still one we will import from. Ignoring it in the mismatch scan would
-    let a bnb4bit <-> stock switch reinstall the wrong router/experts layout.
-    """
+    """Refusing to write a marker must not also mean trusting the stale module: the
+    compiler applies no such gate when it imports from that same directory."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     cache = tmp_path / "unsloth_compiled_cache"
@@ -323,13 +297,9 @@ def test_gpt_oss_marker_write_does_not_follow_a_symlink(tmp_path, victim_file):
 
 
 def test_gpt_oss_marker_write_refuses_a_fifo(tmp_path):
-    """A planted FIFO must not block the model load, nor silently eat the marker.
-
-    A trusted cache can still be group-writable, so a group member can create this
-    entry. Without O_NONBLOCK the open waits for a reader forever; with a reader
-    attached it succeeds and the flavor is never recorded, which is the silent
-    version of the same defect.
-    """
+    """A planted FIFO must not block the load, nor silently eat the marker: without
+    O_NONBLOCK the open waits for a reader forever, and with one attached it succeeds
+    and the flavor is never recorded."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     cache = tmp_path / "cache"
@@ -370,11 +340,8 @@ def test_visual_server_request_write_refuses_to_block_on_a_fifo(monkeypatch, tmp
 
 
 def test_visual_server_request_refuses_a_fifo_someone_is_reading(monkeypatch, tmp_path):
-    """O_NONBLOCK only refuses a FIFO with NO reader.
-
-    Held open for reading, the open succeeds and the whole conversation would go to
-    whoever is holding it, so only the fstat refuses this one.
-    """
+    """O_NONBLOCK only refuses a FIFO with NO reader: held open for reading the open
+    succeeds, and only the fstat refuses this one."""
     import threading
     import unsloth_zoo.diffusion_studio.visual_engine as visual_engine
 
@@ -427,8 +394,6 @@ def test_gpt_oss_marker_is_written_into_a_directory_we_own(tmp_path, monkeypatch
     assert marker.read_text() == "bnb4bit"
     assert stat.S_IMODE(os.stat(marker).st_mode) & 0o077 == 0
 
-
-# ------------------------------------ diffusion_studio/visual_engine.py
 
 
 def test_visual_server_request_path_is_private_and_unpredictable(monkeypatch, tmp_path):
