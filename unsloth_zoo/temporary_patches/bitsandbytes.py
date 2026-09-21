@@ -77,15 +77,18 @@ def _packed_weight_without_quant_state_error(module):
     except Exception:
         transformers_version = "unknown"
     shape = tuple(module.weight.shape)
+    # The cause belongs in the version-specific branch below, never here. This function
+    # inspects the module, never the checkpoint, so "lost while loading" is a claim it
+    # cannot make: a checkpoint whose sidecars really are absent reaches this same line.
     head = (
         f"Unsloth: a bitsandbytes Linear4bit still holds its PACKED 4-bit weight "
         f"(shape {shape}, dtype {module.weight.dtype}) but has no quant_state, so it "
-        f"cannot be dequantized. The quantization metadata was lost while loading, not "
-        f"while saving."
+        f"cannot be dequantized. Its quantization metadata is missing."
     )
     if _transformers_drops_prequantized_quant_state():
         return (
-            f"{head}\nThis is transformers=={transformers_version}: releases 5.4.0 and "
+            f"{head} It was lost while LOADING, not while saving.\n"
+            f"This is transformers=={transformers_version}: releases 5.4.0 and "
             f"5.5.0 to 5.5.4 discard the quant_state sidecar tensors of pre-quantized "
             f"composite (multimodal) checkpoints. Introduced by transformers PR #44300, "
             f"fixed by PR #45567 in 5.6.0. Install transformers>=5.6.0, or fall back to "
