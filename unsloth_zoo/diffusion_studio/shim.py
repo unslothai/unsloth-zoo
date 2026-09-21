@@ -260,10 +260,12 @@ def _max_blocks(body):
         mt = int(mt)
     except (TypeError, ValueError):
         mt = 2048
-    # Clamped: the decoder is single-sequence and the request holds _LOCK for the
-    # whole generation, so an unbounded max_tokens is the whole server for as long
-    # as the caller likes. DG_MAX_BLOCKS raises it, read at the call so Studio can
-    # set it after import.
+    # Clamped so a request cannot name an arbitrary block count. This is a size
+    # bound and not a deadline, and it is not what stops a long generation: the
+    # server answers anything over its own per-turn budget with ERR toolong, and
+    # an explicit --maxtok is already capped at 8192 (32 blocks) by _canvas_maxtok,
+    # below this ceiling. It binds only against an auto-sized budget above 16384.
+    # DG_MAX_BLOCKS raises it, read at the call so Studio can set it after import.
     try:
         ceiling = max(1, int(os.environ.get("DG_MAX_BLOCKS", "").strip()))
     except ValueError:
