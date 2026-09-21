@@ -4400,9 +4400,13 @@ if converter:
     # A symlinked converter has two directories and each slot wants its own: the
     # entrypoint self-locates through `__file__` (the link), while CPython prepends
     # the script's directory "if it's a symbolic link, resolve symbolic links"
-    # (sys.path docs).
+    # (sys.path docs). That resolution is POSIX only -- measured on windows-latest,
+    # a script reached through a link keeps the LINK's directory at sys.path[0] --
+    # so asking realpath there would model a slot the real run does not have.
     converter_dir = os.path.dirname(os.path.abspath(converter))
-    script_dir = os.path.dirname(os.path.realpath(converter))
+    script_dir = os.path.dirname(
+        os.path.abspath(converter) if os.name == "nt" else os.path.realpath(converter)
+    )
     if "NO_LOCAL_GGUF" not in os.environ:
         sys.path.insert(1 if converter_safe else 0,
                         os.path.join(converter_dir, "gguf-py"))

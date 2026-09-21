@@ -392,7 +392,10 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
         stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
     )
     actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
-    assert actual.startswith(str(resolved_gguf)), f"the converter itself resolved {actual}"
+    # Which side wins is the platform's business and differs: POSIX resolves the
+    # link for sys.path[0], Windows keeps the link's own directory. Derived from
+    # the run rather than asserted, so the test pins agreement, not a platform.
+    assert actual.startswith((str(resolved_gguf), str(linkdir))), actual
 
     probe_env = dict(env)
     probe_env["PYTHONSAFEPATH"] = "1"
