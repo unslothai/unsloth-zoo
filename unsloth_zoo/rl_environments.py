@@ -1146,6 +1146,48 @@ _OPENENV_CHILDREN = {}
 # WNOHANG waitpid does not block, so holding the lock across poll() is cheap.
 _OPENENV_CHILDREN_LOCK = threading.Lock()
 
+# Endpoints a launch has claimed but not yet spawned a child onto. The lock makes
+# each registry operation atomic, which is not the same as making
+# check-then-spawn-then-register atomic: two threads could both find one port
+# closed, both spawn, and the later registration would drop the earlier child,
+# leaving a bound uvicorn nobody tracks while the other launch adopted it. A
+# reservation is what the availability check alone cannot express, since the
+# endpoint is not yet open and no child record exists for it.
+_OPENENV_RESERVED = set()
+
+
+def _reserve_openenv_endpoint(client_host, port):
+    """ Claim this endpoint for the caller, or report that someone already has. """
+    with _OPENENV_CHILDREN_LOCK:
+        key = (client_host, port)
+        if key in _OPENENV_RESERVED or key in _OPENENV_CHILDREN:
+            return False
+        _OPENENV_RESERVED.add(key)
+        return True
+pass
+
+
+def _register_openenv_child(client_host, port, child):
+    """ Hand the endpoint over from the reservation to the child now holding it. """
+    with _OPENENV_CHILDREN_LOCK:
+        _OPENENV_CHILDREN[(client_host, port)] = child
+        _OPENENV_RESERVED.discard((client_host, port))
+pass
+
+
+def _release_openenv_endpoint(client_host, port, child = None):
+    """ Give the endpoint up, removing the child record only if it is still `child`.
+
+    Compare-and-delete, because an unconditional pop removes whatever is stored,
+    which after a lost spawn race is another launch's live child.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        key = (client_host, port)
+        _OPENENV_RESERVED.discard(key)
+        if child is not None and _OPENENV_CHILDREN.get(key, None) is child:
+            _OPENENV_CHILDREN.pop(key, None)
+pass
+
 
 def _reap_exited_openenv_children():
     """ Drop and reap every registered child that has already exited.
@@ -1272,24 +1314,35 @@ def launch_openenv(
             if trials == 30:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
             continue
+        # A closed port says nothing about another thread of ours already being
+        # on its way to binding it, so claim the endpoint before spawning.
+        if not _reserve_openenv_endpoint(client_host, port):
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
-        openenv_child = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", server, "--host", host, "--port", str(port)],
-            env = environment,
-            stdout = subprocess.PIPE,
-            stderr = subprocess.PIPE,
-            text = True,
-            cwd = working_directory,
-        )
-        with _OPENENV_CHILDREN_LOCK:
-            _OPENENV_CHILDREN[(client_host, port)] = openenv_child
+        try:
+            openenv_child = subprocess.Popen(
+                [sys.executable, "-m", "uvicorn", server, "--host", host, "--port", str(port)],
+                env = environment,
+                stdout = subprocess.PIPE,
+                stderr = subprocess.PIPE,
+                text = True,
+                cwd = working_directory,
+            )
+        except BaseException:
+            # Otherwise the reservation outlives the call and blocks the endpoint
+            # for the rest of the process.
+            _release_openenv_endpoint(client_host, port)
+            raise
+        _register_openenv_child(client_host, port, openenv_child)
         # Wait until port is open
         wait_trials = 0
         while not is_port_open(client_host, port):
             # A child that died cannot be the one that opens this port later.
             if openenv_child.poll() is not None:
-                with _OPENENV_CHILDREN_LOCK:
-                    _OPENENV_CHILDREN.pop((client_host, port), None)
+                _release_openenv_endpoint(client_host, port, openenv_child)
                 break
             time.sleep(0.01)
             if wait_trials % 10 == 0:

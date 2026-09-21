@@ -196,9 +196,12 @@ def foreign_listener():
 def no_leaked_children():
     """The launcher's registry is a module global, so isolate it per test."""
     registry = getattr(rl_env, "_OPENENV_CHILDREN", None)
-    if registry is not None: registry.clear()
+    reserved = getattr(rl_env, "_OPENENV_RESERVED", None)
+    for state in (registry, reserved):
+        if state is not None: state.clear()
     yield
-    if registry is not None: registry.clear()
+    for state in (registry, reserved):
+        if state is not None: state.clear()
 
 
 class _DeadChild:
@@ -590,3 +593,74 @@ def test_a_liveness_check_cannot_delete_another_threads_live_child():
     checker.start(); replacer.start()
     checker.join(); replacer.join()
     assert rl_env._OPENENV_CHILDREN.get(endpoint) is replacement
+
+
+def test_a_second_thread_cannot_spawn_onto_a_claimed_endpoint(monkeypatch, tmp_path):
+    """A closed port does not mean no launch of ours is already heading for it."""
+    port = 55000
+    bound = set()
+    spawned = []
+
+    class _Binding:
+        """Wins the port only if nothing has bound it yet, as uvicorn does."""
+        def __init__(self, prt):
+            self.won = prt not in bound
+            if self.won: bound.add(prt)
+        def poll(self): return None if self.won else 1
+
+    def fake_popen(argv, **kwargs):
+        child = _Binding(int(argv[argv.index("--port") + 1]))
+        spawned.append(child)
+        return child
+
+    ports = iter([port, 55101, 55102, 55103])
+    monkeypatch.setattr(rl_env, "subprocess", types.SimpleNamespace(
+        Popen = fake_popen, PIPE = subprocess.PIPE,
+    ))
+    monkeypatch.setattr(rl_env, "random", types.SimpleNamespace(
+        randint = lambda low, high: next(ports, 55999),
+    ))
+    monkeypatch.setattr(rl_env, "is_port_open", lambda host, prt: prt in bound)
+    monkeypatch.setattr(rl_env, "requests", types.SimpleNamespace(
+        get = lambda url, **kwargs: types.SimpleNamespace(content = b"healthy"),
+    ))
+    monkeypatch.setattr(rl_env, "time", types.SimpleNamespace(sleep = lambda seconds: None))
+
+    # Thread A has claimed the endpoint and is mid-spawn. A second launch that
+    # picks the same port must step aside rather than spawn a rival onto it.
+    assert rl_env._reserve_openenv_endpoint("127.0.0.1", port)
+    chosen, client = rl_env.launch_openenv(
+        working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
+    )
+    assert chosen != port, "the second launch spawned onto a claimed endpoint"
+    assert ("127.0.0.1", chosen) in rl_env._OPENENV_CHILDREN
+    # A's claim is untouched, and no child was ever spawned on it.
+    assert ("127.0.0.1", port) in rl_env._OPENENV_RESERVED
+
+
+def test_abandoning_a_child_does_not_delete_another_launchs_record():
+    """The dead-child path popped whatever was stored, not what it polled."""
+    endpoint = ("127.0.0.1", 54000)
+    other_live = _LiveChild()
+    rl_env._OPENENV_CHILDREN[endpoint] = other_live
+    rl_env._release_openenv_endpoint(*endpoint, child = _DeadChild())
+    assert rl_env._OPENENV_CHILDREN.get(endpoint) is other_live
+    # Our own record, though, is removed.
+    mine = _DeadChild()
+    rl_env._OPENENV_CHILDREN[endpoint] = mine
+    rl_env._release_openenv_endpoint(*endpoint, child = mine)
+    assert endpoint not in rl_env._OPENENV_CHILDREN
+
+
+def test_a_failed_spawn_does_not_strand_the_reservation(monkeypatch, tmp_path):
+    """A leaked claim would block that endpoint for the rest of the process."""
+    def boom(argv, **kwargs): raise OSError(12, "Cannot allocate memory")
+    monkeypatch.setattr(rl_env, "subprocess", types.SimpleNamespace(
+        Popen = boom, PIPE = subprocess.PIPE,
+    ))
+    monkeypatch.setattr(rl_env, "random", types.SimpleNamespace(randint = lambda low, high: 56000))
+    monkeypatch.setattr(rl_env, "is_port_open", lambda host, port: False)
+    monkeypatch.setattr(rl_env, "time", types.SimpleNamespace(sleep = lambda seconds: None))
+    with pytest.raises(OSError):
+        rl_env.launch_openenv(working_directory = str(tmp_path), openenv_class = _DummyClient)
+    assert rl_env._OPENENV_RESERVED == set()
