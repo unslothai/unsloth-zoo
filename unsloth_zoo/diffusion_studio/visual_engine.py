@@ -263,8 +263,14 @@ class VisualServer:
         # O_NONBLOCK so an explicit req_path pointing at a FIFO fails the request
         # instead of blocking the server forever waiting for a reader. It is a no-op
         # on the regular file the default path always is.
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            # Windows has no O_NOFOLLOW; without this the conversation is written
+            # through whatever link is sitting at the path.
+            from unsloth_zoo.compiler import _refuse_a_link_without_o_nofollow
+            _refuse_a_link_without_o_nofollow(self.req)
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= no_follow
         flags |= getattr(os, "O_NONBLOCK", 0)
         descriptor = os.open(self.req, flags, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as f:

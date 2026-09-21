@@ -77,6 +77,45 @@ def test_compiled_cache_write_refuses_a_fifo(tmp_path):
     assert target.read_bytes() == b"generated = 1\n"
 
 
+@pytest.fixture
+def no_o_nofollow(monkeypatch):
+    """Present the interpreter Windows presents: no O_NOFOLLOW constant at all."""
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising = False)
+
+
+def test_compiled_cache_write_refuses_a_symlink_without_o_nofollow(
+    tmp_path, victim_file, no_o_nofollow,
+):
+    """Windows has no O_NOFOLLOW, so the flag silently becomes 0 and O_TRUNC would
+    truncate the victim before the fstat ever runs."""
+    from unsloth_zoo.compiler import _write_compiled_cache_file
+
+    cache = tmp_path / "unsloth_compiled_cache"
+    cache.mkdir()
+    planted = cache / "UnslothSFTTrainer.py"
+    os.symlink(victim_file, planted)
+
+    _write_compiled_cache_file(str(planted), b"generated = 1\n")
+
+    assert victim_file.read_text() == "do not overwrite me"
+    assert not os.path.islink(planted)
+    assert planted.read_bytes() == b"generated = 1\n"
+
+
+def test_gpt_oss_marker_write_refuses_a_symlink_without_o_nofollow(
+    tmp_path, victim_file, no_o_nofollow,
+):
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    cache = tmp_path / "cache"
+    cache.mkdir(mode = 0o700)
+    os.symlink(victim_file, cache / gpt_oss._GPT_OSS_FLAVOR_MARKER)
+
+    with pytest.raises(OSError):
+        gpt_oss._gpt_oss_write_marker(str(cache), "stock")
+    assert victim_file.read_text() == "do not overwrite me"
+
+
 def test_compiled_cache_write_still_writes_an_ordinary_file(tmp_path):
     from unsloth_zoo.compiler import _write_compiled_cache_file
 
@@ -129,18 +168,56 @@ def test_gpt_oss_marker_survives_a_group_writable_cache(tmp_path, monkeypatch):
 
 
 def test_gpt_oss_marker_skips_a_cache_owned_by_another_user(tmp_path, monkeypatch):
-    """The attacker's `mkdir /tmp/unsloth_compiled_cache` case, by ownership."""
+    """The attacker's `mkdir /tmp/unsloth_compiled_cache` case, by ownership.
+
+    0755, so it is not shared with our group either: someone else's directory that
+    we were never invited into.
+    """
     from unsloth_zoo.temporary_patches import gpt_oss
 
     cache = tmp_path / "unsloth_compiled_cache"
     cache.mkdir(mode = 0o755)
     # A directory we cannot create as an unprivileged test: pretend to be someone else.
-    monkeypatch.setattr(gpt_oss.os, "geteuid", lambda: os.geteuid() + 1)
+    # The real euid is captured FIRST; a lambda calling os.geteuid() after the patch
+    # calls itself, and the RecursionError is swallowed into a False that looks like
+    # the answer under test.
+    other_uid = os.geteuid() + 1
+    monkeypatch.setattr(gpt_oss.os, "geteuid", lambda: other_uid)
 
     monkeypatch.setattr(gpt_oss, "_gpt_oss_cache_locations", lambda: [str(cache)])
     gpt_oss._sync_gpt_oss_compiled_flavor("stock")
 
     assert not (cache / gpt_oss._GPT_OSS_FLAVOR_MARKER).exists()
+
+
+def test_gpt_oss_keeps_a_group_shared_cache_built_by_another_user(tmp_path, monkeypatch):
+    """User B must not destroy user A's module in a cache shared with their group.
+
+    A 0775 cache is owned by whoever built it first, so for everyone else it fails an
+    ownership test while still being exactly the shared cache they were given write
+    access to. Rejecting it made every load unlink the module and recompile.
+    """
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    cache = tmp_path / "unsloth_compiled_cache"
+    cache.mkdir(mode = 0o775)
+    os.chmod(cache, 0o775)
+    module = cache / (gpt_oss._GPT_OSS_COMPILED_MODULE + ".py")
+    module.write_text("# built by user A\n")
+    (cache / gpt_oss._GPT_OSS_FLAVOR_MARKER).write_text("stock")
+
+    # We are user B: same group, write access, not the owner.
+    other_uid = os.geteuid() + 1
+    monkeypatch.setattr(gpt_oss.os, "geteuid", lambda: other_uid)
+    monkeypatch.setattr(gpt_oss, "_gpt_oss_cache_locations", lambda: [str(cache)])
+    assert os.lstat(cache).st_gid in set(os.getgroups()) | {os.getgid()}, (
+        "the fixture cannot model a group-shared cache on this runner"
+    )
+
+    gpt_oss._sync_gpt_oss_compiled_flavor("stock")
+
+    assert module.exists(), "a group member deleted the shared compiled module"
+    assert (cache / gpt_oss._GPT_OSS_FLAVOR_MARKER).read_text() == "stock"
 
 
 def test_gpt_oss_untrusted_cache_still_forces_regeneration(tmp_path, monkeypatch):

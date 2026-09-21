@@ -1455,6 +1455,14 @@ def _gpt_oss_cache_location_is_trusted(loc):
     flavor invalidation for every umask 002 machine, which is the default on plenty
     of shared systems and would leave a stale module reinstalling the wrong
     router/experts layout.
+
+    A group-shared cache is owned by whoever built it first, so ownership alone is
+    the wrong question: for user B the directory is user A's, and rejecting it there
+    made B force-regenerate on every load and unlink A's module with the group write
+    bit it was given on purpose. What the write actually needs is that everyone who
+    can create an entry here is someone the sharing group already trusts, which is
+    ownership OR group-write to a group we are in. A world-writable directory is
+    nobody's deliberate sharing choice and is still refused.
     """
     try:
         directory_stat = os.lstat(loc)
@@ -1467,10 +1475,20 @@ def _gpt_oss_cache_location_is_trusted(loc):
             return False
         if os.name != "posix":
             return True
-        if directory_stat.st_uid != os.geteuid():
+        if directory_stat.st_mode & 0o002:
             return False
-        # World-writable is never a deliberate sharing choice, group-writable is.
-        return not (directory_stat.st_mode & 0o002)
+        if directory_stat.st_uid == os.geteuid():
+            return True
+        # Someone else's directory, shared with a group we belong to. They could
+        # already replace the 0644 compiled module sitting next to the marker, so
+        # refusing the marker protects nothing and breaks the sharing.
+        if not (directory_stat.st_mode & 0o020):
+            return False
+        try:
+            groups = set(os.getgroups()) | {os.getgid(), os.getegid()}
+        except Exception:
+            return False
+        return directory_stat.st_gid in groups
     except Exception:
         return False
 pass
@@ -1484,10 +1502,18 @@ def _gpt_oss_write_marker(loc, desired_flavor):
     and one with a reader attached would swallow the marker, leaving the flavor
     silently unrecorded. A trusted directory can still be group-writable by design.
     """
+    marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        # Windows has no O_NOFOLLOW, so without this the write follows the link.
+        # Absolute, like the compile_cache import above: a relative one resolves
+        # against temporary_patches/ under transformers' custom_object_save.
+        from unsloth_zoo.compiler import _refuse_a_link_without_o_nofollow
+        _refuse_a_link_without_o_nofollow(marker_path)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= no_follow
     flags |= getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), flags, 0o600)
+    descriptor = os.open(marker_path, flags, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise OSError(f"Unsloth: refusing to write the gpt-oss flavor marker in `{loc}`: not a regular file.")
