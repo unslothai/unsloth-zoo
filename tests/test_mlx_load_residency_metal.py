@@ -14,7 +14,8 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason = "Requires 
 import sys
 
 import mlx.nn as nn
-from unsloth_zoo.mlx.loader import _finish_load
+from mlx.utils import tree_flatten
+from unsloth_zoo.mlx.loader import _MLXQuantizationSpec, _apply_mlx_quantization, _finish_load
 
 _SIDES = (2048, 1024, 512)
 _BYTES = sum(side * side * 4 for side in _SIDES)
@@ -40,6 +41,35 @@ def _lazy_model(tmp_path):
     for i, layer in enumerate(model.layers):
         layer.update({"weight": mapped[str(i)]})
     return model
+
+
+def test_runtime_quantization_reads_each_weight_before_its_kernel(tmp_path, monkeypatch):
+    """A quantize kernel evaluated while its source is still being read keeps a GPU command
+    buffer waiting on the disk: by then, reading each source must allocate nothing."""
+    quantize, evaluate = mx.quantize, mx.eval
+    pending, reads = {}, []
+
+    def recording_quantize(weight, *args, **kwargs):
+        quantized = quantize(weight, *args, **kwargs)
+        pending[id(quantized[0])] = (quantized[0], weight)  # held, so the id is never reused
+        return quantized
+
+    def checking_eval(*arrays):
+        for _, array in tree_flatten(list(arrays)):
+            _, source = pending.pop(id(array), (None, None))
+            if source is not None:
+                before = mx.get_active_memory()
+                evaluate(source)
+                reads.append(mx.get_active_memory() - before)
+        return evaluate(*arrays)
+
+    model = _lazy_model(tmp_path)
+    monkeypatch.setattr(mx, "quantize", recording_quantize)
+    monkeypatch.setattr(mx, "eval", checking_eval)
+    spec = _MLXQuantizationSpec(enabled = True, bits = 4, group_size = 64)
+    model, _ = _apply_mlx_quantization(model, {}, spec, is_vlm = False)
+    mx.eval(model.parameters())  # as the load branches do after quantizing
+    assert len(reads) == len(_SIDES) and not any(reads), reads
 
 
 def test_finish_load_returns_resident_weights(tmp_path):
