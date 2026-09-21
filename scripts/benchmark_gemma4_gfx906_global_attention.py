@@ -57,7 +57,31 @@ def make_inputs(seq_len, dtype, seed):
     return q, k, v, grad
 
 
-def run_once(backend, seq_len, dtype, scale, seed, *, measure):
+def load_triton_attention():
+    """Load the private kernel once, before warmup and measured timing."""
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "unsloth_zoo"
+        / "temporary_patches"
+        / "_gemma4_gfx906_global_kernels.py"
+    )
+    spec = importlib.util.spec_from_file_location("_gemma4_gfx906_bench_kernel", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.gemma4_gfx906_global_attention
+
+
+def run_once(
+    backend,
+    seq_len,
+    dtype,
+    scale,
+    seed,
+    *,
+    measure,
+    triton_attention=None,
+):
     q, k, v, grad = make_inputs(seq_len, dtype, seed)
     if measure:
         torch.cuda.empty_cache()
@@ -78,21 +102,8 @@ def run_once(backend, seq_len, dtype, scale, seed, *, measure):
             enable_gqa=True,
         )
     else:
-        # Load the private kernel file directly so benchmark stdout stays valid
-        # JSON and is not polluted by Unsloth package startup banners.
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "unsloth_zoo"
-            / "temporary_patches"
-            / "_gemma4_gfx906_global_kernels.py"
-        )
-        spec = importlib.util.spec_from_file_location("_gemma4_gfx906_bench_kernel", path)
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        gemma4_gfx906_global_attention = module.gemma4_gfx906_global_attention
-
-        out = gemma4_gfx906_global_attention(q, k, v, scale)
+        assert triton_attention is not None
+        out = triton_attention(q, k, v, scale)
     sync()
     t1 = time.perf_counter()
 
@@ -103,6 +114,13 @@ def run_once(backend, seq_len, dtype, scale, seed, *, measure):
     out.backward(grad)
     sync()
     t2 = time.perf_counter()
+
+    # Snapshot measured peaks before finiteness validation allocates temporary
+    # tensors.  The benchmark reports end-to-end allocated memory for this
+    # attention call (outputs/saved tensors/gradients included), not "workspace".
+    if measure:
+        peak_total_alloc = torch.cuda.max_memory_allocated()
+        peak_total_reserved = torch.cuda.max_memory_reserved()
 
     row = {
         "forward_sec": t1 - t0,
@@ -121,10 +139,10 @@ def run_once(backend, seq_len, dtype, scale, seed, *, measure):
             peak_forward_reserved_gib=peak_fwd_reserved / 2**30,
             incremental_forward_allocated_gib=(peak_fwd_alloc - baseline_alloc) / 2**30,
             incremental_forward_reserved_gib=(peak_fwd_reserved - baseline_reserved) / 2**30,
-            peak_total_allocated_gib=torch.cuda.max_memory_allocated() / 2**30,
-            peak_total_reserved_gib=torch.cuda.max_memory_reserved() / 2**30,
-            incremental_total_allocated_gib=(torch.cuda.max_memory_allocated() - baseline_alloc) / 2**30,
-            incremental_total_reserved_gib=(torch.cuda.max_memory_reserved() - baseline_reserved) / 2**30,
+            peak_total_allocated_gib=peak_total_alloc / 2**30,
+            peak_total_reserved_gib=peak_total_reserved / 2**30,
+            incremental_total_allocated_gib=(peak_total_alloc - baseline_alloc) / 2**30,
+            incremental_total_reserved_gib=(peak_total_reserved - baseline_reserved) / 2**30,
         )
     return row
 
@@ -142,8 +160,17 @@ def main():
         raise SystemExit(f"Triton fallback benchmark requires gfx906, got {arch!r}")
 
     dtype = dtype_from_name(args.dtype)
+    triton_attention = load_triton_attention() if args.backend == "triton" else None
     for i in range(args.warmup):
-        run_once(args.backend, args.seq_len, dtype, args.scale, args.seed + i, measure=False)
+        run_once(
+            args.backend,
+            args.seq_len,
+            dtype,
+            args.scale,
+            args.seed + i,
+            measure=False,
+            triton_attention=triton_attention,
+        )
         torch.cuda.empty_cache()
 
     rows = [
@@ -154,6 +181,7 @@ def main():
             args.scale,
             args.seed + 10_000 + i,
             measure=True,
+            triton_attention=triton_attention,
         )
         for i in range(args.steps)
     ]

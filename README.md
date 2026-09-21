@@ -180,15 +180,18 @@ export UNSLOTH_GEMMA4_GFX906_GLOBAL_MIN_SEQ=1024
 
 The fallback is memory-oriented and can be substantially slower than SDPA. It
 runs only for the narrow Gemma 4 D=512 global-attention training shape on
-`gfx906`, including reentrant gradient-checkpoint pack/recompute forwards.
-Eval/inference, unsupported compiler versions, sliding attention, dropout,
-unequal Q/K/V sequence lengths, and the FORCE_FLOAT32 path when a cache object
-is present keep the existing backend.
+`gfx906`, including reentrant gradient-checkpoint pack/recompute forwards, and
+supports first-order gradients only. Higher-order graph construction is rejected
+explicitly. Eval-mode calls, unsupported compiler versions, sliding attention,
+dropout, any cache-bearing attention call, and unequal Q/K/V sequence lengths
+keep the existing backend.
 
-Explicit masks must be exactly dense causal: boolean, or float with `0` on
-allowed positions and `-inf` on blocked positions. Padded, packed, per-head,
-finite-bias, or differentiable masks fall back to the existing backend. Runtime
-kernel failures after selection are surfaced rather than retried through SDPA.
+Explicit masks must be exactly dense causal: boolean, or an SDPA-compatible
+floating dtype (FP32 or the query dtype) with `0` on allowed positions and
+`-inf` on blocked positions. Padded, packed, per-head, finite-bias,
+differentiable, or dtype-incompatible masks fall back to the existing backend.
+Runtime kernel failures after selection are surfaced rather than retried through
+SDPA.
 The environment variables above are read dynamically.
 
 ### Conda Installation (Optional)

@@ -299,6 +299,13 @@ class _Gemma4Gfx906GlobalAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        # This hand-written Triton backward returns detached first derivatives;
+        # allowing create_graph=True would silently construct a partial Hessian
+        # when the loss also contains differentiable non-attention terms.
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "gfx906 Gemma4 global attention supports first-order gradients only"
+            )
         q, k, v, out, lse = ctx.saved_tensors
         with torch.cuda.device(q.device):
             do = do.contiguous()

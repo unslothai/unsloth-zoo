@@ -25,7 +25,9 @@ attention or an exact boolean / 0-and-negative-infinity causal mask.
 threshold, not a performance crossover point.
 """
 
+import contextvars
 import functools
+import inspect
 import os
 import torch
 from packaging.version import Version
@@ -42,6 +44,7 @@ __all__ = [
 _ORIG_SDPA = [None]
 _ENGAGED = [0]
 _MIN_TRITON_VERSION = Version("3.8.0")
+_CACHE_PRESENT = contextvars.ContextVar("gemma4_gfx906_cache_present", default=False)
 
 
 def _enabled():
@@ -80,7 +83,7 @@ def _triton_supported():
         return False
 
 
-def _mask_is_exact_causal(mask, S, batch_size, device, _block=1024):
+def _mask_is_exact_causal(mask, S, batch_size, device, query_dtype, _block=1024):
     """Verify an explicit mask is exactly dense causal attention.
 
     This intentionally does not reuse the sliding-window mask cache: a cached
@@ -96,6 +99,11 @@ def _mask_is_exact_causal(mask, S, batch_size, device, _block=1024):
     if mask.requires_grad or mask.device != device:
         return False
     if mask.dtype != torch.bool and not torch.is_floating_point(mask):
+        return False
+    # Match torch SDPA's public mask-dtype contract.  Accept bool, fp32, or the
+    # query dtype; do not turn an invalid SDPA call into a successful custom
+    # kernel invocation merely because the mask values happen to be causal.
+    if mask.dtype not in (torch.bool, torch.float32, query_dtype):
         return False
     if mask.shape[0] not in (1, batch_size) or mask.shape[1] != 1:
         return False
@@ -173,7 +181,9 @@ def _eligible(
     # this exact probe and defer to the original backend.
     if attention_mask is None and not causal:
         return False
-    return _mask_is_exact_causal(attention_mask, Sq, query.shape[0], query.device)
+    return _mask_is_exact_causal(
+        attention_mask, Sq, query.shape[0], query.device, query.dtype
+    )
 
 
 def maybe_gemma4_gfx906_global_attention(
@@ -231,6 +241,12 @@ def _sdpa_maybe_gfx906_global(
     _fallback=None,
     **kwargs,
 ):
+    has_cache = (
+        bool(_CACHE_PRESENT.get())
+        or kwargs.get("past_key_values", None) is not None
+        or kwargs.get("past_key_value", None) is not None
+        or getattr(module, "_unsloth_shared_kv_carrier", None) is not None
+    )
     out = maybe_gemma4_gfx906_global_attention(
         module,
         query,
@@ -240,6 +256,7 @@ def _sdpa_maybe_gfx906_global(
         dropout=dropout,
         scaling=scaling,
         is_causal=is_causal,
+        has_cache=has_cache,
     )
     if out is not None:
         return out.transpose(1, 2).contiguous(), None
@@ -293,11 +310,71 @@ def _make_gfx906_global_wrapper(original):
     return wrapped
 
 
+def _make_gemma4_cache_scope_wrapper(original):
+    """Expose Gemma4 cache presence to registry attention without changing API.
+
+    Transformers consumes ``past_key_values`` inside ``Gemma4TextAttention``
+    before calling ``ALL_ATTENTION_FUNCTIONS``.  Consequently equal-length
+    first-prefill Q/K/V tensors do not reveal that a cache object exists.  A
+    ContextVar keeps the state local to the current forward (and async context)
+    while preserving the upstream forward signature and return values.
+    """
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        signature = None
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        if not _enabled():
+            return original(*args, **kwargs)
+
+        cache = kwargs.get("past_key_values", None)
+        if "past_key_values" not in kwargs and signature is not None:
+            try:
+                cache = signature.bind_partial(*args, **kwargs).arguments.get(
+                    "past_key_values", None
+                )
+            except TypeError:
+                cache = None
+
+        token = _CACHE_PRESENT.set(cache is not None)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            _CACHE_PRESENT.reset(token)
+
+    wrapped._unsloth_gemma4_gfx906_cache_scope = True
+    wrapped._unsloth_gemma4_gfx906_cache_scope_original = original
+    return wrapped
+
+
+def _patch_gemma4_cache_scope():
+    try:
+        from transformers.models.gemma4 import modeling_gemma4
+        current = modeling_gemma4.Gemma4TextAttention.forward
+    except Exception:
+        # Without this scope the normal registry cannot distinguish an empty
+        # DynamicCache prefill from a genuine no-cache equal-length call.  Fail
+        # closed by leaving the custom registry path uninstalled.
+        return False
+    if getattr(current, "_unsloth_gemma4_gfx906_cache_scope", False):
+        return True
+    modeling_gemma4.Gemma4TextAttention.forward = _make_gemma4_cache_scope_wrapper(current)
+    return True
+
+
 def patch_gemma4_gfx906_global_attention():
     try:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     except Exception as e:
         return raise_error("transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS", e)
+
+    # Install the cache scope independently from the registry wrapper. Repeated
+    # patch passes are safe, and this lets us restore the scope if another
+    # Gemma4 forward patch replaced it between passes.
+    if not _patch_gemma4_cache_scope():
+        return
 
     try:
         current = ALL_ATTENTION_FUNCTIONS["sdpa"]
