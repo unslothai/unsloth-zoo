@@ -102,18 +102,53 @@ def test_compiled_cache_write_refuses_a_symlink_without_o_nofollow(
     assert planted.read_bytes() == b"generated = 1\n"
 
 
-def test_gpt_oss_marker_write_refuses_a_symlink_without_o_nofollow(
+def test_gpt_oss_marker_write_replaces_a_symlink_without_o_nofollow(
     tmp_path, victim_file, no_o_nofollow,
 ):
+    """No atomic no-follow open, so the marker lands on the name, not through it."""
     from unsloth_zoo.temporary_patches import gpt_oss
 
     cache = tmp_path / "cache"
     cache.mkdir(mode = 0o700)
-    os.symlink(victim_file, cache / gpt_oss._GPT_OSS_FLAVOR_MARKER)
+    marker = cache / gpt_oss._GPT_OSS_FLAVOR_MARKER
+    os.symlink(victim_file, marker)
 
-    with pytest.raises(OSError):
-        gpt_oss._gpt_oss_write_marker(str(cache), "stock")
+    gpt_oss._gpt_oss_write_marker(str(cache), "stock")
+
     assert victim_file.read_text() == "do not overwrite me"
+    assert not os.path.islink(marker)
+    assert marker.read_text() == "stock"
+
+
+def test_visual_server_request_replaces_a_symlink_without_o_nofollow(
+    monkeypatch, tmp_path, victim_file, no_o_nofollow,
+):
+    import unsloth_zoo.diffusion_studio.visual_engine as visual_engine
+
+    monkeypatch.setattr(visual_engine.VisualServer, "_spawn", lambda self: None)
+    monkeypatch.setattr(visual_engine, "_resolve_bin", lambda b: "/bin/true")
+    monkeypatch.setattr(
+        visual_engine, "_build_subprocess_env", lambda *a, **k: {"NGL": "0"},
+    )
+
+    planted = tmp_path / "planted.req"
+    os.symlink(victim_file, planted)
+    server = visual_engine.VisualServer("model.gguf", req_path = str(planted))
+
+    class _Stdin:
+        def write(self, _): pass
+        def flush(self): pass
+
+    class _Process:
+        stdin = _Stdin()
+        def poll(self): return None
+
+    server.p = _Process()
+    server._send([{"role": "user", "content": "secret"}], 1, 0)
+
+    assert victim_file.read_text() == "do not overwrite me"
+    assert not os.path.islink(planted)
+    assert "secret" in planted.read_text()
 
 
 def test_compiled_cache_write_still_writes_an_ordinary_file(tmp_path):

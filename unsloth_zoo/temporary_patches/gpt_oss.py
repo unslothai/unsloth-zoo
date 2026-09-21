@@ -1494,6 +1494,33 @@ def _gpt_oss_cache_location_is_trusted(loc):
 pass
 
 
+def _gpt_oss_replace_marker(marker_path, desired_flavor):
+    """Land the marker by replacing the name, for platforms with no O_NOFOLLOW.
+
+    mkstemp creates a fresh private file nobody else has a name for, and os.replace
+    swaps it into place, so a link sitting at `marker_path` is replaced rather than
+    written through. No check-then-open window to lose.
+    """
+    import tempfile
+    directory = os.path.dirname(marker_path) or "."
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix = f".{os.path.basename(marker_path)}.", suffix = ".tmp", dir = directory,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            f.write(desired_flavor)
+        os.replace(temporary_path, marker_path)
+    except BaseException:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+        try: os.remove(temporary_path)
+        except OSError: pass
+        raise
+pass
+
+
 def _gpt_oss_write_marker(loc, desired_flavor):
     """Write the flavor marker without following a link out of `loc`.
 
@@ -1505,11 +1532,9 @@ def _gpt_oss_write_marker(loc, desired_flavor):
     marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not no_follow:
-        # Windows has no O_NOFOLLOW, so without this the write follows the link.
-        # Absolute, like the compile_cache import above: a relative one resolves
-        # against temporary_patches/ under transformers' custom_object_save.
-        from unsloth_zoo.compiler import _refuse_a_link_without_o_nofollow
-        _refuse_a_link_without_o_nofollow(marker_path)
+        # No atomic no-follow open on this platform, and an lstat first would only be
+        # a time of check. Land on the name instead of through it.
+        return _gpt_oss_replace_marker(marker_path, desired_flavor)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= no_follow
     flags |= getattr(os, "O_NONBLOCK", 0)

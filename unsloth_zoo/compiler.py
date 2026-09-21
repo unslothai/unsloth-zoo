@@ -1536,29 +1536,6 @@ def _set_mode_by_descriptor(descriptor, location, mode):
         os.chmod(location, mode)
 pass
 
-def _refuse_a_link_without_o_nofollow(location):
-    """Raise if `location` is a link, for platforms that have no O_NOFOLLOW.
-
-    Windows is the one that matters: the constant does not exist there, so the flag
-    below degrades to zero and O_TRUNC would truncate whatever the link points at
-    before the fstat ever runs. A pre-check is racy where the flag is not, so it is
-    used ONLY as the fallback; what it buys is that the caller lands in
-    _replace_compiled_cache_file, which replaces the link rather than writing through
-    it. Junctions are checked too, because os.path.islink reports False for them.
-    """
-    try:
-        file_stat = os.lstat(location)
-    except FileNotFoundError:
-        return
-    except OSError:
-        return          # unreadable: let the open below produce the real error
-    if stat.S_ISLNK(file_stat.st_mode):
-        raise OSError(f"Unsloth: refusing to write `{location}`: it is a symbolic link.")
-    reparse_tag = getattr(file_stat, "st_reparse_tag", 0)
-    if reparse_tag:
-        raise OSError(f"Unsloth: refusing to write `{location}`: it is a reparse point.")
-pass
-
 def _write_bytes_durably(location, new_write_bytes):
     """Write and fsync, refusing to follow a link out of the compiled cache.
 
@@ -1570,10 +1547,16 @@ def _write_bytes_durably(location, new_write_bytes):
     it, so the in-place fast path is given up only when it is unsafe. The fstat
     re-checks what was actually opened, since O_NOFOLLOW says nothing about a FIFO or
     a device node. Buffered, so a short write is retried rather than lost.
+
+    Where the constant does not exist at all (Windows) there is no atomic no-follow
+    open to be had, and an lstat first is only a time of check: the entry can become
+    a link before O_TRUNC destroys what it points at. So the in-place path is not
+    attempted there at all, and every write goes through the replacement helper,
+    which lands on the name rather than through it.
     """
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not no_follow:
-        _refuse_a_link_without_o_nofollow(location)
+        raise OSError(f"Unsloth: no O_NOFOLLOW on this platform: replacing `{location}` instead of writing in place.")
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= no_follow
     flags |= getattr(os, "O_BINARY", 0)

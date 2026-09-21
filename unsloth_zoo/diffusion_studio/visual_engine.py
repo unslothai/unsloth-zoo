@@ -199,6 +199,32 @@ def _canvas_maxtok(maxtok):
     return maxtok if 0 < maxtok <= 8192 else 0
 
 
+def _replace_request_file(req_path, req):
+    """Land the request by replacing the name, for platforms with no O_NOFOLLOW.
+
+    mkstemp creates a fresh 0600 file nobody else has a name for, and os.replace swaps
+    it into place, so a link planted at `req_path` is replaced rather than written
+    through. Kept local rather than imported from unsloth_zoo.compiler, which would
+    pull torch into the diffusion path.
+    """
+    directory = os.path.dirname(req_path) or "."
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix = f".{os.path.basename(req_path)}.", suffix = ".tmp", dir = directory,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            json.dump(req, f, ensure_ascii = False)
+        os.replace(temporary_path, req_path)
+    except BaseException:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+        try: os.remove(temporary_path)
+        except OSError: pass
+        raise
+
+
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
@@ -265,16 +291,16 @@ class VisualServer:
         # on the regular file the default path always is.
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         if not no_follow:
-            # Windows has no O_NOFOLLOW; without this the conversation is written
-            # through whatever link is sitting at the path.
-            from unsloth_zoo.compiler import _refuse_a_link_without_o_nofollow
-            _refuse_a_link_without_o_nofollow(self.req)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-        flags |= no_follow
-        flags |= getattr(os, "O_NONBLOCK", 0)
-        descriptor = os.open(self.req, flags, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as f:
-            json.dump(req, f, ensure_ascii=False)
+            # No atomic no-follow open here (Windows), and an lstat first would only
+            # be a time of check, so land on the name instead of through it.
+            _replace_request_file(self.req, req)
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            flags |= no_follow
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(self.req, flags, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                json.dump(req, f, ensure_ascii=False)
         try:
             self.p.stdin.write(self.req + "\n")
             self.p.stdin.flush()
