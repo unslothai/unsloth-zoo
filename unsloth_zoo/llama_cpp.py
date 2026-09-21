@@ -4632,24 +4632,28 @@ def _trusted_gguf_tree(tree, converter_location = None):
     """
     if not tree:
         return None
+    # Resolved, and it is the RESOLVED path that is returned: the check below asks
+    # where `tree` points, so handing the caller back the unresolved string would
+    # let a symlink that passed the check be re-pointed before the import that
+    # consumes it, which is the substitution this whole function exists to refuse.
+    resolved = os.path.realpath(tree)
     roots = [LLAMA_CPP_DEFAULT_DIR, os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")]
     if converter_location:
         roots.append(os.path.dirname(os.path.abspath(converter_location)))
     for root in roots:
         if root and _stays_within(os.path.expanduser(root), tree):
-            return tree
+            return resolved
     # Plus the entry this process would import `gguf` from anyway, which the swap
     # then does not change. Matched exactly rather than by containment: sys.path
     # routinely holds a project root, and everything under one of those is not a
     # tree we chose. Relative entries ('' or '.') resolve to the working directory,
     # which is what this whole check exists to exclude.
-    real = os.path.realpath(tree)
     for entry in sys.path:
         if not entry or not os.path.isabs(entry):
             continue
-        if os.path.realpath(entry) == real and \
+        if os.path.realpath(entry) == resolved and \
             os.path.isfile(os.path.join(entry, "gguf", "__init__.py")):
-            return tree
+            return resolved
     logger.warning(
         "Unsloth: the converter resolved its `gguf` from '%s', which is not inside "
         "a llama.cpp install Unsloth chose. Not adding it to this process's "

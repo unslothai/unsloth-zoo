@@ -115,7 +115,30 @@ def test_a_tree_inside_a_chosen_root_is_kept(llama_cpp, tmp_path, monkeypatch, r
     else:
         monkeypatch.syspath_prepend(str(tree))
 
-    assert llama_cpp._trusted_gguf_tree(tree, converter_location) == tree
+    # Resolved, not the string handed in: see the symlink case below.
+    assert llama_cpp._trusted_gguf_tree(tree, converter_location) == os.path.realpath(tree)
+
+
+def test_a_symlink_into_a_chosen_root_is_returned_resolved(llama_cpp, tmp_path, monkeypatch):
+    """Accepting a link and handing back the link is a check that can be undone: the
+    caller puts the returned string on sys.path and imports it, so a link the lower-
+    trust principal still owns can be re-pointed in between."""
+    install = tmp_path / "install"
+    tree = _gguf_package(install / "gguf-py")
+    monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(install))
+
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    link = attacker / "link"
+    os.symlink(str(tree), str(link))
+
+    assert llama_cpp._trusted_gguf_tree(str(link)) == os.path.realpath(str(tree))
+
+    # And the returned path does not follow the link once it is re-pointed.
+    elsewhere = _gguf_package(tmp_path / "elsewhere")
+    os.remove(str(link))
+    os.symlink(str(elsewhere), str(link))
+    assert llama_cpp._trusted_gguf_tree(str(link)) is None
 
 
 def test_the_conversion_screens_the_tree_before_the_verifier_gets_it(llama_cpp):
