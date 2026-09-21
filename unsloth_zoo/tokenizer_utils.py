@@ -28,6 +28,8 @@ import itertools
 import datasets
 import re
 
+from .log import logger
+
 __all__ = [
     "mean_of_trained_tokens",
     "add_new_tokens",
@@ -271,8 +273,22 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    embedding_matrix = model.get_input_embeddings ().weight
-    lm_head_matrix   = model.get_output_embeddings().weight
+    # A composite checkpoint may have no single input embedding to repair.
+    # `hasattr` does not answer this: transformers 5 defines
+    # get_input_embeddings on every PreTrainedModel and has the base
+    # implementation raise NotImplementedError, so Qwen3-Omni, which carries a
+    # thinker and a talker, raises here. Nothing to reset in that case, so skip
+    # the pass instead of failing the run before training starts.
+    try:
+        embedding_matrix = model.get_input_embeddings ().weight
+        lm_head_matrix   = model.get_output_embeddings().weight
+    except NotImplementedError:
+        logger.info(
+            f"Unsloth: Skipping the untrained token fix for "
+            f"{type(model).__name__}, which does not expose a single input "
+            f"embedding."
+        )
+        return
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
