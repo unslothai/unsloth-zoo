@@ -77,10 +77,9 @@ def _is_local_name(hostname):
         return ipaddress.ip_address(hostname).is_loopback
     except ValueError:
         pass
-    # `127.1` and the other short forms are what a user typed reaching their own
-    # machine, and inet_aton is how the Studio backend's host_policy accepts them.
-    # Widening to these costs nothing: a numeric literal cannot be rebound, so it
-    # names loopback or it fails is_loopback below.
+    # `127.1` and friends are a user reaching their own machine, and inet_aton is how
+    # the Studio backend's host_policy reads them. A numeric literal cannot be
+    # rebound, so it names loopback or it fails is_loopback below.
     try:
         return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(hostname))).is_loopback
     except (OSError, ValueError):
@@ -88,11 +87,9 @@ def _is_local_name(hostname):
 
 
 def _hostname_of(value):
-    """The hostname `urlsplit` reads out of an authority or URL, or None when it
-    will not parse. `urlsplit` raises on a malformed bracketed literal such as
-    `[oops]`, which uncaught is a 500 rather than a refusal, and a host nobody can
-    parse is exactly the one not to trust. A `user@host` form is refused outright:
-    that is not Host syntax, and only the part after the `@` would be compared.
+    """The hostname `urlsplit` reads out of an authority or URL, or None when it will
+    not parse (`[oops]` raises, and uncaught that is a 500 rather than a refusal).
+    `user@host` is refused: not Host syntax, and only the part after `@` is compared.
     """
     try:
         split = urlsplit(value)
@@ -116,9 +113,8 @@ async def _bind_to_local_caller(request, call_next):
         not _is_local_name(_hostname_of("//" + (request.headers.get("host") or ""))):
         return JSONResponse({"error": "forbidden host"}, status_code = 403)
     for header in ("origin", "referer"):
-        # Every value, not the first: a proxy or a hand-written client can send the
-        # header twice, and `.get` would answer with a local one while a foreign one
-        # rode along behind it.
+        # Every value, not the first: sent twice, `.get` answers with the local one
+        # while a foreign one rides behind it.
         for value in request.headers.getlist(header):
             if value and not _is_local_name(_hostname_of(value)):
                 return JSONResponse({"error": "forbidden origin"}, status_code = 403)
@@ -260,12 +256,11 @@ def _max_blocks(body):
         mt = int(mt)
     except (TypeError, ValueError):
         mt = 2048
-    # Clamped so a request cannot name an arbitrary block count. This is a size
-    # bound and not a deadline, and it is not what stops a long generation: the
-    # server answers anything over its own per-turn budget with ERR toolong, and
-    # an explicit --maxtok is already capped at 8192 (32 blocks) by _canvas_maxtok,
-    # below this ceiling. It binds only against an auto-sized budget above 16384.
-    # DG_MAX_BLOCKS raises it, read at the call so Studio can set it after import.
+    # A size bound, not a deadline, and not what stops a long generation: the server
+    # answers anything over its per-turn budget with ERR toolong, and an explicit
+    # --maxtok is already capped at 8192 (32 blocks) by _canvas_maxtok, below this.
+    # So it binds only against an auto-sized budget above 16384. DG_MAX_BLOCKS raises
+    # it, read at the call so Studio can set it after import.
     try:
         ceiling = max(1, int(os.environ.get("DG_MAX_BLOCKS", "").strip()))
     except ValueError:
@@ -277,12 +272,9 @@ def _max_blocks(body):
 def _finish_reason(capped, max_blocks, stats):
     """`length` only when the ceiling WE imposed is what ended the generation.
 
-    A caller whose own max_tokens was honoured, or whose answer stopped early with
-    blocks to spare, still finished naturally. Reporting `length` there would be as
-    wrong as the reverse, and it is the reverse that matters: without this, a reply
-    this server cut short is indistinguishable from a complete one, so a client
-    never runs its continuation path. An older visual server that reports no block
-    count leaves us unable to tell, and then today's answer stands.
+    A request honoured in full, or one that stopped early with blocks to spare,
+    finished naturally and saying `length` there is the same bug reversed. An older
+    server reporting no block count leaves it undecidable, and then `stop` stands.
     """
     if not capped:
         return "stop"

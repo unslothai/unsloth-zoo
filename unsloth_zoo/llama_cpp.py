@@ -4380,54 +4380,35 @@ converter = sys.argv[1]
 # characters. stdin has no such ceiling.
 requirements = json.loads(sys.stdin.read() or "[]")
 
-# Reproduce the entrypoint's own self-location exactly, or the probe would
-# measure a different `gguf` than the real run: every llama.cpp converter (and
-# its conversion/base.py) does this before `import gguf`, and `python -c` has no
-# script directory of its own to do it for us.
-# Index 1 is the converter's own slot only while something occupies index 0: the
-# real run has its script directory there, and `python -c` has the CWD. Safe-path
-# mode removes that entry, from a script run as much as from `-c`, so where the
-# sibling tree lands RELATIVE TO PYTHONPATH depends on the mode each side runs in
-# and the two sides do not always agree. The probe is always in safe-path mode;
-# the converter is only when the caller's own environment already asked for it,
-# which argv[2] reports. Both terms are needed:
-#   converter plain -> sibling ahead of all of PYTHONPATH
-#   converter safe  -> sibling behind PYTHONPATH's first entry
-# PYTHONSAFEPATH is ignored before 3.11, and there the parent's provenance check is
-# no help: it can refuse to IMPORT a planted tree, but this child has already run
-# whatever `./gguf/__init__.py` it found, with the parent's environment and token.
-# So drop the entry here as well, which needs no interpreter support. A script run
-# never has the working directory on its path either, so nothing faithful is lost.
-# Exactly one entry, and only the implicit one. A caller who put '.' on PYTHONPATH
-# meant it, and the real converter honours it, so deleting those too would report a
-# tree the conversion does not use -- the same fault as reporting one it cannot see.
+# Rebuild the sys.path the CONVERTER will have, or the probe reports a `gguf` the
+# conversion never uses. Only the implicit `-c` entry goes: an explicit '.' on
+# PYTHONPATH is the caller's, and the converter honours it. Dropped here rather
+# than left to PYTHONSAFEPATH because that is ignored before 3.11, where refusing
+# the tree later cannot unrun the `./gguf/__init__.py` this child already executed
+# with the parent's token.
 if not getattr(sys.flags, "safe_path", False) and sys.path and \
     sys.path[0] in ("", os.getcwd()):
     del sys.path[0]
-# Either way sys.path now begins with PYTHONPATH, which is the shape safe-path mode
-# gives. The converter is a different question: it is a SCRIPT, so it has its own
-# directory at index 0 and its `insert(1, ...)` puts the sibling tree ahead of all
-# of PYTHONPATH -- unless the caller's environment already asked for safe-path mode,
-# which removes that slot and drops the sibling behind PYTHONPATH's first entry.
-# argv[2] reports which, and before 3.11 the answer is always "plain".
+# sys.path now starts at PYTHONPATH, so only the converter's own mode decides where
+# its tree lands: a script has its directory at 0 and inserts the sibling at 1,
+# ahead of all PYTHONPATH, while safe-path mode removes that slot and drops the
+# sibling behind PYTHONPATH's first entry. argv[2] reports which; before 3.11 the
+# converter is always plain.
 converter_safe = (sys.version_info >= (3, 11)
                   and len(sys.argv) > 2 and sys.argv[2] == "1")
 if converter:
-    # Two different directories whenever the converter is reached through a symlink,
-    # and each slot wants its own. The entrypoint self-locates through `__file__`,
-    # which stays the symlink's own path, while CPython prepends the script's
-    # directory "if it's a symbolic link, resolve symbolic links" (sys.path docs).
+    # A symlinked converter has two directories and each slot wants its own: the
+    # entrypoint self-locates through `__file__` (the link), while CPython prepends
+    # the script's directory "if it's a symbolic link, resolve symbolic links"
+    # (sys.path docs).
     converter_dir = os.path.dirname(os.path.abspath(converter))
     script_dir = os.path.dirname(os.path.realpath(converter))
     if "NO_LOCAL_GGUF" not in os.environ:
         sys.path.insert(1 if converter_safe else 0,
                         os.path.join(converter_dir, "gguf-py"))
-    # The script directory itself, which a script run has at sys.path[0] and which
-    # therefore outranks the sibling tree whenever the converter's own directory
-    # holds an importable `gguf` (custom and editable layouts do). Modelled outside
-    # the NO_LOCAL_GGUF branch because suppressing the sibling insert does not take
-    # the script's own directory off the real run's path. Safe-path mode is the one
-    # case with no such entry to model.
+    # Outside the NO_LOCAL_GGUF branch: suppressing the sibling insert does not take
+    # the script's own directory off the real run's path, and a `gguf` sitting there
+    # outranks the sibling.
     if not converter_safe:
         sys.path.insert(0, script_dir)
 
@@ -4692,37 +4673,26 @@ def _trusted_gguf_tree(tree, converter_location = None):
     """
     if not tree:
         return None
-    # Resolved ONCE, and it is that one result which is both checked and returned.
-    # A symlink here is the lower-trust principal's to move, so resolving separately
-    # for the check and for the return lets the two disagree: the check answers for
-    # a tree inside a chosen root while the value returned is the one outside, and
-    # that is what the caller then puts on sys.path and imports. Passing `resolved`
-    # to `_stays_within` also stops it re-traversing the link, since realpath of an
-    # already-resolved path is itself.
+    # Resolved ONCE, and that one result is both checked and returned. The link
+    # belongs to the principal being screened, so a second resolution can answer
+    # differently and hand back a tree the check never approved.
     resolved = os.path.realpath(tree)
     roots = [LLAMA_CPP_DEFAULT_DIR, os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")]
     if converter_location:
-        # Both directories, because a symlinked converter has two and each can hold
-        # the tree the conversion actually used: the entrypoint self-locates its
-        # gguf-py through `__file__` (the link's own directory) while the script
-        # slot CPython prepends is the resolved target. Trusting only one refuses a
-        # writer tree we did resolve, which costs the read-back its same-writer gguf.
-        # No wider either way: this is the directory of the script we are about to
-        # execute as the converter.
+        # Both, because a symlinked converter has two directories and either can
+        # hold the tree the conversion used (`__file__` is the link, the script slot
+        # is the target). No wider: this is the script we run as the converter.
         roots.append(os.path.dirname(os.path.abspath(converter_location)))
         roots.append(os.path.dirname(os.path.realpath(converter_location)))
     for root in roots:
         if root and _stays_within(os.path.expanduser(root), resolved):
             return resolved
-    # Plus the tree this process would import `gguf` from anyway, where the swap
-    # changes nothing. Two things have to hold together, and neither implies the
-    # other. It must be the tree that WINS resolution, since a shadowed entry is a
-    # package this process does not run and the swap puts it at index 0, which runs
-    # it. And it must be reachable by an ABSOLUTE `sys.path` entry: `find_spec`
-    # honours the relative entries ('' and '.') that an interactive parent carries,
-    # and those resolve to the working directory, which is the one thing this whole
-    # function exists to exclude. Exact match, not containment: `sys.path` routinely
-    # holds a project root and everything beneath one is not a tree we chose.
+    # Plus the tree this process would import anyway, where the swap changes nothing.
+    # Both halves are load-bearing: it must WIN resolution, since promoting a
+    # shadowed package to index 0 is what starts running it, and it must be reachable
+    # by an ABSOLUTE entry, since `find_spec` honours the relative '' and '.' that
+    # resolve to the working directory this function exists to exclude. Exact match,
+    # not containment: a project root on `sys.path` does not vouch for what is under it.
     if _importing_gguf_tree() == resolved and any(
         entry and os.path.isabs(entry) and os.path.realpath(entry) == resolved
         for entry in sys.path

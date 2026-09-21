@@ -56,9 +56,8 @@ def client(monkeypatch):
 
     def _generate_visual(server, messages, **kwargs):
         calls.append(kwargs)
-        # The real server always closes a turn with STATS, and a generation that
-        # runs to its block budget reports that budget back. Standing in with no
-        # stats at all would quietly make the finish-reason tests unfailable.
+        # The real server closes a turn with STATS. Standing in without them would
+        # quietly make every finish-reason assertion unfailable.
         blocks = kwargs.get("max_blocks", 8)
         on_stats = kwargs.get("on_stats")
         if on_stats is not None:
@@ -114,22 +113,20 @@ def test_a_rebound_hostname_is_refused(client):
 # --- An ordinary local client keeps working ---
 
 def test_an_unparseable_host_is_refused_not_a_500(client):
-    """`urlsplit` raises on a malformed bracketed literal. Uncaught that is a 500,
-    and a host nobody can parse is the one least worth trusting."""
+    """Uncaught, `urlsplit` raising is a 500; a host nobody can parse is the one
+    least worth trusting."""
     response = client.post("/v1/chat/completions", json = BODY, headers = {"Host": "[oops]"})
     assert response.status_code == 403, response.text
 
 
 def test_userinfo_in_the_host_is_refused(client):
-    """`attacker.example@localhost` is not Host syntax; `urlsplit` would read only
-    the part after the `@` and call it local."""
+    """Not Host syntax: `urlsplit` reads only the part after `@` and calls it local."""
     assert client.post("/v1/chat/completions", json = BODY,
                        headers = {"Host": "evil.example@localhost"}).status_code == 403
 
 
 def test_a_second_origin_header_cannot_ride_behind_a_local_one(client):
-    """A single `.get` answers with the first value, so a foreign second one would
-    never be looked at."""
+    """A single `.get` answers with the first value; the foreign second is never seen."""
     request = client.build_request("POST", "/v1/chat/completions", json = BODY)
     raw = [(k, v) for k, v in request.headers.raw if k.lower() != b"origin"]
     raw += [(b"origin", b"http://localhost:3000"), (b"origin", b"https://evil.example")]
@@ -139,9 +136,8 @@ def test_a_second_origin_header_cannot_ride_behind_a_local_one(client):
 
 @pytest.mark.parametrize("spelling", ["127.1", "2130706433", "0x7f000001"])
 def test_a_short_loopback_spelling_is_still_this_machine(spelling):
-    """`curl http://127.1:8123` is a user reaching their own machine. A numeric
-    literal cannot be rebound, so accepting these widens nothing, and the Studio
-    backend's own host_policy resolves them the same way (socket.inet_aton)."""
+    """`curl http://127.1:8123` is a user reaching their own machine, and a numeric
+    literal cannot be rebound. Studio's host_policy reads them the same way."""
     assert shim._is_local_name(spelling) is True
     assert shim._is_local_name("1") is False          # 0.0.0.1, not loopback
     assert shim._is_local_name("evil.example") is False
@@ -207,8 +203,8 @@ def test_the_ceiling_is_configurable(client, monkeypatch):
 # --- A reply this server cut short does not report a natural stop ---
 
 def test_a_capped_generation_reports_length(client):
-    """Without this a client cannot tell a truncated answer from a complete one, so
-    it never runs the continuation it would run against any other OpenAI server."""
+    """Otherwise a truncated answer is indistinguishable from a complete one and the
+    client never runs the continuation it would against any other OpenAI server."""
     client.calls.clear()
     response = client.post("/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9})
     assert response.status_code == 200, response.text
@@ -216,16 +212,15 @@ def test_a_capped_generation_reports_length(client):
 
 
 def test_an_uncapped_generation_still_reports_stop(client):
-    """The ceiling is the only thing this may speak for: a request inside it that
-    ends on its own finished naturally, and saying `length` there is the same bug
-    in reverse."""
+    """A request inside the ceiling that ends on its own finished naturally; saying
+    `length` there is the same bug reversed."""
     response = client.post("/v1/chat/completions", json = BODY)
     assert response.json()["choices"][0]["finish_reason"] == "stop"
 
 
 def test_a_capped_request_that_stops_early_still_reports_stop(client, monkeypatch):
-    """Capped is not the same as truncated. If the model committed fewer blocks than
-    the ceiling allowed, the ceiling is not what ended it."""
+    """Capped is not truncated: fewer blocks than the ceiling allowed means the
+    ceiling is not what ended it."""
     def _short(server, messages, seed = 3407, max_blocks = 8, on_frame = None,
                on_commit = None, on_stats = None, tools = None):
         if on_stats is not None:
@@ -237,8 +232,8 @@ def test_a_capped_request_that_stops_early_still_reports_stop(client, monkeypatc
 
 
 def test_a_capped_streaming_generation_reports_length(client):
-    """The streaming path emits its own terminal chunk, so it needs its own proof:
-    a client reading deltas sees only that last finish_reason."""
+    """The streaming path emits its own terminal chunk, and a client reading deltas
+    sees only that last finish_reason."""
     response = client.post(
         "/v1/chat/completions", json = {**BODY, "max_tokens": 10 ** 9, "stream": True},
     )

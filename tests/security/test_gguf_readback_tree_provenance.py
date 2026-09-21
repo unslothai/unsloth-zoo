@@ -95,9 +95,8 @@ def test_a_relative_sys_path_entry_does_not_launder_the_working_directory(
 
 def test_a_shadowed_sys_path_entry_is_not_the_one_we_would_import(
         llama_cpp, tmp_path, monkeypatch):
-    """The sys.path branch is allowed only because the swap changes nothing. That
-    holds for the tree that WINS resolution, not for one sitting behind it: putting
-    a shadowed package at index 0 is what makes this process start running it."""
+    """That branch is allowed only because the swap changes nothing, which holds for
+    the tree that WINS, not one behind it: index 0 is what starts running it."""
     winner = _gguf_package(tmp_path / "winner")
     shadowed = _gguf_package(tmp_path / "shadowed")
     monkeypatch.syspath_prepend(shadowed)
@@ -135,10 +134,9 @@ def test_a_tree_inside_a_chosen_root_is_kept(llama_cpp, tmp_path, monkeypatch, r
 
 def test_a_symlinked_converter_trusts_the_directory_it_resolves_to(
         llama_cpp, tmp_path, monkeypatch):
-    """A symlinked converter has two directories and the writer tree can be in
-    either: gguf-py beside the link, or the package beside the resolved script.
-    Trusting only the link's side refuses a tree the conversion really used, and
-    the read-back then silently drops to whatever gguf this process happens to have."""
+    """Either directory can hold the writer tree: gguf-py beside the link, or the
+    package beside the resolved script. Trusting one side refuses a tree the
+    conversion really used, and the read-back drops to whatever gguf we happen to have."""
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unrelated"))
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
 
@@ -165,11 +163,9 @@ def test_a_symlinked_converter_trusts_the_directory_it_resolves_to(
 
 def test_the_checked_path_and_the_returned_path_cannot_diverge(
         llama_cpp, tmp_path, monkeypatch):
-    """Resolving separately for the check and for the return is not the same rule
-    twice: the link belongs to the principal being screened, so the two resolutions
-    need not agree, and the value that matters is the one handed back to be imported.
-    Driven with a realpath that answers differently the first time, which is the race
-    made deterministic."""
+    """The link belongs to the principal being screened, so two resolutions need not
+    agree, and the one that matters is the value handed back to be imported. Driven
+    with a realpath that answers differently the first time: the race, made exact."""
     install = tmp_path / "install"
     inside = _gguf_package(install / "gguf-py")
     outside = _gguf_package(tmp_path / "attacker")
@@ -196,9 +192,8 @@ def test_the_checked_path_and_the_returned_path_cannot_diverge(
 
 
 def test_a_symlink_into_a_chosen_root_is_returned_resolved(llama_cpp, tmp_path, monkeypatch):
-    """Accepting a link and handing back the link is a check that can be undone: the
-    caller puts the returned string on sys.path and imports it, so a link the lower-
-    trust principal still owns can be re-pointed in between."""
+    """Handing back the link is a check that can be undone: the caller imports that
+    string, so a link its owner still controls can be re-pointed in between."""
     install = tmp_path / "install"
     tree = _gguf_package(install / "gguf-py")
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(install))
@@ -293,9 +288,8 @@ def test_the_probe_environment_is_not_mutated_for_the_caller(llama_cpp, tmp_path
 
 
 def test_the_probe_models_the_converter_script_directory(llama_cpp, tmp_path):
-    """A script run has its own directory at sys.path[0], so a `gguf` sitting beside
-    the converter outranks the sibling gguf-py it inserts at 1. The probe has to
-    report that one, because it is the one the conversion will use."""
+    """A script has its directory at sys.path[0], so a `gguf` beside the converter
+    outranks the sibling gguf-py inserted at 1. That is the one the conversion uses."""
     install = tmp_path / "install"
     _gguf_package(install / "gguf-py", body = "__version__ = 'sibling'\n")
     beside = _gguf_package(install, body = "__version__ = 'beside'\n")
@@ -334,10 +328,9 @@ def test_the_probe_models_the_converter_script_directory(llama_cpp, tmp_path):
 
 
 def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_path):
-    """Reached through a symlink the two slots part company: `__file__` stays the
-    link, so the entrypoint's own gguf-py insertion is link-relative, while CPython
-    prepends the resolved directory ("if it's a symbolic link, resolve symbolic
-    links", sys.path docs). Each slot has to be modelled from its own directory."""
+    """Through a symlink the slots part company: `__file__` stays the link, while
+    CPython prepends the resolved directory ("if it's a symbolic link, resolve
+    symbolic links", sys.path docs). Each is modelled from its own."""
     target = tmp_path / "target"
     target.mkdir()
     resolved_gguf = _gguf_package(target, body = "__version__ = 'target'\n")
@@ -381,9 +374,8 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
 
 
 def test_an_explicit_cwd_on_pythonpath_survives_the_drop(llama_cpp, tmp_path):
-    """Dropping the implicit `-c` slot must not take a caller's own '.' with it. The
-    converter honours PYTHONPATH, so a package reached that way is one the conversion
-    really uses, and refusing to see it reports the wrong tree just as surely."""
+    """Dropping the implicit `-c` slot must not take a caller's own '.' with it: the
+    converter honours PYTHONPATH, so that package is one the conversion really uses."""
     cwd = tmp_path / "cwd"
     _gguf_package(cwd, body = "__version__ = 'from-pythonpath'\n")
     install = tmp_path / "install"
@@ -422,10 +414,9 @@ def test_an_explicit_cwd_on_pythonpath_survives_the_drop(llama_cpp, tmp_path):
 
 def test_the_probe_drops_the_working_directory_without_interpreter_support(
         llama_cpp, tmp_path, monkeypatch):
-    """The 3.9/3.10 case, simulated by withholding the flag the way those versions
-    do. Refusing the tree afterwards is not enough there: the child has already run
-    the planted package, with this process's environment and token. So the probe
-    drops the entry itself, which needs no interpreter support."""
+    """The 3.9/3.10 case, simulated by withholding the flag as those versions do.
+    Refusing the tree afterwards is too late: the child has already run the planted
+    package with this process's token, so the probe drops the entry itself."""
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     _gguf_package(cwd, body = PROBE_PAYLOAD)
@@ -453,10 +444,9 @@ def test_the_probe_drops_the_working_directory_without_interpreter_support(
 @pytest.mark.parametrize("caller_safe_path", [False, True])
 def test_the_probe_reports_the_tree_the_converter_will_actually_use(
         llama_cpp, tmp_path, caller_safe_path):
-    """Safe-path mode drops the leading entry from a SCRIPT run too, so a caller who
-    already exports PYTHONSAFEPATH gets a converter whose own `insert(1, ...)` lands
-    the sibling tree BEHIND PYTHONPATH. The probe has to match whichever side it is
-    measuring, not assume the converter runs the way it does."""
+    """Safe-path drops the leading entry from a SCRIPT run too, so a caller exporting
+    PYTHONSAFEPATH gets a converter whose `insert(1, ...)` lands the sibling BEHIND
+    PYTHONPATH. The probe matches the side it measures."""
     ambient = tmp_path / "ambient"
     _gguf_package(ambient, body = "__version__ = 'ambient'\n")
     install = tmp_path / "install"
