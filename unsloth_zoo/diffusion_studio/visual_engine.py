@@ -35,6 +35,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 
@@ -199,6 +200,28 @@ def _canvas_maxtok(maxtok):
     return maxtok if 0 < maxtok <= 8192 else 0
 
 
+def _replace_request_file(req_path, req):
+    """Land the request by replacing the name: mkstemp then os.replace, so a link
+    planted at `req_path` is replaced rather than written through. Local rather than
+    imported from unsloth_zoo.compiler, which would pull torch into this path."""
+    directory = os.path.dirname(req_path) or "."
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix = f".{os.path.basename(req_path)}.", suffix = ".tmp", dir = directory,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            json.dump(req, f, ensure_ascii = False)
+        os.replace(temporary_path, req_path)
+    except BaseException:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+        try: os.remove(temporary_path)
+        except OSError: pass
+        raise
+
+
 class VisualServer:
     """Persistent optimized decoder: send chat messages, stream per-step canvas frames + committed text."""
 
@@ -207,11 +230,28 @@ class VisualServer:
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-        self.req = req_path or os.path.join(req_dir, f"dg_visual_{os.getpid()}.req")
-        self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
-        self.ngl = int(self.env["NGL"])
-        self.p = None
-        self._spawn()
+        # /dev/shm and /tmp are 1777 and PIDs are enumerable, so a PID-derived name
+        # there is world readable and can be pre-empted. Give each server its own
+        # 0700 directory with an unpredictable name instead.
+        self._req_dir = None
+        if req_path:
+            self.req = req_path
+        else:
+            self._req_dir = tempfile.mkdtemp(prefix = "dg_visual_", dir = req_dir)
+            self.req = os.path.join(self._req_dir, "request.json")
+        try:
+            self.env = _build_subprocess_env(self.server_bin, gpu=gpu, maxtok=_canvas_maxtok(maxtok), ngl=ngl)
+            self.ngl = int(self.env["NGL"])
+            self.p = None
+            self._spawn()
+        except BaseException:
+            # Nobody can call close() on an object __init__ never returned, so a
+            # server that fails to come up would leave its directory behind, once per
+            # supervisor retry.
+            if self._req_dir is not None:
+                shutil.rmtree(self._req_dir, ignore_errors = True)
+                self._req_dir = None
+            raise
 
     def _spawn(self):
         """Launch the subprocess and finish the READY handshake. Used at startup and by restart()
@@ -249,8 +289,27 @@ class VisualServer:
         # for schema-correct <|tool_call> args.
         if tools:
             req["tools"] = tools
-        with open(self.req, "w", encoding="utf-8") as f:
-            json.dump(req, f, ensure_ascii=False)
+        # The request body carries the whole conversation: no link, not world
+        # readable, and no FIFO. O_NONBLOCK refuses one with no reader; one whose read
+        # end is already held open opens fine, so the fstat is what refuses that.
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            # No atomic no-follow open here, and an lstat first is only a time of check.
+            _replace_request_file(self.req, req)
+        else:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            flags |= no_follow
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            descriptor = os.open(self.req, flags, 0o600)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise OSError(f"Unsloth: refusing to write the request at `{self.req}`: not a regular file.")
+                with os.fdopen(descriptor, "w", encoding="utf-8") as f:
+                    descriptor = None
+                    json.dump(req, f, ensure_ascii=False)
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
         try:
             self.p.stdin.write(self.req + "\n")
             self.p.stdin.flush()
@@ -267,6 +326,11 @@ class VisualServer:
             self.p.wait(timeout=10)
         except Exception:
             self.p.kill()
+        finally:
+            # The request file used to outlive the process, in a shared directory.
+            if self._req_dir is not None:
+                shutil.rmtree(self._req_dir, ignore_errors = True)
+                self._req_dir = None
 
 
 def _parse_stats(line):

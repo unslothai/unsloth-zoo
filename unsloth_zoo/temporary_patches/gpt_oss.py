@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import functools
 import os
+import stat
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -1437,16 +1438,133 @@ def _gpt_oss_cache_locations():
     return out
 
 
-def _invalidate_gpt_oss_compiled_module():
+def _gpt_oss_cache_location_is_trusted(loc):
+    """Whether this process may write the flavor marker into `loc`.
+
+    Deliberately weaker than `compile_cache._is_trusted_directory`, which gates
+    LOADING executable artifacts and so walks every ancestor and refuses any group
+    write: this only writes a flavor string through an O_NOFOLLOW descriptor, beside
+    a compiled module the library itself writes 0644 into the same directory.
+    Ownership alone is the wrong question, since a shared cache belongs to whoever
+    built it first. The real one is whether everyone who can create an entry here is
+    already trusted by the sharing group: ours, or group-write to a group we are in.
+    """
+    try:
+        directory_stat = os.lstat(loc)
+    except FileNotFoundError:
+        return True   # a location we are about to create ourselves
+    except Exception:
+        return False
+    try:
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            return False
+        if os.name != "posix":
+            return True
+        if directory_stat.st_mode & 0o002:
+            return False
+        if directory_stat.st_uid == os.geteuid():
+            return True
+        # A group member can already replace the 0644 module beside the marker.
+        if not (directory_stat.st_mode & 0o020):
+            return False
+        try:
+            groups = set(os.getgroups()) | {os.getgid(), os.getegid()}
+        except Exception:
+            return False
+        return directory_stat.st_gid in groups
+    except Exception:
+        return False
+pass
+
+
+def _gpt_oss_marker_mode(loc):
+    """0664 in a cache shared with our group, 0600 in one only we can reach.
+
+    The marker records a flavor, not a secret, and in a shared cache every member has
+    to be able to read AND rewrite it. Owner-only there means the member who switched
+    flavor deletes the stale module but cannot record the new one, leaving the two
+    disagreeing.
+    """
+    try:
+        if os.name != "posix":
+            return 0o600
+        return 0o664 if (os.lstat(loc).st_mode & 0o020) else 0o600
+    except Exception:
+        return 0o600
+pass
+
+
+def _gpt_oss_replace_marker(marker_path, desired_flavor, mode = 0o600):
+    """Land the marker by replacing the name: mkstemp then os.replace.
+
+    Two things at once. A link sitting at `marker_path` is replaced rather than
+    written through, and the update needs only directory write, so a group member can
+    record a flavor into a marker file owned by whoever built the cache first.
+    """
+    import tempfile
+    directory = os.path.dirname(marker_path) or "."
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix = f".{os.path.basename(marker_path)}.", suffix = ".tmp", dir = directory,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            f.write(desired_flavor)
+        os.chmod(temporary_path, mode)      # mkstemp is 0600; a shared cache needs more
+        os.replace(temporary_path, marker_path)
+    except BaseException:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+        try: os.remove(temporary_path)
+        except OSError: pass
+        raise
+pass
+
+
+def _gpt_oss_write_marker(loc, desired_flavor):
+    """Write the flavor marker without following a link out of `loc`.
+
+    Same flags as `compiler._write_bytes_durably`: O_NONBLOCK because a planted FIFO
+    would otherwise block the load forever, S_ISREG because one with a reader
+    attached opens fine and would swallow the marker instead.
+    """
+    marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+    mode = _gpt_oss_marker_mode(loc)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow or mode != 0o600:
+        # Shared: the existing marker belongs to whoever built the cache, so only a
+        # replacement can update it. Also the no-atomic-no-follow-open case, where an
+        # lstat first would be a time of check.
+        return _gpt_oss_replace_marker(marker_path, desired_flavor, mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= no_follow
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(marker_path, flags, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Unsloth: refusing to write the gpt-oss flavor marker in `{loc}`: not a regular file.")
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            f.write(desired_flavor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+pass
+
+
+def _invalidate_gpt_oss_compiled_module(locations = None):
     """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
     rebuilt against the CURRENT router/experts classes. The single per-model-type file
     hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
-    wrong classes. Cleans every candidate location."""
+    wrong classes. Cleans every candidate location, or only `locations` when given: a
+    location that is stale says nothing about the others, and sweeping them all let one
+    planted candidate delete a perfectly good cache on every load."""
     try:
         import sys as _sys
         import importlib, importlib.util
         _sys.modules.pop(_GPT_OSS_COMPILED_MODULE, None)
-        for loc in _gpt_oss_cache_locations():
+        for loc in (_gpt_oss_cache_locations() if locations is None else locations):
             _f = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if os.path.isfile(_f):
                 try:
@@ -1477,10 +1595,18 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
     missing marker the stale module is dropped for the compiler to regenerate."""
     try:
         locations = _gpt_oss_cache_locations()
-        mismatch = False
+        # Per location, never global: marking all of them stale because one is lets
+        # anyone who can create the predictable temp candidate delete a valid primary
+        # cache on every load.
+        stale = []
         for loc in locations:
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
+                continue
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                # Any marker here is not ours, and the compiler imports the module
+                # beside it with no such gate, so do not trust what it claims.
+                stale.append(loc)
                 continue
             on_disk = None
             marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
@@ -1491,17 +1617,19 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
                 except Exception:
                     on_disk = None
             if on_disk != desired_flavor:
-                mismatch = True
-        if mismatch:
-            _invalidate_gpt_oss_compiled_module()
+                stale.append(loc)
+        if stale:
+            _invalidate_gpt_oss_compiled_module(stale)
         # Record this load's flavor; always at the primary location, the temp fallback only if used.
         for idx, loc in enumerate(locations):
             if idx != 0 and not os.path.isdir(loc):
                 continue
+            # Never write into a directory the sharing group does not already trust.
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                continue
             try:
                 os.makedirs(loc, exist_ok = True)
-                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
-                    f.write(desired_flavor)
+                _gpt_oss_write_marker(loc, desired_flavor)
             except Exception:
                 pass
     except Exception:
