@@ -35,12 +35,14 @@ Run:  DG_VISUAL_BIN=.../llama-diffusion-gemma-visual-server \
 import argparse
 import asyncio
 import atexit
+import ipaddress
 import json
 import math
 import os
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -53,9 +55,48 @@ _PLAYER_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "can
 # DG_ARTIFACT=1 also appends the legacy replay HTML artifact (export/debug); default is live frames only.
 _WANT_ARTIFACT = os.environ.get("DG_ARTIFACT", "") not in ("", "0", "false", "False", "no", "off")
 
+DEFAULT_HOST = "127.0.0.1"
+# 256 tokens per canvas block, so 64 blocks is a 16384-token answer: far above the
+# 2048-token default, and low enough that one caller cannot hold _LOCK for hours.
+DEFAULT_MAX_BLOCKS = 64
+
 app = FastAPI()
-_STATE = {}          # server (VisualServer), player (html template str)
+_STATE = {}          # server (VisualServer), player (html template str), host (bind address)
 _LOCK = threading.Lock()
+
+
+def _is_local_name(hostname):
+    """Whether a Host/Origin hostname names this machine's own loopback interface."""
+    if not hostname:
+        return False
+    hostname = hostname.strip().lower().rstrip(".")
+    if hostname in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+@app.middleware("http")
+async def _bind_to_local_caller(request, call_next):
+    """Loopback is not an authorization boundary for a browser: any page the user
+    visits can POST here cross-site with no preflight (a text/plain body is a CORS
+    simple request), and a name rebound to 127.0.0.1 makes the reply readable too.
+    Bind every request to this machine instead: the Host must be a loopback name
+    (which is what breaks rebinding), and an Origin or Referer, when the caller
+    sends one at all, must be local. An ordinary OpenAI client sends neither.
+    """
+    host = urlsplit("//" + (request.headers.get("host") or "")).hostname
+    # Only when we are loopback-only. A deliberate --host 0.0.0.0 is the operator
+    # publishing this listener, and then the Host is whatever name they reach it by.
+    if _is_local_name(_STATE.get("host", DEFAULT_HOST)) and not _is_local_name(host):
+        return JSONResponse({"error": "forbidden host"}, status_code = 403)
+    for header in ("origin", "referer"):
+        value = request.headers.get(header)
+        if value and not _is_local_name(urlsplit(value).hostname):
+            return JSONResponse({"error": "forbidden origin"}, status_code = 403)
+    return await call_next(request)
 
 
 def _close_server():
@@ -193,7 +234,15 @@ def _max_blocks(body):
         mt = int(mt)
     except (TypeError, ValueError):
         mt = 2048
-    return max(1, math.ceil(mt / V.CANVAS))
+    # Clamped: the decoder is single-sequence and the request holds _LOCK for the
+    # whole generation, so an unbounded max_tokens is the whole server for as long
+    # as the caller likes. DG_MAX_BLOCKS raises it, read at the call so Studio can
+    # set it after import.
+    try:
+        ceiling = max(1, int(os.environ.get("DG_MAX_BLOCKS", "").strip()))
+    except ValueError:
+        ceiling = DEFAULT_MAX_BLOCKS
+    return max(1, min(ceiling, math.ceil(mt / V.CANVAS)))
 
 
 def _artifact(frames):
@@ -363,7 +412,7 @@ async def chat(req: Request):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--gpu", default=os.environ.get("DG_GPU", "0"))
     ap.add_argument("--maxtok", type=int, default=0,
@@ -373,6 +422,7 @@ def main():
                          "the model does not fit VRAM (else the load OOMs in cudaMalloc)")
     args = ap.parse_args()
 
+    _STATE["host"] = args.host
     _STATE["player"] = open(_PLAYER_TEMPLATE).read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
