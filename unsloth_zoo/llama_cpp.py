@@ -4393,13 +4393,25 @@ requirements = json.loads(sys.stdin.read() or "[]")
 # which argv[2] reports. Both terms are needed:
 #   converter plain -> sibling ahead of all of PYTHONPATH
 #   converter safe  -> sibling behind PYTHONPATH's first entry
-probe_safe = getattr(sys.flags, "safe_path", False)
-# Same interpreter both sides, so a probe that did not honour it means a converter
-# that will not either (before 3.11 the variable is ignored).
-converter_safe = probe_safe and len(sys.argv) > 2 and sys.argv[2] == "1"
+# PYTHONSAFEPATH is ignored before 3.11, and there the parent's provenance check is
+# no help: it can refuse to IMPORT a planted tree, but this child has already run
+# whatever `./gguf/__init__.py` it found, with the parent's environment and token.
+# So drop the entry here as well, which needs no interpreter support. A script run
+# never has the working directory on its path either, so nothing faithful is lost.
+if not getattr(sys.flags, "safe_path", False):
+    while sys.path and sys.path[0] in ("", ".", os.getcwd()):
+        del sys.path[0]
+# Either way sys.path now begins with PYTHONPATH, which is the shape safe-path mode
+# gives. The converter is a different question: it is a SCRIPT, so it has its own
+# directory at index 0 and its `insert(1, ...)` puts the sibling tree ahead of all
+# of PYTHONPATH -- unless the caller's environment already asked for safe-path mode,
+# which removes that slot and drops the sibling behind PYTHONPATH's first entry.
+# argv[2] reports which, and before 3.11 the answer is always "plain".
+converter_safe = (sys.version_info >= (3, 11)
+                  and len(sys.argv) > 2 and sys.argv[2] == "1")
 if converter and "NO_LOCAL_GGUF" not in os.environ:
     sys.path.insert(
-        (0 if probe_safe else 1) + (1 if converter_safe else 0),
+        1 if converter_safe else 0,
         os.path.join(os.path.dirname(os.path.abspath(converter)), "gguf-py"),
     )
 

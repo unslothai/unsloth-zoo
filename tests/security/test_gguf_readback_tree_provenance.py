@@ -230,6 +230,34 @@ def test_the_probe_environment_is_not_mutated_for_the_caller(llama_cpp, tmp_path
     assert "PYTHONSAFEPATH" not in env
 
 
+def test_the_probe_drops_the_working_directory_without_interpreter_support(
+        llama_cpp, tmp_path, monkeypatch):
+    """The 3.9/3.10 case, simulated by withholding the flag the way those versions
+    do. Refusing the tree afterwards is not enough there: the child has already run
+    the planted package, with this process's environment and token. So the probe
+    drops the entry itself, which needs no interpreter support."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    _gguf_package(cwd, body = PROBE_PAYLOAD)
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""
+    env.pop("PYTHONSAFEPATH", None)          # exactly what a pre-3.11 child sees
+    completed = subprocess.run(
+        [sys.executable, "-c", llama_cpp._GGUF_PROBE_SOURCE, "", "0"],
+        input = "[]", cwd = str(cwd), env = env, stdout = subprocess.PIPE,
+        stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
+    )
+    reports = [
+        json.loads(line) for line in (completed.stdout or "").splitlines()
+        if line.strip().startswith("{")
+    ]
+    assert reports, completed.stderr
+    location = reports[-1].get("location") or ""
+    assert not str(location).startswith(str(cwd)), location
+    assert not (tmp_path / "EXECUTED").exists(), "the planted package ran in the child"
+
+
 @pytest.mark.skipif(sys.version_info < (3, 11),
                     reason = "PYTHONSAFEPATH is honored from 3.11")
 @pytest.mark.parametrize("caller_safe_path", [False, True])
