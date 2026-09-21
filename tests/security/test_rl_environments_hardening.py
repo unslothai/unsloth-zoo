@@ -19,10 +19,12 @@ CPU-only and network-free; the one real listener here is on 127.0.0.1, which
 the suite's network blocker allows.
 """
 
+import contextlib
 import http.server
 import socket
 import subprocess
 import threading
+import time
 import types
 from urllib.parse import urlsplit
 
@@ -514,3 +516,77 @@ def test_probe_advances_past_a_family_the_host_cannot_open(monkeypatch):
     ))
     assert rl_env.is_port_open("localhost", 9000)
     assert reached == [("127.0.0.1", 9000)]
+
+
+# --- the registry is shared mutable state, so it needs a lock ------------------
+
+class _SlowPollChild:
+    """poll() calls waitpid, which releases the GIL; this models that window."""
+    def __init__(self, dead = False): self.dead = dead
+    def poll(self):
+        time.sleep(0.0005)
+        return 1 if self.dead else None
+
+
+@contextlib.contextmanager
+def _registry_guard():
+    """Whatever serialization the module offers, which is the point of the test.
+
+    Taking the real lock when it exists and nothing when it does not is what keeps
+    these two falsifiable: a helper that required the lock would raise inside its
+    own thread on unlocked code, the contended access would never happen, and the
+    test would pass by doing nothing.
+    """
+    lock = getattr(rl_env, "_OPENENV_CHILDREN_LOCK", None)
+    if lock is None:
+        yield
+    else:
+        with lock:
+            yield
+
+
+def test_reaping_survives_a_concurrent_launch():
+    """Iterating while another thread registers raised 'dictionary changed size'."""
+    for index in range(200):
+        rl_env._OPENENV_CHILDREN[("127.0.0.1", 50000 + index)] = _SlowPollChild(dead = index % 2 == 0)
+    errors = []
+
+    def reap():
+        try:
+            rl_env._reap_exited_openenv_children()
+        except BaseException as error:      # the failure mode is a RuntimeError
+            errors.append(error)
+
+    def register():
+        for index in range(400):
+            with _registry_guard():
+                rl_env._OPENENV_CHILDREN[("::1", 60000 + index)] = _SlowPollChild()
+            time.sleep(0.0001)
+
+    reaper = threading.Thread(target = reap)
+    registrar = threading.Thread(target = register)
+    registrar.start(); reaper.start()
+    reaper.join(); registrar.join()
+    assert errors == [], f"reaping raised {errors!r}"
+    # The sweep still did its job: every dead child is gone, every live one stays.
+    assert all(child.poll() is None for child in rl_env._OPENENV_CHILDREN.values())
+
+
+def test_a_liveness_check_cannot_delete_another_threads_live_child():
+    """get-poll-pop is check-then-mutate: the pop must not outlive the check."""
+    endpoint = ("127.0.0.1", 51000)
+    rl_env._OPENENV_CHILDREN[endpoint] = _SlowPollChild(dead = True)
+    replacement = _SlowPollChild(dead = False)
+
+    def check(): rl_env._openenv_child_alive(*endpoint)
+
+    def replace():
+        time.sleep(0.0002)                  # lands inside the checker's poll()
+        with _registry_guard():
+            rl_env._OPENENV_CHILDREN[endpoint] = replacement
+
+    checker = threading.Thread(target = check)
+    replacer = threading.Thread(target = replace)
+    checker.start(); replacer.start()
+    checker.join(); replacer.join()
+    assert rl_env._OPENENV_CHILDREN.get(endpoint) is replacement

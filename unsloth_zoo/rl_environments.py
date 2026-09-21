@@ -1136,6 +1136,16 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
 # which is the confusion this registry exists to prevent.
 _OPENENV_CHILDREN = {}
 
+# Every read and write of the registry holds this. poll() calls waitpid, which
+# releases the GIL, so a bare `for k, child in _OPENENV_CHILDREN.items() if
+# child.poll() ...` lets a second thread's launch resize the dict mid-iteration
+# and raises "dictionary changed size during iteration" -- the same shape as
+# CPython's own bug in _ExecutorManagerThread (python/cpython#87664). The
+# get-poll-pop and get-compare sequences below are check-then-mutate for the
+# same reason, so one thread could delete another's live child record.
+# WNOHANG waitpid does not block, so holding the lock across poll() is cheap.
+_OPENENV_CHILDREN_LOCK = threading.Lock()
+
 
 def _reap_exited_openenv_children():
     """ Drop and reap every registered child that has already exited.
@@ -1145,8 +1155,10 @@ def _reap_exited_openenv_children():
     Popen also suppresses the interpreter's own opportunistic reaping, so an
     unswept registry turns exited children into zombies that outlive them.
     """
-    for key in [k for k, child in _OPENENV_CHILDREN.items() if child.poll() is not None]:
-        _OPENENV_CHILDREN.pop(key, None)
+    with _OPENENV_CHILDREN_LOCK:
+        for key, child in list(_OPENENV_CHILDREN.items()):
+            if child.poll() is not None:
+                _OPENENV_CHILDREN.pop(key, None)
 pass
 
 
@@ -1163,13 +1175,14 @@ pass
 
 def _openenv_child_alive(client_host, port):
     """ Is the child we spawned on this endpoint still the process holding it? """
-    child = _OPENENV_CHILDREN.get((client_host, port), None)
-    if child is None: return False
-    if child.poll() is not None:
-        # It exited, so the endpoint is free for anyone else to take.
-        _OPENENV_CHILDREN.pop((client_host, port), None)
-        return False
-    return True
+    with _OPENENV_CHILDREN_LOCK:
+        child = _OPENENV_CHILDREN.get((client_host, port), None)
+        if child is None: return False
+        if child.poll() is not None:
+            # It exited, so the endpoint is free for anyone else to take.
+            _OPENENV_CHILDREN.pop((client_host, port), None)
+            return False
+        return True
 pass
 
 
@@ -1268,13 +1281,15 @@ def launch_openenv(
             text = True,
             cwd = working_directory,
         )
-        _OPENENV_CHILDREN[(client_host, port)] = openenv_child
+        with _OPENENV_CHILDREN_LOCK:
+            _OPENENV_CHILDREN[(client_host, port)] = openenv_child
         # Wait until port is open
         wait_trials = 0
         while not is_port_open(client_host, port):
             # A child that died cannot be the one that opens this port later.
             if openenv_child.poll() is not None:
-                _OPENENV_CHILDREN.pop((client_host, port), None)
+                with _OPENENV_CHILDREN_LOCK:
+                    _OPENENV_CHILDREN.pop((client_host, port), None)
                 break
             time.sleep(0.01)
             if wait_trials % 10 == 0:
@@ -1283,7 +1298,9 @@ def launch_openenv(
             if wait_trials == 6000:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
-        if _OPENENV_CHILDREN.get((client_host, port), None) is not openenv_child:
+        with _OPENENV_CHILDREN_LOCK:
+            ours = _OPENENV_CHILDREN.get((client_host, port), None) is openenv_child
+        if not ours:
             trials += 1
             if trials == 30:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
