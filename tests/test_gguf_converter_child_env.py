@@ -829,6 +829,8 @@ def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tm
     tree = tmp_path / "site-packages"
     (tree / "gguf").mkdir(parents=True)
     (tree / "gguf" / "__init__.py").write_text("# gguf\n")
+    # A real one is on sys.path, and only a tree with that provenance is accepted.
+    monkeypatch.syspath_prepend(str(tree))
 
     def _fake_probe(python_exe, env, requirements, converter_location=None, timeout=120):
         captured["env"] = env

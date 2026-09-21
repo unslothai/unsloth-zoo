@@ -35,12 +35,15 @@ Run:  DG_VISUAL_BIN=.../llama-diffusion-gemma-visual-server \
 import argparse
 import asyncio
 import atexit
+import ipaddress
 import json
 import math
 import os
+import socket
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -53,9 +56,69 @@ _PLAYER_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "can
 # DG_ARTIFACT=1 also appends the legacy replay HTML artifact (export/debug); default is live frames only.
 _WANT_ARTIFACT = os.environ.get("DG_ARTIFACT", "") not in ("", "0", "false", "False", "no", "off")
 
+DEFAULT_HOST = "127.0.0.1"
+# 256 tokens per canvas block, so 64 blocks is a 16384-token answer, far above the
+# 2048-token default. See _max_blocks for what this does and does not bound.
+DEFAULT_MAX_BLOCKS = 64
+
 app = FastAPI()
-_STATE = {}          # server (VisualServer), player (html template str)
+_STATE = {}          # server (VisualServer), player (html template str), host (bind address)
 _LOCK = threading.Lock()
+
+
+def _is_local_name(hostname):
+    """Whether a Host/Origin hostname names this machine's own loopback interface."""
+    if not hostname:
+        return False
+    hostname = hostname.strip().lower().rstrip(".")
+    if hostname in ("localhost", "localhost.localdomain"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        pass
+    # `127.1` and friends are a user reaching their own machine, and inet_aton is how
+    # the Studio backend's host_policy reads them. A numeric literal cannot be
+    # rebound, so it names loopback or it fails is_loopback below.
+    try:
+        return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(hostname))).is_loopback
+    except (OSError, ValueError):
+        return False
+
+
+def _hostname_of(value):
+    """The hostname `urlsplit` reads out of an authority or URL, or None when it will
+    not parse (`[oops]` raises, and uncaught that is a 500 rather than a refusal).
+    `user@host` is refused: not Host syntax, and only the part after `@` is compared.
+    """
+    try:
+        split = urlsplit(value)
+        return None if "@" in (split.netloc or "") else split.hostname
+    except ValueError:
+        return None
+
+
+@app.middleware("http")
+async def _bind_to_local_caller(request, call_next):
+    """Loopback is not an authorization boundary for a browser: any page the user
+    visits can POST here cross-site with no preflight (a text/plain body is a CORS
+    simple request), and a name rebound to 127.0.0.1 makes the reply readable too.
+    Bind every request to this machine instead: the Host must be a loopback name
+    (which is what breaks rebinding), and an Origin or Referer, when the caller
+    sends one at all, must be local. An ordinary OpenAI client sends neither.
+    """
+    # Only when we are loopback-only. A deliberate --host 0.0.0.0 is the operator
+    # publishing this listener, and then the Host is whatever name they reach it by.
+    if _is_local_name(_STATE.get("host", DEFAULT_HOST)) and \
+        not _is_local_name(_hostname_of("//" + (request.headers.get("host") or ""))):
+        return JSONResponse({"error": "forbidden host"}, status_code = 403)
+    for header in ("origin", "referer"):
+        # Every value, not the first: sent twice, `.get` answers with the local one
+        # while a foreign one rides behind it.
+        for value in request.headers.getlist(header):
+            if value and not _is_local_name(_hostname_of(value)):
+                return JSONResponse({"error": "forbidden origin"}, status_code = 403)
+    return await call_next(request)
 
 
 def _close_server():
@@ -193,7 +256,33 @@ def _max_blocks(body):
         mt = int(mt)
     except (TypeError, ValueError):
         mt = 2048
-    return max(1, math.ceil(mt / V.CANVAS))
+    # A size bound, not a deadline, and not what stops a long generation: the server
+    # answers anything over its per-turn budget with ERR toolong, and an explicit
+    # --maxtok is already capped at 8192 (32 blocks) by _canvas_maxtok, below this.
+    # So it binds only against an auto-sized budget above 16384. DG_MAX_BLOCKS raises
+    # it, read at the call so Studio can set it after import.
+    try:
+        ceiling = max(1, int(os.environ.get("DG_MAX_BLOCKS", "").strip()))
+    except ValueError:
+        ceiling = DEFAULT_MAX_BLOCKS
+    asked = max(1, math.ceil(mt / V.CANVAS))
+    return min(ceiling, asked), asked > ceiling
+
+
+def _finish_reason(capped, max_blocks, stats):
+    """`length` only when the ceiling WE imposed is what ended the generation.
+
+    A request honoured in full, or one that stopped early with blocks to spare,
+    finished naturally and saying `length` there is the same bug reversed. An older
+    server reporting no block count leaves it undecidable, and then `stop` stands.
+    """
+    if not capped:
+        return "stop"
+    try:
+        used = int(stats.get("blocks", 0))
+    except (TypeError, ValueError):
+        return "stop"
+    return "length" if used >= max_blocks else "stop"
 
 
 def _artifact(frames):
@@ -237,7 +326,7 @@ async def chat(req: Request):
     # forwarded to the visual server, honoring tool_choice
     tools = _tools_for_choice(body.get("tools"), body.get("tool_choice"))
     stream = bool(body.get("stream", False))
-    max_blocks = _max_blocks(body)
+    max_blocks, capped = _max_blocks(body)
     seed = int(body.get("seed", 3407))
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -267,7 +356,7 @@ async def chat(req: Request):
         return JSONResponse({
             "id": cid, "object": "chat.completion", "created": created, "model": MODEL_ID,
             "choices": [{"index": 0, "message": message,
-                         "finish_reason": "stop"}],
+                         "finish_reason": _finish_reason(capped, max_blocks, stats_box)}],
             "usage": {"prompt_tokens": P, "completion_tokens": G, "total_tokens": P + G},
         })
 
@@ -344,7 +433,8 @@ async def chat(req: Request):
                                 "usage": {"prompt_tokens": P, "completion_tokens": G,
                                           "total_tokens": P + G},
                                 "timings": timings})
-                    yield _sse(_chunk(cid, created, {}, finish="stop"))
+                    yield _sse(_chunk(cid, created, {},
+                                      finish=_finish_reason(capped, max_blocks, stats_box)))
                     yield "data: [DONE]\n\n"
                     return
             elif kind == "overflow":
@@ -363,7 +453,7 @@ async def chat(req: Request):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default=DEFAULT_HOST)
     ap.add_argument("--port", type=int, default=8123)
     ap.add_argument("--gpu", default=os.environ.get("DG_GPU", "0"))
     ap.add_argument("--maxtok", type=int, default=0,
@@ -373,6 +463,7 @@ def main():
                          "the model does not fit VRAM (else the load OOMs in cudaMalloc)")
     args = ap.parse_args()
 
+    _STATE["host"] = args.host
     _STATE["player"] = open(_PLAYER_TEMPLATE).read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
