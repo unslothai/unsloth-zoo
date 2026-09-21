@@ -478,16 +478,32 @@ def patch_Gemma4TextAttention():
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
-            attn_output = scaled_dot_product_attention(
+            # This branch bypasses ALL_ATTENTION_FUNCTIONS, so offer the opt-in
+            # tiled D=512 global path here too. It keeps q/k/v in fp32 and
+            # returns None for anything it does not take.
+            from .gemma4_tiled_global_attention import maybe_gemma4_tiled_global_attention
+            attn_output = maybe_gemma4_tiled_global_attention(
+                self,
                 query_states,
                 key_states,
                 value_states,
-                attn_mask = attn_mask,
-                dropout_p = self.attention_dropout if self.training else 0.0,
+                attn_mask,
+                dropout = self.attention_dropout if self.training else 0.0,
+                scaling = self.scaling,
                 is_causal = is_causal,
-                scale = self.scaling,
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                has_cache = past_key_values is not None,
             )
+            if attn_output is None:
+                attn_output = scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask = attn_mask,
+                    dropout_p = self.attention_dropout if self.training else 0.0,
+                    is_causal = is_causal,
+                    scale = self.scaling,
+                    enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                )
             attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 
         # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
