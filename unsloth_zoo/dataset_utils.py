@@ -772,7 +772,19 @@ def train_on_responses_only(
     for q, a in zip(Q_must, A_must):
         if q != a: break
         message_start.append(q)
-    if not set(message_start).intersection(getattr(tokenizer, "all_special_ids", []) or []):
+    # Every token of that opener must be a registered special token, and at least one
+    # must carry non-whitespace text. `all_special_ids` reports only the attribute
+    # specials (bos/eos/pad/unk/...), so on real tokenizers it holds none of the actual
+    # openers - <|im_start|>, <|start_header_id|>, <start_of_turn> are added tokens and
+    # have to be read from added_tokens_decoder, or this whole branch never fires.
+    # The non-whitespace requirement is what keeps a tokenizer that registers a bare
+    # "\n" as a special token (NVIDIA Nemotron) from ending every span at the first
+    # newline inside an answer.
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    special_ids  = {i for i, t in added_tokens.items() if getattr(t, "special", False)}
+    special_ids.update(getattr(tokenizer, "all_special_ids", None) or [])
+    if not all(i in special_ids for i in message_start) or \
+        not any(getattr(added_tokens.get(i), "content", "").strip() for i in message_start):
         message_start = []
     bos_token_id = getattr(tokenizer, "bos_token_id", None)
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
