@@ -83,7 +83,11 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     assert "5.4.0" in message and "5.5.4" in message
     assert "#45567" in message
     # It must not repeat the false advice that the checkpoint needs regenerating.
-    assert "Do NOT regenerate the checkpoint" in message
+    # The advice is conditional on trying a supported transformers first, because the
+    # guard reads the installed version and never inspects the checkpoint: a file whose
+    # sidecars really are absent reaches this same branch.
+    assert "before regenerating anything" in message
+    assert "does need rebuilding" in message
 
 
 def test_error_message_stays_generic_outside_the_window(monkeypatch):
@@ -143,3 +147,23 @@ def test_guard_predicate_matches_the_packed_layout():
     assert not (ordinary.dim() == 2 and ordinary.shape[-1] == 1)
     # A [N, 1] float weight is a legitimate 1-input Linear; the packed case is uint8.
     assert _packed_weight().dtype == torch.uint8
+
+
+def test_unquantized_linear4bit_with_one_input_feature_is_not_accused():
+    """A legitimate Linear4bit with in_features == 1 has a (out_features, 1) weight.
+
+    That matches the packed-blob shape test on its own, so the guard also compares
+    against out_features. Without that clause this forward raises instead of
+    returning, which turns a working model into a hard error and tells the user to
+    reinstall transformers over a checkpoint that was never involved.
+    """
+    import torch
+    import bitsandbytes as bnb
+    from unsloth_zoo.temporary_patches.bitsandbytes import (
+        patch_bitsandbytes_linear4bit_forward,
+    )
+
+    patch_bitsandbytes_linear4bit_forward()
+    module = bnb.nn.Linear4bit(1, 16)
+    out = module(torch.randn(4, 1))
+    assert tuple(out.shape) == (4, 16)

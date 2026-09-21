@@ -88,8 +88,11 @@ def _packed_weight_without_quant_state_error(module):
             f"{head}\nThis is transformers=={transformers_version}: releases 5.4.0 and "
             f"5.5.0 to 5.5.4 discard the quant_state sidecar tensors of pre-quantized "
             f"composite (multimodal) checkpoints. Introduced by transformers PR #44300, "
-            f"fixed by PR #45567 in 5.6.0. Do NOT regenerate the checkpoint, it is fine. "
-            f"Install transformers>=5.6.0, or fall back to 5.3.0 or 4.57.6."
+            f"fixed by PR #45567 in 5.6.0. Install transformers>=5.6.0, or fall back to "
+            f"5.3.0 or 4.57.6, and try again before regenerating anything: if that is "
+            f"what happened here the checkpoint is intact and re-quantizing it will not "
+            f"help. If a supported transformers still reports this, the sidecar tensors "
+            f"really are missing from the files and the checkpoint does need rebuilding."
         )
     return (
         f"{head}\nInstalled transformers=={transformers_version}. Check that the "
@@ -143,7 +146,16 @@ def patch_bitsandbytes_linear4bit_forward():
             # above cannot help here: fix_4bit_weight_quant_state_from_module only copies
             # module.quant_state onto the weight, and module.quant_state is itself None
             # because Params4bit.from_prequantized never ran.
-            if weight.dim() == 2 and weight.shape[-1] == 1:
+            # A packed blob is (out_features * in_features / 2, 1). A legitimate
+            # unquantized Linear4bit with in_features == 1 is (out_features, 1) and
+            # matches the shape test alone, so compare against out_features to tell
+            # them apart. in_features == 2 makes the two shapes equal; that collapses
+            # to not raising, which is the old behaviour, never a false accusation.
+            if (
+                weight.dim() == 2
+                and weight.shape[-1] == 1
+                and weight.shape[0] != getattr(self, "out_features", -1)
+            ):
                 raise RuntimeError(_packed_weight_without_quant_state_error(self))
             if weight.dtype != x.dtype:
                 weight = weight.to(x.dtype)
