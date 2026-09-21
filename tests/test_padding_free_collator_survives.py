@@ -16,16 +16,10 @@
 
 """The collator swap must not throw away a padding-free batch.
 
-Unsloth auto-enables `padding_free` for SFTTrainer whenever packing is off, and
-then wraps the TRL collator's `torch_call` so every batch also carries
-`packed_seq_lengths`. The swap below replaced any collator that was not a
-`DataCollatorForSeq2Seq`, so `train_on_responses_only` quietly put a padding
-collator back and the padding-free path stopped running while `args.padding_free`
-stayed True.
-
-The real TRL collator is used, not a stand-in: what is under test is that TRL's
-own flattening and its consumption of the `labels` column survive, and a mock
-would assert nothing about either. CPU-pure and offline.
+Unsloth auto-enables `padding_free` and wraps `torch_call` to add
+`packed_seq_lengths`; replacing the instance dropped both while
+`args.padding_free` stayed True. Real TRL collator, not a stand-in: a mock
+would assert nothing about TRL's flattening or its use of `labels`.
 """
 
 import inspect
@@ -47,14 +41,13 @@ INSTRUCTION_PART = "<|user|>"
 RESPONSE_PART = "<|assistant|>"
 USER_ID, ASSISTANT_ID, PAD_ID = 1, 2, 0
 
-# Deliberately unequal, so a padded batch and a flattened one cannot be confused:
-# padded is [2, 7], flattened is [1, 11].
+# Unequal, so padded [2, 7] and flattened [1, 11] cannot be confused.
 LONG_ROW = [USER_ID, 10, 11, 12, ASSISTANT_ID, 20, 21]
 SHORT_ROW = [USER_ID, 13, ASSISTANT_ID, 22]
 
 
 class _Encoding(dict):
-    """Mapping (what `datasets.map` wants) that also answers `.input_ids`."""
+    """Mapping for `datasets.map` that also answers `.input_ids`."""
     @property
     def input_ids(self):
         return self["input_ids"]
@@ -103,10 +96,8 @@ def _rows():
     return Dataset.from_dict({"input_ids": [list(LONG_ROW), list(SHORT_ROW)]})
 
 
-# The declared range is `trl>=0.18.2,!=0.19.0,<=1.13.0`, and the collator's
-# signature is not stable across it: `padding_free` arrives in 0.19.1 and
-# `completion_only_loss` is gone again by 1.13.0. Build from the signature so
-# this file pins the exemption, not one release's keyword list.
+# Across `trl>=0.18.2,!=0.19.0,<=1.13.0` the signature moves: `padding_free`
+# arrives in 0.19.1, `completion_only_loss` is gone by 1.13.0. Build from it.
 _TRL_FIELDS = set(inspect.signature(TRLLanguageModeling.__init__).parameters)
 _PADDING_FREE_SUPPORTED = "padding_free" in _TRL_FIELDS
 
@@ -126,9 +117,7 @@ def _trl_collator(padding_free = True, cls = None):
 
 
 def _wrap_like_unsloth(collator):
-    """What `unsloth.utils.packing.enable_padding_free_metadata` installs: a
-    `torch_call` wrapper adding `packed_seq_lengths`, marked on the instance.
-    Replacing the instance throws the wrapper away with it."""
+    """What `enable_padding_free_metadata` installs, lost with the instance."""
     original = collator.torch_call
 
     def torch_call_with_lengths(examples):
@@ -147,9 +136,6 @@ def _collate(trainer):
     return trainer.data_collator(rows)
 
 
-# --------------------------------------------------------------------------
-# What the fix is for. Both of these fail before it.
-# --------------------------------------------------------------------------
 @needs_padding_free
 def test_a_padding_free_trl_collator_is_not_swapped_for_a_padding_one():
     collator = _trl_collator()
@@ -159,10 +145,7 @@ def test_a_padding_free_trl_collator_is_not_swapped_for_a_padding_one():
     batch = _collate(out)
     # Flattened, not padded: one row of 11, not two rows of 7.
     assert list(batch["input_ids"].shape) == [1, len(LONG_ROW) + len(SHORT_ROW)]
-    # Position ids restart at each sequence boundary. TRL carried them under
-    # `attention_mask` before 0.20 (the old flash-attention-2 convention) and
-    # under `position_ids` since, so accept whichever key this release emits
-    # rather than pinning one of them.
+    # TRL carried position ids under `attention_mask` before 0.20, `position_ids` since.
     positions = batch.get("position_ids", batch.get("attention_mask"))
     assert positions is not None
     assert positions.flatten().tolist() == \
@@ -181,24 +164,19 @@ def test_unsloths_sequence_length_wrapper_survives_the_masking_pass():
 
 @needs_padding_free
 def test_the_preserved_collator_keeps_the_response_only_labels():
-    """TRL reads the `labels` the masking pass wrote rather than rebuilding them
-    from `input_ids`, so the supervised tokens must be exactly the responses."""
+    """TRL reads the masking pass's `labels` instead of rebuilding from `input_ids`."""
     out = train_on_responses_only(StubTrainer(_trl_collator(), _rows()),
                                   INSTRUCTION_PART, RESPONSE_PART)
     batch = _collate(out)
     ids = batch["input_ids"].flatten().tolist()
     labels = batch["labels"].flatten().tolist()
     supervised = [i for i, l in zip(ids, labels) if l != -100]
-    # Everything strictly after each ASSISTANT marker, and nothing before one.
-    # TRL additionally masks index 0 of every sequence, which is the marker itself.
+    # After each ASSISTANT marker only; TRL also masks index 0 of every sequence.
     assert supervised == [20, 21, 22]
     assert all(i == l for i, l in zip(ids, labels) if l != -100)
 
 
-# --------------------------------------------------------------------------
-# Negative controls: the exemption must be this narrow. Each of these fails if
-# the guard is widened to "anything with a truthy padding_free".
-# --------------------------------------------------------------------------
+# Negative controls: each fails under a specific widening of the guard.
 def test_a_collator_that_merely_carries_padding_free_is_still_replaced():
     class NotATrlCollator:
         padding_free = True
@@ -210,8 +188,7 @@ def test_a_collator_that_merely_carries_padding_free_is_still_replaced():
 
 
 def test_the_transformers_language_modeling_collator_is_not_exempted():
-    """Same class name, different project: the module prefix is what separates
-    them, and transformers' collator does not flatten."""
+    """Same class name, different project: the module prefix separates them."""
     collator = HFLanguageModeling(tokenizer = StubTokenizer(), mlm = False)
     collator.padding_free = True
     out = train_on_responses_only(StubTrainer(collator, _rows()),
@@ -221,8 +198,7 @@ def test_the_transformers_language_modeling_collator_is_not_exempted():
 
 @needs_padding_free
 def test_a_trl_collator_with_padding_free_off_is_still_replaced():
-    """The exemption is about the mode, not the class: an unflattened TRL
-    collator pads no labels and still needs the swap."""
+    """The exemption is about the mode, not the class."""
     out = train_on_responses_only(StubTrainer(_trl_collator(padding_free = False), _rows()),
                                   INSTRUCTION_PART, RESPONSE_PART)
     assert isinstance(out.data_collator, DataCollatorForSeq2Seq)
