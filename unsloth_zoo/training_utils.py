@@ -264,15 +264,10 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
-# Sentinel for "this config had no use_cache at all", so restore_use_cache can
-# tell that apart from a config that genuinely held None.
-#
-# A class, not `object()`: the record lives on the model, and `copy.deepcopy`
-# and `pickle` both treat a class as atomic while giving a bare instance a new
-# identity. With an instance, deepcopying a prepared model (TRL builds its
-# reference model that way) or a torch.save/load round trip made the identity
-# check fail, so restore wrote the opaque sentinel itself into cfg.use_cache
-# and the config stopped being JSON serializable.
+# Marks a config that never had use_cache, as distinct from one holding None.
+# A class, not object(): deepcopy and pickle preserve a class's identity but not
+# an instance's, which broke the `is` check below and wrote this unserializable
+# object into cfg.use_cache (TRL deepcopies a prepared model for its ref model).
 class _ABSENT:
     """Marker type; never instantiated."""
 
@@ -287,27 +282,20 @@ def disable_use_cache(model):
     originals = getattr(model, "_unsloth_use_cache_originals", None)
     if originals is None:
         originals = []
-    # Record by identity rather than only on the first call. A config first
-    # reached on a later call -- a sub-config attached after training started,
-    # or a config swapped in while the model was prepared -- used to be
-    # disabled without being recorded, so restore_use_cache could never undo
-    # it and the config kept use_cache = False for good.
+    # Record by identity, not only on the first call: a config first reached
+    # later was disabled but never recorded, so restore could not undo it.
     recorded = {id(cfg) for cfg, _ in originals}
     for cfg in _iter_configs(config):
         has_use_cache = hasattr(cfg, "use_cache")
         if has_use_cache and not cfg.use_cache:
             continue                      # already disabled, nothing to record
         if id(cfg) not in recorded:
-            # _ABSENT marks a config that never had the attribute, so restore
-            # removes it again rather than inventing a value. A config already
-            # in the record keeps its first baseline.
+            # first baseline wins; _ABSENT so restore deletes rather than invents
             originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
             recorded.add(id(cfg))
-        # Set it even when the config never declared one. A model whose forward
-        # reads self.config.use_cache then raises AttributeError under gradient
-        # checkpointing instead of running: transformers 5 sub-configs do not
-        # inherit a default, and stepfun-ai/Step-3.7-Flash ships a
-        # Step3p7TextConfig with no use_cache at all.
+        # Set it even when absent: transformers 5 sub-configs inherit no default,
+        # so a forward reading self.config.use_cache raises AttributeError
+        # instead (stepfun-ai/Step-3.7-Flash ships exactly such a text config).
         cfg.use_cache = False
     if originals:
         try:

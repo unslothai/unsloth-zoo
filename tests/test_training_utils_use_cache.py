@@ -6,22 +6,12 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""CPU-pure behavioural tests for the `use_cache` handling in
+"""CPU-pure behavioural tests for `use_cache` handling in
 `prepare_model_for_training` (unsloth_zoo/training_utils.py).
 
-KV cache is unused under gradient checkpointing, so the prepare step
-walks `model.config` and every nested transformers config (composite
-VLM configs expose `text_config` / `vision_config` attributes) and
-sets truthy `use_cache` flags to False. These tests pin the contract:
-
-  - top-level `use_cache=True` flips to False for both
-    `use_gradient_checkpointing=True` and `"unsloth"`;
-  - nested sub-configs of composite configs flip too;
-  - `use_cache=None` and `use_cache=False` are preserved (None means
-    "defer to the model default" and must not become False);
-  - nothing is touched when gradient checkpointing is disabled;
-  - non-config attachments with a `use_cache` attribute are ignored;
-  - self-referencing config graphs terminate (visited-id guard).
+The prepare step walks `model.config` and every nested transformers config and
+disables the KV cache, which gradient checkpointing makes dead weight. These
+tests pin that contract, including its restore half.
 """
 
 from __future__ import annotations
@@ -71,10 +61,7 @@ class _ConfigCarrier(nn.Module):
 
 
 def _none_use_cache_supported() -> bool:
-    """transformers v5 configs are strict huggingface_hub dataclasses whose
-    use_cache field is typed bool, so None ("defer to the model default") is
-    unrepresentable there and the legacy preserve-None contract only applies
-    to stacks that accept it."""
+    """v5 configs type use_cache as bool, so None is unrepresentable there."""
     try:
         LlamaConfig(use_cache = None)
     except Exception:
@@ -175,8 +162,7 @@ def test_restore_without_prepare_is_noop():
 
 @requires_none_use_cache
 def test_restore_preserves_falsy_values():
-    # Configs whose use_cache was None/False are never recorded, so a
-    # restore after prepare must not invent True values for them.
+    # falsy values are never recorded, so restore must not invent True
     model = _tiny_llama(use_cache = None)
     prepare_model_for_training(model, use_gradient_checkpointing = True)
     restore_use_cache(model)
@@ -202,11 +188,9 @@ def test_double_prepare_keeps_first_originals():
     assert model.config.use_cache is True
 
 
-# Configs that never declared use_cache at all. transformers 5 sub-configs
-# inherit no default (measured: True on both 4.57.6 and 5.17.0), so a model
-# whose forward reads self.config.use_cache raised AttributeError under
-# gradient checkpointing rather than training. stepfun-ai/Step-3.7-Flash ships
-# a Step3p7TextConfig of exactly this shape.
+# Configs that never declared use_cache: transformers sub-configs inherit no
+# default, so a forward reading self.config.use_cache raised AttributeError.
+# stepfun-ai/Step-3.7-Flash ships a text config of exactly this shape.
 
 
 class _NoUseCacheConfig(PreTrainedConfig):
@@ -226,18 +210,13 @@ def test_absent_use_cache_is_set_so_forward_can_read_it():
     prepare_model_for_training(
         model, use_gradient_checkpointing = True, use_reentrant = False,
     )
-    # The point of the fix: the attribute now exists, so `self.config.use_cache`
-    # returns False instead of raising AttributeError.
+    # the attribute now exists, so the read returns False instead of raising
     assert config.text_config.use_cache is False
 
 
 def test_restore_removes_an_invented_use_cache_rather_than_inventing_False():
-    """A config that never had the attribute must not keep one afterwards.
-
-    Without the _ABSENT sentinel the restore would write False back, which is a
-    different config from the one the checkpoint shipped and would disable the
-    KV cache for inference.
-    """
+    """Without _ABSENT, restore writes False back and disables the KV cache on
+    a config the checkpoint never shipped one for."""
     config = _composite_without_use_cache()
     model = _ConfigCarrier(config)
     prepare_model_for_training(
@@ -271,13 +250,9 @@ def test_absent_use_cache_survives_a_disable_restore_cycle():
     ],
 )
 def test_absent_marker_survives_copying_the_model(clone):
-    """The record lives on the model, so it gets copied with it.
-
-    With an `object()` sentinel the copy held a different identity, restore
-    fell through to the else branch and wrote the sentinel itself into
-    cfg.use_cache, which is truthy and not JSON serializable. TRL builds its
-    reference model with deepcopy, so this is on a real path.
-    """
+    """The record is copied with the model, so an object() sentinel would lose
+    identity and restore would write the unserializable sentinel into the
+    config. TRL deepcopies a prepared model for its reference model."""
     config = _composite_without_use_cache()
     model = _ConfigCarrier(config)
     prepare_model_for_training(
@@ -290,11 +265,8 @@ def test_absent_marker_survives_copying_the_model(clone):
     copied.config.text_config.to_json_string()
 
 
-# A config first reached on a LATER disable_use_cache call. Recording used to
-# happen only when the model carried no record yet, so a config attached after
-# training had already started was disabled but never recorded: restore could
-# not undo it, and it kept use_cache = False for good. For a config that never
-# declared the attribute that also left an invented one behind on every save.
+# A config first reached on a LATER disable_use_cache call: recording once
+# meant it was disabled but never recorded, so restore could not undo it.
 
 _ABSENT_PARAM = object()
 
