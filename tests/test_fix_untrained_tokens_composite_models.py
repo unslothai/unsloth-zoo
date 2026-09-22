@@ -133,6 +133,20 @@ class _OnlyOutputIsNone(PreTrainedModel):
         return None
 
 
+class _RaisesTypeErrorInsideTheBody(PreTrainedModel):
+    """A callable accessor that fails internally, e.g. remote code against the
+    wrong transformers. Not a signature we cannot call, so it must propagate."""
+
+    config_class = LlamaConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.emb = nn.Embedding(64, 16)
+
+    def get_input_embeddings(self):
+        raise TypeError("something inside the model went wrong")
+
+
 @pytest.mark.parametrize(
     "model_class",
     [_CompositeModel, _NonStandardSignature, _ReturnsNone, _OnlyOutputIsNone],
@@ -154,6 +168,18 @@ def test_the_shapes_really_are_unanswerable(tokenizer, dataset):
     model = _OnlyOutputIsNone(_config())
     assert model.get_input_embeddings() is not None
     assert model.get_output_embeddings() is None
+
+
+def test_a_type_error_from_inside_the_accessor_still_propagates(tokenizer, dataset):
+    """The skip is for signatures we cannot call, not for models that are broken.
+
+    Catching every TypeError would turn a genuine failure into a training run
+    quietly missing its NaN guard, which is the one outcome worse than the crash
+    this whole guard exists to avoid.
+    """
+    model = _RaisesTypeErrorInsideTheBody(_config())
+    with pytest.raises(TypeError, match = "something inside the model went wrong"):
+        fix_untrained_tokens(model, tokenizer, dataset)
 
 
 def test_the_skip_is_visible_without_opting_into_logging(caplog, tokenizer, dataset):

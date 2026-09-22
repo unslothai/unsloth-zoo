@@ -1087,6 +1087,7 @@ jobs:
                   tests/test_moe_merge_e2e_cpu.py \
                   tests/test_merge_e2e_hub_unreachable.py \
                   tests/test_merge_e2e_partial_refusal.py \
+                  tests/test_fix_untrained_tokens_composite_models.py \
                   tests/test_gemma4_dtype_drift_guards.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else
