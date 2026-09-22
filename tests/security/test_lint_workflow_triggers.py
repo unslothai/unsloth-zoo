@@ -207,3 +207,141 @@ def test_a_partitioned_publish_prefix_is_accepted(tmp_path):
     )
     proc = _run(wf)
     assert proc.returncode == 0, f"partitioned prefix rejected:\n{proc.stderr}"
+
+
+def _publish_with_restore_keys(key: str, prefixes: str) -> str:
+    return (
+        "name: wheel-smoke\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "jobs:\n"
+        "  publish:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/cache/restore@v4\n"
+        "        with:\n"
+        "          path: wheels\n"
+        f"          key: {key}\n"
+        "          restore-keys: |\n" + prefixes
+    )
+
+
+def test_a_publish_prefix_longer_than_the_pr_literal_head_is_caught(tmp_path):
+    """One-directional prefix comparison missed the common shape.
+
+    `pip-${{ runner.os }}-abc` has the literal head `pip-`. A publish prefix `pip-Linux-`
+    is longer than that head, so `head.startswith(prefix)` is False and the pairing was
+    accepted, while the runtime key `pip-Linux-abc` does start with it. restore-keys
+    matching is left-anchored and exact, so either string being a prefix of the other
+    means they can meet.
+    """
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    (wf / "pr-build.yml").write_text(_pr_workflow("pip-${{ runner.os }}-abc"))
+    (wf / "wheel-smoke.yml").write_text(
+        _publish_with_restore_keys("pip-pub-${{ runner.os }}", "            pip-Linux-\n")
+    )
+    proc = _run(wf)
+    assert proc.returncode == 1, f"longer publish prefix accepted:\n{proc.stdout}\n{proc.stderr}"
+
+
+def test_an_expression_led_pr_key_is_expanded_not_dropped(tmp_path):
+    """Dropping these was a gate bypass: the PR side reduced to the empty string."""
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    (wf / "pr-build.yml").write_text(_pr_workflow("${{ runner.os }}-shared-abc"))
+    (wf / "wheel-smoke.yml").write_text(
+        _publish_with_restore_keys("pub-${{ runner.os }}", "            Linux-shared-\n")
+    )
+    proc = _run(wf)
+    assert proc.returncode == 1, (
+        f"expression-led PR key silently dropped:\n{proc.stdout}\n{proc.stderr}"
+    )
+
+
+def test_a_composite_that_builds_its_key_in_shell_is_read(tmp_path):
+    """This repo's pip cache names its namespace in shell, not in `key:`.
+
+    pip-cache-restore sets `prefix="pip-${name}-..."` in a run step and exposes it as an
+    output, so its YAML `key:` is only `${{ steps.probe.outputs.key }}`. Reading YAML
+    alone learned nothing about the action this check exists to cover.
+    """
+    root = tmp_path / ".github"
+    wf = root / "workflows"
+    action = root / "actions" / "pip-cache-restore"
+    wf.mkdir(parents = True)
+    action.mkdir(parents = True)
+    (action / "action.yml").write_text(
+        "name: pip cache restore\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - id: probe\n"
+        "      shell: bash\n"
+        "      run: |\n"
+        '        prefix="pip-${name}-${{ runner.os }}-py${pyver}-"\n'
+        '        echo "key=${prefix}${hash}" >> "$GITHUB_OUTPUT"\n'
+        "    - uses: actions/cache/restore@v4\n"
+        "      with:\n"
+        "        path: wheels\n"
+        "        key: ${{ steps.probe.outputs.key }}\n"
+    )
+    (wf / "pr-build.yml").write_text(
+        "name: pr-build\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: ./.github/actions/pip-cache-restore\n"
+    )
+    (wf / "wheel-smoke.yml").write_text(
+        _publish_with_restore_keys("pip-pub", "            pip-\n")
+    )
+    proc = _run(wf)
+    assert proc.returncode == 1, (
+        f"the composite's shell-built pip- namespace was not seen:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
+
+
+def test_a_publish_only_composite_is_not_treated_as_a_pr_namespace(tmp_path):
+    """Scanning every action made a publish-only cache reject its own prefix."""
+    root = tmp_path / ".github"
+    wf = root / "workflows"
+    action = root / "actions" / "release-cache"
+    wf.mkdir(parents = True)
+    action.mkdir(parents = True)
+    (action / "action.yml").write_text(
+        "name: release cache\n"
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - uses: actions/cache/restore@v4\n"
+        "      with:\n"
+        "        path: wheels\n"
+        "        key: release-only-${{ runner.os }}\n"
+    )
+    (wf / "pr-build.yml").write_text(_pr_workflow("pip-${{ runner.os }}-abc"))
+    (wf / "wheel-smoke.yml").write_text(
+        "name: wheel-smoke\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "jobs:\n"
+        "  publish:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: ./.github/actions/release-cache\n"
+        "      - uses: actions/cache/restore@v4\n"
+        "        with:\n"
+        "          path: wheels\n"
+        "          key: release-only-pub\n"
+        "          restore-keys: |\n"
+        "            release-only-\n"
+    )
+    proc = _run(wf)
+    assert proc.returncode == 0, (
+        f"a publish-only composite was treated as a PR namespace:\n"
+        f"{proc.stdout}\n{proc.stderr}"
+    )
