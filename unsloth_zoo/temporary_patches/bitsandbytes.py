@@ -64,26 +64,40 @@ def _transformers_drops_prequantized_quant_state():
     mappings add a prefix instead and are untouched. This predicate reads the
     version only, so it is necessary, not sufficient.
     """
+    installed = _installed_transformers_version()
+    if installed == "unknown": return False
     try:
         from packaging.version import Version as _Version
-        from importlib.metadata import version as _version
-        parsed = _Version(_version("transformers"))
-    except Exception:
-        return False
-    low, high = _QUANT_STATE_BROKEN_TRANSFORMERS
-    try:
+        parsed = _Version(installed)
+        low, high = _QUANT_STATE_BROKEN_TRANSFORMERS
         return _Version(low) <= parsed < _Version(high)
     except Exception:
         return False
 
 
-def _packed_weight_without_quant_state_error(module):
-    """Message for a Linear4bit whose packed weight arrived with no quant_state."""
+def _installed_transformers_version():
+    """The installed transformers version, or "unknown".
+
+    Falls back to an already-imported `transformers.__version__` because a
+    checkout without `.dist-info`, or a frozen bundle, has no metadata to read
+    and would otherwise lose the defect-window explanation entirely. Reads
+    `sys.modules` only, so it never triggers an import.
+    """
     try:
         from importlib.metadata import version as _version
-        transformers_version = _version("transformers")
+        return _version("transformers")
     except Exception:
-        transformers_version = "unknown"
+        pass
+    try:
+        import sys
+        return getattr(sys.modules.get("transformers"), "__version__", "unknown")
+    except Exception:
+        return "unknown"
+
+
+def _packed_weight_without_quant_state_error(module):
+    """Message for a Linear4bit whose packed weight arrived with no quant_state."""
+    transformers_version = _installed_transformers_version()
     shape = tuple(module.weight.shape)
     # The cause belongs in the version-specific branch below, never here. This function
     # inspects the module, never the checkpoint, so "lost while loading" is a claim it
@@ -164,16 +178,20 @@ def patch_bitsandbytes_linear4bit_forward():
             # because Params4bit.from_prequantized never ran.
             # A packed blob is (out_features * in_features // (2 * quant_storage.itemsize), 1)
             # (bitsandbytes _ops.py quantize_4bit), so it is [N, 1] whatever quant_storage
-            # is. A legitimate unquantized Linear4bit with in_features == 1 is
-            # (out_features, 1) and matches the shape test alone, so compare against
-            # out_features to tell them apart. The two shapes coincide when
-            # in_features == 2 * quant_storage.itemsize, i.e. 2 for uint8, 4 for
-            # float16/bfloat16, 8 for float32; there this collapses to not raising,
-            # which is the old behaviour, never a false accusation.
+            # is. The ONE legitimate unquantized weight that is also [N, 1] is a layer with
+            # a single input feature, and then N is exactly out_features. So ask that
+            # question directly rather than comparing row counts alone: comparing only
+            # shape[0] against out_features also excused a packed blob whenever
+            # in_features == 2 * quant_storage.itemsize (2 for uint8, 4 for float16 and
+            # bfloat16, 8 for float32), where the row count coincides by arithmetic and
+            # the user was handed the shape error again. Checking dtype == uint8 instead
+            # would disarm the guard for checkpoints packed with a float quant_storage.
+            in_features  = getattr(self, "in_features",  None)
+            out_features = getattr(self, "out_features", None)
             if (
                 weight.dim() == 2
                 and weight.shape[-1] == 1
-                and weight.shape[0] != getattr(self, "out_features", -1)
+                and not (in_features == 1 and weight.shape[0] == out_features)
             ):
                 raise RuntimeError(_packed_weight_without_quant_state_error(self))
             if weight.dtype != x.dtype:

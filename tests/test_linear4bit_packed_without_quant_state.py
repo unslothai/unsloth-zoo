@@ -142,12 +142,32 @@ def test_defect_window_predicate(monkeypatch, version, expected):
 
 def test_predicate_never_raises_without_transformers(monkeypatch):
     import importlib.metadata as _md
+    import sys
 
     def _boom(name):
         raise _md.PackageNotFoundError(name)
 
     monkeypatch.setattr(_md, "version", _boom)
+    monkeypatch.delitem(sys.modules, "transformers", raising = False)
+    assert bnb_patch._installed_transformers_version() == "unknown"
     assert bnb_patch._transformers_drops_prequantized_quant_state() is False
+
+
+def test_version_falls_back_to_an_already_imported_transformers(monkeypatch):
+    """A checkout with no .dist-info still gets the defect-window explanation."""
+    import importlib.metadata as _md
+    import sys
+    import types
+
+    def _boom(name):
+        raise _md.PackageNotFoundError(name)
+
+    monkeypatch.setattr(_md, "version", _boom)
+    fake = types.ModuleType("transformers")
+    fake.__version__ = "5.5.4"
+    monkeypatch.setitem(sys.modules, "transformers", fake)
+    assert bnb_patch._installed_transformers_version() == "5.5.4"
+    assert bnb_patch._transformers_drops_prequantized_quant_state() is True
 
 
 def test_unquantized_layer_still_falls_through():
@@ -158,23 +178,26 @@ def test_unquantized_layer_still_falls_through():
     assert tuple(out.shape) == (3, 16)
 
 
-def test_packed_blob_whose_rows_equal_out_features_keeps_the_old_behaviour():
-    """The one documented corner where the guard deliberately declines.
+@pytest.mark.parametrize("in_features,itemsize", [(2, 1), (4, 2), (8, 4)])
+def test_packed_blob_whose_rows_equal_out_features_is_still_caught(in_features, itemsize):
+    """The arithmetic coincidence that a row-count comparison alone misses.
 
-    A packed blob has ``(out_features * in_features) // (2 * quant_storage.itemsize)``
+    A packed blob has ``out_features * in_features // (2 * quant_storage.itemsize)``
     rows, which equals ``out_features`` exactly when ``in_features`` is twice the
-    storage itemsize: 2 for uint8, 4 for float16/bfloat16, 8 for float32. The guard
-    cannot tell that apart from a legitimate ``in_features == 1`` layer, so it
-    declines and the pre-existing F.linear path runs, unchanged. That is a known
-    false negative, never a false accusation, and this pins it so a future change
-    to the predicate has to decide about it on purpose.
+    storage itemsize: 2 for uint8, 4 for float16/bfloat16, 8 for float32. Comparing
+    only ``shape[0]`` against ``out_features`` excused those layers and handed the
+    user the shape error this PR exists to remove. Only a real one-input layer may
+    be excused, so the guard asks about ``in_features`` instead.
     """
     forward = _patched_forward()
-    module = _FakeLinear4bit(_packed_weight(16), out_features = 16, in_features = 2)
+    out_features = 16
+    packed = torch.zeros((out_features * in_features // (2 * itemsize), 1), dtype = torch.uint8)
+    assert packed.shape[0] == out_features, "this test is pointless unless they coincide"
+    module = _FakeLinear4bit(packed, out_features = out_features, in_features = in_features)
     with pytest.raises(RuntimeError) as excinfo:
-        forward(module, torch.zeros(3, 2, dtype = torch.float16))
-    # Still the old, unhelpful message: the guard did not fire.
-    assert "mat1 and mat2 shapes cannot be multiplied" in str(excinfo.value)
+        forward(module, torch.zeros(3, in_features, dtype = torch.float16))
+    assert "mat1 and mat2 shapes cannot be multiplied" not in str(excinfo.value)
+    assert "quant_state" in str(excinfo.value)
 
 
 def test_unquantized_linear4bit_with_one_input_feature_is_not_accused():
