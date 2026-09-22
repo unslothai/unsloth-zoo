@@ -41,17 +41,12 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 
 def _needs_the_triton_kernel():
-    """Skip rather than fail when the Triton kernel is not importable.
-
-    _dequantize_full_expert_weights_unsloth returns None for EVERY input when
-    `unsloth.kernels.fp8` cannot be imported, so a test asserting the Triton
-    path was taken fails with "the guard narrowed it" and points at this change
-    when the real cause is a missing unsloth dependency. Observed against
-    transformers 4.57.6 in a venv where unsloth was installed without its deps:
-    six failures, none of them about the guard. Checked inside the test, not as
-    a module-level marker, so a runner with no GPU does not import unsloth at
-    collection just to decide something the CUDA gate already settled.
-    """
+    """Skip rather than fail when the Triton kernel is not importable: the
+    helper returns None for every input then, so the tests below blame the guard
+    for a missing unsloth dependency. Measured on transformers 4.57.6 with
+    unsloth installed --no-deps: six failures, none about the guard. Inside the
+    test, not a marker, so a GPU-less runner does not import unsloth to decide
+    what the CUDA gate already settled."""
     try:
         from unsloth.kernels.fp8 import weight_dequant_block  # noqa: F401
     except Exception as e:  # noqa: BLE001
@@ -97,18 +92,14 @@ def test_a_tile_exactly_at_the_limit_is_still_taken():
 
 
 def test_the_limit_matches_tritons_own():
-    """Read out of Triton, not asserted against our own literal, which would be
-    a tautology. This is what answers the cap on a non-CUDA Triton build: the
-    check lives in the Python frontend (triton/_utils.validate_block_shape), so
-    a ROCm wheel reports the same value, and if one ever did not, this fails
-    here rather than at kernel compile time on that hardware."""
+    """Read out of Triton rather than compared with our own literal, which was
+    a tautology. The check is in the Python frontend
+    (triton/_utils.validate_block_shape), so a ROCm wheel reports the same
+    value; if one ever did not, this fails here and not on that hardware."""
     triton_language = pytest.importorskip("triton.language")
     theirs = getattr(triton_language, "TRITON_MAX_TENSOR_NUMEL", None)
-    # Not `is None`: with no GPU visible, unsloth's import_fixes installs a Triton
-    # stub whose every attribute is a placeholder object, so the name resolves to
-    # something that is not a number. Comparing against it would fail here and,
-    # worse, `tile > placeholder` in the resolver would raise TypeError on exactly
-    # the machines that have no Triton, which is why it checks the type too.
+    # Not `is None`: with no GPU visible unsloth stubs Triton, and every stub
+    # attribute is a placeholder object rather than a number.
     if type(theirs) is not int:
         pytest.skip("Triton is stubbed or does not export TRITON_MAX_TENSOR_NUMEL")
     assert F._triton_max_tensor_numel() == theirs

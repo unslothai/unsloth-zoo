@@ -126,15 +126,13 @@ _TRITON_MAX_TENSOR_NUMEL_RESOLVED = None
 
 
 def _triton_max_tensor_numel():
-    """Triton's own cap rather than our literal copy of it.
+    """Triton's own cap rather than our copy of it.
 
-    validate_block_shape() raises on numel > TRITON_MAX_TENSOR_NUMEL in the
-    Python frontend (triton/_utils.py), before a backend is chosen, so ROCm and
-    CUDA share the value. Reading it anyway costs nothing here -- the caller has
-    already imported the Triton kernel -- and keeps a build that moved the cap
-    either way correct: a lower one would otherwise take a tile that cannot
-    compile, a higher one would decline a tile that would have been fine.
-    Falls back to the literal when Triton is absent or spells it elsewhere.
+    validate_block_shape() enforces it in the Python frontend
+    (triton/_utils.py) before a backend is chosen, so ROCm and CUDA share the
+    value; measured equal on gfx1151. Reading it costs nothing (the caller has
+    already imported the kernel) and keeps a build that moved the cap correct
+    in both directions. Falls back to the literal when Triton is unreadable.
     """
     global _TRITON_MAX_TENSOR_NUMEL_RESOLVED
     if _TRITON_MAX_TENSOR_NUMEL_RESOLVED is None:
@@ -148,7 +146,7 @@ def _triton_max_tensor_numel():
                 )
             except Exception:
                 continue
-            # bool is an int; a stub package can hand back anything.
+            # bool is an int, and unsloth's Triton stub hands back placeholders.
             if type(value) is int and value > 0:
                 resolved = value
                 break
