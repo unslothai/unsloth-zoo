@@ -289,6 +289,20 @@ jobs:
         # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
         # neither was executed by any job before.
         #
+        # The four bnb expert-stack files pin that a stack bitsandbytes cannot count in
+        # 32 bits is quantized and read in slices, and that the slice boundaries are
+        # exact. test_bnb_expert_stack_slicing_cpu is the one that actually executes
+        # here: it drives the arithmetic against a bitsandbytes stand-in, so it needs
+        # neither a GPU nor the package, while the other three carry the CUDA marker
+        # and skip. Collect-only proved only that they import, and a decline condition
+        # can be deleted without any of them going red.
+        #
+        # test_moe_bnb4bit_per_expert_conversions is deliberately NOT here. It needs
+        # bitsandbytes, which this runner does not install, so it could only ever skip
+        # and a gate entry that cannot execute is noise. Adding it did surface a real
+        # latent fault in it, though: six of its tests imported bitsandbytes without a
+        # guard and so failed rather than skipped, which is now fixed in the file.
+        #
         # test_fp8_expert_dequant_tile_limit pins that a per-expert per-tensor FP8 scale
         # derives a Triton tile larger than Triton will compile and is declined rather
         # than launched, and that the limit is read out of Triton instead of copied.
@@ -435,6 +449,9 @@ jobs:
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_router_not_a_lora_target.py \
             tests/test_moe_stacked_expert_lora_reaches_forward.py \
+            tests/test_bnb_expert_stack_slicing.py \
+            tests/test_bnb_expert_stack_slicing_cpu.py \
+            tests/test_bnb_expert_stack_merge_slicing.py \
             tests/test_fp8_expert_dequant_tile_limit.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
