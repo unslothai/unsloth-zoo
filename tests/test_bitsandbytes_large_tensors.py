@@ -62,8 +62,10 @@ def test_small_tensors_take_the_original_path():
     assert torch.equal(data, ref[0]) and torch.equal(state.absmax, ref[1].absmax)
 
 
-@pytest.mark.skipif(torch.cuda.get_device_properties(0).total_memory < 40 * 2**30, reason = "needs a 40 GB card")
 def test_real_tensor_past_int32():
+    """Needs about 30 GB free: the bf16 stack, its packed bytes and the dequantized copy."""
+    if torch.cuda.mem_get_info()[0] < 40 * 2**30:
+        pytest.skip("needs 40 GB of free GPU memory")
     """Inkling-Small's gate_up_proj shape: 256 x 4096 x 4096 = 4.29e9 values."""
     from bitsandbytes import functional as F
     from bitsandbytes.nn import Params4bit
