@@ -309,14 +309,26 @@ def _get_embedding_modules(model):
     embeddings = _own(model, "get_input_embeddings")
     lm_head    = _own(model, "get_output_embeddings")
     if lm_head is None:
+        candidates = []
         for _, module in model.named_modules():
             if module is model: continue
             nested_head = _own(module, "get_output_embeddings")
             if nested_head is None: continue
-            lm_head = nested_head
-            nested_embeddings = _own(module, "get_input_embeddings")
+            candidates.append((nested_head, _own(module, "get_input_embeddings")))
+        # named_modules() is registration order, so "the first module that answers"
+        # is whichever sub-model happens to be declared first. A wrapper that
+        # registers a head-owning vision decoder before `language_model` would hand
+        # back that decoder's matrices, and fix_untrained_tokens would write its mean
+        # embeddings into the wrong sub-model: the vocabularies are only compared by
+        # min(len) further down, so nothing raises. Prefer the module that owns the
+        # embeddings the model's OWN accessor already returned - that is the language
+        # model this tokenizer indexes - and fall back to the first answer otherwise.
+        for nested_head, nested_embeddings in candidates:
+            if embeddings is not None and nested_embeddings is embeddings:
+                return embeddings, nested_head
+        if candidates:
+            lm_head, nested_embeddings = candidates[0]
             if nested_embeddings is not None: embeddings = nested_embeddings
-            break
     return embeddings, lm_head
 pass
 

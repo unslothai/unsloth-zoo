@@ -104,6 +104,47 @@ def test_resolver_prefers_the_model_s_own_accessors():
     assert _get_embedding_modules(model) == (model.embed_tokens, model.lm_head)
 
 
+class _TwoSubModels(PreTrainedModel):
+    """A wrapper that registers a head-owning sub-model BEFORE its language model.
+
+    named_modules() is registration order, so "the first nested module that
+    answers" is whichever sub-model happens to be declared first.
+    """
+    config_class = _Cfg
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.vision_decoder = _CausalLM(config)     # registered first, own head
+        self.language_model = _CausalLM(config)
+
+    def get_input_embeddings(self):
+        return self.language_model.embed_tokens
+
+
+def test_resolver_prefers_the_submodel_the_model_points_at():
+    """The arm that fails when the search takes the first answer it finds."""
+    model = _TwoSubModels(_Cfg())
+    embeddings, lm_head = _get_embedding_modules(model)
+    assert embeddings is model.language_model.embed_tokens
+    assert lm_head is model.language_model.lm_head, "picked the wrong sub-model's head"
+
+
+def test_fix_untrained_tokens_writes_into_the_right_submodel():
+    """A wrong head is silent, not loud: vocabularies are only compared by min(len),
+    so the mean embeddings land in the other sub-model and nothing raises."""
+    torch.manual_seed(0)
+    model = _TwoSubModels(_Cfg(_name_or_path = "test/two-submodels"))
+    for sub in (model.vision_decoder, model.language_model):
+        with torch.no_grad():
+            sub.embed_tokens.weight.normal_(); sub.lm_head.weight.normal_()
+            sub.embed_tokens.weight[VOCAB - 2:].zero_(); sub.lm_head.weight[VOCAB - 2:].zero_()
+    ds = Dataset.from_dict({"input_ids": [[1, 2, VOCAB - 1, VOCAB - 2]]})
+    fix_untrained_tokens(model, _Tokenizer(), ds)
+    assert not torch.all(model.language_model.lm_head.weight[VOCAB - 2:] == 0)
+    assert torch.all(model.vision_decoder.lm_head.weight[VOCAB - 2:] == 0), \
+        "the untrained token fix wrote into the wrong sub-model"
+
+
 def test_resolver_returns_none_when_nothing_owns_a_head():
     class _Headless(PreTrainedModel):
         config_class = _Cfg
