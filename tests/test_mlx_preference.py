@@ -195,9 +195,12 @@ def build_plan(dataset=None, **kwargs):
 
 
 def test_configs_are_objective_specific_and_keyword_only():
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXORPOConfig, MLXTrainingConfig
+    from unsloth_zoo.mlx.trainer import MLXCPOConfig, MLXDPOConfig, MLXORPOConfig, MLXTrainingConfig
 
     assert not hasattr(MLXTrainingConfig(), "beta")
+    cpo, alphapo = MLXCPOConfig(), MLXCPOConfig(loss_type="alphapo", cpo_alpha=0.5)
+    assert (cpo.beta, cpo.label_smoothing, cpo.loss_type, cpo.cpo_alpha, cpo.simpo_gamma, cpo.alpha,
+            alphapo.loss_type, alphapo.cpo_alpha) == (0.1, 0.0, "sigmoid", 1.0, 0.5, 0.0, "simpo", 0.0)
     assert MLXORPOConfig(beta=0.2).beta == 0.2
     assert MLXDPOConfig(beta=0.3, label_smoothing=0.1).reference_free is False
     default = MLXDPOConfig()
@@ -1788,11 +1791,18 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
             _run_generation_trainer(trainer, monkeypatch, [])
 
 
-def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path):
+@pytest.mark.parametrize("kind,provenance,message", [
+    ("dpo", {"kind": "reference_free"}, "provenance does not match"),
+    ("orpo", {"kind": "cpo_no_reference"}, "ORPO: checkpoint objective does not match"),
+    ("cpo", {"kind": "orpo_no_reference"}, "CPO: checkpoint objective does not match"),
+])
+def test_a_mismatched_resume_rejects_before_adapter_hydration(
+    tmp_path, kind, provenance, message,
+):
     import json
     import mlx.core as mx
     import mlx.nn as nn
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    from unsloth_zoo.mlx import trainer as trainer_module
 
     class Adapter(nn.Module):
         def __init__(self):
@@ -1834,12 +1844,12 @@ def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path)
     (checkpoint / "optimizer_state.safetensors").touch()
     (checkpoint / "trainer_state.json").write_text(json.dumps({
         "global_step": 1,
-        "preference_reference": {"kind": "reference_free"},
+        "preference_reference": provenance,
     }))
     model = Model()
-    trainer = MLXDPOTrainer(
+    trainer = getattr(trainer_module, f"MLX{kind.upper()}Trainer")(
         model, Tokenizer(), rows(1),
-        args=MLXDPOConfig(
+        args=getattr(trainer_module, f"MLX{kind.upper()}Config")(
             max_steps=2, compile=False, gradient_checkpointing=False,
             cast_norm_output_to_input_dtype=False, disable_memory_limits=True,
             output_dir=str(tmp_path / "output"),
@@ -1848,7 +1858,7 @@ def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path)
     trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
         learning_rate=mx.array(1e-5), state={}, update=lambda *_args: None,
     )
-    with pytest.raises(ValueError, match="provenance does not match"):
+    with pytest.raises(ValueError, match=message):
         trainer.train(resume_from_checkpoint=str(checkpoint))
     assert model.loaded is False
     assert model.adapter.lora_b.tolist() == [[0.0]]
@@ -1970,7 +1980,8 @@ def _run_generation_trainer(
     return trainer.train()
 
 
-@pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig", "MLXKTOConfig"])
+@pytest.mark.parametrize("config_cls_name", [
+    "MLXDPOConfig", "MLXORPOConfig", "MLXKTOConfig", "MLXCPOConfig"])
 def test_a_preference_field_a_dump_predates_still_reads_as_a_wholesale_copy(
         config_cls_name):
     """An unregistered appended field flips the copy detection, losing warmup_ratio."""
@@ -2325,14 +2336,12 @@ def test_generation_prompt_rejects_a_budget_with_no_room():
         )
 
 
-@pytest.mark.parametrize("objective", ["orpo", "dpo"])
+@pytest.mark.parametrize("objective", ["orpo", "dpo", "cpo"])
 def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch):
     """No perplexity: a preference loss is not a per-token likelihood."""
     from unsloth_zoo.mlx.preference import PREFERENCE_EVAL_METRICS
-    from unsloth_zoo.mlx.trainer import (
-        MLXDPOConfig, MLXDPOTrainer, MLXORPOConfig, MLXORPOTrainer,
-        _preference_metric_values,
-    )
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import _preference_metric_values
 
     # A window sum over the denominator it names; TRL averages per-batch means.
     batches = [[4.0, 9.0, 2.0, 3.0], [1.0, 1.0, 1.0, 1.0]]
@@ -2343,8 +2352,8 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
     assert set(_preference_metric_values(
         ("a", "b"), {0: 2, 1: 3}, [0.0] * 4).values()) == {0.0}
 
-    cls, config = ((MLXORPOTrainer, MLXORPOConfig) if objective == "orpo"
-                   else (MLXDPOTrainer, MLXDPOConfig))
+    cls, config = (getattr(trainer_module, f"MLX{objective.upper()}{part}")
+                   for part in ("Trainer", "Config"))
     common = _generation_common(
         tmp_path, max_steps=1, eval_steps=1, generate_during_eval=False)
     if objective == "dpo":
@@ -2356,35 +2365,47 @@ def test_evaluation_reports_the_trl_metric_set(objective, tmp_path, monkeypatch)
     assert not [name for name in PREFERENCE_EVAL_METRICS[objective]
                 if f"eval_{name}" not in metrics]
     assert "eval_loss" in metrics and "eval_perplexity" not in metrics
+    if objective != "dpo":
+        # Resume compares against exactly this, so a run must write it.
+        assert trainer._preference_reference_provenance == {"kind": f"{objective}_no_reference"}
     assert any("eval_loss" in entry for entry in trainer.state.log_history)
 
 
+# Config fields, then the objective fields they must arrive as.
+_CARRIED_FIELDS = {
+    "dpo": (dict(reference_free=True, loss_type=["sigmoid", "robust"], loss_weights=[0.25, 0.5],
+                 discopop_tau=0.2, label_smoothing=0.2),
+            dict(reference_free=True, loss_types=("sigmoid", "robust"), weights=(0.25, 0.5),
+                 discopop_tau=0.2, label_smoothing=0.2)),
+    "cpo": (dict(loss_type="simpo", label_smoothing=0.2, cpo_alpha=0.3, simpo_gamma=0.7, alpha=0.4),
+            dict(loss_types=("simpo",), label_smoothing=0.2, cpo_alpha=0.3, simpo_gamma=0.7, alpha=0.4)),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_CARRIED_FIELDS))
 @pytest.mark.parametrize("use_cce", [False, True])
 def test_the_config_carries_every_objective_field_into_the_run(tmp_path,
-                                                               monkeypatch, use_cce):
+                                                               monkeypatch, use_cce, kind):
     from unsloth_zoo.mlx import trainer as trainer_module
-    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     captured = {}
-    factory = "make_dpo_cce_loss_fn" if use_cce else "make_dpo_loss_fn"
+    factory = f"make_{kind}_cce_loss_fn" if use_cce else f"make_{kind}_loss_fn"
     for name in (factory, "make_preference_eval_fn"):
         build = getattr(trainer_module, name)
         monkeypatch.setattr(trainer_module, name, (
             lambda *args, build=build, name=name, **kwargs: (
                 captured.setdefault(name, args[-1]),
                 build(*args, **kwargs))[1]))
+    fields, expected = _CARRIED_FIELDS[kind]
     common = _generation_common(
         tmp_path, max_steps=1, eval_steps=1, generate_during_eval=False,
-        use_cce=use_cce, reference_free=True, loss_type=["sigmoid", "robust"],
-        loss_weights=[0.25, 0.5], discopop_tau=0.2, label_smoothing=0.2)
-    trainer = MLXDPOTrainer(_tiny_model(), Tokenizer(), rows(4),
-                            eval_dataset=rows(3), args=MLXDPOConfig(**common))
+        use_cce=use_cce, **fields)
+    trainer = getattr(trainer_module, f"MLX{kind.upper()}Trainer")(
+        _tiny_model(), Tokenizer(), rows(4), eval_dataset=rows(3),
+        args=getattr(trainer_module, f"MLX{kind.upper()}Config")(**common))
     _run_generation_trainer(trainer, monkeypatch, [])
     objective = captured[factory]
-    assert (objective.loss_types, objective.weights) == (
-        ("sigmoid", "robust"), (0.25, 0.5))
-    assert (objective.discopop_tau, objective.label_smoothing) == (0.2, 0.2)
-    assert objective.reference_free
+    assert {name: getattr(objective, name) for name in expected} == expected
     assert captured["make_preference_eval_fn"] == objective
 
 
@@ -3343,14 +3364,18 @@ def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
     assert tokens > 0 and run._compile_decision is not None
 
 
-def test_the_kto_trainer_still_refuses_a_vision_language_model(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+@pytest.mark.parametrize("kind", ["kto", "cpo"])
+def test_the_kto_and_cpo_trainers_refuse_a_vision_language_model(tmp_path, kind):
+    from unsloth_zoo.mlx import trainer as trainer_module
     class Model(type(_tiny_model())):
         _is_vlm_model = True
-    trainer = MLXKTOTrainer(
-        Model(), Tokenizer(), kto_rows(4), processor=VisionProcessor(),
-        args=MLXKTOConfig(**_generation_common(tmp_path, generate_during_eval=False)))
-    with pytest.raises(ValueError, match="KTO: vision-language models are not supported"):
+    trainer = getattr(trainer_module, f"MLX{kind.upper()}Trainer")(
+        Model(), Tokenizer(), kto_rows(4) if kind == "kto" else rows(4),
+        processor=VisionProcessor(),
+        args=getattr(trainer_module, f"MLX{kind.upper()}Config")(
+            **_generation_common(tmp_path, generate_during_eval=False)))
+    with pytest.raises(
+            ValueError, match=f"{kind.upper()}: vision-language models are not supported"):
         trainer._prepare_data(True)
 
 
