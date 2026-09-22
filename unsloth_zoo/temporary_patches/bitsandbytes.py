@@ -39,7 +39,7 @@ from textwrap import dedent
 import re
 
 
-# transformers 5.4.0 and 5.5.x drop the bnb quant_state sidecars of composite checkpoints
+# transformers 5.4.0 and 5.5.x drop the bnb quant_state sidecars of some composite checkpoints
 _QUANT_STATE_BROKEN_TRANSFORMERS = ("5.4.0", "5.6.0")
 
 
@@ -48,13 +48,21 @@ def _transformers_drops_prequantized_quant_state():
 
     transformers 5.4.0 (PR #44300) made the conversion mapping recurse into
     `PreTrainedModel` submodules, which pulled the text model's
-    `^model.language_model.` -> `^model.` `WeightRenaming` into the composite
-    model's mapping. Renamings run before the bitsandbytes converter, so
+    `^model.language_model` -> `model` `WeightRenaming` into the composite model's
+    mapping. That renaming rewrites both the packed `weight` and its
     `weight.absmax`, `weight.quant_map`, `weight.nested_absmax`,
-    `weight.nested_quant_map` and `weight.quant_state.bitsandbytes__nf4` all
-    renamed to keys the model does not have and were discarded as unexpected,
-    while the packed `weight` was loaded raw. transformers PR #45567 fixed it in
-    5.6.0, so the window is exactly 5.4.0 and 5.5.0 through 5.5.4.
+    `weight.nested_quant_map` and `weight.quant_state.bitsandbytes__nf4` sidecars
+    into keys the model does not have. The packed weight survives anyway, because
+    the loader retries with the ORIGINAL key when that key is a model parameter; a
+    sidecar's original key never is, so the retry cannot fire and the sidecars are
+    discarded as unexpected. transformers PR #45567 scoped the prefix surgery with
+    `with_submodel_prefix` in 5.6.0, so the window is exactly 5.4.0 and 5.5.0
+    through 5.5.4 (PyPI has no 5.4.1 and no 5.5.5).
+
+    Only model types whose text submodel mapping STRIPS the composite prefix are
+    affected -- `qwen3_5_text`, `gemma3n_text` and their aliases. Most composite
+    mappings add a prefix instead and are untouched. This predicate reads the
+    version only, so it is necessary, not sufficient.
     """
     try:
         from packaging.version import Version as _Version
@@ -81,21 +89,26 @@ def _packed_weight_without_quant_state_error(module):
     # inspects the module, never the checkpoint, so "lost while loading" is a claim it
     # cannot make: a checkpoint whose sidecars really are absent reaches this same line.
     head = (
-        f"Unsloth: a bitsandbytes Linear4bit still holds its PACKED 4-bit weight "
-        f"(shape {shape}, dtype {module.weight.dtype}) but has no quant_state, so it "
+        f"Unsloth: a bitsandbytes Linear4bit holds what looks like its PACKED 4-bit "
+        f"weight (shape {shape}, dtype {module.weight.dtype}, out_features "
+        f"{getattr(module, 'out_features', 'unknown')}) but has no quant_state, so it "
         f"cannot be dequantized. Its quantization metadata is missing."
     )
     if _transformers_drops_prequantized_quant_state():
         return (
-            f"{head} It was lost while LOADING, not while saving.\n"
+            f"{head} The most likely reason is that it was lost while LOADING, not "
+            f"while saving.\n"
             f"This is transformers=={transformers_version}: releases 5.4.0 and "
             f"5.5.0 to 5.5.4 discard the quant_state sidecar tensors of pre-quantized "
-            f"composite (multimodal) checkpoints. Introduced by transformers PR #44300, "
-            f"fixed by PR #45567 in 5.6.0. Install transformers>=5.6.0, or fall back to "
-            f"5.3.0 or 4.57.6, and try again before regenerating anything: if that is "
-            f"what happened here the checkpoint is intact and re-quantizing it will not "
-            f"help. If a supported transformers still reports this, the sidecar tensors "
-            f"really are missing from the files and the checkpoint does need rebuilding."
+            f"composite (multimodal) checkpoints whose text submodel strips the "
+            f"composite prefix, which covers Qwen3.5 and Gemma 3n. Introduced by "
+            f"transformers PR #44300, fixed by PR #45567 in 5.6.0. Install "
+            f"transformers>=5.6.0, or fall back to 5.3.0 (on Apple Silicon Unsloth "
+            f"caps transformers at 5.5.0, so 5.3.0 is the option there), and try "
+            f"again before regenerating anything: if that is what happened here the "
+            f"checkpoint is intact and re-quantizing it will not help. If a supported "
+            f"transformers still reports this, the sidecar tensors really are missing "
+            f"from the files and the checkpoint does need rebuilding."
         )
     return (
         f"{head}\nInstalled transformers=={transformers_version}. Check that the "
@@ -149,11 +162,14 @@ def patch_bitsandbytes_linear4bit_forward():
             # above cannot help here: fix_4bit_weight_quant_state_from_module only copies
             # module.quant_state onto the weight, and module.quant_state is itself None
             # because Params4bit.from_prequantized never ran.
-            # A packed blob is (out_features * in_features / 2, 1). A legitimate
-            # unquantized Linear4bit with in_features == 1 is (out_features, 1) and
-            # matches the shape test alone, so compare against out_features to tell
-            # them apart. in_features == 2 makes the two shapes equal; that collapses
-            # to not raising, which is the old behaviour, never a false accusation.
+            # A packed blob is (out_features * in_features // (2 * quant_storage.itemsize), 1)
+            # (bitsandbytes _ops.py quantize_4bit), so it is [N, 1] whatever quant_storage
+            # is. A legitimate unquantized Linear4bit with in_features == 1 is
+            # (out_features, 1) and matches the shape test alone, so compare against
+            # out_features to tell them apart. The two shapes coincide when
+            # in_features == 2 * quant_storage.itemsize, i.e. 2 for uint8, 4 for
+            # float16/bfloat16, 8 for float32; there this collapses to not raising,
+            # which is the old behaviour, never a false accusation.
             if (
                 weight.dim() == 2
                 and weight.shape[-1] == 1
