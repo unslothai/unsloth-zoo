@@ -16,14 +16,8 @@
 
 """The MoE router must not be an automatically chosen LoRA target.
 
-A router leaf is an nn.Linear, so the automatic target search counted it as an
-ordinary projection. Llama 4's router subclasses nn.Linear but returns
-(scores, logits), so PEFT's lora.Linear.forward reads `.dtype` off a tuple and
-the model cannot take a single step. Adapting a router is wrong regardless:
-it decides which experts run, not what they compute.
-
-Only the automatic path changes. An explicit target_modules list naming the
-router is a request, and is still honoured. CPU only.
+A router leaf is an nn.Linear, so the automatic search counted it as an ordinary
+projection; Llama 4's and PhiMoE's return a tuple, which PEFT cannot adapt.
 """
 
 from __future__ import annotations
@@ -45,7 +39,6 @@ class _Cfg:
 
 
 def _build(router_leaf="router", model_type="llama4"):
-    """A model shaped the way get_peft_regex reads one: named nn.Linear leaves."""
     model = nn.Module()
     model.config = _Cfg(model_type)
     layers = nn.ModuleList()
@@ -81,7 +74,6 @@ def test_router_is_not_auto_selected():
     _, targets = _targets(_build())
     routers = [t for t in targets if t.rsplit(".")[-1] == "router"]
     assert not routers, f"router auto-selected as a LoRA target: {routers}"
-    # and the real projections are all still there, so the skip is not a blanket drop
     leaves = {t.rsplit(".")[-1] for t in targets}
     assert leaves == {"q_proj", "k_proj", "v_proj", "o_proj",
                       "gate_proj", "up_proj", "down_proj"}
@@ -89,15 +81,12 @@ def test_router_is_not_auto_selected():
 
 
 def test_a_model_without_a_router_gets_an_unchanged_regex():
-    """The skip must be invisible to every non-MoE model."""
     regex_with, targets_with = _targets(_build(router_leaf=None))
     assert "router" not in regex_with
     assert len(targets_with) == N_LAYERS * 7
 
 
 def test_an_explicit_target_modules_list_is_left_alone():
-    """Naming the router explicitly is a request, not an accident, so it is
-    honoured. Only the automatic search skips it."""
     _, targets = _targets(_build(), target_modules=["q_proj", "router"])
     leaves = {t.rsplit(".")[-1] for t in targets}
     assert "router" in leaves, (
@@ -108,10 +97,7 @@ def test_an_explicit_target_modules_list_is_left_alone():
 
 
 def test_router_leaf_is_the_only_name_skipped():
-    """A 'gate' leaf is the router in several families but also a plain
-    projection in others, and no model in the sweep failed because of it, so it
-    is deliberately still targetable. Pin that, so widening the set is a
-    decision rather than a drift."""
+    """Pinned so that widening the set is a decision rather than a drift."""
     from unsloth_zoo.peft_utils import MOE_ROUTER_MODULES
 
     assert MOE_ROUTER_MODULES == frozenset(("router",))
@@ -126,13 +112,8 @@ def test_skip_does_not_depend_on_the_model_family(model_type):
 
 
 def _router_class(family):
-    """The family's router class, found by shape rather than by one spelling.
-
-    Llama 4's class has been named both Llama4Router and Llama4TextRouter, and
-    a getattr on a single spelling turns a rename into a silent skip of the one
-    check this file exists to make. Match any Linear-derived *Router in the
-    module instead, so a rename keeps testing and a real removal still skips.
-    """
+    """Matched by shape, not spelling: the class has been both Llama4Router and
+    Llama4TextRouter, and a getattr on one turns a rename into a silent skip."""
     modeling = pytest.importorskip(f"transformers.models.{family}.modeling_{family}")
     found = sorted(
         (name, obj) for name, obj in vars(modeling).items()
@@ -140,9 +121,7 @@ def _router_class(family):
         and issubclass(obj, nn.Linear) and obj.__module__ == modeling.__name__
     )
     if not found:
-        # Either the family has no router at all, or its router stopped being an
-        # nn.Linear -- in which case the automatic search never saw it and the
-        # skip is moot for this family.
+        # No nn.Linear router means the automatic search never saw one here.
         pytest.skip(f"no nn.Linear router class in modeling_{family}")
     return modeling, found[0][1]
 
@@ -152,14 +131,8 @@ def _router_class(family):
     ("phimoe", "PhimoeConfig"),
 ])
 def test_the_router_returns_a_tuple_so_peft_cannot_adapt_it(family, config_cls_name):
-    """The upstream fact the skip exists for, called rather than read.
-
-    PEFT's lora.Linear.forward does `result.dtype` on whatever the base layer
-    returns, so a router returning a tuple cannot be adapted at all. Asserting
-    on the return value keeps this true across upstream refactors that rename
-    the class or its locals; if a router ever returns a plain tensor again,
-    this fails and the skip can be revisited for that family.
-    """
+    """PEFT's lora.Linear.forward does `result.dtype` on the base layer's return,
+    so a tuple cannot be adapted. Asserted on the value, not on the source text."""
     import torch
 
     transformers = pytest.importorskip("transformers")

@@ -34,12 +34,9 @@ import re
 from .log import logger
 from .empty_model import _get_module_attribute
 
-# Leaf names of MoE routers. Kept out of the automatically chosen LoRA targets:
-# the router decides which experts run, not what they compute. Only names with
-# a measured failure are listed. A bare "gate" leaf is the router in several
-# families and is listed in SKIP_QUANTIZATION_MODULES as one, but a gate leaf
-# can also belong to a non-MoE block, and no model in the sweep failed because
-# of it, so it is left targetable rather than changed on a guess.
+# Leaf names of MoE routers, kept out of the automatically chosen LoRA targets.
+# A bare "gate" leaf is deliberately absent: it is the router in several families
+# but a plain projection in others, and no model in the sweep failed because of it.
 MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
@@ -112,10 +109,8 @@ def get_peft_regex(
         projection_modules  = {}
         for j, (proj, count) in enumerate(all_linear_modules.items()):
             if proj in MOE_ROUTER_MODULES:
-                # A MoE router picks experts; adapting it destabilises routing,
-                # and it is not a plain projection either. Llama 4's router
-                # returns (scores, logits), so PEFT's LoRA forward reads
-                # `result.dtype` off a tuple and the model cannot run at all.
+                # Llama 4's and PhiMoE's routers return a tuple, so PEFT's LoRA
+                # forward reads `result.dtype` off one and the model cannot run.
                 continue
             if count != 1:
                 only_linear_modules.append(proj)
