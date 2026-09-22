@@ -485,9 +485,12 @@ def _aliases_the_environment(tree):
     )
 
 
-# Only %s, %r and %% are folded below. A width turns "%2000000000d" % 1 into a
-# two gigabyte string, and reading a file is not a reason to allocate one.
-RE_UNSAFE_PERCENT = re.compile(r"%[^sr%]")
+# Only %s, %r and %% are folded below, under a mapping key or without one. A
+# width turns "%2000000000d" % 1 into a two gigabyte string, and reading a file
+# is not a reason to allocate one. The key has to be skipped over rather than
+# read as the conversion: "%(host)s" is an ordinary %s, and calling it unsafe
+# left every mapping template unfoldable, holes and all.
+RE_UNSAFE_PERCENT = re.compile(r"%(?:\([^)]*\)[^sr%]|(?!\()[^sr%])")
 
 # Stands in for a piece of a string this cannot read. It is not a hostname
 # character, so a destination interrupted by one fails the hostname check
@@ -535,6 +538,32 @@ def _longest_argument(node):
     texts = [_literal_text(argument) for argument in node.args]
     texts += [_literal_text(keyword.value) for keyword in node.keywords]
     return max((len(text) for text in texts if text is not None), default = 0)
+
+
+# One percent conversion, in the full printf shape the operator accepts:
+# "%(name)-#010.3lf" is one field and "%%" is an escaped sign, not a field.
+RE_PERCENT_FIELD = re.compile(
+    r"%(?:\((?P<key>[^)]*)\))?[-#0 +]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?"
+    r"[diouxXeEfFgGcrsa]"
+)
+
+
+def _percent_holes(template):
+    """The template with each percent conversion replaced by a hole.
+
+    Returning None for a formatting this cannot evaluate read as no text at all,
+    where the join and the f-string leave holes: "%s://%s" % (scheme, host)
+    spells its own scheme that way and no literal carried a URL. It also refused
+    honest code, since "/api/models/%s" % name appended to the hub URL was text
+    the authority check could not read either.
+    """
+    pieces, index = [], 0
+    for match in RE_PERCENT_FIELD.finditer(template):
+        pieces.append(template[index:match.start()])
+        pieces.append(UNKNOWN_PIECE)
+        index = match.end()
+    pieces.append(template[index:])
+    return "".join(pieces).replace("%%", "%")
 
 
 def _replace_text(node):
@@ -768,15 +797,31 @@ def _literal_text(node):
         right = _literal_text(node.right)
         return None if right is None else left + right
     if RE_UNSAFE_PERCENT.search(left):
-        return None
+        return _percent_holes(left)
+    if isinstance(node.right, ast.Dict):
+        # "%(scheme)s://%(host)s/c" % {"scheme": "https", "host": "evil.example"}
+        # is a whole URL whose scheme is spelled by the template and whose host
+        # is spelled by the mapping, and neither half is a destination on its
+        # own. Only the tuple form was folded, so this one read as no URL at all.
+        mapping = {}
+        for key, value in zip(node.right.keys, node.right.values):
+            name = _literal_text(key) if key is not None else None
+            text = _literal_text(value)
+            if name is None or text is None:
+                return _percent_holes(left)
+            mapping[name] = text
+        try:
+            return left % mapping
+        except (TypeError, ValueError, KeyError):
+            return _percent_holes(left)
     operands = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
     values = [_literal_text(operand) for operand in operands]
     if any(value is None for value in values):
-        return None
+        return _percent_holes(left)
     try:
         return left % tuple(values)
     except (TypeError, ValueError):
-        return None
+        return _percent_holes(left)
 
 
 def _mapping_key(node):
