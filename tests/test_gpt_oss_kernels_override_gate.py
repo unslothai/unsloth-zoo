@@ -15,15 +15,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_gpt_oss must not claim MXFP4 kernels are available when transformers cannot load them.
+"""patch_gpt_oss must not claim MXFP4 kernels when transformers cannot load them from the hub.
 
-vLLM registers its bundled copy as the top level `triton_kernels` module. patch_gpt_oss took
-an importable `triton_kernels` as proof that the native MXFP4 path works and forced
-quantizer_mxfp4.is_kernels_available to True. From 4.57 on, transformers' own
-replace_with_mxfp4_linear fetches the kernels through the `kernels` hub (get_kernel), so
-with `kernels` missing or outside the accepted version range the load skipped the bf16
-fallback and died with "ImportError: `kernels` is either not installed or uses an
-incompatible version" (openai/gpt-oss-120b, transformers 5.17, kernels 0.17.1, vLLM 0.29).
 Each case runs in a subprocess because the patch mutates transformers module state.
 """
 import subprocess
@@ -89,8 +82,6 @@ def test_reachable_hub_kernels_still_take_the_native_path():
 
 @pytest.mark.skipif(not _loader_uses_hub_kernel(), reason = "transformers loads MXFP4 kernels without the hub")
 def test_a_direct_replacement_keeps_the_native_path_without_the_hub():
-    """4.57 still ships _replace_with_mxfp4_linear, which patch_gpt_oss builds its own
-    replace_with_mxfp4_linear on; that path uses triton_kernels directly, so a missing hub
-    must not force the bf16 fallback there."""
+    """_replace_with_mxfp4_linear uses triton_kernels directly, so no hub is needed."""
     out = _run("hub_missing", "direct")
     assert "OVERRIDDEN" in out and "CLAIMS True" in out, out

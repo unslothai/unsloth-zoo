@@ -97,14 +97,8 @@ def get_mxfp4_config_for_training():
     return Mxfp4Config(dequantize=dequantize)
 
 def _device_guard(tensor):
-    """Make ``tensor``'s device the current device for the ops inside.
-
-    torch.ldexp on CUDA launches on the current device rather than the device of its
-    operands (seen on torch 2.13), so dequantizing a checkpoint whose layers the
-    device map placed on cuda:1 while cuda:0 is current faults with an illegal memory
-    access. transformers 5 dequantizes from loader threads that never change the
-    current device, so every expert placed off cuda:0 hits it.
-    """
+    """Make ``tensor``'s device current: torch.ldexp launches on the current device,
+    so experts placed off cuda:0 hit an illegal memory access otherwise."""
     device = tensor.device
     backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
     guard = getattr(backend, "device", None)

@@ -322,8 +322,7 @@ def fp16_split_mm(
     if not _split_can_represent(A32) or not _split_can_represent(B32):
         return _mm_float32(A32, B32)
 
-    # torch.ldexp on CUDA runs on the current device, not its operands' device, and on
-    # torch 2.13 returns wrong values for a tensor on another card; make A's device current.
+    # torch.ldexp runs on the current device, not its operands', so make A's device current
     with _current_device_of(A32):
         zero = torch.zeros((), device = A32.device, dtype = torch.int32)
         eA = pow2_exponent(A32) if scale else zero

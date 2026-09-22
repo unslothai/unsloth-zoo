@@ -17,12 +17,7 @@
 
 """MXFP4 dequantization of experts that live on a non-current GPU.
 
-transformers 5 dequantizes gpt-oss experts from loader threads whose current device is
-cuda:0, while the device map has already put the packed blocks on the layer's own card.
-torch.ldexp launches on the current device, not on its operands' device, so the
-dequantize of every expert placed on cuda:1 or later faulted with "CUDA error: an illegal
-memory access was encountered" (openai/gpt-oss-120b on two or more GPUs). Each GPU case
-runs in a subprocess so a faulting kernel cannot poison the test process.
+Each GPU case runs in a subprocess so a faulting kernel cannot poison the test process.
 """
 import os
 import subprocess

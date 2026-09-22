@@ -257,9 +257,7 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
 pass
 
 def _mxfp4_hub_kernel_unreachable():
-    """True when transformers loads the MXFP4 Triton kernels through the `kernels` hub
-    (``get_kernel`` inside replace_with_mxfp4_linear, 4.57 and 5.x) and that hub path is
-    not usable (``kernels`` missing, or outside the version range transformers accepts)."""
+    """True when transformers loads MXFP4 kernels via the `kernels` hub and it is unusable."""
     try:
         import inspect
         import transformers.integrations.mxfp4 as mxfp4_integration
@@ -269,8 +267,7 @@ def _mxfp4_hub_kernel_unreachable():
     if "get_kernel" not in source:
         return False
     if hasattr(mxfp4_integration, "_replace_with_mxfp4_linear"):
-        # patch_gpt_oss replaces replace_with_mxfp4_linear with a version built on this helper,
-        # which uses the importable triton_kernels directly and never reaches the hub.
+        # Our replace_with_mxfp4_linear builds on this and uses triton_kernels directly
         return False
     try:
         from transformers.utils import is_kernels_available as _real_is_kernels_available
@@ -297,11 +294,8 @@ def patch_gpt_oss():
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
     if HAS_TRITON_KERNELS and _mxfp4_hub_kernel_unreachable():
-        # triton_kernels importing is not enough when transformers' own loader fetches
-        # the kernels through the `kernels` hub: claiming kernels are available there
-        # skips the bf16 fallback and replace_with_mxfp4_linear then raises ImportError.
-        # vLLM registers its bundled copy as `triton_kernels`, so this is the common case
-        # whenever vLLM is imported before the load.
+        # Claiming kernels here skips the bf16 fallback and the hub load raises ImportError.
+        # Common when vLLM registers its bundled `triton_kernels`.
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(
                 "Unsloth: triton_kernels is importable but transformers cannot load the MXFP4 "
