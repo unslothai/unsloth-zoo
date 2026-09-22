@@ -50,6 +50,8 @@ SKIP_QUANTIZATION_MODULES = [
     "router",                   # MoE Router
     "mlp.gate",                 # MoE Router
     "block_sparse_moe.gate",    # MoE Router
+    "moe.gate",                 # MoE Router under a `moe` block (Step-3.7); a packed router
+                                # reaches its own matmul as raw bytes, not through Linear4bit
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
