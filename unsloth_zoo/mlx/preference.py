@@ -1348,6 +1348,11 @@ def _require_kind(objective, kind):
 
 
 def _require_reference(objective, reference_policy):
+    if objective.kind == "kto" and reference_policy is None:
+        raise ValueError(
+            "Unsloth MLX KTO: this objective scores against a reference "
+            "policy, but none was given. Pass one as reference_policy."
+        )
     if objective.kind == "dpo" and not objective.reference_free \
             and reference_policy is None:
         raise ValueError(
@@ -1458,9 +1463,10 @@ class ReferencePolicy:
 
     def __init__(
         self, *, model=None, scales=(), overrides=(), paths=(), mirrored=(),
-        neftune_modules=(),
+        neftune_modules=(), objective_name="DPO",
     ):
         self.model = model
+        self.objective_name = objective_name
         self.scales = tuple(scales)
         self.targets = tuple((module, name) for module, name, _ in overrides)
         self.values = [value for _, _, value in overrides]
@@ -1480,8 +1486,8 @@ class ReferencePolicy:
         """Yield the module to score with; overrides sit on the owning module so they hold under a trace."""
         if self.released:
             raise RuntimeError(
-                "Unsloth MLX DPO: the reference was released once its log "
-                "probabilities were precomputed."
+                f"Unsloth MLX {self.objective_name}: the reference was released once "
+                "its log probabilities were precomputed."
             )
         if self.model is not None:
             yield self.model
@@ -1736,11 +1742,13 @@ class PreferenceObjective:
     weights: tuple = (1.0,)
     discopop_tau: float = 0.05
     reference_free: bool = False
+    desirable_weight: float = 1.0
+    undesirable_weight: float = 1.0
 
     def __post_init__(self):
         object.__setattr__(self, "loss_types", tuple(self.loss_types))
         object.__setattr__(self, "weights", tuple(self.weights))
-        if self.kind not in ("dpo", "orpo"):
+        if self.kind not in ("dpo", "orpo", "kto"):
             raise ValueError(
                 f"Unsloth MLX preference: unknown objective kind '{self.kind}'."
             )
@@ -1749,6 +1757,18 @@ class PreferenceObjective:
                 "Unsloth MLX preference: beta must be finite and non-negative, "
                 f"not {self.beta}."
             )
+        if self.kind == "kto":
+            if len(self.loss_types) != 1 or self.loss_types[0] not in KTO_LOSS_TYPES:
+                raise ValueError(
+                    f"Unsloth MLX KTO: loss_type must be one of "
+                    f"{', '.join(KTO_LOSS_TYPES)}, not {list(self.loss_types)}."
+                )
+            weights = (self.desirable_weight, self.undesirable_weight)
+            if not all(math.isfinite(weight) for weight in weights):
+                raise ValueError(
+                    "Unsloth MLX KTO: desirable_weight and undesirable_weight "
+                    f"must be finite, not {list(weights)}."
+                )
         if self.kind != "dpo":
             return
         if len(self.weights) != len(self.loss_types):
@@ -1810,15 +1830,26 @@ class PreferenceObjective:
         """TRL divides before any variant runs, so ipo normalizes the whole list."""
         return "ipo" in self.loss_types
 
+    @property
+    def with_kl(self):
+        return self.kind == "kto" and self.loss_types == ("kto",)
+
 
 def resolve_preference_objective(
     kind, *, beta, label_smoothing=0.0, loss_type="sigmoid",
     loss_weights=None, discopop_tau=0.05, reference_free=False,
+    desirable_weight=1.0, undesirable_weight=1.0,
 ):
     beta = float(beta)
     if kind == "orpo":
         return PreferenceObjective(kind="orpo", beta=beta)
     names = (loss_type,) if isinstance(loss_type, str) else tuple(loss_type)
+    if kind == "kto":
+        return PreferenceObjective(
+            kind="kto", beta=beta, loss_types=names,
+            desirable_weight=float(desirable_weight),
+            undesirable_weight=float(undesirable_weight),
+        )
     if loss_weights is None:
         weights = (1.0,) * len(names)
     else:
@@ -2223,6 +2254,8 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     kind = objective.kind
     beta = objective.beta
     scorer = None if model is None else _make_preference_cce_scorer(model)
+    if kind == "kto":
+        return _make_kto_eval_fn(objective, reference_policy, scorer)
 
     def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
         pairs = batch.shape[0] // 2
@@ -2252,6 +2285,161 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     return eval_fn
 
 
+KTO_LOSS_TYPES = ("kto", "apo_zero_unpaired")
+
+# Summed per side so a window divides by its own row counts, as TRL's KTOTrainer.log
+# does; the KL estimate is averaged over the batches that produced it.
+KTO_METRICS = (
+    "rewards/chosen", "rewards/rejected", "logps/chosen", "logps/rejected",
+    "logits/chosen", "logits/rejected", "kl",
+)
+# The metric sums, then chosen rows, rejected rows and batches.
+KTO_STATS_WIDTH = len(KTO_METRICS) + 3
+
+
+def kto_metric_values(summed):
+    """TRL's logged KTO metrics from summed stats; a side with no rows is left out."""
+    sums = dict(zip(KTO_METRICS, summed))
+    chosen, rejected, batches = summed[len(KTO_METRICS):]
+    values = {}
+    for side, count in (("chosen", chosen), ("rejected", rejected)):
+        if count > 0:
+            for metric in ("rewards", "logps", "logits"):
+                values[f"{metric}/{side}"] = sums[f"{metric}/{side}"] / count
+    if chosen > 0 and rejected > 0:
+        values["rewards/margins"] = values["rewards/chosen"] - values["rewards/rejected"]
+    values["kl"] = sums["kl"] / batches if batches > 0 else 0.0
+    return values
+
+
+def _kto_supervised_tokens(batch_data):
+    rows = batch_data[3].shape[0]
+    return _supervised_tokens((batch_data[0][:rows], batch_data[1][:rows]))
+
+
+def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
+                scorer=None, reference=None, kl_mean=None):
+    """Per-row weighted losses and the batch's metric sums."""
+    rows = labels.shape[0]
+    completions, completion_lengths = batch[:rows], lengths[:rows]
+    mask = _response_mask(completions[:, 1:], completion_lengths)
+    # Positions predicting a real token, prompt included; TRL's sum also takes in
+    # its batch's padding, which depends on how its collator padded.
+    positions = (
+        mx.arange(1, completions.shape[1]) < completion_lengths[:, 1:]
+    ).astype(mx.float32)
+    if scorer is None:
+        logits, ce, _ = _preference_forward(model, completions, completion_lengths)
+        logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
+    else:
+        ce, sums = scorer(model, completions, mask > 0, every_position=True)
+        logit_sums = (sums * positions).sum(axis=1)
+    logps = -(ce * mask).sum(axis=1)
+
+    def score(model, batch, lengths):
+        if scorer is None:
+            return _response_logps(model, batch, lengths)
+        batch_mask = _response_mask(batch[:, 1:], lengths)
+        return -(scorer(model, batch, batch_mask > 0)[0] * batch_mask).sum(axis=1)
+
+    if reference is None:
+        reference = reference_policy.forward(
+            model, batch, lengths,
+            response_scorer=(
+                score if scorer is not None and reference_policy.model is None
+                else None
+            ),
+        )
+    reference = reference.astype(mx.float32)
+    zero = mx.array(0.0, mx.float32)
+    kl = zero
+    if objective.with_kl:
+        # TRL scores the KL rows under no_grad, so they get a forward of their own
+        # rather than joining the completions' differentiated one.
+        policy_kl = mx.stop_gradient(score(model, batch[rows:], lengths[rows:]))
+        kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
+        if kl_mean is not None:
+            kl = kl_mean(kl)
+        kl = mx.stop_gradient(mx.maximum(kl, zero))
+    logratio = logps.astype(mx.float32) - reference[:rows]
+    desirable = labels.astype(mx.bool_)
+    beta = objective.beta
+    if objective.with_kl:
+        chosen_loss = 1.0 - mx.sigmoid(beta * (logratio - kl))
+        rejected_loss = 1.0 - mx.sigmoid(beta * (kl - logratio))
+    else:
+        chosen_loss = 1.0 - mx.sigmoid(beta * logratio)
+        rejected_loss = mx.sigmoid(beta * logratio)
+    losses = mx.where(
+        desirable,
+        objective.desirable_weight * chosen_loss,
+        objective.undesirable_weight * rejected_loss,
+    )
+    chosen = desirable.astype(mx.float32)
+    rejected = 1.0 - chosen
+    sums = []
+    for values in (beta * logratio, logps.astype(mx.float32), logit_sums):
+        sums += [(values * chosen).sum(), (values * rejected).sum()]
+    stats = mx.stop_gradient(mx.stack(
+        sums + [kl, chosen.sum(), rejected.sum(), mx.array(1.0, mx.float32)]
+    ))
+    return losses, stats
+
+
+def _mark_kto_fn(fn, scorer):
+    fn._unsloth_preference_metrics = KTO_METRICS
+    fn._unsloth_preference_stats_width = KTO_STATS_WIDTH
+    fn._unsloth_preference_report = kto_metric_values
+    # A KTO batch has no chosen/rejected halves to compact.
+    fn._unsloth_cce_compaction = False
+    if scorer is not None:
+        fn._unsloth_cce_backend = "runtime-cce"
+    return fn
+
+
+def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None):
+    """Create a KTO loss normalized over the rows of its logical window.
+
+    ``kl_mean`` maps this process's KL estimate to the mean across processes
+    before it is clamped, as TRL gathers it.
+    """
+    _require_kind(objective, "kto")
+    _require_reference(objective, reference_policy)
+
+    def loss_fn(model, batch, lengths, normalizers, labels, reference=None):
+        losses, stats = _kto_scores(
+            model, batch, lengths, labels, objective,
+            reference_policy=reference_policy, scorer=_scorer,
+            reference=reference, kl_mean=kl_mean,
+        )
+        _, window_rows, window_microbatches = normalizers
+        loss = window_microbatches.astype(mx.float32) * losses.sum() / mx.maximum(
+            window_rows, mx.array(1),
+        ).astype(mx.float32)
+        return loss, mx.array(1, dtype=mx.int32), stats
+
+    loss_fn._unsloth_supervised_tokens = _kto_supervised_tokens
+    return _mark_kto_fn(loss_fn, _scorer)
+
+
+def make_kto_cce_loss_fn(model, objective, *, reference_policy, kl_mean=None):
+    return make_kto_loss_fn(
+        objective, reference_policy=reference_policy, kl_mean=kl_mean,
+        _scorer=_make_preference_cce_scorer(model),
+    )
+
+
+def _make_kto_eval_fn(objective, reference_policy, scorer):
+    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None):
+        losses, stats = _kto_scores(
+            model, batch, lengths, labels, objective,
+            reference_policy=reference_policy, scorer=scorer, reference=reference,
+        )
+        return losses.mean(), mx.array(labels.shape[0], dtype=mx.int32), stats
+
+    return _mark_kto_fn(eval_fn, scorer)
+
+
 def lora_modules_have_nonzero_delta(modules):
     def has_values(value):
         if value is not None and not hasattr(value, "shape"):
@@ -2271,7 +2459,7 @@ def lora_modules_have_nonzero_delta(modules):
     )
 
 
-def _dora_base_magnitude(module):
+def _dora_base_magnitude(module, objective_name):
     """Base weight row norms, as set_linear / set_embedding set DoRA's magnitude."""
     if hasattr(module, "_dequantized_weight"):
         weight = module._dequantized_weight().astype(mx.float32)
@@ -2279,7 +2467,7 @@ def _dora_base_magnitude(module):
         weight = module.embedding.weight
     else:
         raise ValueError(
-            f"Unsloth MLX DPO: cannot recover the base magnitude of a "
+            f"Unsloth MLX {objective_name}: cannot recover the base magnitude of a "
             f"{type(module).__name__}; its base weight is not where DoRALinear "
             "or DoRAEmbedding keeps it."
         )
@@ -2293,26 +2481,29 @@ def _adapter_carries_delta(modules, magnitudes):
     )
 
 
-def _owner_of(by_name, parameter_path, *, of="the model"):
+def _owner_of(by_name, parameter_path, *, objective_name, of="the model"):
     module_path, _, attribute = parameter_path.rpartition(".")
     module = by_name.get(module_path)
     if module is None:
         raise ValueError(
-            f"Unsloth MLX DPO: the reference cannot stand in for "
+            f"Unsloth MLX {objective_name}: the reference cannot stand in for "
             f"{parameter_path!r}, which no module of {of} owns: a "
             "parameter held in a list or dict is not supported for a "
-            "referenced run. Use reference_free=True."
+            "referenced run."
+            + (" Use reference_free=True." if objective_name == "DPO" else "")
         )
     return module, attribute
 
 
-def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
+def _reference_adapter_overrides(
+    by_name, parameters, adapters, path, *, dora, objective_name,
+):
     """Return a saved adapter's scale, its tensors as overrides, and their names."""
     path = Path(path)
     weights_file = path / "adapters.safetensors"
     if not weights_file.is_file():
         raise ValueError(
-            f"Unsloth MLX DPO: ref_adapter_name={str(path)!r} is not a saved "
+            f"Unsloth MLX {objective_name}: ref_adapter_name={str(path)!r} is not a saved "
             "adapter directory: it has no adapters.safetensors."
         )
     tensors = mx.load(str(weights_file))
@@ -2324,7 +2515,7 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
     kind = config.get("fine_tune_type")
     if kind in ("lora", "dora") and (kind == "dora") != dora:
         raise ValueError(
-            f"Unsloth MLX DPO: the reference adapter is {kind} and this "
+            f"Unsloth MLX {objective_name}: the reference adapter is {kind} and this "
             f"model's adapters are {'dora' if dora else 'lora'}; the reference "
             "must adapt the same way."
         )
@@ -2334,7 +2525,7 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
     missing = sorted(name for name in adapters if name not in tensors)
     if missing:
         raise ValueError(
-            f"Unsloth MLX DPO: the reference adapter lacks {len(missing)} of "
+            f"Unsloth MLX {objective_name}: the reference adapter lacks {len(missing)} of "
             f"this model's {len(adapters)} adapter tensors, starting with "
             f"{missing[0]!r}. The reference must adapt the same modules."
         )
@@ -2345,18 +2536,19 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
         reference = tensors[name]
         if tuple(reference.shape) != tuple(value.shape):
             raise ValueError(
-                f"Unsloth MLX DPO: the reference adapter's {name!r} has shape "
+                f"Unsloth MLX {objective_name}: the reference adapter's {name!r} "
+                "has shape "
                 f"{tuple(reference.shape)}, but this model's has "
                 f"{tuple(value.shape)}; its rank or layout differs."
             )
-        module, attribute = _owner_of(by_name, name)
+        module, attribute = _owner_of(by_name, name, objective_name=objective_name)
         overrides.append((module, attribute, reference.astype(value.dtype)))
     # mx.load is lazy and file-backed: read before the directory can change.
     mx.eval(*(value for _, _, value in overrides))
     unused = sorted(set(tensors) - set(parameters))
     if unused:
         warnings.warn(
-            f"Unsloth MLX DPO: the reference adapter names {len(unused)} "
+            f"Unsloth MLX {objective_name}: the reference adapter names {len(unused)} "
             "parameters this model does not have, and they are ignored "
             f"(first: {unused[:3]}).",
             RuntimeWarning, stacklevel=3,
@@ -2364,21 +2556,23 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
     return scale, overrides, set(tensors)
 
 
-def _snapshot_policy(by_name, trainable, *, neftune, synced, fixed=()):
+def _snapshot_policy(by_name, trainable, *, neftune, synced, objective_name, fixed=()):
     """Hold every trainable tensor at the value given; ``fixed`` overrides never sync."""
     return ReferencePolicy(
         overrides=[
-            (*_owner_of(by_name, name), value) for name, value in trainable.items()
+            (*_owner_of(by_name, name, objective_name=objective_name), value)
+            for name, value in trainable.items()
         ] + list(fixed),
         paths=list(trainable) if synced else (),
-        neftune_modules=neftune,
+        neftune_modules=neftune, objective_name=objective_name,
     )
 
 
-def _check_provenance(resume_provenance, provenance):
+def _check_provenance(resume_provenance, provenance, objective_name):
     if resume_provenance is not None and resume_provenance != provenance:
         raise ValueError(
-            "Unsloth MLX DPO: the checkpoint reference provenance does not match "
+            f"Unsloth MLX {objective_name}: the checkpoint reference provenance "
+            "does not match "
             "this model, adapter layout, or reference."
         )
 
@@ -2387,13 +2581,14 @@ def build_reference_policy(
     model, *, reference_free, resume_provenance, neftune=(),
     ref_adapter_name=None, model_adapter_name=None,
     ref_model=None, force_use_ref_model=False, sync_ref_model=False,
+    objective_name="DPO",
 ):
     """Validate the reference and build its policy in TRL's order: ref_model, adapters off, start weights."""
     if reference_free:
         return None, {"kind": "reference_free"}
     if model_adapter_name not in (None, "default"):
         raise ValueError(
-            "Unsloth MLX DPO: model_adapter_name names one of several PEFT "
+            f"Unsloth MLX {objective_name}: model_adapter_name names one of several PEFT "
             "adapters, and an MLX model carries a single unnamed adapter set, "
             "which is the one trained. Leave it None; ref_adapter_name takes "
             "the directory of the saved adapter to score against."
@@ -2402,7 +2597,7 @@ def build_reference_policy(
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     if not trainable:
         raise ValueError(
-            "Unsloth MLX DPO: this model has no trainable parameters to "
+            f"Unsloth MLX {objective_name}: this model has no trainable parameters to "
             "reference."
         )
     provenance = {
@@ -2428,23 +2623,25 @@ def build_reference_policy(
     if ref_model is not None:
         if not hasattr(ref_model, "parameters"):
             raise ValueError(
-                "Unsloth MLX DPO: ref_model must be a loaded MLX model, not "
-                f"{type(ref_model).__name__}; MLX DPO does not load a "
+                f"Unsloth MLX {objective_name}: ref_model must be a loaded MLX model, "
+                f"not {type(ref_model).__name__}; MLX {objective_name} does not load a "
                 "reference from a model id."
             )
         if ref_model is model:
             raise ValueError(
-                "Unsloth MLX DPO: model and ref_model cannot be the same "
+                f"Unsloth MLX {objective_name}: model and ref_model cannot be the same "
                 "object. Load the reference separately, or pass ref_model=None."
             )
         if ref_adapter_name is not None:
             raise ValueError(
-                "Unsloth MLX DPO: ref_model and ref_adapter_name each name a "
+                f"Unsloth MLX {objective_name}: ref_model and ref_adapter_name each "
+                "name a "
                 "reference; pass one of them."
             )
         if named_modules and not (force_use_ref_model or sync_ref_model):
             warnings.warn(
-                "Unsloth MLX DPO: this model carries adapters, so its base is "
+                f"Unsloth MLX {objective_name}: this model carries adapters, so its "
+                "base is "
                 "already the reference and a ref_model doubles the memory. "
                 "Pass ref_model=None, or force_use_ref_model=True to score "
                 "against a different model without this warning.",
@@ -2468,28 +2665,31 @@ def build_reference_policy(
                         f"{tuple(value.shape)}. Load the reference the way the "
                         "model is loaded, adapters included."
                     )
-                mirrored.append(_owner_of(ref_by_name, name, of="ref_model"))
+                mirrored.append(_owner_of(
+                    ref_by_name, name, objective_name=objective_name, of="ref_model",
+                ))
         provenance.update(
             kind="reference_model",
             reference_repo=getattr(ref_model, "_hf_repo", None),
             reference_commit=getattr(ref_model, "_unsloth_base_commit_hash", None),
         )
-        _check_provenance(resume_provenance, provenance)
+        _check_provenance(resume_provenance, provenance, objective_name)
         return ReferencePolicy(
             model=ref_model, mirrored=mirrored,
-            paths=list(trainable) if sync_ref_model else (),
+            paths=list(trainable) if sync_ref_model else (), objective_name=objective_name,
         ), provenance
     by_name = dict(model.named_modules())
     if not named_modules:
         if ref_adapter_name is not None:
             raise ValueError(
-                "Unsloth MLX DPO: ref_adapter_name replaces this model's "
+                f"Unsloth MLX {objective_name}: ref_adapter_name replaces this model's "
                 "adapter tensors, and a full fine-tune has none."
             )
         provenance["kind"] = "parameter_snapshot"
-        _check_provenance(resume_provenance, provenance)
+        _check_provenance(resume_provenance, provenance, objective_name)
         return _snapshot_policy(
             by_name, trainable, neftune=neftune, synced=sync_ref_model,
+            objective_name=objective_name,
         ), provenance
     if sync_ref_model and ref_adapter_name is not None:
         raise ValueError(
@@ -2500,14 +2700,14 @@ def build_reference_policy(
     adapters = collect_mlx_lora_adapter_tensors(model)
     if not any(name in adapters for name in trainable):
         raise ValueError(
-            "Unsloth MLX DPO: referenced training requires at least one "
+            f"Unsloth MLX {objective_name}: referenced training requires at least one "
             "trainable LoRA adapter tensor."
         )
     modules = [module for _, module in named_modules]
     if ref_adapter_name is not None:
         provenance["kind"] = "reference_adapter"
         provenance["reference_adapter"] = os.path.normpath(str(ref_adapter_name))
-    _check_provenance(resume_provenance, provenance)
+    _check_provenance(resume_provenance, provenance, objective_name)
     # Held at its start value, as PEFT restores modules_to_save.
     extra = [name for name in trainable if name not in adapters]
     reloaded = sorted(
@@ -2515,7 +2715,7 @@ def build_reference_policy(
         if name not in adapters
     )
     magnitudes = [
-        (module, _dora_base_magnitude(module))
+        (module, _dora_base_magnitude(module, objective_name))
         for module in modules if is_mlx_dora_module(module)
     ]
     delta = resume_provenance is None and _adapter_carries_delta(
@@ -2550,7 +2750,7 @@ def build_reference_policy(
             }
             return _snapshot_policy(
                 by_name, {**trainable, **base_magnitudes},
-                neftune=neftune, synced=True,
+                neftune=neftune, synced=True, objective_name=objective_name,
                 fixed=[
                     (module, "m", magnitude)
                     for module, magnitude in magnitudes
@@ -2559,21 +2759,23 @@ def build_reference_policy(
             ), provenance
         if trained:
             raise ValueError(
-                "Unsloth MLX DPO: the model carries trained tensors no adapter "
-                f"owns (starting with {trained[0]!r}), so disabling the adapter "
-                "does not recover the base model. Pass ref_adapter_name=<a "
-                "saved copy of this adapter, such as the directory it was "
-                "loaded from> to score against the loaded policy, or "
-                "reference_free=True. A resumed run constructs the model from "
-                "its base and lets the checkpoint hydrate it."
+                f"Unsloth MLX {objective_name}: the model carries trained tensors no "
+                f"adapter owns (starting with {trained[0]!r}), so disabling the "
+                "adapter does not recover the base model. Pass ref_adapter_name="
+                "<a saved copy of this adapter, such as the directory it was "
+                "loaded from> to score against the loaded policy"
+                + (", or reference_free=True" if objective_name == "DPO" else "")
+                + ". A resumed run constructs the model from its base and lets "
+                "the checkpoint hydrate it."
             )
         scales = [(module, 0.0) for module in modules]
         overrides = [(module, "m", magnitude) for module, magnitude in magnitudes]
         if delta:
             warnings.warn(
-                "Unsloth MLX DPO: the adapter already carries a delta, so the "
-                "reference is the base model with the adapter disabled, as "
-                "TRL's DPOTrainer scores it, not the policy this run starts "
+                f"Unsloth MLX {objective_name}: the adapter already carries a delta, "
+                "so the reference is the base model with the adapter disabled, "
+                f"as TRL's {objective_name}Trainer scores it, not the policy this "
+                "run starts "
                 "from. Pass ref_adapter_name=<saved adapter directory> to "
                 "score against the loaded adapter instead.",
                 RuntimeWarning, stacklevel=2,
@@ -2583,11 +2785,12 @@ def build_reference_policy(
             by_name, dict(mlx.utils.tree_flatten(model.parameters())),
             adapters, ref_adapter_name,
             dora=any(is_mlx_dora_module(module) for module in modules),
+            objective_name=objective_name,
         )
         uncovered = [name for name in trained if name not in named]
         if uncovered:
             raise ValueError(
-                "Unsloth MLX DPO: the reference adapter lacks the trained "
+                f"Unsloth MLX {objective_name}: the reference adapter lacks the trained "
                 f"tensors this model carries (starting with {uncovered[0]!r}), "
                 "so the reference would mix its adapter with this model's "
                 "trained weights."
@@ -2595,9 +2798,10 @@ def build_reference_policy(
         scales = [(module, scale) for module in modules]
     overridden = {(id(module), name) for module, name, _ in overrides}
     for name in extra:
-        module, attribute = _owner_of(by_name, name)
+        module, attribute = _owner_of(by_name, name, objective_name=objective_name)
         if (id(module), attribute) not in overridden:
             overrides.append((module, attribute, trainable[name]))
     return ReferencePolicy(
         scales=scales, overrides=overrides, neftune_modules=neftune,
+        objective_name=objective_name,
     ), provenance

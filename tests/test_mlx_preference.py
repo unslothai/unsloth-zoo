@@ -897,6 +897,8 @@ def test_an_objective_is_valid_however_it_was_built():
          "discopop_tau"),
         ("dpo", dict(loss_types=("aot",), reference_free=True),
          "reference_free never computes"),
+        ("kto", dict(loss_types=("kto", "sigmoid")), "loss_type must be one of"),
+        ("kto", dict(loss_types=("kto",), undesirable_weight=math.inf), "must be finite"),
     ):
         with pytest.raises(ValueError, match=match):
             PreferenceObjective(kind=kind, **{"beta": 0.1, **options})
@@ -914,7 +916,8 @@ def test_an_objective_is_valid_however_it_was_built():
         kind="orpo", beta=0.1, label_smoothing=0.5).label_smoothing == 0.5
     assert {f.name for f in dataclasses.fields(PreferenceObjective)} == {
         "kind", "beta", "label_smoothing", "loss_types", "weights",
-        "discopop_tau", "reference_free"}
+        "discopop_tau", "reference_free", "desirable_weight",
+        "undesirable_weight"}
 
     dpo = resolve_preference_objective("dpo", beta=0.1)
     assert (dpo.loss_types, dpo.weights, dpo.label_smoothing) == (
@@ -2815,3 +2818,69 @@ def test_kto_warns_when_neither_weight_balances_the_labels(labels, weights, warn
         warnings.simplefilter("always")
         warn_kto_weight_balance(labels, *weights)
     assert bool(caught) == warns
+
+
+@pytest.mark.parametrize("loss_type,labels", [
+    ("kto", [True, False, True]), ("kto", [False] * 3),
+    ("apo_zero_unpaired", [True, False, True]),
+])
+def test_the_kto_loss_is_trls_weighted_row_mean(loss_type, labels):
+    from unsloth_zoo.mlx.preference import (
+        ReferencePolicy, _response_logps, make_kto_loss_fn,
+        make_preference_eval_fn, precompute_reference_logps,
+        resolve_preference_objective)
+    objective = resolve_preference_objective(
+        "kto", beta=0.5, loss_type=loss_type, desirable_weight=1.5, undesirable_weight=0.7)
+    # TinyModel's logits see one token, so answers starting alike would give the KL
+    # rows the completions' own log probabilities.
+    dataset = [{"prompt": f"p{i}", "completion": ("a", "bc", "def")[i], "label": label}
+               for i, label in enumerate(labels)]
+    plan = kto_plan(dataset, with_kl=objective.with_kl)
+    n = len(labels)
+    policy, reference = TinyModel(), ReferencePolicy(model=TinyModel())
+    own, ref = (_response_logps(m, *plan[0][:2]).tolist() for m in (policy, reference.model))
+    ratios = [a - b for a, b in zip(own, ref)]
+    raw_kl = sum(ratios[n:]) / n if objective.with_kl else None
+    local_kl = max(raw_kl or 0.0, 0.0)
+
+    def expected(kl):
+        sig = lambda x: 1 / (1 + math.exp(-x))
+        kto = loss_type == "kto"
+        return sum(
+            1.5 * (1 - sig(0.5 * (r - kl if kto else r))) if label
+            else 0.7 * (1 - sig(0.5 * (kl - r)) if kto else sig(0.5 * r))
+            for r, label in zip(ratios, labels)) / n
+
+    def loss_fn(kl_mean):
+        return make_kto_loss_fn(objective, reference_policy=reference, kl_mean=kl_mean)
+
+    # The cross-process reducer takes the unclamped estimate over the KL rows.
+    shared = 0.0 if raw_kl is None else raw_kl + 100
+    loss, _, stats = loss_fn(lambda kl: kl + 100)(policy, *plan[0])
+    assert [float(loss), float(stats[6])] == pytest.approx([expected(shared), shared], rel=1e-5)
+    assert float(loss_fn(lambda kl: kl - 100)(policy, *plan[0])[2][6]) == 0.0
+    eval_loss, rows, eval_stats = make_preference_eval_fn(
+        objective, reference_policy=reference)(policy, *plan[0])
+    assert (float(eval_loss), int(rows)) == (pytest.approx(expected(local_kl), rel=1e-5), n)
+    side = lambda values, want: sum(v for v, l in zip(values, labels) if l == want)
+    logits = [sum(map(sum, row[:end - 1])) for row, (_, end) in zip(
+        policy(plan[0][0][:n, :-1]).tolist(), plan[0][1].tolist())]
+    assert eval_stats.tolist() == pytest.approx([
+        0.5 * side(ratios, True), 0.5 * side(ratios, False), side(own, True),
+        side(own, False), side(logits, True), side(logits, False), local_kl,
+        sum(labels), n - sum(labels), 1.0], rel=1e-4, abs=1e-4)
+    micro = kto_plan(dataset, with_kl=objective.with_kl, batch_size=2, grad_accum=2)
+    assert sum(float(loss_fn(lambda kl: kl * 0 + 0.3)(policy, *micro[i])[0])
+               for i in range(2)) / 2 == pytest.approx(expected(0.3), rel=1e-5)
+    precompute_reference_logps(plan, policy, reference, batch_size=2)
+    reference.forward = None  # read from the batch from here on
+    assert float(make_preference_eval_fn(objective, reference_policy=reference)(
+        policy, *plan[0])[0]) == pytest.approx(expected(local_kl), rel=1e-5)
+
+
+def test_kto_metrics_average_each_side_over_its_own_rows():
+    from unsloth_zoo.mlx.preference import kto_metric_values
+    # A side without rows is left out, and so is the margin between the sides.
+    assert kto_metric_values([0, 3.0, 0, -9.0, 0, 30.0, 0.6, 0, 3, 4]) == pytest.approx({
+        "rewards/rejected": 1.0, "logps/rejected": -3.0, "logits/rejected": 10.0, "kl": 0.15})
+    assert kto_metric_values([4.0, 3.0, 0, 0, 0, 0, 0, 2, 3, 1])["rewards/margins"] == 1.0
