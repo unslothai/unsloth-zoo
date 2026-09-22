@@ -548,6 +548,20 @@ RE_PERCENT_FIELD = re.compile(
 )
 
 
+def _percent_is_oversized(template, values):
+    """Whether this formatting would materialise more than the fold ceiling.
+
+    The aggregate budget is spent on what the walk READS, and the operator runs
+    before that: a 53 KB source with a thousand %(x)s fields and a 50 KB value
+    built 50 MB first, and both factors scale inside the 8 MiB the scan accepts.
+    The estimate is one longest value per field, which is exact for %s and %r
+    and the only conversions folded here.
+    """
+    fields = len(RE_PERCENT_FIELD.findall(template))
+    longest = max((len(value) for value in values), default = 0)
+    return len(template) + fields * longest > MAX_FOLDED_JOIN
+
+
 def _percent_holes(template):
     """The template with each percent conversion replaced by a hole.
 
@@ -810,6 +824,8 @@ def _literal_text(node):
             if name is None or text is None:
                 return _percent_holes(left)
             mapping[name] = text
+        if _percent_is_oversized(left, mapping.values()):
+            return _percent_holes(left)
         try:
             return left % mapping
         except (TypeError, ValueError, KeyError):
@@ -817,6 +833,8 @@ def _literal_text(node):
     operands = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
     values = [_literal_text(operand) for operand in operands]
     if any(value is None for value in values):
+        return _percent_holes(left)
+    if _percent_is_oversized(left, values):
         return _percent_holes(left)
     try:
         return left % tuple(values)
@@ -1126,6 +1144,94 @@ def _docstrings(tree):
     return frozenset(nodes)
 
 
+def _single_assignments(tree):
+    """`{name: value}` for every name this module binds exactly once.
+
+    Bindings of every kind are counted, not just assignments: a parameter, a
+    loop variable, an import or a `for` target that reuses the name means the
+    name is not one value, and anything but exactly one Assign is left alone.
+    """
+    counts, values = {}, {}
+
+    def bind(name, value = None):
+        counts[name] = counts.get(name, 0) + 1
+        if value is not None:
+            values[name] = value
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                bind(node.targets[0].id, node.value)
+            else:
+                for target in node.targets:
+                    for name in _bound_names(target):
+                        bind(name)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                bind(node.target.id, node.value)
+            else:
+                for name in _bound_names(node.target):
+                    bind(name)
+        elif isinstance(node, (ast.AugAssign, ast.NamedExpr, ast.For,
+                               ast.AsyncFor, ast.comprehension)):
+            for name in _bound_names(node.target):
+                bind(name)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            for name in _bound_names(node.optional_vars):
+                bind(name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            bind(node.name)
+        elif isinstance(node, ast.arg):
+            bind(node.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bind((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bind(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                bind(name)
+                bind(name)              # never one value, whatever else it is
+    return {
+        name: value for name, value in values.items() if counts.get(name) == 1
+    }
+
+
+def _inline_constants(tree):
+    """The tree with every single-assignment constant name read as its text.
+
+    scheme = "https"; separator = "://"; host = "evil.example" assembles a URL
+    that no literal in the file spells, and nothing here reads a name, so the
+    only destination recorded was an unused hub literal beside it. Substituting
+    the text a name can only ever hold puts the assembled URL back in front of
+    every rule that reads one, the destination walk included.
+
+    Only names bound exactly once, and only to text that folds with no hole in
+    it, under the same ceiling the folds use: this replaces a name with a value
+    it demonstrably has, never with a guess.
+    """
+    texts, budget = {}, MAX_FOLDED_JOIN
+    for name, value in _single_assignments(tree).items():
+        text = _literal_text(value)
+        if text is None or UNKNOWN_PIECE in text:
+            continue
+        budget -= len(text)
+        if budget < 0:
+            break
+        texts[name] = text
+    if not texts:
+        return tree
+
+    class Inliner(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and node.id in texts:
+                return ast.copy_location(ast.Constant(texts[node.id]), node)
+            return node
+
+    return Inliner().visit(tree)
+
+
 def _literal_texts(tree, skip = frozenset()):
     """Every whole literal expression in `tree`, folded ones in place of parts.
 
@@ -1216,6 +1322,7 @@ def _talks_only_to_the_model_hub(text):
 
 def _talks_only_to_the_model_hub_tree(tree, text):
     """The parsed half of the allowance. See the caller."""
+    tree = _inline_constants(tree)
     if _writes_anything(tree):
         # Sending TO the hub is not downloading from it. The hub is writable and
         # multi-tenant: a token with write scope can create a public repository
