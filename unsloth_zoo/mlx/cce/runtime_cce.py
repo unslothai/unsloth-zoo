@@ -895,29 +895,17 @@ def make_runtime_cce_loss_fused_finalize(
             vocab_size,
             bytes_per_element=compute_bytes,
         )
-        # A vocabulary small enough that the default 16-chunk split lands under
-        # 4096 gives the GEMM too little work per launch. Widening to 4096 is
-        # worth 1.01-1.47x on the backward for such heads, but only while every
-        # buffer it grows stays small: the token-side buffers, the weight slice
-        # (hidden), and the classifier gradient when the head is trained.
-        # Each is held to 8 MB, which is what confines this to compact heads.
+        # A split under 4096 gives the GEMM too little work per launch, so widen it
+        # while every buffer it grows stays under 8 MB.
         #
-        # The 8 MB above is a calibration against one token-side buffer per chunk, not a
-        # true live set: logits and d_logits are both live in every case. One cell
-        # departs from that calibration by enough to invert the result. A trainable
-        # bfloat16 head on the kernel path has dlogits_out_dtype below write d_logits in
-        # float32 and the hidden GEMM then cast it back, so its token side is 4x
-        # compute_bytes where every other kernel-path cell is 2x, and promoting costs
-        # memory rather than saving it: measured on an M1 at n_tokens=512, hidden=512,
-        # vocab=16384, the 4096 plan peaked at 146324012 bytes against 143211072 for
-        # 2048. Hold that cell to the same 8 MB with its own ratio.
-        #
-        # Label smoothing is excluded outright rather than given its own ratio. It
-        # disables the kernels and routes to _fallback_dlogits, which holds d_capped,
-        # zeros_like(d_capped) and the mx.where result as float32 at once, so its token
-        # side is 12 to 16 bytes where compute_bytes says 4. Widening a chunk under a
-        # bound that low is the same mistake as the trainable bfloat16 cell above, and
-        # nothing here has measured it, so the smoothed path keeps the unpromoted plan.
+        # 8 MB is calibrated against ONE token-side buffer per chunk, not the true live
+        # set: logits and d_logits are always both live. Two cells break that ratio badly
+        # enough to invert the result, so each is held out rather than re-calibrating the
+        # rest. Trainable bfloat16 on the kernel path is 4x, not 2x: dlogits_out_dtype
+        # below writes d_logits float32 and the hidden GEMM casts it back. Label
+        # smoothing is 12-16 bytes, not 4: it disables the kernels, and _fallback_dlogits
+        # holds d_capped, zeros_like(d_capped) and the mx.where result as float32 at
+        # once. Promoting either one costs memory instead of saving it.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
         token_bytes = compute_bytes
