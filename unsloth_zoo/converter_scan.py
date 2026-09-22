@@ -537,6 +537,63 @@ def _longest_argument(node):
     return max((len(text) for text in texts if text is not None), default = 0)
 
 
+def _replace_text(node):
+    """The text of a literal `"...".replace(old, new)`, or None.
+
+    "httpsX//evil.example/c".replace("X", ":") is a URL whose scheme does not
+    exist until the call runs, so the walk read a literal with no scheme in it
+    and recorded no destination at all while a hub literal elsewhere granted the
+    allowance. Folding it reads the destination the way the join, the f-string
+    and the format fold do.
+
+    Only a literal receiver with literal arguments. Upstream's replaces are all
+    `parameter.replace(" ", "-")`, whose receiver is not a literal, so this
+    never reaches them; a literal receiver whose arguments cannot be read is
+    refused outright in _reshapes_a_url instead.
+    """
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "replace"
+        and not node.keywords
+        and len(node.args) == 2
+    ):
+        return None
+    receiver = _literal_text(node.func.value)
+    old = _literal_text(node.args[0])
+    new = _literal_text(node.args[1])
+    if receiver is None or old is None or new is None:
+        return None
+    if len(receiver) * (len(new) + 1) > MAX_FOLDED_JOIN:
+        return None                     # the same output ceiling as the join
+    try:
+        return receiver.replace(old, new)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rewrites_a_constant(node):
+    """Whether a literal string is rewritten by arguments this cannot read.
+
+    "httpsX//evil.example/c".replace(marker, colon) manufactures its scheme out
+    of names, and _replace_text can only fold the arguments it can read. The
+    receiver being a literal is what makes this narrow: upstream rewrites
+    parameters, never constants.
+    """
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("replace", "translate")
+    ):
+        return False
+    if _literal_text(node.func.value) is None:
+        return False
+    return any(
+        _literal_text(argument) is None
+        for argument in [*node.args, *(k.value for k in node.keywords)]
+    )
+
+
 def _format_holes(node, template):
     """The template with every field replaced by a hole, or None.
 
@@ -687,6 +744,9 @@ def _literal_text(node):
                 known = _literal_text(part)
             pieces.append(UNKNOWN_PIECE if known is None else known)
         return "".join(pieces)
+    rewritten = _replace_text(node)
+    if rewritten is not None:
+        return rewritten
     formatted = _format_text(node)
     if formatted is not None:
         return formatted
@@ -886,10 +946,26 @@ def _reshapes_a_url(tree):
             # with a hole in it is not read by anyone, which is the case this
             # check exists for.
             return False
+        def flatten(node):
+            # HUB + "/api/" + name parses as (HUB + "/api/") + name, so reading
+            # two parts put the path inside the first one and the check never
+            # saw the delimiter that had already ended the authority. It then
+            # refused ordinary upstream-shaped code, which is the false positive
+            # this rule has to stay clear of. Iteratively, because a long chain
+            # of appends is exactly what nests deepest.
+            parts, stack = [], [node]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, ast.BinOp) and isinstance(item.op, ast.Add):
+                    stack.extend([item.right, item.left])
+                else:
+                    parts.append(item)
+            return parts
+
         if isinstance(node, ast.JoinedStr):
             parts = node.values
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            parts = [node.left, node.right]
+            parts = flatten(node)
         else:
             return False
         appended = False
@@ -915,6 +991,8 @@ def _reshapes_a_url(tree):
 
     for node in ast.walk(tree):
         if extends_the_authority(node):
+            return True
+        if _rewrites_a_constant(node):
             return True
         if isinstance(node, ast.Call) and any(
             built_from_a_carrier(argument)

