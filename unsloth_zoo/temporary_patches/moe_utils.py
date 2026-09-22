@@ -4040,7 +4040,10 @@ def forward_native_moe_loop(
     # Some patches (Qwen3-VL-MoE) store experts in grouped_mm layout (E, in, out)
     # rather than F.linear's (E, out, in) and set _unsloth_grouped_mm_format=True.
     # Prefer it over the shape check, which is unsafe when intermediate_dim == hidden_dim.
-    grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
+    # A declared (E, in, out) layout wins over the shape test, which a square stack defeats.
+    grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False)) or (
+        getattr(self, "is_transposed", None) is True
+    )
 
     # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
     is_gpt_oss = _gate_up_is_interleaved(self)

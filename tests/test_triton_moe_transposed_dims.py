@@ -107,3 +107,23 @@ def test_square_stacks_follow_the_declared_layout(monkeypatch, declared):
         )
     want = experts.gate_up_proj.transpose(-2, -1) if declared else experts.gate_up_proj
     assert torch.equal(seen[0], want)
+
+
+def test_native_loop_follows_the_declared_layout_for_square_stacks():
+    # native_torch fallback: a declared is_transposed square (E, H, H) gate_up must be
+    # transposed like the Triton path does.
+    E, H = 2, 8
+    I = H // 2
+    torch.manual_seed(0)
+    experts = _experts(E, H, I, transposed = True)
+    experts.gate_up_proj = nn.Parameter(torch.randn(E, H, 2 * I))
+    experts.down_proj = nn.Parameter(torch.randn(E, I, H))
+    experts.is_transposed = True
+    experts.act_fn = torch.nn.functional.silu
+    hidden = torch.randn(3, H)
+    top_k_index = torch.zeros(3, 1, dtype = torch.long)
+    top_k_weights = torch.ones(3, 1)
+    got = moe_utils.forward_native_moe_loop(experts, hidden, top_k_index, top_k_weights)
+    gate, up = (hidden @ experts.gate_up_proj[0]).chunk(2, dim = -1)
+    want = (torch.nn.functional.silu(gate) * up) @ experts.down_proj[0]
+    torch.testing.assert_close(got, want)
