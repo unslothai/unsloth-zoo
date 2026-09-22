@@ -17,32 +17,25 @@
 """Keep a pre-quantized multimodal checkpoint's bitsandbytes quant_state on transformers 5.4/5.5.
 
 transformers 5.4.0 (PR #44300) made `get_model_conversion_mapping` recurse into
-`PreTrainedModel` submodules and merge each submodule's registered conversions into the
-parent's mapping. A submodule's mapping is written against ITS OWN key space, so a renaming
-anchored at the start of the key is meaningless once the submodule is nested. The standalone
-`qwen3_5_text` / `qwen3_5_moe_text` / `gemma3n_text` models register
-`^model.language_model.` -> `^model.` to strip a prefix their own checkpoints carry, and the
-recursion hands that renaming to the COMPOSITE model, whose weights really ARE named
-`model.language_model....`.
+`PreTrainedModel` submodules and merge each submodule's conversions into the parent's mapping.
+A submodule's mapping is written against ITS OWN key space, so the standalone
+`qwen3_5_text` / `gemma3n_text` entry `^model.language_model.` -> `^model.`, which strips a
+prefix their own checkpoints carry, is handed to the COMPOSITE model, whose weights really are
+named `model.language_model....`.
 
-Renamings all run before any `WeightConverter` (`core_model_loading.py` splits the two lists
-and chains every renaming first), so every checkpoint key loses the `language_model.` segment.
-The packed `weight` is rescued by original key with no converter attached and loads as a bare
-uint8 parameter, while `weight.absmax`, `weight.quant_map`, `weight.nested_absmax`,
-`weight.nested_quant_map` and `weight.quant_state.bitsandbytes__nf4` match nothing and are
-discarded as unexpected. `Bnb4bitDeserialize.convert` then takes its `len(input_dict) == 1`
-early return and hands back the raw packed tensor WITHOUT RAISING, which is why the failure
-only surfaces at the first forward, as a shape error about a blob.
+Renamings all run before any `WeightConverter`, so every key loses the `language_model.`
+segment. The packed `weight` is rescued by original key and loads as a bare uint8 parameter,
+while its five sidecars match nothing and are dropped as unexpected. `Bnb4bitDeserialize.convert`
+then takes its `len(input_dict) == 1` early return and hands back the raw packed tensor WITHOUT
+RAISING, so the failure only surfaces at the first forward, as a shape error about a blob.
 
-Upstream fixed it in 5.6.0 (PR #45567) by scoping each transform non-destructively instead of
-rewriting its patterns. This patch re-scopes the leaked renaming the same way for the releases
-that cannot, which is 5.4.0 and 5.5.0 through 5.5.4.
+Upstream fixed it in 5.6.0 (PR #45567) by scoping each transform instead of rewriting its
+patterns; this re-scopes the leaked renaming the same way for 5.4.0 and 5.5.0 through 5.5.4.
 
-It lives here, and not only in `unsloth/import_fixes.py`, because this package is the one that
-owns the bitsandbytes `Linear4bit` patch that reports the failure, is importable without
-`unsloth`, and caps transformers at 5.5.0 on Apple Silicon in its own `pyproject.toml` -- which
-puts every Mac install inside the defect window by construction. `unsloth`'s copy defers to
-this one when it is present, so only ever one of the two installs.
+It lives here rather than only in `unsloth/import_fixes.py` because this package owns the
+`Linear4bit` patch that reports the failure, is importable without `unsloth`, and caps
+transformers at 5.5.0 on Apple Silicon in its own `pyproject.toml`, putting every Mac install
+inside the window by construction. `unsloth`'s copy defers to this one when present.
 
 Neither gate is a version number. The install gate asks whether this transformers has any of
 the shapes upstream has used for per-submodule scoping; the call gate only touches a renaming
@@ -68,14 +61,11 @@ from .utils import raise_error
 # unsloth's own wrapper carries this. Either mark means the repair is already live.
 _UNSLOTH_PATCH_FLAG = "_unsloth_patched_composite_prefix_renaming"
 
-# How many of a submodule's own parameter names to try a renaming against. A prefix renaming
-# either matches every name under the submodule or none of them, so one would do; eight costs
-# nothing and covers a mapping that only rewrites some leaf names.
+# A prefix renaming matches all of a submodule's names or none, so one sample would do; eight
+# also covers a mapping that rewrites only some leaf names.
 _RENAMING_SAMPLE = 8
 
-# `__wrapped__` chains are walked rather than followed blindly: `moe_utils_bnb4bit.py` wraps the
-# same function without setting `__wrapped__` at all, so a chain can end early, and a malformed
-# one must not spin.
+# Bounded: a chain can end early, and a malformed one must not spin.
 _MAX_WRAPPER_DEPTH = 8
 
 
@@ -101,9 +91,8 @@ def _transformers_rescopes_submodule_prefix_renamings():
         return True
     extract = getattr(conversion_mapping, "extract_weight_conversions_for_model", None)
     if extract is None:
-        # No per-submodule extraction, so no recursion to correct. Every 5.x before 5.4.0 reads
-        # the top model's mapping and stops, and this is also the answer for any future build
-        # whose machinery we cannot recognise.
+        # No per-submodule extraction, so no recursion to correct. Also the answer for any
+        # future build whose machinery we cannot recognise.
         return True
     transform = getattr(core_model_loading, "WeightTransform", None)
     if transform is not None and hasattr(transform, "scope_prefix"):
@@ -226,9 +215,8 @@ def _rescoped_renaming(conversion, prefix, sample_keys, model_keys):
     try:
         rescoped = type(conversion)(**patterns)
     except Exception:
-        # A subclass whose __init__ takes something else entirely -- upstream's `PrefixChange`
-        # takes prefixes, not patterns. It is still a WeightRenaming, and a renaming is all this
-        # produces, so fall back to the base class rather than giving up.
+        # `PrefixChange` takes prefixes, not patterns. Still a WeightRenaming, and a renaming
+        # is all this produces, so fall back to the base class rather than giving up.
         try:
             rescoped = WeightRenaming(**patterns)
         except Exception:
@@ -258,8 +246,8 @@ def _leaked_submodule_prefix_renamings(model):
     from transformers.modeling_utils import PreTrainedModel
 
     def extract(module, prefix):
-        # Some releases take the submodule's dotted path as a second argument, everything else
-        # takes the module alone. Asked of the function rather than of a version.
+        # Some releases take the submodule's dotted path too. Asked of the function, not a
+        # version.
         try:
             return extract_weight_conversions_for_model(module, prefix)
         except TypeError:
@@ -336,10 +324,8 @@ def _rescope_conversions(model, conversions):
         fixed += 1
 
     if not fixed and not dropped:
-        # Nothing was actually replaced. A leaked SIGNATURE can still match an entry that this
-        # transformers already scoped for itself -- which is what a fixed release looks like if
-        # the install gate is ever bypassed -- and returning the caller's own list rather than a
-        # copy of it is what makes "this patch changed nothing" checkable by identity.
+        # Nothing replaced: return the caller's OWN list, not a copy, so "this patch changed
+        # nothing" stays checkable by identity if the install gate is ever bypassed.
         return conversions
 
     if UNSLOTH_ENABLE_LOGGING:
@@ -382,10 +368,8 @@ def patch_transformers_composite_prefix_renaming():
     original = getattr(conversion_mapping, "get_model_conversion_mapping", None)
     if original is None:
         return
-    # Both marks, and the whole chain: `unsloth` may have installed its copy first, and
-    # `moe_utils_bnb4bit.py` may have put its own unmarked wrapper on top of that. Installing a
-    # second repair is measurably inert -- the first pass leaves no signature for the second to
-    # match -- but it is still a wrapper nobody needs.
+    # Both marks, whole chain: unsloth may have installed its copy first, under
+    # `moe_utils_bnb4bit.py`'s wrapper. A second repair is inert but is a wrapper nobody needs.
     if _repair_already_installed(original):
         return
     # Probe and wrap the ORIGINAL, never a wrapper of ours that lost its mark.
@@ -405,23 +389,17 @@ def patch_transformers_composite_prefix_renaming():
                 logger.info(f"Unsloth: Could not re-scope the conversion mapping ({e})")
             return conversions
 
-    # functools.wraps sets __wrapped__, but set it explicitly: the probe and the tests both read
-    # it, and a wraps-less edit must not make the patch un-probeable and un-undoable.
+    # Explicit, not just via functools.wraps: a wraps-less edit must not make the patch
+    # un-probeable and un-undoable.
     get_model_conversion_mapping.__wrapped__ = original
     setattr(get_model_conversion_mapping, RESCOPE_PATCH_FLAG, True)
 
     try:
         conversion_mapping.get_model_conversion_mapping = get_model_conversion_mapping
-        # Every module that already did `from .conversion_mapping import
-        # get_model_conversion_mapping` holds the OBJECT, not the attribute:
-        # transformers.modeling_utils and transformers.integrations.peft do, and so does peft
-        # itself. Modules that import it later pick the patched one up from the module above.
-        #
-        # Restricted to the packages that import this name from transformers, because the test
-        # below cannot be an identity test: `moe_utils_bnb4bit.py` wraps the same function
-        # without `functools.wraps` and without `__wrapped__`, so when it goes first a module
-        # holding the pre-zoo function matches neither object. Without the restriction the sweep
-        # would replace ANY callable of that name, including one a notebook defined for itself.
+        # A module that already did `from .conversion_mapping import ...` holds the OBJECT,
+        # not the attribute (modeling_utils, integrations.peft, peft itself). Restricted to
+        # packages importing this name from transformers, because the test below cannot be an
+        # identity one and an unrestricted sweep would replace ANY callable so named.
         owning_packages = ("transformers", "peft", "unsloth_zoo", "unsloth")
         for module_name, module in list(sys.modules.items()):
             if module is None or module is conversion_mapping:
@@ -432,10 +410,8 @@ def patch_transformers_composite_prefix_renaming():
             namespace = getattr(module, "__dict__", None)
             if not isinstance(namespace, dict):
                 continue
-            # `__dict__`, never `getattr`: transformers' lazy modules answer ANY attribute name
-            # through `__getattr__`, which imports a submodule, prints a deprecation notice and
-            # hands back an alias. Sweeping with getattr walks the whole model zoo and says
-            # "Accessing get_model_conversion_mapping from ..." several hundred times.
+            # `__dict__`, never `getattr`: transformers' lazy modules answer any name through
+            # `__getattr__`, so a getattr sweep walks the whole model zoo printing deprecations.
             try:
                 bound = namespace.get("get_model_conversion_mapping", None)
                 if callable(bound) and bound is not get_model_conversion_mapping:

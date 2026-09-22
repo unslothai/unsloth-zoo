@@ -24,8 +24,7 @@ uint8 buffer, producing
 
     RuntimeError: mat1 and mat2 shapes cannot be multiplied (8x5120 and 1x15728640)
 
-which reads like a corrupt checkpoint. Reproduced end to end on one B200 with
-``unsloth/qwen3.8-27b-unsloth-bnb-4bit`` and transformers 5.5.4.
+which reads like a corrupt checkpoint.
 
 CPU only, no GPU, no bitsandbytes CUDA kernels, no network.
 """
@@ -34,13 +33,8 @@ from __future__ import annotations
 
 import pytest
 
-# `importorskip`, not a bare import. Every test here needs torch, and the macOS staging
-# runner does not ship it: a bare `import torch` turns the whole module into a COLLECTION
-# ERROR, which is not the same thing as a skip. The step that runs this suite has an escape
-# for a missing dependency, but it counts `^(FAILED|ERROR) ` lines against the ones that name
-# the module, and a collection error prints only the file path with no message -- so the
-# escape could not fire and the leg went red. Measured on staging-1313 macos-15: "1 skipped,
-# 1 warning, 1 error", exit 2, while windows-latest passed because its install brings torch.
+# `importorskip`, not a bare import: a torch-less runner turns a bare import into a
+# COLLECTION ERROR, which aborts the session instead of skipping the module.
 torch = pytest.importorskip("torch")
 
 from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
@@ -49,10 +43,8 @@ from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
 class _FakeLinear4bit(torch.nn.Module):
     """The shape of a Linear4bit after a load that dropped the quant_state.
 
-    ``out_features`` and ``in_features`` are always set, because the real class
-    subclasses ``nn.Linear`` and can never be missing them. Leaving them off made
-    the guard fire through its ``getattr(self, "out_features", -1)`` default, which
-    is a state no real module reaches, so the shape comparison went untested.
+    Both feature counts are always set: the real class subclasses ``nn.Linear``, so leaving
+    them off fires the guard through a default no real module reaches.
     """
 
     def __init__(self, weight, bias = None, out_features = 5120, in_features = 5120):
@@ -74,12 +66,8 @@ def _packed_weight(n_bytes = 8192):
 def _real_bitsandbytes():
     """The installed bitsandbytes, or skip.
 
-    ``importorskip`` is not enough. On a host with no real bitsandbytes, zoo installs
-    `stubs/bitsandbytes_stub.py` under that name, so the import succeeds and every
-    attribute resolves to a permissive no-op: the patch has nothing to patch,
-    `Linear4bit(...)` raises NotImplementedError, and these tests either fail for a
-    reason that has nothing to do with the guard or pass without touching it. Ask the
-    canonical helper whether the real package is there.
+    ``importorskip`` is not enough: zoo installs `stubs/bitsandbytes_stub.py` under that name,
+    so the import succeeds and every attribute is a permissive no-op the patch cannot patch.
     """
     bitsandbytes = pytest.importorskip("bitsandbytes")
     from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
@@ -94,8 +82,8 @@ def _patched_forward():
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     forward = bitsandbytes.nn.modules.Linear4bit.forward
     forward = getattr(forward, "__wrapped__", forward)
-    # patch_function can decline and return False, which this patch discards. Without
-    # this assert a test would then silently exercise upstream bitsandbytes and pass.
+    # patch_function can decline and return False, which this patch discards; without this
+    # a test would silently exercise upstream bitsandbytes and pass.
     assert forward.__module__ == "unsloth_zoo.temporary_patches.bitsandbytes"
     return forward
 
@@ -127,20 +115,13 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     message = bnb_patch._packed_weight_without_quant_state_error(_FakeLinear4bit(_packed_weight()))
     assert "5.4.0" in message and "5.5.4" in message
     assert "#45567" in message
-    # It must not repeat the false advice that the checkpoint needs regenerating.
-    # The advice is conditional on trying a supported transformers first, because the
-    # guard reads the installed version and never inspects the checkpoint: a file whose
-    # sidecars really are absent reaches this same branch.
+    # Regeneration advice stays conditional on trying a supported transformers first: a
+    # checkpoint whose sidecars really are absent reaches this same branch.
     assert "before regenerating anything" in message
     assert "does need rebuilding" in message
-    # transformers 4.57.6 ships no qwen3_5 model at all (the first release carrying it
-    # is 5.3.0), so recommending it to a Qwen3.5 reporter swaps the shape error for an
-    # unrecognised-architecture error. Never offer it as the fallback.
-    #
-    # Asserted on the ADVICE, not on the whole message. A bare `"4.57" not in message`
-    # also matches the installed version this message interpolates, so it failed on a
-    # host that really is running 4.57.6 -- where the predicate is mocked True here --
-    # for a reason that has nothing to do with what the advice says.
+    # 4.57.6 ships no qwen3_5 at all, so it would swap the shape error for an
+    # unrecognised-architecture one. Asserted on the ADVICE: a bare `not in message` also
+    # matches the installed version the message interpolates.
     _, _, advice = message.partition("fixed by PR #45567 in 5.6.0.")
     assert advice, "the advice section moved; this assertion no longer reads it"
     assert "4.57" not in advice
@@ -221,11 +202,8 @@ def test_unquantized_layer_still_falls_through():
 def test_a_packed_one_by_one_weight_is_not_mistaken_for_a_scalar_layer():
     """in_features == out_features == 1 packs to (1, 1), the same shape as unquantized.
 
-    The one-input exemption is what makes this ambiguous, so it also requires a float
-    weight. Measured on bitsandbytes 0.50.2: a quantized Linear4bit(1, 1) has weight
-    (1, 1) uint8, and once the sidecars are lost it is a plain Parameter, so
-    `isinstance(weight, Params4bit)` and `bnb_quantized` are both gone and cannot be the
-    discriminator. The dtype survives, and an unquantized weight is never uint8.
+    Once the sidecars are lost the weight is a plain Parameter, so `Params4bit` and
+    `bnb_quantized` are both gone; the dtype survives and an unquantized weight is never uint8.
     """
     forward = _patched_forward()
     packed = _FakeLinear4bit(
@@ -242,14 +220,10 @@ def test_a_packed_one_by_one_weight_is_not_mistaken_for_a_scalar_layer():
 
 @pytest.mark.parametrize("in_features,itemsize", [(2, 1), (4, 2), (8, 4)])
 def test_packed_blob_whose_rows_equal_out_features_is_still_caught(in_features, itemsize):
-    """The arithmetic coincidence that a row-count comparison alone misses.
+    """The arithmetic coincidence a row-count comparison alone misses.
 
-    A packed blob has ``out_features * in_features // (2 * quant_storage.itemsize)``
-    rows, which equals ``out_features`` exactly when ``in_features`` is twice the
-    storage itemsize: 2 for uint8, 4 for float16/bfloat16, 8 for float32. Comparing
-    only ``shape[0]`` against ``out_features`` excused those layers and handed the
-    user the shape error this PR exists to remove. Only a real one-input layer may
-    be excused, so the guard asks about ``in_features`` instead.
+    Packed rows equal ``out_features`` exactly when ``in_features == 2 * itemsize`` (2 uint8,
+    4 fp16/bf16, 8 fp32), so only a real one-input layer may be excused.
     """
     forward = _patched_forward()
     out_features = 16

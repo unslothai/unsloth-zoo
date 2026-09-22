@@ -39,40 +39,25 @@ from textwrap import dedent
 import re
 
 
-# transformers 5.4.0 and 5.5.x drop the bnb quant_state sidecars of some composite checkpoints.
-#
-# Both bounds carry `.dev0` so a prerelease sorts with the release line it belongs to. Without
-# it `Version("5.6.0.dev0") < Version("5.6.0")` puts a 5.6.0 release candidate INSIDE the
-# window and tells someone running a build that carries the fix that their transformers is the
-# problem. The same applies at the bottom: a 5.4.0 prerelease already has the defect.
-#
-# Compared with `packaging.version.Version` below, and deliberately NOT with
-# `unsloth_zoo.utils.Version`, which is the wrapper most of this package uses: that one
-# rewrites a prerelease suffix and answers `Version('5.6.0.1')` for the string "5.6.0.dev0",
-# which sorts AFTER the release it has to sort before, so the window would swallow 5.6.0.
+# transformers releases that drop the bnb quant_state sidecars of some composite checkpoints.
+# `.dev0` bounds so a prerelease sorts with its own release line: without it
+# `Version("5.6.0.dev0") < Version("5.6.0")` puts a 5.6.0 rc inside the window.
+# Compared with `packaging.version.Version`, NOT `unsloth_zoo.utils.Version`: that one answers
+# `Version('5.6.0.1')` for "5.6.0.dev0", which sorts after the release it must sort before.
 _QUANT_STATE_BROKEN_TRANSFORMERS = ("5.4.0.dev0", "5.6.0.dev0")
 
 
 def _transformers_drops_prequantized_quant_state():
     """True when the installed transformers is inside the quant_state defect window.
 
-    transformers 5.4.0 (PR #44300) made the conversion mapping recurse into
-    `PreTrainedModel` submodules, which pulled the text model's
-    `^model.language_model` -> `model` `WeightRenaming` into the composite model's
-    mapping. That renaming rewrites both the packed `weight` and its
-    `weight.absmax`, `weight.quant_map`, `weight.nested_absmax`,
-    `weight.nested_quant_map` and `weight.quant_state.bitsandbytes__nf4` sidecars
-    into keys the model does not have. The packed weight survives anyway, because
-    the loader retries with the ORIGINAL key when that key is a model parameter; a
-    sidecar's original key never is, so the retry cannot fire and the sidecars are
-    discarded as unexpected. transformers PR #45567 scoped the prefix surgery with
-    `with_submodel_prefix` in 5.6.0, so the window is exactly 5.4.0 and 5.5.0
-    through 5.5.4 (PyPI has no 5.4.1 and no 5.5.5).
+    transformers PR #44300 (5.4.0) recursed the conversion mapping into `PreTrainedModel`
+    submodules, pulling the text model's `^model.language_model` -> `model` renaming into the
+    composite mapping, where it rewrites the packed weight and its five sidecars off the map.
+    The weight survives because the loader retries the ORIGINAL key when that key is a model
+    parameter; a sidecar's never is. PR #45567 scoped it in 5.6.0.
 
-    Only model types whose text submodel mapping STRIPS the composite prefix are
-    affected -- `qwen3_5_text`, `gemma3n_text` and their aliases. Most composite
-    mappings add a prefix instead and are untouched. This predicate reads the
-    version only, so it is necessary, not sufficient.
+    Version only, so necessary and not sufficient: it also needs a text submodel mapping that
+    STRIPS the composite prefix (`qwen3_5_text`, `gemma3n_text`), not one that adds one.
     """
     installed = _installed_transformers_version()
     if installed == "unknown": return False
@@ -88,10 +73,8 @@ def _transformers_drops_prequantized_quant_state():
 def _installed_transformers_version():
     """The installed transformers version, or "unknown".
 
-    Falls back to an already-imported `transformers.__version__` because a
-    checkout without `.dist-info`, or a frozen bundle, has no metadata to read
-    and would otherwise lose the defect-window explanation entirely. Reads
-    `sys.modules` only, so it never triggers an import.
+    Falls back to an already-imported `transformers.__version__`: a source checkout or frozen
+    bundle has no `.dist-info` to read. Reads `sys.modules` only, so it never triggers an import.
     """
     try:
         from importlib.metadata import version as _version
@@ -108,18 +91,15 @@ def _installed_transformers_version():
 def _composite_renaming_repair_installed():
     """Is the runtime repair for that defect live in THIS process?
 
-    `temporary_patches/conversion_mapping_rescope.py` here, and
-    `fix_transformers_composite_prefix_renaming` in unsloth's `import_fixes.py`, both re-scope
-    the leaked renaming before it can rename anything. Either mark counts, and the whole chain
-    is walked, because the two compose in either order and `moe_utils_bnb4bit.py` puts a third
-    wrapper on the same function. That third one publishes `WRAPPER_INNER_ATTR` rather than
-    `__wrapped__`, so follow both: it must survive a rescope install, and the rescope unwraps
-    `__wrapped__` to decide what to wrap.
+    Either package's mark counts (zoo's `conversion_mapping_rescope.py`, unsloth's
+    `fix_transformers_composite_prefix_renaming`), anywhere down the chain, since they compose
+    in either order with `moe_utils_bnb4bit.py`'s wrapper. Follow `WRAPPER_INNER_ATTR` as well
+    as `__wrapped__`: a wrapper that must survive a rescope install cannot publish
+    `__wrapped__`, which the rescope unwraps to choose what to wrap.
 
-    Asked so the message cannot send a user to change a transformers version that is no longer
-    what is failing them. With the repair live, a module that still reaches this guard has a
-    checkpoint whose sidecars really are absent -- which is the one case where re-quantizing IS
-    the answer, and the version branch would have told them the opposite.
+    Asked because with the repair live, a module reaching this guard has a checkpoint whose
+    sidecars really are absent, the one case where re-quantizing IS the answer and the version
+    branch says the opposite.
     """
     try:
         from transformers import conversion_mapping
@@ -141,9 +121,8 @@ def _packed_weight_without_quant_state_error(module):
     """Message for a Linear4bit whose packed weight arrived with no quant_state."""
     transformers_version = _installed_transformers_version()
     shape = tuple(module.weight.shape)
-    # The cause belongs in the version-specific branch below, never here. This function
-    # inspects the module, never the checkpoint, so "lost while loading" is a claim it
-    # cannot make: a checkpoint whose sidecars really are absent reaches this same line.
+    # No cause here: this inspects the module, never the checkpoint, and a genuinely
+    # stateless checkpoint reaches this same line. The branches below qualify it.
     head = (
         f"Unsloth: a bitsandbytes Linear4bit holds what looks like its PACKED 4-bit "
         f"weight (shape {shape}, dtype {module.weight.dtype}, out_features "
@@ -217,37 +196,20 @@ def patch_bitsandbytes_linear4bit_forward():
         if quant_state is None:
             bias = None if self.bias is None else self.bias
             weight = self.weight
-            # A layer that is genuinely unquantized holds an ordinary [out, in] weight,
-            # and the fallback below is correct for it. A PACKED 4-bit buffer is [N, 1]
-            # uint8, and handing that to F.linear only ever produces
-            #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (8x5120 and 1x15728640)
-            # which reads like a corrupt checkpoint and sent the reporters of unsloth
-            # #9867, #10010, #10017 and #10276 off regenerating good ones. It is not the
-            # checkpoint: transformers 5.4.0 and 5.5.x discard the quant_state sidecars of
-            # pre-quantized composite (multimodal) checkpoints while loading them. Name
-            # that instead of letting the shape error stand. Note the recovery attempt
-            # above cannot help here: fix_4bit_weight_quant_state_from_module only copies
-            # module.quant_state onto the weight, and module.quant_state is itself None
-            # because Params4bit.from_prequantized never ran.
-            # A packed blob is (out_features * in_features // (2 * quant_storage.itemsize), 1)
-            # (bitsandbytes _ops.py quantize_4bit), so it is [N, 1] whatever quant_storage
-            # is. The ONE legitimate unquantized weight that is also [N, 1] is a layer with
-            # a single input feature, and then N is exactly out_features. So ask that
-            # question directly rather than comparing row counts alone: comparing only
-            # shape[0] against out_features also excused a packed blob whenever
-            # in_features == 2 * quant_storage.itemsize (2 for uint8, 4 for float16 and
-            # bfloat16, 8 for float32), where the row count coincides by arithmetic and
-            # the user was handed the shape error again.
+            # A packed 4-bit buffer is
+            # (out_features * in_features // (2 * quant_storage.itemsize), 1) -- [N, 1] for
+            # every quant_storage (bitsandbytes _ops.py quantize_4bit). F.linear on one only
+            # ever produces "mat1 and mat2 shapes cannot be multiplied", which reads like a
+            # corrupt checkpoint (unsloth #9867, #10010, #10017, #10276). The recovery above
+            # cannot help: it copies module.quant_state, which is itself None here.
             #
-            # The exemption also requires a float weight, because in_features ==
-            # out_features == 1 packs to (1, 1) and so satisfies the shape test on its own.
-            # An unquantized weight is always floating point; a packed one carries
-            # quant_storage, uint8 by default. Dtype NARROWS the exemption here, it does not
-            # gate the raise: making the raise itself conditional on uint8 would disarm the
-            # guard for a checkpoint packed with a float quant_storage, which is why it is
-            # written this way round. No float-storage packing reaches the exemption anyway,
-            # since shape[0] == out_features with in_features == 1 needs
-            # out // (2 * itemsize) == out, which holds for no itemsize >= 1.
+            # The only legitimately unquantized [N, 1] weight is a one-input layer, where N is
+            # out_features, so ask that rather than comparing row counts: a bare
+            # shape[0] != out_features also excused packed blobs at
+            # in_features == 2 * quant_storage.itemsize (2 uint8, 4 fp16/bf16, 8 fp32).
+            # The float clause covers in_features == out_features == 1, which packs to (1, 1).
+            # Dtype NARROWS the exemption and must not gate the raise: an uint8-gated raise
+            # would disarm the guard for float-quant_storage checkpoints.
             in_features  = getattr(self, "in_features",  None)
             out_features = getattr(self, "out_features", None)
             if (
