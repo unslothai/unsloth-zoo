@@ -399,3 +399,108 @@ def test_round_trip_through_both_sliced_paths(M):
     param = _quantized(M, value)
     back = M._dequantize_4bit_in_slices(param).float()
     assert (back - value.float()).abs().mean() < 0.1
+
+
+# ---------------------------------------------------------------------------
+# The boundary itself, which the shipped shapes sit exactly on
+# ---------------------------------------------------------------------------
+
+class _PretendCuda(torch.Tensor):
+    """A CPU tensor that answers `is_cuda`, so the gate in
+    `_make_expert_params4bit` can be exercised without a GPU. Only the gate
+    reads it; everything past it is the same integer arithmetic."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+def test_the_cap_is_the_measured_bitsandbytes_limit():
+    """Not a round number picked for looking safe. Probed against bitsandbytes
+    0.50.2 on a B200: quantize_4bit takes 2**31 - 64 and aborts at 2**31 with
+    "Error invalid argument at line 74 in file /src/csrc/ops.cu"; dequantize_4bit
+    takes 2146435072 and aborts at 2**31 at line 93 of the same file. Raising
+    this constant puts the aborting call back; lowering it slices stacks that
+    did not need it."""
+    real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
+    assert real._BNB_MAX_QUANTIZE_NUMEL == 2 ** 31
+
+
+def test_every_threshold_comparison_is_inclusive_at_the_cap():
+    """Inkling-Small's `w2_weight` is (256, 4096, 2048) = 2**31 elements
+    exactly, so a stack sitting precisely on the cap is not a corner case, it
+    is half of every MoE layer in the model this change exists for. `>` instead
+    of `>=` at any of these gates leaves those aborting, and every behavioural
+    test here still passes, because none of them lands on the boundary.
+    Checked in the source rather than per call site so a gate added later is
+    covered the day it is written."""
+    import ast
+
+    real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
+    tree = ast.parse(open(real.__file__).read())
+
+    seen = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        operands = [node.left] + list(node.comparators)
+        if not any(isinstance(o, ast.Name) and o.id == "_BNB_MAX_QUANTIZE_NUMEL"
+                   for o in operands):
+            continue
+        seen.append((node.lineno, ast.unparse(node), [type(o).__name__ for o in node.ops]))
+
+    assert len(seen) >= 4, (
+        f"expected the load, forward, merge and repack gates, found {len(seen)}: "
+        f"{seen}. A rename would empty this test rather than fail it."
+    )
+    for lineno, text, ops in seen:
+        # `numel >= CAP` slices at the cap; `numel < CAP` declines below it.
+        # `>` and `<=` both let a stack of exactly CAP through to the abort.
+        assert ops in (["GtE"], ["Lt"]), (
+            f"line {lineno}: `{text}` is exclusive at the cap, so a stack of "
+            f"exactly {2 ** 31} elements reaches the bitsandbytes call that aborts"
+        )
+
+
+def test_a_stack_of_exactly_the_cap_is_sliced(M):
+    """The load-path gate, driven end to end rather than read out of the source."""
+    value = _stack(experts = 4, out = 16, inp = 64).as_subclass(_PretendCuda)
+    assert value.numel() == SMALL_CAP, "this test is only about the boundary"
+
+    param = M._make_expert_params4bit(
+        value, requires_grad = False, blocksize = BLOCKSIZE, quant_type = "nf4",
+    )
+    assert len(RECORDER.quantize) > 1, (
+        "a stack of exactly the cap went to the unsliced path, which is the "
+        "call that aborts inside bitsandbytes"
+    )
+    assert max(RECORDER.quantize) < SMALL_CAP
+    assert tuple(param.quant_state.shape) == tuple(value.shape)
+
+
+def test_a_stack_one_element_under_the_cap_is_left_alone(M):
+    """The other side of the same boundary: the gate must not start slicing
+    stacks bitsandbytes can still count."""
+    value = _stack(experts = 4, out = 16, inp = 64).as_subclass(_PretendCuda)
+    M._BNB_MAX_QUANTIZE_NUMEL = value.numel() + 1
+    M._make_expert_params4bit(
+        value, requires_grad = False, blocksize = BLOCKSIZE, quant_type = "nf4",
+    )
+    assert RECORDER.quantize == [], "it was sliced despite fitting in one call"
+
+
+def test_dequant_slices_a_stack_of_exactly_the_cap(M):
+    """The read side has the same boundary, and runs on every forward."""
+    value = _stack(experts = 4, out = 16, inp = 64)
+    assert value.numel() == SMALL_CAP
+    param = _quantized(M, value)
+
+    RECORDER.clear()
+    out = M._dequantize_4bit_in_slices(param)
+    assert out is not None, (
+        "a stack of exactly the cap was handed to the single dequantize call "
+        "that aborts at ops.cu line 93"
+    )
+    assert len(RECORDER.dequantize) > 1
+    assert max(RECORDER.dequantize) < SMALL_CAP
+    assert torch.equal(out, M._dequantize_4bit_in_slices(param))
