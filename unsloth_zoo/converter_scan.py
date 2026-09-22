@@ -520,7 +520,13 @@ def _join_parts(node):
     separator_node, element_nodes = nodes
     separator = _literal_text(separator_node)
     separator = UNKNOWN_PIECE if separator is None else separator
-    elements = [_literal_text(element) or UNKNOWN_PIECE for element in element_nodes]
+    elements = []
+    for element in element_nodes:
+        # `or` here turned a folded "" into the sentinel, and
+        # "".join(("https://huggingface.co", "")) then read as a host with an
+        # unreadable piece stuck to it: a CRITICAL on a benign download.
+        text = _literal_text(element)
+        elements.append(UNKNOWN_PIECE if text is None else text)
     size = sum(map(len, elements)) + len(separator) * max(len(elements) - 1, 0)
     if size > MAX_FOLDED_JOIN:
         return None
@@ -595,6 +601,27 @@ def _literal_text(node):
         return None
 
 
+def _bound_names(target):
+    """Every name an assignment target binds, unpacking included.
+
+    `BASE, = ("https://huggingface.co",)` binds BASE through a Tuple, and
+    reading only bare Name targets lost the carrier. An attribute target gives
+    its attribute name, which is what carries() matches for cls.BASE_DOMAIN.
+    """
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Attribute):
+        return {target.attr}
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = set()
+        for element in target.elts:
+            names |= _bound_names(element)
+        return names
+    return set()
+
+
 def _reshapes_a_url(tree):
     """Whether a URL this file spells out is transformed before it is used.
 
@@ -651,6 +678,11 @@ def _reshapes_a_url(tree):
                 node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
             )
             return any(built_from_a_carrier(operand) for operand in operands)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            # BASE, = ("https://huggingface.co",): the value is a sequence, and
+            # which element lands on which name is not worth tracking, so every
+            # name the target binds carries when any element does.
+            return any(built_from_a_carrier(element) for element in node.elts)
         nodes = _join_nodes(node)
         if nodes is not None:
             # "".join([BASE, "/x"]) carries: without this the join laundered the
@@ -679,9 +711,8 @@ def _reshapes_a_url(tree):
                 continue
             if not built_from_a_carrier(value):
                 continue
-            found.update(
-                target.id for target in targets if isinstance(target, ast.Name)
-            )
+            for target in targets:
+                found.update(_bound_names(target))
         if found <= carriers:
             break
         carriers |= found
@@ -722,6 +753,14 @@ def _docstrings(tree):
     if any(
         (isinstance(node, ast.Name) and node.id == "__doc__")
         or (isinstance(node, ast.Attribute) and node.attr == "__doc__")
+        # getattr(fn, "__doc__") reaches the same value with neither shape.
+        or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and _literal_text(node.args[1]) == "__doc__"
+        )
         for node in ast.walk(tree)
     ):
         # Read from the AST: the word in a comment is not a read, and taking it
