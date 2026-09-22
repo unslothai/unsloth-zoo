@@ -6,10 +6,8 @@
 
 The side stream that stages each card's activations was created with a bare
 ``torch.cuda.Stream()``, which belongs to the current device, so every card past the
-first ordered its offload copies against cuda:0's streams. A remote-code MoE model
-(sarvamai/sarvam-105b-fp8) split over three B200s by the sequential fallback failed
-its first backward with ``CUDA error: unspecified launch failure``, and passed with
-``CUDA_LAUNCH_BLOCKING=1`` or with plain (non-offloaded) checkpointing.
+first issued its offload copies against a cuda:0 stream. These pin each card's stream
+to that card and check the offloaded result still matches plain checkpointing.
 """
 
 import pytest
