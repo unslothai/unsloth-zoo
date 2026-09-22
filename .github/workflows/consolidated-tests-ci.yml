@@ -1080,6 +1080,7 @@ jobs:
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
+                  tests/test_linear4bit_packed_without_quant_state.py \
                   tests/test_missing_parent_package_is_drift.py \
                   tests/test_unsloth_zoo_lora_merge.py \
                   tests/test_peft_paramwrapper_layout_drift.py \
