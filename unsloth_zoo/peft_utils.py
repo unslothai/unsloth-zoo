@@ -137,6 +137,13 @@ def get_peft_regex(
     # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
     # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
     # so ending at the group keeps every real target and drops same-prefix non-linear modules.
+    #
+    # And a "." before the group, so an entry only matches a whole leaf name, never the tail of
+    # a longer one. A vision tower with a Linear named exactly "proj" puts the bare "proj" in the
+    # group; without the anchor ".*?" absorbs "...mixer.fc1_latent_" and "proj" matches the rest,
+    # so the nn.Identity placeholders Nemotron-H keeps in fc1_latent_proj / fc2_latent_proj on
+    # every layer without a latent projection were selected -> "Target module Identity() is not
+    # supported". Every real target is a leaf, so it always has the dot in front of it.
     if regex_model_parts == "":
         # No vision/language model-part selected (e.g. audio-only finetuning):
         # the standard matcher would degenerate into matching every attention/mlp
@@ -147,7 +154,7 @@ def get_peft_regex(
         regex_matcher = \
             r".*?(?:"  + regex_model_parts + \
             r").*?(?:" + regex_components + \
-            r").*?"    + match_linear_modules
+            r").*?\."  + match_linear_modules
 
         # Also account for model.layers.0.self_attn/mlp type modules like Qwen
         if finetune_language_layers:
@@ -255,7 +262,30 @@ def get_peft_regex(
         if not check:
             regex_matcher = \
                 r".*?(?:" + regex_components + \
-                r").*?"   + match_linear_modules
+                r").*?\." + match_linear_modules
+    pass
+
+    # A leaf that carries no parameters can never take an adapter, whatever PEFT
+    # has registered for custom layers. When such a module answers to a group
+    # entry by its full name (Nemotron-H keeps an nn.Identity in fc1_latent_proj /
+    # fc2_latent_proj on the layers without a latent projection while other
+    # checkpoints of the family have a Linear there), exclude that exact module
+    # and nothing else: the same leaf name stays targetable wherever it is real.
+    placeholders = [
+        name for name, module in model.named_modules()
+        if name
+        and next(module.parameters(recurse = False), None) is None
+        and next(module.children(), None) is None
+        and re.fullmatch(regex_matcher, name, flags = re.DOTALL)
+    ]
+    if placeholders:
+        logger.info(
+            f"Unsloth: leaving {len(placeholders)} parameter-free placeholder module(s) out of "
+            f"the LoRA targets, e.g. {placeholders[0]}"
+        )
+        regex_matcher = (
+            r"(?!(?:" + "|".join(re.escape(x) for x in placeholders) + r")$)(?:" + regex_matcher + r")"
+        )
     pass
 
     # Final check to confirm if matches exist
