@@ -2606,3 +2606,32 @@ def patch_longrope_impossible_attention_factor():
         return
 pass
 TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
+
+
+def patch_relu_squared_activation_dtype():
+    """`relu2` keeps the dtype of its input under autocast.
+
+    transformers spells the Nemotron-H expert activation as `torch.square(relu(x))`, and
+    `square` is on autocast's float32 list, so a bf16 expert stack hands float32 to the
+    down projection and to whatever combines the experts. Modeling code that accumulates
+    the routed outputs in the router's dtype (the Nemotron-H hub checkpoints do, with
+    `index_add_` into a bf16 buffer) then stops with "self (BFloat16) and source (Float)
+    must have the same scalar type". `y * y` is the same product rounded once at the
+    same width the down projection would have cast it to, so the numbers do not move.
+    """
+    try:
+        import transformers.activations as activations_module
+    except Exception:
+        return
+    activation_class = getattr(activations_module, "ReLUSquaredActivation", None)
+    if activation_class is None or getattr(activation_class, "_unsloth_dtype_patched", False):
+        return
+
+    def forward(self, input):
+        relu_applied = torch.nn.functional.relu(input)
+        return relu_applied * relu_applied
+
+    activation_class.forward = forward
+    activation_class._unsloth_dtype_patched = True
+pass
+TEMPORARY_PATCHES.append(patch_relu_squared_activation_dtype)
