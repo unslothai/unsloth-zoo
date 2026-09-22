@@ -341,6 +341,19 @@ SENSITIVE_MODULES = frozenset(("os", "requests", "httpx", "urllib", "socket"))
 # utility.py imports urlparse from it twice.
 UNVOUCHABLE_MODULES = ("socket", "http.client", "http.server", "urllib.request")
 
+# The same door for the string builders. RE_UNVOUCHABLE_STRING_BUILD reads
+# qualified spellings, so `from base64 import b64decode as d` left it nothing to
+# match and `d("aHR0cHM6...")` decoded an attacker URL beside an unused hub
+# literal. Modules whose members rebuild a string, and the member names that do
+# it under any module. Upstream imports none of these anywhere.
+STRING_BUILDER_MODULES = ("base64", "binascii", "codecs", "quopri", "uu")
+STRING_BUILDER_NAMES = frozenset((
+    "b64decode", "b64encode", "b32decode", "b16decode", "b85decode",
+    "a85decode", "standard_b64decode", "urlsafe_b64decode", "decodebytes",
+    "unhexlify", "hexlify", "decode", "encode",
+    "unquote", "unquote_plus", "unquote_to_bytes",
+))
+
 # Functions that BUILD a URL out of one. urlparse and urlsplit are not here:
 # upstream reads its URL with urlparse, and reading one is not rebuilding it.
 URL_BUILDERS = frozenset((
@@ -370,6 +383,32 @@ def _imports_an_unvouchable_api(tree):
             # import socket as s: the qualified pattern sees no socket. call
             # anywhere, so the import itself is the only place it is named.
             if any(unvouchable(alias.name) for alias in node.names):
+                return True
+    return False
+
+
+def _imports_a_string_builder(tree):
+    """Whether a string decoder arrives by import, under any name.
+
+    An alias erases the only spelling RE_UNVOUCHABLE_STRING_BUILD can read: with
+    `from base64 import b64decode as d` the call is `d(...)`, and with
+    `import base64 as b` it is `b.b64decode(...)`. Either one decoded an
+    attacker URL while an unused hub literal still granted the allowance.
+    """
+    def builder_module(name):
+        return any(
+            name == module or name.startswith(module + ".")
+            for module in STRING_BUILDER_MODULES
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module and builder_module(node.module):
+                return True
+            if any(alias.name in STRING_BUILDER_NAMES for alias in node.names):
+                return True
+        elif isinstance(node, ast.Import):
+            if any(builder_module(alias.name) for alias in node.names):
                 return True
     return False
 
@@ -498,6 +537,26 @@ def _longest_argument(node):
     return max((len(text) for text in texts if text is not None), default = 0)
 
 
+def _format_holes(node, template):
+    """The template with every field replaced by a hole, or None.
+
+    Returning None for a format this cannot evaluate was the one builder that
+    read as no text at all, where the join and the f-string both leave holes.
+    "{p[s]}://{p[h]}".format(p = parts) spells its own scheme that way, and no
+    literal in the file then carried a URL for the walk to refuse.
+    """
+    try:
+        fields = list(string.Formatter().parse(template))
+    except Exception:
+        return None
+    pieces = []
+    for literal, name, _spec, _conversion in fields:
+        pieces.append(literal)
+        if name is not None:
+            pieces.append(UNKNOWN_PIECE)
+    return "".join(pieces)
+
+
 def _format_text(node):
     """The text of a literal `"...".format(...)`, or None.
 
@@ -513,21 +572,23 @@ def _format_text(node):
     ):
         return None
     template = _literal_text(node.func.value)
-    if template is None or not _fields_are_plain(template):
+    if template is None:
         return None
+    if not _fields_are_plain(template):
+        return _format_holes(node, template)
     if len(template) * (1 + _longest_argument(node)) > MAX_FOLDED_JOIN:
         # One argument referenced by thousands of {0} fields expands far past
         # the input cap, so the ceiling is on the OUTPUT, as it is for joins.
-        return None
+        return _format_holes(node, template)
     if node.func.attr == "format_map":
         if node.keywords or len(node.args) != 1 or not isinstance(node.args[0], ast.Dict):
-            return None
+            return _format_holes(node, template)
         mapping = {}
         for key, value in zip(node.args[0].keys, node.args[0].values):
             name = _literal_text(key) if key is not None else None
             text = _literal_text(value)
             if name is None or text is None:
-                return None
+                return _format_holes(node, template)
             mapping[name] = text
         try:
             return template.format_map(mapping)
@@ -535,7 +596,7 @@ def _format_text(node):
             # Any exception at all: "{0[x]}".format("a") raises TypeError, and
             # one unreachable expression like it made the whole scan raise,
             # which the caller turns into "continue with no findings".
-            return None
+            return _format_holes(node, template)
     arguments = [_literal_text(argument) for argument in node.args]
     keywords = {
         keyword.arg: _literal_text(keyword.value)
@@ -544,11 +605,11 @@ def _format_text(node):
     if any(value is None for value in arguments) or any(
         value is None for value in keywords.values()
     ) or len(node.keywords) != len(keywords):
-        return None
+        return _format_holes(node, template)
     try:
         return template.format(*arguments, **keywords)
     except Exception:
-        return None                     # see format_map above
+        return _format_holes(node, template)    # see format_map above
 
 
 def _join_nodes(node):
@@ -909,6 +970,16 @@ def _docstrings(tree):
     if any(
         (isinstance(node, ast.Name) and node.id in DOCSTRING_READERS)
         or (isinstance(node, ast.Attribute) and node.attr in DOCSTRING_READERS)
+        # `from inspect import getdoc as g` names the reader in an alias, which
+        # is neither, and g(fetch) then read a docstring this had skipped.
+        or (
+            isinstance(node, ast.alias)
+            and node.name.split(".")[0] in DOCSTRING_READERS
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] in DOCSTRING_READERS
+        )
         # Folded, like the write and environment names: getattr(fn, "__" +
         # "doc__") reads the same attribute.
         or _literal_text(node) in DOCSTRING_READERS
@@ -1031,6 +1102,9 @@ def _talks_only_to_the_model_hub_tree(tree, text):
     if _imports_an_unvouchable_api(tree):
         # A destination this allowance never looks at, arriving by another door.
         return False
+    if _imports_a_string_builder(tree):
+        # A decoder whose only readable name is the import line itself.
+        return False
     if _reaches_through_getattr(tree):
         # A lookup this cannot read is a write or a read it cannot see.
         return False
@@ -1071,6 +1145,12 @@ def _talks_only_to_the_model_hub_tree(tree, text):
 
     try:
         for literal in folded_literals():
+            if UNKNOWN_PIECE + "://" in literal:
+                # The scheme itself came out of a piece this cannot read, so
+                # the destination is not merely unnamed, it is hidden: nothing
+                # in the file spells a URL for the walk below to look at. Every
+                # upstream "://" is preceded by a readable http, https or ssh.
+                return False
             for match in RE_URL_SCHEME.finditer(literal):
                 rest = literal[match.end():]
                 end = RE_AUTHORITY_END.search(rest)
