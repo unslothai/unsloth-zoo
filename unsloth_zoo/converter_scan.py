@@ -57,6 +57,7 @@ import ast
 import logging
 import os
 import re
+import string
 from dataclasses import dataclass
 
 __all__ = [
@@ -314,6 +315,14 @@ def _writes_anything(tree):
     return any(
         (isinstance(node, ast.Attribute) and node.attr in WRITE_METHODS)
         or (isinstance(node, ast.Name) and node.id in WRITE_METHODS)
+        # vars(requests)["post"] and requests.__dict__["post"] leave the method
+        # name as a string and nothing else. None of these names appears as a
+        # string constant anywhere in the 21 real modules either.
+        or (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in WRITE_METHODS
+        )
         or (
             isinstance(node, ast.ImportFrom)
             and any(alias.name in WRITE_METHODS for alias in node.names)
@@ -449,11 +458,27 @@ MAX_CARRIER_PASSES = 16
 MAX_FOLDED_JOIN = 1 << 20
 
 
-# A field with a conversion or a format spec is not folded: "{:>1000000000}"
-# .format("x") is a one gigabyte string, and a converter that needs one of those
-# in a URL does not exist. Upstream formats with plain fields in 15 places, so
-# folding rather than refusing is what keeps those files readable here.
-RE_FORMAT_SPEC = re.compile(r"\{[^{}]*[:!][^{}]*\}")
+def _fields_are_plain(template):
+    """Whether every replacement field is a bare name, with no spec at all.
+
+    A spec is not folded: "{:>1000000000}".format("x") is a gigabyte, and a
+    converter that needs one of those in a URL does not exist. Read with the
+    formatter rather than a pattern, because a pattern cannot see into a NESTED
+    spec: "{0:{1}}".format("x", "10000000000") has one, the character classes
+    could not span the inner braces, the length estimate stayed tiny, and
+    formatting it took 8.5 seconds and ten gigabytes.
+
+    Upstream formats with plain fields in 15 places, so folding rather than
+    refusing is what keeps those files readable here.
+    """
+    try:
+        fields = list(string.Formatter().parse(template))
+    except Exception:
+        return False                    # unparseable is unfoldable
+    return not any(
+        name is not None and (spec or conversion)
+        for _, name, spec, conversion in fields
+    )
 
 
 def _longest_argument(node):
@@ -478,7 +503,7 @@ def _format_text(node):
     ):
         return None
     template = _literal_text(node.func.value)
-    if template is None or RE_FORMAT_SPEC.search(template):
+    if template is None or not _fields_are_plain(template):
         return None
     if len(template) * (1 + _longest_argument(node)) > MAX_FOLDED_JOIN:
         # One argument referenced by thousands of {0} fields expands far past

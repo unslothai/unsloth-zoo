@@ -3455,6 +3455,17 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         'import os\nimport os as o\nimport requests\n' + hub
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": o.getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        # A module dictionary leaves the method name as a string and nothing
+        # else. None of these names appears as a string constant anywhere in
+        # the 21 real modules either.
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'f = vars(requests)["post"]\n'
+        + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'f = requests.__dict__["post"]\n'
+        + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
         # getattr holds neither an Attribute nor a Name spelled post.
         'import os\nimport requests\n' + hub
         + 'f = getattr(requests, "post")\n'
@@ -3550,6 +3561,19 @@ def test_an_oversized_join_is_not_folded():
             'requests.get(X, headers = {"a": token})\n'
         )
     ], "an oversized join must not hide the literals inside it"
+
+    # A NESTED spec is why the fields are parsed rather than pattern-matched:
+    # "{0:{1}}".format("x", "10000000000") has one, character classes cannot
+    # span the inner braces, the length estimate stays tiny, and formatting it
+    # took 8.5 seconds and ten gigabytes.
+    started = time.perf_counter()
+    module.scan_converter_source(
+        preamble
+        + 'def dead():\n'
+        + '    return "{0:{1}}".format("x", "10000000000")\n'
+        'requests.get(HUB, headers = {"a": token})\n'
+    )
+    assert time.perf_counter() - started < 5
 
     # str.format has the same ceiling and needs it for a different reason: one
     # argument referenced by thousands of {0} fields expands far past the input
