@@ -11,7 +11,7 @@ import torch
 
 bnb = pytest.importorskip("bitsandbytes")
 
-from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as M
+from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as M  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -132,3 +132,91 @@ def test_ragged_slice_at_the_end(small_threshold):
     )
     assert sliced.data.numel() * 2 == value.numel()
     assert tuple(sliced.quant_state.shape) == (7, 64, 128)
+
+
+@pytest.mark.parametrize(
+    "quant_storage", [torch.uint8, torch.float16, torch.bfloat16, torch.float32]
+)
+def test_the_configured_quant_storage_survives_slicing(small_threshold, quant_storage):
+    """FSDP asks for a floating point parameter storage dtype via
+    bnb_4bit_quant_storage. Handing back uint8 silently breaks the wrap it
+    asked for, and the packed tensor is then indexed in bytes while its
+    elements are two or four bytes wide, which reads off the end of it."""
+    value = _stack()
+    sliced = M._make_expert_params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+        quant_storage=quant_storage, compress_statistics=False,
+    )
+    whole = M.Params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+        quant_storage=quant_storage, compress_statistics=False,
+    ).to(value.device)
+
+    assert sliced.data.dtype == whole.data.dtype == quant_storage
+    assert sliced.quant_storage == quant_storage
+    assert torch.equal(
+        sliced.data.reshape(-1).view(torch.uint8),
+        whole.data.reshape(-1).view(torch.uint8),
+    )
+
+    sliced._original_shape = value.shape
+    read = M._dequantize_4bit_in_slices(sliced)
+    assert read is not None, "threshold did not force the sliced read"
+    reference = bnb.functional.dequantize_4bit(
+        whole.data, whole.quant_state
+    ).reshape(value.shape)
+    assert torch.equal(read, reference)
+
+
+def test_the_forward_read_slices_too(small_threshold, monkeypatch):
+    """The recompute and grouped-mm providers read the stack through
+    moe_utils._get_base_weight on every forward, and again on every backward
+    recomputation. That read is a single dequantize call, which aborts on the
+    same element count the load-time one does."""
+    from unsloth_zoo.temporary_patches import moe_utils as MU
+
+    value = _stack()
+    param = M._make_expert_params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+    )
+    param._original_shape = value.shape
+
+    seen = []
+    real = bnb.functional.dequantize_4bit
+
+    def _spy(data, *args, **kwargs):
+        seen.append(data.numel() * data.element_size() * 2)
+        return real(data, *args, **kwargs)
+
+    monkeypatch.setattr(bnb.functional, "dequantize_4bit", _spy)
+    out = MU._get_base_weight(param, torch.bfloat16)
+
+    assert tuple(out.shape) == tuple(value.shape) and out.dtype == torch.bfloat16
+    assert seen, "_get_base_weight did not dequantize at all"
+    too_big = [n for n in seen if n >= M._BNB_MAX_QUANTIZE_NUMEL]
+    assert not too_big, (
+        f"_get_base_weight issued {len(too_big)} whole-stack dequantize call(s) of "
+        f"{too_big} weights with the threshold at {M._BNB_MAX_QUANTIZE_NUMEL}; "
+        f"bitsandbytes aborts the process on those."
+    )
+
+
+def test_get_base_weight_is_unchanged_below_the_threshold(monkeypatch):
+    """No slicing, and still exactly one call, for every ordinary expert."""
+    from unsloth_zoo.temporary_patches import moe_utils as MU
+
+    value = _stack(experts=2)
+    param = M._make_expert_params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+    )
+    param._original_shape = value.shape
+
+    seen = []
+    real = bnb.functional.dequantize_4bit
+    monkeypatch.setattr(
+        bnb.functional, "dequantize_4bit",
+        lambda d, *a, **k: (seen.append(d.numel()), real(d, *a, **k))[1],
+    )
+    out = MU._get_base_weight(param, torch.bfloat16)
+    assert len(seen) == 1, f"expected one whole-stack call, got {len(seen)}"
+    assert tuple(out.shape) == tuple(value.shape)

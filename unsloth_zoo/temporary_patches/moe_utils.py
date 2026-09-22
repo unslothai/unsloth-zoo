@@ -1663,7 +1663,20 @@ def _get_base_weight(param, target_dtype=None):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        # An expert stack of 2**31 elements or more aborts inside the
+        # bitsandbytes dequantize kernel (csrc/ops.cu line 93), and this is the
+        # read the recompute and grouped-mm providers take on every forward and
+        # again on every backward recomputation. Slice it the same way the load
+        # does; the helper returns None for everything smaller, which leaves the
+        # single call below untouched.
+        weight = None
+        try:
+            from .moe_utils_bnb4bit import _dequantize_4bit_in_slices
+            weight = _dequantize_4bit_in_slices(param)
+        except ImportError:
+            pass
+        if weight is None:
+            weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
         original_shape = getattr(param, "_original_shape", None)
         if original_shape is not None and weight.shape != original_shape:
             weight = weight.reshape(original_shape)

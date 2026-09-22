@@ -112,13 +112,18 @@ def _is_expert_module(module: nn.Module) -> bool:
 _BNB_MAX_QUANTIZE_NUMEL = 2 ** 31
 
 
-def _quantize_expert_stack_in_slices(value, blocksize, quant_type):
+def _quantize_expert_stack_in_slices(value, blocksize, quant_type, quant_storage = torch.uint8):
     """Params4bit for a stack too large for one bitsandbytes quantize call.
 
     Each slice holds whole experts, and one expert is a whole number of blocks
     for every MoE shape shipped so far, so the packed bytes and the absmax
     blocks concatenate exactly and nothing is requantized. Returns None when
     that does not hold, leaving the caller on the unsliced path.
+
+    `quant_storage` is honoured: FSDP needs a floating point parameter storage
+    dtype, and silently handing it back uint8 breaks the wrap it asked for. A
+    slice must still be a whole number of storage elements for the packed
+    pieces to concatenate, which is why it is checked rather than assumed.
     """
     from bitsandbytes.functional import QuantState
 
@@ -126,6 +131,11 @@ def _quantize_expert_stack_in_slices(value, blocksize, quant_type):
         return None
     per_expert = value[0].numel()
     if per_expert == 0 or per_expert % blocksize != 0:
+        return None
+    # One packed element covers 2 weights per byte of its storage dtype.
+    storage_itemsize = torch.empty(0, dtype = quant_storage).element_size()
+    weights_per_storage_element = 2 * storage_itemsize
+    if per_expert % weights_per_storage_element != 0:
         return None
     experts_per_slice = (_BNB_MAX_QUANTIZE_NUMEL - 1) // per_expert
     if experts_per_slice < 1:
@@ -138,6 +148,7 @@ def _quantize_expert_stack_in_slices(value, blocksize, quant_type):
             value[start : start + experts_per_slice].contiguous(),
             blocksize = blocksize,
             quant_type = quant_type,
+            quant_storage = quant_storage,
             # Double quantization nests absmax per call, and the nested states
             # of separate calls do not concatenate. Keep the slices flat; the
             # absmax of one expert stack is small next to its weights.
@@ -161,7 +172,7 @@ def _quantize_expert_stack_in_slices(value, blocksize, quant_type):
     new_param.blocksize = blocksize
     new_param.compress_statistics = False
     new_param.quant_type = quant_type
-    new_param.quant_storage = new_param.dtype
+    new_param.quant_storage = quant_storage
     new_param.bnb_quantized = True
     return new_param
 
@@ -174,6 +185,7 @@ def _make_expert_params4bit(value, **kwargs):
             value,
             blocksize = kwargs.get("blocksize") or 64,
             quant_type = kwargs.get("quant_type") or "nf4",
+            quant_storage = kwargs.get("quant_storage") or torch.uint8,
         )
         if sliced is not None:
             return sliced
@@ -211,16 +223,24 @@ def _dequantize_4bit_in_slices(weight):
 
     blocksize = quant_state.blocksize
     per_expert = math.prod(shape[1:])
-    if per_expert == 0 or per_expert % blocksize != 0 or per_expert % 2 != 0:
+    if per_expert == 0 or per_expert % blocksize != 0:
+        return None
+    # The packed tensor is not necessarily uint8: bnb_4bit_quant_storage may be
+    # float16/bfloat16/float32, and a prequantized checkpoint keeps whatever it
+    # was saved with. Slice in ELEMENTS of that dtype, not in bytes, or every
+    # slice after the first starts two or four times too far in and the read
+    # runs off the end of the tensor.
+    flat = weight.data.reshape(-1)
+    weights_per_element = 2 * flat.element_size()
+    if per_expert % weights_per_element != 0:
         return None
     experts_per_slice = (_BNB_MAX_QUANTIZE_NUMEL - 1) // per_expert
     if experts_per_slice < 1:
         return None
 
     absmax = _quantstate_absmax_fp32(quant_state)
-    flat = weight.data.reshape(-1)
     blocks_per_expert = per_expert // blocksize
-    bytes_per_expert = per_expert // 2
+    elements_per_expert = per_expert // weights_per_element
 
     out = []
     for start in range(0, shape[0], experts_per_slice):
@@ -234,7 +254,7 @@ def _dequantize_4bit_in_slices(weight):
             dtype = quant_state.dtype,
         )
         out.append(bnb.functional.dequantize_4bit(
-            flat[start * bytes_per_expert : stop * bytes_per_expert].unsqueeze(-1),
+            flat[start * elements_per_expert : stop * elements_per_expert].unsqueeze(-1),
             sub_state,
         ).reshape((stop - start,) + shape[1:]))
     return torch.cat(out, dim = 0)
@@ -683,7 +703,20 @@ def patch_peft_param_wrapper_merge_4bit():
         device = reference.device
         if device.type == "meta":
             device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        new_param = Params4bit(new_data.detach().to("cpu").contiguous(), **kwargs).to(device)
+        if device.type == "cuda" and new_data.numel() >= _BNB_MAX_QUANTIZE_NUMEL:
+            # merge_and_unload() re-quantizes the very stack that had to be
+            # sliced to be quantized at all, so the same 32-bit element count
+            # aborts here. Route it through the sliced path too; below the
+            # threshold the original single call is unchanged.
+            new_param = _make_expert_params4bit(
+                new_data.detach().to(device).contiguous(),
+                requires_grad = False,
+                blocksize = kwargs["blocksize"],
+                quant_type = kwargs["quant_type"],
+                quant_storage = kwargs["quant_storage"],
+            )
+        else:
+            new_param = Params4bit(new_data.detach().to("cpu").contiguous(), **kwargs).to(device)
         new_param._original_shape = torch.Size(original_shape)
         return new_param
 
