@@ -109,7 +109,14 @@ def _make_op(Fp8Dequantize):
             # dequantized here and is quantized back; a weight the checkpoint excluded from FP8
             # (modules_to_not_convert) has no scale and is written as it is.
             has_scale = any("scale_inv" in (k[:-1] if k.endswith("$") else k) for k in input_dict)
-            if has_scale and full_layer_name:
+            # An FP4-packed weight (int8 / float4_e2m1fn_x2) is unpacked by Fp8Dequantize too, but
+            # the reverse op only knows how to write float8_e4m3fn, so it is left dequantized on
+            # save rather than silently changing format under a config that still says FP4.
+            arrived_packed_fp4 = any(
+                isinstance(_first(v), torch.Tensor) and _first(v).dtype in _PACKED_FP4_DTYPES
+                for v in input_dict.values()
+            )
+            if has_scale and not arrived_packed_fp4 and full_layer_name:
                 _dequantized_targets(model).add(full_layer_name)
             return out
 
@@ -157,6 +164,9 @@ def _make_op(Fp8Dequantize):
     return Fp8DequantizeWithoutContainer
 
 
+_PACKED_FP4_DTYPES = tuple(
+    d for d in (torch.int8, torch.uint8, getattr(torch, "float4_e2m1fn_x2", None)) if d is not None
+)
 _FP8_DTYPES = tuple(
     getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, name)
 )

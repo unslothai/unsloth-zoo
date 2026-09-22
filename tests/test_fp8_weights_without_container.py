@@ -30,6 +30,7 @@ pytest.importorskip("transformers.integrations.finegrained_fp8")
 
 import unsloth_zoo  # noqa: F401  registers the temporary patches
 from unsloth_zoo.temporary_patches.fp8_uncontained_weights import (
+    _dequantized_targets,
     patch_fp8_dequantize_weights_without_container,
     _make_op,
     _target_owns_scale,
@@ -402,3 +403,21 @@ def test_from_pretrained_gives_the_dequantized_experts(tmp_path):
     with torch.no_grad():
         wrong = F.linear(x.float(), q[1].float())
     assert not torch.allclose(wrong, want, rtol = 0.15, atol = 0.15 * want.abs().max().item())
+
+
+def test_an_fp4_packed_weight_is_not_marked_for_fp8_requantization():
+    """Fp8Dequantize unpacks packed e2m1 FP4 too, but the reverse op only writes
+    float8_e4m3fn: recording such a weight would save an FP8 tensor under a config that
+    still says FP4. It stays dequantized on save instead."""
+    model = _Holder()
+    op = _make_op(Fp8Dequantize)(_quantizer())
+    packed = torch.zeros(8, 4, dtype = torch.int8)
+    scale = torch.ones(4, 4)
+    try:
+        op.convert({"weight$": [packed], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
+    except Exception:
+        pass  # the unpack itself is transformers' business; only the provenance is under test
+    assert "experts.weight" not in _dequantized_targets(model)
+    fp8 = torch.zeros(8, 8).to(E4M3)
+    op.convert({"weight$": [fp8], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
+    assert "experts.weight" in _dequantized_targets(model)
