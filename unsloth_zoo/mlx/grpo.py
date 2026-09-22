@@ -6,14 +6,25 @@ The behaviour mirrors TRL 0.24's ``GRPOTrainer`` as Unsloth patches it on CUDA
 
 import copy
 import warnings
+from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .preference import _response_mask, _supervised_tokens
-from .utils import _model_logits
+from . import generate as generate_module
+from .generate import GenerationDefaults, GenerationRequest, SamplingParams
+from .preference import _chat_template, _response_mask, _supervised_tokens
+from .utils import (
+    _finite_batch_schedule,
+    _finite_text_pad_width,
+    _model_logits,
+    _normalize_mlx_messages,
+    _normalize_seed,
+    encode_mlx_text,
+)
 
 
 GRPO_LOSS_TYPES = ("grpo", "bnpo", "dr_grpo", "dapo")
@@ -264,3 +275,495 @@ def make_grpo_loss_fn(objective):
     loss_fn._unsloth_preference_report = grpo_metric_values
     loss_fn._unsloth_cce_compaction = False
     return loss_fn
+
+
+# Columns Unsloth never forwards to the chat template as keyword arguments.
+_TEMPLATE_RESERVED_COLUMNS = frozenset((
+    "prompt", "chosen", "rejected", "completion", "messages", "label",
+    "images", "image", "videos", "video", "audios", "audio",
+))
+
+
+def render_grpo_prompt(tokenizer, row):
+    """TRL's prompt text; a string column the chat template names is passed to
+    it as a keyword, as Unsloth does."""
+    prompt = row["prompt"]
+    if not _is_conversational_prompt(prompt):
+        if not isinstance(prompt, str):
+            raise ValueError(
+                "Unsloth MLX GRPO: a prompt must be a string or a list of chat messages."
+            )
+        return prompt
+    template = getattr(tokenizer, "chat_template", None)
+    kwargs = {
+        key: value for key, value in row.items()
+        if isinstance(value, str) and key not in _TEMPLATE_RESERVED_COLUMNS
+        and isinstance(template, str) and key in template
+    }
+    messages = _normalize_mlx_messages(prompt, is_vlm=False)
+    role = messages[-1].get("role")
+    if role == "user":
+        mode = {"add_generation_prompt": True}
+    elif role == "assistant":
+        mode = {"continue_final_message": True}
+    else:
+        raise ValueError(
+            "Unsloth MLX GRPO: a conversational prompt must end with a user or "
+            "assistant message."
+        )
+    return _chat_template(tokenizer, messages, tools=None, kwargs=kwargs, **mode)
+
+
+@dataclass(frozen=True)
+class GRPOSampling:
+    """Rollout sampling as TRL configures it; ``top_k`` / ``min_p`` None switch the
+    filter off, and ``max_tokens`` is the resolved completion length."""
+
+    max_tokens: int = 256
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float = 1.0
+
+    @property
+    def warps(self):
+        return (
+            self.temperature != 1.0 or self.top_p < 1.0 or bool(self.top_k)
+            or bool(self.min_p) or self.repetition_penalty != 1.0
+        )
+
+
+def hf_logits_warper(sampling, prompt_ids):
+    """One row's HF sampling processors: repetition penalty over the prompt and
+    what followed it, then temperature, top-k, top-p and min-p."""
+    # The engine shows a processor its last prompt token onward.
+    context = mx.array(list(prompt_ids[:-1]), dtype=mx.int32)
+    penalty = float(sampling.repetition_penalty)
+
+    def warp(tokens, logits):
+        logits = logits.astype(mx.float32)
+        if penalty != 1.0:
+            seen = mx.concatenate([context, tokens.astype(mx.int32)])
+            picked = logits[:, seen]
+            logits[:, seen] = mx.where(picked < 0, picked * penalty, picked / penalty)
+        if sampling.temperature != 1.0:
+            logits = logits / sampling.temperature
+        removed = mx.array(-float("inf"), mx.float32)
+        vocab = logits.shape[-1]
+        if sampling.top_k:
+            kept = vocab - min(int(sampling.top_k), vocab)
+            cutoff = mx.sort(logits, axis=-1)[:, kept:kept + 1]
+            logits = mx.where(logits < cutoff, removed, logits)
+        if sampling.top_p < 1.0:
+            # By sorted position, as HF drops them: a value cutoff keeps every tie.
+            # The most likely token always survives, as HF's min_tokens_to_keep=1.
+            order = mx.argsort(logits, axis=-1)
+            ordered = mx.take_along_axis(logits, order, axis=-1)
+            below = mx.cumsum(mx.softmax(ordered, axis=-1), axis=-1) <= 1 - sampling.top_p
+            below = mx.logical_and(below, mx.arange(vocab) < vocab - 1)
+            dropped = mx.take_along_axis(below, mx.argsort(order, axis=-1), axis=-1)
+            logits = mx.where(dropped, removed, logits)
+        if sampling.min_p:
+            probs = mx.softmax(logits, axis=-1)
+            floor = sampling.min_p * mx.max(probs, axis=-1, keepdims=True)
+            logits = mx.where(probs < floor, removed, logits)
+        return logits
+
+    return warp
+
+
+def _derived_seed(*parts):
+    return int(np.random.SeedSequence([int(part) % (2 ** 32) for part in parts])
+               .generate_state(1, np.uint64)[0])
+
+
+class _RepeatSamplerOrder:
+    """TRL's RepeatSampler order: one generator seeded once, one permutation per epoch."""
+
+    def __init__(self, size, seed, shuffle):
+        self._size = size
+        self._orders = []
+        self._draw = None
+        if not shuffle:
+            return
+        try:
+            import torch
+        except ImportError:
+            warnings.warn(
+                "Unsloth MLX GRPO: torch is not installed, so prompts are shuffled "
+                "with numpy instead of TRL's torch.randperm; the order is seeded but "
+                "differs from CUDA's.",
+                stacklevel=3,
+            )
+            rng = np.random.default_rng(seed)
+            self._draw = lambda: rng.permutation(size).tolist()
+        else:
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            self._draw = lambda: torch.randperm(size, generator=generator).tolist()
+
+    def __call__(self, epoch):
+        while len(self._orders) <= epoch:
+            self._orders.append(
+                list(range(self._size)) if self._draw is None else self._draw()
+            )
+        return self._orders[epoch]
+
+
+@dataclass
+class _Generation:
+    visit: int
+    sequences: list
+    prompt_lengths: np.ndarray
+    advantages: np.ndarray
+    kept: np.ndarray
+    old: list | None
+    ref: list | None
+    generation_tokens: int
+
+
+class GRPOBatchPlan:
+    """Finite GRPO schedule: one entry per micro-step, each naming the prompt chunk
+    its generation samples from. A generation covers ``steps_per_generation *
+    num_iterations`` micro-steps counted from ``start_at``, so a resumed run
+    generates at once, as TRL does with an empty buffer."""
+
+    def __init__(
+        self, dataset, tokenizer, prompt_ids, max_tokens, schedule, *, cycle_length,
+        num_generations, batch_size, steps_per_generation, num_iterations, grad_accum,
+        sampling, scale_rewards, mask_truncated_completions, with_old_logps,
+        with_reference, max_seq_length, seed,
+    ):
+        self._dataset = dataset
+        self._tokenizer = tokenizer
+        self._prompt_ids = prompt_ids
+        self._max_tokens = max_tokens
+        self._schedule = schedule
+        self._cycle_length = cycle_length
+        self.num_generations = num_generations
+        self.batch_size = batch_size
+        self.steps_per_generation = steps_per_generation
+        self._repeats = steps_per_generation * num_iterations
+        self._grad_accum = grad_accum
+        self.sampling = sampling
+        self.scale_rewards = scale_rewards
+        self.mask_truncated_completions = mask_truncated_completions
+        self.with_old_logps = with_old_logps
+        self.with_reference = with_reference
+        self.max_seq_length = max_seq_length
+        self.seed = seed
+        self.eos_id = int(tokenizer.eos_token_id)
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        self.pad_id = self.eos_id if pad_id is None else int(pad_id)
+        self._anchor = 0
+        self._current = None
+        self._model = None
+        self._metrics = {}
+        self.num_input_tokens_seen = 0
+
+    @property
+    def schedule(self):
+        return self._schedule
+
+    @property
+    def cycle_length(self):
+        return self._cycle_length
+
+    def __len__(self):
+        return len(self._schedule)
+
+    def batch_index_for_visit(self, absolute_visit):
+        return int(absolute_visit) % len(self._schedule)
+
+    def bind(
+        self, model, reward_funcs, *, reward_weights=None, reference_policy=None,
+        trainer_state=None, rollout_context=None,
+    ):
+        """Attach what generating needs: the policy, rewards and the reference."""
+        if self.with_reference and reference_policy is None:
+            raise ValueError("Unsloth MLX GRPO: this plan scores a reference policy.")
+        self._model = model
+        self._reward_funcs = list(reward_funcs)
+        self._reward_weights = (
+            [1.0] * len(self._reward_funcs) if reward_weights is None
+            else [float(weight) for weight in reward_weights]
+        )
+        self._reference_policy = reference_policy
+        self._trainer_state = trainer_state
+        self._rollout_context = rollout_context or nullcontext
+
+    def start_at(self, visit):
+        """Count generations from ``visit``, the first micro-step a run fetches."""
+        self._anchor = int(visit)
+        self._current = None
+
+    def _generation_start(self, index):
+        return self._anchor + ((index - self._anchor) // self._repeats) * self._repeats
+
+    def _width(self, raw):
+        return _finite_text_pad_width(
+            raw, pad_to_multiple=32, minimum_width=2, max_seq_length=self.max_seq_length,
+        )
+
+    def width_rungs(self, index):
+        """Every padded width a micro-step of this entry's generation can take."""
+        chunk = self._schedule[self._generation_start(index) % len(self._schedule)]
+        low = self._width(min(len(self._prompt_ids[prompt]) for prompt in chunk) + 1)
+        high = self._width(max(
+            len(self._prompt_ids[prompt]) + self._max_tokens[prompt] for prompt in chunk
+        ))
+        return tuple(sorted({*range(low, high, 32), high}))
+
+    def pop_metrics(self):
+        """Generation-side metrics recorded since the last call, each averaged."""
+        if not self._metrics:
+            return {}
+        values = {name: float(np.mean(recorded)) for name, recorded in self._metrics.items()}
+        values["num_tokens"] = float(self.num_input_tokens_seen)
+        self._metrics = {}
+        return values
+
+    def _record(self, name, value):
+        self._metrics.setdefault(name, []).append(float(value))
+
+    def _pack(self, sequences, prompt_lengths, width):
+        batch = np.full((len(sequences), width), self.pad_id, dtype=np.int32)
+        lengths = np.zeros((len(sequences), 2), dtype=np.int32)
+        for row, (sequence, prompt_length) in enumerate(zip(sequences, prompt_lengths)):
+            batch[row, :len(sequence)] = sequence
+            lengths[row] = (prompt_length, len(sequence))
+        return batch, lengths
+
+    def _score(self, scorer, sequences, prompt_lengths):
+        values = []
+        for start in range(0, len(sequences), self.batch_size):
+            chunk = sequences[start:start + self.batch_size]
+            batch, lengths = self._pack(
+                chunk, prompt_lengths[start:start + self.batch_size],
+                self._width(max(len(sequence) for sequence in chunk)),
+            )
+            logps = np.array(scorer(mx.array(batch), mx.array(lengths)), dtype=np.float32)
+            values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
+        return values
+
+    def _decode(self, ids):
+        try:
+            return self._tokenizer.decode(list(ids), skip_special_tokens=True)
+        except TypeError:
+            return self._tokenizer.decode(list(ids))
+
+    def _generate(self, visit):
+        if self._model is None:
+            raise RuntimeError("Unsloth MLX GRPO: bind the plan before fetching batches.")
+        prompts = [
+            prompt for prompt in self._schedule[visit % len(self._schedule)]
+            for _ in range(self.num_generations)
+        ]
+        requests = [
+            GenerationRequest(
+                prompt_token_ids=self._prompt_ids[prompt],
+                max_tokens=self._max_tokens[prompt],
+                sampling=SamplingParams(temperature=1.0, seed=_derived_seed(self.seed, visit, 0, row)),
+                logits_processors=(
+                    (hf_logits_warper(self.sampling, self._prompt_ids[prompt]),)
+                    if self.sampling.warps else None
+                ),
+            )
+            for row, prompt in enumerate(prompts)
+        ]
+        defaults = GenerationDefaults(
+            max_tokens=self.sampling.max_tokens, stop_token_ids=(self.eos_id,),
+        )
+        with self._rollout_context():
+            results = generate_module.generate_batch(
+                self._model, self._tokenizer, requests, defaults=defaults,
+            )
+        cut = [
+            cut_completion(result.token_ids, result.finish_reason, eos_id=self.eos_id, pad_id=self.pad_id)
+            for result in results
+        ]
+        completion_ids = [ids for ids, _ in cut]
+        truncated = np.array([flag for _, flag in cut], dtype=bool)
+        rows = [self._dataset[prompt] for prompt in prompts]
+        reward_prompts, completions = reward_prompts_and_completions(
+            [row["prompt"] for row in rows], [self._decode(ids) for ids in completion_ids],
+        )
+        rewards = calculate_rewards(
+            self._reward_funcs, rows, prompts=reward_prompts, completions=completions,
+            completion_ids=completion_ids, trainer_state=self._trainer_state,
+        )
+        advantages, reward_stats = group_advantages(
+            rewards, self._reward_weights, self.num_generations, self.scale_rewards,
+        )
+        lengths = np.array([len(ids) for ids in completion_ids])
+        prompt_lengths = np.array([len(self._prompt_ids[prompt]) for prompt in prompts])
+        self._record_generation(lengths, truncated, rewards, reward_stats)
+        self.num_input_tokens_seen += int(prompt_lengths.sum() + lengths.sum())
+        kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
+        # Shuffled before scoring, so each old/reference chunk is one micro-batch at
+        # its own width and a first iteration's ratio is exactly 1 when eager.
+        order = np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(len(prompts))
+        sequences = [
+            tuple(self._prompt_ids[prompts[row]]) + tuple(completion_ids[row]) for row in order
+        ]
+        prompt_lengths = prompt_lengths[order]
+        temperature = self.sampling.temperature
+        old = ref = None
+        if self.with_old_logps:
+            old = self._score(
+                lambda batch, _: mx.stop_gradient(completion_logps(self._model, batch, temperature)),
+                sequences, prompt_lengths,
+            )
+        if self.with_reference:
+            ref = self._score(
+                lambda batch, lengths: self._reference_policy.forward(
+                    self._model, batch, lengths,
+                    response_scorer=lambda module, tokens, _: completion_logps(module, tokens, temperature),
+                ),
+                sequences, prompt_lengths,
+            )
+        return _Generation(
+            visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
+            advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
+            generation_tokens=int(lengths.sum()),
+        )
+
+    def _record_generation(self, lengths, truncated, rewards, reward_stats):
+        terminated = lengths[~truncated] if (~truncated).any() else np.zeros(1)
+        for name, values in (("length", lengths), ("terminated_length", terminated)):
+            self._record(f"completions/mean_{name}", values.mean())
+            self._record(f"completions/min_{name}", values.min())
+            self._record(f"completions/max_{name}", values.max())
+        self._record("completions/clipped_ratio", truncated.mean())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            for column, reward_func in enumerate(self._reward_funcs):
+                name = reward_function_name(reward_func)
+                self._record(f"rewards/{name}/mean", np.nanmean(rewards[:, column]))
+                self._record(f"rewards/{name}/std", np.nanstd(rewards[:, column], ddof=1))
+        for name, value in reward_stats.items():
+            self._record(name, value)
+
+    def _window_microbatches(self, index):
+        epoch_start = (index // self._cycle_length) * self._cycle_length
+        epoch_end = min(epoch_start + self._cycle_length, len(self._schedule))
+        start = epoch_start + ((index - epoch_start) // self._grad_accum) * self._grad_accum
+        return min(start + self._grad_accum, epoch_end) - start
+
+    def materialize(self, index):
+        """The micro-batch for schedule entry ``index``. Refetching an entry reuses
+        its generation instead of sampling again."""
+        start = self._generation_start(index)
+        if self._current is None or self._current.visit != start:
+            self._current = self._generate(start)
+        generation = self._current
+        position = ((index - start) % self.steps_per_generation) * self.batch_size
+        rows = range(position, position + self.batch_size)
+        sequences = [generation.sequences[row] for row in rows]
+        width = self._width(max(len(sequence) for sequence in sequences))
+        batch, lengths = self._pack(sequences, generation.prompt_lengths[position:position + self.batch_size], width)
+
+        def held(values):
+            if values is None:
+                return None
+            table = np.zeros((len(sequences), width - 1), dtype=np.float32)
+            for offset, row in enumerate(rows):
+                table[offset, :len(values[row])] = values[row]
+            return mx.array(table)
+
+        return (
+            mx.array(batch), mx.array(lengths),
+            mx.array([self._window_microbatches(index), generation.generation_tokens], dtype=mx.float32),
+            mx.array(generation.advantages[position:position + self.batch_size]),
+            mx.array(generation.kept[position:position + self.batch_size]),
+            held(generation.old), held(generation.ref),
+        )
+
+    def __getitem__(self, index):
+        return self.materialize(index)
+
+
+def create_grpo_batch_plan(
+    dataset, tokenizer, *, num_generations, batch_size, steps_per_generation,
+    num_iterations, grad_accum, sampling, max_seq_length, scale_rewards="group",
+    mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
+    shuffle=True, seed=None, num_batches=None, num_epochs=None,
+):
+    """Encode every prompt once and lay out TRL's RepeatSampler schedule.
+
+    ``batch_size`` counts completions; a generation samples ``batch_size *
+    steps_per_generation`` of them, ``num_generations`` per prompt.
+    """
+    if getattr(tokenizer, "eos_token_id", None) is None:
+        raise ValueError("Unsloth MLX GRPO: the tokenizer needs an eos_token_id to stop on.")
+    prompt_ids, max_tokens = [], []
+    long_prompts = capped = 0
+    for index in range(len(dataset)):
+        row = dataset[index]
+        if not isinstance(row, Mapping) or "prompt" not in row:
+            raise ValueError(
+                f"Unsloth MLX GRPO: dataset row {index} has no prompt column."
+            )
+        ids = tuple(int(token) for token in encode_mlx_text(tokenizer, render_grpo_prompt(tokenizer, row)))
+        if not ids or len(ids) >= max_seq_length:
+            raise ValueError(
+                f"Unsloth MLX GRPO: dataset row {index} encodes to a {len(ids)}-token "
+                f"prompt, which leaves no room to generate within max_seq_length="
+                f"{max_seq_length}. Filter the dataset or raise max_seq_length."
+            )
+        room = max_seq_length - len(ids)
+        capped += room < sampling.max_tokens
+        long_prompts += max_prompt_length is not None and len(ids) > max_prompt_length
+        prompt_ids.append(ids)
+        max_tokens.append(min(sampling.max_tokens, room))
+    if long_prompts:
+        warnings.warn(
+            f"Unsloth MLX GRPO: {long_prompts} prompt(s) exceed max_prompt_length="
+            f"{max_prompt_length}, which is not enforced (as on CUDA Unsloth and TRL "
+            ">= 0.26); filter the dataset to bound prompt length.",
+            stacklevel=2,
+        )
+    if capped:
+        warnings.warn(
+            f"Unsloth MLX GRPO: {capped} prompt(s) leave fewer than "
+            f"{sampling.max_tokens} tokens within max_seq_length={max_seq_length}; "
+            "their completions are capped to the room left.",
+            stacklevel=2,
+        )
+    if batch_size * steps_per_generation % num_generations:
+        raise ValueError(
+            f"Unsloth MLX GRPO: a generation of {batch_size * steps_per_generation} "
+            f"completions is not divisible by num_generations={num_generations}."
+        )
+    chunk = batch_size * steps_per_generation // num_generations
+    repeats = steps_per_generation * num_iterations
+    order = _RepeatSamplerOrder(len(prompt_ids), _normalize_seed(seed), shuffle)
+
+    def batches_for_epoch(epoch):
+        prompts = order(epoch)
+        return tuple(
+            tuple(prompts[start:start + chunk])
+            for start in range(0, len(prompts) - chunk + 1, chunk)
+            for _ in range(repeats)
+        )
+
+    schedule, cycle_length = _finite_batch_schedule(
+        batches_for_epoch, num_batches=num_batches, num_epochs=num_epochs,
+        grad_accum=grad_accum,
+    )
+    if not cycle_length:
+        raise ValueError(
+            f"Unsloth MLX GRPO: the dataset has {len(prompt_ids)} prompt(s), fewer "
+            f"than the {chunk} one generation samples from."
+        )
+    return GRPOBatchPlan(
+        dataset, tokenizer, prompt_ids, max_tokens, schedule,
+        cycle_length=cycle_length, num_generations=num_generations,
+        batch_size=batch_size, steps_per_generation=steps_per_generation,
+        num_iterations=num_iterations, grad_accum=grad_accum, sampling=sampling,
+        scale_rewards=scale_rewards,
+        mask_truncated_completions=mask_truncated_completions,
+        with_old_logps=grad_accum % repeats != 0, with_reference=with_reference,
+        max_seq_length=max_seq_length, seed=_normalize_seed(seed),
+    )

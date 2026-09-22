@@ -3383,3 +3383,154 @@ def test_grpo_rewards_advantages_and_reward_inputs_follow_trl():
     assert GRPOObjective(epsilon=0.3).epsilon_high == 0.3
     with pytest.raises(ValueError, match="TRL 0.24 supports"):
         GRPOObjective(loss_type="cispo")
+
+
+@pytest.mark.parametrize("settings", [
+    dict(repetition_penalty=1.3, temperature=0.7, top_k=4),
+    dict(temperature=1.4, min_p=0.15), dict(top_p=0.6), dict(top_p=0.0),
+    dict(top_k=3, top_p=0.9, min_p=0.2),
+])
+def test_grpo_rollout_warper_matches_hf_sampling_processors(settings):
+    import torch
+    from transformers.generation import logits_process as hf
+    from unsloth_zoo.mlx.grpo import GRPOSampling, hf_logits_warper
+
+    sampling = GRPOSampling(**settings)
+    prompt, generated = [5, 1, 5, 7], [2, 9]
+    logits = torch.randn(1, 12, generator=torch.Generator().manual_seed(1)) * 3
+    ours = hf_logits_warper(sampling, prompt)(torch.tensor(prompt[-1:] + generated), logits.clone())
+    expected = hf.LogitsProcessorList([
+        hf.RepetitionPenaltyLogitsProcessor(sampling.repetition_penalty),
+        hf.TemperatureLogitsWarper(sampling.temperature), *(
+            [hf.TopKLogitsWarper(sampling.top_k)] if sampling.top_k else []),
+        hf.TopPLogitsWarper(sampling.top_p), *(
+            [hf.MinPLogitsWarper(sampling.min_p)] if sampling.min_p else []),
+    ])(torch.tensor([prompt + generated]), logits.clone())
+    assert torch.equal(torch.isinf(ours), torch.isinf(expected)) and 0 < torch.isinf(ours).sum() < 12
+    assert torch.allclose(ours[~torch.isinf(ours)], expected[~torch.isinf(expected)], rtol=1e-5)
+    tied = hf_logits_warper(GRPOSampling(top_p=0.5), [1])(torch.tensor([1]), torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
+    assert torch.isfinite(tied).sum() == 2  # HF keeps two of the three tied logits
+
+
+@pytest.mark.parametrize("bsz,spg,iterations,shuffle", [(4, 2, 1, True), (2, 3, 2, True), (6, 1, 1, False)])
+def test_grpo_plan_order_follows_trl_repeat_sampler(bsz, spg, iterations, shuffle):
+    from trl.trainer.utils import RepeatSampler
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan
+
+    dataset = [{"prompt": f"q{index}"} for index in range(11)]
+    plan = create_grpo_batch_plan(
+        dataset, Tokenizer(), num_generations=2, batch_size=bsz, steps_per_generation=spg,
+        num_iterations=iterations, grad_accum=2, sampling=GRPOSampling(max_tokens=4),
+        max_seq_length=32, shuffle=shuffle, seed=7, num_epochs=2,
+    )
+    sampler = RepeatSampler(dataset, 2, bsz * spg // 2, iterations * spg, shuffle, seed=7)
+    expected = [index for _ in range(2) for index in sampler][::2]
+    visits = [prompt for entry in plan.schedule for prompt in entry]
+    assert visits == expected and plan.cycle_length * 2 == len(plan.schedule)
+    cycle = plan.cycle_length
+    assert plan.with_old_logps == (2 % (spg * iterations) != 0)
+    assert [plan._window_microbatches(i) for i in range(2 * cycle)] == [min(2, cycle - i % cycle // 2 * 2) for i in range(2 * cycle)]  # noqa: E501
+
+
+def test_grpo_prompts_render_as_trl_and_unsloth_pass_them(monkeypatch):
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan, render_grpo_prompt
+
+    tokenizer = CapturingTokenizer()
+    tokenizer.chat_template = "{{ reasoning_effort }}{{ label }}"
+    user, assistant = {"role": "user", "content": "hi"}, {"role": "assistant", "content": "so"}
+    render_grpo_prompt(tokenizer, {"prompt": [user], "reasoning_effort": "low", "label": "x", "level": 3})
+    render_grpo_prompt(tokenizer, {"prompt": [user, assistant]})
+    assert [kwargs for _, kwargs in tokenizer.calls] == [
+        {"tokenize": False, "add_generation_prompt": True, "reasoning_effort": "low"},
+        {"tokenize": False, "continue_final_message": True},
+    ]
+    with pytest.raises(ValueError, match="user or assistant"):
+        render_grpo_prompt(tokenizer, {"prompt": [{"role": "system", "content": "s"}]})
+    options = dict(num_generations=2, batch_size=2, steps_per_generation=1, num_iterations=1, grad_accum=1,
+                   sampling=GRPOSampling(max_tokens=2), max_seq_length=4)
+    with pytest.raises(ValueError, match="row 1 encodes to a 4-token"):
+        create_grpo_batch_plan([{"prompt": "a"}, {"prompt": "abcd"}], Tokenizer(), **options)
+    with pytest.warns(UserWarning, match="1 prompt.*max_prompt_length=1"):
+        create_grpo_batch_plan([{"prompt": "a"}, {"prompt": "ab"}], Tokenizer(), max_prompt_length=1, **options)
+    with pytest.raises(ValueError, match="fewer than the 2"):
+        create_grpo_batch_plan([{"prompt": "a"}], Tokenizer(), **{**options, "batch_size": 4})
+    with pytest.raises(ValueError, match="row 0 has no prompt"):
+        create_grpo_batch_plan([{"text": "a"}], Tokenizer(), **options)
+    tokenizer = type("Unpadded", (Tokenizer,), {"pad_token_id": None})()
+    plan = create_grpo_batch_plan([{"prompt": "a" * 32}, {"prompt": "a" * 40}], tokenizer, **{
+        **options, "batch_size": 4, "max_seq_length": 200, "sampling": GRPOSampling(max_tokens=30)})
+    assert plan.pad_id == 2 and plan.width_rungs(0) == (65, 97)
+    monkeypatch.setitem(sys.modules, "torch", None)
+    with pytest.warns(UserWarning, match="numpy instead of TRL's torch.randperm"):
+        orders = [create_grpo_batch_plan([{"prompt": "a"}] * 4, Tokenizer(), **{**options, "seed": 5}).schedule for _ in "ab"]
+    assert orders[0] == orders[1] == ((3,), (1,), (2,), (0,))
+
+
+def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.grpo import GRPOSampling, completion_logps, create_grpo_batch_plan
+
+    class Model:
+        def __call__(self, ids):
+            return ids.astype(mx.float32)[..., None] * mx.arange(16).astype(mx.float32) * 0.01
+
+    class Reference:
+        def forward(self, model, batch, lengths, *, response_scorer):
+            return response_scorer(model, batch, lengths) - 1.0
+
+    class Decoding(Tokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "".join(chr(97 + token) for token in ids if not skip_special_tokens or token != 2)
+
+    calls, seen = [], {}
+
+    def fake_generate_batch(model, tokenizer, requests, *, defaults=None):
+        calls.append((requests, defaults))
+        return [types.SimpleNamespace(token_ids=[1] * r.max_tokens if row % 2 else [1], finish_reason="length" if row % 2 else "stop")  # noqa: E501
+                for row, r in enumerate(requests)]
+
+    def stopped(completions, completion_ids, answer, **kwargs):
+        seen.update(completions=completions, ids=completion_ids, answer=answer)
+        return [float(ids[-1] == 2) for ids in completion_ids]
+
+    monkeypatch.setattr(generate_module, "generate_batch", fake_generate_batch)
+    dataset = [{"prompt": "a" * (index + 1), "answer": index} for index in range(4)]
+    with pytest.warns(UserWarning, match="1 prompt"):
+        plan = create_grpo_batch_plan(
+            dataset, Decoding(), num_generations=2, batch_size=2, steps_per_generation=2,
+            num_iterations=2, grad_accum=2, sampling=GRPOSampling(max_tokens=3, temperature=0.5),
+            max_seq_length=6, mask_truncated_completions=True, with_reference=True,
+            shuffle=False, num_batches=8,
+        )
+    plan.bind(Model(), [stopped], reference_policy=Reference())
+    first = plan.materialize(0)
+    replayed = [plan[index][0].tolist() for index in (1, 2, 3)]
+    assert replayed[1:] == [first[0].tolist(), replayed[0]] != [replayed[0]] * 2 and len(calls) == 1
+    requests, defaults = calls[0]
+    assert defaults.stop_token_ids == (2,) and [r.max_tokens for r in requests] == [3] * 4
+    assert len({r.sampling.seed for r in requests}) == 4 and requests[0].logits_processors and not GRPOSampling().warps
+    assert [r.prompt_token_ids for r in requests] == [(14,), (14,), (14, 14), (14, 14)]
+    assert seen["ids"] == [[1, 2], [1, 1, 1]] * 2 and seen["completions"][:2] == ["b", "bbb"] and seen["answer"] == [0, 0, 1, 1]  # noqa: E501
+    tokens, lengths, normalizers, advantages, kept, old, ref = first
+    assert normalizers.tolist() == [2.0, 10.0] and tokens.shape == (2, 6)
+    assert plan[1][4].tolist() == [0, 1]  # the seeded shuffle moved a truncated row ahead of a stopped one
+    for micro in (first, plan[1]):
+        ends = [end for _, end in micro[1].tolist()]
+        assert [bool(flag) for flag in micro[4].tolist()] == [row[end - 1] == 2 for row, end in zip(micro[0].tolist(), ends)]  # noqa: E501
+        assert np.allclose(np.array(micro[3]), [(0.5 if flag else -0.5) / (np.sqrt(0.5) + 1e-4) for flag in micro[4].tolist()])  # noqa: E501
+    ends = [end for _, end in lengths.tolist()]
+    logps = np.array(completion_logps(Model(), tokens, 0.5))
+    positions = np.arange(1, 6)[None, :] < np.array(ends)[:, None]
+    assert np.allclose(np.array(old)[positions], logps[positions]) and np.allclose(np.array(ref)[positions], logps[positions] - 1)  # noqa: E501
+    metrics = plan.pop_metrics()
+    assert metrics["completions/clipped_ratio"] == 0.5 and metrics["completions/mean_terminated_length"] == 2.0
+    assert metrics["completions/mean_length"] == 2.5 and metrics["rewards/stopped/std"] == pytest.approx(3 ** -0.5)
+    assert metrics["rewards/stopped/mean"] == 0.5 and metrics["num_tokens"] == 16 and plan.pop_metrics() == {}
+    plan.materialize(4)
+    assert len(calls) == 2 and calls[1][0][0].prompt_token_ids == (14, 14, 14)
+    assert [r.max_tokens for r in calls[1][0]] == [3, 3, 2, 2]
+    plan.start_at(6)
+    plan.materialize(6)
+    assert len(calls) == 3 and calls[2][0][0].sampling.seed != calls[1][0][0].sampling.seed and plan.width_rungs(6) == (6,)
