@@ -22,11 +22,14 @@ slicing path has to produce the same weights as a single call would, so the
 tests below lower the threshold and compare the two directly instead of
 allocating a 6.4e9 element stack.
 """
+from pathlib import Path
+
 import pytest
 import torch
 
 bnb = pytest.importorskip("bitsandbytes")
 
+from unsloth_zoo.temporary_patches import moe_utils as MU  # noqa: E402
 from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as M  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -271,3 +274,52 @@ def test_sliced_dequant_does_not_hold_every_slice_at_once(small_threshold, monke
         param.data, param.quant_state
     ).reshape(value.shape)
     assert torch.equal(out, reference)
+
+
+def test_the_forward_read_still_slices_from_the_cached_top_level_module(
+    small_threshold, monkeypatch, tmp_path
+):
+    """compiler.py emits `from moe_utils import ...`, so unsloth_compiled_cache
+    holds moe_utils as a TOP-LEVEL module with no package context. A relative
+    import of a sibling raises there, and because the import is guarded the
+    oversized stack would go quietly back onto the single call that aborts.
+
+    Loaded exactly that way here. With a relative import this made one
+    whole-stack call; the absolute import makes the sliced ones.
+    """
+    import importlib.util
+    import shutil
+    import sys
+
+    source = Path(MU.__file__)
+    cached = tmp_path / "moe_utils.py"
+    shutil.copy(source, cached)
+
+    spec = importlib.util.spec_from_file_location("moe_utils", cached)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "moe_utils", module)
+    spec.loader.exec_module(module)
+    assert module.__package__ == "", "fixture did not reproduce the no-package load"
+
+    value = _stack()
+    param = M._make_expert_params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+    )
+    param._original_shape = value.shape
+
+    seen = []
+    real = bnb.functional.dequantize_4bit
+    monkeypatch.setattr(
+        bnb.functional, "dequantize_4bit",
+        lambda d, *a, **k: (seen.append(d.numel() * d.element_size() * 2),
+                            real(d, *a, **k))[1],
+    )
+    out = module._get_base_weight(param, torch.bfloat16)
+
+    assert seen, "the cached module did not dequantize at all"
+    too_big = [n for n in seen if n >= M._BNB_MAX_QUANTIZE_NUMEL]
+    assert not too_big, (
+        f"the cached top-level module issued {len(too_big)} whole-stack call(s) of "
+        f"{too_big} weights; the sibling import did not resolve there"
+    )
+    assert tuple(out.shape) == tuple(value.shape)

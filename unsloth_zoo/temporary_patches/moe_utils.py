@@ -1669,12 +1669,20 @@ def _get_base_weight(param, target_dtype=None):
         # again on every backward recomputation. Slice it the same way the load
         # does; the helper returns None for everything smaller, which leaves the
         # single call below untouched.
+        # Absolute, like the dispatcher above and for the same reason: this file
+        # is also copied to unsloth_compiled_cache/moe_utils.py and imported as a
+        # top-level module, where a relative import of a sibling raises and the
+        # except below would quietly put an oversized stack back on the call that
+        # aborts. Only the import is guarded; a real failure inside must propagate.
         weight = None
         try:
-            from .moe_utils_bnb4bit import _dequantize_4bit_in_slices
-            weight = _dequantize_4bit_in_slices(param)
+            from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
+                _dequantize_4bit_in_slices,
+            )
         except ImportError:
-            pass
+            _dequantize_4bit_in_slices = None
+        if _dequantize_4bit_in_slices is not None:
+            weight = _dequantize_4bit_in_slices(param)
         if weight is None:
             weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
         original_shape = getattr(param, "_original_shape", None)
