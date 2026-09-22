@@ -45,6 +45,7 @@ from .pixtral import *
 from .ministral import *
 from .amd_aiter import *
 from .mxfp4 import *
+from .conversion_mapping_rescope import *
 from .bitsandbytes import *
 from .moe_utils_bnb4bit import *
 from .moe_experts_interface import *

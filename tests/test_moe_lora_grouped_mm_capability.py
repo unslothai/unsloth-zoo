@@ -644,3 +644,57 @@ def test_an_ordinary_backward_still_writes_in_place(unsupported):
     assert torch.is_grad_enabled()          # the caller's mode is irrelevant
     seen = _backward_matmul_out_usage(out, torch.ones_like(out))
     assert seen and all(seen), seen
+
+
+def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
+    """A box without CUDA must not be told the Triton grouped GEMM is available.
+
+    `_check_grouped_gemm_available` answered purely on whether
+    `unsloth.kernels.moe.grouped_gemm.interface` imports, but the kernel opens with
+    `assert X.device.type == "cuda"`. So on a CPU machine that happens to have unsloth
+    installed the probe said yes, `select_moe_backend` chose "unsloth_triton", and the
+    first expert forward died on "X and W must be on CUDA" rather than taking the
+    native loop. Importable is not usable; the sibling probe
+    `_check_torch_grouped_mm_supported` already refuses without an accelerator.
+
+    The kernel import is STUBBED to succeed. Without that this test passes on any host
+    that cannot import unsloth at all, which is most CI boxes and was how the first
+    version of it passed with the guard deleted: the ImportError arm returned False and
+    nothing about the device was ever exercised.
+    """
+    import sys, types
+
+    for name in (
+        "unsloth", "unsloth.kernels", "unsloth.kernels.moe",
+        "unsloth.kernels.moe.grouped_gemm", "unsloth.kernels.moe.grouped_gemm.interface",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    interface = sys.modules["unsloth.kernels.moe.grouped_gemm.interface"]
+    interface.grouped_gemm = lambda *a, **kw: None
+    interface.supports_tma = lambda *a, **kw: False
+    monkeypatch.setattr(M, "_init_triton_allocator", lambda *a, **kw: None, raising = False)
+
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_MOE_TRITON", raising = False)
+
+    # The stub really is importable, so a False below is about the device and nothing else.
+    monkeypatch.setattr(M.torch.cuda, "is_available", lambda: True)
+    assert M._check_grouped_gemm_available() is True
+
+    monkeypatch.setattr(M.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    assert M._check_grouped_gemm_available() is False
+
+    # And the selector then has to land somewhere that runs on this device.
+    # select_moe_backend is lru_cached: read it cold, or this asserts on whatever an
+    # earlier test selected, and clear it on the way out, or the "native_torch" it
+    # computes under these patches outlives them and every later test in the process
+    # skips the GPU backends.
+    monkeypatch.setattr(M, "_TORCH_GROUPED_MM_SUPPORTED", False, raising = False)
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    monkeypatch.delenv("UNSLOTH_MOE_BACKEND", raising = False)
+    M.select_moe_backend.cache_clear()
+    try:
+        assert M.select_moe_backend() == "native_torch"
+    finally:
+        M.select_moe_backend.cache_clear()

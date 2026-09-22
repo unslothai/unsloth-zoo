@@ -167,6 +167,11 @@ jobs:
         # MLXTrainer, exercising the PR 684 trainer rework end to end.
         run: python -m pytest tests/test_mlx_training_e2e_metal.py -v -rs
 
+      - name: tests/test_mlx_runtime_cce_compile.py
+        # The runtime CCE kernels under mx.compile. No other workflow runs this file,
+        # so without this step its Metal-only cases are never executed anywhere.
+        run: python -m pytest tests/test_mlx_runtime_cce_compile.py -v -rs
+
       - name: tests/test_mlx_generate.py
         # Batched-generation logic that needs no Metal but does need the mlx-vlm
         # import: release-protocol handling, prompt-kwarg splitting, stop-string
@@ -191,6 +196,10 @@ jobs:
         # refusal that keeps a drifted upstream on the native path. This job is the
         # only place the kernel runs, since the file needs real Metal.
         run: python -m pytest tests/test_mlx_decode_metal.py -v -rs
+
+      - name: tests/test_mlx_load_residency_metal.py
+        # A finished load must own its weights.
+        run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
 
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
