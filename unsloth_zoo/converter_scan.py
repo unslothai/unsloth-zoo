@@ -163,6 +163,24 @@ RE_UNVOUCHABLE_NETWORK = re.compile(
 )
 
 
+# Primitives that build a string, and so a host, out of view of the folding in
+# _literal_text: bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65")
+# .decode() is "https://evil.example" with no URL anywhere in the source for the
+# literal walk to read. Folding each of them would mean an evaluator; refusing
+# them costs nothing, because none appears anywhere in the real gguf-py or
+# conversion packages, and the allowance is for a file that names its
+# destination plainly, which none of these does.
+RE_UNVOUCHABLE_STRING_BUILD = re.compile(
+    r"\bfromhex\s*\("
+    r"|\bunhexlify\s*\("
+    r"|\bmaketrans\s*\("
+    r"|\.translate\s*\("
+    r"|\.to_bytes\s*\("
+    r"|\bcodecs\s*\.\s*(?:decode|encode)\b"
+    r"|\bbase64\s*\.\s*\w+\s*\(",
+)
+
+
 # The shape the allowance is actually for: a token-authenticated READ from the
 # hub. Anything else sent to a writable multi-tenant host is not obviously
 # benign, since a write-capable token can create a public repo there and use it
@@ -542,6 +560,9 @@ def _talks_only_to_the_model_hub(text):
     """
     if _matches(RE_UNVOUCHABLE_NETWORK, text):
         # A destination this allowance never looks at, so it cannot vouch for it.
+        return False
+    if _matches(RE_UNVOUCHABLE_STRING_BUILD, text):
+        # A destination decoded out of a constant is one this cannot read.
         return False
     if _matches(RE_WHOLE_ENV, text):
         # Reading the whole environment is not the token-authenticated download

