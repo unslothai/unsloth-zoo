@@ -562,6 +562,12 @@ def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, froz
         model.language_model.model.proj = adapter
         model.freeze()
         adapter.unfreeze(keys=["lora_a", "lora_b"])
+    # This file runs on the torch shim, whose Module.freeze/unfreeze are `return self`
+    # no-ops (tests/mlx_simulation/mlx_nn_stub.py), so trainable_parameters() still
+    # reports lm_head.weight and the setup above cannot be read back. Under real MLX the
+    # same model gives _is_lm_head_trainable() is False. Pin the derivation the loss
+    # actually uses, which is the wiring this test is about.
+    monkeypatch.setattr(U, "_is_lm_head_trainable", lambda _model: not frozen)
     factories = []
     monkeypatch.setattr(U, "_get_runtime_cce", lambda **kwargs: factories.append(kwargs))
     U.make_vlm_cce_loss_fn(model)

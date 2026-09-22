@@ -660,6 +660,11 @@ def test_runtime_cce_backward_peak_memory(quantized, budget_mib):
 @pytest.mark.parametrize("softcap", [0.0, 5.0])
 def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, softcap):
     _skip_torch_shim()
+    if not mx.metal.is_available():
+        # precompute_hidden_gradient is admitted only when the Metal kernels exist, so
+        # off Metal the loss-only path is returned and `calls == [1]` fails rather than
+        # skips. The silent fallback is the documented contract, not a defect.
+        pytest.skip("requires Metal kernels")
     from unsloth_zoo.mlx.cce import runtime_cce
 
     mx.random.seed(5)
