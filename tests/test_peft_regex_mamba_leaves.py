@@ -100,3 +100,39 @@ def test_explicit_target_modules_are_the_caller_s_decision():
 
 def test_model_without_config_is_untouched():
     assert _mamba_only_leaves(nn.Linear(2, 2)) == frozenset()
+
+
+class _Tower(nn.Module):
+    """A vision or audio attention block that owns an out_proj of its own."""
+    def __init__(self, dim):
+        super().__init__()
+        self.q_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+
+
+class _Wrapper(nn.Module):
+    def __init__(self, dim = 8):
+        super().__init__()
+        self.vision_model = nn.Module()
+        self.vision_model.encoder = nn.Module()
+        self.vision_model.encoder.layers = nn.ModuleList(nn.Module() for _ in range(2))
+        for layer in self.vision_model.encoder.layers:
+            layer.self_attn = _Tower(dim)
+        self.language_model = _Model("nemotron_h", dim = dim).model
+        self.config = SimpleNamespace(
+            model_type = "omni_wrapper",
+            llm_config = SimpleNamespace(model_type = "nemotron_h"),
+            _name_or_path = "test/wrapped-mamba",
+        )
+
+
+def test_nested_mamba_excludes_only_the_mixer_out_proj():
+    """A wrapper with a Mamba language model keeps the vision tower's out_proj: PEFT keys its
+    refusal off the outer model_type, and that tower feeds nothing to a fused kernel."""
+    model = _Wrapper()
+    regex = get_peft_regex(model, finetune_vision_layers = True, finetune_language_layers = True)
+    matched = _matched(model, regex)
+    assert "vision_model.encoder.layers.0.self_attn.out_proj" in matched
+    assert "vision_model.encoder.layers.1.self_attn.out_proj" in matched
+    assert not any(".mixer.out_proj" in n or ".mixer.conv1d" in n for n in matched), sorted(matched)
+    assert "language_model.layers.0.mixer.in_proj" in matched

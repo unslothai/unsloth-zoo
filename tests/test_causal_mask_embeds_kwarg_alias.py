@@ -137,3 +137,33 @@ def test_requires_grad_short_cut_reads_both_spellings(patched):
             cache_position = None, past_key_values = None,
         )
         assert out is mask
+
+
+def test_aliases_are_installed_with_compilation_disabled():
+    """UNSLOTH_COMPILE_DISABLE=1 is a supported setting; the patch used to return before
+    installing the aliases, so the remote-code call shapes failed there. One fresh
+    interpreter, because the flag is read at import."""
+    import subprocess, sys, os
+    code = (
+        "import os; os.environ['UNSLOTH_COMPILE_DISABLE'] = '1'\n"
+        "import torch\n"
+        "import unsloth_zoo\n"
+        "from unsloth_zoo.temporary_patches.misc import patch_transformers_masks\n"
+        "import transformers.masking_utils as mu\n"
+        "patch_transformers_masks()\n"
+        "assert hasattr(mu, '_unsloth_original_create_causal_mask')\n"
+        "import inspect\n"
+        "p = inspect.signature(mu._unsloth_original_create_causal_mask).parameters\n"
+        "name = 'inputs_embeds' if 'inputs_embeds' in p else 'input_embeds'\n"
+        "other = 'input_embeds' if name == 'inputs_embeds' else 'inputs_embeds'\n"
+        "from transformers import AutoConfig\n"
+        "config = AutoConfig.for_model('llama', num_hidden_layers = 1, hidden_size = 8, num_attention_heads = 2)\n"
+        "config._attn_implementation = 'sdpa'\n"
+        "kw = {other: torch.zeros(1, 4, 8), 'attention_mask': torch.ones(1, 4, dtype = torch.long),"
+        " 'cache_position': torch.arange(4), 'past_key_values': None, 'position_ids': torch.arange(4)[None]}\n"
+        "mu.create_causal_mask(config = config, **kw)\n"
+        "print('ALIAS_OK')\n"
+    )
+    env = dict(os.environ, UNSLOTH_COMPILE_DISABLE = "1")
+    out = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, env = env, timeout = 600)
+    assert "ALIAS_OK" in out.stdout, out.stdout[-2000:] + out.stderr[-2000:]

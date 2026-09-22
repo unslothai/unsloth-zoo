@@ -585,8 +585,9 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return
+    # Under UNSLOTH_COMPILE_DISABLE=1 `_torch_compile` is a no-op, so the builders stay eager;
+    # the keyword aliases and the multi-device offset fix below are still needed, since
+    # remote code calls the builders the same way whether or not anything is compiled.
     try:
         import transformers.masking_utils as masking_utils
         import transformers.generation.utils as generation_utils

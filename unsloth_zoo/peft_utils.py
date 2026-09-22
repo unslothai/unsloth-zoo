@@ -47,16 +47,20 @@ MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "
 MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
 
 
-def _mamba_only_leaves(model):
-    """The leaf names a LoRA adapter must not target on this model, or an empty set.
+# The attribute names Mamba families give their mixer, so a nested exclusion can be scoped
+# to the Mamba subtree: Mamba, Mamba2 and Nemotron-H use `mixer`, Falcon-H1, Bamba and Zamba2 `mamba`.
+MAMBA_MIXER_NAMES = ("mixer", "mamba")
 
-    Looks at the model's own model_type and at every nested config's (a
-    multimodal wrapper carries its Mamba language model in llm_config /
-    text_config), so a wrapped Nemotron-H answers the same as a bare one.
-    """
+
+def _mamba_scope(model):
+    """Where this model's Mamba mixers live: "root" (the model itself is a Mamba
+    family), "nested" (a multimodal wrapper carries one in llm_config /
+    text_config), or None."""
     config = getattr(model, "config", None)
     if config is None:
-        return frozenset()
+        return None
+    if str(getattr(config, "model_type", "") or "").lower() in MAMBA_MODEL_TYPES:
+        return "root"
     seen, stack = set(), [config]
     while stack:
         cfg = stack.pop()
@@ -65,11 +69,30 @@ def _mamba_only_leaves(model):
         seen.add(id(cfg))
         model_type = str(getattr(cfg, "model_type", "") or "").lower()
         if model_type in MAMBA_MODEL_TYPES:
-            return MAMBA_ONLY_LEAVES
+            return "nested"
         for value in list(vars(cfg).values()) if hasattr(cfg, "__dict__") else []:
             if hasattr(value, "model_type") and not isinstance(value, (str, int, float, bool)):
                 stack.append(value)
-    return frozenset()
+    return None
+
+
+def _mamba_only_leaves(model):
+    """The leaf names a LoRA adapter must not target on this model, or an empty set.
+
+    Looks at the model's own model_type and at every nested config's (a
+    multimodal wrapper carries its Mamba language model in llm_config /
+    text_config), so a wrapped Nemotron-H answers the same as a bare one.
+    """
+    return MAMBA_ONLY_LEAVES if _mamba_scope(model) else frozenset()
+
+
+def _mamba_subtree_exclusion(leaves):
+    """A lookahead that keeps `leaves` out of the Mamba mixers only, so a vision or
+    audio tower's own out_proj next to a nested Mamba language model stays a target."""
+    return (
+        r"(?!.*\.(?:" + "|".join(MAMBA_MIXER_NAMES) + r")\.(?:"
+        + "|".join(re.escape(x) for x in sorted(leaves)) + r")$)"
+    )
 
 
 # Skip some modules sensitive to quantization
@@ -157,15 +180,24 @@ def get_peft_regex(
     # conv1d straight to their fused kernels, so a LoRA wrapper on them never runs, and PEFT
     # (>= 0.17) refuses both names on these model types. Leave them out of the automatic targets;
     # an explicit target_modules list is the caller's decision.
+    mamba_nested_exclusion = None
     if target_modules is None:
-        mamba_leaves = _mamba_only_leaves(model)
+        mamba_scope = _mamba_scope(model)
+        mamba_leaves = MAMBA_ONLY_LEAVES if mamba_scope else frozenset()
         if mamba_leaves:
             dropped = [x for x in only_linear_modules if x in mamba_leaves]
-            only_linear_modules = [x for x in only_linear_modules if x not in mamba_leaves]
+            if mamba_scope == "root":
+                # PEFT refuses these leaf names anywhere on a Mamba model type.
+                only_linear_modules = [x for x in only_linear_modules if x not in mamba_leaves]
+            elif dropped:
+                # A wrapper: PEFT keys its refusal off the outer model_type, and a vision or audio
+                # tower may own an out_proj of its own, so exclude the Mamba subtree only.
+                mamba_nested_exclusion = _mamba_subtree_exclusion(mamba_leaves)
             if dropped:
                 logger.info(
-                    f"Unsloth: leaving {', '.join(dropped)} out of the LoRA targets: a Mamba mixer "
-                    "feeds them to its fused kernels, so an adapter on them would not train."
+                    f"Unsloth: leaving {', '.join(dropped)} out of the LoRA targets"
+                    + (" of the Mamba mixers" if mamba_scope == "nested" else "")
+                    + ": a Mamba mixer feeds them to its fused kernels, so an adapter on them would not train."
                 )
     pass
 
@@ -346,6 +378,8 @@ def get_peft_regex(
             f"Unsloth: No layers to finetune for {model.config._name_or_path}. Please file a bug report!"
         )
     pass
+    if mamba_nested_exclusion is not None:
+        regex_matcher = mamba_nested_exclusion + r"(?:" + regex_matcher + r")"
     return regex_matcher
 pass
 
