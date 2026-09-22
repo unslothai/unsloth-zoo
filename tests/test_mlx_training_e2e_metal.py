@@ -2245,7 +2245,8 @@ def test_cce_hidden_forward_preserves_wrapper_embeddings_and_image_mask():
 
 
 @metal_only
-def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatch):
+@pytest.mark.parametrize("media_key", ["pixel_values", "pixel_values_videos"])
+def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatch, media_key):
     calls = []
     factory = mlx_utils._get_runtime_cce
     def counted_factory(**kwargs):
@@ -2261,6 +2262,7 @@ def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatc
             super().__init__()
             self.model.encoder = nn.Identity()
         def __call__(self, ids, pixel_values=None, **kwargs):
+            pixel_values = kwargs.get("pixel_values_videos", pixel_values)
             h = self.model(ids)
             return self.lm_head(h if pixel_values is None else h + pixel_values)
         def get_input_embeddings(self, *args, **kwargs):
@@ -2271,7 +2273,7 @@ def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatc
     assert loss._unsloth_cce_backend == "runtime-cce"
     baseline = mlx_utils.make_vlm_baseline_loss_fn(model)
     for pixels in (None, mx.ones((2, 3, 64)), None):
-        batch = dict(input_ids=mx.array([[2, 3, 4], [7, 6, 5]]), pixel_values=pixels)
+        batch = dict(input_ids=mx.array([[2, 3, 4], [7, 6, 5]]), **{media_key: pixels})
         before = len(calls)
         actual, ntoks = loss(model, batch)
         expected, expected_ntoks = baseline(model, batch)

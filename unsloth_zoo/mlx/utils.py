@@ -4377,8 +4377,10 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
 
         def loss_fn(model, batch_dict):
             nonlocal noticed_media_fallback
-            if (batch_dict.get("pixel_values") is not None
-                    or _vlm_batch_carries_audio(batch_dict)):
+            if (any(
+                    batch_dict.get(key) is not None
+                    for key in ("pixel_values", "pixel_values_videos")
+                ) or _vlm_batch_carries_audio(batch_dict)):
                 if not noticed_media_fallback:
                     print("Unsloth: CCE backbone cannot accept multimodal embeddings; using standard cross-entropy for media batches.")
                     noticed_media_fallback = True
