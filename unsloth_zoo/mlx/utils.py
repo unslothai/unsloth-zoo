@@ -940,6 +940,23 @@ def _get_text_backbone(model):
     return getattr(tm, "model", None)
 
 
+def _get_encoder_decoder_backbone(model):
+    tm = _get_text_model(model)
+    backbone = getattr(model, "model", None)
+    if (getattr(tm, "_parent", None) is model
+            and callable(getattr(backbone, "encoder", None))
+            and getattr(backbone, "decoder", None) is getattr(tm, "model", None)):
+        return backbone
+    return None
+
+
+def _get_output_transform_owner(model):
+    # A non-owning decoder view omits the parent's post-projection transforms.
+    if _get_encoder_decoder_backbone(model) is not None:
+        return model
+    return _get_text_model(model)
+
+
 def _validate_output_token_mask(model):
     tm = _get_text_model(model)
     ids = getattr(tm, "_dummy_tokenizer_ids", None)
@@ -1432,6 +1449,10 @@ def _has_direct_hidden_stack(model):
 
 def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     """Run a text stack up to pre-lm_head hidden states for CCE."""
+    composite = _get_encoder_decoder_backbone(model)
+    if composite is not None:
+        hidden, _ = composite(inputs, **_filter_backbone_kwargs(composite, kwargs))
+        return hidden
     tm = _get_text_model(model)
     if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
             and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
@@ -1782,7 +1803,7 @@ def _is_quantized_layer(layer):
 
 def _get_logit_softcap(model):
     """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     softcap = getattr(tm, "final_logit_softcapping", None)
     if softcap is None and hasattr(tm, "args"):
         softcap = getattr(tm.args, "final_logit_softcapping", None)
@@ -1798,7 +1819,7 @@ def _get_logit_scale(model):
     ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
     bool/non-scalar/non-finite/out-of-range values (callers must fall back).
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
     # then config (aya_vision); no upstream forward reads a direct attribute.
     scale = None
@@ -1895,7 +1916,7 @@ def _detect_logit_softcap(model):
     mean no cap, a positive finite real caps, anything else (or both attrs
     present) fails closed rather than dropping the cap.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Presence, not value: an explicitly-None legacy attr still makes the
     # dual-attr combination unverified.
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
@@ -1940,7 +1961,7 @@ def _detect_head_transform(model, head_status):
     no-op case; accepted scales obey the ``_get_logit_scale`` range.
     ``head_status`` selects branch-conditional transforms as the forwards do.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     present = {}
     for name, sites in _HEAD_TRANSFORM_KNOBS.items():
         value, conflict = _knob_value(tm, name, sites)
@@ -3081,16 +3102,25 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     _apply_static_vlm_metadata(model, batch_dict, extra_kwargs)
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
 
-    embed_result = model.get_input_embeddings(
-        inputs,
-        pixel_values,
-        mask=fwd_attn_mask,
-        **extra_kwargs,
-    )
-    merged_embeds, backbone_kwargs = _unpack_embed_result(
-        embed_result, model, input_ids=inputs, attention_mask=attention_mask,
-    )
-    merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
+    backbone = _get_text_backbone(model)
+    if (_get_encoder_decoder_backbone(model) is not None
+            or (backbone is not None and _get_backbone_embed_kwarg(backbone) is None)):
+        merged_embeds = None
+        backbone_kwargs = dict(extra_kwargs, pixel_values=pixel_values)
+        backbone_kwargs["mask"] = (
+            fwd_attn_mask if _keeps_forwarded_mask(model) else None
+        )
+    else:
+        embed_result = model.get_input_embeddings(
+            inputs,
+            pixel_values,
+            mask=fwd_attn_mask,
+            **extra_kwargs,
+        )
+        merged_embeds, backbone_kwargs = _unpack_embed_result(
+            embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+        )
+        merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
@@ -4212,9 +4242,10 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         return _marked_vlm_baseline()
 
     backbone = getattr(tm, "model", None)
-    if backbone is not None and _get_backbone_embed_kwarg(backbone) is None:
-        print("Unsloth: CCE backbone has no explicit embedding argument; using standard cross-entropy.")
-        return _marked_vlm_baseline()
+    token_ids_only = (
+        backbone is not None and _get_backbone_embed_kwarg(backbone) is None
+        and _get_encoder_decoder_backbone(model) is None
+    )
 
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
@@ -4338,6 +4369,21 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
             loss = rt_cce(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
+
+    if token_ids_only:
+        cce_loss_fn = loss_fn
+        baseline_loss_fn = _marked_vlm_baseline()
+        noticed_media_fallback = False
+
+        def loss_fn(model, batch_dict):
+            nonlocal noticed_media_fallback
+            if (batch_dict.get("pixel_values") is not None
+                    or _vlm_batch_carries_audio(batch_dict)):
+                if not noticed_media_fallback:
+                    print("Unsloth: CCE backbone cannot accept multimodal embeddings; using standard cross-entropy for media batches.")
+                    noticed_media_fallback = True
+                return baseline_loss_fn(model, batch_dict)
+            return cce_loss_fn(model, batch_dict)
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192

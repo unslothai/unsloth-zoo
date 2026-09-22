@@ -2245,13 +2245,40 @@ def test_cce_hidden_forward_preserves_wrapper_embeddings_and_image_mask():
 
 
 @metal_only
-def test_cce_embedding_signature_falls_back_before_loss(capsys):
-    model = _cce_text_model(32, 64, quantized=False)
-    model.get_input_embeddings = lambda ids, pixels, **kw: model.model.embed_tokens(ids)
+def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatch):
+    calls = []
+    factory = mlx_utils._get_runtime_cce
+    def counted_factory(**kwargs):
+        runtime = factory(**kwargs)
+        def run(*args):
+            calls.append(True)
+            return runtime(*args)
+        return run
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", counted_factory)
+    base = _cce_text_model(32, 64, quantized=False)
+    class Model(type(base)):
+        def __init__(self):
+            super().__init__()
+            self.model.encoder = nn.Identity()
+        def __call__(self, ids, pixel_values=None, **kwargs):
+            h = self.model(ids)
+            return self.lm_head(h if pixel_values is None else h + pixel_values)
+        def get_input_embeddings(self, *args, **kwargs):
+            pytest.fail("token-ID CCE must not request merged embeddings")
+    model = Model()
     assert mlx_utils._get_backbone_embed_kwarg(model.model) is None
     loss = mlx_utils.make_vlm_cce_loss_fn(model)
-    assert loss._unsloth_cce_backend == "baseline-fallback"
-    assert "no explicit embedding argument" in capsys.readouterr().out
+    assert loss._unsloth_cce_backend == "runtime-cce"
+    baseline = mlx_utils.make_vlm_baseline_loss_fn(model)
+    for pixels in (None, mx.ones((2, 3, 64)), None):
+        batch = dict(input_ids=mx.array([[2, 3, 4], [7, 6, 5]]), pixel_values=pixels)
+        before = len(calls)
+        actual, ntoks = loss(model, batch)
+        expected, expected_ntoks = baseline(model, batch)
+        assert mx.allclose(actual, expected, atol=1e-5).item()
+        assert ntoks.item() == expected_ntoks.item() == 4
+        assert len(calls) - before == int(pixels is None)
+    assert capsys.readouterr().out.count("cannot accept multimodal embeddings") == 1
 
     class Alias:
         def __call__(self, ids, input_embeddings=None):
@@ -2265,6 +2292,37 @@ def test_cce_embedding_signature_falls_back_before_loss(capsys):
     assert mlx_utils._get_backbone_embed_kwarg(Alias()) == "input_embeddings"
     assert mlx_utils._get_backbone_embed_kwarg(Unknown()) is None
     assert mlx_utils._get_backbone_embed_kwarg(Positional()) is None
+
+
+@metal_only
+@pytest.mark.parametrize("conditioning", ["self_conditioning_logits", "self_conditioning_embeddings"])
+def test_encoder_decoder_cce_matches_full_forward_and_gradients(conditioning, request):
+    mlx_utils.acquire_mlx_training_patches()
+    request.addfinalizer(mlx_utils.release_mlx_training_patches)
+    config = pytest.importorskip("mlx_vlm.models.diffusion_gemma.config")
+    module = pytest.importorskip("mlx_vlm.models.diffusion_gemma.diffusion_gemma")
+    model = module.Model(config.ModelConfig(canvas_length=4, text_config=config.TextConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        num_global_key_value_heads=1, head_dim=32, global_head_dim=32,
+        num_experts=2, top_k_experts=1, final_logit_softcapping=0.5,
+        layer_types=["sliding_attention", "full_attention"],
+    )))
+    cce = mlx_utils.make_vlm_cce_loss_fn(model, ignore_token_ids=[])
+    assert cce._unsloth_cce_backend == "runtime-cce"
+    ce = mlx_utils.make_vlm_baseline_loss_fn(model, ignore_token_ids=[])
+    for rows in ([[2, 3, 4, 5], [6, 7, 8, 9]], [[9, 8, 7, 6], [5, 4, 3, 2]]):
+        ids = mx.array(rows)
+        batch = dict(input_ids=ids, labels=mx.where(ids % 3 == 0, -100, ids),
+                     attention_mask=mx.ones_like(ids), canvas_ids=ids[:, ::-1],
+                     decoder_attention_mask=mx.ones((2, 8), dtype=mx.bool_))
+        batch[conditioning] = mx.random.normal((2, 4, 64)) * 0.1
+        (expected, n1), g1 = nn.value_and_grad(model, ce)(model, batch)
+        (actual, n2), g2 = nn.value_and_grad(model, cce)(model, batch)
+        assert n1.item() == n2.item()
+        assert mx.allclose(actual, expected, atol=1e-5).item()
+        for (name, a), (_, b) in zip(tree_flatten(g1), tree_flatten(g2)):
+            assert mx.allclose(a, b, atol=2e-5, rtol=2e-3).item(), name
 
 
 @metal_only
