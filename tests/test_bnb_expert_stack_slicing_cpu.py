@@ -16,23 +16,14 @@
 
 """The expert-stack slicing arithmetic, without CUDA and without bitsandbytes.
 
-test_bnb_expert_stack_slicing.py needs both, so on a runner with neither it
-reports "skipped" for every test, and a per-OS CI leg made of nothing but skips
-is green while answering nothing. What the fix actually consists of is
-arithmetic -- how many experts fit under the element cap, where the packed
-bytes and the absmax blocks are cut, which layouts must be declined rather than
-split -- and none of that needs a GPU.
-
-So this drives the same two functions against a bitsandbytes stand-in that
-models the 4-bit contract exactly: whole blocks, one absmax per block, two
-weights per byte of the storage dtype. Two properties make it a real test
-rather than a re-implementation. The stand-in RECORDS the element count of
-every call, so "no single call went over the cap" is measured instead of
-assumed; and the sliced result is compared byte for byte against one unsliced
-call, so any mistake in the splice shows up as inequality rather than as
-plausible-looking numbers.
-
-The real-hardware equivalents live in test_bnb_expert_stack_slicing.py.
+The hardware equivalents in test_bnb_expert_stack_slicing.py skip entirely on a
+runner with neither, which made a per-OS CI leg green that answered nothing.
+The fix is integer arithmetic, so it is testable against a bitsandbytes
+stand-in modelling the 4-bit contract: whole blocks, one absmax per block, two
+weights per byte of the storage dtype. What keeps this a test rather than a
+re-implementation: the stand-in records every call's element count, so the cap
+is measured, and the sliced result is compared byte for byte with one unsliced
+call, so a bad splice is inequality rather than plausible numbers.
 """
 from __future__ import annotations
 
@@ -43,9 +34,8 @@ import types
 import pytest
 import torch
 
-# Lowered cap. The real one is 2**31, and a stack that crosses it is 12 GiB of
-# bfloat16, so every test here scales the threshold down instead and exercises
-# the identical integer arithmetic.
+# Lowered cap: the real 2**31 needs a 12 GiB bfloat16 stack, and the integer
+# arithmetic under test is identical either way.
 SMALL_CAP = 4096
 BLOCKSIZE = 64
 
@@ -84,12 +74,9 @@ class _Params4bit(torch.Tensor):
 
 
 class _Recorder:
-    """Every element count handed to the quantize and dequantize kernels.
-
-    This is the whole point: bitsandbytes does not raise on an oversized call,
-    it aborts the process inside the CUDA kernel, so the only thing a test can
-    assert without a GPU is that no such call is ever made.
-    """
+    """Every element count handed to the kernels. bitsandbytes aborts the
+    process rather than raising, so "it was never asked" is the only assertion
+    available without a GPU."""
 
     def __init__(self):
         self.quantize = []
@@ -169,14 +156,10 @@ def _install_fake_bitsandbytes(monkeypatch):
 
 @pytest.fixture
 def M(monkeypatch):
-    """A private copy of moe_utils_bnb4bit bound to the stand-in.
-
-    Loaded under its own module name rather than reloaded in place: the real
-    module may already be imported and bound to the real bitsandbytes, and
-    reloading it would hand a test double to every other test in the session.
-    The name keeps the package prefix so the module's relative imports
-    (`from .common import ...`) still resolve.
-    """
+    """A private copy of moe_utils_bnb4bit bound to the stand-in. Loaded under
+    its own name rather than reloaded, which would hand a test double to every
+    other test in the session; the package prefix keeps `from .common import`
+    resolving."""
     _install_fake_bitsandbytes(monkeypatch)
     real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
 
@@ -203,8 +186,7 @@ def _stack(experts = 8, out = 16, inp = 64, dtype = torch.bfloat16):
 # ---------------------------------------------------------------------------
 
 def test_no_single_quantize_call_exceeds_the_cap(M):
-    """bitsandbytes aborts the process rather than raising, so the only thing
-    worth asserting is that it is never asked."""
+    """bitsandbytes aborts rather than raising, so "never asked" is the test."""
     value = _stack(experts = 8)           # 8192 elements, twice SMALL_CAP
     assert value.numel() > SMALL_CAP
 
@@ -220,9 +202,7 @@ def test_no_single_quantize_call_exceeds_the_cap(M):
 
 
 def test_the_slice_is_the_largest_that_fits(M):
-    """Correctness alone is satisfied by one expert per call; that would be
-    hundreds of kernel launches at load. experts_per_slice must be the largest
-    count whose element total stays under the cap."""
+    """One expert per call is also correct, and hundreds of launches at load."""
     value = _stack(experts = 8)
     per_expert = value[0].numel()
     expected_per_slice = (SMALL_CAP - 1) // per_expert
@@ -250,9 +230,8 @@ def test_sliced_quantization_is_byte_identical_to_one_call(M):
 
 
 def test_sliced_quantization_does_not_nest_absmax(M):
-    """Double quantization nests absmax per call and nested states from
-    separate calls do not concatenate, so the sliced path must keep them flat
-    whatever the caller asked for."""
+    """Nested absmax states from separate calls do not concatenate, so the
+    sliced path keeps them flat whatever the caller asked for."""
     param = M._quantize_expert_stack_in_slices(
         _stack(experts = 8), blocksize = BLOCKSIZE, quant_type = "nf4",
     )
@@ -261,8 +240,7 @@ def test_sliced_quantization_does_not_nest_absmax(M):
 
 
 def test_module_is_set_on_the_sliced_param(M):
-    """Params4bit.__torch_function__ reads .module on torch.chunk/torch.split,
-    so an unset one makes a sliced stack raise where an unsliced one shards."""
+    """Params4bit.__torch_function__ reads .module on torch.chunk/split."""
     owner = object()
     param = M._quantize_expert_stack_in_slices(
         _stack(experts = 8), blocksize = BLOCKSIZE, quant_type = "nf4", module = owner,
@@ -320,8 +298,8 @@ def test_declines_when_one_expert_alone_is_over_the_cap(M, monkeypatch):
 
 
 def test_declines_a_storage_dtype_the_slice_does_not_divide(M):
-    """quant_storage may be float32, which is 8 weights per element. A slice
-    that is not a whole number of storage elements cannot be concatenated."""
+    """float32 storage is 8 weights per element; a slice that is not a whole
+    number of them cannot be concatenated."""
     # 4 per expert: a whole number of bytes (2 weights each) but not of float32
     # elements (8 weights each).
     value = torch.zeros(8, 2, 2, dtype = torch.bfloat16)
@@ -331,8 +309,7 @@ def test_declines_a_storage_dtype_the_slice_does_not_divide(M):
 
 
 def test_a_dividing_storage_dtype_is_honoured(M):
-    """FSDP asks for a floating point parameter storage dtype and silently
-    handing back uint8 breaks the wrap it asked for."""
+    """FSDP asks for a float storage dtype; uint8 breaks the wrap it asked for."""
     value = _stack(experts = 8)
     param = M._quantize_expert_stack_in_slices(
         value, blocksize = BLOCKSIZE, quant_type = "nf4", quant_storage = torch.float32,
@@ -374,10 +351,8 @@ def test_no_single_dequantize_call_exceeds_the_cap(M):
 
 
 def test_dequant_slices_in_storage_elements_not_bytes(M):
-    """The trap this guards: with a float32 quant_storage one packed element
-    covers eight weights, so a slice offset computed in bytes starts four times
-    too far in and every slice after the first reads the wrong data. uint8
-    hides it because the two units coincide."""
+    """A byte-computed offset starts four times too far in under float32
+    storage. uint8 hides this, because there the two units coincide."""
     value = _stack(experts = 8)
     param = _quantized(M, value, quant_storage = torch.float32)
     assert param.data.element_size() == 4
@@ -388,8 +363,7 @@ def test_dequant_slices_in_storage_elements_not_bytes(M):
 
 
 def test_dequant_declines_below_the_cap(M):
-    """Under the cap the single call is untouched, so the sliced reader must
-    hand the decision back rather than take a path nothing needs."""
+    """Under the cap the single call must stay untouched."""
     value = _stack(experts = 1)
     assert value.numel() < SMALL_CAP
     param = _quantized(M, value)
@@ -419,9 +393,8 @@ def test_dequant_preserves_the_logical_shape_and_dtype(M):
 
 
 def test_round_trip_through_both_sliced_paths(M):
-    """Quantize sliced, read back sliced. NF4 on unit-normal data lands well
-    under 0.1 mean absolute error, so this catches a mangled layout rather than
-    quantization drift."""
+    """NF4 on unit-normal data lands well under 0.1, so this catches a mangled
+    layout rather than quantization drift."""
     value = _stack(experts = 8)
     param = _quantized(M, value)
     back = M._dequantize_4bit_in_slices(param).float()
