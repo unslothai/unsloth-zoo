@@ -44,35 +44,55 @@ EXPERT_NAMES = [
 ]
 
 
+def _should_convert_module():
+    """transformers' own matcher, or a skip.
+
+    `quantizers_utils` exists on transformers 4.x too, so importorskip on the
+    module resolves there and the attribute access then raises AttributeError:
+    `should_convert_module` first ships in transformers 5.0. Gate on the symbol.
+    """
+    module = pytest.importorskip("transformers.quantizers.quantizers_utils")
+    function = getattr(module, "should_convert_module", None)
+    if function is None:
+        pytest.skip("transformers < 5.0 has no should_convert_module")
+    return function
+
+
 def test_moe_gate_is_in_the_skip_list():
     assert "moe.gate" in SKIP_QUANTIZATION_MODULES
 
 
 @pytest.mark.parametrize("name", ROUTER_NAMES)
 def test_router_under_moe_block_is_skipped(name):
-    should_convert_module = pytest.importorskip(
-        "transformers.quantizers.quantizers_utils"
-    ).should_convert_module
+    should_convert_module = _should_convert_module()
     assert not should_convert_module(name, SKIP_QUANTIZATION_MODULES), name
 
 
 @pytest.mark.parametrize("name", EXPERT_NAMES)
 def test_neighbouring_projections_still_convert(name):
-    should_convert_module = pytest.importorskip(
-        "transformers.quantizers.quantizers_utils"
-    ).should_convert_module
+    should_convert_module = _should_convert_module()
     assert should_convert_module(name, SKIP_QUANTIZATION_MODULES), name
 
 
-def test_legacy_segment_match_agrees():
-    """transformers 4.57 matched `key + "."` inside `full_name + "."`; the new
-    entry must behave the same there: the router hits, gate_proj does not."""
+def test_legacy_match_reaches_no_router_and_no_expert():
+    """What transformers 4.x really does with this entry.
+
+    `_replace_with_bnb_linear` there tests `(key + "." in current_key_name_str)
+    or (key == current_key_name_str)` on the UNPADDED path, so a pattern can
+    only match something BELOW the key, never a leaf: `moe.gate` does not reach
+    `model.layers.3.moe.gate`, exactly as the pre-existing `mlp.gate` and
+    `block_sparse_moe.gate` entries do not. The entry is inert on 4.x and the
+    router is still quantized there; what matters is that it is inert in the
+    SAFE direction, i.e. it never captures an expert or attention projection.
+    Copied from transformers 4.57.6 integrations/bitsandbytes.py."""
     def legacy_skip(full_name, keys):
-        padded = full_name + "."
-        return any((key + "." in padded) or (key == full_name) for key in keys)
+        return any((key + "." in full_name) or (key == full_name) for key in keys)
 
     for name in ROUTER_NAMES:
-        assert legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
+        if name == "moe.gate":   # a root-level router is an exact-equality hit
+            assert legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
+        else:
+            assert not legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
     for name in EXPERT_NAMES:
         assert not legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
 
@@ -111,6 +131,7 @@ class _Model(nn.Module):
 
 
 def test_replace_with_bnb_linear_leaves_the_router_alone():
+    _should_convert_module()   # the entry only reaches a leaf on transformers >= 5.0
     bnb = pytest.importorskip("bitsandbytes")
     integrations = pytest.importorskip("transformers.integrations.bitsandbytes")
     from transformers import BitsAndBytesConfig
