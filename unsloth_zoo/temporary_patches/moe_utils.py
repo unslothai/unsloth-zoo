@@ -3349,24 +3349,23 @@ def patch_param_wrapper_for_moe():
 # UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
 
 
-@lru_cache(maxsize=1)
-def _moe_triton_combine_enabled() -> bool:
-    """Whether the fused Triton combine (weighted_unpermute) may be used. It is
-    always safe to answer False: the eager reduction is kept as the fallback."""
-    try:
-        from unsloth_zoo.temporary_patches.moe_triton_kernels import moe_triton_kernels_available
-    except ImportError:
-        return False
-    return moe_triton_kernels_available()
+_WEIGHTED_UNPERMUTE = None
 
 
 def weighted_unpermute(*args, **kwargs):
-    """Fused combine; returns None (caller falls back) when Triton is unavailable."""
-    try:
-        from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
-    except ImportError:
+    """Fused Triton combine; None (caller falls back to the eager reduction) when
+    the kernel module or the Triton path is unavailable. Absolute import: this
+    file is also copied into unsloth_compiled_cache and imported top-level."""
+    global _WEIGHTED_UNPERMUTE
+    if _WEIGHTED_UNPERMUTE is None:
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
+        except ImportError:
+            _wu = False
+        _WEIGHTED_UNPERMUTE = _wu
+    if _WEIGHTED_UNPERMUTE is False:
         return None
-    return _wu(*args, **kwargs)
+    return _WEIGHTED_UNPERMUTE(*args, **kwargs)
 
 
 def _moe_gategrad_enabled() -> bool:
@@ -3737,16 +3736,14 @@ def forward_native_grouped_mm(
     # One fused pass (weights applied and the top_k slots of each token summed in
     # fp32, rounded once) where Triton is available; otherwise the eager spelling,
     # which promotes the whole permuted output to the router dtype first.
-    final_hidden_states = None
-    if _moe_triton_combine_enabled():
-        final_hidden_states = weighted_unpermute(
-            mm2_out,
-            sorted_indices,
-            permuted_weights,
-            batch_size * sequence_length,
-            top_k_index.shape[-1],
-            out_dtype = hidden_states.dtype,
-        )
+    final_hidden_states = weighted_unpermute(
+        mm2_out,
+        sorted_indices,
+        permuted_weights,
+        batch_size * sequence_length,
+        top_k_index.shape[-1],
+        out_dtype = hidden_states.dtype,
+    )
     if final_hidden_states is None:
         mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
         final_hidden_states = combine_permuted_moe_outputs(

@@ -25,15 +25,25 @@ nf4_dequant_triton
 weighted_unpermute
     The MoE combine: out[t] = sum_k w[slot(t, k)] * Y[slot(t, k)] accumulated in
     fp32 and rounded once to out_dtype, with a matching backward, no atomics and
-    a fixed reduction order. Replaces the fp32 routing-weight multiply of the
-    whole permuted output, the fp32 gather through the inverse permutation, the
-    sum over top_k and the cast (four full passes over a [tokens * top_k, hidden]
-    fp32 buffer, plus the same again in backward).
+    a fixed reduction order. Replaces the routing-weight multiply of the whole
+    permuted output, the gather through the inverse permutation, the sum over
+    top_k and the cast (four full passes over a [tokens * top_k, hidden] buffer,
+    plus the same again in backward).
+
+Both kernels are launched with enable_fp_fusion=False: the eager paths they
+replace materialise every product before adding it (two roundings), and a
+contracted fma would round once and drift. That flag is honoured by the CUDA and
+the HIP backend alike, unlike libdevice's mul_rn/add_rn which the HIP backend
+does not ship, so the kernels compile on ROCm too.
 
 Both are used only when a CUDA/ROCm device and Triton are available and
-UNSLOTH_MOE_TRITON_KERNELS is not "0"; every caller keeps its eager path.
+UNSLOTH_MOE_TRITON_KERNELS is not "0"; every caller keeps its eager path. If a
+launch ever fails (a Triton build without a working compiler, an unsupported
+backend), the kernels switch themselves off for the process with one warning
+and the caller falls back, rather than taking the training run down.
 """
 import os
+import logging
 import torch
 
 __all__ = [
@@ -42,15 +52,20 @@ __all__ = [
     "weighted_unpermute",
 ]
 
-_TRITON = None
+logger = logging.getLogger(__name__)
+
+_TRITON = None          # None: not probed yet; True/False: importable on a CUDA/ROCm device
+_DISABLED_REASON = None # set on the first failed launch; everything falls back afterwards
+_K = None               # compiled kernels, built on first use
 
 
 def moe_triton_kernels_available(device = None) -> bool:
-    """Triton importable, an accelerator Triton can target, and not disabled."""
+    """Triton importable, an accelerator Triton can target, not disabled, and no
+    launch has failed in this process."""
     global _TRITON
-    if os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
+    if _DISABLED_REASON is not None or os.environ.get("UNSLOTH_MOE_TRITON_KERNELS", "1") == "0":
         return False
-    if device is not None and getattr(device, "type", None) not in ("cuda",):
+    if device is not None and getattr(device, "type", None) != "cuda":
         return False
     if _TRITON is None:
         try:
@@ -62,122 +77,125 @@ def moe_triton_kernels_available(device = None) -> bool:
     return _TRITON
 
 
-if True:  # kernels are defined lazily so an import never needs Triton
-    def _kernels():
-        import triton
-        import triton.language as tl
-        from triton.language.extra import libdevice
+def _disable(where, exc):
+    """Switch the kernels off for the rest of the process after a failed launch."""
+    global _DISABLED_REASON
+    _DISABLED_REASON = f"{where}: {type(exc).__name__}: {exc}"
+    logger.warning(
+        "Unsloth: the Triton MoE kernels failed to compile or launch and are disabled "
+        "for this process; the bitsandbytes / eager path is used instead. "
+        f"Set UNSLOTH_MOE_TRITON_KERNELS=0 to silence this. Reason: {_DISABLED_REASON}"
+    )
 
-        @triton.jit
-        def _nf4_dequant_kernel(
-            q_ptr, out_ptr, code_ptr,
-            absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr,
-            n_bytes,
-            NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr,
-        ):
-            pid = tl.program_id(0).to(tl.int64)
-            offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-            mask = offs < n_bytes
-            qw = tl.load(q_ptr + offs, mask = mask, other = 0)
-            blk = offs // 32                      # 64 elements = 32 bytes per absmax block
-            if NESTED:
-                aq = tl.load(absmax_ptr + blk, mask = mask, other = 0).to(tl.int32)
-                am = tl.load(code2_ptr + aq)
-                am2 = tl.load(absmax2_ptr + blk // BLOCKSIZE2, mask = mask, other = 0.0).to(tl.float32)
-                # bitsandbytes dequantizes the absmax as a separate blockwise
-                # multiply and then adds the offset: two roundings. Keep both
-                # (no fma contraction) so the fp32 output is bit-identical.
-                am = libdevice.add_rn(libdevice.mul_rn(am, am2), tl.load(offset_ptr).to(tl.float32))
+
+def _kernels():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _nf4_dequant_kernel(
+        q_ptr, out_ptr, code_ptr,
+        absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr,
+        n_bytes,
+        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0).to(tl.int64)
+        offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        mask = offs < n_bytes
+        qw = tl.load(q_ptr + offs, mask = mask, other = 0)
+        blk = offs // 32                      # 64 elements = 32 bytes per absmax block
+        if NESTED:
+            aq = tl.load(absmax_ptr + blk, mask = mask, other = 0).to(tl.int32)
+            am2 = tl.load(absmax2_ptr + blk // BLOCKSIZE2, mask = mask, other = 0.0).to(tl.float32)
+            # bitsandbytes dequantizes the absmax as a blockwise multiply and then
+            # adds the offset: two roundings (fp fusion is off for this kernel).
+            am = tl.load(code2_ptr + aq) * am2 + tl.load(offset_ptr).to(tl.float32)
+        else:
+            am = tl.load(absmax_ptr + blk, mask = mask, other = 0.0).to(tl.float32)
+        hi = (qw >> 4).to(tl.int32)
+        lo = (qw & 15).to(tl.int32)
+        vh = (tl.load(code_ptr + hi) * am).to(out_ptr.dtype.element_ty)
+        vl = (tl.load(code_ptr + lo) * am).to(out_ptr.dtype.element_ty)
+        w = tl.reshape(tl.join(vh, vl), (2 * BLOCK,))
+        offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK).to(tl.int64)
+        tl.store(out_ptr + offs2, w, mask = offs2 < 2 * n_bytes)
+
+    @triton.jit
+    def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,
+                            BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):
+        # A tile of BLOCK_T tokens by BLOCK_H hidden columns per program: the
+        # per-token loads then coalesce across the tile instead of one token
+        # per program (measured 0.074 -> 0.04 ms on 2048 x 8 x 2816).
+        pid_t = tl.program_id(0).to(tl.int64)
+        hb = tl.program_id(1)
+        offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
+        t_mask = offs_t < T
+        offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+        # torch.sum over the top_k axis (the eager path) accumulates with four
+        # interleaved partial sums, acc[k % 4] += p_k, then ((a0 + a1) + a2) + a3.
+        # Same order here, so the fp32 result and its single rounding are
+        # bit-identical to the eager combine for any top_k.
+        acc0 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
+        acc1 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
+        acc2 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
+        acc3 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
+        for k in tl.static_range(TOPK):
+            slot = tl.load(inv_ptr + offs_t * TOPK + k, mask = t_mask, other = 0).to(tl.int64)
+            wk = tl.load(w_ptr + slot, mask = t_mask, other = 0.0).to(tl.float32)
+            y = tl.load(y_ptr + slot[:, None] * H + offs_h[None, :], mask = t_mask[:, None] & h_mask[None, :], other = 0.0)
+            p = wk[:, None] * y.to(tl.float32)
+            if ROUND_PRODUCT:
+                # A low-precision router multiplies in the activation dtype in
+                # the eager path; match that rounding, then sum in fp32.
+                p = p.to(y_ptr.dtype.element_ty).to(tl.float32)
+            if k % 4 == 0:
+                acc0 += p
+            elif k % 4 == 1:
+                acc1 += p
+            elif k % 4 == 2:
+                acc2 += p
             else:
-                am = tl.load(absmax_ptr + blk, mask = mask, other = 0.0).to(tl.float32)
-            hi = (qw >> 4).to(tl.int32)
-            lo = (qw & 15).to(tl.int32)
-            vh = (tl.load(code_ptr + hi) * am).to(out_ptr.dtype.element_ty)
-            vl = (tl.load(code_ptr + lo) * am).to(out_ptr.dtype.element_ty)
-            w = tl.reshape(tl.join(vh, vl), (2 * BLOCK,))
-            offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK).to(tl.int64)
-            tl.store(out_ptr + offs2, w, mask = offs2 < 2 * n_bytes)
+                acc3 += p
+        acc = ((acc0 + acc1) + acc2) + acc3
+        tl.store(out_ptr + offs_t[:, None] * H + offs_h[None, :], acc.to(out_ptr.dtype.element_ty),
+                 mask = t_mask[:, None] & h_mask[None, :])
 
-        @triton.jit
-        def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,
-                                BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):
-            # A tile of BLOCK_T tokens by BLOCK_H hidden columns per program: the
-            # per-token loads then coalesce across the tile instead of one token
-            # per program (measured 0.074 -> 0.04 ms on 2048 x 8 x 2816).
-            pid_t = tl.program_id(0).to(tl.int64)
-            hb = tl.program_id(1)
-            offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
-            t_mask = offs_t < T
+    @triton.jit
+    def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,
+                               BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):
+        pid = tl.program_id(0).to(tl.int64)
+        hb = tl.program_id(1)
+        offs_i = pid * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
+        i_mask = offs_i < N
+        offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
+        h_mask = offs_h < H
+        t = tl.load(sorted_ptr + offs_i, mask = i_mask, other = 0).to(tl.int64) // TOPK
+        wk = tl.load(w_ptr + offs_i, mask = i_mask, other = 0.0).to(tl.float32)
+        g = tl.load(dout_ptr + t[:, None] * H + offs_h[None, :], mask = i_mask[:, None] & h_mask[None, :], other = 0.0).to(tl.float32)
+        tl.store(dy_ptr + offs_i[:, None] * H + offs_h[None, :], (wk[:, None] * g).to(dy_ptr.dtype.element_ty),
+                 mask = i_mask[:, None] & h_mask[None, :])
+
+    @triton.jit
+    def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,
+                               ROUND_PRODUCT: tl.constexpr):
+        i = tl.program_id(0).to(tl.int64)
+        t = tl.load(sorted_ptr + i).to(tl.int64) // TOPK
+        acc = tl.zeros((BLOCK_H,), dtype = tl.float32)
+        for hb in range(0, tl.cdiv(H, BLOCK_H)):
             offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
             h_mask = offs_h < H
-            # torch.sum over the top_k axis (the eager path) accumulates with four
-            # interleaved partial sums, acc[k % 4] += p_k, then ((a0 + a1) + a2) + a3.
-            # Same order here, so the fp32 result and its single bf16 rounding are
-            # bit-identical to the eager combine for any top_k.
-            acc0 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
-            acc1 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
-            acc2 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
-            acc3 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
-            for k in tl.static_range(TOPK):
-                slot = tl.load(inv_ptr + offs_t * TOPK + k, mask = t_mask, other = 0).to(tl.int64)
-                wk = tl.load(w_ptr + slot, mask = t_mask, other = 0.0).to(tl.float32)
-                y = tl.load(y_ptr + slot[:, None] * H + offs_h[None, :], mask = t_mask[:, None] & h_mask[None, :], other = 0.0)
-                # mul_rn / add_rn: the eager path materialises the product and then
-                # sums it, two roundings; a contracted fma would round once and drift.
-                p = libdevice.mul_rn(wk[:, None], y.to(tl.float32))
-                if ROUND_PRODUCT:
-                    # A low-precision router multiplies in the activation dtype
-                    # in the eager path; match that rounding, then sum in fp32.
-                    p = p.to(y_ptr.dtype.element_ty).to(tl.float32)
-                if k % 4 == 0:
-                    acc0 = libdevice.add_rn(acc0, p)
-                elif k % 4 == 1:
-                    acc1 = libdevice.add_rn(acc1, p)
-                elif k % 4 == 2:
-                    acc2 = libdevice.add_rn(acc2, p)
-                else:
-                    acc3 = libdevice.add_rn(acc3, p)
-            acc = libdevice.add_rn(libdevice.add_rn(libdevice.add_rn(acc0, acc1), acc2), acc3)
-            tl.store(out_ptr + offs_t[:, None] * H + offs_h[None, :], acc.to(out_ptr.dtype.element_ty),
-                     mask = t_mask[:, None] & h_mask[None, :])
+            y = tl.load(y_ptr + i * H + offs_h, mask = h_mask, other = 0.0)
+            g = tl.load(dout_ptr + t * H + offs_h, mask = h_mask, other = 0.0)
+            p = y.to(tl.float32) * g.to(tl.float32)
+            if ROUND_PRODUCT:
+                # The eager mul-backward forms grad * Y in the activation
+                # dtype before its fp32-accumulated reduction; match it.
+                p = p.to(y_ptr.dtype.element_ty).to(tl.float32)
+            acc += p
+        tl.store(dw_ptr + i, tl.sum(acc, axis = 0))
 
-        @triton.jit
-        def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,
-                                   BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):
-            pid = tl.program_id(0).to(tl.int64)
-            hb = tl.program_id(1)
-            offs_i = pid * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
-            i_mask = offs_i < N
-            offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
-            h_mask = offs_h < H
-            t = tl.load(sorted_ptr + offs_i, mask = i_mask, other = 0).to(tl.int64) // TOPK
-            wk = tl.load(w_ptr + offs_i, mask = i_mask, other = 0.0).to(tl.float32)
-            g = tl.load(dout_ptr + t[:, None] * H + offs_h[None, :], mask = i_mask[:, None] & h_mask[None, :], other = 0.0).to(tl.float32)
-            tl.store(dy_ptr + offs_i[:, None] * H + offs_h[None, :], (wk[:, None] * g).to(dy_ptr.dtype.element_ty),
-                     mask = i_mask[:, None] & h_mask[None, :])
-
-        @triton.jit
-        def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,
-                                   ROUND_PRODUCT: tl.constexpr):
-            i = tl.program_id(0).to(tl.int64)
-            t = tl.load(sorted_ptr + i).to(tl.int64) // TOPK
-            acc = tl.zeros((BLOCK_H,), dtype = tl.float32)
-            for hb in range(0, tl.cdiv(H, BLOCK_H)):
-                offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
-                h_mask = offs_h < H
-                y = tl.load(y_ptr + i * H + offs_h, mask = h_mask, other = 0.0)
-                g = tl.load(dout_ptr + t * H + offs_h, mask = h_mask, other = 0.0)
-                p = y.to(tl.float32) * g.to(tl.float32)
-                if ROUND_PRODUCT:
-                    # The eager mul-backward forms grad * Y in the activation
-                    # dtype before its fp32-accumulated reduction; match it.
-                    p = p.to(y_ptr.dtype.element_ty).to(tl.float32)
-                acc += p
-            tl.store(dw_ptr + i, tl.sum(acc, axis = 0))
-
-        return triton, _nf4_dequant_kernel, _combine_fwd_kernel, _combine_bwd_dy_kernel, _combine_bwd_dw_kernel
-
-_K = None
+    return triton, _nf4_dequant_kernel, _combine_fwd_kernel, _combine_bwd_dy_kernel, _combine_bwd_dw_kernel
 
 
 def _get_kernels():
@@ -191,48 +209,77 @@ def _get_kernels():
 # NF4 dequant
 # ---------------------------------------------------------------------------
 
+def _on_device(device, *tensors):
+    return all(isinstance(t, torch.Tensor) and t.device == device for t in tensors)
+
+
 def nf4_dequant_triton(packed, quant_state, out_shape = None):
-    """Dequantize bitsandbytes NF4 `packed` (any shape, uint8 storage) with
-    `quant_state` to a tensor of `out_shape` (default quant_state.shape) in
-    quant_state.dtype. Returns None when this state is not the one the kernel
-    was written for (blocksize 64, NF4, uint8 storage), so the caller keeps
-    the bitsandbytes path."""
+    """Dequantize bitsandbytes NF4 `packed` (any shape; any quant_storage dtype,
+    the bytes are viewed as uint8) with `quant_state` to a tensor of `out_shape`
+    (default quant_state.shape) in quant_state.dtype. Returns None when this is
+    not a state the kernel handles (not NF4, blocksize other than 64, a padded
+    odd element count, state tensors on another device), or when the Triton
+    path is unavailable, so the caller keeps the bitsandbytes path."""
     if not moe_triton_kernels_available(packed.device):
         return None
     if (getattr(quant_state, "quant_type", None) != "nf4" or quant_state.blocksize != 64
-            or packed.dtype != torch.uint8 or quant_state.code.numel() != 16):
+            or quant_state.code.numel() != 16):
         return None
     shape = tuple(out_shape) if out_shape is not None else tuple(quant_state.shape)
-    n_bytes = packed.numel()
     numel = 1
     for s in shape:
         numel *= s
+    q = packed.contiguous().reshape(-1)
+    if q.dtype != torch.uint8:
+        q = q.view(torch.uint8)
+    n_bytes = q.numel()
     if numel != 2 * n_bytes:
         return None
-    triton, kernel, _, _, _ = _get_kernels()
-    q = packed.reshape(-1)
+    device = packed.device
     code = quant_state.code
+    absmax = quant_state.absmax
+    nested = bool(quant_state.nested)
+    if nested:
+        s2 = quant_state.state2
+        code2, absmax2 = s2.code, s2.absmax
+        offset = quant_state.offset
+        if not isinstance(offset, torch.Tensor):   # older bitsandbytes kept a python float
+            offset = torch.tensor(float(offset), dtype = torch.float32, device = device)
+        offset = offset.reshape(1)
+        if not _on_device(device, code, absmax, code2, absmax2, offset):
+            return None
+    else:
+        if not _on_device(device, code, absmax):
+            return None
+        code2 = absmax2 = offset = absmax   # unused pointers, must still be valid
     if code.dtype != torch.float32:
         code = code.float()
-    out = torch.empty(numel, dtype = quant_state.dtype, device = packed.device)
+    if nested and code2.dtype != torch.float32:
+        code2 = code2.float()
     BLOCK = 1024
-    if quant_state.nested:
-        s2 = quant_state.state2
-        code2 = s2.code if s2.code.dtype == torch.float32 else s2.code.float()
+    try:
+        triton, kernel, _, _, _ = _get_kernels()
+        out = torch.empty(numel, dtype = quant_state.dtype, device = device)
         kernel[(triton.cdiv(n_bytes, BLOCK),)](
-            q, out, code, quant_state.absmax, code2, s2.absmax, quant_state.offset.reshape(1),
-            n_bytes, NESTED = True, BLOCKSIZE2 = s2.blocksize, BLOCK = BLOCK, num_warps = 4)
-    else:
-        absmax = quant_state.absmax
-        kernel[(triton.cdiv(n_bytes, BLOCK),)](
-            q, out, code, absmax, absmax, absmax, absmax,
-            n_bytes, NESTED = False, BLOCKSIZE2 = 1, BLOCK = BLOCK, num_warps = 4)
+            q, out, code, absmax, code2, absmax2, offset, n_bytes,
+            NESTED = nested, BLOCKSIZE2 = (quant_state.state2.blocksize if nested else 1),
+            BLOCK = BLOCK, num_warps = 4, enable_fp_fusion = False,
+        )
+    except Exception as exc:
+        _disable("nf4_dequant_triton", exc)
+        return None
     return out.view(shape)
 
 
 # ---------------------------------------------------------------------------
 # Weighted unpermute (combine)
 # ---------------------------------------------------------------------------
+
+def _round_product(w, y) -> bool:
+    """The eager path forms w * y in torch's promoted dtype; it rounds each
+    product only when that dtype is narrower than fp32 (then it equals y's)."""
+    return torch.promote_types(w.dtype, y.dtype) != torch.float32
+
 
 class _WeightedUnpermute(torch.autograd.Function):
     @staticmethod
@@ -245,7 +292,7 @@ class _WeightedUnpermute(torch.autograd.Function):
         BLOCK_T, BLOCK_H = 8, 512
         fwd[(triton.cdiv(num_tokens, BLOCK_T), triton.cdiv(H, BLOCK_H))](
             y, inv, w_perm, out, num_tokens, H, top_k, BLOCK_T, BLOCK_H,
-            ROUND_PRODUCT = (w_perm.dtype != torch.float32), num_warps = 4,
+            ROUND_PRODUCT = _round_product(w_perm, y), num_warps = 4, enable_fp_fusion = False,
         )
         ctx.save_for_backward(y, sorted_indices, w_perm)
         ctx.top_k = top_k
@@ -262,13 +309,13 @@ class _WeightedUnpermute(torch.autograd.Function):
         BLOCK_T, BLOCK_H = 16, 512
         dy = torch.empty_like(y)
         bwd_dy[(triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))](
-            dout, sorted_indices, w_perm, dy, T, H, top_k, BLOCK_T, BLOCK_H, num_warps = 4)
-        BLOCK_H = 1024
+            dout, sorted_indices, w_perm, dy, T, H, top_k, BLOCK_T, BLOCK_H,
+            num_warps = 4, enable_fp_fusion = False)
         dw = None
         if ctx.needs_w:
             dw32 = torch.empty((T,), device = y.device, dtype = torch.float32)
-            bwd_dw[(T,)](y, dout, sorted_indices, dw32, H, top_k, BLOCK_H,
-                         ROUND_PRODUCT = (w_perm.dtype != torch.float32))
+            bwd_dw[(T,)](y, dout, sorted_indices, dw32, H, top_k, 1024,
+                         ROUND_PRODUCT = _round_product(w_perm, y), enable_fp_fusion = False)
             dw = dw32.to(w_perm.dtype)
         return dy, None, dw, None, None, None
 
@@ -284,7 +331,11 @@ def weighted_unpermute(permuted_output, sorted_indices, permuted_weights, num_to
         return None
     if permuted_output.dim() != 2 or sorted_indices.numel() != permuted_output.shape[0]:
         return None
-    return _WeightedUnpermute.apply(
-        permuted_output.contiguous(), sorted_indices.contiguous(),
-        permuted_weights.reshape(-1).contiguous(), int(num_tokens), int(top_k), out_dtype,
-    )
+    try:
+        return _WeightedUnpermute.apply(
+            permuted_output.contiguous(), sorted_indices.contiguous(),
+            permuted_weights.reshape(-1).contiguous(), int(num_tokens), int(top_k), out_dtype,
+        )
+    except Exception as exc:
+        _disable("weighted_unpermute", exc)
+        return None

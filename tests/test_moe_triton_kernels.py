@@ -2,16 +2,18 @@
 
 nf4_dequant_triton is held to bit-identity with bitsandbytes (same fp32
 product, one rounding), nested and non-nested absmax, every dtype bnb emits,
-and shapes that are not a multiple of the launch block. weighted_unpermute is
-held to bf16-rounding tolerance in forward (the fp32 sum order over top_k
-differs) and to exact dY, with dw within fp32 reduction tolerance; a missing
-Triton or a non-CUDA tensor must make both return None rather than raise.
+every quant_storage dtype, a serialised-and-reloaded QuantState, and shapes
+that are not a multiple of the launch block. weighted_unpermute is held to
+bit-identity in forward and dY for every router/activation dtype pairing, with
+dw within fp32 reduction-order tolerance. Anything the kernels do not handle,
+and any failed launch, must make them return None rather than raise.
 """
 import os
 
 import pytest
 import torch
 
+import unsloth_zoo.temporary_patches.moe_triton_kernels as mk
 from unsloth_zoo.temporary_patches.moe_triton_kernels import (
     moe_triton_kernels_available,
     nf4_dequant_triton,
@@ -19,6 +21,8 @@ from unsloth_zoo.temporary_patches.moe_triton_kernels import (
 )
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
+bnb = pytest.importorskip("bitsandbytes")
+from bitsandbytes.functional import QuantState, dequantize_4bit, quantize_4bit  # noqa: E402
 
 
 @pytest.fixture(autouse = True)
@@ -28,8 +32,11 @@ def _release_cuda_cache():
     yield
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-bnb = pytest.importorskip("bitsandbytes")
-from bitsandbytes.functional import dequantize_4bit, quantize_4bit  # noqa: E402
+
+
+def _need_triton():
+    if not moe_triton_kernels_available():
+        pytest.skip("Triton unavailable")
 
 
 @cuda
@@ -37,8 +44,7 @@ from bitsandbytes.functional import dequantize_4bit, quantize_4bit  # noqa: E402
 @pytest.mark.parametrize("nested", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
-    if not moe_triton_kernels_available():
-        pytest.skip("Triton unavailable")
+    _need_triton()
     torch.manual_seed(0)
     w = torch.randn(*shape, device = "cuda", dtype = dtype)
     q, qs = quantize_4bit(w, blocksize = 64, compress_statistics = nested, quant_type = "nf4")
@@ -55,9 +61,43 @@ def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
 
 
 @cuda
+@pytest.mark.parametrize("storage", [torch.bfloat16, torch.float16, torch.float32])
+def test_nf4_dequant_other_quant_storage_dtypes(storage):
+    """bnb_4bit_quant_storage changes only how the packed bytes are typed."""
+    _need_triton()
+    w = torch.randn(4, 64, 256, device = "cuda", dtype = torch.bfloat16)
+    q, qs = quantize_4bit(w, blocksize = 64, compress_statistics = True, quant_type = "nf4", quant_storage = storage)
+    assert q.dtype == storage
+    out = nf4_dequant_triton(q, qs)
+    assert out is not None and torch.equal(out, dequantize_4bit(q, qs))
+
+
+@cuda
+def test_nf4_dequant_reloaded_quant_state():
+    """A prequantized checkpoint arrives through QuantState.from_dict."""
+    _need_triton()
+    w = torch.randn(8, 64, 256, device = "cuda", dtype = torch.bfloat16)
+    q, qs = quantize_4bit(w, blocksize = 64, compress_statistics = True, quant_type = "nf4")
+    qs2 = QuantState.from_dict(qs_dict = qs.as_dict(packed = True), device = torch.device("cuda"))
+    assert torch.equal(nf4_dequant_triton(q, qs2), dequantize_4bit(q, qs2))
+
+
+@cuda
+def test_nf4_dequant_offset_as_python_float():
+    """Older bitsandbytes kept the nested-absmax offset as a float."""
+    _need_triton()
+    import copy
+    w = torch.randn(4, 64, 128, device = "cuda", dtype = torch.bfloat16)
+    q, qs = quantize_4bit(w, blocksize = 64, compress_statistics = True, quant_type = "nf4")
+    qso = copy.copy(qs)
+    qso.offset = float(qs.offset)
+    assert torch.equal(nf4_dequant_triton(q, qso), dequantize_4bit(q, qs))
+
+
+@cuda
 def test_nf4_dequant_declines_other_states():
-    if not moe_triton_kernels_available():
-        pytest.skip("Triton unavailable")
+    _need_triton()
+    import copy
     w = torch.randn(4, 256, device = "cuda", dtype = torch.bfloat16)
     q, qs = quantize_4bit(w, blocksize = 128, quant_type = "nf4")
     assert nf4_dequant_triton(q, qs) is None            # blocksize 128: not this kernel
@@ -65,18 +105,39 @@ def test_nf4_dequant_declines_other_states():
     assert nf4_dequant_triton(q, qs) is None            # fp4 codebook
     q, qs = quantize_4bit(w, blocksize = 64, quant_type = "nf4")
     assert nf4_dequant_triton(q, qs, out_shape = (4, 128)) is None   # wrong element count
+    qsc = copy.copy(qs)
+    qsc.code = qs.code.cpu()
+    assert nf4_dequant_triton(q, qsc) is None           # state tensor on another device
+    w = torch.randn(7, 9, device = "cuda", dtype = torch.bfloat16)   # odd numel: bnb pads a byte
+    q, qs = quantize_4bit(w, blocksize = 64, quant_type = "nf4")
+    assert nf4_dequant_triton(q, qs) is None
 
 
-def test_nf4_dequant_none_on_cpu():
-    w = torch.randn(4, 64)
-    assert nf4_dequant_triton(w.to(torch.uint8), None) is None or not torch.cuda.is_available() or True
-    # The public gate is what callers rely on: a CPU tensor never takes the Triton path.
+def test_gate_never_takes_a_cpu_tensor():
     assert moe_triton_kernels_available(torch.device("cpu")) is False
 
 
 def test_env_disable(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MOE_TRITON_KERNELS", "0")
     assert moe_triton_kernels_available() is False
+
+
+@cuda
+def test_failed_launch_falls_back_and_disables(monkeypatch):
+    """A Triton that imports but cannot compile must not take the run down."""
+    _need_triton()
+    monkeypatch.setattr(mk, "_DISABLED_REASON", None)
+    def boom():
+        raise RuntimeError("no compiler")
+    monkeypatch.setattr(mk, "_get_kernels", boom)
+    w = torch.randn(4, 64, 128, device = "cuda", dtype = torch.bfloat16)
+    q, qs = quantize_4bit(w, blocksize = 64, quant_type = "nf4")
+    assert nf4_dequant_triton(q, qs) is None
+    assert mk._DISABLED_REASON is not None and "no compiler" in mk._DISABLED_REASON
+    assert moe_triton_kernels_available() is False     # and stays off for the process
+    y = torch.randn(8, 16, device = "cuda", dtype = torch.bfloat16)
+    assert weighted_unpermute(y, torch.arange(8, device = "cuda"), torch.rand(8, device = "cuda"), 4, 2) is None
+    monkeypatch.setattr(mk, "_DISABLED_REASON", None)
 
 
 def _reference_combine(y, sorted_indices, w_perm, num_tokens, top_k, out_dtype):
@@ -91,8 +152,7 @@ def _reference_combine(y, sorted_indices, w_perm, num_tokens, top_k, out_dtype):
                                                       (300, 6, 512, 64), (128, 10, 768, 32), (64, 16, 256, 32), (50, 3, 100, 8)])
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
 def test_weighted_unpermute_matches_eager(num_tokens, top_k, hidden, E, w_dtype):
-    if not moe_triton_kernels_available():
-        pytest.skip("Triton unavailable")
+    _need_triton()
     torch.manual_seed(0)
     flat = torch.randint(0, E, (num_tokens * top_k,), device = "cuda")
     sorted_indices = torch.argsort(flat, stable = True)
@@ -113,9 +173,37 @@ def test_weighted_unpermute_matches_eager(num_tokens, top_k, hidden, E, w_dtype)
 
 
 @cuda
+@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("y_dtype", [torch.bfloat16, torch.float16])
+def test_weighted_unpermute_dtype_pairings(w_dtype, y_dtype):
+    """Each product is rounded exactly when torch's promoted dtype is narrower
+    than fp32, so a bf16 router with fp16 activations (promotes to fp32) must
+    not round, while matching dtypes must."""
+    _need_triton()
+    torch.manual_seed(1)
+    num_tokens, top_k, hidden = 33, 4, 1500
+    sorted_indices = torch.argsort(torch.randint(0, 16, (num_tokens * top_k,), device = "cuda"), stable = True)
+    y = torch.randn(num_tokens * top_k, hidden, device = "cuda", dtype = y_dtype)
+    w = torch.rand(num_tokens * top_k, device = "cuda", dtype = w_dtype)
+    out = weighted_unpermute(y, sorted_indices, w, num_tokens, top_k, out_dtype = y_dtype)
+    assert torch.equal(out, _reference_combine(y, sorted_indices, w, num_tokens, top_k, y_dtype))
+
+
+@cuda
+def test_weighted_unpermute_empty_experts():
+    """Experts that received no tokens change nothing about the combine."""
+    _need_triton()
+    num_tokens, top_k, hidden = 256, 8, 512
+    sorted_indices = torch.argsort(torch.randint(0, 3, (num_tokens * top_k,), device = "cuda"), stable = True)
+    y = torch.randn(num_tokens * top_k, hidden, device = "cuda", dtype = torch.bfloat16)
+    w = torch.rand(num_tokens * top_k, device = "cuda")
+    assert torch.equal(weighted_unpermute(y, sorted_indices, w, num_tokens, top_k, out_dtype = torch.bfloat16),
+                       _reference_combine(y, sorted_indices, w, num_tokens, top_k, torch.bfloat16))
+
+
+@cuda
 def test_weighted_unpermute_detached_weights_skip_dw():
-    if not moe_triton_kernels_available():
-        pytest.skip("Triton unavailable")
+    _need_triton()
     num_tokens, top_k, hidden = 16, 2, 64
     sorted_indices = torch.argsort(torch.randint(0, 4, (num_tokens * top_k,), device = "cuda"), stable = True)
     y = torch.randn(num_tokens * top_k, hidden, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
@@ -127,8 +215,7 @@ def test_weighted_unpermute_detached_weights_skip_dw():
 
 @cuda
 def test_weighted_unpermute_is_deterministic():
-    if not moe_triton_kernels_available():
-        pytest.skip("Triton unavailable")
+    _need_triton()
     num_tokens, top_k, hidden = 512, 8, 1024
     sorted_indices = torch.argsort(torch.randint(0, 32, (num_tokens * top_k,), device = "cuda"), stable = True)
     y = torch.randn(num_tokens * top_k, hidden, device = "cuda", dtype = torch.bfloat16)
