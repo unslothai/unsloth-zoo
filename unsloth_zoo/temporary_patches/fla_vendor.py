@@ -234,6 +234,52 @@ def _torch_triton_cuda_supported():
     return True
 
 
+# RDNA1 parts with no dot instructions at all (LLVM AMDGPU: gfx1010 and gfx1013 lack
+# dot1/dot2-insts; gfx1011/gfx1012 have them, gfx103x has them). Triton's AMD backend
+# still lowers a 16-bit tl.dot to v_dot2 there, so every fla chunk kernel dies at
+# compile time inside LLVM, taking the whole process with it:
+#   LLVM ERROR: Cannot select: AMDGPUISD::FDOT2
+# Nothing in fla can run on these GPUs; transformers' pure-torch gated-delta path can.
+_NO_DOT_INSTRUCTION_GFX = ("gfx1010", "gfx1013")
+
+
+def _gpu_lacks_dot_instructions(torch_mod=None):
+    """True on a ROCm build when any visible GPU is an RDNA1 part without dot instructions.
+
+    Every visible device is checked, not just device 0, for the same reason as the Hopper
+    probe: a model can be placed on a nonzero card. Anything unreadable answers False."""
+    try:
+        if torch_mod is None:
+            import torch as torch_mod
+        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
+            return False
+        if not torch_mod.cuda.is_available():
+            return False
+        for i in range(int(torch_mod.cuda.device_count())):
+            props = torch_mod.cuda.get_device_properties(i)
+            arch = str(getattr(props, "gcnArchName", "") or "").split(":", 1)[0].strip().lower()
+            if arch in _NO_DOT_INSTRUCTION_GFX:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _mark_fla_disabled_no_dot_instructions():
+    global _FLA_DISABLED_REASON
+    if _FLA_DISABLED_REASON is not None:
+        return
+    _FLA_DISABLED_REASON = (
+        "Unsloth: gated-deltanet (linear attention) fast kernels are DISABLED on this GPU.\n"
+        "RDNA1 (gfx1010 / gfx1013, e.g. RX 5700 XT) has no dot instructions, and Triton\n"
+        "compiles flash-linear-attention's kernels to them anyway, so the process would\n"
+        "abort inside LLVM (\"Cannot select: AMDGPUISD::FDOT2\"). Training uses the slower\n"
+        "pure-PyTorch gated-delta path instead."
+    )
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.warning(_FLA_DISABLED_REASON)
+
+
 def _hopper_dqkwg_suspect_here():
     """``_hopper_dqkwg_suspect`` for the live interpreter, or False if unknowable."""
     try:
@@ -1155,6 +1201,15 @@ def _patch_vendor_fla(phase=None):
     # installed fla stays importable, so transformers' own availability probe would
     # answer True and bind the unpatched kernels (unslothai/unsloth#5276).
     optout_degraded = False
+    # Not an opt-out: on an RDNA1 GPU no fla kernel can compile (see
+    # _NO_DOT_INSTRUCTION_GFX), so the only working path is transformers' pure-torch
+    # one. Same two-part switch as the Hopper case below: probe answers False and any
+    # already-imported gated-delta module is unbound from the kernel.
+    if _gpu_lacks_dot_instructions() and _transformers_uses_availability_probe():
+        _mark_fla_disabled_no_dot_instructions()
+        _patch_is_available(_unavailable_probe)
+        _disable_already_imported_gated_delta(why="no dot instructions on this GPU (RDNA1)")
+        return
     if _flag("UNSLOTH_DISABLE_HOPPER_FLA_BWD") and _hopper_dqkwg_suspect_here():
         # Sample the layout BEFORE _patch_is_available, which assigns the probe
         # attribute unconditionally and would otherwise make every Transformers
