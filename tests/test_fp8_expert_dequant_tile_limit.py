@@ -40,6 +40,24 @@ from unsloth_zoo.temporary_patches import moe_utils_fp8 as F
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
+def _needs_the_triton_kernel():
+    """Skip rather than fail when the Triton kernel is not importable.
+
+    _dequantize_full_expert_weights_unsloth returns None for EVERY input when
+    `unsloth.kernels.fp8` cannot be imported, so a test asserting the Triton
+    path was taken fails with "the guard narrowed it" and points at this change
+    when the real cause is a missing unsloth dependency. Observed against
+    transformers 4.57.6 in a venv where unsloth was installed without its deps:
+    six failures, none of them about the guard. Checked inside the test, not as
+    a module-level marker, so a runner with no GPU does not import unsloth at
+    collection just to decide something the CUDA gate already settled.
+    """
+    try:
+        from unsloth.kernels.fp8 import weight_dequant_block  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"unsloth.kernels.fp8 is not importable ({type(e).__name__}: {e})")
+
+
 def _weight(E, M, N, device):
     return torch.zeros(E, M, N, device=device).to(torch.float8_e4m3fn)
 
@@ -67,6 +85,7 @@ def test_a_tile_exactly_at_the_limit_is_still_taken():
     """1024 x 1024 is exactly the cap, so it is legal and must not be declined.
     The guard is `>`, and an off-by-one to `>=` would silently cost the fast
     path here."""
+    _needs_the_triton_kernel()
     M = N = 1024
     torch.manual_seed(0)
     w = (torch.randn(2, M, N, device="cuda") * 0.1).to(torch.float8_e4m3fn)
@@ -117,6 +136,7 @@ def test_block_scales_still_take_the_triton_path(block):
     """Every scale granularity that fits the tile limit must still reach the
     Triton kernel, so the guard cannot have narrowed the fast path. Returning
     None here would be a silent demotion to the slower fallback."""
+    _needs_the_triton_kernel()
     M = N = 2048
     torch.manual_seed(0)
     w = (torch.randn(2, M, N, device="cuda") * 0.1).to(torch.float8_e4m3fn)
@@ -159,6 +179,7 @@ def test_caller_falls_back_and_returns_correct_values(M, N):
 def test_finer_scales_still_go_through_triton_and_agree():
     """The Triton path must still be taken for a normal 128-block scale, and
     must agree with the vectorized maths."""
+    _needs_the_triton_kernel()
     torch.manual_seed(0)
     E, M, N, block = 2, 1024, 1024, 128
     w = (torch.randn(E, M, N, device="cuda") * 0.1).to(torch.float8_e4m3fn)
