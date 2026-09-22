@@ -482,3 +482,33 @@ def test_the_sweep_still_rebinds_a_plain_alias(monkeypatch):
     live = conversion_mapping.get_model_conversion_mapping
     assert live is not pristine
     assert modeling_utils.get_model_conversion_mapping is live
+
+
+def test_a_third_party_wrapper_on_the_module_attribute_survives(monkeypatch):
+    """The canonical-binding half of the same hazard.
+
+    Installing used to unwrap `__wrapped__` before wrapping, to avoid re-wrapping a wrapper of
+    ours that had lost its mark. But the already-installed check declines whenever either mark
+    is anywhere in the chain, so that case cannot reach the unwrap, while a third party's
+    `functools.wraps` wrapper on the module attribute WAS unwrapped past and then replaced,
+    dropping their behaviour with nothing left in the chain.
+    """
+    conversion_mapping = _requires_submodule_extraction()
+    if rescope._transformers_rescopes_submodule_prefix_renamings():
+        pytest.skip("this transformers carries the upstream fix; the re-scope declines")
+    import functools
+
+    pristine = _base_mapping_fn(conversion_mapping)
+
+    @functools.wraps(pristine)
+    def third_party(*args, **kwargs):
+        return pristine(*args, **kwargs)
+
+    monkeypatch.setattr(conversion_mapping, "get_model_conversion_mapping", third_party)
+    rescope.patch_transformers_composite_prefix_renaming()
+
+    live = conversion_mapping.get_model_conversion_mapping
+    assert live is not third_party, "expected an install"
+    chain = rescope._wrapper_chain(live)
+    assert any(f is third_party for f in chain), \
+        "the third party's wrapper must still run, not be unwrapped past and discarded"

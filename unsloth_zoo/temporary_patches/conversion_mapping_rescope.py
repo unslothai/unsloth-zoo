@@ -388,12 +388,15 @@ def patch_transformers_composite_prefix_renaming():
     # `moe_utils_bnb4bit.py`'s wrapper. A second repair is inert but is a wrapper nobody needs.
     if _repair_already_installed(original):
         return
-    live_before = original
-    # Probe and wrap the ORIGINAL, never a wrapper of ours that lost its mark.
-    original = getattr(original, "__wrapped__", original)
+    # Wrap WHATEVER IS LIVE, never what it wraps. This used to unwrap `__wrapped__` first, to
+    # avoid re-wrapping a wrapper of ours that had lost its mark -- but the check above already
+    # declines when either mark is anywhere in the chain, so that case cannot reach here, while
+    # unwrapping a THIRD PARTY's `functools.wraps` wrapper and then replacing the module
+    # attribute dropped their behaviour entirely. Measured on transformers 5.5.4: their wrapper
+    # was absent from the resulting chain.
     # Every callable our wrapper now sits in front of, so the sweep below can tell a binding it
     # SUPERSEDES from one it would silently destroy.
-    superseded = _wrapper_chain(live_before) + _wrapper_chain(original)
+    superseded = _wrapper_chain(original)
 
     @functools.wraps(original)
     def get_model_conversion_mapping(*args, **kwargs):
