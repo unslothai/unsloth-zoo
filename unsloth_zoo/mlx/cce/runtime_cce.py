@@ -902,21 +902,25 @@ def make_runtime_cce_loss_fused_finalize(
         # (hidden), and the classifier gradient when the head is trained.
         # Each is held to 8 MB, which is what confines this to compact heads.
         #
-        # A trainable bfloat16 head on the kernel path is the one case where the token
-        # side is not one buffer: dlogits_out_dtype below writes d_logits in float32,
-        # and the hidden GEMM then needs it cast back, so logits + d_logits + the cast
-        # are live at once, 4x what counting the logits chunk alone allowed. Promoting
-        # there costs memory rather than saving it: measured on an M1 at n_tokens=512,
-        # hidden=512, vocab=16384, the 4096 plan peaked at 146324012 bytes against
-        # 143211072 for 2048. Everywhere else the derivative matches the logits dtype
-        # and the original single-buffer bound is what applies. Label smoothing is
-        # excluded because it disables the kernels, so dlogits_out_dtype never runs and
-        # compute_bytes is already 4.
+        # The 8 MB above is a calibration against one token-side buffer per chunk, not a
+        # true live set: logits and d_logits are both live in every case. One cell
+        # departs from that calibration by enough to invert the result. A trainable
+        # bfloat16 head on the kernel path has dlogits_out_dtype below write d_logits in
+        # float32 and the hidden GEMM then cast it back, so its token side is 4x
+        # compute_bytes where every other kernel-path cell is 2x, and promoting costs
+        # memory rather than saving it: measured on an M1 at n_tokens=512, hidden=512,
+        # vocab=16384, the 4096 plan peaked at 146324012 bytes against 143211072 for
+        # 2048. Hold that cell to the same 8 MB with its own ratio.
+        #
+        # Requiring label_smoothing == 0 keeps this to the path it was measured on.
+        # Smoothing routes to _fallback_dlogits, whose float32 intermediates the bound
+        # already underestimates; widening the estimate there is unmeasured, so it keeps
+        # the behaviour this PR started from rather than tightening it blind.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
         token_bytes = compute_bytes
         if label_smoothing == 0.0 and hidden.dtype == mx.bfloat16 and not weight_is_frozen:
-            token_bytes = compute_bytes + 4 + compute_bytes
+            token_bytes = 4 * compute_bytes
         if (chunk_size <= 0 and not quantized
                 and hidden.dtype == weight.dtype and hidden.dtype in (mx.bfloat16, mx.float32)
                 and n_tokens >= 256 and resolved_chunk_size < promoted_chunk
@@ -1111,6 +1115,7 @@ def make_runtime_cce_loss_fused_finalize(
             return losses + lse * mx.array(0.0, dtype=mx.float32)
 
         runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
+        runtime_cce_loss._unsloth_get_chunk_plan = get_chunk_plan
         return runtime_cce_loss, use_metal_kernel
 
     @mx.custom_function
@@ -1221,6 +1226,7 @@ def make_runtime_cce_loss_fused_finalize(
         return losses + lse * mx.array(0.0, dtype=mx.float32)
 
     runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
+    runtime_cce_loss._unsloth_get_chunk_plan = get_chunk_plan
     return runtime_cce_loss, use_metal_kernel
 
 

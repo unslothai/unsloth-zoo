@@ -126,6 +126,43 @@ def test_automatic_chunks_reduce_backward_peak(frozen, dim):
         assert peaks[1] < peaks[0]
 
 
+def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
+    """The promotion rule itself, as integers.
+
+    The peak assertions above can only discriminate on hardware where the promoted
+    plan is actually worse, which so far is one runner, and they skip entirely off
+    Metal. The rule is a pure integer predicate, so pin it directly: at these shapes
+    a frozen head takes the wide chunk and a trainable bfloat16 head must not, on
+    every device.
+    """
+    _skip_torch_shim()
+    import unsloth_zoo.mlx.cce.runtime_cce as runtime_cce_module
+    from unsloth_zoo.mlx.cce import _get_runtime_cce, clear_cce_cache
+
+    hidden = mx.zeros((512, 512), dtype=mx.bfloat16)
+    weight = mx.zeros((16384, 512), dtype=mx.bfloat16)
+    saved_budget = runtime_cce_module._CHUNK_BUDGET
+    try:
+        # Every budget _get_memory_budget can return, from its 4 MB floor (smallest
+        # supported device) to its 128 MB cap. The answer must not depend on which.
+        for budget_mib in (4, 6, 12, 27, 103, 128):
+            runtime_cce_module._CHUNK_BUDGET = budget_mib * 1024 * 1024
+            clear_cce_cache()
+            plans = {}
+            for frozen in (True, False):
+                runtime = _get_runtime_cce(
+                    ignore_index=-100,
+                    logit_softcap=0.0,
+                    chunk_size=0,
+                    weight_is_frozen=frozen,
+                )
+                plans[frozen] = runtime._unsloth_get_chunk_plan(hidden, weight)[0]
+            assert plans == {True: 4096, False: 2048}, (budget_mib, plans)
+    finally:
+        runtime_cce_module._CHUNK_BUDGET = saved_budget
+        clear_cce_cache()
+
+
 def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
     # hidden=0 with non-empty targets must raise, not silently drop labels.
     _skip_torch_shim()
