@@ -421,3 +421,13 @@ def test_an_fp4_packed_weight_is_not_marked_for_fp8_requantization():
     fp8 = torch.zeros(8, 8).to(E4M3)
     op.convert({"weight$": [fp8], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
     assert "experts.weight" in _dequantized_targets(model)
+
+
+def test_a_uint8_scale_does_not_read_as_a_packed_weight():
+    """MXFP8 stores its E8M0 scale as uint8; the weight is still e4m3 and is recorded."""
+    model = _Holder()
+    op = _make_op(Fp8Dequantize)(_quantizer())
+    fp8 = torch.zeros(8, 8).to(E4M3)
+    e8m0 = torch.full((4, 4), 127, dtype = torch.uint8)
+    op.convert({"weight$": [fp8], "weight_scale_inv": [e8m0]}, full_layer_name = "experts.weight", model = model)
+    assert "experts.weight" in _dequantized_targets(model)

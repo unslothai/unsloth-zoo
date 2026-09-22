@@ -112,9 +112,12 @@ def _make_op(Fp8Dequantize):
             # An FP4-packed weight (int8 / float4_e2m1fn_x2) is unpacked by Fp8Dequantize too, but
             # the reverse op only knows how to write float8_e4m3fn, so it is left dequantized on
             # save rather than silently changing format under a config that still says FP4.
+            # Only the weight entry decides: an MXFP8 checkpoint stores its E8M0 scale as uint8,
+            # and that must not read as a packed weight.
             arrived_packed_fp4 = any(
                 isinstance(_first(v), torch.Tensor) and _first(v).dtype in _PACKED_FP4_DTYPES
-                for v in input_dict.values()
+                for k, v in input_dict.items()
+                if "scale" not in (k[:-1] if k.endswith("$") else k)
             )
             if has_scale and not arrived_packed_fp4 and full_layer_name:
                 _dequantized_targets(model).add(full_layer_name)
