@@ -4626,6 +4626,47 @@ def test_a_bytes_environment_read_and_a_called_plus_are_read():
     ) == []
 
 
+def test_two_scans_at_once_do_not_share_one_budget():
+    """The fold budget was a module global, so two exports running at once
+    charged the same counter and the first to finish cleared it under the
+    second. A clean converter could then be refused for text another thread
+    folded, which is a CRITICAL finding and a blocked export in strict mode.
+
+    Asserted on the state rather than on a race: a scan running on another
+    thread must leave this thread's budget exactly as it found it.
+    """
+    import threading
+
+    module = _load(
+        "converter_scan_threaded_probe", "unsloth_zoo/converter_scan.py",
+    )
+    clean = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    )
+    module._fold_state.budget = 4_096
+    # The charge is read from this thread's state, which is what makes the
+    # budget a property of one decision rather than of the process.
+    try:
+        module._charge_fold("x" * 4_097)
+    except module._FoldBudgetExceeded:
+        pass
+    else:
+        raise AssertionError("the charge did not read this thread's budget")
+
+    module._fold_state.budget = 4_096
+    verdicts = []
+    thread = threading.Thread(
+        target = lambda: verdicts.append(module.scan_converter_source(clean)),
+    )
+    thread.start()
+    thread.join()
+    assert verdicts == [[]]
+    assert module._fold_state.budget == 4_096
+    del module._fold_state.budget
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.

@@ -57,6 +57,7 @@ import ast
 import logging
 import os
 import re
+import threading
 import string
 from dataclasses import dataclass
 
@@ -718,15 +719,19 @@ class _FoldBudgetExceeded(Exception):
 # gguf-py package folds well under one megabyte across every pass.
 MAX_TOTAL_FOLD = 32 * MAX_FOLDED_JOIN
 
-_fold_budget = None
+# Per thread, not per module: two exports running at once shared one counter,
+# so the first to finish cleared it under the second, their charges were added
+# together, and the bound stopped meaning anything for either.
+_fold_state = threading.local()
 
 
 def _charge_fold(text):
-    global _fold_budget
-    if _fold_budget is None or text is None:
+    budget = getattr(_fold_state, "budget", None)
+    if budget is None or text is None:
         return text
-    _fold_budget -= len(text)
-    if _fold_budget < 0:
+    budget -= len(text)
+    _fold_state.budget = budget
+    if budget < 0:
         raise _FoldBudgetExceeded("folded more text than one decision may")
     return text
 
@@ -1168,7 +1173,7 @@ def _bound_names(target):
     return set()
 
 
-def _reshapes_a_url(tree):
+def _reshapes_a_url(tree, assignments = None):
     """Whether a URL this file spells out is transformed before it is used.
 
     Reading every literal and asking whether each names a hub host assumes a
@@ -1200,7 +1205,7 @@ def _reshapes_a_url(tree):
     aliases = _import_aliases(tree)
     # j = urljoin rebinds the builder with no import in sight, so a single
     # assignment of one name to another is followed the same way an alias is.
-    for name, value in _single_assignments(tree).items():
+    for name, value in (assignments or _single_assignments(tree)).items():
         if isinstance(value, ast.Name):
             aliases[name] = aliases.get(value.id, value.id)
         elif isinstance(value, ast.Attribute):
@@ -1558,7 +1563,7 @@ DESCRIPTOR_METHODS = frozenset((
 ))
 
 
-def _bind_descriptor_calls(tree):
+def _bind_descriptor_calls(tree, assignments = None):
     """The tree with `str.format(t, x)` rewritten as `t.format(x)`.
 
     Called unbound, the receiver is the type rather than the template, so every
@@ -1570,8 +1575,10 @@ def _bind_descriptor_calls(tree):
     # r = str.replace then r(HUB, "huggingface.co", "evil.example") is the same
     # call with the method behind a name, which no rule that reads a call site
     # could see.
+    if assignments is None:
+        assignments = _single_assignments(tree)
     rebound = {}
-    for name, value in _single_assignments(tree).items():
+    for name, value in assignments.items():
         if (
             isinstance(value, ast.Attribute)
             and value.attr in DESCRIPTOR_METHODS
@@ -1580,44 +1587,32 @@ def _bind_descriptor_calls(tree):
         ):
             rebound[name] = value.attr
 
-    class Binder(ast.NodeTransformer):
-        def visit_Call(self, node):
-            self.generic_visit(node)
-            if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in rebound
-                and node.args
-            ):
-                node.func = ast.copy_location(
-                    ast.Attribute(
-                        value = node.args[0], attr = rebound[node.func.id],
-                        ctx = ast.Load(),
-                    ),
-                    node.func,
-                )
-                node.args = node.args[1:]
-                return node
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr in DESCRIPTOR_METHODS
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id in ("str", "bytes", "bytearray")
-                and node.args
-            ):
-                node.func = ast.copy_location(
-                    ast.Attribute(
-                        value = node.args[0], attr = node.func.attr,
-                        ctx = ast.Load(),
-                    ),
-                    node.func,
-                )
-                node.args = node.args[1:]
-            return node
-
-    return Binder().visit(tree)
+    # Rewritten in place, in one walk. A NodeTransformer over the whole tree
+    # cost 3.7 seconds of the 11 this allowance spent on a 6.4 MB file, and
+    # rebinding a call's function changes no structure for a parent to rewire.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in rebound:
+            attribute = rebound[node.func.id]
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in DESCRIPTOR_METHODS
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in ("str", "bytes", "bytearray")
+        ):
+            attribute = node.func.attr
+        else:
+            continue
+        node.func = ast.copy_location(
+            ast.Attribute(value = node.args[0], attr = attribute, ctx = ast.Load()),
+            node.func,
+        )
+        node.args = node.args[1:]
+    return tree
 
 
-def _inline_constants(tree):
+def _inline_constants(tree, assignments = None):
     """The tree with every single-assignment constant name read as its text.
 
     scheme = "https"; separator = "://"; host = "evil.example" assembles a URL
@@ -1635,8 +1630,10 @@ def _inline_constants(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
             uses[node.id] = uses.get(node.id, 0) + 1
 
+    if assignments is None:
+        assignments = _single_assignments(tree)
     texts, budget = {}, MAX_FOLDED_JOIN
-    for name, value in _single_assignments(tree).items():
+    for name, value in assignments.items():
         text = _literal_text(value)
         if text is None or UNKNOWN_PIECE in text:
             continue
@@ -1753,17 +1750,22 @@ def _talks_only_to_the_model_hub(text):
 
 def _talks_only_to_the_model_hub_tree(tree, text):
     """The parsed half of the allowance. See the caller."""
-    global _fold_budget
-    _fold_budget = MAX_TOTAL_FOLD
+    previous = getattr(_fold_state, "budget", None)
+    _fold_state.budget = MAX_TOTAL_FOLD
     try:
         return _talks_only_to_the_model_hub_parsed(tree, text)
     finally:
-        _fold_budget = None
+        _fold_state.budget = previous
 
 
 def _talks_only_to_the_model_hub_parsed(tree, text):
     """The allowance proper, under the fold budget its caller opened."""
-    tree = _inline_constants(_bind_descriptor_calls(tree))
+    # Read once and handed on. Every binding form is counted by walking the
+    # whole tree, and doing that per transformation was over half the time this
+    # allowance spent on a 6.4 MB file: 9.3 seconds of 16.
+    assignments = _single_assignments(tree)
+    tree = _bind_descriptor_calls(tree, assignments)
+    tree = _inline_constants(tree, assignments)
     if _writes_anything(tree):
         # Sending TO the hub is not downloading from it. The hub is writable and
         # multi-tenant: a token with write scope can create a public repository
@@ -1791,7 +1793,7 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
     if _aliases_the_environment(tree):
         # A read this cannot attribute is the same as one it cannot see.
         return False
-    if _reshapes_a_url(tree):
+    if _reshapes_a_url(tree, assignments):
         # A literal that is rewritten before it is sent names the host it was,
         # not the host it becomes.
         return False
