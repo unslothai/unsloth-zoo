@@ -61,6 +61,37 @@ SKIP_QUANTIZATION_MODULES = [
     "qa_outputs",               # *ForQuestionAnswering head
 ]
 
+# The model types PEFT's _check_lora_target_modules_mamba refuses out_proj / conv1d on,
+# plus the leaf names it refuses. Kept in step with peft/tuners/tuners_utils.py.
+MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
+MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
+
+
+def _mamba_only_leaves(model):
+    """The leaf names a LoRA adapter must not target on this model, or an empty set.
+
+    Looks at the model's own model_type and at every nested config's (a
+    multimodal wrapper carries its Mamba language model in llm_config /
+    text_config), so a wrapped Nemotron-H answers the same as a bare one.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return frozenset()
+    seen, stack = set(), [config]
+    while stack:
+        cfg = stack.pop()
+        if id(cfg) in seen or cfg is None:
+            continue
+        seen.add(id(cfg))
+        model_type = str(getattr(cfg, "model_type", "") or "").lower()
+        if model_type in MAMBA_MODEL_TYPES:
+            return MAMBA_ONLY_LEAVES
+        for value in list(vars(cfg).values()) if hasattr(cfg, "__dict__") else []:
+            if hasattr(value, "model_type") and not isinstance(value, (str, int, float, bool)):
+                stack.append(value)
+    return frozenset()
+
+
 def get_peft_regex(
     model,
     finetune_vision_layers     : bool = True,
@@ -120,6 +151,22 @@ def get_peft_regex(
     else:
         assert(type(target_modules) is list)
         only_linear_modules = list(target_modules)
+    pass
+
+    # Mamba mixers (Mamba, Mamba2, Falcon-Mamba, Falcon-H1, Nemotron-H) hand out_proj.weight and
+    # conv1d straight to their fused kernels, so a LoRA wrapper on them never runs, and PEFT
+    # (>= 0.17) refuses both names on these model types. Leave them out of the automatic targets;
+    # an explicit target_modules list is the caller's decision.
+    if target_modules is None:
+        mamba_leaves = _mamba_only_leaves(model)
+        if mamba_leaves:
+            dropped = [x for x in only_linear_modules if x in mamba_leaves]
+            only_linear_modules = [x for x in only_linear_modules if x not in mamba_leaves]
+            if dropped:
+                logger.info(
+                    f"Unsloth: leaving {', '.join(dropped)} out of the LoRA targets: a Mamba mixer "
+                    "feeds them to its fused kernels, so an adapter on them would not train."
+                )
     pass
 
     regex_model_parts = []
