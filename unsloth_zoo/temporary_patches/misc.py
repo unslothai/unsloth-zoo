@@ -2635,3 +2635,45 @@ def patch_relu_squared_activation_dtype():
     activation_class._unsloth_dtype_patched = True
 pass
 TEMPORARY_PATCHES.append(patch_relu_squared_activation_dtype)
+
+
+def patch_peft_lora_integer_input():
+    """An integer input never reaches a LoRA matmul on a bitsandbytes 4-bit layer.
+
+    PEFT's `Linear4bit.forward` casts the input to the adapter dtype only when autocast is
+    off; under autocast it trusts autocast, which leaves integer tensors alone, so the LoRA
+    branch runs `F.linear(uint8, bf16)` and stops with "expected mat1 and mat2 to have the
+    same dtype". The base 4-bit layer takes the same input without complaint, because it
+    casts to its compute dtype itself. Modeling code does produce such inputs: the Nemotron-H
+    hub checkpoints run every idle expert on `zeros(...).to(expert.down_proj.weight.dtype)`,
+    and on a 4-bit expert that dtype is uint8. The cast lands on the compute dtype of the
+    base layer, falling back to the adapter's dtype; floating inputs are untouched.
+    """
+    try:
+        import peft.tuners.lora.bnb as peft_bnb
+        Linear4bit = getattr(peft_bnb, "Linear4bit", None)
+    except Exception:
+        return
+    if Linear4bit is None:
+        return
+    original_forward = Linear4bit.__dict__.get("forward")
+    if original_forward is None or getattr(original_forward, "_unsloth_integer_input", False):
+        return
+
+    @functools.wraps(original_forward)
+    def forward(self, x, *args, **kwargs):
+        if isinstance(x, torch.Tensor) and not (x.is_floating_point() or x.is_complex()):
+            dtype = getattr(self.base_layer, "compute_dtype", None)
+            if dtype is None:
+                for adapter in self.active_adapters:
+                    if adapter in self.lora_A:
+                        dtype = self.lora_A[adapter].weight.dtype
+                        break
+            if dtype is not None:
+                x = x.to(dtype)
+        return original_forward(self, x, *args, **kwargs)
+
+    forward._unsloth_integer_input = True
+    Linear4bit.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
