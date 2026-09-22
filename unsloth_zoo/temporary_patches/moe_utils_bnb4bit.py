@@ -111,6 +111,9 @@ def _is_expert_module(module: nn.Module) -> bool:
 # slices and splice the results instead.
 _BNB_MAX_QUANTIZE_NUMEL = 2 ** 31
 
+# Module level so the read path below runs no import statement per call.
+from math import prod as _prod
+
 
 def _quantize_expert_stack_in_slices(value, blocksize, quant_type, quant_storage = torch.uint8, module = None):
     """Params4bit for a stack too large for one bitsandbytes quantize call.
@@ -218,17 +221,23 @@ def _dequantize_4bit_in_slices(weight):
     aborts the same way, at csrc/ops.cu line 93, and it runs on every forward
     rather than once at load.
     """
-    import math
-    from bitsandbytes.functional import QuantState
-
+    # Nothing above the size check runs an import or touches the data: this
+    # function is called on EVERY forward read of a 4-bit expert stack, and
+    # almost every such stack is under the cap, so the declining path is the
+    # hot one. torch.Size.numel() rather than math.prod over a tuple, and the
+    # QuantState import deferred past the return, keep it to a few attribute
+    # reads.
     quant_state = weight.quant_state
-    shape = tuple(getattr(weight, "_original_shape", None) or quant_state.shape)
-    numel = math.prod(shape) if shape else 0
+    shape = getattr(weight, "_original_shape", None) or quant_state.shape
+    numel = shape.numel() if isinstance(shape, torch.Size) else _prod(shape)
     if numel < _BNB_MAX_QUANTIZE_NUMEL or len(shape) < 2:
         return None
 
+    from bitsandbytes.functional import QuantState
+
+    shape = tuple(shape)
     blocksize = quant_state.blocksize
-    per_expert = math.prod(shape[1:])
+    per_expert = _prod(shape[1:])
     if per_expert == 0 or per_expert % blocksize != 0:
         return None
     # The packed tensor is not necessarily uint8: bnb_4bit_quant_storage may be

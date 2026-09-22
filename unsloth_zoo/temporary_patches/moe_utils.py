@@ -1646,6 +1646,31 @@ def _extract_lora_weights(
     return result[0], result[1], result[2]
 
 
+_DEQUANTIZE_4BIT_IN_SLICES = None          # unresolved
+_DEQUANTIZE_4BIT_IN_SLICES_MISSING = False  # resolved, and there is none
+
+
+def _get_dequantize_4bit_in_slices():
+    """The sliced 4-bit read, resolved once.
+
+    Absolute, like the dispatcher above and for the same reason: this file is
+    also copied to unsloth_compiled_cache/moe_utils.py and imported as a
+    top-level module, where a relative import of a sibling raises and the
+    caller would quietly put an oversized stack back on the call that aborts.
+    Only the import is guarded; a real failure inside the helper must propagate.
+    """
+    global _DEQUANTIZE_4BIT_IN_SLICES, _DEQUANTIZE_4BIT_IN_SLICES_MISSING
+    if _DEQUANTIZE_4BIT_IN_SLICES is None and not _DEQUANTIZE_4BIT_IN_SLICES_MISSING:
+        try:
+            from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
+                _dequantize_4bit_in_slices,
+            )
+            _DEQUANTIZE_4BIT_IN_SLICES = _dequantize_4bit_in_slices
+        except ImportError:
+            _DEQUANTIZE_4BIT_IN_SLICES_MISSING = True
+    return _DEQUANTIZE_4BIT_IN_SLICES
+
+
 def _get_base_weight(param, target_dtype=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts."""
@@ -1669,20 +1694,10 @@ def _get_base_weight(param, target_dtype=None):
         # again on every backward recomputation. Slice it the same way the load
         # does; the helper returns None for everything smaller, which leaves the
         # single call below untouched.
-        # Absolute, like the dispatcher above and for the same reason: this file
-        # is also copied to unsloth_compiled_cache/moe_utils.py and imported as a
-        # top-level module, where a relative import of a sibling raises and the
-        # except below would quietly put an oversized stack back on the call that
-        # aborts. Only the import is guarded; a real failure inside must propagate.
-        weight = None
-        try:
-            from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
-                _dequantize_4bit_in_slices,
-            )
-        except ImportError:
-            _dequantize_4bit_in_slices = None
-        if _dequantize_4bit_in_slices is not None:
-            weight = _dequantize_4bit_in_slices(param)
+        # Resolved once and memoized rather than imported per call, since this
+        # is a read on every forward and every backward recomputation.
+        slicer = _get_dequantize_4bit_in_slices()
+        weight = slicer(param) if slicer is not None else None
         if weight is None:
             weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
         original_shape = getattr(param, "_original_shape", None)
