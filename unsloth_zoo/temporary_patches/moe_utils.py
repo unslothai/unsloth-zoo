@@ -3368,6 +3368,7 @@ def weighted_unpermute(*args, **kwargs):
     return _WEIGHTED_UNPERMUTE(*args, **kwargs)
 
 
+@lru_cache(maxsize=1)
 def _moe_gategrad_enabled() -> bool:
     """Whether the MoE gate-gradient identity path is active (on by default).
 

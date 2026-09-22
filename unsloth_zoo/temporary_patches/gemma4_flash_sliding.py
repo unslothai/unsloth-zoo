@@ -104,11 +104,14 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
         causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
         # A sequence no longer than the window is the same band check with the band
         # covering the whole causal triangle: FA2's window kernel is still exact, and
-        # the mask-free causal SDPA below reaches its flash kernel. Gating on Sq > w
-        # sent exactly that case (seq_len <= sliding_window, the common SFT length)
-        # to the wrapped SDPA, which takes an explicit mask and so drops to the
-        # memory-efficient kernel: 4.2 ms vs 0.45 ms forward+backward per layer at
-        # 2 x 1024 x 16 x 256 on a B200, on all 25 sliding layers.
+        # the mask-free causal SDPA below reaches its flash kernel. transformers only
+        # materialises the sliding mask once kv_length reaches the window, so the
+        # case this changes is seq_len == sliding_window exactly (1024, the common
+        # SFT length), or a caller passing an explicit band mask. Gating on Sq > w
+        # sent that case to the wrapped SDPA with an explicit mask, which drops to
+        # the memory-efficient kernel: 4.2 ms vs 0.45 ms forward+backward per layer
+        # at 2 x 1024 x 16 x 256 on a B200, on all 25 sliding layers. Below the
+        # window the mask was already None and SDPA already picked its flash kernel.
         if (w and Sq == Sk
                 and (attention_mask is not None or causal)
                 and _mask_is_plain_band(attention_mask, Sq, w)):

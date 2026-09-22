@@ -205,6 +205,32 @@ def _get_kernels():
     return _K
 
 
+def _build_kernels_eagerly():
+    """Define the @triton.jit functions once, outside any compiled region.
+
+    Defining them is cheap (no compilation happens until the first launch), but
+    doing it lazily from inside an autograd Function meant the first call under
+    torch.compile(fullgraph=True) traced the decorator itself, which Dynamo
+    cannot do. Built here at import when Triton is importable; anything that
+    fails just leaves the lazy path, and a launch failure still disables the
+    kernels through _disable.
+    """
+    global _K
+    if _K is not None:
+        return
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        return
+    try:
+        _K = _kernels()
+    except Exception:
+        _K = None
+
+
+_build_kernels_eagerly()
+
+
 # ---------------------------------------------------------------------------
 # NF4 dequant
 # ---------------------------------------------------------------------------
@@ -294,28 +320,38 @@ class _WeightedUnpermute(torch.autograd.Function):
             y, inv, w_perm, out, num_tokens, H, top_k, BLOCK_T, BLOCK_H,
             ROUND_PRODUCT = _round_product(w_perm, y), num_warps = 4, enable_fp_fusion = False,
         )
-        ctx.save_for_backward(y, sorted_indices, w_perm)
-        ctx.top_k = top_k
+        # y is only read by the routing-weight gradient. When the router is
+        # frozen or detached (the gate-grad identity path hands us a detached
+        # weight on purpose, so that Y is not pinned on the tape), keep only
+        # its shape; saving it unconditionally would undo that memory saving.
         ctx.needs_w = w_perm.requires_grad
+        ctx.save_for_backward(*((y, sorted_indices, w_perm) if ctx.needs_w else (sorted_indices, w_perm)))
+        ctx.y_meta = (y.shape, y.dtype, y.device)
+        ctx.top_k = top_k
+        ctx.round_product = _round_product(w_perm, y)
         return out
 
     @staticmethod
     def backward(ctx, dout):
         triton, _, _, bwd_dy, bwd_dw = _get_kernels()
-        y, sorted_indices, w_perm = ctx.saved_tensors
+        if ctx.needs_w:
+            y, sorted_indices, w_perm = ctx.saved_tensors
+        else:
+            y = None
+            sorted_indices, w_perm = ctx.saved_tensors
+        (T, H), y_dtype, y_device = ctx.y_meta
         top_k = ctx.top_k
-        T, H = y.shape
         dout = dout.contiguous()
         BLOCK_T, BLOCK_H = 16, 512
-        dy = torch.empty_like(y)
+        dy = torch.empty((T, H), dtype = y_dtype, device = y_device)
         bwd_dy[(triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))](
             dout, sorted_indices, w_perm, dy, T, H, top_k, BLOCK_T, BLOCK_H,
             num_warps = 4, enable_fp_fusion = False)
         dw = None
         if ctx.needs_w:
-            dw32 = torch.empty((T,), device = y.device, dtype = torch.float32)
+            dw32 = torch.empty((T,), device = y_device, dtype = torch.float32)
             bwd_dw[(T,)](y, dout, sorted_indices, dw32, H, top_k, 1024,
-                         ROUND_PRODUCT = _round_product(w_perm, y), enable_fp_fusion = False)
+                         ROUND_PRODUCT = ctx.round_product, enable_fp_fusion = False)
             dw = dw32.to(w_perm.dtype)
         return dy, None, dw, None, None, None
 
