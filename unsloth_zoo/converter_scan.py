@@ -500,7 +500,37 @@ def _reshapes_a_url(tree):
     return False
 
 
-def _literal_texts(tree):
+def _docstrings(tree, text):
+    """Docstring nodes, which document a destination rather than name one.
+
+    Comments never reach here, since the walk reads the AST, so upstream's
+    `# Reference: https://github.com/...` costs nothing. A docstring saying the
+    same thing IS a Constant, and counting it as a destination refuses a clean
+    hub-only converter over a link in its own documentation, which is the false
+    positive this whole narrowing exists to remove.
+
+    Unless the file reads `__doc__`, in which case a docstring is reachable as a
+    value and the argument above stops holding. Nothing upstream does, and
+    refusing is the cheap side of that bet.
+    """
+    if "__doc__" in text:
+        return frozenset()
+    nodes = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            nodes.add(id(first.value))
+    return frozenset(nodes)
+
+
+def _literal_texts(tree, skip = frozenset()):
     """Every whole literal expression in `tree`, folded ones in place of parts.
 
     A folded expression is not descended into: reading "https://hugging" +
@@ -511,6 +541,8 @@ def _literal_texts(tree):
     stack = [tree]
     while stack:
         node = stack.pop()
+        if id(node) in skip:
+            continue
         text = _literal_text(node)
         if text is not None:
             yield text
@@ -572,6 +604,20 @@ def _talks_only_to_the_model_hub(text):
         tree = ast.parse(text)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return False                # cannot tell, so do not suppress anything
+    try:
+        return _talks_only_to_the_model_hub_tree(tree, text)
+    except (RecursionError, MemoryError):
+        # Nothing in here may raise. The walks below recurse through nested
+        # expressions, and 600 operands in one addition is enough to exhaust the
+        # default limit; scan_converter_source does not catch that, and
+        # warn_on_suspicious_converter catches everything and CONTINUES, so a
+        # payload could have appended one long expression to itself and had the
+        # whole scan report nothing, in strict mode included.
+        return False
+
+
+def _talks_only_to_the_model_hub_tree(tree, text):
+    """The parsed half of the allowance. See the caller."""
     if _writes_anything(tree):
         # Sending TO the hub is not downloading from it. The hub is writable and
         # multi-tenant: a token with write scope can create a public repository
@@ -601,7 +647,7 @@ def _talks_only_to_the_model_hub(text):
     # accepts it, so skipping bytes constants let a destination hide in one while
     # a str hub literal stayed in the file.
     try:
-        literals = list(_literal_texts(tree))
+        literals = list(_literal_texts(tree, skip = _docstrings(tree, text)))
     except (UnicodeError, AttributeError, MemoryError, RecursionError):
         return False                # cannot tell, so do not suppress anything
     for literal in literals:
