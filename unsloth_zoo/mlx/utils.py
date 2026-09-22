@@ -3996,6 +3996,9 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_5_moe",
     "qwen4_exp",
     "prism_hadamard_qwen35",
+    # Their upstream `get_rope_index` computes the same positions.
+    "glm4v",
+    "glm4v_moe",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}

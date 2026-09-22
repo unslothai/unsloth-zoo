@@ -2627,6 +2627,18 @@ HOST_GRID_FAMILIES = [
       ("model", "VariableResolutionResamplerModel", "__call__"),
       ("model", "Model", "_merge_input_ids_with_image_features")],
      None),
+    *[(arch,
+       [("vision", f"{prefix}VisionRotaryEmbedding", "__call__"),
+        ("vision", "VisionModel", "rot_pos_emb"),
+        ("vision", "VisionModel", "__call__"),
+        *attention,
+        ("model", "Model", "get_input_embeddings"),
+        ("model", "Model", "merge_input_ids_with_image_features",
+         "_merge_exclusive_special_token_features")],
+       ("Model", "merge_input_ids_with_image_features", False))
+      for arch, prefix, attention in (
+          ("glm4v", "Glm4v", [("vision", "Glm4vVisionAttention", "__call__")]),
+          ("glm4v_moe", "Glm4vMoe", []))],
 ]
 
 

@@ -3955,6 +3955,37 @@ def test_qwen_mrope_families_get_pipeline_built_position_ids():
     assert "position_ids" not in _prepared_positions("glm5_next")
 
 
+@pytest.mark.parametrize("arch", ["glm4v", "glm4v_moe"])
+def test_glm4v_pipeline_positions_equal_its_upstream_rope_index(arch):
+    """glm4v has no builder of its own; the qwen one has to reproduce upstream
+    across rows, several images, and right padding."""
+    from types import SimpleNamespace
+
+    language = pytest.importorskip(f"mlx_vlm.models.{arch}.language")
+    from unsloth_zoo.mlx.utils import _vlm_positions_for_compile
+
+    image, start, end = 151343, 151339, 151340
+    config = {"model_type": arch, "image_token_id": image, "video_token_id": 151344,
+              "vision_start_token_id": start, "vision_config": {"spatial_merge_size": 2}}
+    grids = ((1, 8, 8), (1, 8, 12), (1, 4, 8))
+    rows = [[5, start] + [image] * 16 + [end, 6, 7],
+            [5, start] + [image] * 24 + [end, 6, start] + [image] * 8 + [end, 7]]
+    width = max(map(len, rows))
+    ids = np.array([row + [0] * (width - len(row)) for row in rows], np.int32)
+    mask = np.array([[1] * len(row) + [0] * (width - len(row)) for row in rows], np.int32)
+
+    built = _vlm_positions_for_compile(
+        {"input_ids": ids, "attention_mask": mask, "image_grid_thw": grids}, config)
+    upstream, _ = language.LanguageModel.get_rope_index(
+        SimpleNamespace(config=SimpleNamespace(**{
+            **config, "vision_config": SimpleNamespace(spatial_merge_size=2)})),
+        mx.array(ids), mx.array(grids), None, mx.array(mask))
+
+    real = mask.astype(bool)
+    np.testing.assert_array_equal(
+        np.asarray(built["position_ids"])[:, real], np.asarray(upstream)[:, real])
+
+
 # --- audio alignment from stated spans, for families whose run carries no id ---
 
 
