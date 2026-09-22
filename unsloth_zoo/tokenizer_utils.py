@@ -283,8 +283,15 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     # nothing to reset in either case, so skip the pass instead of failing the
     # run before training starts.
     try:
-        embedding_matrix = model.get_input_embeddings ().weight
-        lm_head_matrix   = model.get_output_embeddings().weight
+        input_embeddings  = model.get_input_embeddings ()
+        output_embeddings = model.get_output_embeddings()
+        # A model is also entitled to answer "I have none" by returning None,
+        # and `.weight` on that is an AttributeError several frames from the
+        # cause. Same outcome, so route it through the same skip.
+        if input_embeddings is None or output_embeddings is None:
+            raise NotImplementedError("no input or output embeddings")
+        embedding_matrix = input_embeddings.weight
+        lm_head_matrix   = output_embeddings.weight
     except (NotImplementedError, TypeError):
         logger.info(
             f"Unsloth: Skipping the untrained token fix for "
