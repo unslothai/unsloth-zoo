@@ -85,6 +85,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "ernie4_5_moe_vl",
     "glm4v",
     "glm4v_moe",
+    "glm5_next",
     "glm_ocr",
     "idefics2",
     "idefics3",
@@ -247,6 +248,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "ernie4_5_moe_vl": "verify_ernie4_5_moe_vl",
     "glm4v": "verify_glm4v",
     "glm4v_moe": "verify_glm4v_moe",
+    "glm5_next": "verify_glm5_next",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
     "idefics3": "verify_idefics3",
@@ -4749,6 +4751,114 @@ def _install_glm4v_family_compile_patches(arch):
     _PATCHED_ARCHES.add(arch)
 
 
+def _install_glm5_next_compile_patches():
+    """Install compile-safe glm5_next vision patches.
+
+    Its tower reads the grid on the host (`grid_thw.tolist()`) and then reduces
+    the same array with `mx.max`, so neither form of the argument survives a
+    trace. These replacements take the grid as Python tuples throughout.
+    """
+
+    module = _try_import_module("mlx_vlm.models.glm5_next.glm5_next")
+    vision_module = _try_import_module("mlx_vlm.models.glm5_next.vision")
+    if module is None or vision_module is None:
+        return
+
+    def patched_rotary_embeddings(self, grid_thw):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in grid_spec:
+            h_ids = mx.repeat(mx.arange(h)[:, None], w, axis=1)
+            w_ids = mx.repeat(mx.arange(w)[None, :], h, axis=0)
+            h_ids = h_ids.reshape(h // merge, merge, w // merge, merge)
+            w_ids = w_ids.reshape(h // merge, merge, w // merge, merge)
+            h_ids = h_ids.transpose(0, 2, 1, 3).flatten()
+            w_ids = w_ids.transpose(0, 2, 1, 3).flatten()
+            pos_ids.append(mx.tile(mx.stack([h_ids, w_ids], axis=-1), (t, 1)))
+
+        pos_ids = mx.concatenate(pos_ids, axis=0)
+        max_grid = max(max(h, w) for _, h, w in grid_spec)
+        rotary = self.rotary_pos_emb(max_grid)[pos_ids].reshape(pos_ids.shape[0], -1)
+        emb = mx.concatenate([rotary, rotary], axis=-1)
+        return mx.cos(emb), mx.sin(emb)
+
+    def patched_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
+        import mlx.core as mx
+
+        del output_hidden_states
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states)
+        position_embeddings = self._rotary_embeddings(grid_spec)
+
+        cu_seqlens = _build_cu_seqlens(grid_spec)
+
+        for block in self.blocks:
+            hidden_states = block(hidden_states, cu_seqlens, position_embeddings)
+
+        hidden_states = self.post_layernorm(hidden_states)
+        merge = self.spatial_merge_size
+        hidden_states = hidden_states.reshape(-1, merge, merge, hidden_states.shape[-1])
+        hidden_states = self.downsample(hidden_states).reshape(
+            -1, self.config.out_hidden_size
+        )
+        return self.merger(hidden_states)
+
+    def patched_video_grid(self, video_grid_thw):
+        # Python rows rather than upstream's array: the tower below reads them
+        # back, and the array's dtype came from a grid that is now a tuple.
+        flattened = []
+        for t, h, w in _grid_to_tuple(video_grid_thw):
+            flattened.extend([(1, h, w)] * t)
+        return tuple(flattened)
+
+    def patched_replace_features(inputs_embeds, positions, features, label):
+        # Upstream slices the features row by row off a host count; the
+        # cumulative-sum index needs no host value.
+        del label
+        _raise_on_feature_count_mismatch(positions, features, inputs_embeds)
+        merged, _ = _merge_sequence_mask_features(
+            positions, features, inputs_embeds
+        )
+        return merged
+
+    def patched_vision_attention(self, x, cu_seqlens, position_embeddings):
+        import mlx.core as mx
+
+        length = x.shape[0]
+        qkv = self.qkv(x).reshape(length, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.transpose(1, 0, 2, 3)
+        q, k = self.q_norm(q), self.k_norm(k)
+        q, k = vision_module._apply_rotary(q, k, *position_embeddings)
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        split_indices = _split_points(cu_seqlens)
+        outputs = [
+            mx.fast.scaled_dot_product_attention(
+                q_chunk, k_chunk, v_chunk, scale=self.scale
+            )
+            for q_chunk, k_chunk, v_chunk in zip(
+                mx.split(q, split_indices, axis=2),
+                mx.split(k, split_indices, axis=2),
+                mx.split(v, split_indices, axis=2),
+            )
+        ]
+        out = mx.concatenate(outputs, axis=2)
+        out = out.transpose(0, 2, 1, 3).reshape(length, -1)
+        return self.proj(out)
+
+    setattr(module, "_replace_features", patched_replace_features)
+    _patch_method(vision_module.VisionAttention, "__call__", patched_vision_attention)
+    _patch_method(vision_module.VisionModel, "_rotary_embeddings", patched_rotary_embeddings)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(module.Model, "_video_grid", patched_video_grid)
+    _PATCHED_ARCHES.add("glm5_next")
+
+
 def _paddleocr_vl_has_batched_vision(vision_module) -> bool:
     """Whether PaddleOCR-VL exposes its newer batched vision contract."""
 
@@ -6965,6 +7075,17 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             ),
         ),
         CompilePatternBundle(
+            name="glm5_next_vision_compile",
+            description="glm5_next vision grid-metadata compile patch set.",
+            matcher=lambda arch, report: arch == "glm5_next",
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=("glm5_next_vision_compile_runtime",),
+        ),
+        CompilePatternBundle(
             name="glm_ocr_vision_compile",
             description="GLM OCR vision/merge compile patch set.",
             matcher=lambda arch, report: arch == "glm_ocr",
@@ -7075,6 +7196,7 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "glm4v_moe_vision_compile_runtime": partial(
             _install_glm4v_family_compile_patches, "glm4v_moe"
         ),
+        "glm5_next_vision_compile_runtime": _install_glm5_next_compile_patches,
         "glm_ocr_vision_compile_runtime": _install_glm_ocr_compile_patches,
         "paddleocr_vl_multimodal_runtime": _install_paddleocr_vl_compile_patches,
     }
