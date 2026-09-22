@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+import functools
+import gc
+import sys
+import threading
+from types import FunctionType, SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -11,14 +17,20 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason = "Requires 
 
 import mlx.nn as nn
 from mlx.utils import tree_flatten
+from mlx_lm.models import gemma4_text as lm_gemma
+from mlx_lm.models import qwen3_next as lm_qwen
 from mlx_lm.models import switch_layers as lm
 from mlx_lm.models.gpt_oss import SwiGLU
 from mlx_vlm.models import switch_layers as vlm
+from mlx_vlm.models.gemma4 import language as vlm_gemma
 from mlx_vlm.models.gemma4.language import GeGLU
+from mlx_vlm.models.qwen3_5_moe import language as vlm_qwen
 from unsloth_zoo.mlx import inference as fusion
 from unsloth_zoo.mlx.generate import generation_mode
 from unsloth_zoo.mlx.inference import fused_moe_gate_up
 
+
+QWEN, GEMMA = fusion._QWEN_ROUTING, fusion._GEMMA_ROUTING
 
 QUANTIZATIONS = [(8, "affine", 64), (4, "affine", 64), (4, "affine", 32), (6, "affine", 32),
                  (4, "mxfp4", 32), (8, "mxfp8", 32), (4, "nvfp4", 16)]
@@ -41,6 +53,19 @@ def _model(native, dtype = mx.bfloat16, dims = (2048, 512), quantization = (8, "
 
 def _equal(a, b):
     assert np.array_equal(np.array(a.view(mx.uint8)), np.array(b.view(mx.uint8)))
+
+
+def _identical(a, b, nan_payload_may_differ = False):
+    assert a.dtype == b.dtype
+    if nan_payload_may_differ and mx.issubdtype(a.dtype, mx.floating):
+        # WHICH NaN a poisoned row carries is not stable: the native chain yields bfloat16 0x7FFF
+        # on an M1 and 0x7FC0 on an M3 Max, so no fixed kernel output satisfies a byte comparison
+        # on all hardware. Still exact elsewhere: the NaN positions must match, and every other
+        # byte, every index and every finite weight, still compares bit for bit.
+        assert mx.array_equal(mx.isnan(a), mx.isnan(b)), "the poisoned positions differ"
+        quiet = mx.array(float("nan"), dtype = a.dtype)
+        a, b = mx.where(mx.isnan(a), quiet, a), mx.where(mx.isnan(b), quiet, b)
+    _equal(a, b)
 
 
 def _samples(model, dtype, width, shapes):
@@ -131,6 +156,96 @@ def test_nested_scopes_restore_all_modules_after_exception(native):
         assert type(module) is native.SwitchGLU
         assert set(module.__dict__) == keys
         _equal(module(x, indices), answer)
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_that_fails_partway_leaves_every_module_native(native, monkeypatch):
+    """A refused scope must put back the modules it had already patched."""
+    first, second = _model(native), _model(native)
+    root = nn.Sequential(first, second)
+    root.eval()
+    before = [set(module.__dict__) for module in (first, second)]
+    x, indices = _sample()
+    expected = [module(x, indices) for module in (first, second)]
+    mx.eval(expected)
+
+    native_init, built = fusion._PackedMoEGateUp.__init__, []
+
+    def refuse_the_second(self, module):
+        built.append(module)
+        if len(built) > 1:
+            raise RuntimeError("injected: no headroom")
+        native_init(self, module)
+
+    monkeypatch.setattr(fusion._PackedMoEGateUp, "__init__", refuse_the_second)
+    with pytest.raises(RuntimeError, match = "injected"):
+        with fused_moe_gate_up(root):
+            pass  # pragma: no cover
+    assert len(built) == 2
+    for module, keys, answer in zip((first, second), before, expected):
+        assert type(module) is native.SwitchGLU
+        assert set(module.__dict__) == keys
+        _equal(module(x, indices), answer)
+
+
+def _cache_limit():
+    current = mx.set_cache_limit(0)
+    mx.set_cache_limit(current)
+    return current
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_retains_nothing_it_replaces(native, monkeypatch):
+    """Cached rather than returned, the replaced arrays are a second copy of the packed half of
+    the model."""
+    modules = [_model(native) for _ in range(4)]
+    root = nn.Sequential(*modules)
+    root.eval()
+    one_layer = max(
+        sum(module.gate_proj[name].nbytes + module.up_proj[name].nbytes
+            for name in fusion._MOE_PROJECTION_FIELDS if module.gate_proj.get(name) is not None)
+        for module in modules
+    )
+
+    footprints = []
+    attach = fusion._PackedMoEGateUp.attach
+
+    def record(self):
+        attach(self)
+        footprints.append(mx.get_active_memory() + mx.get_cache_memory())
+
+    monkeypatch.setattr(fusion._PackedMoEGateUp, "attach", record)
+    gc.collect()
+    mx.clear_cache()
+    # room for every layer, so no inherited limit explains a flat footprint
+    previous_limit = mx.set_cache_limit(8 * one_layer)
+    try:
+        before = mx.get_active_memory() + mx.get_cache_memory()
+        with fused_moe_gate_up(root):
+            end = mx.get_active_memory() + mx.get_cache_memory()
+            fused = [type(module) for module in modules]
+    finally:
+        mx.set_cache_limit(previous_limit)
+
+    assert all(cls is not native.SwitchGLU for cls in fused)
+    assert len(footprints) == len(modules)
+    assert [footprint - before for footprint in footprints] == [0] * len(modules)
+    assert end == before
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_restores_the_cache_limit_it_borrowed(native):
+    """Process-global: left at zero it would stop MLX reusing any buffer at all."""
+    root = nn.Sequential(_model(native))
+    root.eval()
+    borrowed = 8 << 20
+    previous_limit = mx.set_cache_limit(borrowed)
+    try:
+        with fused_moe_gate_up(root):
+            assert _cache_limit() == borrowed
+        assert _cache_limit() == borrowed
+    finally:
+        mx.set_cache_limit(previous_limit)
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
@@ -306,3 +421,337 @@ def test_combined_arguments_fall_back_to_the_native_path(with_shared, monkeypatc
         assert observed == len(calls)  # packing here would drop the combine the native call performs
     _equal(actual, expected)
     _equal(model(x, indices, **kwargs), expected)
+
+
+def _inputs(dtype, experts, rows, mode):
+    scale = mx.random.uniform(0.5, 1.5, (experts,)).astype(dtype) if mode == GEMMA else fusion._MOE_ROUTER_NO_SCALE
+    logits = (mx.random.randint(0, 4, (rows, experts)) if rows == 8 else mx.random.normal((rows, experts)) * 3).astype(dtype)
+    if rows == 4096:  # 8 integer rows tie at the top-k boundary; the large arm carries a poisoned expert and a poisoned row
+        logits[0, 5], logits[1] = float("nan"), float("nan")
+    return logits, scale
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("experts, top_k", [(32, 1), (64, 5), (128, 8), (160, 3), (256, 8), (1024, 8)])
+@pytest.mark.parametrize("mode, normalize", [(QWEN, True), (QWEN, False), (GEMMA, False)])
+def test_kernel_reproduces_native_routing(dtype, experts, top_k, mode, normalize):
+    for rows in (0, 1, 8, 4096):
+        mx.random.seed(rows + experts + top_k)
+        logits, scale = _inputs(dtype, experts, rows, mode)
+        fused = fusion._fused_moe_router(logits, scale, top_k, mode, normalize)
+        if rows == 0 or (mode == QWEN and experts > 256):
+            assert fused is None
+            continue
+        assert fused is not None
+        assert fusion._fused_moe_router(logits[0], scale, top_k, mode, normalize) is None  # rank-1 takes the native chain
+        for a, b in zip(fusion._native_moe_router(logits, scale, top_k, mode, normalize), fused):
+            _identical(a, b, nan_payload_may_differ = True)
+
+
+def _prepared(module):
+    module.set_dtype(mx.bfloat16)
+    nn.quantize(module, bits = 8, group_size = 32)
+    module.eval()
+    mx.eval(module.parameters())
+    return module
+
+
+def _block(native, experts = 256, top_k = 8, norm_topk_prob = True, cls = None):
+    mx.random.seed(7)
+    args = SimpleNamespace(hidden_size = 64, moe_intermediate_size = 32, num_experts = experts,
+                           num_experts_per_tok = top_k, shared_expert_intermediate_size = 32,
+                           norm_topk_prob = norm_topk_prob)
+    cls = cls or (vlm_qwen.Qwen3_5MoeSparseMoeBlock if native is vlm_qwen else lm_qwen.Qwen3NextSparseMoeBlock)
+    return _prepared(cls(args))
+
+
+def _router(native, experts = 128, top_k = 8, scale_dtype = mx.bfloat16):
+    mx.random.seed(11)
+    config = SimpleNamespace(hidden_size = 64, num_experts = experts, top_k_experts = top_k, rms_norm_eps = 1e-6)
+    router = _prepared(native.Router(config))
+    router.scale = mx.random.uniform(0.5, 1.5, (64,)).astype(mx.bfloat16)
+    router.per_expert_scale = mx.random.uniform(0.5, 1.5, (experts,)).astype(scale_dtype)
+    return router
+
+
+def _routing_samples(module):
+    xs = [mx.random.normal(shape).astype(mx.bfloat16) for shape in ((1, 1, 64), (2, 3, 64), (1, 70, 64))]
+    return [(x, module(x)) for x in xs]
+
+
+def _check(module, samples):
+    as_tuple = lambda out: out if isinstance(out, tuple) else (out,)
+    for x, expected in samples:
+        for a, b in zip(as_tuple(module(x)), as_tuple(expected)):
+            _identical(a, b)
+
+
+def _counting_argpartition(monkeypatch):
+    partitions, argpartition = [], mx.argpartition
+    monkeypatch.setattr(mx, "argpartition", lambda *a, **k: partitions.append(None) or argpartition(*a, **k))
+    return partitions
+
+
+def _skip_unless_gate_up_resolves(native):
+    if native.SwitchGLU not in fusion._moe_switch_specs():
+        pytest.skip("the gate/up contract does not resolve for this package")
+
+
+@pytest.mark.parametrize("native", [vlm_qwen, lm_qwen])
+@pytest.mark.parametrize("gate_up_first", [False, True])
+def test_scope_fuses_routing_composes_with_gate_up_in_either_order_and_restores(native, gate_up_first, monkeypatch):
+    _skip_unless_gate_up_resolves(native)
+    block = _block(native)
+    samples = _routing_samples(block)
+    base = type(block)
+    partitions = _counting_argpartition(monkeypatch)
+    outer, inner = (fusion.fused_moe_gate_up, fusion.fused_moe_router) if gate_up_first else (fusion.fused_moe_router, fusion.fused_moe_gate_up)
+    with outer(block):
+        with inner(block):
+            assert type(block) is not base and isinstance(block, base)
+            assert type(block.switch_mlp) is not native.SwitchGLU
+            mx.eval(block(samples[0][0]))  # the first fused call verifies the kernel against the native chain
+            partitions.clear()
+            _check(block, samples)
+            assert not partitions
+        _check(block, samples)
+        assert bool(partitions) is gate_up_first  # the routing stays fused until its own scope exits
+    assert type(block) is base and type(block.switch_mlp) is native.SwitchGLU
+    _check(block, samples)
+    assert partitions
+
+
+def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
+    class Scaled(vlm_qwen.Qwen3_5MoeSparseMoeBlock):  # qwen4_exp inherits the body and overrides the shared gate
+        def _shared_expert_scale(self, x):
+            return 2 * super()._shared_expert_scale(x)
+
+    partitions = _counting_argpartition(monkeypatch)
+    for block in (_block(lm_qwen, norm_topk_prob = False), _block(vlm_qwen, cls = Scaled)):
+        samples = _routing_samples(block)
+        base = type(block)
+        with fusion.fused_moe_router(block):
+            assert type(block) is not base and isinstance(block, base)
+            mx.eval(block(samples[0][0]))
+            partitions.clear()
+            _check(block, samples)
+            assert not partitions
+
+
+@pytest.mark.parametrize("native", [vlm_gemma, lm_gemma])
+def test_router_packing_that_fails_partway_leaves_every_module_native(native, monkeypatch):
+    """The router holds the same contract as the gate/up pack, through its own cleanup: it
+    builds a norm scale per Gemma module after swapping the class, so it too can fail with
+    modules already patched."""
+    first, second = _router(native), _router(native)
+    root = nn.Sequential(first, second)
+    root.eval()
+    before = [set(module.__dict__) for module in (first, second)]
+    samples = [_routing_samples(module) for module in (first, second)]
+
+    native_init, built = fusion._RouterNormScale.__init__, []
+
+    def refuse_the_second(self, module):
+        built.append(module)
+        if len(built) > 1:
+            raise RuntimeError("injected: no headroom")
+        native_init(self, module)
+
+    monkeypatch.setattr(fusion._RouterNormScale, "__init__", refuse_the_second)
+    with pytest.raises(RuntimeError, match = "injected"):
+        with fusion.fused_moe_router(root):
+            pass  # pragma: no cover
+    assert len(built) == 2
+    for module, keys, pairs in zip((first, second), before, samples):
+        assert type(module) is native.Router
+        assert set(module.__dict__) == keys
+        _check(module, pairs)
+
+
+@pytest.mark.parametrize("native, scale_dtype", [(vlm_gemma, mx.bfloat16), (lm_gemma, mx.float32)])
+def test_gemma_router_is_fused_and_falls_back_on_the_raw_input(native, scale_dtype, monkeypatch):
+    router = _router(native, scale_dtype = scale_dtype)
+    samples = _routing_samples(router)
+    assert samples[0][1][1].dtype == scale_dtype  # a float32 per_expert_scale promotes the weights
+    partitions = _counting_argpartition(monkeypatch)
+    with fusion.fused_moe_router(router):
+        assert type(router) is not native.Router
+        mx.eval(router(samples[0][0]))
+        partitions.clear()
+        _check(router, samples)
+        assert not partitions
+        monkeypatch.setattr(fusion, "_fused_moe_router", lambda *a: None)
+        _check(router, samples)
+        assert partitions
+    assert type(router) is native.Router
+
+
+def test_gemma_holds_the_norm_weight_for_the_scope_and_refuses_a_stale_one(monkeypatch):
+    router = _router(vlm_gemma)
+    samples = _routing_samples(router)
+    partitions = _counting_argpartition(monkeypatch)
+    weights, rms_norm = [], mx.fast.rms_norm
+    monkeypatch.setattr(mx.fast, "rms_norm", lambda x, w, eps: weights.append(w) or rms_norm(x, w, eps))
+    with fusion.fused_moe_router(router):
+        held = router._unsloth_router_norm
+        mx.eval(router(samples[0][0]))
+        partitions.clear()
+        weights.clear()
+        _check(router, samples)
+        assert not partitions and router._unsloth_router_norm is held
+        assert weights and all(w is held.weight for w in weights)  # the held product, not a fresh one
+        router.scale = router.scale * 1.5
+        edited = _routing_samples(router)  # a replaced weight is not the held one, so these take the native chain
+        assert partitions
+    assert "_unsloth_router_norm" not in router.__dict__
+    with fusion.fused_moe_router(router):
+        assert router._unsloth_router_norm.weight is not held.weight
+        mx.eval(router(edited[0][0]))
+        partitions.clear()
+        _check(router, edited)
+        assert not partitions
+
+
+def _unpinned_call(self, x):
+    return x
+
+
+@pytest.mark.parametrize("reason", ["training", "top_k", "experts", "few_experts", "unpinned", "sharded", "no_kernel", "distributed"])
+def test_ineligible_modules_keep_native(reason, monkeypatch):
+    module = (_router(vlm_gemma, experts = 4, top_k = 2) if reason == "few_experts"
+              else _block(lm_qwen, experts = 288 if reason == "experts" else 256, top_k = 10 if reason == "top_k" else 8))
+    base = type(module)
+    if reason == "training":
+        module.train()
+    elif reason == "unpinned":
+        monkeypatch.setattr(base, "__call__", _unpinned_call)
+        monkeypatch.setattr(fusion, "_moe_router_class", functools.cache(fusion._moe_router_class.__wrapped__))
+    elif reason == "sharded":
+        module.sharding_group = type("Group", (), {"size": lambda self: 1})()  # hashable for the cached native helper
+    elif reason == "no_kernel":
+        monkeypatch.setattr(fusion, "_moe_router_kernel", lambda: None)
+    elif reason == "distributed":
+        module._unsloth_mlx_distributed_parallel_mode = "pipeline"
+    with fusion.fused_moe_router(module):
+        if reason == "sharded":
+            assert type(module) is not base
+            assert fusion._moe_router_verified(mx.bfloat16, mx.float32, 256, 8, QWEN, True)
+            monkeypatch.setattr(mx, "argpartition", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+            with pytest.raises(AssertionError):
+                module(mx.random.normal((1, 1, 64)).astype(mx.bfloat16))
+        else:
+            assert type(module) is base
+    assert type(module) is base
+
+
+def test_train_mode_or_target_verify_inside_an_open_scope_uses_the_native_chain(monkeypatch):
+    partitions = _counting_argpartition(monkeypatch)
+    for module in (_block(vlm_qwen), _router(lm_gemma)):
+        x = mx.random.normal((1, 2, 64)).astype(mx.bfloat16)
+        with fusion.fused_moe_router(module):
+            mx.eval(module(x))
+            partitions.clear()
+            if type(module)._unsloth_router_native.__call__.__defaults__:  # only mlx-vlm_qwen 0.6.0-0.6.15 takes target_verify
+                mx.eval(module(x, target_verify = True))
+                assert partitions
+                partitions.clear()
+            module.train()
+            mx.eval(module(x))
+            assert partitions
+            partitions.clear()
+            module.eval()
+            mx.eval(module(x))
+            assert not partitions
+
+
+@pytest.mark.parametrize("native, body, build", [(vlm_qwen, "Qwen3_5MoeSparseMoeBlock", _block),
+                                                 (vlm_gemma, "Router", _router)])
+def test_body_rebound_or_globals_drifting_inside_an_open_scope_is_called_instead(monkeypatch, native, body, build):
+    owner = getattr(native, body)
+    pinned = owner.__call__
+    twin = FunctionType(pinned.__code__, dict(pinned.__globals__), pinned.__name__, pinned.__defaults__)
+    monkeypatch.setattr(owner, "__call__", twin)
+    monkeypatch.setattr(fusion, "_moe_router_class", functools.cache(fusion._moe_router_class.__wrapped__))  # scoped cache
+    block = build(native)
+    x = mx.random.normal((1, 2, 64)).astype(mx.bfloat16)
+    partitions = []
+    with fusion.fused_moe_router(block):
+        assert type(block) is not owner
+        mx.eval(block(x))
+        monkeypatch.setattr(owner, "__call__", _unpinned_call)
+        assert block(x) is x
+        monkeypatch.setattr(owner, "__call__", twin)
+        twin.__globals__["mx"] = SimpleNamespace(**{**vars(mx), "argpartition": lambda *a, **k: partitions.append(None) or mx.argpartition(*a, **k)})
+        mx.eval(block(x))
+        assert partitions
+
+
+def test_unverifiable_rounding_keeps_native_per_call(monkeypatch):
+    block = _block(vlm_qwen)
+    x = mx.random.normal((1, 2, 64)).astype(mx.bfloat16)
+    expected = block(x)
+    native = fusion._native_moe_router
+    monkeypatch.setattr(fusion, "_moe_router_verified", functools.cache(fusion._moe_router_verified.__wrapped__))
+    monkeypatch.setattr(fusion, "_native_moe_router", lambda *a: (mx.zeros((1, 8), dtype = mx.uint32), mx.zeros((1, 8))))
+    with fusion.fused_moe_router(block):
+        _identical(block(x), expected)
+        assert not fusion._moe_router_verified(mx.bfloat16, mx.float32, 256, 8, QWEN, True)
+    fusion._moe_router_verified.cache_clear()
+    monkeypatch.setattr(fusion, "_native_moe_router", lambda *a: tuple(v.astype(mx.float32) for v in native(*a)))
+    assert not fusion._moe_router_verified(mx.bfloat16, mx.float32, 256, 8, QWEN, True)  # equal values, wrong dtype
+    fusion._moe_router_verified.cache_clear()
+    monkeypatch.setattr(fusion, "_native_moe_router", native)
+    lower_index_wins = lambda a, kth, axis: mx.argsort(a.astype(mx.float32) - mx.arange(a.shape[-1]) * 1e-8, axis = axis)
+    monkeypatch.setattr(mx, "argpartition", lower_index_wins)
+    assert not fusion._moe_router_verified(mx.float16, mx.float32, 64, 8, QWEN, True)  # only the integer probe ties
+
+
+def test_nested_scopes_and_generation_mode_restore():
+    modules = [_block(vlm_qwen), _block(lm_qwen), _router(lm_gemma)]
+    root = nn.Sequential(*modules)
+    root.eval()
+    with pytest.raises(RuntimeError, match = "cancel"):
+        with fusion.fused_moe_router(root):
+            classes = [type(m) for m in modules]
+            with fusion.fused_moe_router(root):
+                assert [type(m) for m in modules] == classes
+            assert [type(m) for m in modules] == classes
+            raise RuntimeError("cancel")
+    natives = [vlm_qwen.Qwen3_5MoeSparseMoeBlock, lm_qwen.Qwen3NextSparseMoeBlock, lm_gemma.Router]
+    assert [type(m) for m in modules] == natives
+    assert all("_unsloth_router_scopes" not in m.__dict__ for m in modules)
+    with generation_mode(root):
+        assert not any(type(m) is native for m, native in zip(modules, natives))
+    assert [type(m) for m in modules] == natives
+
+
+def test_contended_scopes_leave_no_module_patched():
+    # The loader's generate() wrappers enter this scope without the lock generation_mode holds, so
+    # two requests can be in the entry loop at once. Without _MOE_ROUTER_LOCK that stranded the
+    # patched class in 5 of 40 rounds; the switch interval makes it prompt.
+    block = _block(lm_qwen)
+    base = type(block)
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    failures = []
+
+    def worker():
+        try:
+            for _ in range(40):
+                with fusion.fused_moe_router(block):
+                    pass
+        except BaseException as error:          # noqa: BLE001 -- reported, not swallowed
+            failures.append(error)
+
+    try:
+        for _ in range(25):
+            threads = [threading.Thread(target = worker) for _ in range(6)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout = 60)
+            assert not failures, failures[0]
+            assert type(block) is base, "a patched class outlived every scope that asked for it"
+            assert "_unsloth_router_scopes" not in block.__dict__
+    finally:
+        sys.setswitchinterval(previous)

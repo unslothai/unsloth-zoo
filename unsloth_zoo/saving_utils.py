@@ -18,6 +18,10 @@ __all__ = [
     "create_huggingface_repo",
     "merge_and_dequantize_lora",
     "merge_and_overwrite_lora",
+    "MTP_CONFIG_KEY",
+    "is_mtp_tensor_name",
+    "mtp_head_is_present",
+    "reconcile_mtp_config",
     "normalize_safe_serialization",
     "PartialLoraMergeError",
 ]
@@ -89,7 +93,11 @@ except:
 pass
 from transformers.modeling_utils import PushToHubMixin
 import json
+import ntpath
 import os
+import posixpath
+import re
+import stat
 from pathlib import Path
 from typing import Union, List, Optional
 import tempfile
@@ -107,6 +115,224 @@ def find_skipped_quantized_modules(model):
         elif isinstance(module, torch.nn.Linear):
             skipped_modules.append(name)
     return skipped_modules, quantized_modules
+pass
+
+# vLLM fuses these before reading `llm_int8_skip_modules`, and its
+# `is_layer_skipped_bnb` matches only a module's own dotted ancestors, so the
+# fused name must be present verbatim or the layer is quantized despite being
+# saved dense (vllm/model_executor/layers/quantization/bitsandbytes.py).
+_VLLM_FUSED_SKIP_MODULES = (
+    (("q_proj", "k_proj", "v_proj"), "qkv_proj"),
+    (("gate_proj", "up_proj"),       "gate_up_proj"),
+)
+
+# Transformers >= 4.52 nests multimodal text stacks as `model.language_model.*`
+# while vLLM keeps `language_model.model.*`: an entry in one is invisible in the
+# other. Save-time twin of `_get_gemma4_bnb_skip_module_aliases` (vllm_utils.py).
+_VLLM_SKIP_MODULE_NAMESPACES = (
+    ("model.language_model.", ("language_model.model.", "model.")),
+    ("language_model.model.", ("model.language_model.", "model.")),
+    ("model.visual.",         ("visual.",)),
+    ("model.vision_tower.",   ("vision_tower.",)),
+    ("model.audio_tower.",    ("audio_tower.",)),
+)
+
+def add_vllm_namespace_skip_module_aliases(skipped_modules):
+    """Return `skipped_modules` plus the equivalent names in vLLM's namespace.
+
+    Additive. "Inert for Transformers" is decided by the matchers in
+    `_SKIP_MATCHERS`, not by whether the name exists in the tree.
+    """
+    if not skipped_modules: return skipped_modules
+    seen = set(skipped_modules)
+    aliases = []
+    for module_name in skipped_modules:
+        if not isinstance(module_name, str): continue
+        for prefix, replacements in _VLLM_SKIP_MODULE_NAMESPACES:
+            if not module_name.startswith(prefix): continue
+            tail = module_name[len(prefix):]
+            # A bare namespace root matches every module under it, leaving the
+            # whole model unquantized. Guards hand-built lists only.
+            if not tail: continue
+            for replacement in replacements:
+                alias = replacement + tail
+                if alias in seen: continue
+                seen.add(alias)
+                aliases.append(alias)
+        pass
+    pass
+    if not aliases: return skipped_modules
+    return list(skipped_modules) + sorted(aliases)
+pass
+
+def add_vllm_fused_skip_module_aliases(skipped_modules):
+    """Return `skipped_modules` plus the fused-module aliases vLLM needs.
+
+    Purely additive. These two are inert for Transformers because a model
+    exposing `gate_up_proj`/`qkv_proj` has no `gate_proj`/`up_proj` or
+    `q/k/v_proj` siblings under the same parent, so this never fires for it.
+    Non-existence alone would NOT be enough: see `_SKIP_MATCHERS`. A new entry
+    in `_VLLM_FUSED_SKIP_MODULES` or `_VLLM_SKIP_MODULE_NAMESPACES` must be
+    re-checked against those matchers.
+
+    An alias is only added when *every* shard is skipped: vLLM cannot express a
+    partially skipped fused module, and claiming otherwise corrupts the
+    quantized shard.
+    """
+    if not skipped_modules: return skipped_modules
+
+    by_parent = {}
+    for module_name in skipped_modules:
+        if not isinstance(module_name, str) or "." not in module_name: continue
+        parent, _, leaf = module_name.rpartition(".")
+        by_parent.setdefault(parent, set()).add(leaf)
+    pass
+
+    aliases = []
+    seen = set(skipped_modules)
+    for parent, leaves in by_parent.items():
+        for shard_names, fused_name in _VLLM_FUSED_SKIP_MODULES:
+            if not set(shard_names).issubset(leaves): continue
+            alias = f"{parent}.{fused_name}"
+            if alias in seen: continue
+            seen.add(alias)
+            aliases.append(alias)
+        pass
+    pass
+    if not aliases: return skipped_modules
+    return list(skipped_modules) + sorted(aliases)
+pass
+
+def drop_skip_module_aliases_that_widen(skipped_modules, aliased, module_names):
+    """Drop any alias that changes a Transformers conversion decision.
+
+    Transformers matches a skip entry by prefix and suffix, not by exact name,
+    so an alias need not name a real module to change what gets quantized. On a
+    tower named `model.vision_tower.vision_model.layers.N.mlp.gate_proj` the
+    `model.` namespace alias reaches the leaf under 5.x and, in parent form,
+    every leaf under it on 4.x. That weight is quantized on disk, so skipping it
+    rebuilds a plain `Linear` for a packed checkpoint entry.
+
+    No shipping architecture names a tower that way, so this is a guard, not a
+    fix for an observed break.
+    """
+    if not module_names: return aliased
+    added = [name for name in aliased if name not in set(skipped_modules)]
+    if not added: return aliased
+
+    # Checked against the semantics directly, not the installed function: the
+    # transformers that RELOADS this checkpoint is not the one saving it, and no
+    # matcher is a superset of the others.
+    # Matching is monotone, so per matcher an alias is safe exactly when it hits
+    # nothing that list already left convertible, and each can be tested alone.
+    safe = set(added)
+    for build in _SKIP_MATCHERS:
+        try:
+            matches_any = build(list(skipped_modules))
+            convertible = [name for name in module_names if not matches_any(name)]
+        except Exception:
+            # Cannot evaluate this matcher, so it cannot clear anything either.
+            safe = set()
+            break
+        for alias in sorted(safe):
+            try:
+                widens = any(build([alias])(name) for name in convertible)
+            except Exception:
+                # A pathological entry can make a matcher's `re.match` raise.
+                # Treat that as unsafe and drop the alias.
+                widens = True
+            if widens: safe.discard(alias)
+        pass
+    pass
+    if len(safe) == len(added): return aliased
+    return list(skipped_modules) + [alias for alias in added if alias in safe]
+pass
+
+def _transformers_4x_skip_matcher(entries):
+    """transformers 4.x, `integrations/bitsandbytes.py::replace_with_bnb_linear`.
+
+    4.x has no `should_convert_module`; it decides inline:
+
+        name not in modules_to_not_convert      # the module's own short name
+        (key + "." in current_key_name_str) or (key == current_key_name_str)
+
+    That first clause is an UNANCHORED substring, unlike 5.x's anchored prefix,
+    so `model.layers.0.mlp` matches `...vision_model.layers.0.mlp.gate_proj`
+    here but not there. Neither generation is a subset of the other.
+    """
+    entries = [e for e in entries if isinstance(e, str)]
+    if not entries:
+        return lambda name: False
+    exact = set(entries)
+    dotted = tuple(e + "." for e in entries)
+
+    def matches(name):
+        if name in exact: return True
+        if name.rpartition(".")[2] in exact: return True   # the short-name clause
+        return any(d in name for d in dotted)
+    return matches
+pass
+
+def _transformers_5x_skip_matcher(entries):
+    """transformers 5.x, `quantizers/quantizers_utils.py::should_convert_module`.
+
+    Mirrors its three clauses exactly: `re.match(key + ".", name)`,
+    `re.match(key, name)`, `name.endswith(key)`. Entries are regexes there, so
+    each alternative is wrapped rather than escaped. Folded into one alternation
+    plus one `endswith` tuple because the per-pair call is quadratic.
+    """
+    entries = [e for e in entries if isinstance(e, str)]
+    if not entries:
+        return lambda name: False
+    suffixes = tuple(entries)
+    try:
+        pattern = re.compile("|".join(f"(?:{e})\\.|(?:{e})" for e in entries))
+    except re.error:
+        def slow(name):
+            return any(re.match(f"{k}\\.", name) or re.match(f"{k}", name) or
+                       name.endswith(k) for k in entries)
+        return slow
+
+    def matches(name):
+        return bool(pattern.match(name)) or name.endswith(suffixes)
+    return matches
+pass
+
+def _unsloth_patched_skip_matcher(entries):
+    """5.x plus the whole-dot-component clause patching_utils.py adds, which is
+    what a model reloaded inside Unsloth sees."""
+    entries = [e for e in entries if isinstance(e, str)]
+    if not entries:
+        return lambda name: False
+    base = _transformers_5x_skip_matcher(entries)
+    exact = set(entries)
+
+    def matches(name):
+        return base(name) or bool(exact.intersection(name.split(".")))
+    return matches
+pass
+
+# Every matcher a checkpoint written by this module can later be loaded with.
+_SKIP_MATCHERS = (
+    _transformers_4x_skip_matcher,
+    _transformers_5x_skip_matcher,
+    _unsloth_patched_skip_matcher,
+)
+
+def vllm_compatible_skip_modules(skipped_modules, module_names = None):
+    """Every spelling of `skipped_modules` that vLLM's matcher can hit.
+
+    Fused aliases first, then namespace aliases over the result, so a fused
+    alias from a `model.language_model.*` entry also gets its
+    `language_model.model.*` twin.
+
+    `module_names`, the live module tree, drops any alias that would change what
+    Transformers quantizes. Omitting it keeps every alias, as callers had before.
+    """
+    aliased = add_vllm_namespace_skip_module_aliases(
+        add_vllm_fused_skip_module_aliases(skipped_modules)
+    )
+    return drop_skip_module_aliases_that_widen(skipped_modules, aliased, module_names)
 pass
 
 def create_huggingface_repo(
@@ -720,6 +946,7 @@ def _merge_and_overwrite_lora(
     pass
 
     filename_original = os.path.join(save_directory, filename)  # Original file path
+    _assert_shard_is_inside(filename_original, save_directory)
     count = 0
     # Collect keys for this shard so the caller can aggregate without re-reading the file (avoids
     # an extra safetensors pass purely for tied-embedding bookkeeping).
@@ -2172,6 +2399,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
+    _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
     count = 0
     safetensor_keys_seen = set()
@@ -2605,6 +2833,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
     filename_original = os.path.join(save_directory, filename)
+    _assert_shard_is_inside(filename_original, save_directory)
     tensors = OrderedDict()
     count = 0
     safetensor_keys_seen = set()
@@ -2939,6 +3168,247 @@ def _remove_transformers_version(config_path: Path):
     pass
 pass
 
+# transformers drops `mtp.*` tensors on load (Qwen3.5's
+# `_keys_to_ignore_on_load_unexpected`), so a round-tripped export declares an MTP
+# head it no longer has and llama.cpp / vLLM then break on the stale key.
+MTP_CONFIG_KEY = "mtp_num_hidden_layers"
+
+# Prefix group is repeatable and order free: Qwen3.5 writes
+# `model.language_model.mtp.*`, older Qwen2-VL naming is `language_model.model.mtp.*`.
+_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model)\.)*mtp\.")
+
+
+def is_mtp_tensor_name(name):
+    """Whether a checkpoint tensor name belongs to the MTP head."""
+    return _MTP_TENSOR_RE.match(str(name)) is not None
+
+
+def _checkpoint_tensor_names(folder):
+    """Every tensor name in a saved checkpoint, or None when it cannot be read.
+
+    None means "unknown", not "no tensors": callers must leave the config alone.
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        return None
+
+    for index_name, pattern in (
+        ("model.safetensors.index.json", "model*.safetensors"),
+        ("pytorch_model.bin.index.json", "pytorch_model*.bin"),
+    ):
+        parts = sorted(folder.glob(pattern))
+        if not parts:
+            continue
+        index_path = folder / index_name
+        # The index is canonical whenever it exists, matching llama.cpp.
+        if index_path.is_file():
+            try:
+                with index_path.open("r", encoding = "utf-8") as f:
+                    index = json.load(f)
+                weight_map = index["weight_map"]
+                if not isinstance(weight_map, dict):
+                    return None
+                return list(weight_map.keys())
+            except Exception:
+                return None
+        if pattern.endswith(".bin"):
+            # Not worth unpickling just to list names; exports are safetensors.
+            return None
+        names = []
+        for part in parts:
+            try:
+                with safe_open(part, framework = "pt", device = "cpu") as f:
+                    names.extend(f.keys())
+            except Exception:
+                return None
+        return names
+    return None
+
+
+# The other MTP spelling: DeepSeek-V3 / GLM store the head as extra `layers.N`
+# blocks past `num_hidden_layers`. Detected only so this repair does not fire on
+# such a checkpoint; `mlx/utils.py` and `llama_cpp.py` handle those.
+_LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model)\.)*layers\.(\d+)\.")
+
+
+def _has_layers_past(tensor_names, num_hidden_layers):
+    """Whether any `layers.N` index reaches past the declared layer count."""
+    if not isinstance(num_hidden_layers, int) or isinstance(num_hidden_layers, bool):
+        return False
+    if num_hidden_layers <= 0:
+        return False
+    for name in tensor_names:
+        match = _LAYER_INDEX_RE.match(str(name))
+        if match is not None and int(match.group(1)) >= num_hidden_layers:
+            return True
+    return False
+
+
+def _config_layer_count(config, container = None):
+    """The transformer layer count, searched across the whole config object.
+
+    A multimodal config can declare the MTP key at the top level while keeping
+    `num_hidden_layers` in `text_config`, so the declaring container alone is not
+    enough. Accepts dicts, config objects, or a bare layer count.
+    """
+    for value in (container, config):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+
+    def _get(holder, key):
+        if holder is None:
+            return None
+        if isinstance(holder, dict):
+            return holder.get(key)
+        return getattr(holder, key, None)
+
+    def _nested(holder):
+        return _get(holder, "text_config")
+
+    for holder in (container, config, _nested(config), _nested(container)):
+        value = _get(holder, "num_hidden_layers")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def mtp_head_is_present(tensor_names, config = None, container = None):
+    """Whether these tensor names carry a multi-token prediction head.
+
+    Covers both spellings: `mtp.*` blocks, and extra `layers.N` past
+    `num_hidden_layers`. The second needs a layer count, so without `config` a
+    head stored that way reads as absent.
+    """
+    tensor_names = list(tensor_names or ())
+    if any(is_mtp_tensor_name(name) for name in tensor_names):
+        return True
+    return _has_layers_past(tensor_names, _config_layer_count(config, container))
+
+
+def _mtp_config_containers(config):
+    """Every dict inside a loaded config.json that declares the MTP key.
+
+    Nested shapes kept identical to `_sync_gguf_nextn_layer_config` in
+    `mlx/utils.py`; a declaration missed here stays stale and fails GGUF later.
+    """
+    if not isinstance(config, dict):
+        return []
+    thinker = config.get("thinker_config")
+    candidates = [
+        config,
+        config.get("text_config"),
+        config.get("language_config"),
+        thinker.get("text_config") if isinstance(thinker, dict) else None,
+    ]
+    containers = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or MTP_CONFIG_KEY not in candidate:
+            continue
+        # Identity, not equality: equal-but-distinct dicts both need rewriting.
+        if any(candidate is seen for seen in containers):
+            continue
+        containers.append(candidate)
+    return containers
+
+
+def _config_is_writable(config_path) -> bool:
+    """Whether this config may be rewritten, checking the MODE as well as access.
+
+    `os.access(W_OK)` returns True as root even for `0444`, and exports often run
+    as root, so the mode is consulted to honour a read-only marking. An
+    unreadable stat means "cannot tell" and falls back to the access check.
+    """
+    if not os.access(config_path, os.W_OK):
+        return False
+    try:
+        mode = stat.S_IMODE(os.stat(config_path).st_mode)
+    except OSError:
+        return True
+    return bool(mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
+def reconcile_mtp_config(save_directory, tensor_names = None):
+    """Make an exported config.json's MTP declaration agree with its weights.
+
+    Returns "no-config", "not-declared", "unknown", "agrees" or "stripped".
+    Idempotent and never raises: a save must not fail on a metadata repair. Pass
+    `tensor_names` when there is no local folder to inspect (push_to_hub).
+    """
+    try:
+        config_path = os.path.join(str(save_directory), "config.json")
+        if not os.path.isfile(config_path):
+            return "no-config"
+        with open(config_path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+        containers = _mtp_config_containers(config)
+        if not containers:
+            return "not-declared"
+
+        if tensor_names is None:
+            tensor_names = _checkpoint_tensor_names(save_directory)
+        if tensor_names is None:
+            return "unknown"
+        tensor_names = list(tensor_names)
+        # Same rule as `unsloth/save.py`'s dict-level stripper.
+        if any(
+            mtp_head_is_present(tensor_names, config, container)
+            for container in containers
+        ):
+            return "agrees"
+
+        for container in containers:
+            container.pop(MTP_CONFIG_KEY, None)
+        # Staged to a sibling and `os.replace`d: opening the real file "w" would
+        # truncate it, leaving a half-written config if the dump fails (full disk).
+        directory = os.path.dirname(config_path) or "."
+        if not _config_is_writable(config_path):
+            # Checked up front: `os.replace` only needs the DIRECTORY writable, so
+            # a read-only config.json would otherwise be replaced anyway.
+            raise PermissionError(f"{config_path} is not writable")
+        handle, staged_path = tempfile.mkstemp(
+            prefix = os.path.basename(config_path) + ".",
+            suffix = ".tmp",
+            dir = directory,
+        )
+        try:
+            # mkstemp creates 0600; restore the original mode or the export
+            # becomes unreadable to everyone but its owner.
+            try:
+                os.chmod(staged_path, stat.S_IMODE(os.stat(config_path).st_mode))
+            except OSError:
+                pass
+            with os.fdopen(handle, "w", encoding = "utf-8") as f:
+                json.dump(config, f, indent = 2, ensure_ascii = False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(staged_path, config_path)
+        except BaseException:
+            # The original is untouched, so only the staged copy needs cleanup.
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+            raise
+        logger.warning_once(
+            f"Unsloth: `{os.path.basename(config_path)}` declared "
+            f"`{MTP_CONFIG_KEY}` but the exported weights carry no `mtp.*` "
+            f"tensors, so the declaration was removed. This model is exported "
+            f"without its multi-token prediction head: transformers does not "
+            f"load that head, so a merge or re-save cannot preserve it. The "
+            f"export is otherwise complete and serves normally without "
+            f"speculative decoding."
+        )
+        return "stripped"
+    except Exception as error:
+        logger.warning_once(
+            f"Unsloth: Could not reconcile `{MTP_CONFIG_KEY}` in "
+            f"{save_directory}: {error}"
+        )
+        return "unknown"
+pass
+
+
 def fix_tokenizer_config_json(tokenizer, saved_folder):
     # Add "chat_template" to tokenizer_config.json
     tokenizer_config_path = os.path.join(saved_folder, "tokenizer_config.json")
@@ -3055,6 +3525,257 @@ def _carry_over_vocab_size(base_config, trained_config):
             f"the embedding rows written."
         )
     pass
+pass
+
+
+def _shard_name_stays_inside(name):
+    """Whether `name` resolves under the directory it is joined onto.
+
+    Judged under POSIX and Windows rules both: the index gets exported and read back
+    elsewhere, and `..\\..\\x` is an ordinary filename on POSIX and a traversal on
+    Windows, so the host's rules alone would bless an index that escapes on the
+    machine that opens it.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if "\x00" in name:
+        # `os.path.exists` raises ValueError on NUL, which the caller swallows into a
+        # bare assert 300 lines later.
+        return False
+    if ntpath.splitdrive(name)[0]:
+        # Drive-qualified but not drive-absolute: `ntpath.isabs("C:..\\x")` is False and
+        # normpath keeps `C:` ahead of the `..`, so the leading-`..` test never sees it,
+        # while Windows resolves it against that drive's working directory.
+        return False
+    # Windows trims the trailing run of spaces and periods from a component, so `.. `
+    # and `.. .` open as `..` while `normpath` sees the literal spelling and never
+    # matches the traversal test. Judge the Windows-visible spelling too.
+    # `.rstrip(" .")` is WRONG here: it takes `.. .` to the empty string, which normpath
+    # drops, accepting the traversal. Count dots instead. Three or more is deliberately
+    # stricter than Windows, where "a segment of three or more periods isn't normalized
+    # and is actually a valid file/directory name": fails closed, no shard is named that.
+    # learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats
+    def _as_windows_opens_it(component):
+        if component and not (set(component) - {".", " "}):
+            _dots = component.count(".")
+            return "" if _dots == 0 else ("." if _dots == 1 else "..")
+        return component.rstrip(" .")
+
+    _windows_view = "\\".join(
+        _as_windows_opens_it(_component)
+        for _component in name.replace("/", "\\").split("\\")
+    )
+    for _candidate in (name, _windows_view):
+        for _module in (posixpath, ntpath):
+            if _module.isabs(_candidate):
+                return False
+            if _candidate[:1] in ("\\", "/"):
+                # Rooted but drive-relative (`\victim.safetensors`). `ntpath.isabs` says
+                # NOT absolute, correctly, since Windows resolves it against the current
+                # drive; it still lands at that drive's root.
+                return False
+            # Normalise the candidate ON ITS OWN: normpath collapses interior `..`, so a
+            # leading one survives exactly when the path escapes. Joining onto a stand-in
+            # root and testing the prefix is WRONG, because it is collidable:
+            # `../unsloth_shard_root/victim` leaves the stand-in and re-enters a sibling
+            # of the same name, normalising back under it while the real join escapes.
+            _normalized = _module.normpath(_candidate)
+            if _normalized in (_module.curdir, _module.pardir):
+                return False
+            if _normalized.startswith(_module.pardir + _module.sep):
+                return False
+    return True
+
+
+def _has_directory_component(name):
+    """Whether `name` puts its shard in a subdirectory, under EITHER separator rule.
+
+    Judged the same way the predicate that admitted the name judges: native
+    `os.path.dirname` sees no directory in `weights\\model.safetensors` on POSIX, which
+    would leave the export with neither a root shard nor an index naming the one it has.
+    """
+    return bool(posixpath.dirname(name)) or bool(ntpath.dirname(name))
+
+
+def _reject_unsafe_shard_index(index_path):
+    """Refuse an index whose weight_map points outside the directory it sits in.
+
+    Raised rather than rewritten: a quiet rewrite hands back an export whose tensors no
+    longer resolve. Returns the bytes it vouched for, so the caller exports those rather
+    than re-reading a file that can be swapped in between.
+    """
+    try:
+        with open(index_path, "rb") as file:
+            raw = file.read()
+        # Permissive, not strict UTF-8: transformers opens this in the locale encoding,
+        # so under cp1252 it parses bytes strict UTF-8 rejects, and refusing to decode
+        # would wave that index through to a reader that still follows its traversal.
+        index_data = json.loads(raw.decode("utf-8", errors = "surrogateescape"))
+    except Exception:
+        return None
+    if not isinstance(index_data, dict):
+        # `[]`, `null` and bare scalars parse fine, so the `except` never sees them. A
+        # stale one beside a model needing no index used to be ignored, and must stay so.
+        return None
+    weight_map = index_data.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return raw
+    unsafe = sorted({
+        str(value) for value in weight_map.values()
+        if not _shard_name_stays_inside(value)
+    })
+    if unsafe:
+        raise RuntimeError(
+            f"Unsloth: Refusing to export {index_path} because its weight_map names "
+            f"{len(unsafe)} shard path(s) outside the model directory: "
+            f"{', '.join(repr(name) for name in unsafe[:5])}."
+        )
+    return raw
+
+
+def _resolves_inside(path, directory):
+    """Whether `path` REALLY lands under `directory`, links resolved.
+
+    Lexical is right for a name vouched for in a file someone else opens; this judges a
+    path about to be written here, so it follows the links that exist on this machine.
+    """
+    resolved = os.path.realpath(path)
+    root = os.path.realpath(directory)
+    try:
+        # `commonpath` rather than a `root + os.sep` prefix, which is wrong at a
+        # filesystem root: realpath("/") is "/", so the prefix becomes "//" and
+        # "/model.safetensors" tests as outside the directory holding it.
+        return os.path.commonpath([resolved, root]) == root
+    except ValueError:
+        return False
+
+
+def _materialize_shard_that_resolves_outside(file_path, save_directory):
+    """Replace a shard that is a link out of `save_directory` with a real copy.
+
+    In place, nothing copies the shard first (`os.path.exists` is true THROUGH a link),
+    so the `r+b` mmap overwrite went straight into the link target, with no index
+    involved, which is why the `weight_map` guarding never caught it.
+
+    Materialised rather than refused because the layout is ordinary: a Hugging Face cache
+    snapshot is exactly this, every shard a link into shared `blobs/`. Refusing breaks
+    merging one; writing through corrupts a blob other models share.
+    """
+    if not _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory):
+        # Materialising is a write, so it must not land in a directory that is not ours.
+        return
+    if not os.path.islink(file_path):
+        # Escaping through a symlinked PARENT cannot be repaired by replacing the file,
+        # so `_assert_shard_is_inside` refuses it at the sink instead.
+        return
+    if _resolves_inside(file_path, save_directory):
+        return
+    target = os.path.realpath(file_path)
+    if not os.path.isfile(target):
+        return
+    # Copy beside it then `os.replace`, never unlink then copy: on ENOSPC or an
+    # interruption the unlink ordering leaves the user's checkpoint with its link gone
+    # and a partial file in its place. `mkstemp` rather than a fixed
+    # `<shard>.unsloth-materializing`, because this directory is attacker-supplied: a
+    # fixed name had to be unlinked first to survive a leftover, and that unlink deletes
+    # whatever is really there, while O_EXCL at 0o600 cannot collide at all.
+    # The basename is carried only to name the shard a leftover belongs to, and must be
+    # BOUNDED: `mkstemp` adds 8 random characters, so a basename near NAME_MAX pushed the
+    # staging component over it and raised ENAMETOOLONG (ext4, at 230 characters).
+    _staging_directory = os.path.dirname(file_path) or os.curdir
+    try:
+        _name_max = os.pathconf(_staging_directory, "PC_NAME_MAX")
+    except (AttributeError, OSError, ValueError):
+        _name_max = 255
+    _marker = ".unsloth-materializing-"
+    _budget = max(0, _name_max - len(_marker) - 8)
+    _staging_fd, staging = tempfile.mkstemp(
+        dir = _staging_directory,
+        prefix = os.path.basename(file_path)[:_budget] + _marker,
+    )
+    try:
+        with os.fdopen(_staging_fd, "wb") as _staging_file, open(target, "rb") as _source:
+            shutil.copyfileobj(_source, _staging_file)
+        shutil.copystat(target, staging)
+        os.replace(staging, file_path)
+    except BaseException:
+        if os.path.exists(staging):
+            try:
+                os.remove(staging)
+            except OSError:
+                pass
+        raise
+    print(
+        f"Unsloth: Copied {os.path.basename(file_path)} out of the link it pointed at, "
+        f"so the merge does not write outside {save_directory}"
+    )
+
+
+def _assert_shard_is_inside(file_path, save_directory):
+    """Last check before a writer opens a shard. Every write sink calls this.
+
+    At the sinks rather than where the name is chosen, so it holds however the path
+    arrived: local listing, index, Hub listing, or a later rename.
+
+    PARENT and path both, because resolving the whole path follows the final component,
+    which is what a READER sees, while these writers act on the directory ENTRY:
+    `os.replace` at the mxfp4 and fp8 sinks never follows the last component, so a parent
+    linking OUT with a leaf linking back IN passed the path-only check while the
+    replacement wrote into the external directory. Nothing contained is refused: a flat
+    shard's parent IS `save_directory`, a nested one's is the subdirectory it created.
+    """
+    if _resolves_inside(os.path.dirname(file_path) or os.curdir, save_directory) and \
+            _resolves_inside(file_path, save_directory):
+        return
+    raise RuntimeError(
+        f"Unsloth: Refusing to write {file_path} because it, or the directory holding "
+        f"it, resolves outside the output directory {os.path.realpath(save_directory)} "
+        f"(the path resolves to {os.path.realpath(file_path)}, its directory to "
+        f"{os.path.realpath(os.path.dirname(file_path) or os.curdir)}). A shard, or one "
+        f"of its parent directories, is a link out of the directory being exported to."
+    )
+
+
+def _export_index_atomically(source_path, destination, payload, mode_from = None):
+    """Write `payload` at `destination` without following a link sitting there.
+
+    `source_path` is the file whose mode to carry over, None when the index is regenerated
+    here and has no source.
+
+    `open(destination, "wb")`, and `shutil.copy2` which uses it, follow a symlink at the
+    destination and truncate its TARGET; `os.replace` swaps the directory ENTRY and never
+    follows the last component. `copystat` runs on the staging file, so the index is never
+    briefly readable under the creation mode before being narrowed.
+    """
+    _fd, _staging = tempfile.mkstemp(
+        dir = os.path.dirname(destination) or os.curdir, prefix = ".unsloth-index-",
+    )
+    try:
+        with os.fdopen(_fd, "wb") as _index_file:
+            _index_file.write(payload)
+        if source_path is not None:
+            shutil.copystat(source_path, _staging)
+        else:
+            # `mkstemp` opens at 0o600 but `open(..., "w")` gave the umask, so shipping
+            # 0o600 hands back an index only its owner can read. The mode comes off a file
+            # the export just wrote: umask-correct, and the index ends up as readable as
+            # the weights beside it. NOT `os.umask` to read the umask -- it has no getter,
+            # so reading means a process-wide set-and-restore that races other threads.
+            _mode = 0o644
+            if mode_from is not None:
+                try:
+                    _mode = os.stat(mode_from).st_mode & 0o666
+                except OSError:
+                    pass
+            os.chmod(_staging, _mode)
+        os.replace(_staging, destination)
+    except BaseException:
+        if os.path.exists(_staging):
+            try:
+                os.remove(_staging)
+            except OSError:
+                pass
+        raise
 pass
 
 
@@ -3188,8 +3909,13 @@ def merge_and_overwrite_lora(
                         index_data = json.load(f)
                         # Extract file names from the index if available
                         if "weight_map" in index_data:
-                            # Get unique filenames from weight map
-                            indexed_files = set(index_data["weight_map"].values())
+                            # Drop names that escape, keep the rest exactly as written.
+                            # Filtering closes this, NOT flattening: a contained nested name
+                            # is a real file, and its basename is a path that does not exist.
+                            indexed_files = {
+                                _name for _name in index_data["weight_map"].values()
+                                if _shard_name_stays_inside(_name)
+                            }
                             # Only use these if we didn't find files directly
                             if not safetensors_list:
                                 safetensors_list = list(indexed_files)
@@ -3384,7 +4110,15 @@ def merge_and_overwrite_lora(
             # Ensure quantization_config exists before modifying
             if not hasattr(merged_model.config, "quantization_config"):
                 merged_model.config.quantization_config = {} # Initialize if somehow missing
-            merged_model.config.quantization_config["llm_int8_skip_modules"] = skipped_modules
+            # These are leaf projections; vLLM only ever sees the fused modules, so
+            # without the aliases a dynamic-quant merge loads under Unsloth but dies in
+            # vLLM on `assert param_data.shape == loaded_weight.shape`. The live tree
+            # drops any alias that would change what Transformers quantizes on reload.
+            merged_model.config.quantization_config["llm_int8_skip_modules"] = \
+                vllm_compatible_skip_modules(
+                    skipped_modules,
+                    module_names = [name for name, _ in merged_model.named_modules()],
+                )
 
         print(f"Unsloth: Saving merged 4bit model to {save_directory}...")
         try:
@@ -3467,7 +4201,11 @@ def merge_and_overwrite_lora(
     copied_all_from_cache = False
     copied_tokenizer_model_from_cache = False
     is_hf_sharded = is_hf_sharded_safetensors(safetensors_list)
-    safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded) else []
+    # A lone nested shard needs its index carried too: the two conditions beside this one
+    # cover what a loader finds unaided (several shards, or HF `model-0000n-of-0000m`), and
+    # `weights/model.safetensors` is neither, leaving the export with nothing discoverable.
+    _has_nested_shard = any(_has_directory_component(_f) for _f in safetensors_list)
+    safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
     # copying it (regenerated below). FP8 only dequantizes on a merged_16bit save, so an
@@ -3475,16 +4213,40 @@ def merge_and_overwrite_lora(
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
     ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
+    # Before any branch decides whether to copy it: filtering the in-memory list is not
+    # enough, since a later from_pretrained joins the raw weight_map values itself.
+    # Outside the branch below, which a dequant or splitting export skips. Scoped to
+    # indexes that can reach the output; refusing an inert one fails a working export.
+    _validated_index_bytes = None
+    if is_local_path:
+        _local_index_path = os.path.join(model_name, "model.safetensors.index.json")
+        _exports_in_place = os.path.realpath(save_directory) == os.path.realpath(model_name)
+        if (safe_tensor_index_files or _exports_in_place) and os.path.exists(_local_index_path):
+            _validated_index_bytes = _reject_unsafe_shard_index(_local_index_path)
     # ONLY download/copy the original index if we are NOT dequantizing a quantized model
     if not _is_quant_dequant and not needs_splitting:
         if is_local_path:
             os.makedirs(save_directory, exist_ok = True)
             # Copy from local
+            local_index_path = os.path.join(model_name, "model.safetensors.index.json")
             if safe_tensor_index_files:
-                local_index_path = os.path.join(model_name, "model.safetensors.index.json")
                 if os.path.exists(local_index_path):
+                    _index_destination = os.path.join(save_directory, "model.safetensors.index.json")
                     try:
-                        shutil.copy2(local_index_path, os.path.join(save_directory, "model.safetensors.index.json"))
+                        # Covers both payloads; `samefile` follows links as `copy2` did.
+                        if os.path.exists(_index_destination) and \
+                                os.path.samefile(local_index_path, _index_destination):
+                            raise shutil.SameFileError
+                        if _validated_index_bytes is None:
+                            # Unparseable: carry it across, through the same safe write.
+                            with open(local_index_path, "rb") as _index_source:
+                                _index_payload = _index_source.read()
+                        else:
+                            # The bytes the guard read: a second read can be swapped.
+                            _index_payload = _validated_index_bytes
+                        _export_index_atomically(
+                            local_index_path, _index_destination, _index_payload,
+                        )
                     except shutil.SameFileError:
                         pass
                     except Exception as e:
@@ -3553,12 +4315,21 @@ def merge_and_overwrite_lora(
     # Step 5: Iterate through original shards, merge LoRA, and overwrite/save
     for filename in ProgressBar(safetensors_list, desc = "Unsloth: Preparing safetensor model files"):
         file_path = os.path.join(save_directory, filename)
+        _materialize_shard_that_resolves_outside(file_path, save_directory)
+        # Before the copy, not only at the writers: those run much later, so a linked
+        # output component (`save_directory/weights -> /outside`) was followed by
+        # `makedirs` and `copy2` before anything refused.
+        _assert_shard_is_inside(file_path, save_directory)
         # Only download if we didn't get everything from cache AND this specific file doesn't exist
         # AND we're in low disk space mode
         # For local models, copy the file if needed
         if is_local_path and not os.path.exists(file_path):
             local_file_path = os.path.join(model_name, filename)
             if os.path.exists(local_file_path):
+                # A nested name has no parent here yet, so `copy2` would raise
+                # FileNotFoundError. The name is known to stay inside LEXICALLY, no
+                # stronger: a symlinked component still resolves wherever it points.
+                os.makedirs(os.path.dirname(file_path), exist_ok = True)
                 shutil.copy2(local_file_path, file_path)
                 print(f"Copied {filename} from local model directory")
 
@@ -3609,7 +4380,12 @@ def merge_and_overwrite_lora(
     _quant_dequant_index = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
     ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
-    regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded) and save_method != "mxfp4"
+    # A dequant or splitting export skips the index-copy block, so regeneration is the
+    # only thing that can leave an index behind, and from_pretrained looks for exactly
+    # `model.safetensors` then the index at the ROOT, which a nested singleton is neither.
+    # Read off the FINAL list: splitting and renumbering flatten names before this point.
+    _final_has_nested_shard = any(_has_directory_component(_f) for _f in final_safetensors_list)
+    regenerate_index = (_quant_dequant_index or needs_splitting) and (len(final_safetensors_list) > 1 or is_final_safetensors_list_sharded or _final_has_nested_shard) and save_method != "mxfp4"
     weight_map = {}
 
     # Collect all tensor keys encountered across shards so we can reason about tied embeddings
@@ -3789,8 +4565,17 @@ def merge_and_overwrite_lora(
 
         index_data = {"metadata": {}, "weight_map": weight_map}
         index_path = os.path.join(save_directory, "model.safetensors.index.json")
-        with open(index_path, "w", encoding = "utf-8") as f:
-            json.dump(index_data, f, indent = 4)
+        # Staged and replaced for the same reason the copied index is.
+        _mode_donor = next(
+            (_p for _p in (os.path.join(save_directory, _f) for _f in final_safetensors_list)
+             if os.path.exists(_p)),
+            None,
+        )
+        _export_index_atomically(
+            None, index_path,
+            json.dumps(index_data, indent = 4).encode("utf-8"),
+            mode_from = _mode_donor,
+        )
 
         if push_to_hub:
             upload_items("model.safetensors.index.json")

@@ -34,6 +34,7 @@ import importlib.machinery
 import importlib.util
 import numpy as np
 import os
+import stat
 import torch
 import subprocess
 import types
@@ -177,6 +178,14 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_window_index",
     "get_vision_interpolation_indices_and_weights",
     "get_vision_bilinear_indices_and_weights",
+
+    # Locally defined grid helpers get their own compile decorators. Listing them
+    # disables helper compilation and allows graph breaks in their callers.
+    # Keep temporal_merge_index listed: it fails on supported torch 2.9.1 even
+    # though it traces on 2.10.0 and 2.13.0.
+    "get_vision_pixel_shuffle_index",   # muse_glimmer
+    "get_vision_frame_index",           # kimi_k25
+    "get_vision_temporal_merge_index",  # kimi_k25
 ]
 
 
@@ -1536,11 +1545,37 @@ def _set_mode_by_descriptor(descriptor, location, mode):
 pass
 
 def _write_bytes_durably(location, new_write_bytes):
-    """Write and fsync. Buffered, so a short write is retried rather than lost."""
-    with open(location, "wb") as file:
-        file.write(new_write_bytes)
-        file.flush()
-        os.fsync(file.fileno())
+    """Write and fsync, refusing to follow a link out of the compiled cache.
+
+    The cache path and the generated module names are both predictable, so a
+    co-located user can plant a symlink at one. O_NOFOLLOW turns that into an
+    OSError, which sends the caller to _replace_compiled_cache_file, and that lands
+    on the name rather than through it; the in-place path is given up only when it is
+    unsafe. The fstat is needed too, since O_NOFOLLOW says nothing about a FIFO or a
+    device node. Where the constant does not exist (Windows) there is no atomic
+    no-follow open and an lstat first is only a time of check, so the in-place path
+    is not attempted at all.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise OSError(f"Unsloth: no O_NOFOLLOW on this platform: replacing `{location}` instead of writing in place.")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= no_follow
+    flags |= getattr(os, "O_BINARY", 0)
+    # A FIFO planted here would otherwise block forever waiting for a reader.
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(location, flags, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Unsloth: refusing to write `{location}`: not a regular file.")
+        with os.fdopen(descriptor, "wb") as file:
+            descriptor = None
+            file.write(new_write_bytes)
+            file.flush()
+            os.fsync(file.fileno())
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 pass
 
 def _write_compiled_cache_file(function_location, new_write_bytes):

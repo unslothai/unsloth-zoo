@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
-and recurrent decode convolution and SiLU."""
+recurrent decode convolution and SiLU, and the MoE routing chain."""
 
 import ast
 import functools
@@ -277,6 +277,17 @@ def _fused_moe_gate_up_class(original_class, projection_type, gather_sort, scatt
 
 
 @contextmanager
+def _uncached_allocations():
+    """Free buffers to the driver: a pack replaces two arrays with one of their combined size,
+    which neither freed buffer can serve, so cached they only accumulate."""
+    previous_limit = mx.set_cache_limit(0)
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(previous_limit)
+
+
+@contextmanager
 def fused_moe_gate_up(model):
     """Fuse quantized MoE gate and up projections while their weights stay fixed.
 
@@ -285,7 +296,7 @@ def fused_moe_gate_up(model):
     """
     patched = []
     try:
-        with _MOE_GATE_UP_LOCK:
+        with _MOE_GATE_UP_LOCK, _uncached_allocations():
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 specs = _moe_switch_specs()
                 modules = model.named_modules() if hasattr(model, "named_modules") else ()
@@ -752,3 +763,340 @@ def fused_residual_norm(model):
             for module, base, fused in reversed(patched):
                 if type(module) is fused:
                     module.__class__ = base
+
+_QWEN_ROUTING, _GEMMA_ROUTING = 0, 1  # kernel MODE
+
+# The kernel emulates the chain's rounding: softmax partials and reciprocal, stable tie order,
+# sequential bf16 sum over <= 8 values. `_moe_router_verified` checks that at first use.
+@functools.cache
+def _moe_router_kernel():
+    try:
+        if not mx.metal.is_available():
+            return None
+        return mx.fast.metal_kernel(
+            name = "unsloth_moe_router",
+            input_names = ["logits", "scale"], output_names = ["inds", "weights"],
+            compile_options = {"math_mode": "safe"},
+            source = """
+                #pragma clang fp contract(off) reassociate(off)
+                // One simdgroup per row. Register r of lane l holds element
+                // 128*(r/4) + 4*l + r%4, the element the native softmax's thread 32*(r/4)+l
+                // reads at offset r%4, so the fp32 normalizer sums in the native order.
+                constexpr int R = (E + 127) / 128 * 4;
+                const uint row = thread_position_in_grid.x / 32;
+                const uint lane = thread_index_in_simdgroup;
+                if (row >= uint(logits_shape[0])) return;
+                const device T* x = logits + row * E;
+
+                float v[R];
+                uint taken = 0u;
+                for (int r = 0; r < R; ++r) {
+                    const int e = 128 * (r / 4) + 4 * lane + (r % 4);
+                    if (e < E) {
+                        v[r] = float(x[e]);
+                    } else {
+                        v[r] = -INFINITY;
+                        taken |= 1u << r;
+                    }
+                }
+
+                if (MODE == 0) {
+                    float m = v[0];
+                    for (int r = 1; r < R; ++r) m = max(m, v[r]);
+                    m = simd_max(m);
+                    float total = 0.0f;
+                    for (int g = 0; g < R / 4; ++g) {
+                        float partial = 0.0f;
+                        for (int i = 0; i < 4; ++i) {
+                            v[4 * g + i] = fast::exp(v[4 * g + i] - m);
+                            partial += v[4 * g + i];
+                        }
+                        total += simd_sum(partial);
+                    }
+                    const float normalizer = 1 / total;
+                    for (int r = 0; r < R; ++r) v[r] = float(T(v[r] * normalizer));
+                }
+
+                bool nan_row = false;  // NaN sorts last in mx.argpartition and poisons the weights
+                for (int r = 0; r < R; ++r) { nan_row |= isnan(v[r]); if (isnan(v[r])) v[r] = INFINITY; }
+                nan_row = simd_any(nan_row);
+                float sel_val[K];
+                uint sel_idx[K];
+                for (int k = 0; k < K; ++k) {
+                    float best = -INFINITY;
+                    int bi = -1;
+                    for (int r = 0; r < R; ++r) {
+                        if (!(taken & (1u << r)) && v[r] >= best) { best = v[r]; bi = r; }
+                    }
+                    const float m = simd_max(best);
+                    const uint cand = (bi >= 0 && best == m)
+                        ? uint(128 * (bi / 4) + 4 * lane + (bi % 4)) : 0u;
+                    const uint win = simd_max(cand);
+                    if ((win / 4) % 32 == lane) taken |= 1u << (4 * (win / 128) + win % 4);
+                    sel_idx[K - 1 - k] = win;
+                    sel_val[K - 1 - k] = m;
+                }
+
+                if (lane != 0) return;
+                device uint* oi = inds + row * K;
+                device OUT_T* ow = weights + row * K;
+                for (int k = 0; k < K; ++k) oi[k] = sel_idx[k];
+                if (nan_row) { for (int k = 0; k < K; ++k) ow[k] = OUT_T(NAN); return; }
+                if (MODE == 0) {
+                    float denom = sel_val[0];
+                    for (int k = 1; k < K; ++k) denom = float(T(denom + sel_val[k]));
+                    for (int k = 0; k < K; ++k) {
+                        ow[k] = OUT_T(NORM ? sel_val[k] / denom : sel_val[k]);
+                    }
+                } else {
+                    const float m = sel_val[K - 1];
+                    float e[K];
+                    float part[2] = {0.0f, 0.0f};
+                    for (int k = 0; k < K; ++k) {
+                        e[k] = float(T(fast::exp(float(T(sel_val[k] - m)))));
+                        part[k / 4] = float(T(part[k / 4] + e[k]));
+                    }
+                    const float recip = float(T(1.0f / float(T(part[0] + part[1]))));
+                    for (int k = 0; k < K; ++k) {
+                        ow[k] = OUT_T(float(T(e[k] * recip)) * float(scale[sel_idx[k]]));
+                    }
+                }
+            """,
+        )
+    except (AttributeError, TypeError):
+        return None
+
+
+_MOE_ROUTER_DTYPES = (mx.bfloat16, mx.float16, mx.float32)
+
+
+def _moe_router_shape_ok(experts, top_k, mode):
+    # Qwen sums softmax partials of at most two simdgroups in the native order;
+    # the 32-bit `taken` mask caps both modes at 1024.
+    return experts % 32 == 0 and experts <= (256 if mode == _QWEN_ROUTING else 1024) and 1 <= top_k <= 8
+
+
+def _run_moe_router(logits, scale, top_k, mode, normalize, out_dtype):
+    experts = logits.shape[-1]
+    rows = logits.size // experts
+    inds, weights = _moe_router_kernel()(
+        inputs = [logits.reshape(rows, experts), scale],
+        template = [("T", logits.dtype), ("OUT_T", out_dtype), ("E", experts), ("K", top_k),
+                    ("MODE", mode), ("NORM", int(normalize))],
+        grid = ((rows + 7) // 8 * 256, 1, 1), threadgroup = (256, 1, 1),
+        output_shapes = [(rows, top_k), (rows, top_k)], output_dtypes = [mx.uint32, out_dtype],
+    )
+    return inds.reshape(*logits.shape[:-1], top_k), weights.reshape(*logits.shape[:-1], top_k)
+
+
+def _native_moe_router(logits, scale, top_k, mode, normalize):
+    if mode == _QWEN_ROUTING:
+        gates = mx.softmax(logits, axis = -1, precise = True)
+        inds = mx.argpartition(gates, kth = -top_k, axis = -1)[..., -top_k:]
+        weights = mx.take_along_axis(gates, inds, axis = -1)
+        if normalize:
+            weights = weights / weights.sum(axis = -1, keepdims = True)
+        return inds, weights
+    inds = mx.argpartition(logits, kth = -top_k, axis = -1)[..., -top_k:]
+    weights = mx.softmax(mx.take_along_axis(logits, inds, axis = -1), axis = -1)
+    return inds, weights * scale[inds]
+
+
+def _moe_router_out_dtype(logits, scale, mode):
+    return mx.result_type(logits, scale) if mode == _GEMMA_ROUTING else logits.dtype
+
+
+# Qwen routing never reads `scale`; the kernel takes one because its input list is fixed.
+_MOE_ROUTER_NO_SCALE = mx.zeros((1,), dtype = mx.float32)
+
+
+@functools.cache
+def _moe_router_verified(dtype, scale_dtype, experts, top_k, mode, normalize):
+    if mode == _QWEN_ROUTING:
+        scale = _MOE_ROUTER_NO_SCALE
+    else:
+        scale = mx.random.uniform(0.5, 1.5, (experts,), key = mx.random.key(experts)).astype(scale_dtype)
+    probes = [mx.random.normal((rows, experts), key = mx.random.key(rows)) * 3 for rows in (1, 9)]
+    probes.append(mx.random.randint(0, 4, (9, experts), key = mx.random.key(0)))  # top-k boundary ties
+    for logits in probes:
+        logits = logits.astype(dtype)
+        native = _native_moe_router(logits, scale, top_k, mode, normalize)
+        fused = _run_moe_router(logits, scale, top_k, mode, normalize,
+                                _moe_router_out_dtype(logits, scale, mode))
+        if not all(a.dtype == b.dtype and mx.array_equal(a, b) for a, b in zip(native, fused)):
+            logger.warning("the fused MoE router does not reproduce this MLX build's native rounding "
+                           "for %s x%d top-%d; the native chain stays in use", dtype, experts, top_k)
+            return False
+    return True
+
+
+def _fused_moe_router(logits, scale, top_k, mode, normalize):
+    """The fused routing, or None when this call has to take the native chain."""
+    # A 1-D input normalizes with a sum that rounds differently.
+    if (logits.dtype not in _MOE_ROUTER_DTYPES or logits.size == 0 or logits.ndim < 2
+            or not _moe_router_shape_ok(logits.shape[-1], top_k, mode)
+            or not _moe_router_verified(logits.dtype, scale.dtype, logits.shape[-1], top_k,
+                                        mode, normalize)):
+        return None
+    return _run_moe_router(logits, scale, top_k, mode, normalize,
+                           _moe_router_out_dtype(logits, scale, mode))
+
+
+def _drifted_call(self, native):
+    """The base class's routing body once it or its `mx` alias drifted from the pinned one, else None."""
+    current = type(self)._unsloth_router_native.__call__
+    if current is native and native.__globals__.get("mx") is mx:
+        return None
+    return current
+
+
+def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
+    # 0.7.1 scales the shared expert by `_shared_expert_scale`, earlier bodies gate it
+    # by a sigmoid. mlx_lm honours `norm_topk_prob`; mlx_vlm always normalizes.
+    def fused_call(self, x, target_verify = False):
+        drifted = _drifted_call(self, native)
+        if drifted is not None:
+            return drifted(self, x, target_verify) if target_verify else drifted(self, x)
+        if target_verify or self.training or getattr(self, "sharding_group", None) is not None:
+            return native(self, x, target_verify) if target_verify else native(self, x)
+        normalize = bool(self.norm_topk_prob) if top_k_norm else True
+        routed = _fused_moe_router(self.gate(x), _MOE_ROUTER_NO_SCALE, self.top_k, _QWEN_ROUTING, normalize)
+        if routed is None:
+            return native(self, x)
+        inds, scores = routed
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis = -2)
+        shared_y = self.shared_expert(x)
+        if scaled_shared:
+            shared_y = self._shared_expert_scale(x) * shared_y
+        else:
+            shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        return y + shared_y
+
+    return fused_call
+
+
+class _RouterNormScale:
+    """The Gemma router's `scale * root_size`, built at scope entry, used while `scale` is that array."""
+
+    def __init__(self, module):
+        self.scale = module.scale
+        self.weight = self.scale * module._root_size
+
+    def matches(self, module):
+        return module.scale is self.scale
+
+
+def _gemma4_router_call(native):
+    def fused_call(self, x):
+        drifted = _drifted_call(self, native)
+        if drifted is not None:
+            return drifted(self, x)
+        norm = getattr(self, "_unsloth_router_norm", None)
+        if self.training or norm is None or not norm.matches(self):
+            return native(self, x)
+        normed = mx.fast.rms_norm(x, norm.weight, self.eps)
+        routed = _fused_moe_router(self.proj(normed), self.per_expert_scale,
+                                   self.config.top_k_experts, _GEMMA_ROUTING, False)
+        return native(self, x) if routed is None else routed
+
+    return fused_call
+
+
+# Routing bodies the fused calls reimplement: builder, kernel mode, expert-count and top-k attributes.
+_MOE_ROUTER_BODIES = {
+    # mlx_vlm qwen3_5_moe: 0.4.4-0.5.0 and 0.6.16-0.7.0; 0.6.0-0.6.15 takes a target-verify
+    # argument; 0.7.1 scales the shared expert. qwen4_exp reuses the block, subclassing it in 0.7.1.
+    "903a5a99afcad95a": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
+    "0ca80e0451802015": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
+    "b948b94a9d18333f": (functools.partial(_qwen3_5_moe_call, scaled_shared = True, top_k_norm = False), _QWEN_ROUTING, "num_experts", "top_k"),
+    # qwen3_next in mlx_lm and mlx_vlm, reused by mlx_lm qwen3_5
+    "6d29bc869fdde5aa": (functools.partial(_qwen3_5_moe_call, scaled_shared = False, top_k_norm = True), _QWEN_ROUTING, "num_experts", "top_k"),
+    # gemma4 Router in mlx_vlm gemma4_text, gemma4 and mlx_lm gemma4_text
+    "c64fed4e7e7514ea": (_gemma4_router_call, _GEMMA_ROUTING, "config.num_experts", "config.top_k_experts"),
+}
+
+
+@functools.cache
+def _moe_router_class(base):
+    call = getattr(base, "__call__", None)
+    if not isinstance(call, FunctionType) or hasattr(call, "__wrapped__") or call.__closure__:
+        return None
+    try:
+        spec = _MOE_ROUTER_BODIES.get(_ast_fingerprint(call))
+    except (OSError, TypeError, SyntaxError):
+        return None
+    if spec is None or call.__globals__.get("mx") is not mx:
+        return None
+    build, mode, experts_path, top_k_path = spec
+    patched = type(f"_FusedMoERouter{base.__name__}", (base,),
+                   {"__call__": build(call), "_unsloth_router_native": base})
+    return patched, mode, experts_path, top_k_path
+
+
+# `generation_mode` serializes, but the loader's two generate() wrappers enter this scope directly
+# and do not, and this is the only one of the four carrying a per-module count: unlocked,
+# `count += 1` against a `finally` that pops the same key strands the patched class or raises
+# AttributeError out of generation (5 of 40 contended rounds).
+_MOE_ROUTER_LOCK = RLock()
+
+@contextmanager
+def fused_moe_router(model):
+    """Fuse the MoE routing chain into one Metal dispatch during serialized inference.
+
+    Modules whose routing body, expert count, or top-k the kernel does not cover keep
+    their native call, as do training and distributed models; the native call is also
+    taken per invocation when the kernel cannot reproduce this MLX build's rounding.
+    Instance classes are restored when the context exits, including on cancellation.
+    Gemma routers fold `scale` into a normalization weight held until the outermost
+    scope exits, so `scale` must stay fixed while the scope is open, as the gate and up
+    packing requires of its own weights: replacing it is detected and takes the native
+    call, editing it in place is not detected. Edits between scopes are always picked up.
+
+    Bit-identity covers every index and every finite weight, not the NaN payload of a poisoned
+    row: MLX's own payload is not stable across Apple GPU families, so nothing can match it
+    everywhere. Both paths return NaN in the same positions.
+    """
+    changed = []
+    try:
+        with _MOE_ROUTER_LOCK:
+            modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and _moe_router_kernel() is not None):
+                for _, module in modules:
+                    # Type before `training`: named_modules() may yield plain stand-ins.
+                    if not isinstance(module, dict) or module.training or "__call__" in module:
+                        continue
+                    base = type(module)
+                    if getattr(base, "_unsloth_router_native", None) is not None:
+                        if getattr(module, "_unsloth_router_scopes", 0):
+                            module._unsloth_router_scopes += 1
+                            changed.append(module)
+                        continue
+                    spec = _moe_router_class(base)
+                    if spec is None:
+                        continue
+                    patched, mode, experts_path, top_k_path = spec
+                    experts = _resolve_dotted(module, experts_path)
+                    top_k = _resolve_dotted(module, top_k_path)
+                    if not (isinstance(experts, int) and isinstance(top_k, int)
+                            and _moe_router_shape_ok(experts, top_k, mode)):
+                        continue
+                    module.__class__ = patched
+                    module._unsloth_router_scopes = 1
+                    changed.append(module)
+                    if mode == _GEMMA_ROUTING:
+                        module._unsloth_router_norm = _RouterNormScale(module)
+        yield model
+    finally:
+        with _MOE_ROUTER_LOCK:
+            for module in reversed(changed):
+                scopes = getattr(module, "_unsloth_router_scopes", 0)
+                if scopes > 1:
+                    module._unsloth_router_scopes = scopes - 1
+                    continue
+                native = getattr(type(module), "_unsloth_router_native", None)
+                if native is not None:
+                    module.__class__ = native
+                module.__dict__.pop("_unsloth_router_scopes", None)
+                module.__dict__.pop("_unsloth_router_norm", None)

@@ -597,7 +597,14 @@ def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest 
         llama_cpp, "_fetch_release_json_asset",
         lambda assets, name: manifest if "manifest" in name else {"artifacts": {}},
     )
-    def fake_stage(folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None, source_assets = None):
+    def fake_stage(
+        folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None,
+        source_assets = None, checksums = None,
+    ):
+        # The checksum map has to reach here: it is what the source archive
+        # the converter is copied out of gets verified against, and a double
+        # that silently dropped it would let that plumbing rot unnoticed.
+        assert checksums is not None, "the checksum map did not reach staging"
         calls.append((repo, asset_name))
         raise RuntimeError("forced fall-through")
     monkeypatch.setattr(llama_cpp, "_stage_prebuilt_install", fake_stage)
@@ -663,7 +670,11 @@ def test_attempt_order_darwin_fork_only_no_ggml(monkeypatch, tmp_path):
         lambda assets, name: FORK_MANIFEST if "manifest" in name else {"artifacts": {}},
     )
     calls = []
-    def fake_stage(folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None, source_assets = None):
+    def fake_stage(
+        folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None,
+        source_assets = None, checksums = None,
+    ):
+        assert checksums is not None, "the checksum map did not reach staging"
         calls.append((repo, asset_name))
         raise RuntimeError("forced")
     monkeypatch.setattr(llama_cpp, "_stage_prebuilt_install", fake_stage)
