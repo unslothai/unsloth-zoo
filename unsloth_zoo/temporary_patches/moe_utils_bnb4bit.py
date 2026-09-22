@@ -1024,12 +1024,27 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     ], dim=0)
                     for e in range(num_experts)
                 ])
-                data, quant_state = bnb.functional.quantize_4bit(
-                    full.to(device, first_qs.dtype).contiguous(),
-                    blocksize=blocksize,
-                    quant_type=first_qs.quant_type,
-                    compress_statistics=False,
-                )
+                full = full.to(device, first_qs.dtype).contiguous()
+                # Repacking means one quantize call over the WHOLE stack, so this
+                # branch reaches the same 32-bit element count that the load path
+                # has to slice around. Reached by an old per-expert checkpoint
+                # whose segments end mid-block; nothing else about it is
+                # oversized-specific, so it would abort inside bitsandbytes on a
+                # stack the ordinary path handles. Slice it the same way.
+                sliced = None
+                if full.numel() >= _BNB_MAX_QUANTIZE_NUMEL:
+                    sliced = _quantize_expert_stack_in_slices(
+                        full, blocksize=blocksize, quant_type=first_qs.quant_type,
+                    )
+                if sliced is not None:
+                    data, quant_state = sliced.data, sliced.quant_state
+                else:
+                    data, quant_state = bnb.functional.quantize_4bit(
+                        full,
+                        blocksize=blocksize,
+                        quant_type=first_qs.quant_type,
+                        compress_statistics=False,
+                    )
                 quant_state.shape = torch.Size((num_experts, out_dim, in_dim))
             else:
                 packed_rows, absmax_rows = [], []
