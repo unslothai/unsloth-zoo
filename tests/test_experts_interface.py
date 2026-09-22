@@ -170,3 +170,17 @@ def test_every_transformers_custom_gate_class_is_detected():
         pass
     if not found:
         pytest.skip("this transformers has none of the custom-gate expert classes")
+
+
+def test_fp8_experts_registry_resolves_the_unsloth_default(monkeypatch):
+    # The FP8Experts swap keeps config._experts_implementation, which Unsloth defaults to
+    # "unsloth"; transformers' FP8 registry must resolve it instead of raising KeyError.
+    fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
+    from unsloth_zoo.temporary_patches import moe_utils_fp8
+
+    moe_utils_fp8.patch_fp8_experts_interface()
+    forward = fp8.ALL_FP8_EXPERTS_FUNCTIONS.get_interface("unsloth", None)
+    calls = []
+    monkeypatch.setattr(moe_utils_fp8, "forward_moe_backend_fp8", lambda *a: calls.append(a) or "ok")
+    assert forward(object(), "h", "i", "w") == "ok"
+    assert len(calls) == 1

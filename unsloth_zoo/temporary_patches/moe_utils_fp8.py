@@ -1062,7 +1062,9 @@ def patch_fp8_experts_interface():
     def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
         return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
-    for key in ("grouped_mm", "batched_mm", "deepgemm"):
+    # "unsloth" is the default experts implementation Unsloth registers on transformers 5, and
+    # the FP8Experts swap keeps the config's key, so it has to resolve in this registry too.
+    for key in ("grouped_mm", "batched_mm", "deepgemm", "unsloth"):
         try:
             ALL_FP8_EXPERTS_FUNCTIONS[key] = _unsloth_fp8_dispatch
         except Exception:
