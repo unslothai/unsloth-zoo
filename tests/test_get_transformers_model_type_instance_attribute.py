@@ -1,23 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`model_type` set on the config INSTANCE instead of on the config class.
-
-`PretrainedConfig.to_dict` ends with `output["model_type"] = self.__class__.model_type`,
-so it reports the class attribute and overwrites whatever `__init__` assigned to the
-object. `get_transformers_model_type` walked `to_dict()` alone, so a trust_remote_code
-config that leaves `model_type = ""` on the class and sets `self.model_type` in
-`__init__` was unreadable and raised "Cannot determine model type for config file".
-
-That is not hypothetical: `inclusionAI/Ling-2.6-flash` ships
-`BailingMoeV2_5Config` with `model_type = ""` at class level and
-`self.model_type = "bailing_hybrid"` in `__init__`, so Unsloth refused to load a model
-transformers itself resolves. The classes below reproduce that exact shape offline.
-
-The fallback is only consulted when the `to_dict` walk yields nothing usable, so every
-config that already answers through `to_dict` resolves exactly as before, and the
-returned name still goes through the same validation - the result is interpolated into
-an import path and a compiled-cache filename.
+"""`model_type` set on the config instance instead of the class (eg Ling-2.6-flash).
 
 CPU-only and network-free.
 """
@@ -33,7 +17,7 @@ _UNRESOLVED_MESSAGE = "Cannot determine model type for config file"
 
 
 class _SubConfig(PretrainedConfig):
-    """A sub-config that names itself on the instance only, like its parent."""
+    """Names itself on the instance only."""
     model_type = ""
 
     def __init__(self, model_type = "bailing_hybrid_text", **kwargs):
@@ -42,7 +26,7 @@ class _SubConfig(PretrainedConfig):
 
 
 class _BailingLikeConfig(PretrainedConfig):
-    """The `BailingMoeV2_5Config` shape: empty class attribute, real instance one."""
+    """Empty class attribute, real instance one."""
     model_type = ""
 
     def __init__(self, model_type = "bailing_hybrid", **kwargs):
@@ -53,7 +37,7 @@ class _BailingLikeConfig(PretrainedConfig):
 
 
 class _EmptyEverywhereConfig(PretrainedConfig):
-    """Nothing names this architecture anywhere, so it stays unresolved."""
+    """Nothing names this architecture."""
     model_type = ""
 
 
@@ -61,7 +45,6 @@ class _EmptyEverywhereConfig(PretrainedConfig):
 
 def test_instance_only_model_type_resolves():
     config = _BailingLikeConfig()
-    # The precondition that made this fail: the serialization disagrees with the object
     assert config.to_dict()["model_type"] == ""
     assert config.model_type == "bailing_hybrid"
 
@@ -69,9 +52,7 @@ def test_instance_only_model_type_resolves():
 
 
 def test_unknown_remote_type_is_not_prefix_truncated():
-    """`bailing_hybrid` is not a `transformers.models` module. The trimming loop only
-    replaces a name when some prefix of it IS one, so an unknown remote type is
-    returned whole and the caller sees the architecture the config actually named."""
+    """An unknown remote type is returned whole."""
     import transformers.models
     assert "bailing_hybrid" not in set(dir(transformers.models))
 
@@ -79,10 +60,7 @@ def test_unknown_remote_type_is_not_prefix_truncated():
 
 
 def test_prefix_colliding_remote_type_is_not_rewritten():
-    """The trimming loop exists for transformers' own mislabels (gemma3_text ->
-    gemma3). A remote-code name that merely shares a prefix with a shipped module
-    must not be rewritten to it, or the model is dispatched to the wrong
-    architecture's optimized path."""
+    """A remote name sharing a prefix with a shipped module is not trimmed to it."""
     import transformers.models
     assert "llama" in set(dir(transformers.models))
 
@@ -93,7 +71,7 @@ def test_prefix_colliding_remote_type_is_not_rewritten():
 
 
 def test_nested_sub_config_instance_attribute_is_reached():
-    """Composite remote-code configs hide the only real name on a sub-config."""
+    """The only real name may sit on a sub-config."""
     config = _EmptyEverywhereConfig()
     config.text_config = _SubConfig()
 
@@ -110,14 +88,12 @@ def test_sub_config_inside_a_list_is_reached():
 # --- nothing that resolved before may change ----------------------------------
 
 def test_to_dict_answer_wins_over_instance_attribute():
-    """The fallback is consulted only when `to_dict` yields nothing usable, so a
-    config that already answers keeps answering the same way."""
+    """The fallback is only used when `to_dict` yields nothing."""
     class _NamedOnClass(PretrainedConfig):
         model_type = "llama"
 
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
-            # An instance attribute that disagrees must not be able to take over
             self.model_type = "not_llama"
 
     assert get_transformers_model_type(_NamedOnClass()) == ["llama"]
@@ -155,8 +131,7 @@ def test_plain_config_unchanged():
     "llama)",
 ])
 def test_injected_instance_model_type_is_rejected(model_type):
-    """A remote-code config controls its instance attribute exactly as much as it
-    controls its serialization, so the import-path guard must cover both."""
+    """The import-path guard also covers the instance attribute."""
     config = _EmptyEverywhereConfig()
     config.model_type = model_type
 
@@ -175,7 +150,7 @@ def test_instance_model_type_path_traversal_cannot_survive():
 
 
 def test_cyclic_config_graph_terminates():
-    """Sub-configs are walked off `__dict__`, which can be cyclic."""
+    """`__dict__` walks can be cyclic."""
     parent = _EmptyEverywhereConfig()
     child = _EmptyEverywhereConfig()
     parent.child = child
@@ -186,14 +161,12 @@ def test_cyclic_config_graph_terminates():
 
 
 def test_non_config_attributes_are_not_walked():
-    """Only config-shaped objects are followed, so an unrelated attribute that happens
-    to carry a `model_type` string cannot name the architecture."""
+    """Only config objects are followed."""
     class _NotAConfig:
         model_type = "definitely_not_the_model"
 
     class _Holder:
-        """Plain object, so `str()` in the error message stays a plain repr -
-        `PretrainedConfig.__repr__` JSON-dumps itself and would choke on the helper."""
+        """Plain object so `str()` in the error message does not JSON-dump the helper."""
         def __init__(self):
             self.some_helper = _NotAConfig()
         def to_dict(self):
@@ -231,11 +204,7 @@ print("OK")
 
 @pytest.mark.parametrize("mode", ["isinstance", "duck"])
 def test_mock_config_raises_instead_of_hanging(mode):
-    # Mock fabricates an attribute on every access and stores it on `__dict__`, so a
-    # walk that reads `model_type` off each node grows the graph forever. Before the
-    # instance-attribute fallback this raised TypeError; it must still raise, promptly.
-    # A subprocess with a timeout, because a hang cannot be interrupted in-process
-    # portably (no SIGALRM on Windows).
+    # Mock mints attributes forever; subprocess + timeout since there is no SIGALRM on Windows
     import os
     import subprocess
     import sys

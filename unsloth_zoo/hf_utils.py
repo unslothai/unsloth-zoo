@@ -129,14 +129,10 @@ def _transformers_model_module_name_set() -> frozenset:
 
 
 def _standardize_model_types(model_types) -> list:
-    """Lowercase, punctuation-normalize and validate raw model_type candidates.
+    """Normalize and validate model_type candidates.
 
-    Empty candidates are dropped rather than rejected: `PretrainedConfig.model_type`
-    defaults to "", so any nested sub-config that does not override it (dbrx
-    attn_config/ffn_config, got_ocr2, qwen3_omni_moe) shows up as an empty sentinel
-    that says nothing about the architecture. Anything non-empty must be a plain
-    module name, because the result is interpolated into an import path and into the
-    compiled-cache filename.
+    Empty ones are dropped since sub-configs default to "". The rest must be plain
+    module names, since they are interpolated into an import path and cache filename.
     """
     final_model_types = []
     for model_type in (model_types or []):
@@ -157,36 +153,21 @@ _MAX_INSTANCE_CONFIG_NODES = 1024
 
 
 def _instance_attribute_model_types(config) -> list:
-    """`model_type` read off the live config objects instead of their serialization.
+    """`model_type` read off the live config objects instead of `to_dict()`.
 
-    `PretrainedConfig.to_dict` ends with `output["model_type"] = self.__class__.model_type`,
-    so it reports the CLASS attribute and overwrites whatever `__init__` put on the
-    instance. A trust_remote_code config that leaves `model_type = ""` on the class and
-    assigns `self.model_type = "..."` in `__init__` therefore serializes as the empty
-    sentinel while the object itself knows its architecture. inclusionAI/Ling-2.6-flash's
-    `BailingMoeV2_5Config` does exactly that: `to_dict()["model_type"]` is "" but
-    `config.model_type` is "bailing_hybrid".
-
-    Only reached when the to_dict walk produced nothing usable, so a config that already
-    answers through to_dict is unaffected. Breadth-first from the top-level config so the
-    model's own type precedes any sub-config's. Sub-configs are found on `__dict__`
-    (including inside lists/tuples/dicts) rather than by serializing, which is the whole
-    point, and `id()` tracking keeps a cyclic graph from looping.
+    `to_dict()` reports the class attribute, so remote configs that set `model_type = ""`
+    on the class and the real name in `__init__` (eg Ling-2.6-flash) serialize as "".
+    Breadth-first over `__dict__` so the top-level type comes first.
     """
     try:
         from transformers import PretrainedConfig
         config_types = (PretrainedConfig,)
     except Exception:
-        # Never let a transformers layout change turn a fallback into a hard failure
         config_types = ()
 
     def _is_config(value):
-        # With transformers importable, only real configs are walked. Duck typing
-        # would also accept objects that fabricate attributes on access (unittest.mock
-        # Mock / MagicMock): every `getattr(obj, "model_type")` then mints a new child
-        # that lands in `__dict__["_mock_children"]`, so the walk never ends.
+        # Duck typing would accept Mock objects, which mint children forever
         if config_types: return isinstance(value, config_types)
-        # Duck-typed stand-in for a config: has both a model_type and a to_dict
         return (
             not isinstance(value, type) and
             hasattr(value, "to_dict") and
@@ -194,8 +175,7 @@ def _instance_attribute_model_types(config) -> list:
             hasattr(value, "__dict__")
         )
 
-    # A real config graph is a handful of nodes; the cap only bounds pathological
-    # objects so a fallback can never turn a clean TypeError into a hang.
+    # Cap bounds pathological objects so the fallback cannot hang
     found, seen, stack = [], set(), [config]
     while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
         obj = stack.pop(0)
@@ -321,20 +301,16 @@ def get_transformers_model_type(config, trust_remote_code=False):
     pass
     # `find` above returns a list, so an unresolved config arrives here as [], never
     # None - an `is None` check would let it through and every consumer indexes [0]
-    # or joins the list. Treat empty and None the same. Normalizing first and testing
-    # the result folds that case together with the all-empty-sentinels case below:
-    # both mean "to_dict said nothing usable".
+    # or joins the list. Treat empty and None the same.
     from_instance_attribute = False
     final_model_types = _standardize_model_types(model_types)
     if not final_model_types:
-        # Nothing usable came out of to_dict(), so read the live object instead.
-        # See `_instance_attribute_model_types` for why the two can disagree.
+        # Nothing usable from to_dict(), so read the live object instead
         final_model_types = _standardize_model_types(
             _instance_attribute_model_types(config)
         )
         from_instance_attribute = bool(final_model_types)
-    # Every candidate was an empty sentinel and the object carries no instance
-    # attribute either, so the architecture is still unknown
+    # Every candidate was an empty sentinel, so the architecture is still unknown
     if not final_model_types:
         raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
     final_model_types = sorted(final_model_types)
@@ -348,11 +324,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
     found_type = False
     for j, model_type in enumerate(final_model_types):
         if from_instance_attribute:
-            # Only a config whose serialization refused to name it lands here, which
-            # means remote code. Trimming is for transformers' own mislabels
-            # (gemma3_text -> gemma3); applied to a remote name that merely shares a
-            # prefix with a shipped module it would rewrite the architecture to the
-            # wrong one and dispatch the model down the wrong optimized path.
+            # Remote code; trimming would rewrite eg llama_foo to the wrong llama path
             found_type = True
         elif model_type in _REMOTE_CODE_MODEL_TYPES:
             found_type = True
