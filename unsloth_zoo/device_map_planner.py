@@ -1665,7 +1665,36 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     return quantization_config
 
 
-def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
+def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
+    """A copy of ``config`` with the loader's config overrides applied.
+
+    Mirrors what ``PretrainedConfig.from_dict`` does with the leftover kwargs of
+    ``AutoConfig.from_pretrained``: ``dtype`` / ``torch_dtype`` unless "auto",
+    and any other key the config already has. Hub options are not config fields
+    and are dropped. Copied so the caller's config, which the load itself uses
+    next, is never edited by the planner.
+    """
+    import copy
+
+    config = copy.deepcopy(config)
+    for key, value in overrides.items():
+        if key in _HUB_KWARGS or key == "trust_remote_code":
+            continue
+        if key in ("dtype", "torch_dtype"):
+            if value is not None and value != "auto":
+                setattr(config, key, value)
+            continue
+        if hasattr(config, key):
+            setattr(config, key, value)
+    return config
+
+
+def build_meta_model(
+    model_name_or_path: str,
+    *,
+    config: Any = None,
+    **from_pretrained_kwargs: Any,
+):
     """Instantiate the model on the meta device, quantiser included.
 
     Returns ``(model, hf_quantizer, config)``. Costs no GPU memory and no weight
@@ -1674,12 +1703,22 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` are honoured
     the way the loader honours them, so runtime quantisation of a full-precision
     checkpoint is sized as it will really be loaded.
+
+    ``config`` is the config the load will really use, when that is not the one
+    ``model_name_or_path`` describes: a text-only load of a vision-language
+    checkpoint builds the decoder from ``text_config`` alone, with module names
+    (``model.layers.0``) the full model does not have (``model.language_model
+    .layers.0``). Planning the repo's own config there sizes a vision tower that
+    is never built and names modules the load cannot place.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
     runtime_qcfg = _runtime_quantization_config(from_pretrained_kwargs)
-    config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
+    if config is not None:
+        config = _apply_config_overrides(config, from_pretrained_kwargs)
+    else:
+        config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
     trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
     auto_cls = _auto_class_for(config, trust_remote_code=trust_remote_code)
     hf_quantizer = None
@@ -1837,6 +1876,7 @@ def plan_device_map_for_pretrained(
     no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
     trust_remote_code: bool = False,
+    config: Any = None,
     **config_kwargs: Any,
 ) -> DeviceMapPlan | None:
     """Plan a device map straight from a checkpoint id or path.
@@ -1852,11 +1892,16 @@ def plan_device_map_for_pretrained(
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` pass through to
     :func:`build_meta_model`, so a full-precision checkpoint you intend to load
     quantised is sized as it will really be loaded.
+
+    ``config`` plans the model the load builds from an already resolved config
+    (for example the text decoder of a vision-language repo) instead of the
+    repo's own; see :func:`build_meta_model`.
     """
     if len(_usable_devices(max_memory)) < 2:
         return None
     model, hf_quantizer, _config = build_meta_model(
-        model_name_or_path, trust_remote_code=trust_remote_code, **config_kwargs
+        model_name_or_path, config=config,
+        trust_remote_code=trust_remote_code, **config_kwargs
     )
     return plan_device_map(
         model,
