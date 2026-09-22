@@ -2,13 +2,9 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""The YaRN mscale helpers MLA attention calls from __init__ must stay uncompiled.
+"""YaRN mscale helpers called from MLA attention __init__ must stay uncompiled.
 
-transformers builds the model under the meta device. A compiled graph of Python floats
-comes back there as a meta tensor, so `.item()` fails and every YaRN config of
-DeepSeek-V2/V3, Mistral4, GLM-4 MoE Lite, MiniCPM3, LongCat, ... died in from_pretrained.
-The compiler matches DISABLED_KEYWORDS against `inspect.getsource(function)`, so these
-pin that match on the functions transformers actually ships.
+Under meta init a compiled float helper returns a meta tensor and `.item()` fails.
 """
 
 import glob
@@ -26,8 +22,7 @@ _HELPERS = ("yarn_get_mscale", "yarn_apply_mscale")
 
 
 def _modeling_files_defining_helpers():
-    # Discovered from the installed transformers rather than listed, so a new MLA model
-    # (axk1, deepseek_v32, glm_moe_dsa, hy_v4, ...) is covered the day it ships.
+    # Discovered rather than listed so new MLA models are covered automatically.
     import transformers.models
 
     root = os.path.dirname(transformers.models.__file__)
@@ -73,7 +68,7 @@ def test_shipped_yarn_helpers_are_disabled():
 
 
 def test_callers_are_not_disabled():
-    # The keywords name the definitions, so the attention classes that call them keep compiling.
+    # Keywords match the definitions only, so callers keep compiling.
     try:
         from transformers.models.deepseek_v3 import modeling_deepseek_v3 as m
     except Exception:
@@ -88,7 +83,7 @@ def _yarn_get_mscale(scale = 1, mscale = 1):
 
 
 def test_compiled_scalar_helper_fails_under_meta_init():
-    # Why they are listed: the eager helper is fine under the meta device, a compiled one is not.
+    # Eager is fine under meta init, compiled is not.
     with torch.device("meta"):
         assert _yarn_get_mscale(40.0, 1.0) == pytest.approx(1.3688879454113936)
         compiled = torch.compile(_yarn_get_mscale, fullgraph = True, dynamic = True)

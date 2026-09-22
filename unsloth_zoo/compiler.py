@@ -149,10 +149,7 @@ DISABLED_KEYWORDS = [
     "apply_mask_to_padding_states",  # falcon h1
     "reshape_into_chunks",  # falcon h1
     "pad_tensor_by_size",  # falcon h1
-    # Python-float helpers MLA attention calls from __init__ (DeepSeek-V2/V3, Mistral4, GLM-4
-    # MoE Lite, MiniCPM3, LongCat, ...). transformers builds the model under the meta device,
-    # where a compiled graph of scalars comes back as a meta tensor and `.item()` fails, so any
-    # YaRN config died in from_pretrained. Nothing is gained by compiling them.
+    # MLA YaRN float helpers run in __init__ under meta init; compiled they return meta tensors
     "def yarn_get_mscale(",
     "def yarn_apply_mscale(",
 ]
