@@ -26,6 +26,12 @@ import os
 
 import pytest
 
+# Every `temporary_patches` submodule imports torch, so on a runner without it this whole
+# suite is a precondition failure, not a finding: 37 of its 40 cases go red on merge base
+# too. The macOS staging runner is one, because pyproject declares no torch on darwin/arm64.
+# The two sibling suites in the same CI step already guard this way.
+pytest.importorskip("torch")
+
 
 # The switch `__init__.py:179` reads into _SKIP_GPU_INIT, which the device-capacity tests
 # below are entirely about: with it on, the import skips device detection and DEVICE_TYPE
