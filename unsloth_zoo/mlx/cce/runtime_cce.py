@@ -898,16 +898,28 @@ def make_runtime_cce_loss_fused_finalize(
         # A vocabulary small enough that the default 16-chunk split lands under
         # 4096 gives the GEMM too little work per launch. Widening to 4096 is
         # worth 1.01-1.47x on the backward for such heads, but only while every
-        # buffer it grows stays small: the logits chunk (tokens), the weight
-        # slice (hidden), and the classifier gradient when the head is trained.
+        # buffer it grows stays small: the token-side buffers, the weight slice
+        # (hidden), and the classifier gradient when the head is trained.
         # Each is held to 8 MB, which is what confines this to compact heads.
+        #
+        # A trainable bfloat16 head is the one case where the token side is not one
+        # buffer: dlogits_out_dtype below writes d_logits in float32, and the hidden
+        # GEMM then needs it cast back, so logits + d_logits + the cast are live at
+        # once, 4x what counting the logits chunk alone allowed. Promoting there
+        # costs memory rather than saving it: measured on an M1 at n_tokens=512,
+        # hidden=512, vocab=16384, the 4096 plan peaked at 146324012 bytes against
+        # 143211072 for 2048. Everywhere else the derivative matches the logits
+        # dtype and the original single-buffer bound is what applies.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
+        token_bytes = compute_bytes
+        if hidden.dtype == mx.bfloat16 and not weight_is_frozen:
+            token_bytes = compute_bytes + 4 + compute_bytes
         if (chunk_size <= 0 and not quantized
                 and hidden.dtype == weight.dtype and hidden.dtype in (mx.bfloat16, mx.float32)
                 and n_tokens >= 256 and resolved_chunk_size < promoted_chunk
                 and vocab_size >= 16384
-                and n_tokens * promoted_bytes <= min(8 * 1024 * 1024, _CHUNK_BUDGET)
+                and n_tokens * promoted_chunk * token_bytes <= min(8 * 1024 * 1024, _CHUNK_BUDGET)
                 and hidden.shape[1] * promoted_bytes <= 8 * 1024 * 1024
                 and (weight_is_frozen
                      or hidden.shape[1] * promoted_chunk * 4 <= 8 * 1024 * 1024)):
