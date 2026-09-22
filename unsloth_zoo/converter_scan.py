@@ -264,6 +264,11 @@ def _env_reads(tree):
             # take a named one, with the collected set still reading HF_TOKEN
             # alone. Anything else leaves that os.environ unaccounted, which
             # makes the reads dynamic and refuses the allowance.
+            if func.attr == "getenv" and not is_getenv:
+                # import os as o, then o.getenv("AWS_SECRET_ACCESS_KEY"). The
+                # receiver says nothing, so neither does the name it reads.
+                dynamic = True
+                continue
             if not (is_env_get or is_getenv):
                 continue
             if node.args:
@@ -301,6 +306,42 @@ def _writes_anything(tree):
         )
         for node in ast.walk(tree)
     )
+
+
+# Modules whose attributes are the things this refuses by name. A getattr on
+# one of them with a name this cannot read is a lookup this cannot vouch for.
+SENSITIVE_MODULES = frozenset(("os", "requests", "httpx", "urllib", "socket"))
+
+
+def _reaches_through_getattr(tree):
+    """Whether a write or the environment is reached by a computed lookup.
+
+    `f = getattr(requests, "post")` holds no Attribute and no Name spelled post,
+    so the write checks saw nothing and a POST of HF_TOKEN to the hub scanned
+    clean. A constant name is read here and refused; a name that is NOT constant
+    is refused only on the modules above, because upstream calls getattr with a
+    computed name nine times, all on its own objects, and refusing those would
+    refuse real converter modules.
+    """
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+        ):
+            continue
+        name = _literal_text(node.args[1])
+        if name is not None:
+            if name in WRITE_METHODS or name in ENV_ALIAS_NAMES:
+                return True
+            continue
+        target = node.args[0]
+        if isinstance(target, ast.Name) and target.id in SENSITIVE_MODULES:
+            return True
+        if isinstance(target, ast.Attribute) and target.attr in SENSITIVE_MODULES:
+            return True
+    return False
 
 
 def _aliases_the_environment(tree):
@@ -368,6 +409,13 @@ MAX_FOLDED_JOIN = 1 << 20
 RE_FORMAT_SPEC = re.compile(r"\{[^{}]*[:!][^{}]*\}")
 
 
+def _longest_argument(node):
+    """Length of the longest literal argument of a call, 0 when there is none."""
+    texts = [_literal_text(argument) for argument in node.args]
+    texts += [_literal_text(keyword.value) for keyword in node.keywords]
+    return max((len(text) for text in texts if text is not None), default = 0)
+
+
 def _format_text(node):
     """The text of a literal `"...".format(...)`, or None.
 
@@ -384,6 +432,10 @@ def _format_text(node):
         return None
     template = _literal_text(node.func.value)
     if template is None or RE_FORMAT_SPEC.search(template):
+        return None
+    if len(template) * (1 + _longest_argument(node)) > MAX_FOLDED_JOIN:
+        # One argument referenced by thousands of {0} fields expands far past
+        # the input cap, so the ceiling is on the OUTPUT, as it is for joins.
         return None
     if node.func.attr == "format_map":
         if node.keywords or len(node.args) != 1 or not isinstance(node.args[0], ast.Dict):
@@ -608,6 +660,10 @@ def _reshapes_a_url(tree):
     else:
         return True
     for node in ast.walk(tree):
+        if isinstance(node, ast.AugAssign) and (
+            carries(node.target) or built_from_a_carrier(node.value)
+        ):
+            return True                 # url += "@evil.example/collect"
         # built_from_a_carrier, not carries: the receiver may be the string
         # building itself, as in "".join([BASE, "/x"]).replace(...) or
         # f"{BASE}"[:8], with no name in between to have been tainted.
@@ -622,7 +678,7 @@ def _reshapes_a_url(tree):
     return False
 
 
-def _docstrings(tree, text):
+def _docstrings(tree):
     """Docstring nodes, which document a destination rather than name one.
 
     Comments never reach here, since the walk reads the AST, so upstream's
@@ -635,7 +691,13 @@ def _docstrings(tree, text):
     value and the argument above stops holding. Nothing upstream does, and
     refusing is the cheap side of that bet.
     """
-    if "__doc__" in text:
+    if any(
+        (isinstance(node, ast.Name) and node.id == "__doc__")
+        or (isinstance(node, ast.Attribute) and node.attr == "__doc__")
+        for node in ast.walk(tree)
+    ):
+        # Read from the AST: the word in a comment is not a read, and taking it
+        # for one put the false positive straight back.
         return frozenset()
     nodes = set()
     for node in ast.walk(tree):
@@ -746,6 +808,9 @@ def _talks_only_to_the_model_hub_tree(tree, text):
         # there and make it a channel anyone can read back, so "the destination
         # is the hub" is not on its own a reason to say nothing.
         return False
+    if _reaches_through_getattr(tree):
+        # A lookup this cannot read is a write or a read it cannot see.
+        return False
     if _aliases_the_environment(tree):
         # A read this cannot attribute is the same as one it cannot see.
         return False
@@ -772,7 +837,7 @@ def _talks_only_to_the_model_hub_tree(tree, text):
     # accepts it, so skipping bytes constants let a destination hide in one while
     # a str hub literal stayed in the file.
     try:
-        literals = list(_literal_texts(tree, skip = _docstrings(tree, text)))
+        literals = list(_literal_texts(tree, skip = _docstrings(tree)))
     except (UnicodeError, AttributeError, MemoryError, RecursionError):
         return False                # cannot tell, so do not suppress anything
     for literal in literals:

