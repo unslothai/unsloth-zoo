@@ -381,6 +381,109 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 # transformers integration patches
 # ============================================================================
 
+# ============================================================================
+# Experts classes Unsloth has no model-specific patch for
+# ============================================================================
+
+# Every v5 experts module above is quantized, whichever model it belongs to, but only the
+# families with a patch (qwen3_moe, glm4_moe, lfm2_moe, ...) have their forward routed
+# through forward_moe_backend, which dequantizes. Any other family keeps transformers'
+# generic experts forward (grouped_mm / batched_mm / eager), which matmuls the packed
+# uint8 storage: "Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Byte" on
+# tencent/Hy3 (HYV3Experts). Such a class is routed here, at quantization time, before
+# accelerate hooks capture the forward.
+
+_GENERIC_EXPERTS_FORWARD_FILE = ("transformers", "integrations", "moe.py")
+
+# A module global on purpose: the ParamWrapper patch decides whether an experts forward
+# applies the stashed expert LoRA by following the global names it calls
+# (`_forward_statically_reads_stash`), and a name imported inside the function is invisible
+# to it. Answering "not read" there on a compiled first call changes the traced graph
+# between the forward and the checkpoint recompute.
+from .moe_utils import get_forward_moe_backend
+
+
+def _is_generic_transformers_experts_forward(forward) -> bool:
+    """True iff `forward` is the dispatcher `use_experts_implementation` installs."""
+    code = getattr(forward, "__code__", None)
+    if code is None:
+        return False
+    parts = code.co_filename.replace("\\", "/").split("/")
+    return tuple(parts[-3:]) == _GENERIC_EXPERTS_FORWARD_FILE
+
+
+def _experts_layout_is_standard(module: nn.Module) -> bool:
+    """True iff the experts module is laid out the way forward_moe_backend computes it:
+    concatenated [gate; up] in gate_up_proj (E, 2*I, H), down_proj (E, H, I), no biases,
+    act_fn(gate) * up. Any other variant keeps its own forward."""
+    # Attributes set by `use_experts_implementation`; absent on transformers 5.0 for the
+    # newer flags, whose only layout there was the standard one.
+    if not getattr(module, "has_gate", True):
+        return False
+    if getattr(module, "has_bias", False) or getattr(module, "is_transposed", False):
+        return False
+    if not getattr(module, "is_concatenated", True):
+        return False
+    apply_gate = getattr(type(module), "_apply_gate", None)
+    if apply_gate is not None and getattr(apply_gate, "__name__", "") != "_default_apply_gate":
+        return False
+    if not callable(getattr(module, "act_fn", None)):
+        return False
+    gate_up_shape = tuple(getattr(module.gate_up_proj, "_original_shape", None) or module.gate_up_proj.shape)
+    down_shape = tuple(getattr(module.down_proj, "_original_shape", None) or module.down_proj.shape)
+    if len(gate_up_shape) != 3 or len(down_shape) != 3:
+        return False
+    num_experts, two_intermediate, hidden = gate_up_shape
+    return (
+        down_shape == (num_experts, hidden, two_intermediate // 2)
+        and two_intermediate % 2 == 0
+    )
+
+
+def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k_index, top_k_weights):
+    """Run the Unsloth MoE backend outside any enclosing torch.compile region, as the
+    patched Qwen MoE block does. The compiled module for such a family disables its MoE
+    block only non-recursively, so without this Dynamo traces the bnb 4-bit backend, whose
+    log-once bookkeeping and per-layer parameter guards pick a different graph for the
+    gradient checkpoint recompute than for the forward (CheckpointError: recomputed values
+    have different metadata). The resolver is passed in rather than called by the caller so
+    the caller keeps naming it; see get_forward_moe_backend's import above."""
+    return resolve_backend()(self, hidden_states, top_k_index, top_k_weights)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _forward_generic_experts_eagerly = torch.compiler.disable(_forward_generic_experts_eagerly)
+
+
+def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
+    """Give an experts class that still runs transformers' generic forward a forward that
+    sends bnb 4-bit instances through Unsloth's MoE backend. Every other call, including
+    16-bit instances of the same class, goes to the original forward unchanged."""
+    klass = type(module)
+    if getattr(klass, "_unsloth_bnb4bit_routed", False):
+        return True
+    original_forward = klass.__dict__.get("forward", None)
+    if not _is_generic_transformers_experts_forward(original_forward):
+        return False
+    if not _experts_layout_is_standard(module):
+        return False
+
+    def forward(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
+        if not args and not kwargs and _moe_uses_bnb4bit_expert_weights(self):
+            return _forward_generic_experts_eagerly(
+                get_forward_moe_backend, self, hidden_states, top_k_index, top_k_weights
+            )
+        return original_forward(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
+
+    forward.__wrapped__ = original_forward
+    forward.__doc__ = original_forward.__doc__
+    klass.forward = forward
+    klass._unsloth_bnb4bit_routed = True
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: routing bnb 4-bit {klass.__name__} through the Unsloth MoE backend.")
+    return True
+
+
 def replace_expert_params_with_bnb_params(
     model: nn.Module,
     modules_to_not_convert: Optional[List[str]] = None,
@@ -428,6 +531,7 @@ def replace_expert_params_with_bnb_params(
         module.gate_up_proj = placeholder_gate_up
         module.down_proj = placeholder_down
         has_been_replaced = True
+        _route_generic_bnb4bit_experts_class(module)
 
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Prepared {module_name}'s gate_up_proj & down_proj for BNB 4-bit quantization (shapes: {gate_up_proj.shape}, {down_proj.shape})")
