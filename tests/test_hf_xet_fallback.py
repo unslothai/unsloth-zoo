@@ -271,8 +271,10 @@ def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
     try:
         time.sleep(stall_timeout + 0.5)   # past stall_timeout, but repo-wide bytes keep growing
     finally:
-        stopped = time.monotonic()
         stop.set()
+        # After the signal, not before: a runner that preempts the test between the two would give
+        # the watchdog a no-growth interval this measure never sees.
+        stopped = time.monotonic()
         grow_stop.set()
         grower.join(timeout = 5)
     # Through the moment the watchdog stopped: a grower starved after its last write leaves a
