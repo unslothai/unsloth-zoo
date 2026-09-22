@@ -274,11 +274,16 @@ def _requires_arguments(method):
     TypeError from one propagates instead of being read as an uncallable accessor.
     """
     try:
-        inspect.signature(method).bind()
+        signature = inspect.signature(method)
+    except (TypeError, ValueError, AttributeError):
+        # Unreadable metadata, e.g. a wrapper whose __signature__ is not one.
+        # signature() raises TypeError for that too, so looking it up has to be
+        # separate from binding: only bind() failing proves arguments are needed.
+        return False
+    try:
+        signature.bind()
     except TypeError:
         return True
-    except (ValueError, AttributeError):
-        return False
     return False
 pass
 

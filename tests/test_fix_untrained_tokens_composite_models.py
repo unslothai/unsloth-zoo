@@ -170,6 +170,49 @@ def test_the_shapes_really_are_unanswerable(tokenizer, dataset):
     assert model.get_output_embeddings() is None
 
 
+class _UnreadableSignature(PreTrainedModel):
+    """A perfectly callable accessor whose metadata cannot be read.
+
+    inspect.signature() raises TypeError on this, the same exception bind()
+    raises for a required argument, so reading the two as one would skip a model
+    that works.
+    """
+
+    config_class = LlamaConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.emb = nn.Embedding(64, 16)
+        self.head = nn.Linear(16, 64, bias = False)
+
+    def get_input_embeddings(self):
+        return self.emb
+
+    def get_output_embeddings(self):
+        return self.head
+
+
+_UnreadableSignature.get_input_embeddings.__signature__ = 42
+
+
+def test_an_unreadable_signature_counts_as_callable(tokenizer):
+    """Stated policy, now pinned: unreadable metadata must not mean "skip"."""
+    import inspect
+
+    model = _UnreadableSignature(_config())
+    with pytest.raises(TypeError):
+        inspect.signature(model.get_input_embeddings)
+    untrained = slice(5, 8)
+    with torch.no_grad():
+        model.emb .weight[untrained] = 0.0
+        model.head.weight[untrained] = 0.0
+    dataset = datasets.Dataset.from_dict({"input_ids": [[2, 3, 4, 5]]})
+    fix_untrained_tokens(model, tokenizer, dataset)
+    # It ran: the pass reset the untrained rows instead of skipping the model.
+    assert model.emb .weight[untrained].abs().sum() > 0
+    assert model.head.weight[untrained].abs().sum() > 0
+
+
 class _BrokenInputAndUncallableOutput(PreTrainedModel):
     """The compound case: the input accessor fails in its body while the output
     accessor is the one that cannot be called. Checking either signature against
