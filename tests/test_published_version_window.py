@@ -638,3 +638,67 @@ def test_both_halves_declare_the_floor_that_peft_needs() -> None:
         f"peft 0.18.0 needs: {wrong}. A floor below 4.52.0 resolves cleanly and then "
         f"fails at import with ModuleNotFoundError: transformers.modeling_layers."
     )
+
+
+# The range unsloth's own `patch_datasets` refuses at import (import_fixes.py). Restated here
+# rather than read, because the zoo cannot import unsloth, and named rather than folded into the
+# window so the reason survives a future rewrite of the specifier.
+UNSLOTH_REFUSES_DATASETS = (Version("4.4.0"), Version("4.5.0"))
+
+
+def _datasets_lists() -> dict[str, list[Requirement]]:
+    return {
+        where: reqs
+        for where, raws in _requirement_lists().items()
+        if (reqs := _named(raws, "datasets"))
+    }
+
+
+def test_every_list_declares_the_same_datasets_window() -> None:
+    """Two copies that can drift are how a cap goes stale in one place only.
+
+    The window is spelled once per requirement list, so nothing but this keeps them equal: one
+    would be what users resolve and the other what CI reads.
+    """
+    lists = _datasets_lists()
+    assert lists, "pyproject.toml declares no datasets requirement at all"
+    windows = {str(req.specifier) for reqs in lists.values() for req in reqs}
+    assert len(windows) == 1, (
+        f"pyproject.toml declares {len(windows)} different datasets windows across its "
+        f"requirement lists: {sorted(windows)}"
+    )
+
+
+def test_the_datasets_window_excludes_what_unsloth_refuses_at_import() -> None:
+    """unsloth raises on datasets 4.4.0 through 4.5.0, and unsloth is what imports this package.
+
+    pip intersects the two requirements, so a zoo window admitting one of those releases lets a
+    resolve succeed and then die at `import unsloth` with NotImplementedError. The zoo bound is
+    therefore not free to be wider than unsloth's, whatever the zoo's own code can handle.
+    """
+    lists = _datasets_lists()
+    assert lists, "pyproject.toml declares no datasets requirement at all"
+    low, high = UNSLOTH_REFUSES_DATASETS
+    admitted = set()
+    for reqs in lists.values():
+        for req in reqs:
+            for release in ("4.4.0", "4.4.1", "4.4.2", "4.5.0"):
+                if low <= Version(release) <= high and release in req.specifier:
+                    admitted.add(release)
+    assert not admitted, (
+        f"the declared datasets window admits {sorted(admitted)}, which unsloth's "
+        f"patch_datasets refuses at import, so pip can resolve a release that cannot run"
+    )
+
+
+def test_the_datasets_checker_rejects_the_window_that_would_ship_the_defect() -> None:
+    """NEGATIVE CONTROL: both assertions above are "nothing found" shapes, which is also what a
+    checker that has stopped checking reports.
+    """
+    low, high = UNSLOTH_REFUSES_DATASETS
+    permissive = SpecifierSet(">=3.4.1,<5.0.0")
+    admitted = [
+        r for r in ("4.4.0", "4.4.1", "4.4.2", "4.5.0")
+        if low <= Version(r) <= high and r in permissive
+    ]
+    assert admitted, "the refused-range probe no longer finds the releases it is about"
