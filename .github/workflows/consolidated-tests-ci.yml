@@ -434,6 +434,7 @@ jobs:
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_router_not_a_lora_target.py \
+            tests/test_moe_router_under_moe_block_not_quantized.py \
             tests/test_moe_stacked_expert_lora_reaches_forward.py \
             tests/test_fp8_expert_dequant_tile_limit.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
