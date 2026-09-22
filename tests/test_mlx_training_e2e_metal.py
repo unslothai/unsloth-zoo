@@ -690,6 +690,49 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
     assert plan.prepare_cce_batch(1, batch) is batch
 
 
+@metal_only
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 7.0])
+def test_frozen_dense_cce_preserves_gradients_with_lower_peak(compiled, softcap):
+    import gc
+    from unsloth_zoo.mlx.cce.runtime_cce import make_chunked_cross_entropy_loss
+
+    mx.random.seed(719)
+    hidden = (mx.random.normal((256, 128)) * 0.2).astype(mx.bfloat16)
+    weight = (mx.random.normal((8192, 128)) * 0.1).astype(mx.bfloat16)
+    targets = mx.where(mx.arange(256) % 5 == 0, -100, mx.arange(256) * 29)
+    cotangent = mx.where(mx.arange(256) % 2 == 0, 1.0, -0.5)
+    mx.eval(hidden, weight, targets, cotangent)
+    functions = []
+    for frozen in (False, True):
+        runtime, _ = make_chunked_cross_entropy_loss(
+            chunk_size=2048, weight_is_frozen=frozen, logit_softcap=softcap,
+        )
+        def loss(h, runtime=runtime):
+            return (runtime(h, weight, targets) * cotangent).sum()
+        grad = mx.value_and_grad(loss)
+        functions.append(mx.compile(grad) if compiled else grad)
+    expected, actual = [fn(hidden) for fn in functions]
+    mx.eval(expected, actual)
+    for left, right in zip(expected, actual):
+        assert mx.array_equal(left, right).item()
+    assert mx.all(actual[1][::5] == 0).item()
+    assert mx.any(actual[1][1:] > 0).item() and mx.any(actual[1][1:] < 0).item()
+    del expected, actual, left, right
+    peaks = []
+    for fn in functions:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        result = fn(hidden)
+        mx.eval(result)
+        peaks.append(mx.get_peak_memory() - resident)
+        del result
+    assert peaks[1] < peaks[0]
+
+
 def _norm_model(seed=77, dtype=None):
     class _TinyLM(nn.Module):
         def __init__(self):

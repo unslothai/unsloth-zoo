@@ -39,6 +39,155 @@ def _skip_torch_shim():
         pytest.skip("requires real MLX runtime")
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_single_simd_forward_preserves_each_row(dtype, finalize):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import runtime_cce as rt
+
+    mx.random.seed(718)
+    rows, width = 267, 2048
+    targets = mx.where(mx.arange(rows) % 5 == 0, -100, mx.arange(rows) * 17)
+    inputs = [
+        mx.random.normal((rows, width)).astype(dtype), targets,
+        mx.random.uniform(shape=(rows,)), mx.random.uniform(shape=(rows,)),
+        mx.random.normal((rows,)), mx.array([1024], mx.int32),
+        mx.array([-100], mx.int32), mx.array([0.0], mx.float32),
+    ]
+    original = (rt._build_forward_update_finalize_kernel() if finalize
+                else rt._build_forward_update_kernel())
+
+    def unreachable(**kwargs):
+        raise AssertionError("fell back from the single SIMD kernel")
+
+    optimized = rt._with_single_simd_forward(unreachable, finalize)
+    kwargs = dict(
+        inputs=inputs, output_shapes=[(rows,)] * (5 if finalize else 3),
+        output_dtypes=[mx.float32] * (5 if finalize else 3),
+        grid=(rows * 256, 1, 1), threadgroup=(256, 1, 1),
+    )
+    expected, actual = original(**kwargs), optimized(**kwargs)
+    mx.eval(expected, actual)
+    for left, right in zip(expected, actual):
+        assert mx.allclose(left, right, atol=1e-5, rtol=1e-5).item()
+
+
+@pytest.mark.parametrize("frozen,dim", [(False, 512), (False, 1024), (True, 1024)])
+def test_automatic_chunks_reduce_backward_peak(frozen, dim):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        # Both halves need Metal: the peak assertion needs Metal memory accounting, and
+        # off-Metal the bf16 LSE accumulates at the logits dtype (the float32 cast in
+        # _forward_chunked_fused_finalize is gated on label smoothing), so the loss moves
+        # with the chunk size and the two plans do not agree.
+        pytest.skip("requires Metal memory accounting")
+    import gc
+    from unsloth_zoo.mlx.cce import _get_runtime_cce
+
+    mx.random.seed(812)
+    hidden = mx.random.normal((512, dim)).astype(mx.bfloat16)
+    weight = (mx.random.normal((16384, dim)) * 0.05).astype(mx.bfloat16)
+    targets = mx.where(mx.arange(512) % 7 == 0, -100, mx.arange(512) * 31)
+    mx.eval(hidden, weight, targets)
+    functions, plans = [], []
+    for chunk in (2048, 0):
+        runtime = _get_runtime_cce(
+            ignore_index=-100, logit_softcap=0, chunk_size=chunk, weight_is_frozen=frozen,
+        )
+        plans.append(runtime._unsloth_get_chunk_plan(hidden, weight)[0])
+        def loss(h, w, runtime=runtime):
+            return runtime(h, w, targets).sum() / 512
+        functions.append(mx.compile(mx.value_and_grad(loss, argnums=0 if frozen else (0, 1))))
+    expected, actual = [fn(hidden, weight) for fn in functions]
+    mx.eval(expected, actual)
+    assert actual[0].item() == pytest.approx(expected[0].item(), abs=2e-5)
+    pairs = [(expected[1], actual[1])] if frozen else zip(expected[1], actual[1])
+    for left, right in pairs:
+        assert mx.allclose(left, right, atol=2e-5, rtol=0.02).item()
+    del expected, actual, left, right, pairs
+    # Only a frozen head is admitted at these shapes, so for the other two the automatic
+    # arm resolves to 2048 and both arms run the identical plan. Comparing their peaks
+    # then measures allocator noise and nothing else: on a macos-15 M1 the [False-1024]
+    # pair, byte-identical work, came back 212941388 against 203504192 and failed. The
+    # numerics above are the whole of what those cells can assert.
+    assert plans[0] == 2048
+    if plans[1] == plans[0]:
+        assert not frozen
+        return
+    peaks = []
+    for fn in functions:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        result = fn(hidden, weight)
+        mx.eval(result)
+        peaks.append(mx.get_peak_memory() - resident)
+        del result
+    # Reached only when the promotion actually changed the plan, which is the frozen
+    # head. There the wider chunk is supposed to pay for itself, so require a strict
+    # drop rather than a tie.
+    assert plans[1] == 4096 and frozen
+    assert peaks[1] < peaks[0]
+
+
+def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
+    """The promotion rule itself, as integers.
+
+    The peak assertions above can only discriminate on hardware where the promoted
+    plan is actually worse, which so far is one runner, and they skip entirely off
+    Metal. The rule is a pure integer predicate, so pin it directly: at these shapes
+    a frozen head takes the wide chunk and a trainable bfloat16 head must not, on
+    every device.
+    """
+    _skip_torch_shim()
+    import unsloth_zoo.mlx.cce.runtime_cce as runtime_cce_module
+    from unsloth_zoo.mlx.cce import _get_runtime_cce, clear_cce_cache
+
+    hidden = mx.zeros((512, 512), dtype=mx.bfloat16)
+    weight = mx.zeros((16384, 512), dtype=mx.bfloat16)
+    saved_budget = runtime_cce_module._CHUNK_BUDGET
+    try:
+        # Every budget _get_memory_budget can return, from its 4 MB floor (smallest
+        # supported device) to its 128 MB cap. The answer must not depend on which.
+        for budget_mib in (4, 6, 12, 27, 103, 128):
+            runtime_cce_module._CHUNK_BUDGET = budget_mib * 1024 * 1024
+            clear_cce_cache()
+            plans = {}
+            for frozen in (True, False):
+                runtime = _get_runtime_cce(
+                    ignore_index=-100,
+                    logit_softcap=0.0,
+                    chunk_size=0,
+                    weight_is_frozen=frozen,
+                )
+                plans[frozen] = runtime._unsloth_get_chunk_plan(hidden, weight)[0]
+            assert plans == {True: 4096, False: 2048}, (budget_mib, plans)
+
+            # Label smoothing never promotes, at any shape the unsmoothed path would.
+            # It routes to _fallback_dlogits, whose float32 intermediates the bound
+            # underestimates by 3-4x, so a wider chunk there is unbounded in practice.
+            for frozen in (True, False):
+                for n_tokens in (256, 512, 1024):
+                    smoothed = _get_runtime_cce(
+                        ignore_index=-100,
+                        logit_softcap=0.0,
+                        chunk_size=0,
+                        weight_is_frozen=frozen,
+                        label_smoothing=0.1,
+                    )
+                    plan = smoothed._unsloth_get_chunk_plan(
+                        mx.zeros((n_tokens, 512), dtype=mx.bfloat16), weight,
+                    )[0]
+                    assert plan == 2048, (budget_mib, frozen, n_tokens, plan)
+    finally:
+        runtime_cce_module._CHUNK_BUDGET = saved_budget
+        clear_cce_cache()
+
+
 def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
     # hidden=0 with non-empty targets must raise, not silently drop labels.
     _skip_torch_shim()

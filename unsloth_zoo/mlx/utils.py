@@ -2161,6 +2161,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             ignore_index=-100,
             logit_softcap=softcap,
             label_smoothing=label_smoothing,
+            weight_is_frozen=_skip_weight_grad,
         )
 
         def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
