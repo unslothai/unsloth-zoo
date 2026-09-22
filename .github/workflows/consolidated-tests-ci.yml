@@ -289,6 +289,18 @@ jobs:
         # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
         # neither was executed by any job before.
         #
+        # test_fp8_expert_dequant_tile_limit pins that a per-expert per-tensor FP8 scale
+        # derives a Triton tile larger than Triton will compile and is declined rather
+        # than launched, and that the limit is read out of Triton instead of copied.
+        # Three of its cases need no GPU, so they are a real gate on this runner; the
+        # rest carry the CUDA marker and skip here. Collect-only would have proved only
+        # that the file imports, which is how the guard could be removed and CI stay
+        # green.
+        #
+        # test_moe_router_not_a_lora_target pins that the automatic LoRA target search
+        # skips the MoE router leaf. Collect-only stays green with the skip reverted,
+        # which is the one state these assertions exist to catch.
+        #
         # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
         # the forward of a stacked-expert family Unsloth has no forward for, which is
         # what stops an adapter that looks healthy in named_parameters from having no
@@ -421,7 +433,9 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_moe_router_not_a_lora_target.py \
             tests/test_moe_stacked_expert_lora_reaches_forward.py \
+            tests/test_fp8_expert_dequant_tile_limit.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
@@ -1088,6 +1102,7 @@ jobs:
                   tests/test_moe_merge_e2e_cpu.py \
                   tests/test_merge_e2e_hub_unreachable.py \
                   tests/test_merge_e2e_partial_refusal.py \
+                  tests/test_fix_untrained_tokens_composite_models.py \
                   tests/test_gemma4_dtype_drift_guards.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else
