@@ -423,7 +423,7 @@ def test_the_widening_probe_can_actually_detect_widening():
     assert changed, "the probe cannot see widening, so its passes mean nothing"
 
 
-def test_vanilla_skip_matcher_matches_the_stock_transformers_clauses():
+def test_transformers_5x_skip_matcher_matches_the_stock_transformers_clauses():
     """The guard folds transformers' three clauses into one precompiled pass.
 
     Compared against the clauses written out literally rather than against the
@@ -434,7 +434,7 @@ def test_vanilla_skip_matcher_matches_the_stock_transformers_clauses():
     import random
     import re as _re
 
-    from unsloth_zoo.saving_utils import _vanilla_skip_matcher
+    from unsloth_zoo.saving_utils import _transformers_5x_skip_matcher
 
     def stock(name, entries):
         return any(
@@ -453,7 +453,7 @@ def test_vanilla_skip_matcher_matches_the_stock_transformers_clauses():
     names = [rnd(6) for _ in range(500)]
     for _ in range(150):
         entries = [rnd(4) for _ in range(random.randint(1, 5))]
-        matches = _vanilla_skip_matcher(entries)
+        matches = _transformers_5x_skip_matcher(entries)
         for name in random.sample(names, 20):
             assert matches(name) == bool(stock(name, entries)), (
                 f"fast matcher diverged for entries={entries} name={name!r}"
@@ -466,3 +466,104 @@ def test_guard_is_inert_when_no_module_names_are_given():
 
     assert (vllm_compatible_skip_modules(MERGED_LEAF_SKIP_MODULES) ==
             vllm_compatible_skip_modules(MERGED_LEAF_SKIP_MODULES, module_names = None))
+
+
+# --- the guard must hold for every transformers generation, not just installed ---
+# A checkpoint is written by one transformers and loaded by another. 4.x and 5.x
+# match skip entries differently and neither is a subset of the other, so an
+# alias has to be safe under both (plus the broader matcher unsloth installs).
+
+def test_transformers_4x_skip_matcher_matches_the_literal_4_57_expression():
+    """Pinned against transformers 4.57.6 integrations/bitsandbytes.py:167-172.
+
+        if (isinstance(module, ...)) and name not in modules_to_not_convert:
+            current_key_name_str = ".".join(current_key_name)
+            if not any((key + "." in current_key_name_str)
+                       or (key == current_key_name_str) for key in ...):
+    """
+    import random
+
+    from unsloth_zoo.saving_utils import _transformers_4x_skip_matcher
+
+    def stock_4x(full_name, entries):
+        short_name = full_name.rpartition(".")[2]
+        if short_name in entries: return True
+        return any((key + "." in full_name) or (key == full_name) for key in entries)
+
+    random.seed(11)
+    parts = ["model", "language_model", "layers", "0", "1", "10", "mlp", "self_attn",
+             "gate_proj", "up_proj", "qkv_proj", "lm_head", "visual", "vision_model",
+             "blocks", "fc1", "proj"]
+
+    def rnd(n):
+        return ".".join(random.choice(parts) for _ in range(random.randint(1, n)))
+
+    names = [rnd(6) for _ in range(300)]
+    for _ in range(150):
+        entries = [rnd(4) for _ in range(random.randint(1, 5))]
+        matches = _transformers_4x_skip_matcher(entries)
+        for name in random.sample(names, 20):
+            assert matches(name) == bool(stock_4x(name, entries)), (
+                f"4.x matcher diverged for entries={entries} name={name!r}"
+            )
+
+
+def test_guard_covers_the_4x_only_widening_vector():
+    """A parent-form alias reaches the tower under 4.x and not under 5.x.
+
+    This is the case a guard written against only the installed (5.x) matcher
+    would wave through, and it is reachable by anyone who saves on 5.x and
+    reloads on 4.57.6.
+    """
+    from unsloth_zoo.saving_utils import (
+        _transformers_4x_skip_matcher, _transformers_5x_skip_matcher,
+        vllm_compatible_skip_modules,
+    )
+
+    tree = MODULE_TREES["adversarial_suffix"]
+    skip = ["model.language_model.layers.0.mlp", "lm_head"]
+    unguarded = vllm_compatible_skip_modules(skip)
+    added = [a for a in unguarded if a not in set(skip)]
+
+    def newly_matched(build):
+        base = build(skip)
+        extra = build(added)
+        return [n for n in tree if extra(n) and not base(n)]
+
+    assert newly_matched(_transformers_5x_skip_matcher) == [], (
+        "this case is supposed to be invisible to 5.x; the fixture has drifted"
+    )
+    reached_4x = newly_matched(_transformers_4x_skip_matcher)
+    assert reached_4x, "the fixture no longer exercises the 4.x substring clause"
+    assert all("vision" in n for n in reached_4x)
+
+    guarded = vllm_compatible_skip_modules(skip, module_names = tree)
+    guarded_added = [a for a in guarded if a not in set(skip)]
+    for build in (_transformers_4x_skip_matcher, _transformers_5x_skip_matcher):
+        base = build(skip)
+        extra = build(guarded_added) if guarded_added else (lambda n: False)
+        assert [n for n in tree if extra(n) and not base(n)] == []
+
+
+@pytest.mark.parametrize("arch", sorted(MODULE_TREES))
+@pytest.mark.parametrize("shape", ["leaf", "parent"])
+def test_no_widening_under_any_transformers_generation(arch, shape):
+    """The per-architecture check, run against all three matchers."""
+    from unsloth_zoo.saving_utils import _SKIP_MATCHERS, vllm_compatible_skip_modules
+
+    tree = MODULE_TREES[arch]
+    skip = _skip_lists(tree)[shape]
+    aliased = vllm_compatible_skip_modules(skip, module_names = tree)
+    added = [a for a in aliased if a not in set(skip)]
+
+    for build in _SKIP_MATCHERS:
+        base = build(skip)
+        extra = build(added) if added else (lambda n: False)
+        widened = [n for n in tree if extra(n) and not base(n)]
+        assert not widened, (
+            f"{arch}/{shape} widened under {build.__name__}: {widened}"
+        )
+    if shape == "leaf":
+        assert any(a.endswith(".gate_up_proj") for a in added), (
+            f"{arch}/{shape}: the guard dropped the fused aliases too, added={added}"
+        )
