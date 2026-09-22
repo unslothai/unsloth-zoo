@@ -196,6 +196,11 @@ HUB_TOKEN_ENV_NAMES = frozenset((
 # one of them as a write costs nothing there.
 WRITE_METHODS = frozenset(("post", "put", "patch", "delete", "request", "send"))
 
+# The environment under another name. os.environ and os.getenv are attributes
+# and are read normally; these are the bare names an alias or a from-import
+# leaves behind, which _env_reads does not inspect.
+ENV_ALIAS_NAMES = frozenset(("environ", "getenv", "environb", "getenvb"))
+
 RE_WHOLE_ENV = re.compile(
     r"\bos\.environ\s*\.\s*copy\s*\("
     r"|\bdict\s*\(\s*os\.environ\s*\)"
@@ -267,18 +272,48 @@ def _env_reads(tree):
 
 
 def _writes_anything(tree):
-    """Whether this file calls a write method on anything at all.
+    """Whether this file so much as NAMES a write method.
 
     Matching only receivers spelled `session` or `client` missed
     `s = requests.Session(); s.post(...)`, which is the writable-hub channel
-    this is here to refuse. The real gguf-py and conversion packages contain no
-    .post, .put, .patch or .delete call at all, so refusing on any receiver
-    costs nothing upstream and needs no guess about what the receiver is.
+    this is here to refuse. Matching only CALLS then missed the same write one
+    rename later: `post = requests.post` and `from requests import post` both
+    leave the call site an ast.Name, so post(HUB, data = os.environ["HF_TOKEN"])
+    read as no write at all. Following the alias means following assignment
+    through every shape; naming one at all is enough to refuse, and the 21 real
+    gguf-py and converter modules contain no reference to any of these names,
+    in any position, so it costs nothing upstream.
     """
     return any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in WRITE_METHODS
+        (isinstance(node, ast.Attribute) and node.attr in WRITE_METHODS)
+        or (isinstance(node, ast.Name) and node.id in WRITE_METHODS)
+        or (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name in WRITE_METHODS for alias in node.names)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+def _aliases_the_environment(tree):
+    """Whether the environment is reachable here under another name.
+
+    `getenv = os.getenv` and `from os import getenv` both leave the read an
+    ast.Name, which _env_reads does not inspect, so getenv("AWS_SECRET_ACCESS_KEY")
+    beside a legitimate os.environ["HF_TOKEN"] left the collected set holding the
+    hub token alone and the allowance was granted. `from os import environ` does
+    the same to the subscript form.
+
+    `os.environ` and `os.getenv` themselves are attributes and are unaffected:
+    this is about the bare name. Upstream reads the environment only through
+    os.environ, so refusing the aliases costs nothing.
+    """
+    return any(
+        (isinstance(node, ast.Name) and node.id in ENV_ALIAS_NAMES)
+        or (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name in ENV_ALIAS_NAMES for alias in node.names)
+        )
         for node in ast.walk(tree)
     )
 
@@ -623,6 +658,9 @@ def _talks_only_to_the_model_hub_tree(tree, text):
         # multi-tenant: a token with write scope can create a public repository
         # there and make it a channel anyone can read back, so "the destination
         # is the hub" is not on its own a reason to say nothing.
+        return False
+    if _aliases_the_environment(tree):
+        # A read this cannot attribute is the same as one it cannot see.
         return False
     if _reshapes_a_url(tree):
         # A literal that is rewritten before it is sent names the host it was,

