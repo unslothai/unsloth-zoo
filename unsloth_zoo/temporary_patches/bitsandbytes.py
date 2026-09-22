@@ -19,7 +19,7 @@ import torch.nn as nn
 import inspect
 import importlib
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from .common import TEMPORARY_PATCHES, torch_compile
+from .common import TEMPORARY_PATCHES, torch_compile, RESCOPE_PATCH_FLAG
 from .utils import (
     patch_function,
     process_output_options,
@@ -39,8 +39,18 @@ from textwrap import dedent
 import re
 
 
-# transformers 5.4.0 and 5.5.x drop the bnb quant_state sidecars of some composite checkpoints
-_QUANT_STATE_BROKEN_TRANSFORMERS = ("5.4.0", "5.6.0")
+# transformers 5.4.0 and 5.5.x drop the bnb quant_state sidecars of some composite checkpoints.
+#
+# Both bounds carry `.dev0` so a prerelease sorts with the release line it belongs to. Without
+# it `Version("5.6.0.dev0") < Version("5.6.0")` puts a 5.6.0 release candidate INSIDE the
+# window and tells someone running a build that carries the fix that their transformers is the
+# problem. The same applies at the bottom: a 5.4.0 prerelease already has the defect.
+#
+# Compared with `packaging.version.Version` below, and deliberately NOT with
+# `unsloth_zoo.utils.Version`, which is the wrapper most of this package uses: that one
+# rewrites a prerelease suffix and answers `Version('5.6.0.1')` for the string "5.6.0.dev0",
+# which sorts AFTER the release it has to sort before, so the window would swallow 5.6.0.
+_QUANT_STATE_BROKEN_TRANSFORMERS = ("5.4.0.dev0", "5.6.0.dev0")
 
 
 def _transformers_drops_prequantized_quant_state():
@@ -95,6 +105,37 @@ def _installed_transformers_version():
         return "unknown"
 
 
+def _composite_renaming_repair_installed():
+    """Is the runtime repair for that defect live in THIS process?
+
+    `temporary_patches/conversion_mapping_rescope.py` here, and
+    `fix_transformers_composite_prefix_renaming` in unsloth's `import_fixes.py`, both re-scope
+    the leaked renaming before it can rename anything. Either mark counts, and the whole
+    `__wrapped__` chain is walked, because the two compose in either order and
+    `moe_utils_bnb4bit.py` puts a third wrapper on the same function without setting
+    `__wrapped__` at all.
+
+    Asked so the message cannot send a user to change a transformers version that is no longer
+    what is failing them. With the repair live, a module that still reaches this guard has a
+    checkpoint whose sidecars really are absent -- which is the one case where re-quantizing IS
+    the answer, and the version branch would have told them the opposite.
+    """
+    try:
+        from transformers import conversion_mapping
+    except Exception:
+        return False
+    function = getattr(conversion_mapping, "get_model_conversion_mapping", None)
+    seen = 0
+    while function is not None and seen < 8:
+        if getattr(function, RESCOPE_PATCH_FLAG, False):
+            return True
+        if getattr(function, "_unsloth_patched_composite_prefix_renaming", False):
+            return True
+        function = getattr(function, "__wrapped__", None)
+        seen += 1
+    return False
+
+
 def _packed_weight_without_quant_state_error(module):
     """Message for a Linear4bit whose packed weight arrived with no quant_state."""
     transformers_version = _installed_transformers_version()
@@ -108,6 +149,17 @@ def _packed_weight_without_quant_state_error(module):
         f"{getattr(module, 'out_features', 'unknown')}) but has no quant_state, so it "
         f"cannot be dequantized. Its quantization metadata is missing."
     )
+    if _transformers_drops_prequantized_quant_state() and _composite_renaming_repair_installed():
+        # Inside the window, but the repair is live, so the renaming never fired and the
+        # version is not what went wrong here.
+        return (
+            f"{head}\nInstalled transformers=={transformers_version}, which is inside the "
+            f"window that discards quant_state sidecars -- but Unsloth's runtime repair for "
+            f"that is installed in this process, so it is not the explanation here. Check "
+            f"that the checkpoint's `weight.absmax`, `weight.quant_map` and "
+            f"`weight.quant_state.bitsandbytes__nf4` tensors are present and were not "
+            f"reported as unexpected keys during loading."
+        )
     if _transformers_drops_prequantized_quant_state():
         return (
             f"{head} The most likely reason is that it was lost while LOADING, not "

@@ -108,6 +108,12 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     monkeypatch.setattr(
         bnb_patch, "_transformers_drops_prequantized_quant_state", lambda: True
     )
+    # Explicitly the no-repair case, so this cannot depend on whether something else in the
+    # session installed the runtime repair. The repair branch is asserted in
+    # tests/test_composite_conversion_rescope.py.
+    monkeypatch.setattr(
+        bnb_patch, "_composite_renaming_repair_installed", lambda: False
+    )
     message = bnb_patch._packed_weight_without_quant_state_error(_FakeLinear4bit(_packed_weight()))
     assert "5.4.0" in message and "5.5.4" in message
     assert "#45567" in message
@@ -120,7 +126,14 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     # transformers 4.57.6 ships no qwen3_5 model at all (the first release carrying it
     # is 5.3.0), so recommending it to a Qwen3.5 reporter swaps the shape error for an
     # unrecognised-architecture error. Never offer it as the fallback.
-    assert "4.57" not in message
+    #
+    # Asserted on the ADVICE, not on the whole message. A bare `"4.57" not in message`
+    # also matches the installed version this message interpolates, so it failed on a
+    # host that really is running 4.57.6 -- where the predicate is mocked True here --
+    # for a reason that has nothing to do with what the advice says.
+    _, _, advice = message.partition("fixed by PR #45567 in 5.6.0.")
+    assert advice, "the advice section moved; this assertion no longer reads it"
+    assert "4.57" not in advice
     # The claim about where the state was lost is a version inference, not an
     # observation of the checkpoint, and must stay hedged.
     assert "most likely" in message

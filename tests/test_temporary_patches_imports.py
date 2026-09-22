@@ -53,6 +53,7 @@ def _child_env(**overrides: str) -> dict:
 TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.common",
     "unsloth_zoo.temporary_patches.bitsandbytes",
+    "unsloth_zoo.temporary_patches.conversion_mapping_rescope",
     "unsloth_zoo.temporary_patches.deepseek_v3_moe",
     "unsloth_zoo.temporary_patches.ernie4_5_moe",
     "unsloth_zoo.temporary_patches.fla_vendor",
