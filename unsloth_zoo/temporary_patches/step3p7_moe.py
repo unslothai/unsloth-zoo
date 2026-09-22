@@ -14,6 +14,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import math
+import types
+
 from .common import (
     TEMPORARY_PATCHES,
     UNSLOTH_ENABLE_LOGGING,
@@ -67,6 +70,73 @@ def _make_step3p7_moe_lora_extractor():
     return _step3p7_moe_lora_extractor
 
 
+def _step3p7_apply_gate(self, gate_up):
+    """Step3p7Experts._apply_gate: swiglu with the clamp AFTER the activation, for an FP8Experts
+    that took the place of a clamped Step3p7Experts (FP8Experts' own gate clamps before it)."""
+    gate, up = gate_up.chunk(2, dim=-1)
+    gate = self.act_fn(gate).clamp(max=self.limit)
+    up = up.clamp(min=-self.limit, max=self.limit)
+    return gate * up
+
+
+def _adopt_step3p7_fp8_experts(model, limits):
+    """Fix up the FP8Experts that replace_with_fp8_linear put in Step3p7SparseMoeBlocks.
+
+    FP8Experts reads `config.swiglu_limit`, which step3p7 does not have (its bound is per layer, in
+    `swiglu_limits`), so the routed-expert clamp of Step-3.7-Flash layers 43-44 is dropped; and
+    step3p7 is not a `@use_experts_implementation` model, so `_experts_implementation` stays
+    "eager" and FP8Experts runs its per-expert fp8_linear loop, which never reads the expert LoRA
+    stash. Restore the layer's clamp as the module's own gate and dispatch through the FP8 experts
+    interface (Unsloth's LoRA-aware FP8 backend once patch_fp8_experts_interface ran).
+    """
+    try:
+        from transformers.integrations.finegrained_fp8 import ALL_FP8_EXPERTS_FUNCTIONS
+    except Exception:
+        return
+    routed = getattr(ALL_FP8_EXPERTS_FUNCTIONS, "_unsloth_fp8_dispatcher", False)
+    for block, limit in limits:
+        experts = getattr(block, "experts", None)
+        if experts is None or type(experts).__name__ != "FP8Experts":
+            continue
+        if limit is not None and math.isfinite(limit):
+            experts.limit = limit
+            experts._apply_gate = types.MethodType(_step3p7_apply_gate, experts)
+            experts._unsloth_own_apply_gate = True
+        config = getattr(experts, "config", None)
+        if routed and config is not None and getattr(config, "_experts_implementation", None) in (None, "eager"):
+            config._experts_implementation = "grouped_mm"
+
+
+def patch_step3p7_fp8_experts():
+    """Wrap transformers' replace_with_fp8_linear (imported at call time by the FP8 quantizer) so a
+    step3p7 model's FP8Experts get the fix-up above. Each block's clamp is read off its
+    Step3p7Experts before the swap, since FP8Experts has no layer index to look it up by."""
+    try:
+        import transformers.integrations.finegrained_fp8 as finegrained_fp8
+        import transformers.models.step3p7.modeling_step3p7  # noqa: F401
+    except Exception:
+        return
+    original = finegrained_fp8.replace_with_fp8_linear
+    if getattr(original, "_unsloth_step3p7", False):
+        return
+
+    def replace_with_fp8_linear(model, *args, **kwargs):
+        # By class name: Unsloth's compiler re-creates the step3p7 module classes.
+        limits = [
+            (block, getattr(block.experts, "limit", None))
+            for block in model.modules()
+            if type(getattr(block, "experts", None)).__name__ == "Step3p7Experts"
+        ]
+        model = original(model, *args, **kwargs)
+        if limits:
+            _adopt_step3p7_fp8_experts(model, limits)
+        return model
+
+    replace_with_fp8_linear._unsloth_step3p7 = True
+    replace_with_fp8_linear.__wrapped__ = original
+    finegrained_fp8.replace_with_fp8_linear = replace_with_fp8_linear
+
+
 def patch_step3p7_moe():
     """Patch Step-3.7-Flash (transformers step3p7) routed experts for Split LoRA via grouped GEMM.
 
@@ -87,6 +157,9 @@ def patch_step3p7_moe():
         from transformers.models.step3p7.modeling_step3p7 import Step3p7Experts
     except Exception:
         return
+
+    # The FP8 checkpoint swaps Step3p7Experts for transformers' FP8Experts at load; see above.
+    patch_step3p7_fp8_experts()
 
     if getattr(Step3p7Experts, "_unsloth_already_patched", False):
         return
