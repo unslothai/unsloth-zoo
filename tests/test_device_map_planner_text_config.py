@@ -120,3 +120,26 @@ def test_without_config_the_repo_config_is_planned(monkeypatch):
     )
     assert calls == ["org/vlm"]
     assert any("language_model" in k or "vision" in k for k in plan.device_map)
+
+
+def test_dtype_wins_over_torch_dtype_in_either_order():
+    config = _tiny_vlm_config().get_text_config()
+    for overrides in (
+        {"dtype": torch.float32, "torch_dtype": torch.float16},
+        {"torch_dtype": torch.float16, "dtype": torch.float32},
+    ):
+        out = planner._apply_config_overrides(config, overrides)
+        assert out.torch_dtype == torch.float32
+    out = planner._apply_config_overrides(config, {"torch_dtype": torch.float16})
+    assert out.torch_dtype == torch.float16
+
+
+def test_a_partial_sub_config_dict_is_merged_not_substituted():
+    config = _tiny_vlm_config()
+    sub_type = type(config.text_config)
+    before = config.text_config.to_dict()
+    out = planner._apply_config_overrides(config, {"text_config": {"max_position_embeddings": 64}})
+    assert isinstance(out.text_config, sub_type)
+    assert out.text_config.max_position_embeddings == 64
+    assert out.text_config.hidden_size == config.text_config.hidden_size
+    assert config.text_config.to_dict() == before

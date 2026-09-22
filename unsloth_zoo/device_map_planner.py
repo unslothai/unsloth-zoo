@@ -1677,15 +1677,30 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
     import copy
 
     config = copy.deepcopy(config)
+    # from_pretrained gives a non-None `dtype` precedence over the older `torch_dtype`.
+    dtype = overrides.get("dtype", None)
+    if dtype is None:
+        dtype = overrides.get("torch_dtype", None)
+    if dtype is not None and dtype != "auto":
+        # 5.x keeps `torch_dtype` as an alias of `dtype`; 4.x stores `torch_dtype` only.
+        for name in ("torch_dtype", "dtype"):
+            try:
+                setattr(config, name, dtype)
+            except Exception:
+                pass
     for key, value in overrides.items():
-        if key in _HUB_KWARGS or key == "trust_remote_code":
+        if key in _HUB_KWARGS or key in ("trust_remote_code", "dtype", "torch_dtype"):
             continue
-        if key in ("dtype", "torch_dtype"):
-            if value is not None and value != "auto":
-                setattr(config, key, value)
+        if not hasattr(config, key):
             continue
-        if hasattr(config, key):
-            setattr(config, key, value)
+        current = getattr(config, key)
+        # A partial dict for a sub-config (text_config = {...}) is merged into it, as
+        # PretrainedConfig.from_dict does, instead of replacing the config object.
+        if isinstance(value, Mapping) and hasattr(current, "to_dict") and not isinstance(current, Mapping):
+            for sub_key, sub_value in value.items():
+                setattr(current, sub_key, sub_value)
+            continue
+        setattr(config, key, value)
     return config
 
 
