@@ -293,7 +293,10 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         embedding_matrix = input_embeddings.weight
         lm_head_matrix   = output_embeddings.weight
     except (NotImplementedError, TypeError):
-        logger.info(
+        # Warning rather than info: skipping means the run loses the NaN guard
+        # this pass provides, and the success path below announces itself with
+        # a plain print, so an invisible skip would be the odd one out.
+        logger.warning(
             f"Unsloth: Skipping the untrained token fix for "
             f"{type(model).__name__}, which does not expose a single input "
             f"embedding."

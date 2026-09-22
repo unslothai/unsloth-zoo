@@ -156,6 +156,25 @@ def test_the_shapes_really_are_unanswerable(tokenizer, dataset):
     assert model.get_output_embeddings() is None
 
 
+def test_the_skip_is_visible_without_opting_into_logging(caplog, tokenizer, dataset):
+    """A silent skip would look exactly like a pass that ran.
+
+    The package logger sits at WARNING unless UNSLOTH_ENABLE_LOGGING is set, so
+    an info-level line here would never reach the user who needs it: the run
+    they just started is going without the NaN guard this pass provides.
+    """
+    import logging
+
+    from unsloth_zoo.log import logger as package_logger
+
+    assert package_logger.getEffectiveLevel() <= logging.WARNING
+    with caplog.at_level(logging.WARNING, logger = package_logger.name):
+        fix_untrained_tokens(_CompositeModel(_config()), tokenizer, dataset)
+    skips = [r for r in caplog.records if "Skipping the untrained token fix" in r.message]
+    assert len(skips) == 1
+    assert skips[0].levelno >= logging.WARNING
+
+
 def test_an_ordinary_model_is_still_processed(tokenizer, dataset):
     """The guard must not swallow the models the pass exists for."""
     model = AutoModelForCausalLM.from_config(_config())
