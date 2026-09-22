@@ -19,14 +19,28 @@ serves and a user's own merge of the same model does not.
 
 import pytest
 
+# The identity fallback below exists so this file reports the real defect on a
+# pre-fix tree instead of a collection error. It must fire ONLY when the module
+# imports and the symbol is absent. `unsloth_zoo.saving_utils` imports torch at
+# module scope, so on a runner without torch a bare `except ImportError` would
+# swap in the stub and turn "this runner ships no torch" into 21 assertion
+# failures that read exactly like "the fix is missing" (observed on macos-15).
+# Import the module first, and skip the file outright if that is what failed.
 try:
-    from unsloth_zoo.saving_utils import add_vllm_fused_skip_module_aliases
-except ImportError:
+    import unsloth_zoo.saving_utils as _saving_utils
+except ImportError as _e:
+    pytest.skip(
+        f"unsloth_zoo.saving_utils is not importable here ({_e}); "
+        "this is an environment gap, not a result about the fix",
+        allow_module_level = True,
+    )
+
+add_vllm_fused_skip_module_aliases = getattr(
+    _saving_utils, "add_vllm_fused_skip_module_aliases",
     # Pre-fix tree: the merged 4bit save wrote the leaf list through untouched,
-    # so identity is exactly the old behaviour and the assertions below report
-    # the real defect rather than a collection error.
-    def add_vllm_fused_skip_module_aliases(skipped_modules):
-        return skipped_modules
+    # so identity is exactly the old behaviour.
+    lambda skipped_modules: skipped_modules,
+)
 
 
 def is_layer_skipped_bnb(prefix, llm_int8_skip_modules):
@@ -158,10 +172,9 @@ def test_idempotent():
 #   param_data (12451840, 1) uint8  vs  loaded_weight (2560, 9728) bfloat16
 # at vllm/model_executor/layers/linear.py:1376 (RowParallelLinear.weight_loader).
 
-try:
-    from unsloth_zoo.saving_utils import vllm_compatible_skip_modules
-except ImportError:
-    vllm_compatible_skip_modules = add_vllm_fused_skip_module_aliases
+vllm_compatible_skip_modules = getattr(
+    _saving_utils, "vllm_compatible_skip_modules", add_vllm_fused_skip_module_aliases,
+)
 
 QWEN3VL_SKIP_MODULES = [
     "lm_head",
