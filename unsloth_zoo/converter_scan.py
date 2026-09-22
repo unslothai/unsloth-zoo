@@ -142,6 +142,8 @@ MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
 RE_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 RE_AUTHORITY_END = re.compile(r"[/?#]")
 RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
+# A URL whose authority is already over: what follows cannot change the host.
+RE_AUTHORITY_CLOSED = re.compile(r"https?://[^/?#]*[/?#]", re.IGNORECASE)
 
 
 # Network APIs the allowance cannot vouch for, so their presence refuses it.
@@ -316,13 +318,10 @@ def _writes_anything(tree):
         (isinstance(node, ast.Attribute) and node.attr in WRITE_METHODS)
         or (isinstance(node, ast.Name) and node.id in WRITE_METHODS)
         # vars(requests)["post"] and requests.__dict__["post"] leave the method
-        # name as a string and nothing else. None of these names appears as a
+        # name as a string and nothing else, and "po" + "st" is the same string
+        # spelled to miss a Constant check. None of these names appears as a
         # string constant anywhere in the 21 real modules either.
-        or (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value in WRITE_METHODS
-        )
+        or _literal_text(node) in WRITE_METHODS
         or (
             isinstance(node, ast.ImportFrom)
             and any(alias.name in WRITE_METHODS for alias in node.names)
@@ -420,13 +419,10 @@ def _aliases_the_environment(tree):
     return any(
         (isinstance(node, ast.Name) and node.id in ENV_ALIAS_NAMES)
         # vars(os)["environ"] and os.__dict__["environ"] leave the name as a
-        # string and nothing else, exactly as the write methods did. None of
-        # these appears as a string constant in the 21 real modules.
-        or (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value in ENV_ALIAS_NAMES
-        )
+        # string and nothing else, and "en" + "viron" is the same string spelled
+        # to miss a Constant check. None of these appears as a string constant
+        # in the 21 real modules.
+        or _literal_text(node) in ENV_ALIAS_NAMES
         or (
             isinstance(node, ast.ImportFrom)
             and any(alias.name in ENV_ALIAS_NAMES for alias in node.names)
@@ -806,7 +802,53 @@ def _reshapes_a_url(tree):
         carriers |= found
     else:
         return True
+    def extends_the_authority(node):
+        """Whether this expression appends to a carrier past its authority.
+
+        HUB + "@evil.example/collect" is fetched from evil.example, everything
+        before the @ being user information, while the walk sees only the hub
+        literal the name still holds. Appending a PATH is what upstream does,
+        so text beginning with a URL delimiter is fine and anything else, text
+        this cannot read included, is not.
+        """
+        whole = _literal_text(node)
+        if whole is not None and UNKNOWN_PIECE not in whole:
+            # It folds COMPLETELY, so the walk reads the URL it really builds:
+            # "https://hugging" + "face.co/api/models" is the hub, and judging
+            # that by its pieces refuses a file that names nothing else. A fold
+            # with a hole in it is not read by anyone, which is the case this
+            # check exists for.
+            return False
+        if isinstance(node, ast.JoinedStr):
+            parts = node.values
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            parts = [node.left, node.right]
+        else:
+            return False
+        appended = False
+        for part in parts:
+            if isinstance(part, ast.FormattedValue):
+                part = part.value
+            if not appended:
+                appended = built_from_a_carrier(part)
+                if appended:
+                    carried = _literal_text(part)
+                    if carried and RE_AUTHORITY_CLOSED.search(carried):
+                        break           # this piece already ended the authority
+                continue
+            text = _literal_text(part)
+            if text == "":
+                continue
+            if text and RE_AUTHORITY_END.match(text):
+                break                   # a path, a query or a fragment: the
+                                        # authority ended here, and what comes
+                                        # after it cannot change the host
+            return True
+        return False
+
     for node in ast.walk(tree):
+        if extends_the_authority(node):
+            return True
         if isinstance(node, ast.AugAssign) and (
             carries(node.target) or built_from_a_carrier(node.value)
         ):
@@ -999,42 +1041,51 @@ def _talks_only_to_the_model_hub_tree(tree, text):
     # bytes as well as str: requests decodes b"https://evil.example/collect" and
     # accepts it, so skipping bytes constants let a destination hide in one while
     # a str hub literal stayed in the file.
+    # Iterated, not materialised, and budgeted in aggregate: MAX_FOLDED_JOIN
+    # bounds one expansion, and an 8 MiB file holds thousands of them.
+    def folded_literals():
+        budget = MAX_FOLDED_JOIN
+        for literal in _literal_texts(tree, skip = _docstrings(tree)):
+            budget -= len(literal)
+            if budget < 0:
+                raise MemoryError("folded literal budget")
+            yield literal
+
     try:
-        literals = list(_literal_texts(tree, skip = _docstrings(tree)))
+        for literal in folded_literals():
+            for match in RE_URL_SCHEME.finditer(literal):
+                rest = literal[match.end():]
+                end = RE_AUTHORITY_END.search(rest)
+                if end is None and rest:
+                    # No delimiter, so the authority runs to the end of the literal:
+                    # "https://huggingface.co", which is upstream's BASE_DOMAIN.
+                    host = _authority_host(rest)
+                elif end is None:
+                    # Nothing at all after the scheme. Reading that as "names no
+                    # destination" is what every splitting trick was built on:
+                    # "https://" + host, "".join(("https://", host)),
+                    # "{}evil.example".format("https://"), each leaves a bare scheme
+                    # in one literal and the host somewhere this does not connect to
+                    # it. A scheme with no authority means the destination is
+                    # assembled, and an assembled one is not a destination this can
+                    # vouch for. Upstream's bare "https://" literals are in
+                    # metadata.py, which never reaches this allowance: only
+                    # gguf-py/gguf/utility.py does, measured on master, and it has
+                    # none.
+                    host = None
+                elif end.start() == 0:
+                    # A path with no host, as in https:///collect. requests will not
+                    # send that anywhere useful, but this cannot say where it goes,
+                    # and not knowing is not a reason to allow it.
+                    host = None
+                else:
+                    host = _authority_host(rest[: end.start()])
+                if host is None:
+                    return False        # cannot tell, so do not suppress anything
+                if host:
+                    hosts.add(host)
     except (UnicodeError, AttributeError, MemoryError, RecursionError):
         return False                # cannot tell, so do not suppress anything
-    for literal in literals:
-        for match in RE_URL_SCHEME.finditer(literal):
-            rest = literal[match.end():]
-            end = RE_AUTHORITY_END.search(rest)
-            if end is None and rest:
-                # No delimiter, so the authority runs to the end of the literal:
-                # "https://huggingface.co", which is upstream's BASE_DOMAIN.
-                host = _authority_host(rest)
-            elif end is None:
-                # Nothing at all after the scheme. Reading that as "names no
-                # destination" is what every splitting trick was built on:
-                # "https://" + host, "".join(("https://", host)),
-                # "{}evil.example".format("https://"), each leaves a bare scheme
-                # in one literal and the host somewhere this does not connect to
-                # it. A scheme with no authority means the destination is
-                # assembled, and an assembled one is not a destination this can
-                # vouch for. Upstream's bare "https://" literals are in
-                # metadata.py, which never reaches this allowance: only
-                # gguf-py/gguf/utility.py does, measured on master, and it has
-                # none.
-                host = None
-            elif end.start() == 0:
-                # A path with no host, as in https:///collect. requests will not
-                # send that anywhere useful, but this cannot say where it goes,
-                # and not knowing is not a reason to allow it.
-                host = None
-            else:
-                host = _authority_host(rest[: end.start()])
-            if host is None:
-                return False        # cannot tell, so do not suppress anything
-            if host:
-                hosts.add(host)
     return bool(hosts) and hosts <= MODEL_HUB_HOSTS
 
 
