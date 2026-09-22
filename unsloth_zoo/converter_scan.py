@@ -399,7 +399,7 @@ URL_BUILDERS = frozenset((
 ))
 
 
-def _dynamic_imports(tree):
+def _dynamic_imports(tree, aliases = None):
     """`(names, unreadable)` for every import spelled as a call.
 
     __import__("smtplib") and importlib.import_module("smtplib") bind a module
@@ -407,15 +407,13 @@ def _dynamic_imports(tree):
     nothing at all. A name this cannot read is worse than a known one, so it
     counts as unreadable rather than as no import.
     """
+    if aliases is None:
+        aliases = _call_aliases(tree)
     names, unreadable = set(), False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        called = (
-            node.func.attr if isinstance(node.func, ast.Attribute)
-            else node.func.id if isinstance(node.func, ast.Name) else ""
-        )
-        if called not in ("__import__", "import_module"):
+        if _called_name(node, aliases) not in ("__import__", "import_module"):
             continue
         text = _literal_text(node.args[0]) if node.args else None
         if text is None or UNKNOWN_PIECE in text:
@@ -425,7 +423,7 @@ def _dynamic_imports(tree):
     return names, unreadable
 
 
-def _imports_an_unvouchable_api(tree):
+def _imports_an_unvouchable_api(tree, aliases = None):
     """Whether a connection API arrives by from-import.
 
     RE_UNVOUCHABLE_NETWORK reads qualified spellings, so
@@ -439,7 +437,7 @@ def _imports_an_unvouchable_api(tree):
             for module in UNVOUCHABLE_MODULES
         )
 
-    dynamic, unreadable = _dynamic_imports(tree)
+    dynamic, unreadable = _dynamic_imports(tree, aliases)
     if unreadable or any(unvouchable(name) for name in dynamic):
         return True
     for node in ast.walk(tree):
@@ -553,6 +551,31 @@ def _joins_something_unreadable(tree):
     return False
 
 
+def _call_aliases(tree, assignments = None):
+    """`{local name: original name}` for imports and for rebinding assignments.
+
+    `from importlib import import_module as im` leaves the dynamic import
+    spelled im(...), and `j = urljoin` rebinds a builder with no import in
+    sight. Both are the same question a call site asks: what is this really.
+    """
+    aliases = _import_aliases(tree)
+    for name, value in (assignments or _single_assignments(tree)).items():
+        if isinstance(value, ast.Name):
+            aliases[name] = aliases.get(value.id, value.id)
+        elif isinstance(value, ast.Attribute):
+            aliases[name] = aliases.get(value.attr, value.attr)
+    return aliases
+
+
+def _called_name(node, aliases):
+    """The name a call site uses, read through any alias."""
+    name = (
+        node.func.attr if isinstance(node.func, ast.Attribute)
+        else node.func.id if isinstance(node.func, ast.Name) else ""
+    )
+    return aliases.get(name, name)
+
+
 def _import_aliases(tree):
     """`{local name: imported name}` for every alias an import binds.
 
@@ -569,7 +592,7 @@ def _import_aliases(tree):
     return aliases
 
 
-def _imports_a_string_builder(tree):
+def _imports_a_string_builder(tree, aliases = None):
     """Whether a string decoder arrives by import, under any name.
 
     An alias erases the only spelling RE_UNVOUCHABLE_STRING_BUILD can read: with
@@ -583,7 +606,7 @@ def _imports_a_string_builder(tree):
             for module in STRING_BUILDER_MODULES
         )
 
-    dynamic, _ = _dynamic_imports(tree)
+    dynamic, _ = _dynamic_imports(tree, aliases)
     if any(builder_module(name) for name in dynamic):
         return True
     for node in ast.walk(tree):
@@ -1173,7 +1196,7 @@ def _bound_names(target):
     return set()
 
 
-def _reshapes_a_url(tree, assignments = None):
+def _reshapes_a_url(tree, assignments = None, aliases = None):
     """Whether a URL this file spells out is transformed before it is used.
 
     Reading every literal and asking whether each names a hub host assumes a
@@ -1202,22 +1225,10 @@ def _reshapes_a_url(tree, assignments = None):
     the interprocedural residual this allowance already documents.
     """
     carriers = set()
-    aliases = _import_aliases(tree)
-    # j = urljoin rebinds the builder with no import in sight, so a single
-    # assignment of one name to another is followed the same way an alias is.
-    for name, value in (assignments or _single_assignments(tree)).items():
-        if isinstance(value, ast.Name):
-            aliases[name] = aliases.get(value.id, value.id)
-        elif isinstance(value, ast.Attribute):
-            aliases[name] = aliases.get(value.attr, value.attr)
+    aliases = aliases if aliases is not None else _call_aliases(tree, assignments)
 
     def called_name(node):
-        """The name a call site uses, read through any import alias."""
-        name = (
-            node.func.attr if isinstance(node.func, ast.Attribute)
-            else node.func.id if isinstance(node.func, ast.Name) else ""
-        )
-        return aliases.get(name, name)
+        return _called_name(node, aliases)
 
     def carries(node):
         while isinstance(node, ast.NamedExpr):
@@ -1772,10 +1783,11 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
         # there and make it a channel anyone can read back, so "the destination
         # is the hub" is not on its own a reason to say nothing.
         return False
-    if _imports_an_unvouchable_api(tree):
+    aliases = _call_aliases(tree, assignments)
+    if _imports_an_unvouchable_api(tree, aliases):
         # A destination this allowance never looks at, arriving by another door.
         return False
-    if _imports_a_string_builder(tree):
+    if _imports_a_string_builder(tree, aliases):
         # A decoder whose only readable name is the import line itself.
         return False
     if _templates_are_oversized(tree):
@@ -1793,7 +1805,7 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
     if _aliases_the_environment(tree):
         # A read this cannot attribute is the same as one it cannot see.
         return False
-    if _reshapes_a_url(tree, assignments):
+    if _reshapes_a_url(tree, assignments, aliases):
         # A literal that is rewritten before it is sent names the host it was,
         # not the host it becomes.
         return False
