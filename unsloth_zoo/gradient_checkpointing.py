@@ -764,7 +764,14 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         raise
 
     BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
+    # One side stream per card, created on that card. A bare Stream() belongs to the current
+    # device (normally cuda:0), so every other card's offload copies were ordered against
+    # cuda:0's streams instead of its own: a race that only shows once a model is split over
+    # several cards, as "CUDA error: unspecified launch failure" in the backward.
+    if DEVICE_TYPE_TORCH == "cuda":
+        EXTRA_STREAMS = tuple([torch.cuda.Stream(device = torch.device(f"cuda:{i}")) for i in range(n_gpus)])
+    else:
+        EXTRA_STREAMS = tuple([torch.xpu.Stream(device = torch.device(f"xpu:{i}")) for i in range(n_gpus)])
     if DEVICE_TYPE in ("cuda", "hip"):
         MAIN_STREAMS  = tuple([torch.cuda.default_stream(torch.device(f"cuda:{i}")) for i in range(n_gpus)])
     elif DEVICE_TYPE == "xpu":
