@@ -250,6 +250,13 @@ jobs:
           # `pytest.importorskip("gguf")`: 73 of them, the whole post conversion
           # verification file, silently and with the job still green.
           pip install gguf
+          # Same shape of problem for the planner's compressed-tensors sizing.
+          # tests/test_device_map_planner_compressed_tensors.py opens with
+          # `pytest.importorskip("compressed_tensors")`, and the package is in
+          # neither the base dependencies nor `[core]`, so the one test that
+          # guards a pack-quantized checkpoint being sized at its packed bytes
+          # skips here and the job stays green either way.
+          pip install compressed-tensors
 
       - uses: ./.github/actions/pip-cache-save
         with:
