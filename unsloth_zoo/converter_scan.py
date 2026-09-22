@@ -177,7 +177,12 @@ RE_UNVOUCHABLE_STRING_BUILD = re.compile(
     r"|\.translate\s*\("
     r"|\.to_bytes\s*\("
     r"|\bcodecs\s*\.\s*(?:decode|encode)\b"
-    r"|\bbase64\s*\.\s*\w+\s*\(",
+    r"|\bbase64\s*\.\s*\w+\s*\("
+    # unquote("https%3A%2F%2Fevil.example%2Fc") is a destination too, and the
+    # literal that spells it carries no scheme for the walk to find. urlparse is
+    # NOT here: upstream's utility.py parses URLs with it, and parsing one is not
+    # building one.
+    r"|\bunquote(?:_plus|_to_bytes)?\s*\(",
 )
 
 

