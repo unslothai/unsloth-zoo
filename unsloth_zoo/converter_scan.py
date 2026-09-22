@@ -356,6 +356,21 @@ STRING_BUILDER_NAMES = frozenset((
 
 # Functions that BUILD a URL out of one. urlparse and urlsplit are not here:
 # upstream reads its URL with urlparse, and reading one is not rebuilding it.
+# The methods a URL OBJECT is rewritten by. httpx.URL(HUB).copy_with(host =
+# "evil.example") and yarl.URL(HUB).with_host(...) wrap the carrier in a call
+# first, and a carrier deliberately does not survive a call: upstream writes
+# cls.get_list_tensors(url).items() and response = requests.get(url), and
+# tracking what came back out of those refused the very file this exists for.
+# So the receiver is searched for a carrier only when the method is one that
+# rebuilds a URL, which none of upstream's calls on a URL are. _replace is
+# here for the namedtuple urlparse returns.
+URL_REWRITE_METHODS = frozenset((
+    "copy_with", "copy_set_param", "copy_add_param", "copy_merge_params",
+    "with_host", "with_scheme", "with_path", "with_query", "with_port",
+    "with_user", "with_password", "with_fragment", "with_netloc",
+    "set_host", "set_scheme", "update_query", "_replace",
+))
+
 URL_BUILDERS = frozenset((
     "urljoin", "urlunparse", "urlunsplit", "urldefrag",
 ))
@@ -1056,6 +1071,18 @@ def _reshapes_a_url(tree):
         if extends_the_authority(node):
             return True
         if _rewrites_a_constant(node):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in URL_REWRITE_METHODS
+            and any(
+                built_from_a_carrier(inner)
+                for inner in ast.walk(node.func.value)
+            )
+        ):
+            # httpx.URL(HUB).copy_with(host = "evil.example") sends the token to
+            # evil.example while every literal in the file is still the hub.
             return True
         if isinstance(node, ast.Call) and any(
             built_from_a_carrier(argument)
