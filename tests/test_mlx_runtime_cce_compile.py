@@ -706,3 +706,62 @@ def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, so
     for got in (actual, compiled):
         assert mx.all(mx.isnan(got[1][30])).item()
         assert mx.allclose(got[1], expected[1], atol=2e-6, rtol=0, equal_nan=True).item()
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, frozen):
+    """The dense VLM loss must tell the runtime whether the head is trainable.
+
+    This lives here rather than beside the other VLM tests because that file runs on
+    the torch shim, whose Module.freeze/unfreeze are `return self` no-ops
+    (tests/mlx_simulation/mlx_nn_stub.py). Under the shim trainable_parameters() still
+    reports lm_head.weight, so the freeze below cannot be read back and the frozen case
+    can never be observed. Real MLX runs the whole chain: freeze -> trainable_parameters
+    -> _is_lm_head_trainable -> _skip_weight_grad -> weight_is_frozen.
+    """
+    _skip_torch_shim()
+    from unsloth_zoo.mlx import utils as U
+
+    class _Backbone(U.nn.Module):
+        pass
+
+    class _LM(U.nn.Module):
+        def __call__(self, x):
+            return x
+
+    class _VLM(U.nn.Module):
+        def __init__(self):
+            super().__init__()
+            backbone = _Backbone()
+            backbone.embed_tokens = U.nn.Embedding(96, 32)
+            language_model = _LM()
+            language_model.model = backbone
+            language_model.lm_head = U.nn.Linear(32, 96, bias=False)
+            self.language_model = language_model
+
+        def get_input_embeddings(self):
+            return None
+
+    model = _VLM()
+    if frozen:
+        adapter = U.nn.Linear(32, 32)
+        adapter.lora_a = U.mx.zeros((4, 32))
+        adapter.lora_b = U.mx.zeros((32, 4))
+        model.language_model.model.proj = adapter
+        model.freeze()
+        adapter.unfreeze(keys=["lora_a", "lora_b"])
+    # The derivation is left real. Pinning it here would only re-assert the literal
+    # `frozen` and would stop the nested `language_model.lm_head` head-prefix
+    # resolution from being covered at all.
+    assert U._is_lm_head_trainable(model) is (not frozen)
+
+    factories = []
+    monkeypatch.setattr(U, "_get_runtime_cce", lambda **kwargs: factories.append(kwargs))
+    U.make_vlm_cce_loss_fn(model)
+    assert {kwargs.get("weight_is_frozen") for kwargs in factories} == {frozen}
+    # A frozen head also builds the training-mode runtime that precomputes the hidden
+    # gradient, which is this PR's actual optimisation. Ordered, not collapsed to a set:
+    # a bare set would still pass with the training arm deleted outright.
+    assert [kwargs.get("precompute_hidden_gradient") for kwargs in factories] == (
+        [None, True] if frozen else [None]
+    )

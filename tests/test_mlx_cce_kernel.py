@@ -540,35 +540,3 @@ def test_describe_output_head_evidence_ladder():
     for i, (model, status, path, cand) in enumerate(rows):
         d = U.describe_output_head(model)
         assert (d.status, d.path, d.candidate_path) == (status, path, cand), (i, d)
-
-
-@pytest.mark.parametrize("frozen", [False, True])
-def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, frozen):
-    from unsloth_zoo.mlx import utils as U
-
-    class _VLM(U.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.language_model = _lm(U.nn, head=U.nn.Linear(32, 96, bias=False))
-
-        def get_input_embeddings(self):
-            return None
-
-    model = _VLM()
-    if frozen:
-        adapter = U.nn.Linear(32, 32)
-        adapter.lora_a = U.mx.zeros((4, 32))
-        adapter.lora_b = U.mx.zeros((32, 4))
-        model.language_model.model.proj = adapter
-        model.freeze()
-        adapter.unfreeze(keys=["lora_a", "lora_b"])
-    # This file runs on the torch shim, whose Module.freeze/unfreeze are `return self`
-    # no-ops (tests/mlx_simulation/mlx_nn_stub.py), so trainable_parameters() still
-    # reports lm_head.weight and the setup above cannot be read back. Under real MLX the
-    # same model gives _is_lm_head_trainable() is False. Pin the derivation the loss
-    # actually uses, which is the wiring this test is about.
-    monkeypatch.setattr(U, "_is_lm_head_trainable", lambda _model: not frozen)
-    factories = []
-    monkeypatch.setattr(U, "_get_runtime_cce", lambda **kwargs: factories.append(kwargs))
-    U.make_vlm_cce_loss_fn(model)
-    assert {kwargs.get("weight_is_frozen") for kwargs in factories} == {frozen}
