@@ -1688,16 +1688,32 @@ def _get_base_weight(param, target_dtype=None):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        # An expert stack of 2**31 elements or more aborts inside the
-        # bitsandbytes dequantize kernel (csrc/ops.cu line 93), and this is the
-        # read the recompute and grouped-mm providers take on every forward and
-        # again on every backward recomputation. Slice it the same way the load
-        # does; the helper returns None for everything smaller, which leaves the
-        # single call below untouched.
-        # Resolved once and memoized rather than imported per call, since this
-        # is a read on every forward and every backward recomputation.
-        slicer = _get_dequantize_4bit_in_slices()
-        weight = slicer(param) if slicer is not None else None
+        # The Triton dequant is bit-identical to bitsandbytes and about twice
+        # as fast on an expert stack. None means "not this state" (unsupported
+        # blocksize, no Triton, a failed launch), and bitsandbytes takes over.
+        # Absolute import: this file is also copied to
+        # unsloth_compiled_cache/moe_utils.py and imported as a top-level
+        # module, where a relative import of a sibling raises.
+        weight = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+        except ImportError:
+            nf4_dequant_triton = None
+        if nf4_dequant_triton is not None:
+            weight = nf4_dequant_triton(
+                param.data, param.quant_state, getattr(param, "_original_shape", None),
+            )
+        if weight is None:
+            # An expert stack of 2**31 elements or more aborts inside the
+            # bitsandbytes dequantize kernel (csrc/ops.cu line 93), and this is the
+            # read the recompute and grouped-mm providers take on every forward and
+            # again on every backward recomputation. Slice it the same way the load
+            # does; the helper returns None for everything smaller, which leaves the
+            # single call below untouched.
+            # Resolved once and memoized rather than imported per call, since this
+            # is a read on every forward and every backward recomputation.
+            slicer = _get_dequantize_4bit_in_slices()
+            weight = slicer(param) if slicer is not None else None
         if weight is None:
             weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
         original_shape = getattr(param, "_original_shape", None)
@@ -3334,6 +3350,25 @@ def patch_param_wrapper_for_moe():
 
 
 @lru_cache(maxsize=1)
+def _moe_triton_combine_enabled() -> bool:
+    """Whether the fused Triton combine (weighted_unpermute) may be used. It is
+    always safe to answer False: the eager reduction is kept as the fallback."""
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import moe_triton_kernels_available
+    except ImportError:
+        return False
+    return moe_triton_kernels_available()
+
+
+def weighted_unpermute(*args, **kwargs):
+    """Fused combine; returns None (caller falls back) when Triton is unavailable."""
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
+    except ImportError:
+        return None
+    return _wu(*args, **kwargs)
+
+
 def _moe_gategrad_enabled() -> bool:
     """Whether the MoE gate-gradient identity path is active (on by default).
 
@@ -3694,19 +3729,33 @@ def forward_native_grouped_mm(
     # Apply routing weights and scatter-add (reduce).
     if _gategrad:
         # Gate grad comes from the identity; detach so the multiply does not pin Y.
-        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+        permuted_weights = permuted_weights.detach()
     else:
         flat_weights = top_k_weights.reshape(-1)
         permuted_weights = flat_weights[sorted_indices]
-        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
-    final_hidden_states = combine_permuted_moe_outputs(
-        mm2_out,
-        sorted_indices,
-        batch_size * sequence_length,
-        top_k_index.shape[-1],
-        out_dtype = hidden_states.dtype,
-    )
+    # One fused pass (weights applied and the top_k slots of each token summed in
+    # fp32, rounded once) where Triton is available; otherwise the eager spelling,
+    # which promotes the whole permuted output to the router dtype first.
+    final_hidden_states = None
+    if _moe_triton_combine_enabled():
+        final_hidden_states = weighted_unpermute(
+            mm2_out,
+            sorted_indices,
+            permuted_weights,
+            batch_size * sequence_length,
+            top_k_index.shape[-1],
+            out_dtype = hidden_states.dtype,
+        )
+    if final_hidden_states is None:
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+        final_hidden_states = combine_permuted_moe_outputs(
+            mm2_out,
+            sorted_indices,
+            batch_size * sequence_length,
+            top_k_index.shape[-1],
+            out_dtype = hidden_states.dtype,
+        )
 
     if is_2d_input:
         return final_hidden_states

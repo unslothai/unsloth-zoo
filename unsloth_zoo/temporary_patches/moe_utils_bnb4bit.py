@@ -286,7 +286,16 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """
     if not _is_bnb4bit_param(weight):
         return None
-    dequant = _dequantize_4bit_in_slices(weight)
+    dequant = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+        dequant = nf4_dequant_triton(
+            weight.data, weight.quant_state, getattr(weight, "_original_shape", None),
+        )
+    except ImportError:
+        pass
+    if dequant is None:
+        dequant = _dequantize_4bit_in_slices(weight)
     if dequant is None:
         dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
     original_shape = getattr(weight, "_original_shape", None)
