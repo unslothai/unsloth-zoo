@@ -981,7 +981,10 @@ def forward_moe_backend(
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
-    if backend == "unsloth_triton":
+    # The Triton kernels split gate_up into two halves, apply SiLU and add no bias.
+    # Interleaved gate_up (GPT-OSS) with its clamped gate and biases would silently
+    # compute a different activation there, so it takes the eager loop that has it.
+    if backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
         return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
     return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 

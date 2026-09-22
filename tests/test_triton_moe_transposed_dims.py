@@ -41,3 +41,17 @@ def test_triton_backend_tunes_for_the_real_intermediate_size(monkeypatch, transp
         moe_utils.forward_triton_grouped_gemm(experts, hidden, top_k_index, top_k_weights)
     assert seen and seen[0]["hidden_dim"] == H
     assert seen[0]["intermediate_dim"] == 2 * I
+
+
+@pytest.mark.parametrize("name, interleaved", [("GptOssExperts", True), ("Qwen3MoeExperts", False)])
+def test_triton_backend_is_skipped_for_interleaved_gate_up(monkeypatch, name, interleaved):
+    # The Triton kernels chunk gate_up into halves with SiLU and no bias, which is not
+    # GPT-OSS's interleaved, clamped, biased activation.
+    calls = []
+    monkeypatch.setattr(moe_utils, "select_moe_backend", lambda: "unsloth_triton")
+    monkeypatch.setattr(moe_utils, "forward_triton_grouped_gemm", lambda *a: calls.append("triton"))
+    monkeypatch.setattr(moe_utils, "forward_native_moe_loop", lambda *a: calls.append("loop"))
+    experts = type(name, (nn.Module,), {})()
+    experts.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4))
+    moe_utils.forward_moe_backend(experts, torch.zeros(1, 4), torch.zeros(1, 1, dtype = torch.long), torch.ones(1, 1))
+    assert calls == (["loop"] if interleaved else ["triton"])
