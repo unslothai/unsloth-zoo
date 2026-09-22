@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 import contextlib
 import json
+import math
 import os
 import shutil
 import stat
@@ -695,15 +696,67 @@ def _source_pins_large_dequant(source) -> bool:
         return False
 
 
+def _in_gc_recompute() -> bool:
+    try:
+        from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
+        return bool(in_gradient_checkpoint_recompute())
+    except Exception:
+        return False
+
+
+_MOMENTARY_PIN_HEADROOM = 2.0   # free memory must cover this many copies of one layer's stack
+
+
+def _momentary_pin_fits(source) -> bool:
+    """Whether one layer's dense expert stack can be held for the moment between a
+    gradient-checkpoint replay and that layer's own backward. Measured against what
+    the device has free plus what the caching allocator holds unused, with headroom
+    for the second projection's stack and the layer's activations. Anything that
+    cannot be measured answers False, which keeps the recompute."""
+    try:
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        device = param.device
+        if device.type != "cuda":
+            return True
+        shape = _logical_expert_shape(param)
+        if not shape:
+            return False
+        dtype = getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
+        need = math.prod(int(d) for d in shape) * torch.empty((), dtype = dtype).element_size()
+        free, _ = torch.cuda.mem_get_info(device)
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        return free >= _MOMENTARY_PIN_HEADROOM * need
+    except Exception:
+        return False
+
+
 def _moe_recompute_enabled(source) -> bool:
     """Whether to recompute the dequantized base stack in backward (True) or pin it
     for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
-    everything else the pinned eager path is used. A bnb 4-bit base prefers recompute
-    even under gradient checkpointing so the momentary pin never holds the full bf16
-    expert dequant (see _source_pins_large_dequant)."""
-    return _base_is_recomputable(source) and _moe_recompute_default(
-        prefer_memory = _source_pins_large_dequant(source)
-    )
+    everything else the pinned eager path is used.
+
+    A bnb 4-bit base recomputes by default: pinning it would hold the full bf16
+    expert dequant, which the 4-bit storage exists to avoid. The one cheap pin is
+    inside a gradient-checkpoint replay, where the stack the replay just built is
+    what the same layer's backward needs moments later; holding it there costs one
+    layer's stack transiently and removes one of the three dequants per layer per
+    step. That pin is taken only when the stack fits with headroom
+    (_momentary_pin_fits). UNSLOTH_MOE_RECOMPUTE overrides everything: "1" always
+    recomputes, "0" always pins."""
+    if not _base_is_recomputable(source):
+        return False
+    override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
+    if override == "1":
+        return True
+    if override == "0":
+        return False
+    if _source_pins_large_dequant(source):
+        if _in_gc_recompute() and _momentary_pin_fits(source):
+            return False
+        return True
+    return _moe_recompute_default()
 
 
 class _GroupedMMRecompute(torch.autograd.Function):

@@ -2,15 +2,17 @@
 recompute for the 4-bit base.
 
 forward_moe_backend_bnb4bit must not pre-dequantize the packed Params4bit into a dense
-bf16 stack and then re-hold that stack for a backward recompute. It keeps the 4-bit
-weights and defers dequant to forward_native_grouped_mm's providers by default: the
-4-bit base prefers recompute even inside a gradient-checkpoint recompute pass, because
-pinning it would materialize the full bf16 expert stack the 4-bit storage exists to
-avoid (several GiB per layer on large MoEs, exactly when 4-bit + gradient checkpointing
-means the run is already memory-constrained). Only UNSLOTH_MOE_RECOMPUTE=0 forces the
-pre-dequantize-then-pin path (for memory-rich runs); UNSLOTH_MOE_RECOMPUTE=1 also
-recomputes. In the pin case recompute is disabled, so the dense stack is never re-held
-for a backward recompute with no memory benefit.
+bf16 stack and then re-hold that stack for a backward recompute. Outside a
+gradient-checkpoint replay it keeps the 4-bit weights and defers dequant to
+forward_native_grouped_mm's providers: pinning there would hold the full bf16 expert
+stack across the whole backward, which the 4-bit storage exists to avoid. Inside a
+replay the stack the replay just built is what the same layer's backward needs moments
+later, so it is pinned (the pre-dequantize-then-pin path) when it fits with headroom,
+which removes one of the three dequants per layer per step; when it does not fit the
+recompute is kept. UNSLOTH_MOE_RECOMPUTE=0 forces the pin everywhere,
+UNSLOTH_MOE_RECOMPUTE=1 forces the recompute everywhere. In the pin case recompute is
+disabled, so the dense stack is never re-held for a backward recompute with no memory
+benefit.
 """
 import os
 
@@ -74,10 +76,28 @@ def test_default_non_gc_uses_recompute_provider(monkeypatch):
     assert _run_and_record(monkeypatch) == ["provider"]  # keep 4-bit, recompute
 
 
-def test_gc_recompute_pass_recomputes_for_4bit(monkeypatch):
+def test_gc_recompute_pass_pins_for_4bit_when_the_stack_fits(monkeypatch):
+    # The replay's dequant is reused by the same layer's backward: one dequant saved.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: True)
+    with _gradient_checkpoint_recompute_marker():
+        assert _run_and_record(monkeypatch) == ["swap"]  # momentary pin
+
+
+def test_gc_recompute_pass_recomputes_for_4bit_when_the_stack_does_not_fit(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: False)
     with _gradient_checkpoint_recompute_marker():
         assert _run_and_record(monkeypatch) == ["provider"]  # recompute, no bf16 pin
+
+
+def test_momentary_pin_fits_reads_the_real_stack_size(monkeypatch):
+    q = _quantized_expert_param()
+    if q.device.type != "cuda":
+        pytest.skip("measures CUDA free memory")
+    assert mu._momentary_pin_fits(q) is True              # 4 x 32 x 64 bf16 always fits
+    monkeypatch.setattr(mu, "_MOMENTARY_PIN_HEADROOM", 1e12)
+    assert mu._momentary_pin_fits(q) is False             # and the headroom is honoured
 
 
 def test_env_override_forces_recompute(monkeypatch):
@@ -113,18 +133,26 @@ def test_source_pins_large_dequant_classifies_4bit_only(monkeypatch):
     assert mu._source_pins_large_dequant(dense) is False
 
 
-def test_4bit_prefers_recompute_but_dense_still_pins_under_gc(monkeypatch):
-    # The scope guard: the recompute-under-GC default is 4-bit-specific. A dense
-    # (already bf16) base keeps the speed-oriented adaptive policy and pins under a
-    # GC recompute pass; the 4-bit base recomputes to avoid the bf16 dequant pin.
+def test_4bit_recomputes_outside_gc_and_pins_inside_when_it_fits(monkeypatch):
+    # The scope guard: outside a GC replay the 4-bit base recomputes (a pin there
+    # spans the whole backward); inside a replay it pins when the stack fits and
+    # recomputes when it does not. A dense (already bf16) base keeps the
+    # speed-oriented adaptive policy and pins under a GC replay regardless.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     q = _quantized_expert_param()
     dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)  # frozen
+    assert mu._moe_recompute_enabled(q) is True           # outside GC -> recompute
     with _gradient_checkpoint_recompute_marker():
-        assert mu._moe_recompute_enabled(q) is True       # 4-bit -> recompute
+        monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: True)
+        assert mu._moe_recompute_enabled(q) is False      # fits -> momentary pin
+        monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: False)
+        assert mu._moe_recompute_enabled(q) is True       # does not fit -> recompute
         assert mu._moe_recompute_enabled(dense) is False  # dense -> pin (unchanged)
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "0")
     assert mu._moe_recompute_enabled(q) is False
+    monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "1")
+    with _gradient_checkpoint_recompute_marker():
+        assert mu._moe_recompute_enabled(q) is True       # override beats the pin
 
 
 if __name__ == "__main__":
