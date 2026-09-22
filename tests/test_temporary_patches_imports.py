@@ -96,6 +96,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.qwen3_moe_float32",
     "unsloth_zoo.temporary_patches.qwen3_next_moe",
     "unsloth_zoo.temporary_patches.qwen3_vl_moe",
+    "unsloth_zoo.temporary_patches.step3p7_moe",
     "unsloth_zoo.temporary_patches.utils",
 ]
 
