@@ -157,7 +157,7 @@ RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
 # conversion packages, so refusing on them costs nothing upstream.
 RE_UNVOUCHABLE_NETWORK = re.compile(
     r"\bsocket\s*\.\s*(?:socket|create_connection)\b"
-    r"|\bhttp\.client\b"
+    r"|\bhttp\.(?:client|server)\b"
     r"|\burllib\.request\b"
     r"|\burlopen\s*\(",
 )
@@ -171,11 +171,12 @@ HUB_TOKEN_ENV_NAMES = frozenset((
     "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN",
 ))
 
-# `request` is here because session.request("POST", ...) is a write the named
-# methods do not cover, and reading its method argument would mean following it
-# when it is not a literal. Upstream calls .request() nowhere at all, so taking
-# every one of them as a write costs nothing there.
-WRITE_METHODS = frozenset(("post", "put", "patch", "delete", "request"))
+# `request` and `send` are here because session.request("POST", ...) and
+# Session.send(Request("POST", ...).prepare()) are writes the named methods do
+# not cover, and reading the method out of either would mean following it when
+# it is not a literal. Upstream calls neither anywhere at all, so taking every
+# one of them as a write costs nothing there.
+WRITE_METHODS = frozenset(("post", "put", "patch", "delete", "request", "send"))
 
 RE_WHOLE_ENV = re.compile(
     r"\bos\.environ\s*\.\s*copy\s*\("

