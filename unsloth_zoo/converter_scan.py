@@ -979,6 +979,30 @@ def _literal_text_uncharged(node):
         # treat the pieces around it as the whole string.
         separator, elements = parts
         return separator.join(elements)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        # "https" * 1 + "://evil.example/c" carries its scheme in a repetition,
+        # which was neither folded nor refused, so no literal in the file held
+        # a URL. Either operand may be the count, and one this cannot read
+        # leaves a hole, exactly as an unreadable f-string piece does.
+        for text_side, count_side in (
+            (node.left, node.right), (node.right, node.left),
+        ):
+            text = _literal_text_uncharged(text_side)
+            if text is None:
+                continue
+            count = count_side.value if (
+                isinstance(count_side, ast.Constant)
+                and isinstance(count_side.value, int)
+                and not isinstance(count_side.value, bool)
+            ) else None
+            if count is None:
+                return UNKNOWN_PIECE
+            if count < 0:
+                return ""
+            if len(text) * count > MAX_FOLDED_JOIN:
+                return None             # the same output ceiling as the join
+            return text * count
+        return None
     if not (isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod))):
         return None
     left = _literal_text(node.left)

