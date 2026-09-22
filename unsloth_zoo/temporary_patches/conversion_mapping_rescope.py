@@ -338,6 +338,22 @@ def _rescope_conversions(model, conversions):
     return rescoped_conversions
 
 
+def _wrapper_chain(function):
+    """`function` and everything it wraps, by either link. Bounded, so a cycle terminates."""
+    chain = []
+    seen = 0
+    while function is not None and seen < _MAX_WRAPPER_DEPTH:
+        if any(function is already for already in chain):
+            break
+        chain.append(function)
+        function = (
+            getattr(function, "__wrapped__", None)
+            or getattr(function, WRAPPER_INNER_ATTR, None)
+        )
+        seen += 1
+    return chain
+
+
 def _repair_already_installed(function):
     """Is either package's repair already on this callable, anywhere down the wrapper chain?
 
@@ -372,8 +388,12 @@ def patch_transformers_composite_prefix_renaming():
     # `moe_utils_bnb4bit.py`'s wrapper. A second repair is inert but is a wrapper nobody needs.
     if _repair_already_installed(original):
         return
+    live_before = original
     # Probe and wrap the ORIGINAL, never a wrapper of ours that lost its mark.
     original = getattr(original, "__wrapped__", original)
+    # Every callable our wrapper now sits in front of, so the sweep below can tell a binding it
+    # SUPERSEDES from one it would silently destroy.
+    superseded = _wrapper_chain(live_before) + _wrapper_chain(original)
 
     @functools.wraps(original)
     def get_model_conversion_mapping(*args, **kwargs):
@@ -414,8 +434,22 @@ def patch_transformers_composite_prefix_renaming():
             # `__getattr__`, so a getattr sweep walks the whole model zoo printing deprecations.
             try:
                 bound = namespace.get("get_model_conversion_mapping", None)
-                if callable(bound) and bound is not get_model_conversion_mapping:
-                    module.get_model_conversion_mapping = get_model_conversion_mapping
+                if not callable(bound) or bound is get_model_conversion_mapping:
+                    continue
+                # Only a binding we supersede. Anything else is SOMEONE ELSE'S wrapper on the
+                # same name, and overwriting it drops their behaviour with no trace: our
+                # wrapper closes over the module attribute, not over whatever an alias held,
+                # so their work would simply not be in the chain. Leave it, even though it
+                # then misses this repair -- a partly-unrepaired load beats silently
+                # disabling unrelated conversion logic.
+                if not any(bound is known for known in superseded):
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(
+                            f"Unsloth: leaving {module_name}.get_model_conversion_mapping "
+                            f"alone, it holds another wrapper we do not supersede"
+                        )
+                    continue
+                module.get_model_conversion_mapping = get_model_conversion_mapping
             except Exception:
                 continue
         if UNSLOTH_ENABLE_LOGGING:

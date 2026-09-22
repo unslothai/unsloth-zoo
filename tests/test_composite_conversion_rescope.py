@@ -245,10 +245,31 @@ def test_a_non_composite_model_gets_its_own_list_back():
     assert rescope._rescope_conversions(model, sentinel) is sentinel
 
 
+def _base_mapping_fn(conversion_mapping):
+    """The genuinely unwrapped `get_model_conversion_mapping`.
+
+    conftest applies TEMPORARY_PATCHES, so by the time a test runs the module attribute is
+    already this package's wrappers. Walking to the base is what lets a test install onto a
+    clean function instead of being refused by the already-installed check.
+    """
+    function = conversion_mapping.get_model_conversion_mapping
+    for _ in range(8):
+        following = (
+            getattr(function, "__wrapped__", None)
+            or getattr(function, "_unsloth_wrapper_inner", None)
+        )
+        if following is None:
+            break
+        function = following
+    return function
+
+
 def test_install_is_idempotent_and_undoable():
     conversion_mapping = pytest.importorskip("transformers.conversion_mapping")
-    before = conversion_mapping.get_model_conversion_mapping
+    live = conversion_mapping.get_model_conversion_mapping
+    before = _base_mapping_fn(conversion_mapping)
     try:
+        conversion_mapping.get_model_conversion_mapping = before
         rescope.patch_transformers_composite_prefix_renaming()
         after = conversion_mapping.get_model_conversion_mapping
         if rescope._transformers_rescopes_submodule_prefix_renamings():
@@ -260,7 +281,7 @@ def test_install_is_idempotent_and_undoable():
         assert conversion_mapping.get_model_conversion_mapping is after
         assert after.__wrapped__ is before
     finally:
-        conversion_mapping.get_model_conversion_mapping = before
+        conversion_mapping.get_model_conversion_mapping = live
 
 
 def test_repair_detection_sees_both_packages_marks():
@@ -304,10 +325,11 @@ def test_the_moe_wrapper_does_not_hide_the_repair_from_either_probe():
     transformers version for a load the repair had already fixed, and pass 2 stacked a
     second rescope wrapper.
     """
-    import transformers.conversion_mapping as cm
-    from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
-        patch_bnb4bit_model_conversion_mapping,
-    )
+    # importorskip, not a bare import: transformers 4.x has no conversion_mapping at all, so
+    # on the 4.57.6 CI lane this was a collection-time ModuleNotFoundError rather than a skip.
+    cm = pytest.importorskip("transformers.conversion_mapping")
+    moe = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
+    patch_bnb4bit_model_conversion_mapping = moe.patch_bnb4bit_model_conversion_mapping
 
     pristine = cm.get_model_conversion_mapping
     try:
@@ -410,3 +432,53 @@ def test_repair_probe_never_raises_without_transformers(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", _boom)
     assert bnb_patch._composite_renaming_repair_installed() is False
+
+
+def test_the_sweep_leaves_a_wrapper_it_does_not_supersede(monkeypatch):
+    """Someone else's wrapper on an imported alias must survive the rebinding sweep.
+
+    The sweep exists because a module that did `from .conversion_mapping import
+    get_model_conversion_mapping` holds the OBJECT, so rebinding the module attribute alone
+    leaves it on the unrepaired function. But a binding under that name is not necessarily the
+    function we wrapped: another integration may have wrapped the alias and left the module
+    attribute alone, and our wrapper closes over the module attribute, so overwriting the alias
+    drops their behaviour with no trace -- silently disabling unrelated conversion logic.
+
+    Reproduced before the fix: `modeling_utils.get_model_conversion_mapping` came back as ours
+    and `third_party` was nowhere in the chain.
+    """
+    conversion_mapping = _requires_submodule_extraction()
+    if rescope._transformers_rescopes_submodule_prefix_renamings():
+        pytest.skip("this transformers carries the upstream fix; the re-scope declines")
+    modeling_utils = pytest.importorskip("transformers.modeling_utils")
+
+    pristine = _base_mapping_fn(conversion_mapping)
+
+    def third_party(*args, **kwargs):
+        return pristine(*args, **kwargs)
+
+    monkeypatch.setattr(conversion_mapping, "get_model_conversion_mapping", pristine)
+    monkeypatch.setattr(modeling_utils, "get_model_conversion_mapping", third_party)
+
+    rescope.patch_transformers_composite_prefix_renaming()
+
+    assert conversion_mapping.get_model_conversion_mapping is not pristine, "expected an install"
+    assert modeling_utils.get_model_conversion_mapping is third_party
+
+
+def test_the_sweep_still_rebinds_a_plain_alias(monkeypatch):
+    """The other half: an alias holding exactly what we wrapped must be moved onto ours."""
+    conversion_mapping = _requires_submodule_extraction()
+    if rescope._transformers_rescopes_submodule_prefix_renamings():
+        pytest.skip("this transformers carries the upstream fix; the re-scope declines")
+    modeling_utils = pytest.importorskip("transformers.modeling_utils")
+
+    pristine = _base_mapping_fn(conversion_mapping)
+    monkeypatch.setattr(conversion_mapping, "get_model_conversion_mapping", pristine)
+    monkeypatch.setattr(modeling_utils, "get_model_conversion_mapping", pristine)
+
+    rescope.patch_transformers_composite_prefix_renaming()
+
+    live = conversion_mapping.get_model_conversion_mapping
+    assert live is not pristine
+    assert modeling_utils.get_model_conversion_mapping is live
