@@ -217,6 +217,12 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     if s.ndim == 3 and s.shape[0] == E:
         block_size = getattr(weight, "block_size", None) or getattr(s, "block_size", None)
         p, q = s.shape[1], s.shape[2]
+        if p == 1 and q == 1:
+            # One scale per expert already broadcasts over (E, M, N). Expanding
+            # it first allocates a second full-size tensor: +4.00 GiB measured
+            # on the (128, 4096, 4096) Mistral-Small-4-119B layout, on top of
+            # the 8 GiB the converted weight and the result already need.
+            return w * s.to(target_dtype)
         if block_size is not None and len(block_size) == 2:
             bm, bn = block_size
         else:
