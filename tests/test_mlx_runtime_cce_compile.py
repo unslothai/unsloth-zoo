@@ -91,11 +91,12 @@ def test_automatic_chunks_reduce_backward_peak(frozen, dim):
     weight = (mx.random.normal((16384, dim)) * 0.05).astype(mx.bfloat16)
     targets = mx.where(mx.arange(512) % 7 == 0, -100, mx.arange(512) * 31)
     mx.eval(hidden, weight, targets)
-    functions = []
+    functions, plans = [], []
     for chunk in (2048, 0):
         runtime = _get_runtime_cce(
             ignore_index=-100, logit_softcap=0, chunk_size=chunk, weight_is_frozen=frozen,
         )
+        plans.append(runtime._unsloth_get_chunk_plan(hidden, weight)[0])
         def loss(h, w, runtime=runtime):
             return runtime(h, w, targets).sum() / 512
         functions.append(mx.compile(mx.value_and_grad(loss, argnums=0 if frozen else (0, 1))))
@@ -106,6 +107,15 @@ def test_automatic_chunks_reduce_backward_peak(frozen, dim):
     for left, right in pairs:
         assert mx.allclose(left, right, atol=2e-5, rtol=0.02).item()
     del expected, actual, left, right, pairs
+    # Only a frozen head is admitted at these shapes, so for the other two the automatic
+    # arm resolves to 2048 and both arms run the identical plan. Comparing their peaks
+    # then measures allocator noise and nothing else: on a macos-15 M1 the [False-1024]
+    # pair, byte-identical work, came back 212941388 against 203504192 and failed. The
+    # numerics above are the whole of what those cells can assert.
+    assert plans[0] == 2048
+    if plans[1] == plans[0]:
+        assert not frozen
+        return
     peaks = []
     for fn in functions:
         gc.collect()
@@ -117,13 +127,11 @@ def test_automatic_chunks_reduce_backward_peak(frozen, dim):
         mx.eval(result)
         peaks.append(mx.get_peak_memory() - resident)
         del result
-    assert peaks[1] <= peaks[0]
-    # Only a frozen head is admitted at these shapes. A trainable bfloat16 head writes
-    # d_logits in float32 and then casts it back, so the token-side buffers the promotion
-    # grows are 4x the logits chunk and exceed what the plan allows; measured on an M1,
-    # promoting there cost 146324012 bytes against 143211072.
-    if frozen:
-        assert peaks[1] < peaks[0]
+    # Reached only when the promotion actually changed the plan, which is the frozen
+    # head. There the wider chunk is supposed to pay for itself, so require a strict
+    # drop rather than a tie.
+    assert plans[1] == 4096 and frozen
+    assert peaks[1] < peaks[0]
 
 
 def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
