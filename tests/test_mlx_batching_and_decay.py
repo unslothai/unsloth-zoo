@@ -2596,8 +2596,15 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
 # Per family: the rebindings its installer must make, as (module, class or None
 # for a module-level name, attribute[, the `unsloth_zoo.mlx.compile` attribute it
 # must be bound to]); the merge it replaces, as (class or None, attribute,
-# upstream requires equal counts).
+# upstream requires equal counts), or None when it only delegates to a shared one.
 HOST_GRID_FAMILIES = [
+    ("ernie4_5_moe_vl",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "rot_pos_emb"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "VariableResolutionResamplerModel", "__call__"),
+      ("model", "Model", "_merge_input_ids_with_image_features")],
+     None),
 ]
 
 
@@ -2679,6 +2686,14 @@ def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, m
             if len(binding) == 4:
                 assert bound is getattr(mc, binding[3]), binding[2]
 
+        if merge is None:
+            # Image placeholders fill before video ones, and a surplus row is ignored.
+            owner, binding = owners[-1], bindings[-1]
+            merged = getattr(owner, binding[2])(
+                SimpleNamespace(config=SimpleNamespace(image_token_id=10, video_token_id=20)),
+                mx.array([[1.0], [2.0]]), mx.zeros((1, 3, 1)), mx.array([[20, 10, 5]]))
+            assert merged.tolist() == [[[0.0], [1.0], [0.0]]], binding[2]
+            return
         cls, method, exact = merge
         owner = modules["model"] if cls is None else getattr(modules["model"], cls)
         source = inspect.getsource(getattr(owner, method))

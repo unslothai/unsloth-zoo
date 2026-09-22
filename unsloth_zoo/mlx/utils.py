@@ -3557,6 +3557,7 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
 # them per family is not avoidable, since a tuple raises in the towers of
 # `_VLM_ARRAY_GRID_MODEL_TYPES` above.
 _VLM_STATIC_METADATA_MODEL_TYPES = {
+    "ernie4_5_moe_vl": ("image_grid_thw", "video_grid_thw"),
     # One `_as_grid_list` call reads whichever of the two the batch carries.
     "mage_vl": ("image_grid_thw", "video_grid_thw"),
     # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.

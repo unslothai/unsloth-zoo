@@ -5938,6 +5938,7 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
     ("mistral3", "image_sizes", "image_grid_thw"),
     ("mage_vl", "image_grid_thw", "image_sizes"),
     ("mage_vl", "video_grid_thw", "image_sizes"),
+    ("ernie4_5_moe_vl", "image_grid_thw", "image_sizes"),
 ])
 def test_a_family_without_a_patched_embedder_still_gets_its_static_metadata(
     model_type, declared, undeclared,
