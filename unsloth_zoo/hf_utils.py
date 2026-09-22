@@ -128,6 +128,90 @@ def _transformers_model_module_name_set() -> frozenset:
     return frozenset(_transformers_model_module_names())
 
 
+def _standardize_model_types(model_types) -> list:
+    """Lowercase, punctuation-normalize and validate raw model_type candidates.
+
+    Empty candidates are dropped rather than rejected: `PretrainedConfig.model_type`
+    defaults to "", so any nested sub-config that does not override it (dbrx
+    attn_config/ffn_config, got_ocr2, qwen3_omni_moe) shows up as an empty sentinel
+    that says nothing about the architecture. Anything non-empty must be a plain
+    module name, because the result is interpolated into an import path and into the
+    compiled-cache filename.
+    """
+    final_model_types = []
+    for model_type in (model_types or []):
+        model_type = model_type.lower()
+        model_type = model_type.replace("-", "_")
+        model_type = model_type.replace("/", "_")
+        model_type = model_type.replace(".", "_")
+        if not model_type.strip():
+            continue
+        if not re.fullmatch(r"[a-z0-9_]+", model_type):
+            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
+        final_model_types.append(model_type)
+    return final_model_types
+pass
+
+
+def _instance_attribute_model_types(config) -> list:
+    """`model_type` read off the live config objects instead of their serialization.
+
+    `PretrainedConfig.to_dict` ends with `output["model_type"] = self.__class__.model_type`,
+    so it reports the CLASS attribute and overwrites whatever `__init__` put on the
+    instance. A trust_remote_code config that leaves `model_type = ""` on the class and
+    assigns `self.model_type = "..."` in `__init__` therefore serializes as the empty
+    sentinel while the object itself knows its architecture. inclusionAI/Ling-2.6-flash's
+    `BailingMoeV2_5Config` does exactly that: `to_dict()["model_type"]` is "" but
+    `config.model_type` is "bailing_hybrid".
+
+    Only reached when the to_dict walk produced nothing usable, so a config that already
+    answers through to_dict is unaffected. Breadth-first from the top-level config so the
+    model's own type precedes any sub-config's. Sub-configs are found on `__dict__`
+    (including inside lists/tuples/dicts) rather than by serializing, which is the whole
+    point, and `id()` tracking keeps a cyclic graph from looping.
+    """
+    try:
+        from transformers import PretrainedConfig
+        config_types = (PretrainedConfig,)
+    except Exception:
+        # Never let a transformers layout change turn a fallback into a hard failure
+        config_types = ()
+
+    def _is_config(value):
+        if config_types and isinstance(value, config_types): return True
+        # Duck-typed stand-in for a config: has both a model_type and a to_dict
+        return (
+            not isinstance(value, type) and
+            hasattr(value, "to_dict") and
+            hasattr(value, "model_type") and
+            hasattr(value, "__dict__")
+        )
+
+    found, seen, stack = [], set(), [config]
+    while stack:
+        obj = stack.pop(0)
+        if obj is None or id(obj) in seen: continue
+        seen.add(id(obj))
+        model_type = getattr(obj, "model_type", None)
+        if isinstance(model_type, str) and model_type.strip():
+            found.append(model_type)
+        attributes = getattr(obj, "__dict__", None)
+        if not isinstance(attributes, dict): continue
+        for value in attributes.values():
+            if isinstance(value, (list, tuple)):
+                candidates = value
+            elif isinstance(value, dict):
+                candidates = value.values()
+            else:
+                candidates = (value,)
+            for candidate in candidates:
+                if _is_config(candidate): stack.append(candidate)
+        pass
+    pass
+    return found
+pass
+
+
 def get_transformers_model_type(config, trust_remote_code=False):
     """ Gets model_type from config file - can be PEFT or normal HF """
     if config is None:
@@ -228,26 +312,20 @@ def get_transformers_model_type(config, trust_remote_code=False):
     pass
     # `find` above returns a list, so an unresolved config arrives here as [], never
     # None - an `is None` check would let it through and every consumer indexes [0]
-    # or joins the list. Treat empty and None the same.
-    if not model_types:
-        raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
-    # Standardize model_type
-    final_model_types = []
-    for model_type in model_types:
-        model_type = model_type.lower()
-        model_type = model_type.replace("-", "_")
-        model_type = model_type.replace("/", "_")
-        model_type = model_type.replace(".", "_")
-        # PretrainedConfig.model_type defaults to "", so any nested sub-config that does
-        # not override it (dbrx attn_config/ffn_config, got_ocr2, qwen3_omni_moe) shows up
-        # here as an empty sentinel that says nothing about the architecture
-        if not model_type.strip():
-            continue
-        # model_type is interpolated into an import path, so it must be a plain module name
-        if not re.fullmatch(r"[a-z0-9_]+", model_type):
-            raise ValueError(f"Unsloth: Invalid model_type {model_type!r} in config.")
-        final_model_types.append(model_type)
-    # Every candidate was an empty sentinel, so the architecture is still unknown
+    # or joins the list. Treat empty and None the same. Normalizing first and testing
+    # the result folds that case together with the all-empty-sentinels case below:
+    # both mean "to_dict said nothing usable".
+    from_instance_attribute = False
+    final_model_types = _standardize_model_types(model_types)
+    if not final_model_types:
+        # Nothing usable came out of to_dict(), so read the live object instead.
+        # See `_instance_attribute_model_types` for why the two can disagree.
+        final_model_types = _standardize_model_types(
+            _instance_attribute_model_types(config)
+        )
+        from_instance_attribute = bool(final_model_types)
+    # Every candidate was an empty sentinel and the object carries no instance
+    # attribute either, so the architecture is still unknown
     if not final_model_types:
         raise TypeError(f"Unsloth: Cannot determine model type for config file: {str(config)}")
     final_model_types = sorted(final_model_types)
@@ -260,7 +338,14 @@ def get_transformers_model_type(config, trust_remote_code=False):
     _REMOTE_CODE_MODEL_TYPES = {"nemotron_h", "nemotronh_nano_vl_v2",}
     found_type = False
     for j, model_type in enumerate(final_model_types):
-        if model_type in _REMOTE_CODE_MODEL_TYPES:
+        if from_instance_attribute:
+            # Only a config whose serialization refused to name it lands here, which
+            # means remote code. Trimming is for transformers' own mislabels
+            # (gemma3_text -> gemma3); applied to a remote name that merely shares a
+            # prefix with a shipped module it would rewrite the architecture to the
+            # wrong one and dispatch the model down the wrong optimized path.
+            found_type = True
+        elif model_type in _REMOTE_CODE_MODEL_TYPES:
             found_type = True
         elif model_type not in all_model_types:
             # Try trimming, e.g. gemma3_text -> gemma3
