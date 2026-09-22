@@ -635,9 +635,40 @@ def patch_transformers_masks():
         original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
     )
 
-    def wrap(f):
+    def wrap(f, original):
+        # transformers named the embeddings argument `input_embeds` up to 5.0 and
+        # `inputs_embeds` after. Remote modeling code is written against one of
+        # them (Nemotron-H's `create_causal_mask(input_embeds = ...)` on 5.17 raised
+        # "unexpected keyword argument 'input_embeds'"), so pass whichever this
+        # transformers accepts, and read both here.
+        # Likewise `cache_position`: the builders took it up to 5.0 and derive the
+        # positions from past_key_values and position_ids after, so remote code
+        # written against the older signature (Step-3.7, Nemotron-H) raised
+        # "unexpected keyword argument 'cache_position'". Drop it when this
+        # transformers has no parameter for it and no **kwargs to absorb it.
+        try:
+            parameters = inspect.signature(original).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepted = set(parameters)
+        takes_var_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        embeds_name = None
+        if "inputs_embeds" in accepted and "input_embeds" not in accepted:
+            embeds_name = "inputs_embeds"
+        elif "input_embeds" in accepted and "inputs_embeds" not in accepted:
+            embeds_name = "input_embeds"
+        drop = () if takes_var_kwargs or not parameters else tuple(
+            name for name in ("cache_position",) if name not in accepted
+        )
+
         def return_attention_mask(*args, **kwargs):
-            input_embeds = kwargs.get("input_embeds", None)
+            if embeds_name is not None:
+                for other in ("input_embeds", "inputs_embeds"):
+                    if other != embeds_name and other in kwargs and embeds_name not in kwargs:
+                        kwargs[embeds_name] = kwargs.pop(other)
+            for name in drop:
+                kwargs.pop(name, None)
+            input_embeds = kwargs.get("inputs_embeds", kwargs.get("input_embeds", None))
             if input_embeds is not None and getattr(input_embeds, "requires_grad", False):
                 attention_mask = kwargs.get("attention_mask", None)
                 if isinstance(attention_mask, BlockMask) or (
@@ -650,9 +681,13 @@ def patch_transformers_masks():
 
     masking_utils._unsloth_original_create_causal_mask = original_create_causal_mask
     masking_utils._unsloth_original_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
-    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask)
-    masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
-    masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
+    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask, original_create_causal_mask)
+    masking_utils.create_sliding_window_causal_mask = wrap(
+        compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
+    )
+    masking_utils.create_masks_for_generate = wrap(
+        masking_utils.create_masks_for_generate, masking_utils.create_masks_for_generate
+    )
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
     # Multi-GPU device_map flex_attention fix: offset tensors may live on a
     # different device than inner_mask runs on. Move them inside the closure
