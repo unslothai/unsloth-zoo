@@ -104,3 +104,35 @@ def test_device_guard_switches_and_restores_current_device():
     with _device_guard(torch.zeros(1, device = "cuda:1")):
         assert torch.cuda.current_device() == 1
     assert torch.cuda.current_device() == 0
+
+
+_SPLIT_MM_RUNNER = textwrap.dedent(
+    """
+    import torch
+    from unsloth_zoo.fp16_emulation import fp16_split_mm
+
+    torch.manual_seed(0)
+    A = torch.randn(64, 48, device = "cuda:1") * 0.01
+    B = torch.randn(48, 32, device = "cuda:1") * 0.01
+    torch.cuda.set_device(0)
+    out = fp16_split_mm(A, B)
+    torch.cuda.synchronize(1)
+    want = A @ B
+    assert out.device == A.device
+    assert ((out - want).abs().max() / want.abs().max()).item() < 1e-4
+    assert torch.cuda.current_device() == 0
+    print("OK")
+    """
+)
+
+
+@pytest.mark.skipif(not _two_gpus(), reason = "needs two CUDA devices")
+def test_fp16_split_mm_on_non_current_gpu():
+    proc = subprocess.run(
+        [sys.executable, "-c", _SPLIT_MM_RUNNER],
+        capture_output = True,
+        text = True,
+        env = dict(os.environ, CUDA_LAUNCH_BLOCKING = "1"),
+        timeout = 600,
+    )
+    assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-4000:]

@@ -100,6 +100,7 @@ import itertools
 import math
 import os
 
+import contextlib
 import torch
 
 __all__ = [
@@ -278,6 +279,16 @@ def _split_can_represent(x: torch.Tensor) -> bool:
     return bool(hi / lo <= _SPLIT_RANGE_LIMIT)
 
 
+def _current_device_of(tensor):
+    device = tensor.device
+    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+    guard = getattr(backend, "device", None)
+    if guard is None or device.index is None:
+        return contextlib.nullcontext()
+    return guard(device)
+
+
+
 def fp16_split_mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -311,21 +322,24 @@ def fp16_split_mm(
     if not _split_can_represent(A32) or not _split_can_represent(B32):
         return _mm_float32(A32, B32)
 
-    zero = torch.zeros((), device = A32.device, dtype = torch.int32)
-    eA = pow2_exponent(A32) if scale else zero
-    eB = pow2_exponent(B32) if scale else zero
-    a_terms = split_terms(torch.ldexp(A32, eA), dtype, terms)
-    b_terms = split_terms(torch.ldexp(B32, eB), dtype, terms)
+    # torch.ldexp on CUDA runs on the current device, not its operands' device, and on
+    # torch 2.13 returns wrong values for a tensor on another card; make A's device current.
+    with _current_device_of(A32):
+        zero = torch.zeros((), device = A32.device, dtype = torch.int32)
+        eA = pow2_exponent(A32) if scale else zero
+        eB = pow2_exponent(B32) if scale else zero
+        a_terms = split_terms(torch.ldexp(A32, eA), dtype, terms)
+        b_terms = split_terms(torch.ldexp(B32, eB), dtype, terms)
 
-    pairs = sorted(itertools.product(range(terms), repeat = 2), key = lambda ij: ij[0] + ij[1])
-    acc = None
-    for i, j in pairs[:products]:
-        part = _mm_f32_accumulate(a_terms[i], b_terms[j])
-        acc = part if acc is None else acc + part
-    # One ldexp with the combined exponent. Neither sA * sB nor a division per scale works: the
-    # product overflows for two small operands, and dividing in either order passes through inf
-    # for a large-times-small pair whose answer is perfectly representable.
-    return torch.ldexp(acc, -(eA + eB))
+        pairs = sorted(itertools.product(range(terms), repeat = 2), key = lambda ij: ij[0] + ij[1])
+        acc = None
+        for i, j in pairs[:products]:
+            part = _mm_f32_accumulate(a_terms[i], b_terms[j])
+            acc = part if acc is None else acc + part
+        # One ldexp with the combined exponent. Neither sA * sB nor a division per scale works: the
+        # product overflows for two small operands, and dividing in either order passes through inf
+        # for a large-times-small pair whose answer is perfectly representable.
+        return torch.ldexp(acc, -(eA + eB))
 
 
 class _FP16SplitMatmul(torch.autograd.Function):
