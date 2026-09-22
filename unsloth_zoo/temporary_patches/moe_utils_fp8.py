@@ -1172,10 +1172,85 @@ def patch_fp8_validate_quantization_for_training():
         logger.info("Unsloth: relaxed HF validate_quantization_for_training for FP8+LoRA")
 
 
+class _Fp4ParamShapeProxy:
+    """Expose an FP4-packed expert parameter's logical shape and compute dtype to PEFT.
+
+    The stored tensor is `(E, M, K // 2)` int8; LoRA has to be sized on `(E, M, K)`.
+    """
+
+    def __init__(self, param, shape, dtype):
+        self._param = param
+        self._shape = shape
+        self._dtype = dtype
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def ndim(self) -> int:
+        return len(self._shape)
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def __getattr__(self, name):
+        return getattr(self._param, name)
+
+
+def fp4_packed_expert_logical_shape(experts_module, parameter_name, param):
+    """`(E, M, K)` for an FP4-packed `(E, M, K // 2)` expert stack with a per-row scale next to it, else None."""
+    if not _is_fp4_packed_tensor(param) or param.ndim != 3:
+        return None
+    scale = getattr(experts_module, f"{parameter_name}_scale_inv", None)
+    if scale is None:
+        scale = getattr(experts_module, f"{parameter_name}_scale", None)
+    if not isinstance(scale, torch.Tensor) or scale.ndim != 3 or scale.shape[:2] != param.shape[:2]:
+        return None
+    return torch.Size((param.shape[0], param.shape[1], 2 * param.shape[2]))
+
+
+def patch_peft_param_wrapper_fp4_expert_shape():
+    """PEFT sizes a target parameter's LoRA from `param.shape`; FP4-packed experts store half of K."""
+    try:
+        from peft.tuners.lora.layer import ParamWrapper
+    except (ImportError, AttributeError):
+        return
+    if getattr(ParamWrapper.get_param, "_unsloth_fp4_expert_patched", False):
+        return
+
+    _original_get_param = ParamWrapper.get_param
+
+    def _patched_get_param(self):
+        param = _original_get_param(self)
+        if not _is_fp4_packed_tensor(param):
+            return param
+        try:
+            base_layer = self.get_base_layer()
+            shape = fp4_packed_expert_logical_shape(base_layer, self.parameter_name, param)
+        except Exception:
+            shape = None
+        if shape is None:
+            return param
+        try:
+            param._original_shape = shape
+        except Exception:
+            pass
+        self.num_experts = shape[0]
+        return _Fp4ParamShapeProxy(param, shape, torch.bfloat16)
+
+    _patched_get_param._unsloth_fp4_expert_patched = True
+    ParamWrapper.get_param = _patched_get_param
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: ParamWrapper.get_param exposes the logical shape of FP4-packed experts")
+
+
 def _register_transformers_v5_moe_fp8_patches():
     if not is_transformers_v5_moe_quantization_available():
         return
     TEMPORARY_PATCHES.append(patch_fp8_experts_interface)
     TEMPORARY_PATCHES.append(patch_fp8_validate_quantization_for_training)
+    TEMPORARY_PATCHES.append(patch_peft_param_wrapper_fp4_expert_shape)
 pass
 _register_transformers_v5_moe_fp8_patches()

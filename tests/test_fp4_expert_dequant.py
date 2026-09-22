@@ -61,3 +61,34 @@ def test_fp8_and_mismatched_scales_are_declined():
     packed, scale = _fixture()
     assert _dequantize_full_expert_weights_fp4(packed.view(torch.uint8).to(torch.float8_e4m3fn), scale, torch.float32) is None
     assert _dequantize_full_expert_weights_fp4(packed, scale[:, :4], torch.float32) is None
+
+
+class _PackedExperts(torch.nn.Module):
+    """FP8Experts' storage for `expert_dtype = "fp4"`: int8 `(E, M, K // 2)` plus `(E, M, K // 32)` scales."""
+
+    def __init__(self, E = 2, M = 8, K = 64):
+        super().__init__()
+        packed, scale = _fixture(E, M, K)
+        self.gate_up_proj = torch.nn.Parameter(packed, requires_grad = False)
+        self.gate_up_proj_scale_inv = torch.nn.Parameter(scale, requires_grad = False)
+        self.num_experts = E
+
+    def forward(self, x):
+        return x
+
+
+def test_peft_sizes_the_lora_on_the_logical_shape():
+    """Fails on main: lora_A is sized on the packed K // 2, so the delta cannot contract with the input."""
+    pytest.importorskip("peft")
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import patch_peft_param_wrapper_fp4_expert_shape
+    patch_peft_param_wrapper_fp4_expert_shape()
+    from peft.tuners.lora.layer import ParamWrapper
+    from peft import LoraConfig
+    module = _PackedExperts()
+    wrapper = ParamWrapper(module, "default", parameter_name = "gate_up_proj", config = LoraConfig(r = 4, target_parameters = ["gate_up_proj"]), r = 4)
+    assert wrapper.num_experts == 2
+    assert wrapper.get_param().shape == (2, 8, 64)
+    assert module.gate_up_proj._original_shape == (2, 8, 64)
+    # lora_A contracts with the logical K = 64, not the packed 32.
+    assert wrapper.lora_A["default"].weight.shape[-1] == 64
+    assert wrapper.lora_B["default"].weight.shape[0] == 8
