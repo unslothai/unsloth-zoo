@@ -2,14 +2,17 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Lesser General Public License for more details.
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """The conversion-mapping re-scope, and the guard message that depends on it.
 
@@ -44,7 +47,7 @@ transformers = pytest.importorskip("transformers")
 
 from unsloth_zoo.temporary_patches import conversion_mapping_rescope as rescope
 from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
-from unsloth_zoo.temporary_patches.common import RESCOPE_PATCH_FLAG
+from unsloth_zoo.temporary_patches.common import RESCOPE_PATCH_FLAG, WRAPPER_INNER_ATTR
 
 
 def _core_model_loading():
@@ -275,11 +278,52 @@ def test_repair_detection_sees_both_packages_marks():
     setattr(unsloth_marked, "_unsloth_patched_composite_prefix_renaming", True)
     assert rescope._repair_already_installed(unsloth_marked) is True
 
-    # Under an unmarked wrapper, which is what moe_utils_bnb4bit.py installs.
+    # Under a wrapper that publishes __wrapped__.
     def on_top():
         pass
     on_top.__wrapped__ = unsloth_marked
     assert rescope._repair_already_installed(on_top) is True
+
+    # And under one that publishes only WRAPPER_INNER_ATTR, which is what
+    # moe_utils_bnb4bit.py installs. It cannot use __wrapped__: the installer unwraps that
+    # to choose what to wrap, so publishing it would have the rescope REPLACE the MoE
+    # wrapper instead of sitting on top of it, dropping the per-expert converters.
+    def moe_style():
+        pass
+    setattr(moe_style, WRAPPER_INNER_ATTR, zoo_marked)
+    assert rescope._repair_already_installed(moe_style) is True
+
+
+def test_the_moe_wrapper_does_not_hide_the_repair_from_either_probe():
+    """Regression: the MoE wrapper used to be an opaque lid over the repair.
+
+    `TEMPORARY_PATCHES` runs three times (init, pre_compile, post_compile) and the rescope
+    installs before `moe_utils_bnb4bit`, so from pass 1 onward the MoE wrapper was outermost
+    with no link down. Measured on transformers 5.5.4 before the fix: pass 1 left
+    `_composite_renaming_repair_installed()` False, so the Linear4bit error blamed the
+    transformers version for a load the repair had already fixed, and pass 2 stacked a
+    second rescope wrapper.
+    """
+    import transformers.conversion_mapping as cm
+    from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
+        patch_bnb4bit_model_conversion_mapping,
+    )
+
+    pristine = cm.get_model_conversion_mapping
+    try:
+        def repaired(*args, **kwargs):
+            return pristine(*args, **kwargs)
+        setattr(repaired, RESCOPE_PATCH_FLAG, True)
+        cm.get_model_conversion_mapping = repaired
+
+        patch_bnb4bit_model_conversion_mapping()
+        installed = cm.get_model_conversion_mapping
+        assert installed is not repaired, "the MoE patch did not install"
+        assert getattr(installed, WRAPPER_INNER_ATTR, None) is repaired
+        assert rescope._repair_already_installed(installed) is True
+        assert bnb_patch._composite_renaming_repair_installed() is True
+    finally:
+        cm.get_model_conversion_mapping = pristine
 
 
 def test_repair_detection_cannot_spin_on_a_cycle():

@@ -60,6 +60,7 @@ from .common import (
     TEMPORARY_PATCHES,
     RESCOPE_PATCH_FLAG,
     UNSLOTH_ENABLE_LOGGING,
+    WRAPPER_INNER_ATTR,
     logger,
 )
 from .utils import raise_error
@@ -352,14 +353,20 @@ def _rescope_conversions(model, conversions):
 
 
 def _repair_already_installed(function):
-    """Is either package's repair already on this callable, anywhere down the wrapper chain?"""
+    """Is either package's repair already on this callable, anywhere down the wrapper chain?
+
+    Follows `WRAPPER_INNER_ATTR` as well as `__wrapped__`, because a wrapper that must SURVIVE
+    a rescope install cannot publish `__wrapped__`: the installer below unwraps that attribute
+    to choose what to wrap, so doing so would have the rescope replace it rather than sit on it.
+    `moe_utils_bnb4bit.py` is exactly that case.
+    """
     seen = 0
     while function is not None and seen < _MAX_WRAPPER_DEPTH:
         if getattr(function, RESCOPE_PATCH_FLAG, False):
             return True
         if getattr(function, _UNSLOTH_PATCH_FLAG, False):
             return True
-        function = getattr(function, "__wrapped__", None)
+        function = getattr(function, "__wrapped__", None) or getattr(function, WRAPPER_INNER_ATTR, None)
         seen += 1
     return False
 

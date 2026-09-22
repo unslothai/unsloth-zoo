@@ -19,7 +19,7 @@ import torch.nn as nn
 import inspect
 import importlib
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from .common import TEMPORARY_PATCHES, torch_compile, RESCOPE_PATCH_FLAG
+from .common import TEMPORARY_PATCHES, torch_compile, RESCOPE_PATCH_FLAG, WRAPPER_INNER_ATTR
 from .utils import (
     patch_function,
     process_output_options,
@@ -110,10 +110,11 @@ def _composite_renaming_repair_installed():
 
     `temporary_patches/conversion_mapping_rescope.py` here, and
     `fix_transformers_composite_prefix_renaming` in unsloth's `import_fixes.py`, both re-scope
-    the leaked renaming before it can rename anything. Either mark counts, and the whole
-    `__wrapped__` chain is walked, because the two compose in either order and
-    `moe_utils_bnb4bit.py` puts a third wrapper on the same function without setting
-    `__wrapped__` at all.
+    the leaked renaming before it can rename anything. Either mark counts, and the whole chain
+    is walked, because the two compose in either order and `moe_utils_bnb4bit.py` puts a third
+    wrapper on the same function. That third one publishes `WRAPPER_INNER_ATTR` rather than
+    `__wrapped__`, so follow both: it must survive a rescope install, and the rescope unwraps
+    `__wrapped__` to decide what to wrap.
 
     Asked so the message cannot send a user to change a transformers version that is no longer
     what is failing them. With the repair live, a module that still reaches this guard has a
@@ -131,7 +132,7 @@ def _composite_renaming_repair_installed():
             return True
         if getattr(function, "_unsloth_patched_composite_prefix_renaming", False):
             return True
-        function = getattr(function, "__wrapped__", None)
+        function = getattr(function, "__wrapped__", None) or getattr(function, WRAPPER_INNER_ATTR, None)
         seen += 1
     return False
 

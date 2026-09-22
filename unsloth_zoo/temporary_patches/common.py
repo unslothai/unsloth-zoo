@@ -31,6 +31,7 @@ __all__ = [
     "unwrap_norm_weight",
     "publish_to_modeling_module",
     "RESCOPE_PATCH_FLAG",
+    "WRAPPER_INNER_ATTR",
 ]
 
 import os
@@ -48,6 +49,12 @@ UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0")
 # `conversion_mapping_rescope.py` sets it, and `bitsandbytes.py` asks whether the repair is live
 # before its error message blames the transformers version for a load the repair already fixed.
 RESCOPE_PATCH_FLAG = "_unsloth_zoo_patched_composite_prefix_renaming"
+
+# Links a wrapper on that same function to the callable it wraps, for readers that need to walk
+# the chain. Deliberately NOT `__wrapped__`: the rescope unwraps `__wrapped__` to find the
+# function to wrap, so publishing one on a wrapper that must survive would make the rescope
+# replace it instead of sitting on top of it, silently dropping that wrapper's behaviour.
+WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
 
 # Get only allowed options
 import inspect
