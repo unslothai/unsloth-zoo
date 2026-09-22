@@ -61,9 +61,26 @@ def _packed_weight(n_bytes = 8192):
     return torch.zeros((n_bytes, 1), dtype = torch.uint8)
 
 
+def _real_bitsandbytes():
+    """The installed bitsandbytes, or skip.
+
+    ``importorskip`` is not enough. On a host with no real bitsandbytes, zoo installs
+    `stubs/bitsandbytes_stub.py` under that name, so the import succeeds and every
+    attribute resolves to a permissive no-op: the patch has nothing to patch,
+    `Linear4bit(...)` raises NotImplementedError, and these tests either fail for a
+    reason that has nothing to do with the guard or pass without touching it. Ask the
+    canonical helper whether the real package is there.
+    """
+    bitsandbytes = pytest.importorskip("bitsandbytes")
+    from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
+    if not real_bitsandbytes_available():
+        pytest.skip("bitsandbytes is the unsloth_zoo stub on this host")
+    return bitsandbytes
+
+
 def _patched_forward():
     """The real patched Linear4bit.forward, as installed by the temporary patch."""
-    bitsandbytes = pytest.importorskip("bitsandbytes")
+    bitsandbytes = _real_bitsandbytes()
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     forward = bitsandbytes.nn.modules.Linear4bit.forward
     forward = getattr(forward, "__wrapped__", forward)
@@ -208,7 +225,7 @@ def test_unquantized_linear4bit_with_one_input_feature_is_not_accused():
     returning, which turns a working model into a hard error and tells the user to
     reinstall transformers over a checkpoint that was never involved.
     """
-    bnb = pytest.importorskip("bitsandbytes")
+    bnb = _real_bitsandbytes()
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     module = bnb.nn.Linear4bit(1, 16)
     # On CPU bitsandbytes leaves the layer unquantized, which is the state under test.
