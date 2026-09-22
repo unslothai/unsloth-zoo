@@ -475,6 +475,30 @@ def _name_of_module(model: nn.Module, target: nn.Module) -> str | None:
     return None
 
 
+def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]:
+    """Classes that share a layer list with a declared no-split block but are not declared.
+
+    Remote MoE ports often append a multi-token-prediction layer to the decoder list and
+    declare only the decoder class; split across cards, its attention gets the mask on
+    the wrong device. A block in the same list is the same kind of unit, so keep it whole.
+    """
+    found: set[str] = set()
+    if not declared:
+        return found
+    for _, mod in model.named_modules():
+        if not isinstance(mod, nn.ModuleList):
+            continue
+        names = [type(child).__name__ for child in mod]
+        if not any(name in declared for name in names):
+            continue
+        for child, name in zip(mod, names):
+            if name in declared:
+                continue
+            if any(True for _ in child.parameters(recurse=True)):
+                found.add(name)
+    return found
+
+
 def resolve_no_split_classes(model: nn.Module) -> list[str]:
     """Decoder / encoder block classes that must not be split across devices."""
     classes = getattr(model, "_no_split_modules", None)
@@ -482,7 +506,8 @@ def resolve_no_split_classes(model: nn.Module) -> list[str]:
     # transformers models do (camembert, colpali, colqwen2, efficientnet, fuyu).
     # Only `None`, the base-class default, means "not declared, go and detect".
     if classes is not None:
-        return sorted(str(c) for c in classes)
+        declared = {str(c) for c in classes}
+        return sorted(declared | _undeclared_sibling_blocks(model, declared))
     # Fallback: every distinct child class of every nn.ModuleList that holds
     # more than one entry. That is where repeated transformer blocks live.
     found: set[str] = set()
