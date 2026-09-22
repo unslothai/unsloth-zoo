@@ -209,6 +209,11 @@ WRITE_METHODS = frozenset((
 # leaves behind, which _env_reads does not inspect.
 ENV_ALIAS_NAMES = frozenset(("environ", "getenv", "environb", "getenvb"))
 
+# Anything that can reach a docstring. Enumerating the spellings was losing:
+# __doc__, fn.__doc__, getattr(fn, "__doc__") and vars(fn)["__doc__"] all read
+# the same string, so naming any of these at all keeps docstrings in the scan.
+DOCSTRING_READERS = frozenset(("__doc__", "vars", "__dict__"))
+
 RE_WHOLE_ENV = re.compile(
     r"\bos\.environ\s*\.\s*copy\s*\("
     r"|\bdict\s*\(\s*os\.environ\s*\)"
@@ -324,17 +329,25 @@ def _imports_an_unvouchable_api(tree):
     """Whether a connection API arrives by from-import.
 
     RE_UNVOUCHABLE_NETWORK reads qualified spellings, so
-    `from socket import create_connection` left nothing for it to match and a
-    token could go to a bare host beside a benign hub GET.
+    `from socket import create_connection` left nothing for it to match, and
+    `import socket as s` left it only `s.create_connection`, which it does not
+    recognise either. Both let a token go to a bare host beside a benign hub GET.
     """
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.ImportFrom) or not node.module:
-            continue
-        if any(
-            node.module == module or node.module.startswith(module + ".")
+    def unvouchable(name):
+        return any(
+            name == module or name.startswith(module + ".")
             for module in UNVOUCHABLE_MODULES
-        ):
-            return True
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if unvouchable(node.module):
+                return True
+        elif isinstance(node, ast.Import):
+            # import socket as s: the qualified pattern sees no socket. call
+            # anywhere, so the import itself is the only place it is named.
+            if any(unvouchable(alias.name) for alias in node.names):
+                return True
     return False
 
 
@@ -601,6 +614,19 @@ def _literal_text(node):
         return None
 
 
+def _mapping_key(node):
+    """The literal string key of a Subscript, or None for anything else.
+
+    A dictionary lookup by name reads a value out. A slice, an index, or a key
+    this cannot read takes the string apart, which is what BASE[:8] does, so
+    only the named lookup is treated as a read rather than a reshape.
+    """
+    if not isinstance(node, ast.Subscript):
+        return None
+    key = _literal_text(node.slice)
+    return key if key is not None else None
+
+
 def _bound_names(target):
     """Every name an assignment target binds, unpacking included.
 
@@ -678,6 +704,15 @@ def _reshapes_a_url(tree):
                 node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
             )
             return any(built_from_a_carrier(operand) for operand in operands)
+        if isinstance(node, ast.Dict):
+            # URLS = {"hub": "https://huggingface.co"} then URLS["hub"].
+            return any(
+                value is not None and built_from_a_carrier(value)
+                for value in node.values
+            )
+        if isinstance(node, ast.Subscript) and _mapping_key(node) is not None:
+            # A lookup by name reads the value out; it does not reshape it.
+            return built_from_a_carrier(node.value)
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
             # BASE, = ("https://huggingface.co",): the value is a sequence, and
             # which element lands on which name is not worth tracking, so every
@@ -726,8 +761,12 @@ def _reshapes_a_url(tree):
         # built_from_a_carrier, not carries: the receiver may be the string
         # building itself, as in "".join([BASE, "/x"]).replace(...) or
         # f"{BASE}"[:8], with no name in between to have been tainted.
-        if isinstance(node, ast.Subscript) and built_from_a_carrier(node.value):
-            return True
+        if (
+            isinstance(node, ast.Subscript)
+            and _mapping_key(node) is None
+            and built_from_a_carrier(node.value)
+        ):
+            return True                 # BASE[:8], and any index this cannot read
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -746,20 +785,19 @@ def _docstrings(tree):
     hub-only converter over a link in its own documentation, which is the false
     positive this whole narrowing exists to remove.
 
-    Unless the file reads `__doc__`, in which case a docstring is reachable as a
-    value and the argument above stops holding. Nothing upstream does, and
-    refusing is the cheap side of that bet.
+    Unless the file can REACH a docstring, in which case it is a value like any
+    other and the argument above stops holding. Enumerating the spellings was
+    losing: __doc__, fn.__doc__, getattr(fn, "__doc__") and vars(fn)["__doc__"]
+    all read the same string. So anything that names __doc__, vars or __dict__
+    at all keeps docstrings in the scan. Upstream names none of them.
     """
     if any(
-        (isinstance(node, ast.Name) and node.id == "__doc__")
-        or (isinstance(node, ast.Attribute) and node.attr == "__doc__")
-        # getattr(fn, "__doc__") reaches the same value with neither shape.
+        (isinstance(node, ast.Name) and node.id in DOCSTRING_READERS)
+        or (isinstance(node, ast.Attribute) and node.attr in DOCSTRING_READERS)
         or (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "getattr"
-            and len(node.args) >= 2
-            and _literal_text(node.args[1]) == "__doc__"
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value == "__doc__"
         )
         for node in ast.walk(tree)
     ):

