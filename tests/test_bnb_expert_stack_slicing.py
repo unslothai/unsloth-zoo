@@ -39,6 +39,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 def small_threshold(monkeypatch):
     """Force slicing for a stack of a few experts, not a few billion elements."""
     monkeypatch.setattr(M, "_BNB_MAX_QUANTIZE_NUMEL", 3 * 64 * 128 + 1)
+    # These tests are about the bitsandbytes read; the Triton dequant would
+    # otherwise answer first and bitsandbytes would never be called.
+    monkeypatch.setenv("UNSLOTH_MOE_TRITON_KERNELS", "0")
     return M
 
 
@@ -223,6 +226,7 @@ def test_the_forward_read_slices_too(small_threshold, monkeypatch):
 def test_get_base_weight_is_unchanged_below_the_threshold(monkeypatch):
     """No slicing, and still exactly one call, for every ordinary expert."""
     from unsloth_zoo.temporary_patches import moe_utils as MU
+    monkeypatch.setenv("UNSLOTH_MOE_TRITON_KERNELS", "0")
 
     value = _stack(experts=2)
     param = M._make_expert_params4bit(
