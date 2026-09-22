@@ -1441,6 +1441,22 @@ def _docstrings(tree):
     return frozenset(nodes)
 
 
+# The match patterns capture a name, and they do not exist before Python 3.10,
+# which this package still supports. Named at import rather than reached for
+# per node: ast.MatchAs raised AttributeError there, the allowance caught it and
+# refused, and the honest converter produced a CRITICAL finding on 3.9 alone.
+# isinstance against an empty tuple is simply False.
+MATCH_CAPTURES = tuple(
+    pattern for pattern in
+    (getattr(ast, name, None) for name in ("MatchAs", "MatchStar"))
+    if pattern is not None
+)
+MATCH_MAPPING = tuple(
+    pattern for pattern in (getattr(ast, "MatchMapping", None),)
+    if pattern is not None
+)
+
+
 def _single_assignments(tree):
     """`{name: value}` for every name this module binds exactly once.
 
@@ -1486,11 +1502,9 @@ def _single_assignments(tree):
                 bind((alias.asname or alias.name).split(".")[0])
         elif isinstance(node, ast.ExceptHandler) and node.name:
             bind(node.name)
-        elif isinstance(node, ast.MatchAs) and node.name:
+        elif isinstance(node, MATCH_CAPTURES) and node.name:
             bind(node.name)             # case (scheme, HOST) rebinds HOST
-        elif isinstance(node, ast.MatchStar) and node.name:
-            bind(node.name)
-        elif isinstance(node, ast.MatchMapping) and node.rest:
+        elif isinstance(node, MATCH_MAPPING) and node.rest:
             bind(node.rest)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             for name in node.names:
@@ -1517,9 +1531,36 @@ def _bind_descriptor_calls(tree):
     no destination at all. Rewriting it once here is what keeps the folds and
     the refusals written one way.
     """
+    # r = str.replace then r(HUB, "huggingface.co", "evil.example") is the same
+    # call with the method behind a name, which no rule that reads a call site
+    # could see.
+    rebound = {}
+    for name, value in _single_assignments(tree).items():
+        if (
+            isinstance(value, ast.Attribute)
+            and value.attr in DESCRIPTOR_METHODS
+            and isinstance(value.value, ast.Name)
+            and value.value.id in ("str", "bytes", "bytearray")
+        ):
+            rebound[name] = value.attr
+
     class Binder(ast.NodeTransformer):
         def visit_Call(self, node):
             self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in rebound
+                and node.args
+            ):
+                node.func = ast.copy_location(
+                    ast.Attribute(
+                        value = node.args[0], attr = rebound[node.func.id],
+                        ctx = ast.Load(),
+                    ),
+                    node.func,
+                )
+                node.args = node.args[1:]
+                return node
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr in DESCRIPTOR_METHODS
