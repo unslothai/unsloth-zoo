@@ -1681,6 +1681,13 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
     dtype = overrides.get("dtype", None)
     if dtype is None:
         dtype = overrides.get("torch_dtype", None)
+    if isinstance(dtype, Mapping):
+        # The per-module form: from_pretrained loads every module in the "" entry's dtype.
+        import torch
+
+        dtype = dtype.get("", torch.get_default_dtype())
+        if isinstance(dtype, str) and dtype != "auto":
+            dtype = getattr(torch, dtype)
     if dtype is not None and dtype != "auto":
         # 5.x keeps `torch_dtype` as an alias of `dtype`; 4.x stores `torch_dtype` only.
         for name in ("torch_dtype", "dtype"):

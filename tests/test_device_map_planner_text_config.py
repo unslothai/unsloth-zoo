@@ -134,6 +134,18 @@ def test_dtype_wins_over_torch_dtype_in_either_order():
     assert out.torch_dtype == torch.float16
 
 
+def test_a_per_module_dtype_mapping_resolves_to_its_main_dtype():
+    # from_pretrained loads every module in the "" entry's dtype; a dict left on the
+    # config breaks meta-model construction.
+    config = _tiny_vlm_config().get_text_config()
+    out = planner._apply_config_overrides(config, {"dtype": {"": torch.bfloat16, "text_config": torch.float16}})
+    assert out.torch_dtype == torch.bfloat16
+    out = planner._apply_config_overrides(config, {"dtype": {"": "float16"}})
+    assert out.torch_dtype == torch.float16
+    out = planner._apply_config_overrides(config, {"dtype": {"text_config": torch.float16}})
+    assert out.torch_dtype == torch.get_default_dtype()
+
+
 def test_a_partial_sub_config_dict_is_merged_not_substituted():
     config = _tiny_vlm_config()
     sub_type = type(config.text_config)
