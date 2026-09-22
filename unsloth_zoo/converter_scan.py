@@ -889,11 +889,9 @@ def _docstrings(tree):
     if any(
         (isinstance(node, ast.Name) and node.id in DOCSTRING_READERS)
         or (isinstance(node, ast.Attribute) and node.attr in DOCSTRING_READERS)
-        or (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and node.value == "__doc__"
-        )
+        # Folded, like the write and environment names: getattr(fn, "__" +
+        # "doc__") reads the same attribute.
+        or _literal_text(node) in DOCSTRING_READERS
         for node in ast.walk(tree)
     ):
         # Read from the AST: the word in a comment is not a read, and taking it

