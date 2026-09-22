@@ -3512,3 +3512,36 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # Only %s, %r and %% are folded: "%2000000000d" % 1 is a two gigabyte string,
     # and scanning a file is not a reason to allocate one.
     assert _beside_the_hub('"%2000000000d" % 1') == []
+
+    # An f-string arrives here already split, and an empty interpolation is a
+    # no-op at runtime: f"https://{''}evil.example/log" fetches evil.example
+    # while leaving the scheme in one constant piece and the whole hostname, in
+    # plain sight, in another that no longer has a scheme in front of it. A hole
+    # this cannot read is not a licence to read the text on either side of it as
+    # though the hole were not there.
+    assert _beside_the_hub("f\"https://{''}evil.example/collect\"")
+    assert _beside_the_hub('f"https://{SEP}evil.example/collect"')
+    assert _beside_the_hub('f"https://{org}.huggingface.co/api/models"')
+
+    # These two discriminate the f-string fold from every other check here: the
+    # constant piece in front IS the hub, so a walk that reads the pieces
+    # separately records huggingface.co and allows the file, while at runtime
+    # f"https://huggingface.co{SUFFIX}" with SUFFIX = "@evil.example/collect"
+    # fetches evil.example, everything before the @ being user information.
+    assert _beside_the_hub('f"https://huggingface.co{SUFFIX}"')
+    assert _beside_the_hub("f\"https://huggingface.co{'@evil.example/collect'}\"")
+    assert _beside_the_hub('f"https://huggingface.co{tld}/api/models"')
+
+    # A scheme with no authority at all means the destination is assembled
+    # somewhere this cannot follow, which every splitting trick was built on.
+    # Upstream's bare "https://" literals are in metadata.py, which never
+    # reaches this allowance: on master only gguf-py/gguf/utility.py does.
+    assert _beside_the_hub('"".join(("https://", "evil.example")) + "/collect"')
+    assert _beside_the_hub('"{}evil.example/collect".format("https://")')
+    assert _beside_the_hub('"https://"')
+
+    # The hub through an f-string is still the hub, including upstream's own
+    # f"{BASE_DOMAIN}/{path}" and a BASE_DOMAIN with no trailing path.
+    assert _beside_the_hub('f"https://huggingface.co/api/models/{name}"') == []
+    assert _beside_the_hub('f"{HUB}/api/models"') == []
+    assert _beside_the_hub('"https://huggingface.co"') == []

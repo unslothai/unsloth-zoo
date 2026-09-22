@@ -269,6 +269,11 @@ def _writes_anything(tree):
 # two gigabyte string, and reading a file is not a reason to allocate one.
 RE_UNSAFE_PERCENT = re.compile(r"%[^sr%]")
 
+# Stands in for a piece of a string this cannot read. It is not a hostname
+# character, so a destination interrupted by one fails the hostname check
+# instead of being read as the text on either side of the hole.
+UNKNOWN_PIECE = "\x00"
+
 
 def _literal_text(node):
     """The text a constant expression evaluates to, or None when it is not one.
@@ -287,6 +292,25 @@ def _literal_text(node):
         if isinstance(node.value, bytes):
             return node.value.decode("utf-8", "replace")
         return None
+    if isinstance(node, ast.JoinedStr):
+        # An f-string is the one construction that arrived here already split.
+        # f"https://{''}evil.example/log" left the scheme in one constant piece
+        # and the whole attacker hostname, in plain sight, in another that no
+        # longer had a scheme in front of it, so no host was read from it at all
+        # and a hub literal elsewhere granted the allowance. A piece whose value
+        # is not a literal becomes UNKNOWN_PIECE rather than nothing, so the
+        # text around a hole is never read as though the hole were not there.
+        pieces = []
+        for part in node.values:
+            if isinstance(part, ast.FormattedValue):
+                known = (
+                    None if (part.conversion not in (-1, None) or part.format_spec)
+                    else _literal_text(part.value)
+                )
+            else:
+                known = _literal_text(part)
+            pieces.append(UNKNOWN_PIECE if known is None else known)
+        return "".join(pieces)
     if not (isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod))):
         return None
     left = _literal_text(node.left)
@@ -408,10 +432,23 @@ def _talks_only_to_the_model_hub(text):
         for match in RE_URL_SCHEME.finditer(literal):
             rest = literal[match.end():]
             end = RE_AUTHORITY_END.search(rest)
-            if end is None:
-                # Nothing at all after the scheme: the bare "https://" upstream's
-                # metadata.py hands to startswith, which names no destination.
+            if end is None and rest:
+                # No delimiter, so the authority runs to the end of the literal:
+                # "https://huggingface.co", which is upstream's BASE_DOMAIN.
                 host = _authority_host(rest)
+            elif end is None:
+                # Nothing at all after the scheme. Reading that as "names no
+                # destination" is what every splitting trick was built on:
+                # "https://" + host, "".join(("https://", host)),
+                # "{}evil.example".format("https://"), each leaves a bare scheme
+                # in one literal and the host somewhere this does not connect to
+                # it. A scheme with no authority means the destination is
+                # assembled, and an assembled one is not a destination this can
+                # vouch for. Upstream's bare "https://" literals are in
+                # metadata.py, which never reaches this allowance: only
+                # gguf-py/gguf/utility.py does, measured on master, and it has
+                # none.
+                host = None
             elif end.start() == 0:
                 # A path with no host, as in https:///collect. requests will not
                 # send that anywhere useful, but this cannot say where it goes,
