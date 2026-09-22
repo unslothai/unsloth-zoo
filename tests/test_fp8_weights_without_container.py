@@ -134,16 +134,20 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
     q = (torch.randn(8, 8) * 100).to(E4M3)
     scale = torch.rand(4, 4) + 0.5
     assert bool((q.float().abs().amax() < 448).all())
+    op = _make_op(Fp8Dequantize)(_quantizer())
     with torch.no_grad():
         model.proj.weight.copy_(q)
         model.proj.weight_scale_inv.copy_(scale)
-        # _MoELinear allocates with torch.empty: give the dequantized stack real values.
-        model.experts.weight.copy_(torch.randn(3, 8, 8))
+        # The expert stack goes through the op on load, as a real load does: that is what
+        # marks it for quantization on save.
+        eq, escale = _block_quantize(torch.randn(3, 8, 8), (4, 4))
+        loaded = op.convert({"weight$": [eq], "weight_scale_inv": [escale]}, full_layer_name = "experts.weight", model = model)
+        model.experts.weight.copy_(loaded["experts.weight"])
     model._weight_conversions = [
         WeightConverter(
             source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
             target_patterns = "weight",
-            operations = [_make_op(Fp8Dequantize)(_quantizer())],
+            operations = [op],
         )
     ]
     state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -167,6 +171,43 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
         atol = 0.05,
     )
     assert torch.equal(saved["norm.weight"], state["norm.weight"])
+
+
+def test_save_leaves_an_excluded_full_precision_weight_alone():
+    """A block-divisible bf16 weight the checkpoint excluded from FP8 (modules_to_not_convert)
+    has no scale: it passes through on load and must not be quantized for the first time on
+    save. The reverse op consults which names this converter dequantized."""
+    from transformers import PretrainedConfig
+    from transformers.core_model_loading import WeightConverter, revert_weight_conversion
+
+    torch.manual_seed(0)
+    model = _Holder()
+    model.skip = nn.Linear(8, 8, bias = False).to(torch.bfloat16)
+    model.config = PretrainedConfig()
+    model.base_model_prefix = ""
+    op = _make_op(Fp8Dequantize)(_quantizer())
+    with torch.no_grad():
+        model.experts.weight.copy_(torch.randn(3, 8, 8))
+    # Load: the excluded weight arrives without a scale and passes through; the expert stack is dequantized.
+    w = model.skip.weight.detach().clone()
+    out = op.convert({"weight$": [w]}, full_layer_name = "skip.weight", model = model)
+    assert out["skip.weight"] is w
+    q, scale = _block_quantize(torch.randn(3, 8, 8), (4, 4))
+    op.convert({"weight$": [q], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
+
+    model._weight_conversions = [
+        WeightConverter(
+            source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
+            target_patterns = "weight",
+            operations = [op],
+        )
+    ]
+    state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    saved = revert_weight_conversion(model, dict(state))
+    assert saved["skip.weight"].dtype == torch.bfloat16
+    assert torch.equal(saved["skip.weight"], state["skip.weight"])
+    assert "skip.weight_scale_inv" not in saved
+    assert saved["experts.weight"].dtype == E4M3 and "experts.weight_scale_inv" in saved
 
 
 def test_container_without_a_checkpoint_scale_gets_ones():
