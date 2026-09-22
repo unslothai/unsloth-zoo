@@ -143,3 +143,17 @@ def test_a_partial_sub_config_dict_is_merged_not_substituted():
     assert out.text_config.max_position_embeddings == 64
     assert out.text_config.hidden_size == config.text_config.hidden_size
     assert config.text_config.to_dict() == before
+
+
+def test_a_nested_sub_config_override_keeps_every_level_a_config():
+    omni = pytest.importorskip("transformers.models.qwen2_5_omni.configuration_qwen2_5_omni")
+    config = omni.Qwen2_5OmniConfig()
+    thinker_type = type(config.thinker_config)
+    text_type = type(config.thinker_config.text_config)
+    out = planner._apply_config_overrides(
+        config, {"thinker_config": {"text_config": {"max_position_embeddings": 64}}}
+    )
+    assert isinstance(out.thinker_config, thinker_type)
+    assert isinstance(out.thinker_config.text_config, text_type)
+    assert out.thinker_config.text_config.max_position_embeddings == 64
+    assert config.thinker_config.text_config.max_position_embeddings != 64

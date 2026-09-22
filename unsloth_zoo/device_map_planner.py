@@ -1697,11 +1697,24 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
         # A partial dict for a sub-config (text_config = {...}) is merged into it, as
         # PretrainedConfig.from_dict does, instead of replacing the config object.
         if isinstance(value, Mapping) and hasattr(current, "to_dict") and not isinstance(current, Mapping):
-            for sub_key, sub_value in value.items():
-                setattr(current, sub_key, sub_value)
+            setattr(config, key, _merge_sub_config(current, value))
             continue
         setattr(config, key, value)
     return config
+
+
+def _merge_sub_config(current: Any, override: Mapping[str, Any]) -> Any:
+    """``current`` (a config object) with ``override`` merged in at any depth, rebuilt
+    as the same class so nested sub-configs stay config objects."""
+    for key, value in override.items():
+        child = getattr(current, key, None)
+        if isinstance(value, Mapping) and hasattr(child, "to_dict") and not isinstance(child, Mapping):
+            value = _merge_sub_config(child, value)
+        try:
+            setattr(current, key, value)
+        except Exception:
+            pass
+    return current
 
 
 def build_meta_model(
