@@ -323,3 +323,28 @@ def test_the_forward_read_still_slices_from_the_cached_top_level_module(
         f"{too_big} weights; the sibling import did not resolve there"
     )
     assert tuple(out.shape) == tuple(value.shape)
+
+
+@pytest.mark.parametrize("op", [torch.chunk, torch.split])
+def test_a_sliced_stack_is_as_movable_and_shardable_as_an_unsliced_one(
+    small_threshold, op
+):
+    """Params4bit.__torch_function__ rebuilds the parameter from its own
+    attributes on torch.chunk and torch.split, reading .module among them, so a
+    manually built stack that never defines it raises AttributeError where the
+    constructor path succeeds."""
+    value = _stack()
+    sliced = M._make_expert_params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+    )
+    whole = M.Params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+    ).to(value.device)
+
+    assert sliced.module == whole.module
+    for param in (whole, sliced):
+        parts = op(param, 2) if op is torch.chunk else op(param, param.shape[0] // 2)
+        assert len(parts) == 2
+    # moving is the other thing a manually built parameter tends to lose
+    assert sliced.to("cpu").data.device.type == "cpu"
+    assert sliced.to(value.device).data.device.type == "cuda"

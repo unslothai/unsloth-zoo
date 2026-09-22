@@ -112,7 +112,7 @@ def _is_expert_module(module: nn.Module) -> bool:
 _BNB_MAX_QUANTIZE_NUMEL = 2 ** 31
 
 
-def _quantize_expert_stack_in_slices(value, blocksize, quant_type, quant_storage = torch.uint8):
+def _quantize_expert_stack_in_slices(value, blocksize, quant_type, quant_storage = torch.uint8, module = None):
     """Params4bit for a stack too large for one bitsandbytes quantize call.
 
     Each slice holds whole experts, and one expert is a whole number of blocks
@@ -174,6 +174,11 @@ def _quantize_expert_stack_in_slices(value, blocksize, quant_type, quant_storage
     new_param.quant_type = quant_type
     new_param.quant_storage = quant_storage
     new_param.bnb_quantized = True
+    # Params4bit.__torch_function__ reads .module on torch.chunk/torch.split, so
+    # leaving it undefined makes a sliced stack raise AttributeError where an
+    # unsliced one shards fine. The prequantized path below sets it for the same
+    # reason; the constructor defaults it to None.
+    new_param.module = module
     return new_param
 
 
@@ -186,6 +191,7 @@ def _make_expert_params4bit(value, **kwargs):
             blocksize = kwargs.get("blocksize") or 64,
             quant_type = kwargs.get("quant_type") or "nf4",
             quant_storage = kwargs.get("quant_storage") or torch.uint8,
+            module = kwargs.get("module"),
         )
         if sliced is not None:
             return sliced
