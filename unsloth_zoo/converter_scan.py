@@ -279,6 +279,37 @@ UNKNOWN_PIECE = "\x00"
 MAX_CARRIER_PASSES = 16
 
 
+def _join_nodes(node):
+    """`(separator, elements)` for `sep.join([...])`, or None.
+
+    Only a sequence written out here: `"".join(parts)` names elements this
+    cannot enumerate, and nothing is gained by pretending otherwise.
+    """
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and not node.keywords
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        return None
+    return node.func.value, node.args[0].elts
+
+
+def _join_parts(node):
+    """The text of a `sep.join([...])`, with holes for what cannot be read."""
+    nodes = _join_nodes(node)
+    if nodes is None:
+        return None
+    separator_node, element_nodes = nodes
+    separator = _literal_text(separator_node)
+    return (
+        UNKNOWN_PIECE if separator is None else separator,
+        [_literal_text(element) or UNKNOWN_PIECE for element in element_nodes],
+    )
+
+
 def _literal_text(node):
     """The text a constant expression evaluates to, or None when it is not one.
 
@@ -315,6 +346,15 @@ def _literal_text(node):
                 known = _literal_text(part)
             pieces.append(UNKNOWN_PIECE if known is None else known)
         return "".join(pieces)
+    parts = _join_parts(node)
+    if parts is not None:
+        # "".join(("htt", "ps://ev", "il.exa", "mple/c")) is a URL spelled out in
+        # full whose scheme never appears in any one piece, so nothing matched
+        # RE_URL_SCHEME and nothing was recorded as a destination. Read like an
+        # f-string: a piece that cannot be read is a hole, never a reason to
+        # treat the pieces around it as the whole string.
+        separator, elements = parts
+        return separator.join(elements)
     if not (isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod))):
         return None
     left = _literal_text(node.left)
@@ -391,6 +431,15 @@ def _reshapes_a_url(tree):
                 node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
             )
             return any(built_from_a_carrier(operand) for operand in operands)
+        nodes = _join_nodes(node)
+        if nodes is not None:
+            # "".join([BASE, "/x"]) carries: without this the join laundered the
+            # carrier and .replace() on the result was not a reshape of anything.
+            separator_node, element_nodes = nodes
+            return any(
+                built_from_a_carrier(part)
+                for part in [separator_node, *element_nodes]
+            )
         return False
 
     # Bounded, because each pass walks the whole tree and a chain of assignments
@@ -419,12 +468,15 @@ def _reshapes_a_url(tree):
     else:
         return True
     for node in ast.walk(tree):
-        if isinstance(node, ast.Subscript) and carries(node.value):
+        # built_from_a_carrier, not carries: the receiver may be the string
+        # building itself, as in "".join([BASE, "/x"]).replace(...) or
+        # f"{BASE}"[:8], with no name in between to have been tainted.
+        if isinstance(node, ast.Subscript) and built_from_a_carrier(node.value):
             return True
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
-            and carries(node.func.value)
+            and built_from_a_carrier(node.func.value)
         ):
             return True
     return False

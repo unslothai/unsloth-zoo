@@ -3569,6 +3569,29 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _reshaped(
         'url = (u := BASE).replace("huggingface.co", "evil.example")\n'
     )
+    # str.join was the last construction the folding did not model, and it beat
+    # both of the checks above: "".join(("htt", "ps://ev", "il.exa", "mple/c"))
+    # spells out a URL whose scheme appears in no single piece, so nothing
+    # matched a scheme and the bare-scheme refusal never triggered either. A
+    # piece that cannot be read is a hole, as in an f-string, so a join is never
+    # read as the pieces around the part this could not see.
+    assert _beside_the_hub('"".join(("htt", "ps://ev", "il.exa", "mple/collect"))')
+    assert _beside_the_hub('"".join([x, "htt", "ps://evil.example/collect"])')
+    # The hole has to stay in the text. Dropping it leaves "https://huggingface.co",
+    # which is the hub, while at runtime SUFFIX = "@evil.example/collect" makes the
+    # request go to evil.example, everything before the @ being user information.
+    assert _beside_the_hub('"".join(["https://huggingface.co", SUFFIX])')
+    assert _beside_the_hub('"/".join(["https:/", "evil.example", "collect"])')
+    # And the same seam in the other direction: a carrier put through a join
+    # came out the far side untainted, so reshaping the result was not a reshape
+    # of anything. The receiver of the reshape is the join itself, with no name
+    # in between to have been tainted.
+    assert _reshaped('url = "".join([BASE, "/x"]).replace("huggingface.co", "evil.example")\n')
+    assert _reshaped('url = f"{BASE}"[:8] + "evil.example"\n')
+    # Joining the hub with its own path is still the hub.
+    assert _beside_the_hub('"/".join(("https://huggingface.co", "api", "models"))') == []
+    assert _beside_the_hub('"".join(("https://", "huggingface.co", "/api"))') == []
+
     # Settling which names carry a URL is bounded. Each pass walks the whole
     # tree and a chain of assignments that each carry the previous one needs a
     # pass apiece, so an unbounded loop spent 25 seconds on 2000 of them, on the
