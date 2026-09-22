@@ -148,3 +148,24 @@ def test_replace_with_bnb_linear_leaves_the_router_alone():
         assert isinstance(layer.share_expert.gate_proj, bnb.nn.Linear4bit)
         # Expert stacks are bare parameters: not a Linear, so untouched here.
         assert isinstance(layer.moe.up_proj.weight, nn.Parameter)
+
+
+def test_the_4x_matcher_gains_a_suffix_match():
+    """On transformers 4.x the bitsandbytes skip check is `key + "." in path or key == path`, so
+    a dotted leaf entry never matched the leaf itself. The rewritten check also takes the
+    entry as a suffix."""
+    from unsloth_zoo.patching_utils import _add_suffix_match_to_bnb_skip, _BNB_SKIP_MATCH
+
+    snippet = (
+        "            if not any(\n"
+        "                " + _BNB_SKIP_MATCH + " for key in modules_to_not_convert\n"
+        "            ):\n"
+    )
+    patched = _add_suffix_match_to_bnb_skip(snippet)
+    assert 'endswith("." + key)' in patched
+    namespace = {}
+    exec("def matches(current_key_name_str, modules_to_not_convert):\n    return any(" + _BNB_SKIP_MATCH + ' or current_key_name_str.endswith("." + key)' + " for key in modules_to_not_convert)", namespace)
+    assert namespace["matches"]("model.layers.3.moe.gate", ["moe.gate"]) is True
+    assert namespace["matches"]("model.layers.3.moe.gate_proj", ["moe.gate"]) is False
+    assert namespace["matches"]("model.layers.3.moe.gate.weight", ["moe.gate"]) is True   # parent prefix, as before
+    assert _add_suffix_match_to_bnb_skip("nothing here") == "nothing here"
