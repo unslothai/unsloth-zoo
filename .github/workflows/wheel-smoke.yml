@@ -17,6 +17,13 @@ on:
       # or renaming it fails `python -m build`, and an ordinary edit changes the packaged
       # metadata. The unfiltered push used to be what caught that after merge.
       - 'README.md'
+      # setuptools.build_meta reads these when present, so adding one changes the build
+      # this job runs while matching nothing else in the list. None exist today, so they
+      # trigger nothing now and only close the case where a packaging file arrives with
+      # no CI attached to it.
+      - 'setup.py'
+      - 'setup.cfg'
+      - 'MANIFEST.in'
       - '.github/workflows/wheel-smoke.yml'
   push:
     branches: [main]
@@ -31,6 +38,9 @@ on:
       - 'unsloth_zoo/**'
       - 'tests/**'
       - 'README.md'
+      - 'setup.py'
+      - 'setup.cfg'
+      - 'MANIFEST.in'
       - '.github/workflows/wheel-smoke.yml'
 
 concurrency:
