@@ -3745,6 +3745,9 @@ def test_grpo_evaluation_follows_trl_eval_sampler(monkeypatch):
 def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, monkeypatch, capsys):
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
 
+    built = []  # a CCE scorer scoring 0: any log-prob taken off the logits instead makes kl nonzero
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, logit_sums: (supervised * 0.0, None)))  # noqa: E501
+
     evaluate, scorers = MLXGRPOTrainer._evaluate, []
     monkeypatch.setattr(MLXGRPOTrainer, "_evaluate", lambda self, batches, fn, **kw: scorers.append(fn) or evaluate(self, batches, fn, **kw))
 
@@ -3753,7 +3756,7 @@ def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, 
         trainer = MLXGRPOTrainer(
             _tiny_model(lora=True), DecodingTokenizer(), _grpo_rows(), eval_dataset=eval_dataset,
             reward_funcs=lambda completions, **_: [float(len(c)) for c in completions],
-            args=_grpo_config(tmp_path, max_steps=4, eval_steps=2, per_device_eval_batch_size=4, log_completions=True, beta=0.04))
+            args=_grpo_config(tmp_path, max_steps=4, eval_steps=2, per_device_eval_batch_size=4, log_completions=True, beta=0.04, use_cce=True, temperature=0.7))
         _run_generation_trainer(trainer, monkeypatch, calls)
         return trainer, [[(r.prompt_token_ids, r.sampling.seed) for r in call["requests"]] for call in calls]
 
@@ -3763,9 +3766,10 @@ def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, 
     # Each evaluation samples split a (4 + 2 completions) and split b (4) afresh.
     assert [len(call) for call in calls] == [4, 4, 4, 2, 4] * 2 and calls[:2] + calls[5:7] == training
     assert trainer.state.num_input_tokens_seen == baseline.state.num_input_tokens_seen
-    assert {fn.__qualname__ for fn in scorers} == {"make_grpo_eval_fn.<locals>.eval_fn"}
+    assert {fn.__qualname__ for fn in scorers} == {"make_grpo_eval_fn.<locals>.eval_fn"} and built == [0.7, 0.7]
     names = ("loss", "reward", "kl", "completions/mean_length", "clip_ratio/region_mean", "rewards/<lambda>/mean")
     assert {f"eval_{split}_{name}" for split in "ab" for name in names} <= set(evaluated := trainer._last_eval_metrics)
     assert evaluated["eval_a_num_tokens"] == evaluated["eval_b_num_tokens"] == trainer.state.num_input_tokens_seen
+    assert [entry["kl"] for entry in trainer.state.log_history if "kl" in entry] == [0.0] * 4 == [evaluated[f"eval_{s}_kl"] for s in "aabb"]
     # One table per training log and per evaluated split.
     assert "| a_Reward: 1.0000 | b_Reward: 1.0000" in printed and printed.count("Prompt | Completion | <lambda> | Advantage") == 4 + 4

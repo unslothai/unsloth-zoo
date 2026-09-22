@@ -661,6 +661,7 @@ from .grpo import (
     grpo_objective,
     grpo_reward_funcs,
     grpo_sampling,
+    make_grpo_cce_loss_fn,
     make_grpo_eval_fn,
     make_grpo_loss_fn,
     resolve_grpo_config,
@@ -6481,7 +6482,9 @@ class MLXTrainer:
                 reference_policy, provenance = _reference
                 self._preference_reference_provenance = {**provenance, "objective": "grpo"}
                 _sampling_reference = reference_policy
-                loss_fn = make_grpo_loss_fn(objective)
+                loss_fn = (make_grpo_cce_loss_fn(model, objective)
+                           if args.use_cce else make_grpo_loss_fn(objective))
+                use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
                 _main_print(
                     f"Unsloth: Using GRPO loss (beta={objective.beta}, "
                     f"loss_type={objective.loss_type})."
@@ -6515,7 +6518,9 @@ class MLXTrainer:
             )
             # Not the training loss: that one normalizes across a window.
             if preference_kind == "grpo":
-                preference_eval_fn = make_grpo_eval_fn(objective)
+                preference_eval_fn = make_grpo_eval_fn(
+                    objective, scorer=loss_fn._unsloth_grpo_scorer,
+                )
             else:
                 preference_eval_fn = make_preference_eval_fn(
                     objective, reference_policy=_sampling_reference,
@@ -6547,6 +6552,7 @@ class MLXTrainer:
                 reward_weights=args.reward_weights, reference_policy=_sampling_reference,
                 rollout_context=_training_patches_paused,
                 keep_completions=bool(args.log_completions),
+                scorer=loss_fn._unsloth_grpo_scorer,
             )
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
@@ -7247,6 +7253,7 @@ class MLXTrainer:
                             reference_policy=_sampling_reference,
                             rollout_context=_training_patches_paused,
                             keep_completions=bool(args.log_completions),
+                            scorer=loss_fn._unsloth_grpo_scorer,
                         )
                         return plan
                     prompt_sink = (

@@ -16,7 +16,9 @@ import numpy as np
 
 from . import generate as generate_module
 from .generate import GenerationDefaults, GenerationRequest, SamplingParams
-from .preference import _chat_template, _response_mask, _supervised_tokens
+from .preference import (
+    _chat_template, _make_preference_cce_scorer, _response_mask, _supervised_tokens,
+)
 from .utils import (
     _finite_batch_schedule,
     _finite_text_pad_width,
@@ -178,6 +180,20 @@ def completion_logps(model, batch, temperature):
     return -nn.losses.cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
 
 
+def grpo_logps(temperature, scorer=None):
+    """``(model, batch, lengths) -> log-probs``: the logits path, or ``scorer``'s
+    runtime CCE, whose own temperature then applies; it scores response positions
+    only, and zero elsewhere."""
+    if scorer is None:
+        return lambda model, batch, _lengths: completion_logps(model, batch, temperature)
+
+    def logps(model, batch, lengths):
+        supervised = _response_mask(batch[:, 1:], lengths) > 0
+        return -scorer(model, batch, supervised, logit_sums=False)[0]
+
+    return logps
+
+
 def _masked_mean(values, mask):
     if values.shape[1] == 1:
         return values.mean()
@@ -253,12 +269,13 @@ def grpo_metric_values(summed):
     return values
 
 
-def make_grpo_loss_fn(objective):
+def make_grpo_loss_fn(objective, *, scorer=None):
     """GRPO loss over a micro-batch ``(tokens, lengths, normalizers, advantages,
     kept, old_logps, ref_logps)``; ``kept`` zeroes rows TRL masks as truncated."""
+    logps = grpo_logps(objective.temperature, scorer)
 
     def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None):
-        new = completion_logps(model, batch, objective.temperature)
+        new = logps(model, batch, lengths)
         response_mask = _response_mask(batch[:, 1:], lengths)
         per_token, kl, coef_1 = grpo_terms(
             objective, new, advantages, response_mask, old=old, ref=ref,
@@ -274,13 +291,23 @@ def make_grpo_loss_fn(objective):
     loss_fn._unsloth_preference_stats_width = GRPO_STATS_WIDTH
     loss_fn._unsloth_preference_report = grpo_metric_values
     loss_fn._unsloth_cce_compaction = False
+    loss_fn._unsloth_grpo_scorer = scorer
+    if scorer is not None:
+        loss_fn._unsloth_cce_backend = "runtime-cce"
     return loss_fn
 
 
+def make_grpo_cce_loss_fn(model, objective):
+    """The GRPO loss scored through runtime CCE when the head allows it."""
+    return make_grpo_loss_fn(objective, scorer=_make_preference_cce_scorer(
+        model, temperature=objective.temperature,
+    ))
 
-def make_grpo_eval_fn(objective):
+
+
+def make_grpo_eval_fn(objective, *, scorer=None):
     """The GRPO loss of one eval batch, weighted by its rows as HF's ``eval_loss``."""
-    loss_fn = make_grpo_loss_fn(objective)
+    loss_fn = make_grpo_loss_fn(objective, scorer=scorer)
 
     def eval_fn(model, batch, *rest):
         loss, _, stats = loss_fn(model, batch, *rest)
@@ -510,12 +537,13 @@ class GRPOBatchPlan:
 
     def bind(
         self, model, reward_funcs, *, trainer_state, reward_weights=None,
-        reference_policy=None, rollout_context=None, keep_completions=False,
+        reference_policy=None, rollout_context=None, keep_completions=False, scorer=None,
     ):
         """Attach what generating needs: the policy, rewards and the reference.
         ``trainer_state`` reaches the reward functions and counts the prompt and
         completion tokens, as TRL's does; ``keep_completions`` holds the latest
-        generation's texts in ``completions``."""
+        generation's texts in ``completions``; ``scorer`` is the loss's runtime CCE
+        scorer, so old and reference log-probs are scored as the loss scores."""
         if self.with_reference and reference_policy is None:
             raise ValueError("Unsloth MLX GRPO: this plan scores a reference policy.")
         self._model = model
@@ -528,6 +556,7 @@ class GRPOBatchPlan:
         self._trainer_state = trainer_state
         self._rollout_context = rollout_context or nullcontext
         self._keep_completions = keep_completions
+        self._logps = grpo_logps(self.score_temperature, scorer)
 
     def start_at(self, visit):
         """Count generations from ``visit``, the first micro-step a run fetches."""
@@ -655,18 +684,16 @@ class GRPOBatchPlan:
             tuple(self._prompt_ids[prompts[row]]) + tuple(completion_ids[row]) for row in order
         ]
         prompt_lengths = prompt_lengths[order]
-        temperature = self.score_temperature
         old = ref = None
         if self.with_old_logps:
             old = self._score(
-                lambda batch, _: mx.stop_gradient(completion_logps(self._model, batch, temperature)),
+                lambda batch, lengths: mx.stop_gradient(self._logps(self._model, batch, lengths)),
                 sequences, prompt_lengths,
             )
         if self.with_reference:
             ref = self._score(
                 lambda batch, lengths: self._reference_policy.forward(
-                    self._model, batch, lengths,
-                    response_scorer=lambda module, tokens, _: completion_logps(module, tokens, temperature),
+                    self._model, batch, lengths, response_scorer=self._logps,
                 ),
                 sequences, prompt_lengths,
             )

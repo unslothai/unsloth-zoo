@@ -1880,6 +1880,26 @@ def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
     assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
 
 
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
+def test_grpo_cce_scores_like_the_logits(head):
+    from unsloth_zoo.mlx import grpo as g
+    mx.random.seed(947)
+    calls, objective = [], g.GRPOObjective(beta=0.04, temperature=0.7, max_completion_length=40)
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls, softcap=0.5 if head == "softcap" else 0.0)
+    tokens = (mx.arange(4 * 48).reshape(4, 48) * 7 + 3) % 2053
+    old = g.completion_logps(model, tokens, 0.7) + 0.05
+    batch = (tokens, mx.array([[5, 48], [9, 40], [13, 33], [3, 48]]), mx.array([2.0, 100.0]), mx.array([1.0, -1.0, 0.5, -0.5]), mx.array([1, 1, 0, 1]), old, old - 0.1)  # noqa: E501
+    mx.eval(expected := nn.value_and_grad(model, g.make_grpo_loss_fn(objective))(model, *batch))
+    calls.clear()
+    cce = g.make_grpo_cce_loss_fn(model, objective)
+    mx.eval(actual := mx.compile(lambda *b: nn.value_and_grad(model, cce)(model, *b), inputs=model.state, outputs=model.state)(*batch))
+    assert ("model" in calls) is (head == "softcap") is (cce._unsloth_grpo_scorer is None)  # a softcap keeps the logits
+    flat = lambda out: [*out[0], *(value for _, value in tree_flatten(out[1]))]
+    assert all(mx.allclose(want, got, atol=1e-4, rtol=2e-4).item() for want, got in zip(flat(expected), flat(actual)))
+
+
 @metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("labeled", [False, True])
