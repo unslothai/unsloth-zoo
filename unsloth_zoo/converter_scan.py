@@ -264,6 +264,66 @@ def _writes_anything(tree):
     )
 
 
+# Only %s, %r and %% are folded below. A width turns "%2000000000d" % 1 into a
+# two gigabyte string, and reading a file is not a reason to allocate one.
+RE_UNSAFE_PERCENT = re.compile(r"%[^sr%]")
+
+
+def _literal_text(node):
+    """The text a constant expression evaluates to, or None when it is not one.
+
+    `+` and `%` are folded because ast.parse does not fold them: "https://" +
+    "evil.example/collect" is two Constants, neither of which names a host, so
+    that destination was recorded as no destination at all while a hub literal
+    elsewhere in the file still granted the allowance. Same for "%s://%s" %
+    ("https", "evil.example"), which spells the scheme itself past the check.
+    An operand that is not a literal makes the whole expression unreadable here,
+    which leaves it exactly where the dynamic destinations already sit.
+    """
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return node.value
+        if isinstance(node.value, bytes):
+            return node.value.decode("utf-8", "replace")
+        return None
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod))):
+        return None
+    left = _literal_text(node.left)
+    if left is None:
+        return None
+    if isinstance(node.op, ast.Add):
+        right = _literal_text(node.right)
+        return None if right is None else left + right
+    if RE_UNSAFE_PERCENT.search(left):
+        return None
+    operands = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+    values = [_literal_text(operand) for operand in operands]
+    if any(value is None for value in values):
+        return None
+    try:
+        return left % tuple(values)
+    except (TypeError, ValueError):
+        return None
+
+
+def _literal_texts(tree):
+    """Every whole literal expression in `tree`, folded ones in place of parts.
+
+    A folded expression is not descended into: reading "https://hugging" +
+    "face.co/api/models" as the hub AND as a host called `hugging` refuses the
+    allowance over a file that only ever names the hub, which is the false
+    positive this whole narrowing exists to remove.
+    """
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        text = _literal_text(node)
+        if text is not None:
+            yield text
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
 def _authority_host(authority):
     """The hostname an authority names, "" when it names none, None when unclear.
 
@@ -336,21 +396,14 @@ def _talks_only_to_the_model_hub(text):
         # exactly HF_TOKEN.
         return False
     hosts = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Constant):
-            continue
-        # bytes as well as str: requests decodes b"https://evil.example/collect"
-        # and accepts it, so skipping bytes constants let a destination hide in
-        # one while a str hub literal stayed in the file.
-        if isinstance(node.value, bytes):
-            try:
-                literal = node.value.decode("utf-8", "replace")
-            except (UnicodeError, AttributeError):
-                return False        # cannot tell, so do not suppress anything
-        elif isinstance(node.value, str):
-            literal = node.value
-        else:
-            continue
+    # bytes as well as str: requests decodes b"https://evil.example/collect" and
+    # accepts it, so skipping bytes constants let a destination hide in one while
+    # a str hub literal stayed in the file.
+    try:
+        literals = list(_literal_texts(tree))
+    except (UnicodeError, AttributeError, MemoryError, RecursionError):
+        return False                # cannot tell, so do not suppress anything
+    for literal in literals:
         for match in RE_URL_SCHEME.finditer(literal):
             rest = literal[match.end():]
             end = RE_AUTHORITY_END.search(rest)

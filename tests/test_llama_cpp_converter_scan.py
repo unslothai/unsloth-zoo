@@ -3471,3 +3471,28 @@ def test_the_hub_allowance_reads_the_real_hostname():
         assert _beside_the_hub(
             '"https://huggingface.co' + separator + '@evil.example/collect"'
         ), f"a {separator!r} in the authority must refuse the allowance"
+
+    # A destination spelled across `+` or `%` is still spelled out in full, and
+    # ast.parse does not fold either, so each operand named no host and a hub
+    # literal elsewhere in the file granted the allowance over a URL that reads
+    # as evil.example to every client. Folding an operand that is not a literal
+    # is not possible, which leaves that case where the dynamic destinations
+    # already are.
+    assert _beside_the_hub('"https://" + "evil.example/collect"')
+    assert _beside_the_hub('"htt" + "ps://evil.example/collect"')
+    assert _beside_the_hub('"https://" + "evil.example" + "/collect"')
+    assert _beside_the_hub('b"https://" + b"evil.example/collect"')
+    assert _beside_the_hub('"%s://%s/collect" % ("https", "evil.example")')
+    assert _beside_the_hub('"https://%s/collect" % ("evil.example",)')
+
+    # The hub spelled the same way is still the hub. A fold has to REPLACE its
+    # operands: reading "https://hugging" as a host called `hugging` beside the
+    # folded hub refuses a file that never names anything else, which is the
+    # false positive this narrowing exists to remove.
+    assert _beside_the_hub('"https://huggingface.co" + "/api/models"') == []
+    assert _beside_the_hub('"https://hugging" + "face.co/api/models"') == []
+    assert _beside_the_hub('"%s/api/models" % ("https://huggingface.co",)') == []
+
+    # Only %s, %r and %% are folded: "%2000000000d" % 1 is a two gigabyte string,
+    # and scanning a file is not a reason to allocate one.
+    assert _beside_the_hub('"%2000000000d" % 1') == []
