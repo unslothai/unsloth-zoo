@@ -13,6 +13,10 @@ on:
       - 'pyproject.toml'
       - 'unsloth_zoo/**'
       - 'tests/**'
+      # pyproject declares `readme = "README.md"`, so the build below reads it: deleting
+      # or renaming it fails `python -m build`, and an ordinary edit changes the packaged
+      # metadata. The unfiltered push used to be what caught that after merge.
+      - 'README.md'
       - '.github/workflows/wheel-smoke.yml'
   push:
     branches: [main]
@@ -26,6 +30,7 @@ on:
       - 'pyproject.toml'
       - 'unsloth_zoo/**'
       - 'tests/**'
+      - 'README.md'
       - '.github/workflows/wheel-smoke.yml'
 
 concurrency:
