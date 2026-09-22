@@ -297,6 +297,11 @@ jobs:
         # that the file imports, which is how the guard could be removed and CI stay
         # green.
         #
+        # test_moe_router_not_a_lora_target pins that the automatic LoRA target search
+        # skips the MoE router leaf. CPU-pure, no weights, sub-second. Collect-only
+        # would keep the job green with the skip reverted, which is exactly the state
+        # these assertions exist to catch.
+        #
         # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
         # the forward of a stacked-expert family Unsloth has no forward for, which is
         # what stops an adapter that looks healthy in named_parameters from having no
@@ -429,6 +434,7 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
+            tests/test_moe_router_not_a_lora_target.py \
             tests/test_moe_stacked_expert_lora_reaches_forward.py \
             tests/test_fp8_expert_dequant_tile_limit.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
