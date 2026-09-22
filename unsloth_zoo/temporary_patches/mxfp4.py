@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import os
 import math
+import contextlib
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
@@ -95,6 +96,24 @@ def get_mxfp4_config_for_training():
 
     return Mxfp4Config(dequantize=dequantize)
 
+def _device_guard(tensor):
+    """Make ``tensor``'s device the current device for the ops inside.
+
+    torch.ldexp on CUDA launches on the current device rather than the device of its
+    operands (seen on torch 2.13), so dequantizing a checkpoint whose layers the
+    device map placed on cuda:1 while cuda:0 is current faults with an illegal memory
+    access. transformers 5 dequantizes from loader threads that never change the
+    current device, so every expert placed off cuda:0 hits it.
+    """
+    device = tensor.device
+    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+    guard = getattr(backend, "device", None)
+    if guard is None or device.index is None:
+        return contextlib.nullcontext()
+    return guard(device)
+pass
+
+
 def patch_convert_moe_packed_tensors():
     """Pin the GPU convert_moe_packed_tensors with a smaller default chunk."""
     try:
@@ -130,22 +149,23 @@ def patch_convert_moe_packed_tensors():
 
         out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
 
-        for r0 in range(0, rows_total, rows_per_chunk):
-            r1 = min(r0 + rows_per_chunk, rows_total)
+        with _device_guard(blocks):
+            for r0 in range(0, rows_total, rows_per_chunk):
+                r1 = min(r0 + rows_per_chunk, rows_total)
 
-            blk = blocks[r0:r1]
-            exp = scales[r0:r1]
+                blk = blocks[r0:r1]
+                exp = scales[r0:r1]
 
-            # nibble indices -> int64
-            idx_lo = (blk & 0x0F).to(torch.long)
-            idx_hi = (blk >> 4).to(torch.long)
+                # nibble indices -> int64
+                idx_lo = (blk & 0x0F).to(torch.long)
+                idx_hi = (blk >> 4).to(torch.long)
 
-            sub = out[r0:r1]
-            sub[:, 0::2] = lut[idx_lo]
-            sub[:, 1::2] = lut[idx_hi]
+                sub = out[r0:r1]
+                sub[:, 0::2] = lut[idx_lo]
+                sub[:, 1::2] = lut[idx_hi]
 
-            torch.ldexp(sub, exp, out=sub)
-            del idx_lo, idx_hi, blk, exp, sub
+                torch.ldexp(sub, exp, out=sub)
+                del idx_lo, idx_hi, blk, exp, sub
 
         out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
         del blocks, scales, lut
