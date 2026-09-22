@@ -504,3 +504,27 @@ def test_dequant_slices_a_stack_of_exactly_the_cap(M):
     assert len(RECORDER.dequantize) > 1
     assert max(RECORDER.dequantize) < SMALL_CAP
     assert torch.equal(out, M._dequantize_4bit_in_slices(param))
+
+
+def test_a_plain_tuple_original_shape_counts_the_same(M):
+    """The size check reads torch.Size.numel() when it can and multiplies the
+    dimensions out when it cannot, so `_original_shape` being a plain tuple
+    rather than a torch.Size must not change the decision. The load path sets a
+    torch.Size, which is why a broken fallback here would go unnoticed: every
+    other test in this file arrives by that route."""
+    value = _stack(experts = 8)
+    assert value.numel() > SMALL_CAP
+
+    param = _quantized(M, value)
+    param._original_shape = torch.Size(tuple(value.shape))
+    as_size = M._dequantize_4bit_in_slices(param)
+
+    param._original_shape = tuple(value.shape)      # a plain tuple, not a Size
+    assert not isinstance(param._original_shape, torch.Size)
+    as_tuple = M._dequantize_4bit_in_slices(param)
+
+    assert as_tuple is not None, (
+        "a stack over the cap declined because its shape was a tuple, which "
+        "puts it back on the single call that aborts"
+    )
+    assert torch.equal(as_size, as_tuple)
