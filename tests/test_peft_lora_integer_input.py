@@ -74,3 +74,25 @@ def test_original_forward_fails_on_the_integer_input():
     with torch.autocast("cuda", dtype = torch.bfloat16):
         with pytest.raises(RuntimeError, match = "same dtype"):
             cls.forward.__wrapped__(model.base_model.model[0], x)
+
+
+@cuda
+def test_integer_input_under_autocast_takes_the_autocast_dtype_not_compute_dtype():
+    """bitsandbytes' default compute dtype is float32. Under a bfloat16 autocast the base
+    result comes back in the autocast dtype regardless, so casting the integer input to
+    compute_dtype left the base and LoRA branches to promote to float32 and the caller's
+    index_add_ to raise all the same. The cast target under autocast is the autocast dtype."""
+    import bitsandbytes as bnb
+    from peft import LoraConfig, get_peft_model
+
+    _patch()
+    base = torch.nn.Sequential(bnb.nn.Linear4bit(32, 64, bias = False, compute_dtype = torch.float32, quant_type = "nf4"))
+    base = base.to("cuda")
+    model = get_peft_model(base, LoraConfig(r = 4, target_modules = ["0"]))
+    model = model.to("cuda", dtype = torch.bfloat16)
+    x = torch.randint(0, 3, (8, 32), device = "cuda", dtype = torch.uint8)
+    with torch.autocast("cuda", dtype = torch.bfloat16):
+        out = model(x)
+        reference = model(x.to(torch.bfloat16))
+    assert out.dtype == reference.dtype == torch.bfloat16
+    assert torch.equal(out, reference)
