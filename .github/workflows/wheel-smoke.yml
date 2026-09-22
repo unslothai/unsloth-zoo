@@ -16,6 +16,17 @@ on:
       - '.github/workflows/wheel-smoke.yml'
   push:
     branches: [main]
+    # Same list as the pull_request trigger above. The two are one question asked twice
+    # ("could this commit break the wheel"), so an unfiltered push here only differs by
+    # running the job for commits that cannot: a docs-only or workflow-only merge held a
+    # runner for a build whose inputs had not moved. This repo's jobs measured a 143 minute
+    # median queue against 5.7 minutes of work, so post-merge work that cannot change a
+    # verdict is paid for twice -- as the slot it holds, and as the queue behind it.
+    paths:
+      - 'pyproject.toml'
+      - 'unsloth_zoo/**'
+      - 'tests/**'
+      - '.github/workflows/wheel-smoke.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
