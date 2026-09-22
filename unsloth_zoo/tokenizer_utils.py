@@ -283,6 +283,44 @@ def _requires_arguments(method):
 pass
 
 
+def _get_embedding_modules(model):
+    """Input embedding and output head of `model`, looking through wrappers.
+
+    Multimodal remote-code models (nvidia/Nemotron-3-Nano-Omni-30B-A3B) wrap a
+    complete CausalLM as `language_model` and define neither accessor, so the
+    transformers defaults find `embed_tokens` but return None for the head as the
+    wrapper has no `lm_head` of its own. The first nested module whose own
+    `get_output_embeddings` answers is the language model that owns the head;
+    its input embeddings are taken from the same module so both come from one
+    vocabulary. Returns (None, None) when no module owns a head.
+
+    An accessor is judged before its own call: one that needs arguments
+    (stepfun-ai/Step-3.7-Flash) or raises NotImplementedError (transformers'
+    base implementation on composite models such as Qwen3-Omni) answers None,
+    while any other exception from inside a callable accessor propagates, so a
+    genuine failure is never read as "no embeddings".
+    """
+    def _own(module, name):
+        getter = getattr(module, name, None)
+        if not callable(getter): return None
+        if _requires_arguments(getter): return None
+        try: return getter()
+        except NotImplementedError: return None
+    embeddings = _own(model, "get_input_embeddings")
+    lm_head    = _own(model, "get_output_embeddings")
+    if lm_head is None:
+        for _, module in model.named_modules():
+            if module is model: continue
+            nested_head = _own(module, "get_output_embeddings")
+            if nested_head is None: continue
+            lm_head = nested_head
+            nested_embeddings = _own(module, "get_input_embeddings")
+            if nested_embeddings is not None: embeddings = nested_embeddings
+            break
+    return embeddings, lm_head
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -292,24 +330,14 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     # All Unsloth Zoo code licensed under LGPLv3
     # Not every checkpoint has a single embedding to reset, and `hasattr` does not
     # say so: transformers' base get_input_embeddings raises NotImplementedError
-    # for composite models (Qwen3-Omni), and remote code can declare a signature
-    # that cannot be called (stepfun-ai/Step-3.7-Flash).
-    try:
-        # Each accessor judged before its own call: a TypeError from inside a
-        # callable one must never be read as an accessor we could not call.
-        if _requires_arguments(model.get_input_embeddings):
-            raise NotImplementedError("input embedding accessor requires arguments")
-        input_embeddings  = model.get_input_embeddings ()
-        if _requires_arguments(model.get_output_embeddings):
-            raise NotImplementedError("output embedding accessor requires arguments")
-        output_embeddings = model.get_output_embeddings()
-        # None is a legitimate "I have none", and `.weight` on it is an
-        # AttributeError several frames from the cause.
-        if input_embeddings is None or output_embeddings is None:
-            raise NotImplementedError("no input or output embeddings")
-        embedding_matrix = input_embeddings.weight
-        lm_head_matrix   = output_embeddings.weight
-    except NotImplementedError:
+    # for composite models (Qwen3-Omni), remote code can declare a signature
+    # that cannot be called (stepfun-ai/Step-3.7-Flash), and a multimodal
+    # wrapper may own no head itself while its language model does.
+    embeddings, lm_head = _get_embedding_modules(model)
+    # None is a legitimate "I have none", and `.weight` on it is an
+    # AttributeError several frames from the cause.
+    if embeddings is None or lm_head is None or \
+        getattr(embeddings, "weight", None) is None or getattr(lm_head, "weight", None) is None:
         # Warning, not info: the logger sits at WARNING by default and this run
         # just lost the NaN guard.
         logger.warning(
@@ -318,6 +346,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             f"embedding."
         )
         return
+    embedding_matrix = embeddings.weight
+    lm_head_matrix   = lm_head.weight
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
