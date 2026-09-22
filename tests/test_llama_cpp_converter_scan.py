@@ -37,6 +37,7 @@ import py_compile
 import marshal
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -3568,6 +3569,18 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _reshaped(
         'url = (u := BASE).replace("huggingface.co", "evil.example")\n'
     )
+    # Settling which names carry a URL is bounded. Each pass walks the whole
+    # tree and a chain of assignments that each carry the previous one needs a
+    # pass apiece, so an unbounded loop spent 25 seconds on 2000 of them, on the
+    # path that decides whether an export may run. Unsettled means refused, not
+    # spun on.
+    chain = "".join(
+        f'v{i} = f"{{v{i - 1}}}/x"\n' for i in range(1500)
+    ).replace("{v-1}", "{BASE}")
+    started = time.perf_counter()
+    assert _reshaped(chain + 'url = v1499.replace("huggingface.co", "evil.example")\n')
+    assert time.perf_counter() - started < 10
+
     # What comes BACK from the hub is not a URL. Upstream writes exactly this,
     # and carrying the taint through the call refused the file the allowance
     # exists for: response.raise_for_status(), index_json["weight_map"],

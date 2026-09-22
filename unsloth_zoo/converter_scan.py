@@ -274,6 +274,10 @@ RE_UNSAFE_PERCENT = re.compile(r"%[^sr%]")
 # instead of being read as the text on either side of the hole.
 UNKNOWN_PIECE = "\x00"
 
+# Passes over the tree allowed to settle which names carry a URL. See
+# _reshapes_a_url: real files need one or two.
+MAX_CARRIER_PASSES = 16
+
 
 def _literal_text(node):
     """The text a constant expression evaluates to, or None when it is not one.
@@ -389,7 +393,13 @@ def _reshapes_a_url(tree):
             return any(built_from_a_carrier(operand) for operand in operands)
         return False
 
-    while True:
+    # Bounded, because each pass walks the whole tree and a chain of assignments
+    # that each carry the previous one needs a pass apiece: 2000 of them took 25
+    # seconds, on the path that decides whether an export may run. Real files
+    # settle in one or two. A file that has not settled by then is refused
+    # rather than spun on, which is the same answer this gives to everything
+    # else it cannot read in reasonable time.
+    for _ in range(MAX_CARRIER_PASSES):
         found = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
@@ -406,6 +416,8 @@ def _reshapes_a_url(tree):
         if found <= carriers:
             break
         carriers |= found
+    else:
+        return True
     for node in ast.walk(tree):
         if isinstance(node, ast.Subscript) and carries(node.value):
             return True
