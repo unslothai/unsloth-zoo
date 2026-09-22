@@ -201,3 +201,52 @@ def test_non_config_attributes_are_not_walked():
 
     with pytest.raises(TypeError, match = _UNRESOLVED_MESSAGE):
         get_transformers_model_type(_Holder())
+
+
+_MOCK_PROBE = r"""
+import builtins, sys
+from unittest import mock
+from unsloth_zoo import hf_utils
+
+if sys.argv[1] == "duck":
+    # The duck-typed branch only runs when PretrainedConfig cannot be imported
+    real_import = builtins.__import__
+    def _no_pretrained_config(name, globals = None, locals = None, fromlist = (), level = 0):
+        if name == "transformers" and fromlist and "PretrainedConfig" in fromlist:
+            raise ImportError("simulated layout change")
+        return real_import(name, globals, locals, fromlist, level)
+    builtins.__import__ = _no_pretrained_config
+    assert hf_utils._instance_attribute_model_types(mock.MagicMock()) == []
+else:
+    for config in (mock.MagicMock(), mock.Mock()):
+        try:
+            hf_utils.get_transformers_model_type(config)
+        except TypeError as error:
+            assert "Cannot determine model type" in str(error)
+        else:
+            raise AssertionError("a Mock config resolved to a model type")
+print("OK")
+"""
+
+
+@pytest.mark.parametrize("mode", ["isinstance", "duck"])
+def test_mock_config_raises_instead_of_hanging(mode):
+    # Mock fabricates an attribute on every access and stores it on `__dict__`, so a
+    # walk that reads `model_type` off each node grows the graph forever. Before the
+    # instance-attribute fallback this raised TypeError; it must still raise, promptly.
+    # A subprocess with a timeout, because a hang cannot be interrupted in-process
+    # portably (no SIGALRM on Windows).
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _MOCK_PROBE, mode],
+            capture_output = True, text = True, timeout = 240, env = env,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("instance-attribute walk did not terminate on a Mock config")
+    assert result.returncode == 0 and "OK" in result.stdout, result.stderr[-2000:]

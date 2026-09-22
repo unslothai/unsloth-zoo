@@ -153,6 +153,9 @@ def _standardize_model_types(model_types) -> list:
 pass
 
 
+_MAX_INSTANCE_CONFIG_NODES = 1024
+
+
 def _instance_attribute_model_types(config) -> list:
     """`model_type` read off the live config objects instead of their serialization.
 
@@ -178,7 +181,11 @@ def _instance_attribute_model_types(config) -> list:
         config_types = ()
 
     def _is_config(value):
-        if config_types and isinstance(value, config_types): return True
+        # With transformers importable, only real configs are walked. Duck typing
+        # would also accept objects that fabricate attributes on access (unittest.mock
+        # Mock / MagicMock): every `getattr(obj, "model_type")` then mints a new child
+        # that lands in `__dict__["_mock_children"]`, so the walk never ends.
+        if config_types: return isinstance(value, config_types)
         # Duck-typed stand-in for a config: has both a model_type and a to_dict
         return (
             not isinstance(value, type) and
@@ -187,8 +194,10 @@ def _instance_attribute_model_types(config) -> list:
             hasattr(value, "__dict__")
         )
 
+    # A real config graph is a handful of nodes; the cap only bounds pathological
+    # objects so a fallback can never turn a clean TypeError into a hang.
     found, seen, stack = [], set(), [config]
-    while stack:
+    while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
         obj = stack.pop(0)
         if obj is None or id(obj) in seen: continue
         seen.add(id(obj))
