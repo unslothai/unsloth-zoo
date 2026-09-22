@@ -319,6 +319,49 @@ def _write_fp8_checkpoint(reference, path, block):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "FP8 loading needs a CUDA device")
+def test_save_after_a_real_load_keeps_the_fp8_layout(tmp_path):
+    """The save round trip through the real loader, not a hand-built converter.
+
+    transformers deepcopies the converter for every target key ("each target key
+    gets its own converter instance", core_model_loading.py), and keeps the
+    ORIGINAL on `model._weight_conversions`. Provenance recorded on the op is
+    therefore written on a copy that is thrown away, and the reverse op sees an
+    empty set: the dequantized expert stack was saved as bf16 with its scale
+    grid dropped, while the saved config still advertised fp8. Recording on the
+    model is what survives from the load to the save.
+    """
+    from safetensors.torch import load_file
+
+    torch.manual_seed(0)
+    block = (8, 8)
+    reference = _TinyModel(_TinyConfig(hidden = 16, num_experts = 3)).to(torch.bfloat16)
+    with torch.no_grad():
+        for p in reference.parameters():
+            p.copy_(torch.randn_like(p, dtype = torch.float32).to(torch.bfloat16))
+    ckpt = str(tmp_path / "fp8")
+    _write_fp8_checkpoint(reference, ckpt, block)
+
+    loaded = _TinyModel.from_pretrained(ckpt, dtype = torch.bfloat16, device_map = {"": 0})
+    assert loaded.experts.weight.dtype == torch.bfloat16   # dequantized on load
+    out = str(tmp_path / "saved")
+    loaded.save_pretrained(out, safe_serialization = True)
+    saved = load_file(os.path.join(out, "model.safetensors"))
+
+    # The stack this converter dequantized is quantized back, with its grid.
+    assert saved["experts.weight"].dtype == E4M3, saved["experts.weight"].dtype
+    assert saved["experts.weight_scale_inv"].shape == (3, 2, 2)
+    torch.testing.assert_close(
+        _reference_dequant(saved["experts.weight"], saved["experts.weight_scale_inv"]),
+        loaded.experts.weight.detach().cpu().float(),
+        rtol = 0.07, atol = 0.05,
+    )
+    # The container keeps its packed bytes untouched.
+    original = load_file(os.path.join(ckpt, "model.safetensors"))
+    assert torch.equal(saved["proj.weight"].view(torch.uint8), original["proj.weight"].view(torch.uint8))
+    assert torch.equal(saved["proj.weight_scale_inv"], original["proj.weight_scale_inv"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "FP8 loading needs a CUDA device")
 def test_from_pretrained_gives_the_dequantized_experts(tmp_path):
     torch.manual_seed(0)
     block = (8, 8)

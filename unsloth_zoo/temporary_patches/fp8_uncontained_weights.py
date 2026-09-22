@@ -72,6 +72,31 @@ def _first(value):
     return value[0] if isinstance(value, (list, tuple)) else value
 
 
+def _dequantized_targets(model):
+    """The names this converter folded a checkpoint scale into on load.
+
+    Kept on the MODEL, not on the op. transformers' loader takes a deepcopy of
+    the converter for every target key ("each target key gets its own converter
+    instance", core_model_loading.py), so a set written by `convert` lives on a
+    copy that is discarded, while `model._weight_conversions` keeps the
+    ORIGINAL op and is what `save_pretrained` reverses. The model is the only
+    object that survives from the load to the save.
+    """
+    if model is None:
+        return set()
+    names = getattr(model, "_unsloth_fp8_dequantized_targets", None)
+    if isinstance(names, set):
+        return names
+    names = set()
+    try:
+        model._unsloth_fp8_dequantized_targets = names
+    except Exception:
+        # A model that refuses attributes still saves correctly: an empty set
+        # means "quantize nothing back", which writes every tensor as it is.
+        return set()
+    return names
+
+
 def _make_op(Fp8Dequantize):
     class Fp8DequantizeWithoutContainer(Fp8Dequantize):
         """`Fp8Dequantize` for targets with no FP8 container; pass-through otherwise."""
@@ -85,15 +110,8 @@ def _make_op(Fp8Dequantize):
             # (modules_to_not_convert) has no scale and is written as it is.
             has_scale = any("scale_inv" in (k[:-1] if k.endswith("$") else k) for k in input_dict)
             if has_scale and full_layer_name:
-                self._dequantized_names.add(full_layer_name)
+                _dequantized_targets(model).add(full_layer_name)
             return out
-
-        @property
-        def _dequantized_names(self):
-            names = self.__dict__.get("_unsloth_dequantized_names")
-            if names is None:
-                names = self.__dict__["_unsloth_dequantized_names"] = set()
-            return names
 
         def _pass_through(self, input_dict, full_layer_name, model):
             # Full names on purpose: the loader derives prefix and suffix from the
@@ -135,7 +153,7 @@ def _make_op(Fp8Dequantize):
 
         @property
         def reverse_op(self):
-            return _make_reverse_op(Fp8Dequantize)(self.hf_quantizer, self._dequantized_names)
+            return _make_reverse_op(Fp8Dequantize)(self.hf_quantizer)
     return Fp8DequantizeWithoutContainer
 
 
@@ -157,14 +175,11 @@ def _make_reverse_op(Fp8Dequantize):
     from transformers.integrations.finegrained_fp8 import Fp8Quantize
 
     class Fp8RequantizeWithoutContainer(Fp8Quantize):
-        def __init__(self, hf_quantizer, dequantized_names = None):
-            super().__init__(hf_quantizer)
-            self._dequantized_names = dequantized_names if dequantized_names is not None else set()
-
-        def convert(self, input_dict, full_layer_name = None, **kwargs):
+        def convert(self, input_dict, full_layer_name = None, model = None, **kwargs):
             # The reversed source pattern `weight` also matches `weight_scale_inv`, so
             # every tensor arrives under the key `weight`; `full_layer_name` says what it is.
             name = full_layer_name or ""
+            dequantized = _dequantized_targets(model)
             out = {}
             for key, value in input_dict.items():
                 tensor = _first(value)
@@ -175,7 +190,7 @@ def _make_reverse_op(Fp8Dequantize):
                     or name.endswith("activation_scale")
                     # A full-precision weight this converter never dequantized (the checkpoint's
                     # modules_to_not_convert) is written as it is, not quantized for the first time.
-                    or name not in self._dequantized_names
+                    or name not in dequantized
                 ):
                     # Full name on purpose, so the saved key is the parameter's own.
                     out[name or key] = tensor
