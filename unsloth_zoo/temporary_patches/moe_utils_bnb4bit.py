@@ -412,10 +412,18 @@ def _is_generic_transformers_experts_forward(forward) -> bool:
     return tuple(parts[-3:]) == _GENERIC_EXPERTS_FORWARD_FILE
 
 
+def _experts_have_own_apply_gate(module: nn.Module) -> bool:
+    """True iff the experts class defines its own `_apply_gate` instead of the default
+    `act_fn(gate) * up` that `use_experts_implementation` installs."""
+    apply_gate = getattr(type(module), "_apply_gate", None)
+    return apply_gate is not None and getattr(apply_gate, "__name__", "") != "_default_apply_gate"
+
+
 def _experts_layout_is_standard(module: nn.Module) -> bool:
     """True iff the experts module is laid out the way forward_moe_backend computes it:
     concatenated [gate; up] in gate_up_proj (E, 2*I, H), down_proj (E, H, I), no biases,
-    act_fn(gate) * up. Any other variant keeps its own forward."""
+    and either act_fn(gate) * up or the class's own `_apply_gate` on [gate; up]. Any other
+    variant keeps its own forward."""
     # Attributes set by `use_experts_implementation`; absent on transformers 5.0 for the
     # newer flags, whose only layout there was the standard one.
     if not getattr(module, "has_gate", True):
@@ -424,10 +432,10 @@ def _experts_layout_is_standard(module: nn.Module) -> bool:
         return False
     if not getattr(module, "is_concatenated", True):
         return False
-    apply_gate = getattr(type(module), "_apply_gate", None)
-    if apply_gate is not None and getattr(apply_gate, "__name__", "") != "_default_apply_gate":
-        return False
-    if not callable(getattr(module, "act_fn", None)):
+    # A class with its own `_apply_gate` (MiniMax-M3's clamped swiglu, for one) keeps that
+    # gate: the backends call it on the concatenated gate/up output, as transformers' generic
+    # forward does. Only the default gate needs an `act_fn` to apply.
+    if not _experts_have_own_apply_gate(module) and not callable(getattr(module, "act_fn", None)):
         return False
     gate_up_shape = tuple(getattr(module.gate_up_proj, "_original_shape", None) or module.gate_up_proj.shape)
     down_shape = tuple(getattr(module.down_proj, "_original_shape", None) or module.down_proj.shape)
@@ -490,6 +498,9 @@ def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
 
     forward.__wrapped__ = original_forward
     forward.__doc__ = original_forward.__doc__
+    # Read by the MoE backends: apply the class's own gate instead of act_fn(gate) * up.
+    # Recorded only on classes routed here, so every patched family computes as before.
+    klass._unsloth_own_apply_gate = _experts_have_own_apply_gate(module)
     klass.forward = forward
     klass._unsloth_bnb4bit_routed = True
     if UNSLOTH_ENABLE_LOGGING:

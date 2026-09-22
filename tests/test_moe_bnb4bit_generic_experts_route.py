@@ -99,9 +99,12 @@ def test_only_the_standard_layout_is_routable():
             continue  # this transformers has no such flag
         assert not mb._experts_layout_is_standard(klass(_config())), kwargs
 
+    # A class with its own gate on [gate; up] is routable: the backends apply that gate.
     custom_gate = _make_experts_class()
     custom_gate._apply_gate = lambda self, x: x[..., : x.shape[-1] // 2]
-    assert not mb._experts_layout_is_standard(custom_gate(_config()))
+    assert mb._experts_layout_is_standard(custom_gate(_config()))
+    assert mb._experts_have_own_apply_gate(custom_gate(_config()))
+    assert not mb._experts_have_own_apply_gate(_make_experts_class()(_config()))
 
     no_act = _make_experts_class()(_config())
     no_act.act_fn = None
@@ -247,3 +250,140 @@ def test_bnb4bit_forward_accepts_expert_parallel_sentinel_routes():
     sentinel_weights = torch.cat([top_k_weights, torch.zeros_like(top_k_weights[:, :1])], dim = 1)
     out = experts(hidden, sentinel_index, sentinel_weights)
     torch.testing.assert_close(out.float(), local.float(), rtol = 2e-2, atol = 2e-3)
+
+
+# ----------------------------------------------------------------------------- own _apply_gate
+
+
+LIMIT, ALPHA = 7.0, 1.702
+
+
+def _clamped_swiglu_gate(self, gate_up):
+    # MiniMax-M3's gate: gpt-oss' clamped swiglu, with gate and up NOT interleaved.
+    gate, up = gate_up.chunk(2, dim = -1)
+    gate = gate.clamp(max = LIMIT)
+    up = up.clamp(min = -LIMIT, max = LIMIT)
+    return (up + 1.0) * (gate * torch.sigmoid(gate * ALPHA))
+
+
+def _make_own_gate_experts_class():
+    class OwnGateExperts(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.num_experts = config.num_experts
+            self.hidden_dim = config.hidden_size
+            self.intermediate_dim = config.moe_intermediate_size
+            self.gate_up_proj = nn.Parameter(torch.empty(E, 2 * I, H))
+            self.down_proj = nn.Parameter(torch.empty(E, H, I))
+
+        def forward(self, hidden_states, top_k_index, top_k_weights):
+            final = torch.zeros_like(hidden_states)
+            for e in range(self.num_experts):
+                token_idx, k = torch.where(top_k_index == e)
+                if token_idx.numel() == 0:
+                    continue
+                current = self._apply_gate(nn.functional.linear(hidden_states[token_idx], self.gate_up_proj[e]))
+                out = nn.functional.linear(current, self.down_proj[e])
+                final.index_add_(0, token_idx, (out * top_k_weights[token_idx, k, None]).to(final.dtype))
+            return final
+
+        _apply_gate = _clamped_swiglu_gate
+
+    return use_experts_implementation(OwnGateExperts)
+
+
+def _init_large(module, seed = 0):
+    # Large enough that the +/-7 clamps are active on some entries.
+    g = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        module.gate_up_proj.copy_(torch.randn(E, 2 * I, H, generator = g) * 1.5)
+        module.down_proj.copy_(torch.randn(E, H, I, generator = g) * 0.05)
+    return module
+
+
+def test_own_gate_class_is_routed_and_marked_default_is_not():
+    own = _make_own_gate_experts_class()
+    assert mb._route_generic_bnb4bit_experts_class(own(_config()))
+    assert own._unsloth_own_apply_gate is True
+    default = _make_experts_class()
+    assert mb._route_generic_bnb4bit_experts_class(default(_config()))
+    assert default._unsloth_own_apply_gate is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "the MoE backends need CUDA")
+@pytest.mark.parametrize("backend", ["grouped_mm", "unsloth_triton", "native_torch"])
+def test_every_backend_applies_the_class_gate(backend, monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_utils as mu
+
+    if backend == "grouped_mm" and not getattr(mu, "_check_torch_grouped_mm_supported", lambda: True)():
+        pytest.skip("torch._grouped_mm unavailable")
+    if backend == "unsloth_triton" and not getattr(mu, "_check_grouped_gemm_available", lambda: True)():
+        pytest.skip("Triton grouped GEMM unavailable")
+    monkeypatch.setenv("UNSLOTH_MOE_BACKEND", backend)
+    klass = _make_own_gate_experts_class()
+    module = _init_large(klass(_config("eager"))).to("cuda", torch.bfloat16)
+    hidden, top_k_index, top_k_weights = _routing(64, device = "cuda")
+    hidden = (hidden * 2).to(torch.bfloat16)
+    top_k_weights = top_k_weights.to(torch.bfloat16)
+    # transformers' own eager forward, which calls the class gate.
+    expected = module(hidden, top_k_index, top_k_weights)
+    klass._unsloth_own_apply_gate = True
+    out = mu.forward_moe_backend(module, hidden, top_k_index, top_k_weights)
+    torch.testing.assert_close(out.float(), expected.float(), rtol = 2e-2, atol = 2e-2)
+    # Without the marker the backend would apply silu(gate) * up, which differs here.
+    klass._unsloth_own_apply_gate = False
+    wrong = mu.forward_moe_backend(module, hidden, top_k_index, top_k_weights)
+    assert (wrong.float() - expected.float()).abs().max() > 0.1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "bnb 4-bit needs CUDA")
+def test_bnb4bit_own_gate_experts_match_dequantized_reference():
+    pytest.importorskip("bitsandbytes")
+    klass = _make_own_gate_experts_class()
+    model = nn.Module()
+    model.experts = _init_large(klass(_config("eager")))
+    _quantize_like_the_loader(model, "cuda")
+    experts = model.experts
+    assert klass._unsloth_own_apply_gate is True
+
+    reference = _make_own_gate_experts_class()(_config("eager")).to("cuda", torch.bfloat16)
+    with torch.no_grad():
+        reference.gate_up_proj.copy_(mb._dequantize_bnb4bit_expert_weights(experts.gate_up_proj, torch.bfloat16))
+        reference.down_proj.copy_(mb._dequantize_bnb4bit_expert_weights(experts.down_proj, torch.bfloat16))
+    hidden, top_k_index, top_k_weights = _routing(64, device = "cuda")
+    hidden = (hidden * 2).to(torch.bfloat16)
+    expected = reference(hidden, top_k_index, top_k_weights.to(torch.bfloat16))
+    out = experts(hidden, top_k_index, top_k_weights.to(torch.bfloat16))
+    torch.testing.assert_close(out.float(), expected.float(), rtol = 2e-2, atol = 2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "bnb 4-bit needs CUDA")
+def test_minimax_m3_experts_4bit_match_their_own_forward():
+    pytest.importorskip("bitsandbytes")
+    modeling = pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
+
+    config = MiniMaxM3VLTextConfig(
+        hidden_size = H, intermediate_size = I, num_local_experts = E, num_experts_per_tok = 2,
+        num_hidden_layers = 1, num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 32,
+    )
+    config._experts_implementation = "eager"
+    model = nn.Module()
+    model.experts = _init_large(modeling.MiniMaxM3VLExperts(config))
+    _quantize_like_the_loader(model, "cuda")
+    experts = model.experts
+    assert type(experts)._unsloth_own_apply_gate is True
+
+    reference = modeling.MiniMaxM3VLExperts(config).to("cuda", torch.bfloat16)
+    with torch.no_grad():
+        reference.gate_up_proj.copy_(mb._dequantize_bnb4bit_expert_weights(experts.gate_up_proj, torch.bfloat16))
+        reference.down_proj.copy_(mb._dequantize_bnb4bit_expert_weights(experts.down_proj, torch.bfloat16))
+    hidden, top_k_index, top_k_weights = _routing(64, device = "cuda")
+    hidden = (hidden * 2).to(torch.bfloat16)
+    # The reference is a 16-bit instance: the routed class forward sends it to the original.
+    expected = reference(hidden, top_k_index, top_k_weights.to(torch.bfloat16))
+    out = experts(hidden, top_k_index, top_k_weights.to(torch.bfloat16))
+    torch.testing.assert_close(out.float(), expected.float(), rtol = 2e-2, atol = 2e-2)
+    hidden = hidden.clone().requires_grad_(True)
+    experts(hidden, top_k_index, top_k_weights.to(torch.bfloat16)).float().pow(2).sum().backward()
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
