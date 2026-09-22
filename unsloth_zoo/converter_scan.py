@@ -621,6 +621,36 @@ MAX_FOLDED_JOIN = 1 << 20
 MAX_TEMPLATE = 1 << 16
 
 
+class _FoldBudgetExceeded(Exception):
+    """Raised when one allowance decision has folded more text than it may.
+
+    Each fold carries its own output ceiling, and the destination walk charges
+    what it reads against a shared budget, but the folding itself happens in
+    several places: the carrier fixpoint alone reads every assignment in the
+    file up to sixteen times. Two hundred joins of a megabyte apiece are inside
+    every individual ceiling and still hundreds of megabytes of work. The
+    budget is on the work, and running out of it refuses, since the caller
+    turns any exception here into "do not suppress anything".
+    """
+
+
+# Generous next to a real converter, which folds a few kilobytes: the whole
+# gguf-py package folds well under one megabyte across every pass.
+MAX_TOTAL_FOLD = 32 * MAX_FOLDED_JOIN
+
+_fold_budget = None
+
+
+def _charge_fold(text):
+    global _fold_budget
+    if _fold_budget is None or text is None:
+        return text
+    _fold_budget -= len(text)
+    if _fold_budget < 0:
+        raise _FoldBudgetExceeded("folded more text than one decision may")
+    return text
+
+
 def _fields_are_plain(template):
     """Whether every replacement field is a bare name, with no spec at all.
 
@@ -869,6 +899,11 @@ def _join_parts(node):
 
 
 def _literal_text(node):
+    """As _literal_text_uncharged, with every fold charged to the work budget."""
+    return _charge_fold(_literal_text_uncharged(node))
+
+
+def _literal_text_uncharged(node):
     """The text a constant expression evaluates to, or None when it is not one.
 
     `+` and `%` are folded because ast.parse does not fold them: "https://" +
@@ -1027,6 +1062,13 @@ def _reshapes_a_url(tree):
     """
     carriers = set()
     aliases = _import_aliases(tree)
+    # j = urljoin rebinds the builder with no import in sight, so a single
+    # assignment of one name to another is followed the same way an alias is.
+    for name, value in _single_assignments(tree).items():
+        if isinstance(value, ast.Name):
+            aliases[name] = aliases.get(value.id, value.id)
+        elif isinstance(value, ast.Attribute):
+            aliases[name] = aliases.get(value.attr, value.attr)
 
     def called_name(node):
         """The name a call site uses, read through any import alias."""
@@ -1382,7 +1424,10 @@ def _inline_constants(tree):
         # 8 MiB. The budget is on what the substitution materialises.
         budget -= len(text) * uses.get(name, 0)
         if budget < 0:
-            break
+            # Not a break: leaving the rest of the file unsubstituted analyses a
+            # tree this could not read, and a 600 KB constant loaded twice ahead
+            # of scheme, separator and host bought exactly that.
+            raise _FoldBudgetExceeded("substituted more text than one file may")
         texts[name] = text
     if not texts:
         return tree
@@ -1486,6 +1531,16 @@ def _talks_only_to_the_model_hub(text):
 
 def _talks_only_to_the_model_hub_tree(tree, text):
     """The parsed half of the allowance. See the caller."""
+    global _fold_budget
+    _fold_budget = MAX_TOTAL_FOLD
+    try:
+        return _talks_only_to_the_model_hub_parsed(tree, text)
+    finally:
+        _fold_budget = None
+
+
+def _talks_only_to_the_model_hub_parsed(tree, text):
+    """The allowance proper, under the fold budget its caller opened."""
     tree = _inline_constants(tree)
     if _writes_anything(tree):
         # Sending TO the hub is not downloading from it. The hub is writable and
