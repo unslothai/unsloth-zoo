@@ -1,20 +1,11 @@
 """Merged 4bit exports must carry skip-module names vLLM can actually match.
 
-Regression coverage for unslothai/unsloth#1886 and #464.
-
-`find_skipped_quantized_modules` walks a Transformers module tree, so a dynamic
-4bit merge records leaf projections (`model.layers.0.mlp.gate_proj`). vLLM fuses
-those siblings before it consults `llm_int8_skip_modules`, and its
-`is_layer_skipped_bnb` matches a skip entry against a module's own dotted
-ancestors. `model.layers.0.mlp.gate_up_proj` has no ancestor named
-`...mlp.gate_proj`, so vLLM quantizes a layer that was written to disk dense and
-dies in `vllm/model_executor/layers/linear.py` on
-
-    assert param_data.shape == loaded_weight.shape
-
-The checkpoints Unsloth publishes to the Hub record the parent module
-(`model.layers.0.mlp`), which does match -- which is why the published repo
-serves and a user's own merge of the same model does not.
+Regression coverage for unslothai/unsloth#1886 and #464. A merge records leaf
+projections; vLLM fuses them first and `is_layer_skipped_bnb` matches only a
+module's own dotted ancestors, so the leaf name matches nothing and vLLM
+quantizes a dense-saved layer, dying on `assert param_data.shape ==
+loaded_weight.shape`. Published Hub repos record the parent, which does match,
+which is why they serve and a local merge of the same model does not.
 """
 
 import pytest
@@ -222,16 +213,9 @@ def test_combined_is_additive_and_idempotent():
 
 
 def test_merge_path_actually_writes_the_vllm_compatible_names():
-    """The call site is the only production change; everything else is a helper.
-
-    Reverting just `vllm_compatible_skip_modules(...)` back to `skipped_modules`
-    at the merge writer leaves every helper and every other test in this file
-    passing, so without this test a refactor that drops the wiring ships green
-    and silently re-introduces the vLLM shape assertion.
-
-    Asserted against the source of the writer rather than a full merge, which
-    needs a real model on a GPU.
-    """
+    """Reverting only the wiring leaves every other test here green, so without
+    this a refactor that drops it ships silently. Asserted against the writer's
+    source rather than a full merge, which needs a real model on a GPU."""
     import inspect
     from unsloth_zoo import saving_utils
 
@@ -269,14 +253,11 @@ def test_namespace_alias_never_emits_a_bare_namespace_root():
             assert not name.endswith("."), f"bare namespace root {name!r} from {entry!r}"
 
 
-# --- the other half of the contract: the aliases must be inert for Transformers ---
-# Every assertion above is about vLLM matching more. Nothing above stops an alias
-# from also making *Transformers* skip more, and Transformers does not match by
-# exact name: `should_convert_module` ends in an unanchored
-# `full_name.endswith(key)`, so an alias only has to be a suffix of a real
-# Linear's dotted path to silently leave a layer in 16 bit on reload. These
-# module trees are the real `nn.Linear` naming of the architectures they name,
-# enumerated on the meta device under transformers 5.x.
+# The other half of the contract: everything above is about vLLM matching MORE,
+# nothing stops an alias making Transformers skip more. Matching is by prefix and
+# suffix, not exact name, so an alias need only be a suffix of a real Linear to
+# leave a layer in 16 bit on reload. Trees below are real `nn.Linear` naming,
+# enumerated on the meta device.
 
 MODULE_TREES = {
     # text only
@@ -309,14 +290,13 @@ MODULE_TREES = {
         for i in range(2)
         for rest in ("attn.qkv", "attn.proj", "mlp.linear_fc1", "mlp.linear_fc2")
     ] + ["lm_head"],
-    # a tower that deliberately repeats the text stack's own suffixes
+    # a tower deliberately repeating the text stack's own suffixes
     "adversarial_suffix": [
         f"model.language_model.layers.{i}.{rest}"
         for i in range(2)
         for rest in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
     ] + [
-        # ends in "...model.layers.0.mlp.gate_proj", the exact suffix the
-        # `model.` namespace alias of the text entry collapses to
+        # ends in the exact suffix the text entry's `model.` alias collapses to
         f"model.vision_tower.vision_model.layers.{i}.{rest}"
         for i in range(2)
         for rest in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
@@ -377,11 +357,8 @@ def test_aliases_do_not_widen_the_transformers_skip_set(arch, shape):
 
 
 def test_the_guard_is_what_keeps_the_adversarial_tower_safe():
-    """Without the live tree the `model.` alias does reach the tower.
-
-    This is the behaviour callers get when they cannot supply `module_names`,
-    and the reason the merge writer supplies it.
-    """
+    """Without the live tree the `model.` alias does reach the tower, which is
+    why the merge writer supplies it."""
     should_convert_module = pytest.importorskip(
         "transformers.quantizers.quantizers_utils",
         reason = "needs a transformers exposing should_convert_module",
@@ -424,13 +401,9 @@ def test_the_widening_probe_can_actually_detect_widening():
 
 
 def test_transformers_5x_skip_matcher_matches_the_stock_transformers_clauses():
-    """The guard folds transformers' three clauses into one precompiled pass.
-
-    Compared against the clauses written out literally rather than against the
-    live `should_convert_module`, because unsloth_zoo.patching_utils replaces
-    that function with a broader one at import time and the comparison would
-    then depend on import order.
-    """
+    """Compared against the clauses written out literally, not the live
+    `should_convert_module`: patching_utils replaces that at import time, so the
+    comparison would otherwise depend on import order."""
     import random
     import re as _re
 
@@ -468,10 +441,8 @@ def test_guard_is_inert_when_no_module_names_are_given():
             vllm_compatible_skip_modules(MERGED_LEAF_SKIP_MODULES, module_names = None))
 
 
-# --- the guard must hold for every transformers generation, not just installed ---
-# A checkpoint is written by one transformers and loaded by another. 4.x and 5.x
-# match skip entries differently and neither is a subset of the other, so an
-# alias has to be safe under both (plus the broader matcher unsloth installs).
+# A checkpoint is written by one transformers and loaded by another, and 4.x and
+# 5.x match differently with neither a subset of the other.
 
 def test_transformers_4x_skip_matcher_matches_the_literal_4_57_expression():
     """Pinned against transformers 4.57.6 integrations/bitsandbytes.py:167-172.
@@ -509,12 +480,9 @@ def test_transformers_4x_skip_matcher_matches_the_literal_4_57_expression():
 
 
 def test_guard_covers_the_4x_only_widening_vector():
-    """A parent-form alias reaches the tower under 4.x and not under 5.x.
-
-    This is the case a guard written against only the installed (5.x) matcher
-    would wave through, and it is reachable by anyone who saves on 5.x and
-    reloads on 4.57.6.
-    """
+    """A parent-form alias reaches the tower under 4.x but not 5.x, so a guard
+    written against only the installed matcher waves it through. Reachable by
+    anyone who saves on 5.x and reloads on 4.57.6."""
     from unsloth_zoo.saving_utils import (
         _transformers_4x_skip_matcher, _transformers_5x_skip_matcher,
         vllm_compatible_skip_modules,
