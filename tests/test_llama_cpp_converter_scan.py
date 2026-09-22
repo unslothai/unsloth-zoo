@@ -4061,6 +4061,18 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # everything before the @ being user information. Appending a PATH is what
     # upstream does, so text that begins with a URL delimiter is fine and
     # anything else, text this cannot read included, is not.
+    # A function rewrites a URL as well as a method does: urljoin(BASE,
+    # "//evil.example/collect") resolves to evil.example. Only the builders,
+    # since upstream reads its URL with urlparse and passes it to its own
+    # helpers, and reading one is not rebuilding it.
+    assert _reshaped('url = urljoin(BASE, "//evil.example/collect")\n')
+    assert _reshaped(
+        'import urllib.parse\nurl = urllib.parse.urljoin(BASE, "//evil.example/c")\n'
+    )
+    assert _reshaped(
+        'from urllib.parse import urlparse\n'
+        'assert urlparse(BASE).scheme == "https"\nurl = BASE\n'
+    ) == []
     assert _reshaped('url = BASE + "@evil.example/collect"\n')
     assert _reshaped('url = f"{BASE}@evil.example/collect"\n')
     assert _reshaped('url = BASE + ".evil.example/collect"\n')

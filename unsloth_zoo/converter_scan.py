@@ -341,6 +341,12 @@ SENSITIVE_MODULES = frozenset(("os", "requests", "httpx", "urllib", "socket"))
 # utility.py imports urlparse from it twice.
 UNVOUCHABLE_MODULES = ("socket", "http.client", "http.server", "urllib.request")
 
+# Functions that BUILD a URL out of one. urlparse and urlsplit are not here:
+# upstream reads its URL with urlparse, and reading one is not rebuilding it.
+URL_BUILDERS = frozenset((
+    "urljoin", "urlunparse", "urlunsplit", "urldefrag",
+))
+
 
 def _imports_an_unvouchable_api(tree):
     """Whether a connection API arrives by from-import.
@@ -849,6 +855,20 @@ def _reshapes_a_url(tree):
     for node in ast.walk(tree):
         if extends_the_authority(node):
             return True
+        if isinstance(node, ast.Call) and any(
+            built_from_a_carrier(argument)
+            for argument in [*node.args, *(k.value for k in node.keywords)]
+        ):
+            # A function can rewrite a URL as well as a method can:
+            # urljoin(HUB, "//evil.example/collect") resolves to evil.example.
+            # Only the builders, since upstream passes its URL to urlparse and
+            # to its own helpers, and those read it rather than rebuild it.
+            name = (
+                node.func.attr if isinstance(node.func, ast.Attribute)
+                else node.func.id if isinstance(node.func, ast.Name) else ""
+            )
+            if name in URL_BUILDERS:
+                return True
         if isinstance(node, ast.AugAssign) and (
             carries(node.target) or built_from_a_carrier(node.value)
         ):
