@@ -167,7 +167,7 @@ def test_pruned_and_kept_files():
 def test_all_vendored_python_compiles():
     import py_compile
     py_files = sorted(VENDORED.rglob("*.py"))
-    assert len(py_files) == 42, f"expected 42 vendored .py files, got {len(py_files)}"
+    assert len(py_files) == 47, f"expected 47 vendored .py files, got {len(py_files)}"
     for p in py_files:
         py_compile.compile(str(p), doraise=True)
 
