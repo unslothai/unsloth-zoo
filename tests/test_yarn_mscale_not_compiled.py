@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+
+"""The YaRN mscale helpers MLA attention calls from __init__ must stay uncompiled.
+
+transformers builds the model under the meta device. A compiled graph of Python floats
+comes back there as a meta tensor, so `.item()` fails and every YaRN config of
+DeepSeek-V2/V3, Mistral4, GLM-4 MoE Lite, MiniCPM3, LongCat, ... died in from_pretrained.
+The compiler matches DISABLED_KEYWORDS against `inspect.getsource(function)`, so these
+pin that match on the functions transformers actually ships.
+"""
+
+import importlib
+import inspect
+import math
+
+import pytest
+import torch
+
+from unsloth_zoo.compiler import DISABLED_KEYWORDS
+
+_MLA_MODELS = (
+    "deepseek_v2",
+    "deepseek_v3",
+    "mistral4",
+    "glm4_moe_lite",
+    "minicpm3",
+    "longcat_flash",
+    "youtu",
+)
+_HELPERS = ("yarn_get_mscale", "yarn_apply_mscale")
+
+
+def _shipped_helpers():
+    found = []
+    for model_type in _MLA_MODELS:
+        try:
+            module = importlib.import_module(
+                f"transformers.models.{model_type}.modeling_{model_type}"
+            )
+        except Exception:
+            continue
+        for name in _HELPERS:
+            function = getattr(module, name, None)
+            if callable(function):
+                found.append((model_type, name, function))
+    return found
+
+
+def _disabled(source):
+    return any(keyword in source for keyword in DISABLED_KEYWORDS)
+
+
+def test_shipped_yarn_helpers_are_disabled():
+    helpers = _shipped_helpers()
+    if not helpers:
+        pytest.skip("this transformers has none of the MLA modeling files")
+    missed = [
+        f"{model_type}.{name}"
+        for model_type, name, function in helpers
+        if not _disabled(inspect.getsource(function))
+    ]
+    assert not missed, f"would be compiled and fail under meta init: {missed}"
+
+
+def test_callers_are_not_disabled():
+    # The keywords name the definitions, so the attention classes that call them keep compiling.
+    try:
+        from transformers.models.deepseek_v3 import modeling_deepseek_v3 as m
+    except Exception:
+        pytest.skip("no deepseek_v3 in this transformers")
+    assert not _disabled(inspect.getsource(m.DeepseekV3Attention.forward))
+
+
+def _yarn_get_mscale(scale = 1, mscale = 1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+def test_compiled_scalar_helper_fails_under_meta_init():
+    # Why they are listed: the eager helper is fine under the meta device, a compiled one is not.
+    with torch.device("meta"):
+        assert _yarn_get_mscale(40.0, 1.0) == pytest.approx(1.3688879454113936)
+        compiled = torch.compile(_yarn_get_mscale, fullgraph = True, dynamic = True)
+        try:
+            value = compiled(40.0, 1.0)
+        except Exception:
+            return
+    if value != pytest.approx(1.3688879454113936):
+        pytest.fail(f"compiled helper returned {value!r} under meta init")
