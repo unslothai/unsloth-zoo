@@ -300,7 +300,14 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     # nothing to reset in either case, so skip the pass instead of failing the
     # run before training starts.
     try:
+        # Each accessor is judged on its own signature, immediately before its
+        # own call, so a TypeError raised inside a callable accessor is never
+        # mistaken for one we could not call, whatever the other one looks like.
+        if _requires_arguments(model.get_input_embeddings):
+            raise NotImplementedError("input embedding accessor requires arguments")
         input_embeddings  = model.get_input_embeddings ()
+        if _requires_arguments(model.get_output_embeddings):
+            raise NotImplementedError("output embedding accessor requires arguments")
         output_embeddings = model.get_output_embeddings()
         # A model is also entitled to answer "I have none" by returning None,
         # and `.weight` on that is an AttributeError several frames from the
@@ -309,16 +316,7 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             raise NotImplementedError("no input or output embeddings")
         embedding_matrix = input_embeddings.weight
         lm_head_matrix   = output_embeddings.weight
-    except (NotImplementedError, TypeError) as error:
-        # A TypeError only means "cannot be called" when the signature says so.
-        # Raised from inside a zero-argument accessor it is a genuine failure in
-        # the model, and swallowing it would train on without the NaN guard, so
-        # let it through.
-        if isinstance(error, TypeError) and not (
-            _requires_arguments(model.get_input_embeddings) or
-            _requires_arguments(model.get_output_embeddings)
-        ):
-            raise
+    except NotImplementedError:
         # Warning rather than info: skipping means the run loses the NaN guard
         # this pass provides, and the success path below announces itself with
         # a plain print, so an invisible skip would be the odd one out.

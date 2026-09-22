@@ -170,6 +170,30 @@ def test_the_shapes_really_are_unanswerable(tokenizer, dataset):
     assert model.get_output_embeddings() is None
 
 
+class _BrokenInputAndUncallableOutput(PreTrainedModel):
+    """The compound case: the input accessor fails in its body while the output
+    accessor is the one that cannot be called. Checking either signature against
+    either failure would let the genuine input failure disappear."""
+
+    config_class = LlamaConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.emb = nn.Embedding(64, 16)
+
+    def get_input_embeddings(self):
+        raise TypeError("something inside the model went wrong")
+
+    def get_output_embeddings(self, input_ids):
+        return self.emb(input_ids)
+
+
+def test_an_uncallable_output_accessor_does_not_mask_a_broken_input_accessor(tokenizer, dataset):
+    model = _BrokenInputAndUncallableOutput(_config())
+    with pytest.raises(TypeError, match = "something inside the model went wrong"):
+        fix_untrained_tokens(model, tokenizer, dataset)
+
+
 def test_a_type_error_from_inside_the_accessor_still_propagates(tokenizer, dataset):
     """The skip is for signatures we cannot call, not for models that are broken.
 
