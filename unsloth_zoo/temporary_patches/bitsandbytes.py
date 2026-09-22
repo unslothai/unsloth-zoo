@@ -237,14 +237,27 @@ def patch_bitsandbytes_linear4bit_forward():
             # shape[0] against out_features also excused a packed blob whenever
             # in_features == 2 * quant_storage.itemsize (2 for uint8, 4 for float16 and
             # bfloat16, 8 for float32), where the row count coincides by arithmetic and
-            # the user was handed the shape error again. Checking dtype == uint8 instead
-            # would disarm the guard for checkpoints packed with a float quant_storage.
+            # the user was handed the shape error again.
+            #
+            # The exemption also requires a float weight, because in_features ==
+            # out_features == 1 packs to (1, 1) and so satisfies the shape test on its own.
+            # An unquantized weight is always floating point; a packed one carries
+            # quant_storage, uint8 by default. Dtype NARROWS the exemption here, it does not
+            # gate the raise: making the raise itself conditional on uint8 would disarm the
+            # guard for a checkpoint packed with a float quant_storage, which is why it is
+            # written this way round. No float-storage packing reaches the exemption anyway,
+            # since shape[0] == out_features with in_features == 1 needs
+            # out // (2 * itemsize) == out, which holds for no itemsize >= 1.
             in_features  = getattr(self, "in_features",  None)
             out_features = getattr(self, "out_features", None)
             if (
                 weight.dim() == 2
                 and weight.shape[-1] == 1
-                and not (in_features == 1 and weight.shape[0] == out_features)
+                and not (
+                    in_features == 1
+                    and weight.shape[0] == out_features
+                    and weight.is_floating_point()
+                )
             ):
                 raise RuntimeError(_packed_weight_without_quant_state_error(self))
             if weight.dtype != x.dtype:

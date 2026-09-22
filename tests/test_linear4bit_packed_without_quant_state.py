@@ -218,6 +218,28 @@ def test_unquantized_layer_still_falls_through():
     assert tuple(out.shape) == (3, 16)
 
 
+def test_a_packed_one_by_one_weight_is_not_mistaken_for_a_scalar_layer():
+    """in_features == out_features == 1 packs to (1, 1), the same shape as unquantized.
+
+    The one-input exemption is what makes this ambiguous, so it also requires a float
+    weight. Measured on bitsandbytes 0.50.2: a quantized Linear4bit(1, 1) has weight
+    (1, 1) uint8, and once the sidecars are lost it is a plain Parameter, so
+    `isinstance(weight, Params4bit)` and `bnb_quantized` are both gone and cannot be the
+    discriminator. The dtype survives, and an unquantized weight is never uint8.
+    """
+    forward = _patched_forward()
+    packed = _FakeLinear4bit(
+        torch.zeros((1, 1), dtype = torch.uint8), out_features = 1, in_features = 1,
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        forward(packed, torch.zeros(4, 1, dtype = torch.float16))
+    assert "quant_state" in str(excinfo.value)
+
+    # The real scalar layer this exemption exists for still works.
+    scalar = _FakeLinear4bit(torch.randn(1, 1), out_features = 1, in_features = 1)
+    assert tuple(forward(scalar, torch.randn(4, 1)).shape) == (4, 1)
+
+
 @pytest.mark.parametrize("in_features,itemsize", [(2, 1), (4, 2), (8, 4)])
 def test_packed_blob_whose_rows_equal_out_features_is_still_caught(in_features, itemsize):
     """The arithmetic coincidence that a row-count comparison alone misses.
