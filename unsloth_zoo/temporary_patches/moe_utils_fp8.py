@@ -346,9 +346,69 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
     return out
 
 
+# E2M1 (FP4) value table, low nibble first, the packing transformers' finegrained_fp8
+# loader uses for `config.expert_dtype = "fp4"` experts (DeepSeek-V4).
+_FP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+_FP4_EXPERT_CHUNK = 16
+
+
+def _is_fp4_packed_tensor(tensor) -> bool:
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    return tensor.dtype == torch.int8 or (fp4_dtype is not None and tensor.dtype == fp4_dtype)
+
+
+def _fp4_pair_table(target_dtype, device):
+    """(256, 2) table: byte -> (low nibble value, high nibble value)."""
+    values = torch.tensor(_FP4_E2M1_VALUES, dtype = torch.float32, device = device)
+    codes = torch.arange(256, dtype = torch.int64, device = device)
+    return torch.stack([values[codes & 0xF], values[(codes >> 4) & 0xF]], dim = -1).to(target_dtype)
+
+
+def _fp4_scale_to_float(scale: torch.Tensor) -> torch.Tensor:
+    """UE8M0 scales as fp32 multipliers, whether stored as float8_e8m0fnu or raw uint8 exponents."""
+    if scale.dtype == torch.uint8:
+        return (scale.to(torch.float32) - 127.0).exp2()
+    return scale.to(torch.float32)
+
+
+def _dequantize_full_expert_weights_fp4(weight: torch.Tensor, scale, target_dtype: torch.dtype):
+    """Unpack FP4-packed experts `(E, M, K // 2)` int8 with per-row `(E, M, K // g)` scales to `(E, M, K)`.
+
+    Done in expert chunks: the byte -> value lookup needs an integer index tensor,
+    and the full stack (DeepSeek-V4-Flash: 256 x 4096 x 2048 bytes per layer) would
+    need gigabytes of indices at once.
+    """
+    if weight.ndim != 3 or not _is_fp4_packed_tensor(weight):
+        return None
+    if not isinstance(scale, torch.Tensor) or scale.ndim != 3 or scale.shape[0] != weight.shape[0]:
+        return None
+    E, M, K_packed = weight.shape
+    K = 2 * K_packed
+    if scale.shape[1] != M or K % scale.shape[2] != 0:
+        return None
+    group = K // scale.shape[2]
+    table = _fp4_pair_table(target_dtype, weight.device)
+    out = torch.empty(E, M, K, dtype = target_dtype, device = weight.device)
+    scale_f = _fp4_scale_to_float(scale)
+    for start in range(0, E, _FP4_EXPERT_CHUNK):
+        stop = min(start + _FP4_EXPERT_CHUNK, E)
+        codes = weight[start:stop].contiguous().view(torch.uint8).to(torch.int32)
+        values = F.embedding(codes.view(-1), table).view(stop - start, M, K)
+        s = scale_f[start:stop].to(target_dtype).repeat_interleave(group, dim = -1)
+        out[start:stop] = values * s
+    return out
+
+
 def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dtype: torch.dtype, quant_kind=None):
     if weight.ndim != 3:
         return None
+
+    # FP4-packed experts (DeepSeek-V4): no FP8 kernel understands them, unpack directly.
+    result = _dequantize_full_expert_weights_fp4(weight, quant_state, target_dtype)
+    if result is not None:
+        return result
 
     block_size = getattr(weight, "block_size", None)
     if block_size is not None and quant_state is not None:
