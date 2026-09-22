@@ -3764,6 +3764,18 @@ def forward_native_grouped_mm(
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
 
 
+def _experts_are_input_major(module, name, in_dim) -> bool:
+    """Whether the expert stack `name` is stored (E, in, out) rather than (E, out, in).
+    The declared layout wins; the shape only decides when nothing is declared, since a
+    square stack (Llama-4 with 2I == H) looks the same either way."""
+    if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
+        return True
+    declared = getattr(module, "is_transposed", None)
+    if isinstance(declared, bool):
+        return declared
+    return getattr(module, name).shape[-1] != in_dim
+
+
 def forward_triton_grouped_gemm(
     self,
     hidden_states: torch.Tensor,
@@ -3812,12 +3824,11 @@ def forward_triton_grouped_gemm(
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
-        # (E, 2I, H) as most families store it, or (E, H, 2I) transposed (Llama-4);
-        # the same orientation test that picks w1 below.
-        if self.gate_up_proj.shape[-1] == hidden_dim:
-            intermediate_dim = self.gate_up_proj.shape[1] // 2
-        else:
+        # (E, 2I, H) as most families store it, or (E, H, 2I) transposed (Llama-4).
+        if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
             intermediate_dim = self.gate_up_proj.shape[-1] // 2
+        else:
+            intermediate_dim = self.gate_up_proj.shape[1] // 2
 
         # Autotune first GEMM.
         gemm1_configs = get_or_autotune_moe_kernels(
@@ -3849,10 +3860,10 @@ def forward_triton_grouped_gemm(
     )
     offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
 
-    if self.gate_up_proj.shape[-1] == hidden_dim:
-        w1 = self.gate_up_proj
-    else:
+    if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+    else:
+        w1 = self.gate_up_proj
 
     # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
@@ -3907,10 +3918,10 @@ def forward_triton_grouped_gemm(
     ):
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
 
-    if self.down_proj.shape[-1] == intermediate.shape[-1]:
-        w2 = self.down_proj
-    else:
+    if _experts_are_input_major(self, "down_proj", intermediate.shape[-1]):
         w2 = self.down_proj.transpose(-2, -1).contiguous()
+    else:
+        w2 = self.down_proj
 
     second_gemm_output = grouped_gemm(
         X=intermediate,

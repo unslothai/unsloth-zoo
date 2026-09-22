@@ -79,3 +79,31 @@ def test_quantized_dispatchers_skip_triton_for_interleaved_gate_up(monkeypatch, 
         dispatch = moe_utils_fp8.forward_moe_backend_fp8
     dispatch(experts, torch.zeros(1, 4), torch.zeros(1, 1, dtype = torch.long), torch.ones(1, 1))
     assert calls == (["loop"] if interleaved else ["triton"])
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_square_stacks_follow_the_declared_layout(monkeypatch, declared):
+    # Llama-4 with 2I == H stores gate_up as a square (E, H, H): the shape cannot tell the
+    # orientation, so the declared is_transposed has to pick w1.
+    E, H = 4, 32
+    I = H // 2
+    autotune_cache = pytest.importorskip("unsloth.kernels.moe.autotune_cache")
+    interface = pytest.importorskip("unsloth.kernels.moe.grouped_gemm.interface")
+    monkeypatch.setattr(autotune_cache, "get_or_autotune_moe_kernels", lambda **k: (None, None, None))
+    seen = []
+
+    def fake_grouped_gemm(**kwargs):
+        seen.append(kwargs["W"])
+        raise _Stop()
+
+    monkeypatch.setattr(interface, "grouped_gemm", fake_grouped_gemm)
+    experts = _experts(E, H, I, transposed = declared)
+    experts.gate_up_proj = nn.Parameter(torch.randn(E, H, 2 * I))
+    experts.is_transposed = declared
+    hidden = torch.zeros(3, H)
+    with pytest.raises(_Stop):
+        moe_utils.forward_triton_grouped_gemm(
+            experts, hidden, torch.zeros(3, 1, dtype = torch.long), torch.ones(3, 1)
+        )
+    want = experts.gate_up_proj.transpose(-2, -1) if declared else experts.gate_up_proj
+    assert torch.equal(seen[0], want)
