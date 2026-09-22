@@ -654,14 +654,25 @@ def _datasets_lists() -> dict[str, list[Requirement]]:
     }
 
 
+# The requirement lists that each have to carry the window. Named rather than discovered:
+# _datasets_lists drops a list that names no datasets at all, so on a DELETION from one of them
+# the survivor still yields a single-element window set and a discovered-only check passes. The
+# guard has to see a missing location, not just two disagreeing ones.
+DATASETS_LOCATIONS = ("dependencies", "optional-dependencies.core")
+
+
 def test_every_list_declares_the_same_datasets_window() -> None:
     """Two copies that can drift are how a cap goes stale in one place only.
 
-    The window is spelled once per requirement list, so nothing but this keeps them equal: one
-    would be what users resolve and the other what CI reads.
+    Catches both ways they stop agreeing: a differing specifier, and a deletion from one list.
     """
     lists = _datasets_lists()
     assert lists, "pyproject.toml declares no datasets requirement at all"
+    missing = [where for where in DATASETS_LOCATIONS if where not in lists]
+    assert not missing, (
+        f"{missing} no longer declares datasets, so pip would take the window from the other "
+        f"list alone. Removing it on purpose means removing it from DATASETS_LOCATIONS too."
+    )
     windows = {str(req.specifier) for reqs in lists.values() for req in reqs}
     assert len(windows) == 1, (
         f"pyproject.toml declares {len(windows)} different datasets windows across its "
