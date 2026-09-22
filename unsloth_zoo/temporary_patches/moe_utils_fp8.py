@@ -117,6 +117,43 @@ def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
     return sliced
 
 
+# Triton refuses to compile a kernel that builds a tensor larger than this, so a
+# BLOCK_SIZE x BLOCK_SIZE tile is only legal up to BLOCK_SIZE = 1024. Fallback
+# only: _triton_max_tensor_numel() below prefers Triton's own value.
+_TRITON_MAX_TENSOR_NUMEL = 1048576
+
+_TRITON_MAX_TENSOR_NUMEL_RESOLVED = None
+
+
+def _triton_max_tensor_numel():
+    """Triton's own cap rather than our copy of it.
+
+    validate_block_shape() enforces it in the Python frontend
+    (triton/_utils.py) before a backend is chosen, so ROCm and CUDA share the
+    value; measured equal on gfx1151. Reading it costs nothing (the caller has
+    already imported the kernel) and keeps a build that moved the cap correct
+    in both directions. Falls back to the literal when Triton is unreadable.
+    """
+    global _TRITON_MAX_TENSOR_NUMEL_RESOLVED
+    if _TRITON_MAX_TENSOR_NUMEL_RESOLVED is None:
+        import importlib
+
+        resolved = _TRITON_MAX_TENSOR_NUMEL
+        for module_name in ("triton.language", "triton._utils"):
+            try:
+                value = getattr(
+                    importlib.import_module(module_name), "TRITON_MAX_TENSOR_NUMEL", None
+                )
+            except Exception:
+                continue
+            # bool is an int, and unsloth's Triton stub hands back placeholders.
+            if type(value) is int and value > 0:
+                resolved = value
+                break
+        _TRITON_MAX_TENSOR_NUMEL_RESOLVED = resolved
+    return _TRITON_MAX_TENSOR_NUMEL_RESOLVED
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -212,6 +249,12 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     if s.ndim == 3 and s.shape[0] == E:
         block_size = getattr(weight, "block_size", None) or getattr(s, "block_size", None)
         p, q = s.shape[1], s.shape[2]
+        if p == 1 and q == 1:
+            # One scale per expert already broadcasts over (E, M, N). Expanding
+            # it first allocates a second full-size tensor: +4.00 GiB measured
+            # on the (128, 4096, 4096) Mistral-Small-4-119B layout, on top of
+            # the 8 GiB the converted weight and the result already need.
+            return w * s.to(target_dtype)
         if block_size is not None and len(block_size) == 2:
             bm, bn = block_size
         else:
@@ -270,6 +313,15 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
     bn = _ceil_div(N, q)
     if bm != bn:
         # weight_dequant_block uses a single BLOCK_SIZE; fall through to caller.
+        return None
+    if bm * bn > _triton_max_tensor_numel():
+        # The kernel materialises a BLOCK_SIZE x BLOCK_SIZE tile, so a coarse
+        # scale makes the tile larger than any Triton tensor may be and the
+        # launch fails to compile. A per-expert per-tensor scale (p == q == 1)
+        # derives BLOCK_SIZE = M, which is how
+        # mistralai/Mistral-Small-4-119B-2603 reached
+        # "numel (16777216) exceeds triton maximum tensor numel (1048576)".
+        # The vectorized fallback in the caller handles these layouts.
         return None
 
     # Fast path: when M is exactly p*bm and both tensors are expert-major contiguous,
