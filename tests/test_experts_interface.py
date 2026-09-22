@@ -184,3 +184,18 @@ def test_fp8_experts_registry_resolves_the_unsloth_default(monkeypatch):
     monkeypatch.setattr(moe_utils_fp8, "forward_moe_backend_fp8", lambda *a: calls.append(a) or "ok")
     assert forward(object(), "h", "i", "w") == "ok"
     assert len(calls) == 1
+
+
+def test_a_class_marked_for_its_own_gate_counts_as_handled():
+    # The bnb 4-bit route marks classes whose _apply_gate every backend applies; those are
+    # not custom-gate fallbacks.
+    pytest.importorskip("transformers.integrations.moe")
+    from unsloth_zoo.temporary_patches.moe_experts_interface import _has_custom_gate
+
+    class Clamped(nn.Module):
+        def _apply_gate(self, gate_up_out):
+            return gate_up_out
+
+    assert _has_custom_gate(Clamped())
+    Clamped._unsloth_own_apply_gate = True
+    assert not _has_custom_gate(Clamped())

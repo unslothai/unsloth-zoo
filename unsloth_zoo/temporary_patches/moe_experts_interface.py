@@ -116,6 +116,9 @@ def _has_custom_gate(module) -> bool:
     gate = getattr(type(module), "_apply_gate", None)
     if gate is None or gate is _default_apply_gate:
         return False
+    # A class the bnb 4-bit route marked: every backend applies its own _apply_gate.
+    if getattr(type(module), "_unsloth_own_apply_gate", False):
+        return False
     return "GptOss" not in type(module).__name__
 
 
