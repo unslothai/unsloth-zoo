@@ -242,7 +242,12 @@ def _dequantize_4bit_in_slices(weight):
     blocks_per_expert = per_expert // blocksize
     elements_per_expert = per_expert // weights_per_element
 
-    out = []
+    # Written into a preallocated output rather than collected and concatenated:
+    # keeping every slice alive and then calling torch.cat costs two full dense
+    # stacks at once, about 24 GiB rather than 12 GiB for Inkling-Small's
+    # (256, 6144, 4096) bfloat16 projection, and the recompute path pays that
+    # peak on every forward and backward. Only one slice is extra now.
+    out = torch.empty(shape, dtype = quant_state.dtype, device = weight.data.device)
     for start in range(0, shape[0], experts_per_slice):
         stop = min(start + experts_per_slice, shape[0])
         sub_state = QuantState(
@@ -253,11 +258,11 @@ def _dequantize_4bit_in_slices(weight):
             quant_type = quant_state.quant_type,
             dtype = quant_state.dtype,
         )
-        out.append(bnb.functional.dequantize_4bit(
+        out[start : stop] = bnb.functional.dequantize_4bit(
             flat[start * elements_per_expert : stop * elements_per_expert].unsqueeze(-1),
             sub_state,
-        ).reshape((stop - start,) + shape[1:]))
-    return torch.cat(out, dim = 0)
+        ).reshape((stop - start,) + shape[1:])
+    return out
 
 
 def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):

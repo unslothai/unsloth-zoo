@@ -236,3 +236,38 @@ def test_get_base_weight_is_unchanged_below_the_threshold(monkeypatch):
     out = MU._get_base_weight(param, torch.bfloat16)
     assert len(seen) == 1, f"expected one whole-stack call, got {len(seen)}"
     assert tuple(out.shape) == tuple(value.shape)
+
+
+def test_sliced_dequant_does_not_hold_every_slice_at_once(small_threshold, monkeypatch):
+    """Collecting the slices and calling torch.cat keeps every dense slice live
+    alongside the concatenated result, so the peak is two full stacks. Measured
+    on Inkling-Small's (256, 6144, 4096) projection that is 24.00 GiB against
+    15.98 GiB written into a preallocated output, on every forward and every
+    backward recomputation.
+
+    Asserted on torch.cat not being called, because peak memory at fixture size
+    is dominated by allocator reuse rather than by this.
+    """
+    value = _stack()
+    param = M._make_expert_params4bit(
+        value, requires_grad=False, blocksize=64, quant_type="nf4",
+    )
+    param._original_shape = value.shape
+
+    cats = []
+    real = torch.cat
+    monkeypatch.setattr(
+        torch, "cat", lambda ts, *a, **k: (cats.append(len(ts)), real(ts, *a, **k))[1]
+    )
+    out = M._dequantize_4bit_in_slices(param)
+    assert out is not None, "threshold did not force the sliced read"
+    assert not cats, (
+        f"the slices were concatenated ({cats}), which holds all of them plus "
+        f"the result at once"
+    )
+
+    monkeypatch.undo()
+    reference = bnb.functional.dequantize_4bit(
+        param.data, param.quant_state
+    ).reshape(value.shape)
+    assert torch.equal(out, reference)
