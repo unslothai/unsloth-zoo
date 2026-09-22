@@ -125,3 +125,51 @@ def test_the_byte_view_reinterprets_without_casting():
         assert gc._elements_for(storage, nbytes) == nbytes // storage.element_size()
     values = torch.randn(1024).to(torch.float16)
     assert not torch.equal(values.to(torch.bfloat16).to(torch.float16), values)
+
+
+def test_elements_for_rounds_up_so_an_odd_byte_count_still_fits():
+    """The buffers are sized in their OWN elements but measured in the activation's bytes,
+    so the conversion has to round up. Floor division loses the last partial element, and
+    the failure is not an exception: the byte view is then a byte short of the shape it is
+    asked for. An odd byte count is ordinary, any 1-byte dtype with an odd number of
+    elements produces one."""
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        storage = torch.empty(8, dtype = dtype)
+        esize = storage.element_size()
+        for nbytes in (1, esize - 1 or 1, esize, esize + 1, 3 * esize - 1):
+            got = gc._elements_for(storage, nbytes)
+            assert got * esize >= nbytes, f"{dtype} buffer sized {got} cannot hold {nbytes} bytes"
+            assert (got - 1) * esize < nbytes, f"{dtype} buffer sized {got} for {nbytes} bytes is oversized"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "initialisation allocates GPU buffers")
+@pytest.mark.parametrize("offload", [torch.bfloat16], indirect = True)
+def test_the_offload_cutoff_is_two_megabytes_whatever_the_dtype(offload):
+    """The cutoff used to be 2MB divided by the INIT dtype's width, in elements, and then
+    compared against an element count of the ACTIVATION's width. Those are the same number
+    only while the two dtypes match. In bytes on both sides it is 2MB of memory for every
+    activation, which is what the comment always claimed.
+
+    The concrete case is gemma3: float32 hidden states over bfloat16 buffers. A 3MB one sat
+    under the old element cutoff and was left on the GPU, costing the VRAM this feature
+    exists to save."""
+    assert gc.MINIMUM_SIZE == 2 * 1024 * 1024
+    for dtype in (torch.float16, torch.float32):
+        gc.initialize_unsloth_gradient_checkpointing(dtype)
+        assert gc.MINIMUM_SIZE == 2 * 1024 * 1024, f"the cutoff moved with the init dtype {dtype}"
+
+    gc.initialize_unsloth_gradient_checkpointing(torch.bfloat16)
+
+    def layer(hidden):
+        return hidden * 2
+
+    # 786,432 float32 elements = 3MB: over 2MB of bytes, under 2MB/2 elements.
+    hidden = torch.randn(1, 384, 2048, device = "cuda", dtype = torch.float32, requires_grad = True)
+    out = gc.UnslothCheckpointFunction.apply(layer, False, hidden)
+    out = gc.UnslothCheckpointFunction.apply(layer, False, out)
+    old_cutoff_in_elements = 2 * 1024 * 1024 // torch.empty(0, dtype = torch.bfloat16).element_size()
+    assert hidden.numel() * hidden.element_size() == 3 * 1024 * 1024
+    assert hidden.numel() < old_cutoff_in_elements, "this activation no longer straddles the change"
+    assert gc.CPU_INDEX >= 1, "a 3MB float32 activation was left on the GPU"
+    out.float().sum().backward()
+    torch.cuda.synchronize()
