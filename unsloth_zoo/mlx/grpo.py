@@ -194,6 +194,19 @@ def grpo_logps(temperature, scorer=None):
     return logps
 
 
+def _scored_as_step(logps, step_compiled):
+    """Score as the training step's forward, which MLX runs differently under its trace."""
+
+    def traced(model, batch, lengths):
+        if step_compiled():
+            run = lambda anchor: (anchor, logps(model, batch, lengths))
+            return mx.value_and_grad(run)(mx.array(0.0))[0][1]
+        run = lambda: (mx.array(0.0), logps(model, batch, lengths))
+        return nn.value_and_grad(model, run)()[0][1]
+
+    return traced
+
+
 def _masked_mean(values, mask):
     if values.shape[1] == 1:
         return values.mean()
@@ -538,6 +551,7 @@ class GRPOBatchPlan:
     def bind(
         self, model, reward_funcs, *, trainer_state, reward_weights=None,
         reference_policy=None, rollout_context=None, keep_completions=False, scorer=None,
+        step_compiled=None,
     ):
         """Attach what generating needs: the policy, rewards and the reference.
         ``trainer_state`` reaches the reward functions and counts the prompt and
@@ -557,6 +571,8 @@ class GRPOBatchPlan:
         self._rollout_context = rollout_context or nullcontext
         self._keep_completions = keep_completions
         self._logps = grpo_logps(self.score_temperature, scorer)
+        if step_compiled is not None:
+            self._logps = _scored_as_step(self._logps, step_compiled)
 
     def start_at(self, visit):
         """Count generations from ``visit``, the first micro-step a run fetches."""

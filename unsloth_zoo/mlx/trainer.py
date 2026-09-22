@@ -6553,6 +6553,7 @@ class MLXTrainer:
                 rollout_context=_training_patches_paused,
                 keep_completions=bool(args.log_completions),
                 scorer=loss_fn._unsloth_grpo_scorer,
+                step_compiled=lambda: _use_compile,
             )
 
         # Build loss+grad function — returns ((loss, ntoks), grads)

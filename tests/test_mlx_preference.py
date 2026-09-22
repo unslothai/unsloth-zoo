@@ -3743,11 +3743,14 @@ def test_grpo_evaluation_follows_trl_eval_sampler(monkeypatch):
 
 
 def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, monkeypatch, capsys):
+    from unsloth_zoo.mlx import grpo as grpo_module
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
 
     built = []  # a CCE scorer scoring 0: any log-prob taken off the logits instead makes kl nonzero
     monkeypatch.setattr("unsloth_zoo.mlx.grpo._make_preference_cce_scorer", lambda model, temperature: built.append(temperature) or (lambda model, batch, supervised, logit_sums: (supervised * 0.0, None)))  # noqa: E501
 
+    modes = []
+    monkeypatch.setattr("unsloth_zoo.mlx.grpo._scored_as_step", lambda logps, step_compiled, scored=grpo_module._scored_as_step: scored(logps, lambda: modes.append(step_compiled()) or modes[-1]))  # noqa: E501
     evaluate, scorers = MLXGRPOTrainer._evaluate, []
     monkeypatch.setattr(MLXGRPOTrainer, "_evaluate", lambda self, batches, fn, **kw: scorers.append(fn) or evaluate(self, batches, fn, **kw))
 
@@ -3761,6 +3764,7 @@ def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, 
         return trainer, [[(r.prompt_token_ids, r.sampling.seed) for r in call["requests"]] for call in calls]
 
     trainer, calls = run({"a": _grpo_rows(3), "b": _grpo_rows(2)})
+    assert modes == [True] * 8
     printed = capsys.readouterr().out
     baseline, training = run(None)
     # Each evaluation samples split a (4 + 2 completions) and split b (4) afresh.
