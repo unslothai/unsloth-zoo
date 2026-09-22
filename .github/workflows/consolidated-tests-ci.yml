@@ -289,6 +289,14 @@ jobs:
         # module and its unsloth_compiled_cache copies. CPU-pure torch, no weights;
         # neither was executed by any job before.
         #
+        # The four bnb expert-stack files pin that a stack bitsandbytes cannot count in
+        # 32 bits is quantized and read in slices, and that the slice boundaries are
+        # exact. test_bnb_expert_stack_slicing_cpu is the one that actually executes
+        # here: it drives the arithmetic against a bitsandbytes stand-in, so it needs
+        # neither a GPU nor the package, while the other three carry the CUDA marker
+        # and skip. Collect-only proved only that they import, and a decline condition
+        # can be deleted without any of them going red.
+        #
         # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
         # the forward of a stacked-expert family Unsloth has no forward for, which is
         # what stops an adapter that looks healthy in named_parameters from having no
@@ -422,6 +430,10 @@ jobs:
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_stacked_expert_lora_reaches_forward.py \
+            tests/test_bnb_expert_stack_slicing.py \
+            tests/test_bnb_expert_stack_slicing_cpu.py \
+            tests/test_bnb_expert_stack_merge_slicing.py \
+            tests/test_moe_bnb4bit_per_expert_conversions.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \
