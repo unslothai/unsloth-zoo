@@ -2629,3 +2629,189 @@ def test_evaluation_accepts_a_wrapped_model_output(objective):
     assert math.isclose(float(from_bare[0]), float(from_wrapped[0]),
                         rel_tol=1e-6, abs_tol=1e-6)
     assert int(from_bare[1]) == int(from_wrapped[1])
+
+
+def kto_plan(dataset, **kwargs):
+    from unsloth_zoo.mlx.preference import create_kto_batch_plan
+    options = dict(
+        batch_size=3, kl_batch_size=3, num_epochs=1, grad_accum=1,
+        length_policy=policy("kto", max_prompt_length=32),
+    )
+    options.update(kwargs)
+    return create_kto_batch_plan(dataset, Tokenizer(), **options)
+
+
+def test_kto_unpairs_in_trl_blocks_and_pairs_kl_within_each_chunk(monkeypatch):
+    from unsloth_zoo.mlx import preference
+
+    monkeypatch.setattr(preference, "_UNPAIR_BLOCK", 2)
+    encode = Tokenizer().encode
+    plan = kto_plan([
+        {"prompt": f"p{i}", "chosen": f"c{i}", "rejected": f"r{i}"} for i in range(3)
+    ])
+    order = [("p0", "c0"), ("p1", "c1"), ("p0", "r0"), ("p1", "r1"), ("p2", "c2"), ("p2", "r2")]
+    assert [row.label for row in plan.rows] == [True, True, False, False, True, False]
+    # The previous row in its chunk of three, the first taking the chunk's last.
+    for row, (prompt, answer), partner in zip(plan.rows, order, [2, 0, 1, 5, 3, 4]):
+        assert row.sequence == (*encode(prompt + answer), 2)
+        assert row.kl == (*encode(prompt + order[partner][1]), 2)
+        assert row.kl_prompt_ids == row.prompt_ids == tuple(encode(prompt))
+    assert plan.schedule == ((0, 1, 2), (3, 4, 5))
+
+
+@pytest.mark.parametrize("bos,mode,prompt,answer,expected", [
+    (None, "keep_end", 8, 6, ((14, 15, 16, 17), (20, 21, 22, 23, 2))),
+    (1, "keep_start", 8, 6, ((1, 10, 11, 12, 13), (20, 21, 22, 23, 2))),
+    # TRL reserves a BOS slot unless one leads, even when there is none to add.
+    (10, "keep_end", 4, 5, ((10, 11, 12, 13), (20, 21, 22, 23, 24, 2))),
+    (None, "keep_end", 4, 5, ((10, 11, 12, 13), (20, 21, 22, 23, 2))),
+    # The answer cut spends the whole prompt bound, not the prompt's real length.
+    (None, "keep_end", 2, 12, ((10, 11), (20, 21, 22, 23, 2))),
+])
+def test_kto_truncates_the_way_trl_processes_tokens(bos, mode, prompt, answer, expected):
+    from unsloth_zoo.mlx.preference import _truncate_kto
+
+    length_policy = policy("kto", max_length=10, max_prompt_length=4, truncation_mode=mode)
+    assert _truncate_kto(
+        list(range(10, 10 + prompt)), list(range(20, 20 + answer)), length_policy,
+        bos_id=bos, eos_id=2,
+    ) == expected
+
+
+def test_a_kl_pair_joins_the_processed_prompt_to_the_raw_answer():
+    plan = kto_plan(
+        [{"prompt": "abcde", "completion": "x" * 10, "label": True},
+         {"prompt": "fg", "completion": "y", "label": False},
+         {"prompt": "p", "completion": "x" * 7, "label": True},
+         {"prompt": "abcde", "completion": "y", "label": False}],
+        batch_size=2, kl_batch_size=2,
+        length_policy=policy("kto", max_length=10, max_prompt_length=3),
+    )
+    # A prompt its own answer cut stays cut, though its KL answer is short.
+    assert plan.rows[0].kl_prompt_ids == plan.rows[0].prompt_ids == tuple(
+        Tokenizer().encode("cde"))
+    # The partner's answer before its EOS: with one it would keep a sixth token.
+    assert plan.rows[3].kl_completion_ids == (*Tokenizer().encode("x" * 5), 2)
+    # The KL row masks its own, shorter prompt.
+    assert plan[1][1].tolist()[3] == [3, len(plan.rows[3].kl)]
+
+
+class SpelledSpecialsTokenizer(Tokenizer):
+    """Spells BOS as "^" and EOS as "$", so rows can lead or end with them."""
+
+    bos_token_id = 1
+
+    def encode(self, text, add_special_tokens=True):
+        plain = super().encode
+        return [{"^": 1, "$": 2}.get(c) or plain(c)[0] for c in text]
+
+
+@pytest.mark.parametrize("tokenizer,append_eos,expected_max_length,expected", [
+    # A BOS-led prompt and an EOS-ended answer both lose their token to the cut
+    # and get it back, two tokens TRL reserved no room for.
+    (SpelledSpecialsTokenizer(), True, 8, (1, *Tokenizer().encode("defgxxxx"), 2)),
+    # With no EOS appended only the BOS comes back.
+    (SpelledSpecialsTokenizer(), False, 9, (1, *Tokenizer().encode("defgxxxxx"))),
+    # Without a BOS the prompt always spends a slot: TRL's budget stands.
+    (Tokenizer(), True, 10, (*Tokenizer().encode("defgxxxx"), 2)),
+])
+def test_a_kto_row_fits_the_batch_with_the_tokens_trl_adds_past_max_length(
+    tokenizer, append_eos, expected_max_length, expected,
+):
+    from unsloth_zoo.mlx.preference import (
+        create_kto_batch_plan, resolve_preference_length_policy,
+    )
+
+    args = types.SimpleNamespace(
+        max_length=10, max_prompt_length=4, append_eos=append_eos,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        length_policy = resolve_preference_length_policy(
+            "kto", args, max_seq_length=10, tokenizer=tokenizer,
+        )
+    assert length_policy.max_length == expected_max_length
+    assert any(
+        f"using {expected_max_length}" in str(w.message) for w in caught
+    ) == (expected_max_length < 10)
+    dataset = [{"prompt": "^abcdefg", "completion": "x" * 8 + "$", "label": True}]
+    plan = create_kto_batch_plan(
+        dataset, tokenizer, batch_size=2, kl_batch_size=2,
+        length_policy=length_policy, num_epochs=1, append_eos=append_eos,
+    )
+    assert plan.rows[0].sequence == expected
+
+
+def test_kto_lengths_resolve_only_against_a_tokenizer():
+    from unsloth_zoo.mlx.preference import resolve_preference_length_policy
+
+    args = types.SimpleNamespace(max_length=10, max_prompt_length=4)
+    with pytest.raises(ValueError, match="needs the tokenizer"):
+        resolve_preference_length_policy("kto", args, max_seq_length=10)
+
+
+def test_a_kto_plan_refuses_a_policy_resolved_without_its_eos():
+    from unsloth_zoo.mlx.preference import (
+        create_kto_batch_plan, resolve_preference_length_policy,
+    )
+
+    args = types.SimpleNamespace(max_length=10, max_prompt_length=4, append_eos=False)
+    with pytest.warns(RuntimeWarning, match="using 9"):
+        length_policy = resolve_preference_length_policy(
+            "kto", args, max_seq_length=10, tokenizer=SpelledSpecialsTokenizer(),
+        )
+    with pytest.raises(ValueError, match="resolve the length policy"):
+        create_kto_batch_plan(
+            [{"prompt": "p", "completion": "c", "label": True}],
+            SpelledSpecialsTokenizer(), batch_size=2, kl_batch_size=2,
+            length_policy=length_policy, num_epochs=1, append_eos=True,
+        )
+
+
+def test_a_kto_label_must_be_a_boolean():
+    with pytest.raises(ValueError, match="dataset row 0 .*boolean"):
+        kto_plan([{"prompt": "p", "completion": "c", "label": 1}])
+
+
+@pytest.mark.parametrize("with_kl", [True, False])
+def test_a_kto_batch_holds_completions_then_kl_rows_and_their_reference(with_kl):
+    import mlx.core as mx
+    from unsloth_zoo.mlx.preference import precompute_reference_logps
+
+    plan = kto_plan(
+        [{"prompt": f"q{i}", "completion": "a" * (i + 1), "label": i != 1} for i in range(3)],
+        batch_size=2, kl_batch_size=2, with_kl=with_kl,
+    )
+    batch, lengths, normalizers, labels = plan[0]
+    first, second, third = plan.rows
+    sequences = [first.sequence, second.sequence]
+    sequences += [first.kl, second.kl] if with_kl else []
+    assert [row[:len(sequence)] for row, sequence in zip(batch.tolist(), sequences)] == [
+        list(sequence) for sequence in sequences]
+    assert len(batch.tolist()) == len(sequences)
+    assert lengths.tolist()[0] == [2, len(first.sequence)]
+    assert labels.tolist() == [True, False] and normalizers.tolist() == [0, 2, 1]
+
+    class Scorer:
+        def forward(self, model, batch, lengths):
+            return lengths[:, 1].astype(mx.float32)
+
+    table = precompute_reference_logps(plan, None, Scorer(), batch_size=2)
+    kl_sizes = [len(row.kl) if with_kl else 0 for row in plan.rows]
+    assert table.tolist() == [[len(row.sequence), kl] for row, kl in zip(plan.rows, kl_sizes)]
+    assert plan[1][4].tolist() == [len(third.sequence)] + ([len(third.kl)] if with_kl else [])
+
+
+@pytest.mark.parametrize("labels,weights,warns", [
+    ([True] * 3 + [False], (1.0, 1.0), True),
+    ([True] * 3 + [False], (0.4, 1.0), False),
+    ([True] * 3 + [False], (1.0, 3.0), False),
+    ([True, False], (1.0, 5.0), False),
+])
+def test_kto_warns_when_neither_weight_balances_the_labels(labels, weights, warns):
+    from unsloth_zoo.mlx.preference import warn_kto_weight_balance
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        warn_kto_weight_balance(labels, *weights)
+    assert bool(caught) == warns

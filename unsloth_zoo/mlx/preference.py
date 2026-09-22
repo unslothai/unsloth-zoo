@@ -25,6 +25,7 @@ from .utils import (
     _finite_row_schedule,
     _finite_text_pad_width,
     _get_mlx_dropout_probability,
+    _mlx_prompt_completion_boundary,
     _model_logits,
     _normalize_mlx_messages,
     _normalize_seed,
@@ -84,11 +85,13 @@ def _token_budget(value, name):
     return value
 
 
-def resolve_preference_length_policy(kind, args, *, max_seq_length):
+def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=None):
     """Resolve the four length bounds the way the matching TRL trainer does.
 
     max_seq_length has no TRL counterpart: it is the width a batch can hold, so
     it caps max_length, and for ORPO it can pull max_prompt_length down with it.
+    KTO needs ``tokenizer``: its special tokens decide how far a row can run
+    past max_length.
     """
     truncation_mode = getattr(args, "truncation_mode", "keep_end")
     if truncation_mode not in TRUNCATION_MODES:
@@ -104,49 +107,64 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
     max_completion_length = _token_budget(
         getattr(args, "max_completion_length", None), "max_completion_length",
     )
-    if kind == "orpo":
-        # ORPO splits the budget between prompt and answer, so neither may be open.
+    name = kind.upper()
+    if kind in ("orpo", "kto"):
+        # Both split the budget between prompt and answer, so neither may be open.
         if max_length is None:
             max_length = 512
             warnings.warn(
-                "Unsloth MLX ORPO: max_length is not set; defaulting to 512.",
+                f"Unsloth MLX {name}: max_length is not set; defaulting to 512.",
                 RuntimeWarning, stacklevel=2,
             )
         if max_prompt_length is None:
             max_prompt_length = 128
             warnings.warn(
-                "Unsloth MLX ORPO: max_prompt_length is not set; defaulting "
+                f"Unsloth MLX {name}: max_prompt_length is not set; defaulting "
                 "to 128.",
                 RuntimeWarning, stacklevel=2,
             )
         if max_completion_length is not None:
+            overrun = "branch whose capped prompt plus the longer answer" \
+                if kind == "orpo" else "row whose capped prompt plus answer"
             warnings.warn(
-                "Unsloth MLX ORPO: max_completion_length only applies to "
-                "encoder-decoder models and is ignored here. A branch whose "
-                "capped prompt plus the longer answer still overruns max_length "
-                "has its answer sliced to max_length minus max_prompt_length "
-                "instead, which trims the answer's tail when max_prompt_length "
-                "stands above max_length.",
+                f"Unsloth MLX {name}: max_completion_length only applies to "
+                f"encoder-decoder models and is ignored here. A {overrun} still "
+                "overruns max_length has its answer sliced to max_length minus "
+                "max_prompt_length instead, which trims the answer's tail when "
+                "max_prompt_length stands above max_length.",
                 RuntimeWarning, stacklevel=2,
             )
             max_completion_length = None
+    carry = 0
+    if kind == "kto":
+        if tokenizer is None:
+            raise ValueError(
+                "Unsloth MLX KTO: resolving the length budget needs the tokenizer."
+            )
+        carry = _kto_carry(tokenizer, getattr(args, "append_eos", True))
+    limit = max_seq_length - carry
     if max_length is None:
-        max_length = max_seq_length
-    elif max_length > max_seq_length:
+        max_length = limit
+    elif max_length > limit:
         warnings.warn(
             f"Unsloth MLX preference: max_length={max_length} exceeds "
             f"max_seq_length={max_seq_length}, which bounds the batched "
-            "sequences; using max_seq_length.",
+            "sequences; using max_seq_length."
+            if not carry else
+            f"Unsloth MLX KTO: max_length={max_length} leaves no room inside "
+            f"max_seq_length={max_seq_length}, which bounds the batched "
+            f"sequences, for the {carry} special token(s) this tokenizer can "
+            f"add to a row past max_length; using {limit}.",
             RuntimeWarning, stacklevel=2,
         )
         before_clamp = max_length
-        max_length = max_seq_length
-        if kind == "orpo" and before_clamp > max_prompt_length >= max_length:
+        max_length = limit
+        if kind in ("orpo", "kto") and before_clamp > max_prompt_length >= max_length:
             # The answer gets max_length minus max_prompt_length, so clamping to the
             # prompt bound leaves none. A bound the caller set themselves stands.
             max_prompt_length = max(1, max_length // 2)
             warnings.warn(
-                f"Unsloth MLX ORPO: max_prompt_length no longer leaves room for "
+                f"Unsloth MLX {name}: max_prompt_length no longer leaves room for "
                 f"an answer inside max_length={max_length}; using "
                 f"{max_prompt_length}.",
                 RuntimeWarning, stacklevel=2,
@@ -154,7 +172,8 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
     # A config predating max_length carries the default, not a choice, so the same
     # call now trains on less. No marker means duck-typed, so take the value as meant.
     max_length_explicit = getattr(args, "_unsloth_mlx_max_length_explicit", True)
-    if max_seq_length > max_length and not max_length_explicit:
+    # KTO is newer than max_length, so no earlier run of it had a wider budget.
+    if max_seq_length > max_length and not max_length_explicit and kind != "kto":
         # DPO reads an open prompt bound as no cap; ORPO already made it 128 above.
         restore = (
             "Pass max_length=max_seq_length, max_prompt_length=None"
@@ -174,6 +193,17 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length):
         kind, max_length, max_prompt_length, max_completion_length,
         truncation_mode, max_seq_length,
     )
+
+
+def _kto_carry(tokenizer, append_eos):
+    """How far TRL's KTO rows can run past max_length."""
+    # No slot is reserved for a BOS already leading the prompt or an EOS already
+    # ending the answer, and an overrun cut drops it before TRL adds it back. With
+    # no bos_token_id a prompt still pays a BOS slot, which absorbs the EOS; an
+    # empty prompt leaves the answer the whole prompt bound short instead.
+    if getattr(tokenizer, "bos_token_id", None) is None:
+        return 0
+    return 1 + (append_eos and getattr(tokenizer, "eos_token_id", None) is not None)
 
 
 def _truncate_dpo_branch(prompt_ids, response_ids, policy):
@@ -319,42 +349,46 @@ def _append_to_assistant(prompt, completion):
     return merged
 
 
-def _render_preference_row(tokenizer, row, *, extracted=False):
+def _render_completions(tokenizer, row, names, *, extracted=False):
+    """Render the prompt and, per completion field in ``names``, the prompt
+    followed by that completion."""
     prompt = row["prompt"]
-    chosen = row["chosen"]
-    rejected = row["rejected"]
+    completions = [row[name] for name in names]
+    fields = ("prompt", *names)
+    fields = (
+        " and ".join(fields) if len(fields) == 2
+        else f"{', '.join(fields[:-1])}, and {fields[-1]}"
+    )
     # An empty prompt carries no kind of its own, so it follows the completions.
-    kinds = [_is_messages(chosen), _is_messages(rejected)]
+    kinds = [_is_messages(completion) for completion in completions]
     if prompt:
         kinds.append(_is_messages(prompt))
     if any(kinds) and not all(kinds):
         raise ValueError(
-            "Unsloth MLX preference: prompt, chosen, and rejected must all be "
-            "strings or all be message lists."
+            f"Unsloth MLX preference: {fields} must all be strings or all be "
+            "message lists."
         )
     if not any(kinds):
-        if not all(isinstance(value, str) for value in (prompt, chosen, rejected)):
+        if not all(isinstance(value, str) for value in (prompt, *completions)):
             raise ValueError(
-                "Unsloth MLX preference: prompt, chosen, and rejected must be strings."
+                f"Unsloth MLX preference: {fields} must be strings."
             )
-        return prompt, prompt + chosen, prompt + rejected
+        return prompt, [prompt + completion for completion in completions]
 
-    chosen = _normalize_mlx_messages(chosen, is_vlm=False)
-    rejected = _normalize_mlx_messages(rejected, is_vlm=False)
+    completions = [
+        _normalize_mlx_messages(completion, is_vlm=False)
+        for completion in completions
+    ]
     tools = row.get("tools")
     kwargs = row.get("chat_template_kwargs")
     if not prompt:
-        return (
-            "",
+        return "", [
             _chat_template(
-                tokenizer, chosen, tools=tools, kwargs=kwargs,
+                tokenizer, completion, tools=tools, kwargs=kwargs,
                 add_generation_prompt=False,
-            ),
-            _chat_template(
-                tokenizer, rejected, tools=tools, kwargs=kwargs,
-                add_generation_prompt=False,
-            ),
-        )
+            )
+            for completion in completions
+        ]
     prompt = _normalize_mlx_messages(prompt, is_vlm=False)
     role = prompt[-1].get("role")
     if role == "assistant":
@@ -362,33 +396,38 @@ def _render_preference_row(tokenizer, row, *, extracted=False):
             tokenizer, prompt, tools=tools, kwargs=kwargs,
             continue_final_message=True,
         )
-        if not extracted and _continues_assistant(chosen, rejected):
+        if not extracted and _continues_assistant(*completions):
             # The completions finish this partial turn, so they join its message.
-            chosen_messages = _append_to_assistant(prompt, chosen)
-            rejected_messages = _append_to_assistant(prompt, rejected)
+            conversations = [
+                _append_to_assistant(prompt, completion)
+                for completion in completions
+            ]
         else:
             # A whole turn instead, so its closing marker falls to the response.
-            chosen_messages = prompt + chosen
-            rejected_messages = prompt + rejected
+            conversations = [prompt + completion for completion in completions]
     elif role == "user":
         prompt_text = _chat_template(
             tokenizer, prompt, tools=tools, kwargs=kwargs,
             add_generation_prompt=True,
         )
-        chosen_messages = prompt + chosen
-        rejected_messages = prompt + rejected
+        conversations = [prompt + completion for completion in completions]
     else:
         raise ValueError(
             "Unsloth MLX preference: a conversational prompt must end with a "
             "user or assistant message."
         )
-    chosen_text = _chat_template(
-        tokenizer, chosen_messages, tools=tools, kwargs=kwargs,
-        add_generation_prompt=False,
-    )
-    rejected_text = _chat_template(
-        tokenizer, rejected_messages, tools=tools, kwargs=kwargs,
-        add_generation_prompt=False,
+    return prompt_text, [
+        _chat_template(
+            tokenizer, messages, tools=tools, kwargs=kwargs,
+            add_generation_prompt=False,
+        )
+        for messages in conversations
+    ]
+
+
+def _render_preference_row(tokenizer, row, *, extracted=False):
+    prompt_text, (chosen_text, rejected_text) = _render_completions(
+        tokenizer, row, ("chosen", "rejected"), extracted=extracted,
     )
     return prompt_text, chosen_text, rejected_text
 
@@ -679,22 +718,53 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         return self._reference
 
     def set_reference_logps(self, table):
-        """Install ``(rows, 2)`` reference log probabilities, chosen then rejected."""
+        """Install ``(rows, 2)`` reference log probabilities, one column per
+        branch: chosen then rejected, or a KTO completion then its KL pair."""
         table = np.asarray(table, dtype=np.float32)
         if table.shape != (len(self._rows), 2):
             raise ValueError(
-                "Unsloth MLX DPO: the reference table must hold one (chosen, "
-                "rejected) pair per row."
+                "Unsloth MLX preference: the reference table must hold one pair "
+                "per row."
             )
         self._reference = table
 
     def __len__(self):
         return len(self._schedule)
 
-    def _raw_width(self, batch):
-        return _preference_width(
-            [self._rows[index] for index in batch], self.max_seq_length,
+    def _branches(self, row):
+        return (
+            (row.chosen, len(row.chosen_prompt_ids)),
+            (row.rejected, len(row.rejected_prompt_ids)),
         )
+
+    def _pack_width(self, rows):
+        raw = max(
+            len(values) for row in rows for values, _ in self._branches(row)
+        )
+        return _finite_text_pad_width(
+            raw, pad_to_multiple=32, minimum_width=2,
+            max_seq_length=self.max_seq_length,
+        )
+
+    def pack(self, rows, width=None):
+        """``rows`` as one padded batch, every row's first branch before any
+        second, with each sequence's ``(prompt length, end)``."""
+        if width is None:
+            width = self._pack_width(rows)
+        branches = [self._branches(row) for row in rows]
+        count = len(branches[0]) * len(rows)
+        batch = np.full((count, width), self.pad_id, dtype=np.int32)
+        lengths = np.zeros((count, 2), dtype=np.int32)
+        for offset, row_branches in enumerate(branches):
+            for branch, (values, prompt_length) in enumerate(row_branches):
+                output_row = offset + branch * len(rows)
+                size = min(len(values), width)
+                batch[output_row, :size] = values[:size]
+                lengths[output_row] = (prompt_length, size)
+        return batch, lengths
+
+    def _raw_width(self, batch):
+        return self._pack_width([self._rows[index] for index in batch])
 
     def batch_width(self, index):
         return self._widths[index]
@@ -760,51 +830,33 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         indices[:len(selected)] = selected
         return (*batch[:3], mx.array(indices), *batch[4:])
 
+    def _materialized_width(self, index, phase):
+        width = self._widths[index]
+        if self._shape_plan is not None and phase is not None:
+            width = self._shape_plan.endpoint_for(self.batch_family(index), width)
+        return width
+
     def materialize(self, index, *, phase=None):
         indices = self._schedule[index]
         rows = [self._rows[item] for item in indices]
-        width = self._widths[index]
-        if self._shape_plan is not None and phase is not None:
-            family = self.batch_family(index)
-            width = self._shape_plan.endpoint_for(family, width)
-        batch, lengths = _pack_rows(rows, width, self.pad_id)
+        batch, lengths = self.pack(rows, self._materialized_width(index, phase))
         materialized = (
             mx.array(batch), mx.array(lengths),
             mx.array(self._normalizers[index], dtype=mx.int32),
         )
         if self._reference is None:
             return materialized
-        held = self._reference[list(indices)]
-        return materialized + (
-            None, mx.array(np.concatenate([held[:, 0], held[:, 1]])),
-        )
+        return materialized + (None, self._held_reference(indices))
+
+    def _held_reference(self, indices):
+        branches = len(self._branches(self._rows[indices[0]]))
+        return mx.array(self._reference[list(indices), :branches].T.reshape(-1))
 
     def __getitem__(self, index):
         return self.materialize(index)
 
     def materialize_all(self):
         return [self[index] for index in range(len(self))]
-
-
-def _preference_width(rows, max_seq_length):
-    raw = max(max(len(row.chosen), len(row.rejected)) for row in rows)
-    return _finite_text_pad_width(
-        raw, pad_to_multiple=32, minimum_width=2, max_seq_length=max_seq_length,
-    )
-
-
-def _pack_rows(rows, width, pad_id):
-    batch = np.full((2 * len(rows), width), pad_id, dtype=np.int32)
-    lengths = np.zeros((2 * len(rows), 2), dtype=np.int32)
-    for offset, row in enumerate(rows):
-        for output_row, values, prompt_length in (
-            (offset, row.chosen, len(row.chosen_prompt_ids)),
-            (offset + len(rows), row.rejected, len(row.rejected_prompt_ids)),
-        ):
-            size = min(len(values), width)
-            batch[output_row, :size] = values[:size]
-            lengths[output_row] = (prompt_length, size)
-    return batch, lengths
 
 
 def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
@@ -814,9 +866,7 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
     table = np.zeros((len(rows), 2), dtype=np.float32)
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
-        batch, lengths = _pack_rows(
-            chunk, _preference_width(chunk, plan.max_seq_length), plan.pad_id,
-        )
+        batch, lengths = plan.pack(chunk)
         batch, lengths = mx.array(batch), mx.array(lengths)
         options = {}
         # The live forward scores through CCE too; full logits would defeat it.
@@ -827,14 +877,18 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
             ).sum(axis=1)
         logps = reference_policy.forward(model, batch, lengths, **options)
         mx.eval(logps)
-        values = logps.tolist()
-        table[start:start + len(chunk), 0] = values[:len(chunk)]
-        table[start:start + len(chunk), 1] = values[len(chunk):]
+        values = np.asarray(logps.tolist(), dtype=np.float32)
+        # A plan whose rows carry one sequence each leaves the second column zero.
+        table[start:start + len(chunk), :len(values) // len(chunk)] = (
+            values.reshape(-1, len(chunk)).T
+        )
     plan.set_reference_logps(table)
     return table
 
 
-def _window_normalizers(rows, schedule, cycle_length, grad_accum):
+def _window_normalizers(rows, schedule, cycle_length, grad_accum, *, nll=True):
+    """Per batch: its window's chosen tokens (ORPO's NLL; 0 without ``nll``),
+    rows, and micro-batches."""
     values = []
     accum = max(1, int(grad_accum or 1))
     for position in range(len(schedule)):
@@ -847,7 +901,7 @@ def _window_normalizers(rows, schedule, cycle_length, grad_accum):
         chosen_tokens = sum(
             max(0, len(rows[index].chosen) - 1)
             for batch in batches for index in batch
-        )
+        ) if nll else 0
         values.append((chosen_tokens, pair_count, window_end - window_start))
     return values
 
@@ -947,6 +1001,313 @@ def create_preference_batch_plan(
         cycle_length=cycle_length,
         max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
+    )
+
+
+@dataclass(frozen=True)
+class TokenizedKTORow:
+    """One labeled completion, and the mismatched pair its KL term scores."""
+
+    prompt_ids: tuple
+    completion_ids: tuple
+    label: bool
+    kl_prompt_ids: tuple = ()
+    kl_completion_ids: tuple = ()
+
+    @property
+    def sequence(self):
+        return self.prompt_ids + self.completion_ids
+
+    @property
+    def kl(self):
+        return self.kl_prompt_ids + self.kl_completion_ids
+
+
+# TRL unpairs through datasets.map(batched=True) at its default batch size, so
+# each block of pairs yields its chosen rows, then its rejected rows.
+_UNPAIR_BLOCK = 1000
+
+
+def _kto_label(row):
+    label = row["label"]
+    if not isinstance(label, (bool, np.bool_)):
+        raise ValueError(
+            "label must be a boolean, True for a desirable completion, not "
+            f"{type(label).__name__}. TRL's KTOTrainer keeps a row only when its "
+            "label is True or False, so any other value drops out of its loss."
+        )
+    return bool(label)
+
+
+def _unpaired_kto_rows(dataset, formatting_func):
+    """Yield ``(dataset index, row, extracted)`` per completion, in TRL's order."""
+    block = []
+    paired = None
+
+    def unpair():
+        for side, label in (("chosen", True), ("rejected", False)):
+            for index, row, extracted in block:
+                yield index, {**row, "completion": row[side], "label": label}, extracted
+        block.clear()
+
+    for index, raw in enumerate(dataset):
+        row = formatting_func(raw) if formatting_func is not None else raw
+        if not isinstance(row, Mapping):
+            raise ValueError(
+                f"Unsloth MLX KTO: dataset row {index} is not a mapping."
+            )
+        is_paired = "chosen" in row or "rejected" in row
+        if paired is None:
+            paired = is_paired
+        elif is_paired != paired:
+            raise ValueError(
+                f"Unsloth MLX KTO: dataset row {index} is "
+                f"{'paired' if is_paired else 'unpaired'} and the rows before "
+                "it are not; a dataset is either chosen/rejected pairs or "
+                "prompt/completion/label rows."
+            )
+        if not paired:
+            missing = {"prompt", "completion", "label"} - set(row)
+            if missing:
+                raise ValueError(
+                    f"Unsloth MLX KTO: dataset row {index} lacks "
+                    f"{sorted(missing)!r}; an unpaired row needs prompt, "
+                    "completion, and label."
+                )
+            yield index, row, False
+            continue
+        try:
+            block.append((index, *_maybe_extract_prompt(row)))
+        except ValueError as exc:
+            raise ValueError(f"Unsloth MLX KTO: dataset row {index}: {exc}") from exc
+        if len(block) == _UNPAIR_BLOCK:
+            yield from unpair()
+    yield from unpair()
+
+
+def _encode_kto_row(tokenizer, row, *, extracted):
+    """TRL KTO's _tokenize: returns the rendered prompt, prompt ids, answer ids."""
+    prompt_text, (full_text,) = _render_completions(
+        tokenizer, row, ("completion",), extracted=extracted,
+    )
+    prompt_ids, full_ids = (
+        [int(x) for x in encode_mlx_text(tokenizer, text, add_special_tokens=False)]
+        for text in (_shared_prefix(prompt_text, full_text), full_text)
+    )
+    boundary = _mlx_prompt_completion_boundary(
+        prompt_ids, full_ids, step_back=True,
+    )
+    return prompt_text, full_ids[:boundary], full_ids[boundary:]
+
+
+def _truncate_kto(prompt_ids, answer_ids, policy, *, bos_id, eos_id):
+    """TRL KTOTrainer's _process_tokens for a decoder-only model, including its
+    BOS slot reserved against a None bos_token_id and its answer cut spending the
+    whole prompt bound."""
+    budget = policy.max_length
+    if prompt_ids and prompt_ids[0] != bos_id:
+        budget -= 1
+    if eos_id is not None and answer_ids and answer_ids[-1] != eos_id:
+        budget -= 1
+    keep = policy.max_prompt_length
+    if len(prompt_ids) + len(answer_ids) > budget:
+        prompt_ids = (
+            prompt_ids[:keep] if policy.truncation_mode == "keep_start"
+            else prompt_ids[-keep:]
+        )
+    if len(prompt_ids) + len(answer_ids) > budget:
+        answer_ids = answer_ids[:budget - keep]
+    if bos_id is not None and (not prompt_ids or prompt_ids[0] != bos_id):
+        prompt_ids = [bos_id, *prompt_ids]
+    if eos_id is not None and (not answer_ids or answer_ids[-1] != eos_id):
+        answer_ids = [*answer_ids, eos_id]
+    return tuple(prompt_ids), tuple(answer_ids)
+
+
+def _require_kto_fit(prompt_ids, answer_ids, policy):
+    kept = len(prompt_ids) + len(answer_ids)
+    if kept > policy.max_seq_length:
+        raise ValueError(
+            f"this row keeps {kept} tokens, more than the "
+            f"{policy.max_seq_length} a batch can hold: "
+            f"max_prompt_length={policy.max_prompt_length} leaves an overrun "
+            f"answer no room inside max_length={policy.max_length} once its BOS "
+            "and EOS slots are reserved, so the cut only drops its last tokens. "
+            "Lower max_prompt_length."
+        )
+
+
+def create_kto_batch_plan(
+    dataset,
+    tokenizer,
+    *,
+    batch_size,
+    kl_batch_size,
+    length_policy,
+    with_kl=True,
+    num_batches=None,
+    num_epochs=None,
+    grad_accum=None,
+    append_eos=True,
+    formatting_func=None,
+    prompt_sink=None,
+):
+    """Build a finite KTO plan over TRL's unpaired rows, visited in dataset order.
+
+    Each row's KL pair joins its prompt to the previous row's completion within
+    ``kl_batch_size`` chunks (TRL's per_device_train_batch_size, for evaluation
+    too). ``prompt_sink`` receives each undesirable row's rendered prompt.
+    """
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    bos_id = None if bos_id is None else int(bos_id)
+    eos_id = getattr(tokenizer, "eos_token_id", None) if append_eos else None
+    eos_id = None if eos_id is None else int(eos_id)
+    carry = _kto_carry(tokenizer, append_eos)
+    if length_policy.max_length + carry > length_policy.max_seq_length:
+        raise ValueError(
+            f"Unsloth MLX KTO: max_length={length_policy.max_length} leaves no "
+            f"room inside max_seq_length={length_policy.max_seq_length} for the "
+            f"{carry} special token(s) a row can carry past it; resolve the "
+            "length policy with this tokenizer and append_eos."
+        )
+    tokenized = []
+    for index, row, extracted in _unpaired_kto_rows(dataset, formatting_func):
+        try:
+            label = _kto_label(row)
+            prompt_text, prompt_ids, answer_ids = _encode_kto_row(
+                tokenizer, row, extracted=extracted,
+            )
+            prompt, answer = _truncate_kto(
+                prompt_ids, answer_ids, length_policy, bos_id=bos_id, eos_id=eos_id,
+            )
+            if not answer or len(prompt) + len(answer) < 2:
+                raise ValueError(
+                    "this row leaves no completion token with anything before "
+                    "it to predict from. Raise max_length or lower "
+                    "max_prompt_length if the length budget cut it down."
+                )
+            _require_kto_fit(prompt, answer, length_policy)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsloth MLX KTO: dataset row {index} could not be tokenized. "
+                f"{exc}"
+            ) from exc
+        if prompt_sink is not None and not label:
+            prompt_sink(prompt_text)
+        tokenized.append((prompt, answer, answer_ids, label))
+    if not tokenized:
+        raise ValueError("Unsloth MLX KTO: the dataset is empty.")
+    rows = []
+    for start in range(0, len(tokenized), kl_batch_size):
+        chunk = tokenized[start:start + kl_batch_size]
+        for offset, (prompt, answer, _, label) in enumerate(chunk):
+            kl_prompt = kl_answer = ()
+            if with_kl:
+                # The prompt as processed, so one already cut by its own answer stays cut.
+                kl_prompt, kl_answer = _truncate_kto(
+                    prompt, chunk[offset - 1][2], length_policy,
+                    bos_id=bos_id, eos_id=eos_id,
+                )
+                try:
+                    _require_kto_fit(kl_prompt, kl_answer, length_policy)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Unsloth MLX KTO: the KL pair of unpaired row "
+                        f"{start + offset} could not be formed. {exc}"
+                    ) from exc
+            rows.append(TokenizedKTORow(prompt, answer, label, kl_prompt, kl_answer))
+    schedule, cycle_length = _finite_row_schedule(
+        len(rows), batch_size, order_for_epoch=lambda epoch: range(len(rows)),
+        num_batches=num_batches, num_epochs=num_epochs, grad_accum=grad_accum,
+    )
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", 0)
+    return FiniteKTOBatchPlan(
+        rows, schedule,
+        with_kl=with_kl,
+        normalizers=_window_normalizers(
+            rows, schedule, cycle_length, grad_accum, nll=False,
+        ),
+        cycle_length=cycle_length,
+        max_seq_length=length_policy.max_seq_length,
+        pad_id=0 if pad_id is None else pad_id,
+    )
+
+
+class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
+    """Batches ``(ids, lengths, normalizers, labels[, reference])``: completions,
+    then their KL rows when the loss has a KL term."""
+
+    __slots__ = ("_with_kl",)
+
+    def __init__(self, rows, schedule, *, with_kl, **kwargs):
+        # Before the parent measures batch widths through _branches.
+        self._with_kl = bool(with_kl)
+        super().__init__(rows, schedule, **kwargs)
+
+    @property
+    def with_kl(self):
+        return self._with_kl
+
+    def _branches(self, row):
+        completion = ((row.sequence, len(row.prompt_ids)),)
+        if not self._with_kl:
+            return completion
+        return completion + ((row.kl, len(row.kl_prompt_ids)),)
+
+    def batch_family(self, index):
+        rows = len(self._schedule[index])
+        sequences = rows * (2 if self._with_kl else 1)
+        return (
+            "kto_tuple_4",
+            ((sequences, "sequence"), "int32"),
+            ((sequences, 2), "int32"),
+            ((3,), "int32"),
+            ((rows,), "bool"),
+        )
+
+    def configure_cce_compaction(self, enabled=True, *, kind="kto"):
+        self._cce_capacities = {}
+
+    def prepare_cce_batch(self, index, batch):
+        return batch
+
+    def materialize(self, index, *, phase=None):
+        indices = self._schedule[index]
+        rows = [self._rows[item] for item in indices]
+        batch, lengths = self.pack(rows, self._materialized_width(index, phase))
+        materialized = (
+            mx.array(batch), mx.array(lengths),
+            mx.array(self._normalizers[index], dtype=mx.int32),
+            mx.array([row.label for row in rows]),
+        )
+        if self._reference is None:
+            return materialized
+        return materialized + (self._held_reference(indices),)
+
+
+def warn_kto_weight_balance(labels, desirable_weight, undesirable_weight):
+    """TRL KTOTrainer's warning, from Eq. (8) of the KTO paper, when neither
+    weight lies in the range the label counts recommend."""
+    num_desirable = max(sum(bool(label) for label in labels), 1)
+    num_undesirable = max(len(labels) - num_desirable, 1)
+    if num_desirable == num_undesirable:
+        return
+    ratio = num_undesirable * undesirable_weight / num_desirable
+    inverse = num_desirable * desirable_weight / num_undesirable
+    desirable = (round(ratio, 2), round(ratio * 1.33, 2))
+    undesirable = (round(inverse / 1.33, 2), round(inverse, 2))
+    if desirable[0] <= desirable_weight <= desirable[1]:
+        return
+    if undesirable[0] <= undesirable_weight <= undesirable[1]:
+        return
+    warnings.warn(
+        "Unsloth MLX KTO: the dataset has different numbers of desirable and "
+        "undesirable rows, and the loss weights do not balance them. Set EITHER "
+        f"desirable_weight in [{desirable[0]}, {desirable[1]}] or "
+        f"undesirable_weight in [{undesirable[0]}, {undesirable[1]}], not both.",
+        RuntimeWarning, stacklevel=2,
     )
 
 
