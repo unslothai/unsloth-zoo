@@ -116,10 +116,27 @@ class _ReturnsNone(PreTrainedModel):
         return None
 
 
+class _OnlyOutputIsNone(PreTrainedModel):
+    """One embedding to hand back, no output embedding: transformers 5 returns
+    None from get_output_embeddings for anything without an lm_head."""
+
+    config_class = LlamaConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.emb = nn.Embedding(64, 16)
+
+    def get_input_embeddings(self):
+        return self.emb
+
+    def get_output_embeddings(self):
+        return None
+
+
 @pytest.mark.parametrize(
     "model_class",
-    [_CompositeModel, _NonStandardSignature, _ReturnsNone],
-    ids = ["NotImplementedError", "TypeError", "returns-None"],
+    [_CompositeModel, _NonStandardSignature, _ReturnsNone, _OnlyOutputIsNone],
+    ids = ["NotImplementedError", "TypeError", "returns-None", "output-None"],
 )
 def test_the_pass_is_skipped_instead_of_failing_the_run(model_class, tokenizer, dataset):
     model = model_class(_config())
@@ -134,6 +151,9 @@ def test_the_shapes_really_are_unanswerable(tokenizer, dataset):
     with pytest.raises(TypeError):
         _NonStandardSignature(_config()).get_input_embeddings()
     assert _ReturnsNone(_config()).get_input_embeddings() is None
+    model = _OnlyOutputIsNone(_config())
+    assert model.get_input_embeddings() is not None
+    assert model.get_output_embeddings() is None
 
 
 def test_an_ordinary_model_is_still_processed(tokenizer, dataset):
@@ -144,3 +164,25 @@ def test_an_ordinary_model_is_still_processed(tokenizer, dataset):
     after = model.get_input_embeddings().weight.detach()
     # It ran (no exception) and left a well-trained tiny model alone.
     assert torch.equal(before, after)
+
+
+def test_untrained_tokens_really_are_still_reset(tokenizer):
+    """The negative control the test above cannot be.
+
+    "Nothing changed" also holds when the pass is skipped for every model, so
+    it would survive a guard that swallowed everything. This one has genuinely
+    untrained rows and asserts they were reset, so it fails the moment the
+    ordinary path stops running.
+    """
+    config = _config()
+    config.tie_word_embeddings = False
+    model = AutoModelForCausalLM.from_config(config)
+    untrained = slice(5, 8)
+    with torch.no_grad():
+        model.get_input_embeddings ().weight[untrained] = 0.0
+        model.get_output_embeddings().weight[untrained] = 0.0
+    # An untrained id has to appear in the data for the reset to be triggered.
+    dataset = datasets.Dataset.from_dict({"input_ids": [[2, 3, 4, 5]]})
+    fix_untrained_tokens(model, tokenizer, dataset)
+    assert model.get_input_embeddings ().weight[untrained].abs().sum() > 0
+    assert model.get_output_embeddings().weight[untrained].abs().sum() > 0
