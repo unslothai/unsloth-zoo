@@ -297,6 +297,12 @@ jobs:
         # and skip. Collect-only proved only that they import, and a decline condition
         # can be deleted without any of them going red.
         #
+        # test_moe_bnb4bit_per_expert_conversions is deliberately NOT here. It needs
+        # bitsandbytes, which this runner does not install, so it could only ever skip
+        # and a gate entry that cannot execute is noise. Adding it did surface a real
+        # latent fault in it, though: six of its tests imported bitsandbytes without a
+        # guard and so failed rather than skipped, which is now fixed in the file.
+        #
         # test_moe_stacked_expert_lora_reaches_forward pins that an expert LoRA reaches
         # the forward of a stacked-expert family Unsloth has no forward for, which is
         # what stops an adapter that looks healthy in named_parameters from having no
@@ -433,7 +439,6 @@ jobs:
             tests/test_bnb_expert_stack_slicing.py \
             tests/test_bnb_expert_stack_slicing_cpu.py \
             tests/test_bnb_expert_stack_merge_slicing.py \
-            tests/test_moe_bnb4bit_per_expert_conversions.py \
             tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
             tests/test_python39_compatibility.py \
             tests/test_checkpoint_modes.py \

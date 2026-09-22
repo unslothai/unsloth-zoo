@@ -23,6 +23,12 @@ _core_model_loading = pytest.importorskip(
     reason="requires transformers v5 core_model_loading",
 )
 
+# Six tests here import bitsandbytes in their bodies without guarding it, so on a
+# runner that has transformers v5 but no bitsandbytes they FAIL rather than skip.
+# That never showed because no job executed this file: `pytest tests/ --collect-only`
+# only imports it. Guard it the same way the module above is guarded.
+pytest.importorskip("bitsandbytes", reason="requires bitsandbytes")
+
 # On transformers < v5 the real `core_model_loading` module does not exist, but
 # unsloth injects an inert compat stub of the same name into `sys.modules` so
 # peft LoRA reloads keep working. That stub's `WeightConverter` accepts any
