@@ -475,6 +475,31 @@ def _templates_are_oversized(tree):
     return False
 
 
+def _joins_something_unreadable(tree):
+    """Whether a literal separator joins pieces this cannot enumerate.
+
+    "".join(x for x in ("https", "://evil.example/c")) is a whole URL, and the
+    walk sees two pieces neither of which carries a scheme. Only a sequence
+    written out is folded, and returning no text for anything else left the
+    destination unnamed rather than unreadable.
+
+    One argument, which leaves os.path.join(a, b) alone. No file that reaches
+    this allowance joins anything: gguf-py/gguf/utility.py has no .join at all.
+    """
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            continue
+        if _join_parts(node) is None:
+            return True
+    return False
+
+
 def _import_aliases(tree):
     """`{local name: imported name}` for every alias an import binds.
 
@@ -1556,6 +1581,9 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
         return False
     if _templates_are_oversized(tree):
         # Text no rule here will read, which is not a reason to say nothing.
+        return False
+    if _joins_something_unreadable(tree):
+        # Pieces this cannot enumerate, joined into one string by a literal.
         return False
     if _builds_text_from_numbers(tree):
         # A destination spelled in character codes rather than in characters.

