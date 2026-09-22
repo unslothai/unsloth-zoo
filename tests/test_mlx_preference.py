@@ -3609,7 +3609,7 @@ def _grpo_rows(count=6):
     ({}, {"reward_funcs": []}, "at least one"),
     ({}, {"reward_funcs": type("RewardModel", (), {"__call__": print, "parameters": print})()}, "reward models are not supported"),
     ({"reward_weights": [1.0, 2.0]}, {}, "2 reward_weights for 1"),
-    ({}, {"eval_dataset": _grpo_rows(2)}, "evaluation is not supported"),
+    ({"per_device_eval_batch_size": 3}, {"eval_dataset": _grpo_rows(2)}, "per_device_eval_batch_size=3 must be divisible"),
     ({"max_completion_length": 64}, {}, "leave no room"),
     ({"dataset_order": "sequential"}, {}, "RepeatSampler"),
     ({"sync_ref_model": True, "ref_model_sync_steps": 0}, {}, "GRPO: ref_model_sync_steps must be at least 1"),
@@ -3717,3 +3717,55 @@ def test_a_grpo_run_resumes_by_generating_afresh_and_refuses_another_objective(t
         state_file.write_text(json.dumps({**state, "preference_reference": provenance}))
         with pytest.raises(ValueError, match=match):
             resume(build(), [])
+
+
+def test_grpo_evaluation_follows_trl_eval_sampler(monkeypatch):
+    from trl.trainer.utils import RepeatSampler
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx.grpo import GRPOObjective, GRPOSampling, _derived_seed, create_grpo_eval_plan, make_grpo_eval_fn
+
+    calls = []
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: calls.append(
+        requests) or [types.SimpleNamespace(token_ids=[1] * (1 + row % 2), finish_reason="stop") for row in range(len(requests))])
+    dataset, state = [{"prompt": "a" * (index + 1)} for index in range(5)], types.SimpleNamespace(num_input_tokens_seen=40)
+    plan = create_grpo_eval_plan(dataset, DecodingTokenizer(), num_generations=2, batch_size=4,
+                                 sampling=GRPOSampling(max_tokens=3), max_seq_length=16, seed=7)
+    plan.bind(TinyModel(), [lambda completions, **_: [float(len(c)) for c in completions]], trainer_state=state)
+    batches = list(plan)
+    assert [len(batch[0]) for batch in batches] == [4, 4, 2] and all(batch[5] is None for batch in batches)
+    assert [r.prompt_token_ids for requests in calls for r in requests] == [plan._prompt_ids[i] for i in RepeatSampler(dataset, 2, seed=7)]
+    # Window of one; dapo counts each batch's completion tokens, a stop's eos included.
+    assert [batch[2].tolist() for batch in batches] == [[1.0, 10.0], [1.0, 10.0], [1.0, 5.0]]
+    assert state.num_input_tokens_seen == (metrics := plan.pop_metrics())["num_tokens"] == 40 and metrics["completions/mean_length"] == 2.5
+    list(plan)  # a second evaluation samples again, from the same seeds, none a training rollout's
+    assert len(calls) == 6 and calls[3][0].sampling.seed == calls[0][0].sampling.seed != _derived_seed(7, 0, 0, 0)
+    assert make_grpo_eval_fn(GRPOObjective(beta=0.0))(TinyModel(), *batches[2][:5])[1].item() == 2  # weighted by rows
+
+
+def test_the_grpo_trainer_evaluates_without_changing_its_training_run(tmp_path, monkeypatch, capsys):
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    evaluate, scorers = MLXGRPOTrainer._evaluate, []
+    monkeypatch.setattr(MLXGRPOTrainer, "_evaluate", lambda self, batches, fn, **kw: scorers.append(fn) or evaluate(self, batches, fn, **kw))
+
+    def run(eval_dataset):
+        calls = []
+        trainer = MLXGRPOTrainer(
+            _tiny_model(lora=True), DecodingTokenizer(), _grpo_rows(), eval_dataset=eval_dataset,
+            reward_funcs=lambda completions, **_: [float(len(c)) for c in completions],
+            args=_grpo_config(tmp_path, max_steps=4, eval_steps=2, per_device_eval_batch_size=4, log_completions=True, beta=0.04))
+        _run_generation_trainer(trainer, monkeypatch, calls)
+        return trainer, [[(r.prompt_token_ids, r.sampling.seed) for r in call["requests"]] for call in calls]
+
+    trainer, calls = run({"a": _grpo_rows(3), "b": _grpo_rows(2)})
+    printed = capsys.readouterr().out
+    baseline, training = run(None)
+    # Each evaluation samples split a (4 + 2 completions) and split b (4) afresh.
+    assert [len(call) for call in calls] == [4, 4, 4, 2, 4] * 2 and calls[:2] + calls[5:7] == training
+    assert trainer.state.num_input_tokens_seen == baseline.state.num_input_tokens_seen
+    assert {fn.__qualname__ for fn in scorers} == {"make_grpo_eval_fn.<locals>.eval_fn"}
+    names = ("loss", "reward", "kl", "completions/mean_length", "clip_ratio/region_mean", "rewards/<lambda>/mean")
+    assert {f"eval_{split}_{name}" for split in "ab" for name in names} <= set(evaluated := trainer._last_eval_metrics)
+    assert evaluated["eval_a_num_tokens"] == evaluated["eval_b_num_tokens"] == trainer.state.num_input_tokens_seen
+    # One table per training log and per evaluated split.
+    assert "| a_Reward: 1.0000 | b_Reward: 1.0000" in printed and printed.count("Prompt | Completion | <lambda> | Advantage") == 4 + 4

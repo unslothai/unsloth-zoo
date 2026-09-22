@@ -656,10 +656,12 @@ from .preference import (
 from .grpo import (
     GRPOBatchPlan,
     create_grpo_batch_plan,
+    create_grpo_eval_plan,
     format_completions,
     grpo_objective,
     grpo_reward_funcs,
     grpo_sampling,
+    make_grpo_eval_fn,
     make_grpo_loss_fn,
     resolve_grpo_config,
 )
@@ -4963,8 +4965,13 @@ class MLXTrainer:
             # Set by the preference scorer, which has no perplexity to report.
             metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
 
-            def _record(prefix, losses, weights, stats):
+            def _record(prefix, losses, weights, stats, batches=None):
                 """Write one scope's metrics and return its mean loss."""
+                pop_metrics = getattr(batches, "pop_metrics", None)
+                if pop_metrics is not None:
+                    metrics.update(
+                        (f"{prefix}{name}", value) for name, value in pop_metrics().items()
+                    )
                 total = weights.item()
                 value = (losses / weights).item() if total > 0 else 0.0
                 metrics[f"{prefix}loss"] = value
@@ -5021,7 +5028,7 @@ class MLXTrainer:
                             mx.eval(all_stats)
                         mx.eval(all_losses, ntokens)
                         _record(f"eval_{split_name}_", split_losses, split_tokens,
-                                split_stats)
+                                split_stats, split_batches)
                         if self._distributed_should_stop():
                             break
                 finally:
@@ -5038,7 +5045,7 @@ class MLXTrainer:
 
         finally:
             self.model.train()
-        avg_loss = _record("eval_", all_losses, ntokens, all_stats)
+        avg_loss = _record("eval_", all_losses, ntokens, all_stats, eval_batches)
         self._last_eval_metrics = metrics
         return avg_loss, metrics.get("eval_perplexity")
 
@@ -6507,7 +6514,9 @@ class MLXTrainer:
                 model, enabled=bool(getattr(args, "disable_dropout", True)),
             )
             # Not the training loss: that one normalizes across a window.
-            if preference_kind != "grpo":
+            if preference_kind == "grpo":
+                preference_eval_fn = make_grpo_eval_fn(objective)
+            else:
                 preference_eval_fn = make_preference_eval_fn(
                     objective, reference_policy=_sampling_reference,
                     model=model if args.use_cce else None,
@@ -7222,6 +7231,24 @@ class MLXTrainer:
             else:
                 def _create_eval_batches(eval_dataset, _split_name=None):
                     """Build evaluation batches for one dataset split."""
+                    if self.preference_kind == "grpo":
+                        plan = create_grpo_eval_plan(
+                            eval_dataset, self.tokenizer,
+                            num_generations=args.num_generations, batch_size=eval_batch_size,
+                            sampling=grpo_sampling(args), score_temperature=args.temperature,
+                            max_seq_length=args.max_seq_length, scale_rewards=args.scale_rewards,
+                            mask_truncated_completions=args.mask_truncated_completions,
+                            with_reference=self._uses_reference(args),
+                            max_prompt_length=args.max_prompt_length, seed=args.seed,
+                        )
+                        plan.bind(
+                            model, self.reward_funcs, trainer_state=self.state,
+                            reward_weights=args.reward_weights,
+                            reference_policy=_sampling_reference,
+                            rollout_context=_training_patches_paused,
+                            keep_completions=bool(args.log_completions),
+                        )
+                        return plan
                     prompt_sink = (
                         (lambda text, _n=_split_name: _capture_generation_prompt(_n, text))
                         if _samples_prompts else None
@@ -7866,6 +7893,27 @@ class MLXTrainer:
                     f"  Eval  {current_step}/{total_steps} | "
                     f"Val Loss (GKD): {val_loss:.4f}"
                 )
+            elif preference_kind == "grpo":
+                # One reward per split: eval_reward, or eval_<split>_reward.
+                _rewards = " | ".join(
+                    f"{key[len('eval_'):-len('reward')]}Reward: {value:.4f}"
+                    for key, value in (self._last_eval_metrics or {}).items()
+                    if key.startswith("eval_") and key.endswith("reward")
+                )
+                _main_print(
+                    f"  Eval  {current_step}/{total_steps} | "
+                    f"Val Loss: {val_loss:.4f} | {_rewards}"
+                )
+                if args.log_completions:
+                    for _plan in (
+                        current_eval_batches.values()
+                        if isinstance(current_eval_batches, dict) else (current_eval_batches,)
+                    ):
+                        if _plan.completions is not None:
+                            _main_print(format_completions(
+                                _plan.completions, current_step,
+                                args.num_completions_to_print,
+                            ))
             elif ppl is None:
                 # No per-token likelihood to exponentiate.
                 _scores = self._last_eval_metrics or {}
@@ -10089,8 +10137,13 @@ class MLXGRPOTrainer(MLXTrainer):
         self.reward_funcs = grpo_reward_funcs(reward_funcs)
         super().__init__(*args, **kwargs)
         args = self.args
-        if self.eval_dataset is not None:
-            raise ValueError("Unsloth MLX GRPO: evaluation is not supported yet.")
+        eval_batch_size = args.per_device_eval_batch_size or args.per_device_train_batch_size
+        if self.eval_dataset is not None and eval_batch_size % args.num_generations:
+            raise ValueError(
+                f"Unsloth MLX GRPO: per_device_eval_batch_size={eval_batch_size} must be "
+                f"divisible by num_generations={args.num_generations}, so each "
+                "evaluation batch holds whole groups."
+            )
         if args.reward_weights is not None and len(args.reward_weights) != len(self.reward_funcs):
             raise ValueError(
                 f"Unsloth MLX GRPO: {len(args.reward_weights)} reward_weights for "

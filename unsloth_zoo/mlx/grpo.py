@@ -277,6 +277,18 @@ def make_grpo_loss_fn(objective):
     return loss_fn
 
 
+
+def make_grpo_eval_fn(objective):
+    """The GRPO loss of one eval batch, weighted by its rows as HF's ``eval_loss``."""
+    loss_fn = make_grpo_loss_fn(objective)
+
+    def eval_fn(model, batch, *rest):
+        loss, _, stats = loss_fn(model, batch, *rest)
+        return loss, mx.array(batch.shape[0], dtype=mx.int32), stats
+
+    eval_fn.__dict__.update(loss_fn.__dict__)
+    return eval_fn
+
 # Columns Unsloth never forwards to the chat template as keyword arguments.
 _TEMPLATE_RESERVED_COLUMNS = frozenset((
     "prompt", "chosen", "rejected", "completion", "messages", "label",
@@ -450,7 +462,7 @@ class GRPOBatchPlan:
         self, dataset, tokenizer, prompt_ids, max_tokens, schedule, *, cycle_length,
         num_generations, batch_size, steps_per_generation, num_iterations, grad_accum,
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
-        with_old_logps, with_reference, max_seq_length, seed,
+        with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
     ):
         self._dataset = dataset
         self._tokenizer = tokenizer
@@ -471,6 +483,7 @@ class GRPOBatchPlan:
         self.with_reference = with_reference
         self.max_seq_length = max_seq_length
         self.seed = seed
+        self.counts_tokens = counts_tokens
         self.eos_id = int(tokenizer.eos_token_id)
         pad_id = getattr(tokenizer, "pad_token_id", None)
         self.pad_id = self.eos_id if pad_id is None else int(pad_id)
@@ -610,7 +623,8 @@ class GRPOBatchPlan:
         lengths = np.array([len(ids) for ids in completion_ids])
         prompt_lengths = np.array([len(self._prompt_ids[prompt]) for prompt in prompts])
         # Counted before rewards, which read it through trainer_state as TRL's do.
-        self._trainer_state.num_input_tokens_seen += int(prompt_lengths.sum() + lengths.sum())
+        if self.counts_tokens:
+            self._trainer_state.num_input_tokens_seen += int(prompt_lengths.sum() + lengths.sum())
         self._metrics["num_tokens"] = [self._trainer_state.num_input_tokens_seen]
         reward_prompts, completions = reward_prompts_and_completions(
             [row["prompt"] for row in rows], texts,
@@ -715,7 +729,7 @@ class GRPOBatchPlan:
             self._current = self._generate(start)
         generation = self._current
         position = ((index - start) % self.steps_per_generation) * self.batch_size
-        rows = range(position, position + self.batch_size)
+        rows = range(position, min(position + self.batch_size, len(generation.sequences)))
         sequences = [generation.sequences[row] for row in rows]
         width = self._planned(self._width(max(len(sequence) for sequence in sequences)))
         batch, lengths = self._pack(sequences, generation.prompt_lengths[position:position + self.batch_size], width)
@@ -739,19 +753,13 @@ class GRPOBatchPlan:
     def __getitem__(self, index):
         return self.materialize(index)
 
+    def __iter__(self):
+        # One pass, sampling afresh: an evaluation never reuses an earlier one's rollouts.
+        self._current = None
+        return (self.materialize(index) for index in range(len(self)))
 
-def create_grpo_batch_plan(
-    dataset, tokenizer, *, num_generations, batch_size, steps_per_generation,
-    num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
-    mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
-    shuffle=True, seed=None, num_batches=None, num_epochs=None,
-):
-    """Encode every prompt once and lay out TRL's RepeatSampler schedule.
 
-    ``batch_size`` counts completions; a generation samples ``batch_size *
-    steps_per_generation`` of them, ``num_generations`` per prompt. Log-probs
-    are scored at ``score_temperature``, the sampling temperature by default.
-    """
+def _encode_grpo_prompts(dataset, tokenizer, sampling, max_seq_length, max_prompt_length):
     if getattr(tokenizer, "eos_token_id", None) is None:
         raise ValueError("Unsloth MLX GRPO: the tokenizer needs an eos_token_id to stop on.")
     prompt_ids, max_tokens = [], []
@@ -779,15 +787,33 @@ def create_grpo_batch_plan(
             f"Unsloth MLX GRPO: {long_prompts} prompt(s) exceed max_prompt_length="
             f"{max_prompt_length}, which is not enforced (as on CUDA Unsloth and TRL "
             ">= 0.26); filter the dataset to bound prompt length.",
-            stacklevel=2,
+            stacklevel=3,
         )
     if capped:
         warnings.warn(
             f"Unsloth MLX GRPO: {capped} prompt(s) leave fewer than "
             f"{sampling.max_tokens} tokens within max_seq_length={max_seq_length}; "
             "their completions are capped to the room left.",
-            stacklevel=2,
+            stacklevel=3,
         )
+    return prompt_ids, max_tokens
+
+
+def create_grpo_batch_plan(
+    dataset, tokenizer, *, num_generations, batch_size, steps_per_generation,
+    num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
+    mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
+    shuffle=True, seed=None, num_batches=None, num_epochs=None,
+):
+    """Encode every prompt once and lay out TRL's RepeatSampler schedule.
+
+    ``batch_size`` counts completions; a generation samples ``batch_size *
+    steps_per_generation`` of them, ``num_generations`` per prompt. Log-probs
+    are scored at ``score_temperature``, the sampling temperature by default.
+    """
+    prompt_ids, max_tokens = _encode_grpo_prompts(
+        dataset, tokenizer, sampling, max_seq_length, max_prompt_length,
+    )
     if batch_size * steps_per_generation % num_generations:
         raise ValueError(
             f"Unsloth MLX GRPO: a generation of {batch_size * steps_per_generation} "
@@ -826,6 +852,33 @@ def create_grpo_batch_plan(
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
     )
 
+
+
+def create_grpo_eval_plan(
+    dataset, tokenizer, *, num_generations, batch_size, sampling, max_seq_length,
+    score_temperature=None, scale_rewards="group", mask_truncated_completions=False,
+    with_reference=False, max_prompt_length=None, seed=None,
+):
+    """TRL's eval RepeatSampler order, one generation per ``batch_size`` completions
+    (the last batch may be short), on a seed stream of its own and without
+    advancing ``num_input_tokens_seen``."""
+    prompt_ids, max_tokens = _encode_grpo_prompts(
+        dataset, tokenizer, sampling, max_seq_length, max_prompt_length,
+    )
+    seed = _normalize_seed(seed)
+    order = _RepeatSamplerOrder(len(prompt_ids), seed, True)(0)
+    chunk = batch_size // num_generations
+    schedule = tuple(tuple(order[start:start + chunk]) for start in range(0, len(order), chunk))
+    return GRPOBatchPlan(
+        dataset, tokenizer, prompt_ids, max_tokens, schedule,
+        cycle_length=len(schedule), num_generations=num_generations,
+        batch_size=batch_size, steps_per_generation=1, num_iterations=1, grad_accum=1,
+        sampling=sampling,
+        score_temperature=sampling.temperature if score_temperature is None else score_temperature,
+        scale_rewards=scale_rewards, mask_truncated_completions=mask_truncated_completions,
+        with_old_logps=False, with_reference=with_reference, max_seq_length=max_seq_length,
+        seed=_derived_seed(seed, 1), counts_tokens=False,
+    )
 
 _GENERATION_KWARGS = (
     "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "max_new_tokens",
