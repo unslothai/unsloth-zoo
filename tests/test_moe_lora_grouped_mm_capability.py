@@ -686,7 +686,15 @@ def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
     assert M._check_grouped_gemm_available() is False
 
     # And the selector then has to land somewhere that runs on this device.
+    # select_moe_backend is lru_cached: read it cold, or this asserts on whatever an
+    # earlier test selected, and clear it on the way out, or the "native_torch" it
+    # computes under these patches outlives them and every later test in the process
+    # skips the GPU backends.
     monkeypatch.setattr(M, "_TORCH_GROUPED_MM_SUPPORTED", False, raising = False)
     monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
     monkeypatch.delenv("UNSLOTH_MOE_BACKEND", raising = False)
-    assert M.select_moe_backend() == "native_torch"
+    M.select_moe_backend.cache_clear()
+    try:
+        assert M.select_moe_backend() == "native_torch"
+    finally:
+        M.select_moe_backend.cache_clear()
