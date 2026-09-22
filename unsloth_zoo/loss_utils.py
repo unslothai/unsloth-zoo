@@ -201,6 +201,11 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
     ):
         if labels is None: return None
+        # The stock loss also takes (tokens, vocab) logits with 1-D labels (Ling's MTP head
+        # calls it that way); treat them as one row so the shift matches.
+        if logits.dim() == 2 and labels.dim() == 1:
+            logits = logits.unsqueeze(0)
+            labels = labels.unsqueeze(0)
         shift_logits = logits
         shift_labels = torch.empty_like(labels)
         shift_labels[..., :-1] = labels[..., 1:]
