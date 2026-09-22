@@ -11,40 +11,48 @@ The compiler matches DISABLED_KEYWORDS against `inspect.getsource(function)`, so
 pin that match on the functions transformers actually ships.
 """
 
+import glob
 import importlib
 import inspect
 import math
+import os
 
 import pytest
 import torch
 
 from unsloth_zoo.compiler import DISABLED_KEYWORDS
 
-_MLA_MODELS = (
-    "deepseek_v2",
-    "deepseek_v3",
-    "mistral4",
-    "glm4_moe_lite",
-    "minicpm3",
-    "longcat_flash",
-    "youtu",
-)
 _HELPERS = ("yarn_get_mscale", "yarn_apply_mscale")
+
+
+def _modeling_files_defining_helpers():
+    # Discovered from the installed transformers rather than listed, so a new MLA model
+    # (axk1, deepseek_v32, glm_moe_dsa, hy_v4, ...) is covered the day it ships.
+    import transformers.models
+
+    root = os.path.dirname(transformers.models.__file__)
+    for path in sorted(glob.glob(os.path.join(root, "*", "modeling_*.py"))):
+        try:
+            with open(path, encoding = "utf-8") as file:
+                text = file.read()
+        except OSError:
+            continue
+        if any(f"def {name}(" in text for name in _HELPERS):
+            model_dir = os.path.basename(os.path.dirname(path))
+            yield model_dir, os.path.splitext(os.path.basename(path))[0]
 
 
 def _shipped_helpers():
     found = []
-    for model_type in _MLA_MODELS:
+    for model_dir, module_name in _modeling_files_defining_helpers():
         try:
-            module = importlib.import_module(
-                f"transformers.models.{model_type}.modeling_{model_type}"
-            )
+            module = importlib.import_module(f"transformers.models.{model_dir}.{module_name}")
         except Exception:
             continue
         for name in _HELPERS:
             function = getattr(module, name, None)
             if callable(function):
-                found.append((model_type, name, function))
+                found.append((model_dir, name, function))
     return found
 
 
