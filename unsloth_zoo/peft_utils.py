@@ -41,26 +41,6 @@ MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
 
-# Skip some modules sensitive to quantization
-SKIP_QUANTIZATION_MODULES = [
-    "lm_head",
-    "multi_modal_projector",    # Llama 3.2 Vision, Pixtral, Llava
-    "merger",                   # Qwen2 VL
-    "modality_projection",      # Idefics, SmolVLM
-    "router",                   # MoE Router
-    "mlp.gate",                 # MoE Router
-    "block_sparse_moe.gate",    # MoE Router
-    'mamba',
-    "audio_tower",              # Gemma3N audio encoder conformer
-    "vision_tower",             # Gemma3 vision encoder (SigLIP)
-    "vision_embedder",          # multimodal embedders kept in full precision
-    "embed_vision",
-    "embed_audio",
-    "score",                    # *ForSequenceClassification head
-    "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
-    "qa_outputs",               # *ForQuestionAnswering head
-]
-
 # The model types PEFT's _check_lora_target_modules_mamba refuses out_proj / conv1d on,
 # plus the leaf names it refuses. Kept in step with peft/tuners/tuners_utils.py.
 MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
@@ -91,6 +71,26 @@ def _mamba_only_leaves(model):
                 stack.append(value)
     return frozenset()
 
+
+# Skip some modules sensitive to quantization
+SKIP_QUANTIZATION_MODULES = [
+    "lm_head",
+    "multi_modal_projector",    # Llama 3.2 Vision, Pixtral, Llava
+    "merger",                   # Qwen2 VL
+    "modality_projection",      # Idefics, SmolVLM
+    "router",                   # MoE Router
+    "mlp.gate",                 # MoE Router
+    "block_sparse_moe.gate",    # MoE Router
+    'mamba',
+    "audio_tower",              # Gemma3N audio encoder conformer
+    "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "vision_embedder",          # multimodal embedders kept in full precision
+    "embed_vision",
+    "embed_audio",
+    "score",                    # *ForSequenceClassification head
+    "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
+    "qa_outputs",               # *ForQuestionAnswering head
+]
 
 def get_peft_regex(
     model,
