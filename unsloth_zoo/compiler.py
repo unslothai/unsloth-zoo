@@ -259,6 +259,33 @@ if UNSLOTH_ENABLE_LOGGING:
 global INFERENCE_RUNS
 INFERENCE_RUNS = 0
 
+# True while the inference stance below is one WE set, so that a training
+# forward knows it may put the stance back and knows not to clobber a stance
+# the user chose themselves.
+global UNSLOTH_SET_INFERENCE_STANCE
+UNSLOTH_SET_INFERENCE_STANCE = False
+
+# Latched by the first forward that carries labels. See the comment above
+# __DYNAMO__RESTORE__ for why the inference stance must stay off afterwards.
+global UNSLOTH_SAW_TRAINING_FORWARD
+UNSLOTH_SAW_TRAINING_FORWARD = False
+
+
+# Re-arm the inference-only compiler stance after training has finished.
+# A forward that carries labels latches the optimisation off for the rest of
+# the process, because a training loop that also runs label-free forwards
+# cannot tell them apart from generation and must keep its compiler guards.
+# Call this once training is over and the process is only generating.
+def reset_inference_stance():
+    global INFERENCE_RUNS, UNSLOTH_SET_INFERENCE_STANCE, UNSLOTH_SAW_TRAINING_FORWARD
+    if UNSLOTH_SET_INFERENCE_STANCE and torch_dynamo_eval_frame is not None:
+        if torch_dynamo_eval_frame._stance.stance == "eager_on_recompile":
+            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+    INFERENCE_RUNS = 0
+    UNSLOTH_SET_INFERENCE_STANCE = False
+    UNSLOTH_SAW_TRAINING_FORWARD = False
+pass
+
 try:
     import torch._dynamo.eval_frame as torch_dynamo_eval_frame
     torch_dynamo_eval_frame._stance.stance
@@ -2885,15 +2912,24 @@ pass
 
 __DYNAMO__RECOMPILING__ = """
 
-    # Set compiler stance to fail on recompiles for inference
-    global INFERENCE_RUNS
+    # Set compiler stance to fail on recompiles for inference.
+    # INFERENCE_RUNS and UNSLOTH_SET_INFERENCE_STANCE are declared global by the
+    # restore block, which is spliced into the same function above this branch.
+    # Repeating the declaration here would come after that block has already
+    # assigned them, which Python rejects at compile time.
     if torch_dynamo_eval_frame is not None:
         old_stance = torch_dynamo_eval_frame._stance.stance
     else:
         old_stance = None
-    if old_stance is not None and INFERENCE_RUNS == 1:
+    if UNSLOTH_SAW_TRAINING_FORWARD:
+        # This process trains. A label-free forward here is a teacher scoring a
+        # batch, an eval pass or on-policy sampling, not a generation loop, and
+        # the backward that follows needs recompilation to stay available.
+        pass
+    elif old_stance is not None and INFERENCE_RUNS == 1:
         # Skip guards and return to eager -> we still need guards!
         torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+        UNSLOTH_SET_INFERENCE_STANCE = True
         if UNSLOTH_ENABLE_LOGGING:
             logger_compiler.info(
                 f"Unsloth: Removing compiler guards after 1 inference run. "\\
@@ -2912,7 +2948,52 @@ __DYNAMO__RECOMPILING__ = """
                 f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
             )
         INFERENCE_RUNS = 0
+        UNSLOTH_SET_INFERENCE_STANCE = False
     INFERENCE_RUNS += 1
+"""
+
+# The stance set above is process-global, and nothing in the inference branch
+# can put it back: once it is "eager_on_recompile" the elif above swallows every
+# later visit. That is fine for a pure generation loop, which is all it was
+# written for, but a training loop that also runs label-free forwards flips it
+# and never recovers. Those forwards are ordinary: a GKD or distillation teacher
+# scoring a batch, an evaluation pass, on-policy sampling mid-training.
+#
+# Leaving it flipped during training is not just slower. Under
+# "eager_on_recompile" a guard miss silently runs eager instead of recompiling,
+# so a block can run compiled in the forward and eager in the gradient
+# checkpoint recompute. The two save different numbers of tensors and
+# torch.utils.checkpoint refuses the mismatch with "A different number of
+# tensors was saved during the original forward and recomputation".
+#
+# So a forward that carries labels, which is unambiguously a training step,
+# puts our own stance back and latches UNSLOTH_SAW_TRAINING_FORWARD so the
+# inference branch stops flipping it. Restoring alone is not enough: within one
+# GKD step the teacher forward runs after the student forward and before the
+# backward, so it would just flip the stance straight back again.
+#
+# The latch is one-way for the life of the process. Generation after training
+# therefore keeps compiler guards, which costs recompilation time on new shapes
+# and nothing else. Call reset_inference_stance() to re-arm it. A stance the
+# user set themselves is never touched, which is what
+# UNSLOTH_SET_INFERENCE_STANCE tracks.
+__DYNAMO__RESTORE__ = """
+
+    # Undo the inference-only compiler stance before training on this batch
+    global INFERENCE_RUNS
+    global UNSLOTH_SET_INFERENCE_STANCE
+    global UNSLOTH_SAW_TRAINING_FORWARD
+    UNSLOTH_SAW_TRAINING_FORWARD = True
+    if UNSLOTH_SET_INFERENCE_STANCE and torch_dynamo_eval_frame is not None:
+        if torch_dynamo_eval_frame._stance.stance == "eager_on_recompile":
+            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    "Unsloth: Restoring compiler guards for a training step. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance}"
+                )
+        UNSLOTH_SET_INFERENCE_STANCE = False
+        INFERENCE_RUNS = 0
 """
 
 # Replace Cross Entropy cells with fused linear lm heads
@@ -2963,6 +3044,8 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+if labels is not None:
+    __DYNAMO__RESTORE__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3012,7 +3095,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__RESTORE__", __DYNAMO__RESTORE__)
 
 cross_entropy_find_2 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -3055,6 +3138,8 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+if labels is not None:
+    __DYNAMO__RESTORE__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3129,7 +3214,7 @@ else:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
     loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__RESTORE__", __DYNAMO__RESTORE__)
 
 cross_entropy_find_3 = """
 $OUTPUTLOGITS$
@@ -3178,6 +3263,8 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+if labels is not None:
+    __DYNAMO__RESTORE__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3221,7 +3308,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__RESTORE__", __DYNAMO__RESTORE__)
 
 ce_finders = [
     (
