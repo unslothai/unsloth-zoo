@@ -849,7 +849,11 @@ def _literal_text(node):
         return None
     if isinstance(node.op, ast.Add):
         right = _literal_text(node.right)
-        return None if right is None else left + right
+        if right is None:
+            return None
+        if len(left) + len(right) > MAX_FOLDED_JOIN:
+            return None                 # the same output ceiling as the join
+        return left + right
     if RE_UNSAFE_PERCENT.search(left):
         return _percent_holes(left)
     if isinstance(node.right, ast.Dict):
@@ -1272,12 +1276,21 @@ def _inline_constants(tree):
     it, under the same ceiling the folds use: this replaces a name with a value
     it demonstrably has, never with a guess.
     """
+    uses = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            uses[node.id] = uses.get(node.id, 0) + 1
+
     texts, budget = {}, MAX_FOLDED_JOIN
     for name, value in _single_assignments(tree).items():
         text = _literal_text(value)
         if text is None or UNKNOWN_PIECE in text:
             continue
-        budget -= len(text)
+        # Per USE, not per name: one 50 KB constant loaded a hundred times is
+        # five megabytes of text out of a 49 KB file, and folding the growing
+        # prefixes of that took six seconds on a file the scan accepts at up to
+        # 8 MiB. The budget is on what the substitution materialises.
+        budget -= len(text) * uses.get(name, 0)
         if budget < 0:
             break
         texts[name] = text

