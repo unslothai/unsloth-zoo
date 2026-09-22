@@ -268,17 +268,12 @@ pass
 
 
 def _requires_arguments(method):
-    """Whether calling `method()` fails on the signature rather than in the body.
-
-    Unreadable signatures (C extensions, exotic wrappers) count as callable, so a
-    TypeError from one propagates instead of being read as an uncallable accessor.
-    """
+    """True only when binding zero arguments fails. Unreadable metadata counts as callable."""
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError, AttributeError):
-        # Unreadable metadata, e.g. a wrapper whose __signature__ is not one.
-        # signature() raises TypeError for that too, so looking it up has to be
-        # separate from binding: only bind() failing proves arguments are needed.
+        # signature() raises TypeError for unreadable metadata too, so the lookup
+        # cannot share a try with bind(): only bind() failing proves arguments.
         return False
     try:
         signature.bind()
@@ -295,36 +290,28 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    # Not every checkpoint can hand back a single embedding matrix, and
-    # `hasattr` does not answer the question. transformers 5 defines
-    # get_input_embeddings on every PreTrainedModel with a base implementation
-    # that raises NotImplementedError, so Qwen3-Omni, which carries a thinker
-    # and a talker, raises here; and remote code can declare a non-standard
-    # signature that cannot be called at all (stepfun-ai/Step-3.7-Flash defines
-    # get_input_embeddings(self, input_ids), which raises TypeError). There is
-    # nothing to reset in either case, so skip the pass instead of failing the
-    # run before training starts.
+    # Not every checkpoint has a single embedding to reset, and `hasattr` does not
+    # say so: transformers' base get_input_embeddings raises NotImplementedError
+    # for composite models (Qwen3-Omni), and remote code can declare a signature
+    # that cannot be called (stepfun-ai/Step-3.7-Flash).
     try:
-        # Each accessor is judged on its own signature, immediately before its
-        # own call, so a TypeError raised inside a callable accessor is never
-        # mistaken for one we could not call, whatever the other one looks like.
+        # Each accessor judged before its own call: a TypeError from inside a
+        # callable one must never be read as an accessor we could not call.
         if _requires_arguments(model.get_input_embeddings):
             raise NotImplementedError("input embedding accessor requires arguments")
         input_embeddings  = model.get_input_embeddings ()
         if _requires_arguments(model.get_output_embeddings):
             raise NotImplementedError("output embedding accessor requires arguments")
         output_embeddings = model.get_output_embeddings()
-        # A model is also entitled to answer "I have none" by returning None,
-        # and `.weight` on that is an AttributeError several frames from the
-        # cause. Same outcome, so route it through the same skip.
+        # None is a legitimate "I have none", and `.weight` on it is an
+        # AttributeError several frames from the cause.
         if input_embeddings is None or output_embeddings is None:
             raise NotImplementedError("no input or output embeddings")
         embedding_matrix = input_embeddings.weight
         lm_head_matrix   = output_embeddings.weight
     except NotImplementedError:
-        # Warning rather than info: skipping means the run loses the NaN guard
-        # this pass provides, and the success path below announces itself with
-        # a plain print, so an invisible skip would be the odd one out.
+        # Warning, not info: the logger sits at WARNING by default and this run
+        # just lost the NaN guard.
         logger.warning(
             f"Unsloth: Skipping the untrained token fix for "
             f"{type(model).__name__}, which does not expose a single input "

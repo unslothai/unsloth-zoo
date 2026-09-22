@@ -3,20 +3,8 @@
 
 """Checkpoints that cannot hand back a single input embedding matrix.
 
-`hasattr(model, "get_input_embeddings")` does not answer the question.
-transformers 5 defines the method on every PreTrainedModel with a base
-implementation that raises NotImplementedError, measured True on both 4.57.6
-and 5.17.0, so a composite checkpoint carrying more than one embedding
-(Qwen3-Omni has a thinker and a talker) passes the hasattr check and then
-raises. Remote code can also declare a signature that cannot be called with no
-arguments: stepfun-ai/Step-3.7-Flash defines get_input_embeddings(self,
-input_ids), which raises TypeError.
-
-Both used to fail the run before training started. There is nothing to reset in
-either case, so the pass is skipped.
-
-The models here are stand-ins: the real checkpoints are 30B and larger. What is
-reproduced is the offending shape, not the architecture.
+The models are stand-ins reproducing the offending shape: the real ones
+(Qwen3-Omni, stepfun-ai/Step-3.7-Flash) are 30B and larger.
 """
 
 import datasets
@@ -42,12 +30,8 @@ def _config():
 
 @pytest.fixture(scope = "module")
 def tokenizer():
-    """Built locally rather than pulled from the hub.
-
-    None of these tests needs a particular vocabulary, and a hub tokenizer
-    makes the whole file raise OSError under HF_HUB_OFFLINE=1 instead of
-    testing anything.
-    """
+    """Built locally: a hub tokenizer makes the whole file raise OSError under
+    HF_HUB_OFFLINE=1 instead of testing anything."""
     tokenizers = pytest.importorskip("tokenizers")
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
@@ -76,8 +60,7 @@ def test_the_base_implementation_really_raises():
 
 
 class _CompositeModel(PreTrainedModel):
-    """Qwen3-Omni's shape: several towers, no single embedding, so the
-    transformers base implementation raises NotImplementedError."""
+    """Qwen3-Omni's shape: several towers, so the base implementation raises."""
 
     config_class = LlamaConfig
 
@@ -101,8 +84,6 @@ class _NonStandardSignature(PreTrainedModel):
 
 
 class _ReturnsNone(PreTrainedModel):
-    """A model entitled to answer "I have none"."""
-
     config_class = LlamaConfig
 
     def __init__(self, config):
@@ -117,8 +98,7 @@ class _ReturnsNone(PreTrainedModel):
 
 
 class _OnlyOutputIsNone(PreTrainedModel):
-    """One embedding to hand back, no output embedding: transformers 5 returns
-    None from get_output_embeddings for anything without an lm_head."""
+    """transformers 5 returns None from get_output_embeddings without an lm_head."""
 
     config_class = LlamaConfig
 
@@ -134,8 +114,8 @@ class _OnlyOutputIsNone(PreTrainedModel):
 
 
 class _RaisesTypeErrorInsideTheBody(PreTrainedModel):
-    """A callable accessor that fails internally, e.g. remote code against the
-    wrong transformers. Not a signature we cannot call, so it must propagate."""
+    """Callable accessor failing internally, e.g. remote code against the wrong
+    transformers: not a signature we cannot call, so it must propagate."""
 
     config_class = LlamaConfig
 
@@ -154,7 +134,6 @@ class _RaisesTypeErrorInsideTheBody(PreTrainedModel):
 )
 def test_the_pass_is_skipped_instead_of_failing_the_run(model_class, tokenizer, dataset):
     model = model_class(_config())
-    # Must return, not raise: this runs before training starts.
     assert fix_untrained_tokens(model, tokenizer, dataset) is None
 
 
@@ -171,12 +150,8 @@ def test_the_shapes_really_are_unanswerable(tokenizer, dataset):
 
 
 class _UnreadableSignature(PreTrainedModel):
-    """A perfectly callable accessor whose metadata cannot be read.
-
-    inspect.signature() raises TypeError on this, the same exception bind()
-    raises for a required argument, so reading the two as one would skip a model
-    that works.
-    """
+    """Callable, but inspect.signature() raises TypeError on it, the same
+    exception bind() raises for a required argument."""
 
     config_class = LlamaConfig
 
@@ -208,15 +183,13 @@ def test_an_unreadable_signature_counts_as_callable(tokenizer):
         model.head.weight[untrained] = 0.0
     dataset = datasets.Dataset.from_dict({"input_ids": [[2, 3, 4, 5]]})
     fix_untrained_tokens(model, tokenizer, dataset)
-    # It ran: the pass reset the untrained rows instead of skipping the model.
     assert model.emb .weight[untrained].abs().sum() > 0
     assert model.head.weight[untrained].abs().sum() > 0
 
 
 class _BrokenInputAndUncallableOutput(PreTrainedModel):
-    """The compound case: the input accessor fails in its body while the output
-    accessor is the one that cannot be called. Checking either signature against
-    either failure would let the genuine input failure disappear."""
+    """The input accessor fails in its body while the output one cannot be
+    called: checking either signature against either failure hides the first."""
 
     config_class = LlamaConfig
 
@@ -238,24 +211,16 @@ def test_an_uncallable_output_accessor_does_not_mask_a_broken_input_accessor(tok
 
 
 def test_a_type_error_from_inside_the_accessor_still_propagates(tokenizer, dataset):
-    """The skip is for signatures we cannot call, not for models that are broken.
-
-    Catching every TypeError would turn a genuine failure into a training run
-    quietly missing its NaN guard, which is the one outcome worse than the crash
-    this whole guard exists to avoid.
-    """
+    """Catching every TypeError would turn a genuine failure into a run quietly
+    missing its NaN guard, the one outcome worse than the crash."""
     model = _RaisesTypeErrorInsideTheBody(_config())
     with pytest.raises(TypeError, match = "something inside the model went wrong"):
         fix_untrained_tokens(model, tokenizer, dataset)
 
 
 def test_the_skip_is_visible_without_opting_into_logging(caplog, tokenizer, dataset):
-    """A silent skip would look exactly like a pass that ran.
-
-    The package logger sits at WARNING unless UNSLOTH_ENABLE_LOGGING is set, so
-    an info-level line here would never reach the user who needs it: the run
-    they just started is going without the NaN guard this pass provides.
-    """
+    """The logger sits at WARNING unless UNSLOTH_ENABLE_LOGGING is set, so an
+    info-level line would never reach the user whose run lost the NaN guard."""
     import logging
 
     from unsloth_zoo.log import logger as package_logger
@@ -274,18 +239,12 @@ def test_an_ordinary_model_is_still_processed(tokenizer, dataset):
     before = model.get_input_embeddings().weight.detach().clone()
     fix_untrained_tokens(model, tokenizer, dataset)
     after = model.get_input_embeddings().weight.detach()
-    # It ran (no exception) and left a well-trained tiny model alone.
     assert torch.equal(before, after)
 
 
 def test_untrained_tokens_really_are_still_reset(tokenizer):
-    """The negative control the test above cannot be.
-
-    "Nothing changed" also holds when the pass is skipped for every model, so
-    it would survive a guard that swallowed everything. This one has genuinely
-    untrained rows and asserts they were reset, so it fails the moment the
-    ordinary path stops running.
-    """
+    """"Nothing changed" also holds when the pass is skipped for every model,
+    so this one resets genuinely untrained rows instead."""
     config = _config()
     config.tie_word_embeddings = False
     model = AutoModelForCausalLM.from_config(config)
