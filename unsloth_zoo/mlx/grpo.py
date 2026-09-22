@@ -326,6 +326,23 @@ class GRPOSampling:
     min_p: float | None = None
     repetition_penalty: float = 1.0
 
+    def __post_init__(self):
+        # The ranges Hugging Face's sampling processors accept.
+        valid = {
+            "max_tokens": self.max_tokens >= 1,
+            "temperature": self.temperature > 0,
+            "top_p": 0 <= self.top_p <= 1,
+            "top_k": self.top_k is None or self.top_k >= 0,
+            "min_p": self.min_p is None or 0 <= self.min_p <= 1,
+            "repetition_penalty": self.repetition_penalty > 0,
+        }
+        for name, ok in valid.items():
+            if not ok:
+                raise ValueError(
+                    f"Unsloth MLX GRPO: {name}={getattr(self, name)!r} is out of "
+                    "range for sampling."
+                )
+
     @property
     def warps(self):
         return (
@@ -432,8 +449,8 @@ class GRPOBatchPlan:
     def __init__(
         self, dataset, tokenizer, prompt_ids, max_tokens, schedule, *, cycle_length,
         num_generations, batch_size, steps_per_generation, num_iterations, grad_accum,
-        sampling, scale_rewards, mask_truncated_completions, with_old_logps,
-        with_reference, max_seq_length, seed,
+        sampling, score_temperature, scale_rewards, mask_truncated_completions,
+        with_old_logps, with_reference, max_seq_length, seed,
     ):
         self._dataset = dataset
         self._tokenizer = tokenizer
@@ -447,6 +464,7 @@ class GRPOBatchPlan:
         self._repeats = steps_per_generation * num_iterations
         self._grad_accum = grad_accum
         self.sampling = sampling
+        self.score_temperature = score_temperature
         self.scale_rewards = scale_rewards
         self.mask_truncated_completions = mask_truncated_completions
         self.with_old_logps = with_old_logps
@@ -459,8 +477,9 @@ class GRPOBatchPlan:
         self._anchor = 0
         self._current = None
         self._model = None
+        self._shape_plan = None
         self._metrics = {}
-        self.num_input_tokens_seen = 0
+        self.completions = None
 
     @property
     def schedule(self):
@@ -477,10 +496,13 @@ class GRPOBatchPlan:
         return int(absolute_visit) % len(self._schedule)
 
     def bind(
-        self, model, reward_funcs, *, reward_weights=None, reference_policy=None,
-        trainer_state=None, rollout_context=None,
+        self, model, reward_funcs, *, trainer_state, reward_weights=None,
+        reference_policy=None, rollout_context=None, keep_completions=False,
     ):
-        """Attach what generating needs: the policy, rewards and the reference."""
+        """Attach what generating needs: the policy, rewards and the reference.
+        ``trainer_state`` reaches the reward functions and counts the prompt and
+        completion tokens, as TRL's does; ``keep_completions`` holds the latest
+        generation's texts in ``completions``."""
         if self.with_reference and reference_policy is None:
             raise ValueError("Unsloth MLX GRPO: this plan scores a reference policy.")
         self._model = model
@@ -492,6 +514,7 @@ class GRPOBatchPlan:
         self._reference_policy = reference_policy
         self._trainer_state = trainer_state
         self._rollout_context = rollout_context or nullcontext
+        self._keep_completions = keep_completions
 
     def start_at(self, visit):
         """Count generations from ``visit``, the first micro-step a run fetches."""
@@ -517,10 +540,7 @@ class GRPOBatchPlan:
 
     def pop_metrics(self):
         """Generation-side metrics recorded since the last call, each averaged."""
-        if not self._metrics:
-            return {}
         values = {name: float(np.mean(recorded)) for name, recorded in self._metrics.items()}
-        values["num_tokens"] = float(self.num_input_tokens_seen)
         self._metrics = {}
         return values
 
@@ -541,7 +561,7 @@ class GRPOBatchPlan:
             chunk = sequences[start:start + self.batch_size]
             batch, lengths = self._pack(
                 chunk, prompt_lengths[start:start + self.batch_size],
-                self._width(max(len(sequence) for sequence in chunk)),
+                self._planned(self._width(max(len(sequence) for sequence in chunk))),
             )
             logps = np.array(scorer(mx.array(batch), mx.array(lengths)), dtype=np.float32)
             values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
@@ -586,8 +606,14 @@ class GRPOBatchPlan:
         completion_ids = [ids for ids, _ in cut]
         truncated = np.array([flag for _, flag in cut], dtype=bool)
         rows = [self._dataset[prompt] for prompt in prompts]
+        texts = [self._decode(ids) for ids in completion_ids]
+        lengths = np.array([len(ids) for ids in completion_ids])
+        prompt_lengths = np.array([len(self._prompt_ids[prompt]) for prompt in prompts])
+        # Counted before rewards, which read it through trainer_state as TRL's do.
+        self._trainer_state.num_input_tokens_seen += int(prompt_lengths.sum() + lengths.sum())
+        self._metrics["num_tokens"] = [self._trainer_state.num_input_tokens_seen]
         reward_prompts, completions = reward_prompts_and_completions(
-            [row["prompt"] for row in rows], [self._decode(ids) for ids in completion_ids],
+            [row["prompt"] for row in rows], texts,
         )
         rewards = calculate_rewards(
             self._reward_funcs, rows, prompts=reward_prompts, completions=completions,
@@ -596,10 +622,17 @@ class GRPOBatchPlan:
         advantages, reward_stats = group_advantages(
             rewards, self._reward_weights, self.num_generations, self.scale_rewards,
         )
-        lengths = np.array([len(ids) for ids in completion_ids])
-        prompt_lengths = np.array([len(self._prompt_ids[prompt]) for prompt in prompts])
         self._record_generation(lengths, truncated, rewards, reward_stats)
-        self.num_input_tokens_seen += int(prompt_lengths.sum() + lengths.sum())
+        if self._keep_completions:
+            self.completions = {
+                "prompt": [self._decode(self._prompt_ids[prompt]) for prompt in prompts],
+                "completion": texts,
+                "rewards": {
+                    reward_function_name(reward_func): rewards[:, column].tolist()
+                    for column, reward_func in enumerate(self._reward_funcs)
+                },
+                "advantage": advantages.tolist(),
+            }
         kept = ~truncated if self.mask_truncated_completions else np.ones_like(truncated)
         # Shuffled before scoring, so each old/reference chunk is one micro-batch at
         # its own width and a first iteration's ratio is exactly 1 when eager.
@@ -608,7 +641,7 @@ class GRPOBatchPlan:
             tuple(self._prompt_ids[prompts[row]]) + tuple(completion_ids[row]) for row in order
         ]
         prompt_lengths = prompt_lengths[order]
-        temperature = self.sampling.temperature
+        temperature = self.score_temperature
         old = ref = None
         if self.with_old_logps:
             old = self._score(
@@ -651,9 +684,32 @@ class GRPOBatchPlan:
         start = epoch_start + ((index - epoch_start) // self._grad_accum) * self._grad_accum
         return min(start + self._grad_accum, epoch_end) - start
 
-    def materialize(self, index):
-        """The micro-batch for schedule entry ``index``. Refetching an entry reuses
-        its generation instead of sampling again."""
+    def batch_family(self, index):
+        rows = self.batch_size
+        held = ((rows, "sequence-1"), "float32")
+        return (
+            "grpo_tuple_7", ((rows, "sequence"), "int32"), ((rows, 2), "int32"),
+            ((2,), "float32"), ((rows,), "float32"), ((rows,), "int32"),
+            held if self.with_old_logps else None, held if self.with_reference else None,
+        )
+
+    def set_shape_plan(self, shape_plan):
+        if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
+            raise ValueError("only exact or bucket shape plans can be installed")
+        self._shape_plan = shape_plan
+
+    def _planned(self, width):
+        # Old and reference log-probs are scored at the width the micro-batch
+        # trains at, so a first iteration's ratio stays exactly 1, including
+        # after a compile fallback.
+        if self._shape_plan is None:
+            return width
+        return self._shape_plan.endpoint_for(self.batch_family(0), width)
+
+    def materialize(self, index, *, phase=None):
+        """The micro-batch for schedule entry ``index``, at its planned width
+        whatever the ``phase``. Refetching an entry reuses its generation instead
+        of sampling again."""
         start = self._generation_start(index)
         if self._current is None or self._current.visit != start:
             self._current = self._generate(start)
@@ -661,7 +717,7 @@ class GRPOBatchPlan:
         position = ((index - start) % self.steps_per_generation) * self.batch_size
         rows = range(position, position + self.batch_size)
         sequences = [generation.sequences[row] for row in rows]
-        width = self._width(max(len(sequence) for sequence in sequences))
+        width = self._planned(self._width(max(len(sequence) for sequence in sequences)))
         batch, lengths = self._pack(sequences, generation.prompt_lengths[position:position + self.batch_size], width)
 
         def held(values):
@@ -686,14 +742,15 @@ class GRPOBatchPlan:
 
 def create_grpo_batch_plan(
     dataset, tokenizer, *, num_generations, batch_size, steps_per_generation,
-    num_iterations, grad_accum, sampling, max_seq_length, scale_rewards="group",
+    num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None,
 ):
     """Encode every prompt once and lay out TRL's RepeatSampler schedule.
 
     ``batch_size`` counts completions; a generation samples ``batch_size *
-    steps_per_generation`` of them, ``num_generations`` per prompt.
+    steps_per_generation`` of them, ``num_generations`` per prompt. Log-probs
+    are scored at ``score_temperature``, the sampling temperature by default.
     """
     if getattr(tokenizer, "eos_token_id", None) is None:
         raise ValueError("Unsloth MLX GRPO: the tokenizer needs an eos_token_id to stop on.")
@@ -762,8 +819,163 @@ def create_grpo_batch_plan(
         cycle_length=cycle_length, num_generations=num_generations,
         batch_size=batch_size, steps_per_generation=steps_per_generation,
         num_iterations=num_iterations, grad_accum=grad_accum, sampling=sampling,
+        score_temperature=sampling.temperature if score_temperature is None else score_temperature,
         scale_rewards=scale_rewards,
         mask_truncated_completions=mask_truncated_completions,
         with_old_logps=grad_accum % repeats != 0, with_reference=with_reference,
         max_seq_length=max_seq_length, seed=_normalize_seed(seed),
     )
+
+
+_GENERATION_KWARGS = (
+    "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "max_new_tokens",
+    "do_sample",
+)
+
+
+def grpo_sampling(config):
+    """The rollout sampling a GRPO config asks for; ``generation_kwargs`` override
+    the named fields, as TRL updates its GenerationConfig with them."""
+    kwargs = dict(config.generation_kwargs or {})
+    unsupported = sorted(set(kwargs) - set(_GENERATION_KWARGS))
+    if unsupported:
+        raise ValueError(
+            f"Unsloth MLX GRPO: generation_kwargs {unsupported} are not supported; "
+            f"MLX rollouts take {', '.join(_GENERATION_KWARGS)}."
+        )
+    if kwargs.pop("do_sample", True) is not True:
+        raise ValueError("Unsloth MLX GRPO: GRPO samples its completions, so do_sample must be True.")
+    return GRPOSampling(
+        max_tokens=kwargs.pop("max_new_tokens", config.max_completion_length),
+        **{
+            name: kwargs.get(name, getattr(config, name))
+            for name in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
+        },
+    )
+
+
+def grpo_objective(config):
+    # TRL scores at the configured temperature whatever generation_kwargs sample at.
+    return GRPOObjective(
+        loss_type=config.loss_type, beta=float(config.beta), epsilon=config.epsilon,
+        epsilon_high=config.epsilon_high, delta=config.delta,
+        importance_sampling_level=config.importance_sampling_level,
+        temperature=config.temperature, max_completion_length=config.max_completion_length,
+    )
+
+
+def grpo_reward_funcs(reward_funcs):
+    funcs = list(reward_funcs) if isinstance(reward_funcs, (list, tuple)) else [reward_funcs]
+    if not funcs:
+        raise ValueError("Unsloth MLX GRPO: reward_funcs needs at least one reward function.")
+    for func in funcs:
+        if not callable(func) or hasattr(func, "parameters"):
+            raise ValueError(
+                f"Unsloth MLX GRPO: reward function {func!r} is not a plain callable; "
+                "reward models are not supported."
+            )
+    return funcs
+
+
+def resolve_grpo_config(config):
+    """CUDA Unsloth's GRPOConfig rewrites, then TRL 0.24's ``__post_init__``."""
+    if config.use_vllm:
+        raise ValueError("Unsloth MLX GRPO: use_vllm needs vLLM; MLX samples with its own engine.")
+    if config.use_liger_loss:
+        raise ValueError("Unsloth MLX GRPO: use_liger_loss selects a CUDA kernel.")
+    if isinstance(config.loss_type, str) and config.loss_type.lower() in ("dr_grpo", "dapo"):
+        config.loss_type = config.loss_type.lower()
+    if config.loss_type == "dr_grpo":
+        if config.scale_rewards is None:
+            config.scale_rewards = True
+        elif config.scale_rewards is True:
+            warnings.warn(
+                "Unsloth MLX GRPO: loss_type='dr_grpo' does not scale rewards, so "
+                "scale_rewards=True is set to False, as on CUDA Unsloth.",
+                stacklevel=3,
+            )
+            config.scale_rewards = False
+    if config.loss_type == "dapo":
+        for name, value in (("mask_truncated_completions", True), ("epsilon_high", 0.28)):
+            if getattr(config, name) != value:
+                warnings.warn(
+                    f"Unsloth MLX GRPO: loss_type='dapo' sets {name}={value}, as on "
+                    "CUDA Unsloth.",
+                    stacklevel=3,
+                )
+                setattr(config, name, value)
+        if config.beta != 0:
+            warnings.warn(
+                f"Unsloth MLX GRPO: loss_type='dapo' is usually trained with beta=0; "
+                f"beta={config.beta} keeps its KL term.",
+                stacklevel=3,
+            )
+    if not 0 < config.temperature < 10:
+        raise ValueError(
+            f"Unsloth MLX GRPO: temperature={config.temperature} must lie between 0 "
+            "and 10, as on CUDA Unsloth."
+        )
+    batch_size, generations = config.per_device_train_batch_size, config.num_generations
+    if (
+        config.steps_per_generation is None and config.generation_batch_size is None
+        and batch_size * config.gradient_accumulation_steps % generations
+    ):
+        warnings.warn(
+            f"Unsloth MLX GRPO: per_device_train_batch_size * gradient_accumulation_steps "
+            f"is not divisible by num_generations={generations}, so "
+            f"per_device_train_batch_size is set to {generations}, as on CUDA Unsloth.",
+            stacklevel=3,
+        )
+        config.per_device_train_batch_size = batch_size = generations
+    config.scale_rewards = {True: "group", False: "none"}.get(config.scale_rewards, config.scale_rewards)
+    if config.scale_rewards not in GRPO_SCALE_REWARDS:
+        raise ValueError(
+            f"Unsloth MLX GRPO: scale_rewards must be one of "
+            f"{', '.join(GRPO_SCALE_REWARDS)}, got {config.scale_rewards!r}."
+        )
+    if config.generation_batch_size is not None and config.steps_per_generation is not None:
+        raise ValueError(
+            "Unsloth MLX GRPO: set generation_batch_size or steps_per_generation, not both."
+        )
+    if config.generation_batch_size is None:
+        config.steps_per_generation = config.steps_per_generation or config.gradient_accumulation_steps
+        config.generation_batch_size = batch_size * config.steps_per_generation
+    elif config.generation_batch_size % batch_size:
+        raise ValueError(
+            f"Unsloth MLX GRPO: generation_batch_size={config.generation_batch_size} is "
+            f"not divisible by per_device_train_batch_size={batch_size}."
+        )
+    else:
+        config.steps_per_generation = config.generation_batch_size // batch_size
+    if config.generation_batch_size % generations:
+        raise ValueError(
+            f"Unsloth MLX GRPO: generation_batch_size={config.generation_batch_size} is "
+            f"not divisible by num_generations={generations}."
+        )
+    if generations < 2:
+        raise ValueError(
+            "Unsloth MLX GRPO: num_generations must be at least 2, since advantages "
+            "compare completions within a group."
+        )
+    if config.top_entropy_quantile < 1:
+        warnings.warn(
+            "Unsloth MLX GRPO: top_entropy_quantile < 1 is ignored, as on CUDA Unsloth.",
+            stacklevel=3,
+        )
+    grpo_objective(config)
+    grpo_sampling(config)
+
+
+def format_completions(sample, step, limit=None):
+    """A plain-text take on TRL's ``print_prompt_completions_sample`` table: the
+    first ``limit`` rows, where TRL draws them at random."""
+    names = list(sample["rewards"])
+    count = len(sample["prompt"]) if limit is None else min(int(limit), len(sample["prompt"]))
+    lines = [f"Step {step}", " | ".join(("Prompt", "Completion", *names, "Advantage"))]
+    for row in range(count):
+        lines.append(" | ".join((
+            repr(sample["prompt"][row]), repr(sample["completion"][row]),
+            *(f"{sample['rewards'][name][row]:.2f}" for name in names),
+            f"{sample['advantage'][row]:.2f}",
+        )))
+    return "\n".join(lines)

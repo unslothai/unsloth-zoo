@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import sys
 import types
 import warnings
@@ -156,6 +157,11 @@ class TemplateScriptTokenizer(Tokenizer):
 
     def apply_chat_template(self, messages, **kwargs):
         return self.renders.pop(0)
+
+
+class DecodingTokenizer(Tokenizer):
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(97 + token) for token in ids if not skip_special_tokens or token != 2)
 
 
 def rows(count=6):
@@ -3478,11 +3484,8 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
 
     class Reference:
         def forward(self, model, batch, lengths, *, response_scorer):
+            seen["width"] = batch.shape[1]
             return response_scorer(model, batch, lengths) - 1.0
-
-    class Decoding(Tokenizer):
-        def decode(self, ids, skip_special_tokens=False):
-            return "".join(chr(97 + token) for token in ids if not skip_special_tokens or token != 2)
 
     calls, seen = [], {}
 
@@ -3499,12 +3502,12 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     dataset = [{"prompt": "a" * (index + 1), "answer": index} for index in range(4)]
     with pytest.warns(UserWarning, match="1 prompt"):
         plan = create_grpo_batch_plan(
-            dataset, Decoding(), num_generations=2, batch_size=2, steps_per_generation=2,
-            num_iterations=2, grad_accum=2, sampling=GRPOSampling(max_tokens=3, temperature=0.5),
+            dataset, DecodingTokenizer(), num_generations=2, batch_size=2, steps_per_generation=2,
+            num_iterations=2, grad_accum=2, sampling=GRPOSampling(max_tokens=3, temperature=0.5), score_temperature=0.7,
             max_seq_length=6, mask_truncated_completions=True, with_reference=True,
             shuffle=False, num_batches=8,
         )
-    plan.bind(Model(), [stopped], reference_policy=Reference())
+    plan.bind(Model(), [stopped], reference_policy=Reference(), trainer_state=types.SimpleNamespace(num_input_tokens_seen=0))
     first = plan.materialize(0)
     replayed = [plan[index][0].tolist() for index in (1, 2, 3)]
     assert replayed[1:] == [first[0].tolist(), replayed[0]] != [replayed[0]] * 2 and len(calls) == 1
@@ -3521,7 +3524,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
         assert [bool(flag) for flag in micro[4].tolist()] == [row[end - 1] == 2 for row, end in zip(micro[0].tolist(), ends)]  # noqa: E501
         assert np.allclose(np.array(micro[3]), [(0.5 if flag else -0.5) / (np.sqrt(0.5) + 1e-4) for flag in micro[4].tolist()])  # noqa: E501
     ends = [end for _, end in lengths.tolist()]
-    logps = np.array(completion_logps(Model(), tokens, 0.5))
+    logps = np.array(completion_logps(Model(), tokens, 0.7))
     positions = np.arange(1, 6)[None, :] < np.array(ends)[:, None]
     assert np.allclose(np.array(old)[positions], logps[positions]) and np.allclose(np.array(ref)[positions], logps[positions] - 1)  # noqa: E501
     metrics = plan.pop_metrics()
@@ -3532,5 +3535,185 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     assert len(calls) == 2 and calls[1][0][0].prompt_token_ids == (14, 14, 14)
     assert [r.max_tokens for r in calls[1][0]] == [3, 3, 2, 2]
     plan.start_at(6)
-    plan.materialize(6)
+    plan.set_shape_plan(types.SimpleNamespace(report=types.SimpleNamespace(action="bucket"), endpoint_for=lambda family, width: 8))
+    planned = plan[6]  # an eager fetch, as after a compile fallback
     assert len(calls) == 3 and calls[2][0][0].sampling.seed != calls[1][0][0].sampling.seed and plan.width_rungs(6) == (6,)
+    assert planned[0].shape == (2, 8) and planned[5].shape == planned[6].shape == (2, 7) and seen["width"] == 8
+
+
+@pytest.mark.parametrize("overrides,expected,warns", [
+    ({}, dict(loss_type="bnpo", beta=0.001, scale_rewards="group", per_device_train_batch_size=2,
+              steps_per_generation=4, generation_batch_size=8), None),
+    ({"loss_type": "DAPO", "beta": 0.0}, dict(loss_type="dapo", mask_truncated_completions=True,
+                                              epsilon_high=0.28), "dapo' sets mask_truncated"),
+    ({"loss_type": "dr_grpo", "scale_rewards": True}, dict(scale_rewards="none"), "does not scale"),
+    ({"loss_type": "dr_grpo", "scale_rewards": None}, dict(scale_rewards="group"), None),
+    ({"num_generations": 3}, dict(per_device_train_batch_size=3, generation_batch_size=12), "set to 3"),
+    ({"generation_batch_size": 6, "num_generations": 3}, dict(steps_per_generation=3), None),
+    ({"steps_per_generation": 3, "num_generations": 3}, dict(generation_batch_size=6), None),
+    ({"top_entropy_quantile": 0.5}, {}, "top_entropy_quantile < 1 is ignored"),
+])
+def test_grpo_config_resolves_as_cuda_unsloth(overrides, expected, warns):
+    from unsloth_zoo.mlx.grpo import grpo_sampling
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        config = MLXGRPOConfig(**overrides)
+    assert [str(w.message) for w in caught if warns and warns in str(w.message)] or not warns
+    assert not caught or warns
+    assert {name: getattr(config, name) for name in expected} == expected
+    config = MLXGRPOConfig(temperature=0.7, generation_kwargs={"max_new_tokens": 5, "top_k": 3})
+    assert (grpo_sampling(config).max_tokens, grpo_sampling(config).top_k,
+            grpo_sampling(config).temperature) == (5, 3, 0.7)
+
+
+@pytest.mark.parametrize("overrides,match", [
+    ({"num_generations": 1, "per_device_train_batch_size": 1}, "at least 2"),
+    ({"temperature": 10.0}, "between 0 and 10"),
+    ({"loss_type": "cispo"}, "loss_type='cispo'"),
+    ({"use_vllm": True}, "use_vllm"),
+    ({"use_liger_loss": True}, "use_liger_loss"),
+    ({"generation_kwargs": {"num_beams": 2}}, r"\['num_beams'\] are not supported"),
+    ({"generation_kwargs": {"do_sample": False}}, "do_sample must be True"),
+    ({"top_p": 1.5}, "top_p=1.5 is out of range"),
+    ({"generation_batch_size": 4, "steps_per_generation": 2}, "not both"),
+    ({"generation_batch_size": 5, "num_generations": 5}, "not divisible by per_device_train_batch_size"),
+    ({"generation_batch_size": 6, "num_generations": 4}, "not divisible by num_generations=4"),
+    ({"scale_rewards": "row"}, "scale_rewards must be one of"),
+])
+def test_grpo_config_refuses_what_trl_refuses(overrides, match):
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+
+    with pytest.raises(ValueError, match=match):
+        MLXGRPOConfig(**overrides)
+
+
+def _grpo_config(tmp_path, **overrides):
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig
+
+    common = _generation_common(tmp_path, max_steps=2, num_generations=2, max_completion_length=4)
+    for name in ("generate_during_eval", "num_generation_prompts", "generation_max_tokens",
+                 "eval_steps", "generation_temperature"):
+        common.pop(name)
+    return MLXGRPOConfig(**{**common, **overrides})
+
+
+def _grpo_rows(count=6):
+    return [{"prompt": f"q{index}", "answer": index} for index in range(count)]
+
+
+@pytest.mark.parametrize("overrides,trainer_kwargs,match", [
+    ({}, {"reward_processing_classes": [Tokenizer()]}, "reward_processing_classes"),
+    ({}, {"reward_funcs": "org/reward-model"}, "not a plain callable"),
+    ({}, {"reward_funcs": []}, "at least one"),
+    ({}, {"reward_funcs": type("RewardModel", (), {"__call__": print, "parameters": print})()}, "reward models are not supported"),
+    ({"reward_weights": [1.0, 2.0]}, {}, "2 reward_weights for 1"),
+    ({}, {"eval_dataset": _grpo_rows(2)}, "evaluation is not supported"),
+    ({"max_completion_length": 64}, {}, "leave no room"),
+    ({"dataset_order": "sequential"}, {}, "RepeatSampler"),
+    ({"sync_ref_model": True, "ref_model_sync_steps": 0}, {}, "GRPO: ref_model_sync_steps must be at least 1"),
+])
+def test_the_grpo_trainer_refuses_a_run_it_cannot_train(tmp_path, monkeypatch, overrides, trainer_kwargs, match):
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    kwargs = {"reward_funcs": lambda completions, **_: [0.0] * len(completions), **trainer_kwargs}
+    with pytest.raises(ValueError, match=match):
+        _run_generation_trainer(MLXGRPOTrainer(
+            _tiny_model(), DecodingTokenizer(), _grpo_rows(), args=_grpo_config(tmp_path, **overrides),
+            **kwargs), monkeypatch, [])
+
+
+@pytest.mark.parametrize("model,beta,provenance,synced", [
+    ("lora", 0.04, "plain_lora_base", []), ("full", 0.04, "parameter_snapshot", [2, 4]), ("full", 0.0, "reference_free", []),
+])
+def test_the_grpo_trainer_trains_logs_and_syncs_as_trl(tmp_path, monkeypatch, capsys, model, beta, provenance, synced):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+    from unsloth_zoo.mlx.utils import mlx_training_patches_active
+
+    seen, active, syncs, plans = [], [], [], []
+    make = trainer_module.create_grpo_batch_plan
+    monkeypatch.setattr(trainer_module, "create_grpo_batch_plan", lambda *a, **kw: plans.append(kw) or make(*a, **kw))
+
+    def length(prompts, completions, completion_ids, trainer_state, **kwargs):
+        seen.append((trainer_state, trainer_state.global_step, trainer_state.num_input_tokens_seen, kwargs["answer"]))
+        return [float(len(text)) for text in completions]
+
+    args = _grpo_config(tmp_path, max_steps=4, beta=beta, log_completions=True, num_completions_to_print=1,
+                        sync_ref_model=True, ref_model_sync_steps=2, ref_model_mixup_alpha=0.25,
+                        reward_weights=[2.0], max_completion_length=40,
+                        scale_rewards="batch", shuffle_dataset=False, seed=5, top_k=7,
+                        generation_kwargs={"temperature": 0.5})
+    args.include_num_input_tokens_seen = True  # the loop's own count must stay off
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trainer = MLXGRPOTrainer(_tiny_model(lora=model == "lora", tail=model == "full"),
+                                 DecodingTokenizer(), _grpo_rows(), args=args, reward_funcs=[length])
+    assert any("sync_ref_model has no effect" in str(w.message) for w in caught) is (not synced)
+    build = trainer._build_reference
+
+    def capture(*args, **kwargs):
+        policy, made = build(*args, **kwargs)
+        if policy is not None:
+            policy.sync = lambda model, alpha: syncs.append((trainer._global_step, alpha))
+        return policy, made
+
+    trainer._build_reference = capture
+    calls = []
+    _run_generation_trainer(trainer, monkeypatch, calls,
+                            probe=lambda _: active.append(mlx_training_patches_active()))
+    assert syncs == [(step, 0.25) for step in synced]
+    made = trainer._preference_reference_provenance
+    assert (made["kind"], made["objective"]) == (provenance, "grpo")
+    assert len(calls) == len(seen) == 4 and active == [False] * 4
+    assert all(state is trainer.state for state, *_ in seen) and [step for _, step, *_ in seen] == [0, 1, 2, 3]
+    assert seen[0][3] == [0, 0, 1, 1]  # the dataset column, unshuffled
+    logged = [entry for entry in trainer.state.log_history if "loss" in entry]
+    # Rewards see the count that already includes their own generation, as in TRL.
+    assert [entry["num_tokens"] for entry in logged] == [tokens for _, _, tokens, _ in seen] == [
+        16, 32, 48, trainer.state.num_input_tokens_seen]
+    for name in ("reward", "reward_std", "frac_reward_zero_std", "rewards/length/mean",
+                 "completions/mean_length", "completions/clipped_ratio", "clip_ratio/region_mean", "kl",
+                 "completion_length"):
+        assert name in logged[0], name
+    # A table per log, one row each, as num_completions_to_print asks.
+    printed = capsys.readouterr().out
+    assert printed.count("Prompt | Completion | length | Advantage") == 4
+    assert re.search(r"Step 1\nPrompt \| Completion \| length \| Advantage\n'[^\n]+' \| 'b' \| 1\.00 \| 0\.00\n  Step 2/", printed)
+    report = trainer._compile_shape_guard_report
+    assert report.action in ("exact", "bucket") and report.raw_widths == 2  # rungs 32 and 64
+    assert logged[0]["reward"] == 2.0 and plans[0]["sampling"].top_k == 7
+    # TRL samples at generation_kwargs' temperature but scores at args.temperature.
+    assert (plans[0]["sampling"].temperature, plans[0]["score_temperature"]) == (0.5, 1.0)
+    assert (plans[0]["scale_rewards"], plans[0]["shuffle"], plans[0]["seed"], plans[0]["with_reference"]) == (
+        "batch", False, 5, beta != 0)
+
+
+def test_a_grpo_run_resumes_by_generating_afresh_and_refuses_another_objective(tmp_path, monkeypatch):
+    import json
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    def build(beta=0.0):
+        args = _grpo_config(tmp_path, max_steps=3, save_steps=1, num_iterations=2, beta=beta)
+        return MLXGRPOTrainer(_tiny_model(), DecodingTokenizer(), _grpo_rows(), args=args,
+                              reward_funcs=lambda completions, **_: [0.0] * len(completions))
+
+    def resume(trainer, calls):
+        trainer.train = (lambda train: lambda: train(resume_from_checkpoint=str(checkpoint)))(trainer.train)
+        _run_generation_trainer(trainer, monkeypatch, calls)
+        return trainer
+
+    fresh, resumed, checkpoint = [], [], tmp_path / "checkpoint-1"
+    _run_generation_trainer(build(), monkeypatch, fresh)
+    trainer = resume(build(), resumed)
+    # Step 1 ends mid-generation; the resumed run samples again, at a new seed.
+    assert len(fresh) == 2 and len(resumed) == 1 and trainer.state.num_input_tokens_seen == 32
+    assert resumed[0]["requests"][0].sampling.seed != fresh[0]["requests"][0].sampling.seed
+    state_file = checkpoint / "trainer_state.json"
+    state = json.loads(state_file.read_text())
+    for provenance, match in (({"kind": "parameter_snapshot", "objective": "grpo"}, "reference mode"),
+                              ({"kind": "reference_free", "objective": "kto"}, "GRPO: checkpoint objective")):
+        state_file.write_text(json.dumps({**state, "preference_reference": provenance}))
+        with pytest.raises(ValueError, match=match):
+            resume(build(), [])

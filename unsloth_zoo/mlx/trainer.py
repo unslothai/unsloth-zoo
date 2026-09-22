@@ -36,6 +36,7 @@ Usage mirrors TRL notebooks:
     trainer.train()
 """
 
+from contextlib import contextmanager
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
 import collections
 import copy
@@ -652,6 +653,16 @@ from .preference import (
     resolve_preference_length_policy,
     warn_kto_weight_balance,
 )
+from .grpo import (
+    GRPOBatchPlan,
+    create_grpo_batch_plan,
+    format_completions,
+    grpo_objective,
+    grpo_reward_funcs,
+    grpo_sampling,
+    make_grpo_loss_fn,
+    resolve_grpo_config,
+)
 from .compile import (
     build_compile_policy,
     explain_compile_support,
@@ -686,13 +697,14 @@ from .shape_guard import (
 # Finite CPU-backed batch plans sharing one protocol (visit mapping,
 # __getitem__/materialize, __len__).
 _FINITE_BATCH_PLAN_TYPES = (
-    FiniteTextBatchPlan, FiniteVLMBatchPlan, FinitePreferenceBatchPlan,
+    FiniteTextBatchPlan, FiniteVLMBatchPlan, FinitePreferenceBatchPlan, GRPOBatchPlan,
 )
 # Plans a compile-failure fallback may refetch unpadded. The text plan rebuilds
-# from stored token ids and touches no RNG. The VLM plan reruns the caller's
-# processor, so a refetch would draw twice and offset every later batch; it
-# reuses the materialized batch instead, whose planned padding is masked.
-_EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan)
+# from stored token ids and touches no RNG, and the GRPO plan reuses its cached
+# generation. The VLM plan reruns the caller's processor, so a refetch would
+# draw twice and offset every later batch; it reuses the materialized batch
+# instead, whose planned padding is masked.
+_EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan, GRPOBatchPlan)
 
 
 def _eager_refetchable(batches):
@@ -1646,6 +1658,29 @@ class MLXTrainingConfig:
             "precompute_ref_batch_size",
             "desirable_weight",
             "undesirable_weight",
+            "num_generations",
+            "generation_batch_size",
+            "steps_per_generation",
+            "num_iterations",
+            "shuffle_dataset",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "repetition_penalty",
+            "generation_kwargs",
+            "epsilon",
+            "epsilon_high",
+            "delta",
+            "importance_sampling_level",
+            "scale_rewards",
+            "reward_weights",
+            "mask_truncated_completions",
+            "top_entropy_quantile",
+            "log_completions",
+            "num_completions_to_print",
+            "use_vllm",
+            "use_liger_loss",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1785,6 +1820,53 @@ class MLXKTOConfig(MLXTrainingConfig):
     generation_temperature: float = field(default=0.0, kw_only=True)
 
 
+@dataclass(init=False)
+class MLXGRPOConfig(MLXTrainingConfig):
+    """Configuration owned by MLXGRPOTrainer: TRL 0.24's GRPOConfig fields with
+    CUDA Unsloth's GRPO defaults and rewrites, resolved at construction as there.
+
+    ``top_k`` and ``min_p`` None switch those filters off, as TRL documents,
+    rather than falling back to the model's generation config.
+    ``max_prompt_length`` only warns: prompts are never truncated.
+    """
+
+    num_generations: int = field(default=8, kw_only=True)
+    max_prompt_length: int | None = field(default=None, kw_only=True)
+    max_completion_length: int = field(default=256, kw_only=True)
+    generation_batch_size: int | None = field(default=None, kw_only=True)
+    steps_per_generation: int | None = field(default=None, kw_only=True)
+    num_iterations: int = field(default=1, kw_only=True)
+    shuffle_dataset: bool = field(default=True, kw_only=True)
+    temperature: float = field(default=1.0, kw_only=True)
+    top_p: float = field(default=1.0, kw_only=True)
+    top_k: int | None = field(default=None, kw_only=True)
+    min_p: float | None = field(default=None, kw_only=True)
+    repetition_penalty: float = field(default=1.0, kw_only=True)
+    generation_kwargs: dict | None = field(default=None, kw_only=True)
+    beta: float = field(default=0.001, kw_only=True)
+    loss_type: str = field(default="bnpo", kw_only=True)
+    epsilon: float = field(default=0.2, kw_only=True)
+    epsilon_high: float | None = field(default=None, kw_only=True)
+    delta: float | None = field(default=None, kw_only=True)
+    importance_sampling_level: str = field(default="token", kw_only=True)
+    scale_rewards: str | bool | None = field(default="group", kw_only=True)
+    reward_weights: list[float] | None = field(default=None, kw_only=True)
+    mask_truncated_completions: bool = field(default=False, kw_only=True)
+    sync_ref_model: bool = field(default=False, kw_only=True)
+    ref_model_mixup_alpha: float = field(default=0.6, kw_only=True)
+    ref_model_sync_steps: int = field(default=512, kw_only=True)
+    disable_dropout: bool = field(default=False, kw_only=True)
+    top_entropy_quantile: float = field(default=1.0, kw_only=True)
+    log_completions: bool = field(default=False, kw_only=True)
+    num_completions_to_print: int | None = field(default=None, kw_only=True)
+    use_vllm: bool = field(default=False, kw_only=True)
+    use_liger_loss: bool = field(default=False, kw_only=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        resolve_grpo_config(self)
+
+
 def _shape_guard_report(
     action,
     reason,
@@ -1880,6 +1962,13 @@ def _mlx_microstep_for_step(global_step, epoch_microbatches, grad_accum):
     return epochs_done * epoch_microbatches + min(
         steps_into_epoch * grad_accum, epoch_microbatches,
     )
+
+
+def _mlx_resume_microstep(global_step, epoch_microbatches, grad_accum):
+    """The first micro-batch a run resumed at ``global_step`` fetches."""
+    if epoch_microbatches:
+        return _mlx_microstep_for_step(global_step, epoch_microbatches, grad_accum)
+    return global_step * grad_accum
 
 
 def _mlx_microstep_phase(
@@ -2346,7 +2435,7 @@ def _plan_single_process_text_shapes(
         return None, _shape_guard_report(
             "not_applicable", "compile_disabled", cap,
         ), True, None
-    if not isinstance(batches, (FiniteTextBatchPlan, FinitePreferenceBatchPlan)):
+    if not isinstance(batches, (FiniteTextBatchPlan, FinitePreferenceBatchPlan, GRPOBatchPlan)):
         report = _shape_guard_report(
             "eager", "unsupported_batch_plan", cap, compile_scope,
             lazy_batches=False,
@@ -2401,15 +2490,22 @@ def _plan_single_process_text_shapes(
         # epoch-permuted plans.
         batch_index = batches.batch_index_for_visit(microstep)
         family = batches.batch_family(batch_index)
-        width = batches.batch_width(batch_index)
         phase = _mlx_microstep_phase(
             compile_scope,
             grad_accum,
             microstep,
             epoch_microbatches,
         )
-        key = (family, width, phase, len(batches.schedule[batch_index]))
-        event_counts[key] = event_counts.get(key, 0) + 1
+        if isinstance(batches, GRPOBatchPlan):
+            # A rollout's width is known only once it is sampled, so the visit
+            # counts once at every width its generation can reach.
+            widths, rows = batches.width_rungs(batch_index), batches.batch_size
+        else:
+            widths = (batches.batch_width(batch_index),)
+            rows = len(batches.schedule[batch_index])
+        for width in widths:
+            key = (family, width, phase, rows)
+            event_counts[key] = event_counts.get(key, 0) + 1
     events = tuple(
         TextShapeEvent(
             family=family,
@@ -2518,6 +2614,16 @@ def _preference_report(loss_fn, summed):
     )
 
 
+@contextmanager
+def _training_patches_paused():
+    # Rollouts sample as inference does, off the routers' training paths.
+    paused = pause_mlx_training_patches()
+    try:
+        yield
+    finally:
+        resume_mlx_training_patches(paused)
+
+
 def _warn_resume_adapter_mismatch(model, adapter_file):
     """Say so when a checkpoint does not cover the LoRA modules now wrapped.
 
@@ -2593,6 +2699,9 @@ class MLXTrainer:
             self.preference_kind == "dpo" and not bool(args.reference_free)
         )
 
+    def _syncs_reference(self, args):
+        return self._uses_reference(args) and bool(getattr(args, "sync_ref_model", False))
+
     def _reference_adapter_names(self, args):
         return (
             getattr(args, "model_adapter_name", None),
@@ -2624,7 +2733,7 @@ class MLXTrainer:
             model_adapter_name=model_adapter_name,
             ref_model=getattr(self, "ref_model", None),
             force_use_ref_model=bool(getattr(args, "force_use_ref_model", False)),
-            sync_ref_model=bool(getattr(args, "sync_ref_model", False)),
+            sync_ref_model=self._syncs_reference(args),
             objective_name=self.preference_kind.upper(),
         )
 
@@ -6161,10 +6270,7 @@ class MLXTrainer:
 
         _resume_step = 0
         _reference = None
-        _sync_reference = (
-            preference_kind == "dpo" and not bool(args.reference_free)
-            and bool(getattr(args, "sync_ref_model", False))
-        )
+        _sync_reference = self._syncs_reference(args)
         _sync_every = int(args.ref_model_sync_steps) if _sync_reference else 0
         _sync_alpha = float(args.ref_model_mixup_alpha) if _sync_reference else 0.0
         ts = {}
@@ -6202,12 +6308,20 @@ class MLXTrainer:
                     raise ValueError(
                         "Unsloth MLX DPO: checkpoint reference mode does not match."
                     )
-                if preference_kind == "kto":
+                if preference_kind in ("kto", "grpo"):
                     resume_provenance = dict(resume_provenance)
-                    if resume_provenance.pop("objective", None) != "kto":
+                    if resume_provenance.pop("objective", None) != preference_kind:
                         raise ValueError(
-                            "Unsloth MLX KTO: checkpoint objective does not match."
+                            f"Unsloth MLX {preference_kind.upper()}: checkpoint "
+                            "objective does not match."
                         )
+                if (
+                    preference_kind == "grpo" and not self._uses_reference(args)
+                    and resume_provenance != {"kind": "reference_free"}
+                ):
+                    raise ValueError(
+                        "Unsloth MLX GRPO: checkpoint reference mode does not match."
+                    )
                 if self._uses_reference(args):
                     # Built before the checkpoint hydrates the model.
                     _reference = self._build_reference(
@@ -6353,6 +6467,18 @@ class MLXTrainer:
                     f"Unsloth: Using KTO loss (beta={args.beta}, "
                     f"loss_type={objective.loss_types[0]})."
                 )
+            elif preference_kind == "grpo":
+                objective = grpo_objective(args)
+                if _reference is None:
+                    _reference = self._build_reference(model, resume_provenance=None)
+                reference_policy, provenance = _reference
+                self._preference_reference_provenance = {**provenance, "objective": "grpo"}
+                _sampling_reference = reference_policy
+                loss_fn = make_grpo_loss_fn(objective)
+                _main_print(
+                    f"Unsloth: Using GRPO loss (beta={objective.beta}, "
+                    f"loss_type={objective.loss_type})."
+                )
             else:
                 objective = resolve_preference_objective(
                     "dpo",
@@ -6381,16 +6507,19 @@ class MLXTrainer:
                 model, enabled=bool(getattr(args, "disable_dropout", True)),
             )
             # Not the training loss: that one normalizes across a window.
-            preference_eval_fn = make_preference_eval_fn(
-                objective, reference_policy=_sampling_reference,
-                model=model if args.use_cce else None,
-            )
+            if preference_kind != "grpo":
+                preference_eval_fn = make_preference_eval_fn(
+                    objective, reference_policy=_sampling_reference,
+                    model=model if args.use_cce else None,
+                )
             if isinstance(batches, FinitePreferenceBatchPlan):
                 batches.configure_cce_compaction(
                     getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
                 )
+        # GRPO scores its reference when it generates, outside the compiled step.
         _reference_compile_state = (
-            [] if _sampling_reference is None else [_sampling_reference.state]
+            [] if _sampling_reference is None or preference_kind == "grpo"
+            else [_sampling_reference.state]
         )
 
         self.callback_handler.optimizer = optimizer
@@ -6403,6 +6532,13 @@ class MLXTrainer:
         self._restore_callback_states(
             getattr(self, "_resume_stateful_callbacks", None) or {}
         )
+        if preference_kind == "grpo":
+            batches.bind(
+                model, self.reward_funcs, trainer_state=self.state,
+                reward_weights=args.reward_weights, reference_policy=_sampling_reference,
+                rollout_context=_training_patches_paused,
+                keep_completions=bool(args.log_completions),
+            )
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
@@ -7342,7 +7478,8 @@ class MLXTrainer:
         # entirely. The remaining values select the counting MODE ("non_padding"
         # vs "all"/True). Read once so the branch is identical on every rank.
         input_token_mode = getattr(args, "include_num_input_tokens_seen", False)
-        track_input_tokens = input_token_mode not in ("no", False)
+        # GRPO counts its prompt and completion tokens as it generates, as TRL does.
+        track_input_tokens = input_token_mode not in ("no", False) and preference_kind != "grpo"
         # HF reads the pad id off self.processing_class for the "non_padding"
         # fallback; this trainer's processing class is processor-or-tokenizer.
         input_token_pad_id = getattr(
@@ -7545,6 +7682,12 @@ class MLXTrainer:
                 )
                 mx.eval(summed_stats)
                 logs.update(_preference_report(loss_fn, summed_stats.tolist()))
+            if isinstance(batches, GRPOBatchPlan):
+                logs.update(batches.pop_metrics())
+                if args.log_completions and batches.completions is not None:
+                    _main_print(format_completions(
+                        batches.completions, current_step, args.num_completions_to_print,
+                    ))
             # HF's Trainer.log stamps the epoch onto every payload, so a persisted
             # log_history entry keeps it after state.epoch has moved on.
             if self.state.epoch is not None:
@@ -8024,12 +8167,9 @@ class MLXTrainer:
         # micro-batches, so rebuild the cursor per epoch like HF does; otherwise
         # the resume skips the next epoch's opening micro-batch and cycles into
         # a pass num_train_epochs never authorised.
-        if _epoch_flush_microbatches:
-            _resume_microstep = _mlx_microstep_for_step(
-                _resume_step, _epoch_flush_microbatches, grad_accum,
-            )
-        else:
-            _resume_microstep = _resume_step * grad_accum
+        _resume_microstep = _mlx_resume_microstep(
+            _resume_step, _epoch_flush_microbatches, grad_accum,
+        )
         batch_idx = _resume_microstep
 
         # Streaming mode: fast-forward the iterator to the resume position.
@@ -9334,20 +9474,6 @@ class MLXTrainer:
                     raise ValueError(
                         "Unsloth MLX DPO: label_smoothing must be in [0, 0.5)."
                     )
-                if bool(getattr(args, "sync_ref_model", False)) and not bool(
-                    args.reference_free
-                ):
-                    alpha = float(args.ref_model_mixup_alpha)
-                    if not math.isfinite(alpha) or not 0 <= alpha <= 1:
-                        raise ValueError(
-                            "Unsloth MLX DPO: ref_model_mixup_alpha must be in "
-                            "[0, 1]."
-                        )
-                    if int(args.ref_model_sync_steps) < 1:
-                        raise ValueError(
-                            "Unsloth MLX DPO: ref_model_sync_steps must be at "
-                            "least 1."
-                        )
                 if bool(getattr(args, "precompute_ref_log_probs", False)) and not bool(
                     args.reference_free
                 ) and bool(getattr(args, "sync_ref_model", False)):
@@ -9355,6 +9481,18 @@ class MLXTrainer:
                         "Unsloth MLX DPO: precompute_ref_log_probs scores "
                         "the reference once, and sync_ref_model moves it "
                         "during the run. Use one of the two."
+                    )
+            if self._syncs_reference(args):
+                alpha = float(args.ref_model_mixup_alpha)
+                if not math.isfinite(alpha) or not 0 <= alpha <= 1:
+                    raise ValueError(
+                        f"Unsloth MLX {self.preference_kind.upper()}: "
+                        "ref_model_mixup_alpha must be in [0, 1]."
+                    )
+                if int(args.ref_model_sync_steps) < 1:
+                    raise ValueError(
+                        f"Unsloth MLX {self.preference_kind.upper()}: "
+                        "ref_model_sync_steps must be at least 1."
                     )
             if bool(getattr(args, "precompute_ref_log_probs", False)) and self._uses_reference(args):
                 chunk = getattr(args, "precompute_ref_batch_size", None)
@@ -9380,6 +9518,10 @@ class MLXTrainer:
                 if args.max_steps <= 0 and args.num_train_epochs > 0 else None
             )
             self._prepared_batches_include_epochs = preference_epochs is not None
+            if self.preference_kind == "grpo":
+                return self._create_grpo_plan(
+                    train_dataset, total_batches_needed, preference_epochs,
+                ), None
             if self.preference_kind == "kto":
                 return create_kto_batch_plan(
                     train_dataset,
@@ -9925,6 +10067,89 @@ class MLXKTOTrainer(MLXTrainer):
 
     def _reference_adapter_names(self, args):
         return self.model_adapter_name, self.ref_adapter_name
+
+
+class MLXGRPOTrainer(MLXTrainer):
+    """MLX trainer for Group Relative Policy Optimization of a text model, as
+    TRL's GRPOTrainer trains one on CUDA Unsloth. ``reward_funcs`` are callables
+    TRL's way: called with ``prompts``, ``completions``, ``completion_ids``,
+    every other dataset column and ``trainer_state``, returning one reward (or
+    None) per completion. The reference for ``beta != 0`` is the model with its
+    adapters disabled, or its starting weights for a full fine-tune."""
+
+    config_class = MLXGRPOConfig
+    preference_kind = "grpo"
+
+    def __init__(self, *args, reward_funcs, reward_processing_classes=None, **kwargs):
+        if reward_processing_classes is not None:
+            raise ValueError(
+                "Unsloth MLX GRPO: reward_processing_classes tokenize for reward "
+                "models, which are not supported."
+            )
+        self.reward_funcs = grpo_reward_funcs(reward_funcs)
+        super().__init__(*args, **kwargs)
+        args = self.args
+        if self.eval_dataset is not None:
+            raise ValueError("Unsloth MLX GRPO: evaluation is not supported yet.")
+        if args.reward_weights is not None and len(args.reward_weights) != len(self.reward_funcs):
+            raise ValueError(
+                f"Unsloth MLX GRPO: {len(args.reward_weights)} reward_weights for "
+                f"{len(self.reward_funcs)} reward functions."
+            )
+        max_tokens = grpo_sampling(args).max_tokens
+        if max_tokens >= args.max_seq_length:
+            raise ValueError(
+                f"Unsloth MLX GRPO: completions of up to {max_tokens} tokens leave no "
+                f"room for a prompt within max_seq_length={args.max_seq_length}."
+            )
+        if args.sync_ref_model and not self._syncs_reference(args):
+            import warnings
+            warnings.warn(
+                "Unsloth MLX GRPO: sync_ref_model has no effect here: with beta=0 "
+                "there is no reference, and with adapters the reference is the base "
+                "model with them disabled, as on CUDA Unsloth.",
+                stacklevel=2,
+            )
+
+    def _uses_reference(self, args):
+        return float(args.beta) != 0.0
+
+    def _syncs_reference(self, args):
+        adapted = next(iter_mlx_lora_modules(self.model), None) is not None
+        return super()._syncs_reference(args) and not adapted
+
+    def _create_grpo_plan(self, dataset, num_batches, num_epochs):
+        args = self.args
+        if args.dataset_order != "default" or args.preserve_dataset_order:
+            raise ValueError(
+                "Unsloth MLX GRPO: prompts are ordered as TRL's RepeatSampler orders "
+                "them; set shuffle_dataset=False for dataset order."
+            )
+        plan = create_grpo_batch_plan(
+            dataset, self.tokenizer, num_generations=args.num_generations,
+            batch_size=args.per_device_train_batch_size,
+            steps_per_generation=args.steps_per_generation,
+            num_iterations=args.num_iterations,
+            grad_accum=args.gradient_accumulation_steps, sampling=grpo_sampling(args),
+            score_temperature=args.temperature,
+            max_seq_length=args.max_seq_length, scale_rewards=args.scale_rewards,
+            mask_truncated_completions=args.mask_truncated_completions,
+            with_reference=self._uses_reference(args),
+            max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
+            seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
+        )
+        # A resumed run generates at once, so its widths are planned from there.
+        resume = getattr(self, "_resume_from_checkpoint", None)
+        if resume:
+            _require_complete_resume_checkpoint(resume)
+            plan.start_at(_mlx_resume_microstep(
+                int(load_trainer_state(resume).get("global_step", 0)),
+                _mlx_epoch_microbatches(
+                    args, plan, includes_epochs=self._prepared_batches_include_epochs,
+                ),
+                args.gradient_accumulation_steps,
+            ))
+        return plan
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
