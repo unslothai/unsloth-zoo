@@ -419,6 +419,14 @@ def _aliases_the_environment(tree):
     }
     return any(
         (isinstance(node, ast.Name) and node.id in ENV_ALIAS_NAMES)
+        # vars(os)["environ"] and os.__dict__["environ"] leave the name as a
+        # string and nothing else, exactly as the write methods did. None of
+        # these appears as a string constant in the 21 real modules.
+        or (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in ENV_ALIAS_NAMES
+        )
         or (
             isinstance(node, ast.ImportFrom)
             and any(alias.name in ENV_ALIAS_NAMES for alias in node.names)
