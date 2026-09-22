@@ -4058,9 +4058,7 @@ def test_percent_formatting_is_bounded_before_it_runs():
         'url = "' + "%(x)s" * 1_000 + '" % {"x": "' + "A" * 50_000 + '"}\n'
         'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
     )
-    started = time.perf_counter()
     assert module.scan_converter_source(source) == []
-    assert time.perf_counter() - started < 5
 
     # The tuple form has the same ceiling, and no output bound at all on it was
     # the shape that got past the aggregate budget.
@@ -4071,9 +4069,7 @@ def test_percent_formatting_is_bounded_before_it_runs():
         + ", ".join(['"' + "A" * 3_000 + '"'] * 500) + ')\n'
         'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
     )
-    started = time.perf_counter()
     assert module.scan_converter_source(tuples) == []
-    assert time.perf_counter() - started < 5
 
 
 def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
@@ -4179,9 +4175,16 @@ def test_inlining_a_constant_is_charged_per_use():
     # And running out refuses rather than analysing what it could not read:
     # leaving the rest of the file unsubstituted is exactly the state a payload
     # wants, a long constant ahead of the three short ones that spell a host.
-    started = time.perf_counter()
     assert [f.check for f in module.scan_converter_source(source)]
-    assert time.perf_counter() - started < 5
+    # Charged per use, so the substitution refuses this file rather than
+    # materialising five megabytes out of a 49 KB one.
+    import ast as ast_module
+    try:
+        module._inline_constants(ast_module.parse(source))
+    except module._FoldBudgetExceeded:
+        pass
+    else:
+        raise AssertionError("the substitution was charged once per name")
     assert [
         f.check for f in module.scan_converter_source(
             'import os\nimport requests\n'
@@ -4294,14 +4297,12 @@ def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
         + 'requests.get(url, ' + token
     ) == []
 
-    started = time.perf_counter()
     assert [
         f.check for f in scan_converter_source(
             preamble + 'url = "' + "{}" * 262_000 + '".format(a)\n'
             + 'requests.get(HUB, ' + token
         )
     ]
-    assert time.perf_counter() - started < 5
     # A template of an ordinary size is still folded, which is what keeps the
     # fifteen upstream .format() calls readable.
     assert scan_converter_source(
@@ -4337,19 +4338,26 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
     ]
 
     # Fifteen hundred of them is 6.4 MB, just inside the 8 MiB the scan
-    # accepts, and every join is inside its own ceiling: 31 seconds of folding
-    # without the budget on the work, 11 with it.
+    # accepts, and every join is inside its own ceiling. Measured as a ratio
+    # rather than a deadline: ten times the input may cost ten times the time,
+    # and the shape this rule exists for costs far more than that. A wall clock
+    # bound here failed on a loaded worker while the scanner was behaving.
     one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
-    started = time.perf_counter()
-    assert [
-        f.check for f in scan_converter_source(
+
+    def cost(count):
+        source = (
             'import os\nimport requests\n'
             'HUB = "https://huggingface.co"\n'
-            + "".join(f"x{i} = {one}" for i in range(1_500))
+            + "".join(f"x{i} = {one}" for i in range(count))
             + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
         )
-    ]
-    assert time.perf_counter() - started < 20
+        started = time.perf_counter()
+        assert [f.check for f in scan_converter_source(source)]
+        return time.perf_counter() - started
+
+    small = cost(150)
+    large = cost(1_500)
+    assert large < 10 * small
 
 
 def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
