@@ -55,3 +55,27 @@ def test_triton_backend_is_skipped_for_interleaved_gate_up(monkeypatch, name, in
     experts.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4))
     moe_utils.forward_moe_backend(experts, torch.zeros(1, 4), torch.zeros(1, 1, dtype = torch.long), torch.ones(1, 1))
     assert calls == (["loop"] if interleaved else ["triton"])
+
+
+@pytest.mark.parametrize("quant", ["bnb4bit", "fp8"])
+@pytest.mark.parametrize("name, interleaved", [("GptOssExperts", True), ("Qwen3MoeExperts", False)])
+def test_quantized_dispatchers_skip_triton_for_interleaved_gate_up(monkeypatch, quant, name, interleaved):
+    from unsloth_zoo.temporary_patches import moe_utils_bnb4bit, moe_utils_fp8
+
+    calls = []
+    monkeypatch.setattr(moe_utils, "select_moe_backend", lambda: "unsloth_triton")
+    monkeypatch.setattr(moe_utils, "forward_triton_grouped_gemm", lambda *a: calls.append("triton"))
+    monkeypatch.setattr(moe_utils, "forward_native_moe_loop", lambda *a: calls.append("loop"))
+    experts = type(name, (nn.Module,), {})()
+    experts.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4))
+    experts.down_proj = nn.Parameter(torch.zeros(2, 4, 4))
+    dense = torch.zeros(2, 8, 4)
+    if quant == "bnb4bit":
+        monkeypatch.setattr(moe_utils_bnb4bit, "_dequantize_bnb4bit_expert_weights", lambda w, dtype: dense)
+        dispatch = moe_utils_bnb4bit.forward_moe_backend_bnb4bit
+    else:
+        monkeypatch.setattr(moe_utils_fp8, "_get_moe_weight_and_quant_info", lambda m, n: (dense, None, None))
+        monkeypatch.setattr(moe_utils_fp8, "_dequantize_full_expert_weights", lambda *a, **k: dense)
+        dispatch = moe_utils_fp8.forward_moe_backend_fp8
+    dispatch(experts, torch.zeros(1, 4), torch.zeros(1, 1, dtype = torch.long), torch.ones(1, 1))
+    assert calls == (["loop"] if interleaved else ["triton"])

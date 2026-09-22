@@ -353,6 +353,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
         swap_moe_weights_for_call,
+        _gate_up_is_interleaved,
         _moe_recompute_default,
     )
 
@@ -387,7 +388,8 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     if backend == "grouped_mm":
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-grouped_mm.")
         forward_fn = forward_native_grouped_mm
-    elif backend == "unsloth_triton":
+    # Interleaved gate_up (GPT-OSS) has no Triton path; the eager loop implements it.
+    elif backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-Triton grouped GEMM.")
         forward_fn = forward_triton_grouped_gemm
     else:
