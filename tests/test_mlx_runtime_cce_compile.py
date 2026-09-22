@@ -720,3 +720,110 @@ def test_runtime_cce_backward_peak_memory(quantized, budget_mib):
     peak = mx.get_peak_memory() - resident
     assert mx.isfinite(result[0]).item()
     assert peak < budget_mib * 1024**2, f"CCE backward used {peak / 1024**2:.2f} MiB"
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 5.0])
+def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, softcap):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        # precompute_hidden_gradient is admitted only when the Metal kernels exist, so
+        # off Metal the loss-only path is returned and `calls == [1]` fails rather than
+        # skips. The silent fallback is the documented contract, not a defect.
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    mx.random.seed(5)
+    hidden = mx.random.normal((67, 64)) * 0.5
+    weight = mx.random.normal((4099, 64)) * 0.3
+    # Targets in every chunk, ignored rows, and one out-of-range label.
+    targets = mx.where(mx.arange(67) % 11 == 7, -100, (mx.arange(67) * 613) % 4099)
+    targets = mx.where(mx.arange(67) == 30, 4099, targets)
+    cotangent = mx.linspace(-0.7, 0.9, 67)
+    if quantized:
+        head = mx.quantize(weight, group_size=64, bits=4)
+        weight = mx.dequantize(*head, group_size=64, bits=4)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            quantized=True, group_size=64, bits=4, chunk_size=1024, logit_softcap=softcap,
+            precompute_hidden_gradient=True)[0]
+    else:
+        head = (weight,)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            weight_is_frozen=True, chunk_size=1024, logit_softcap=softcap, precompute_hidden_gradient=True)[0]
+    reference = runtime_cce.make_chunked_cross_entropy_loss(chunk_size=1024, logit_softcap=softcap)[0]
+
+    def run(fn, h, y, g, *args):
+        return mx.value_and_grad(lambda x: (fn(x, *args, y) * g).sum())(h)
+
+    calls, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(runtime_cce, "_forward_with_hidden_gradient",
+                        lambda *args, **kwargs: (calls.append(1), forward(*args, **kwargs))[1])
+    actual = run(loss, hidden, targets, cotangent, *head)
+    mx.eval(actual)
+    assert calls == [1]
+    compiled = mx.compile(lambda *args: run(loss, *args))(hidden, targets, cotangent, *head)
+    expected = run(reference, hidden, targets, cotangent, mx.stop_gradient(weight))
+    mx.eval(compiled, expected)
+    assert mx.array_equal(loss(hidden, *head, targets), reference(hidden, weight, targets), equal_nan=True).item()
+    for got in (actual, compiled):
+        assert mx.all(mx.isnan(got[1][30])).item()
+        assert mx.allclose(got[1], expected[1], atol=2e-6, rtol=0, equal_nan=True).item()
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, frozen):
+    """The dense VLM loss must tell the runtime whether the head is trainable.
+
+    This lives here rather than beside the other VLM tests because that file runs on
+    the torch shim, whose Module.freeze/unfreeze are `return self` no-ops
+    (tests/mlx_simulation/mlx_nn_stub.py). Under the shim trainable_parameters() still
+    reports lm_head.weight, so the freeze below cannot be read back and the frozen case
+    can never be observed. Real MLX runs the whole chain: freeze -> trainable_parameters
+    -> _is_lm_head_trainable -> _skip_weight_grad -> weight_is_frozen.
+    """
+    _skip_torch_shim()
+    from unsloth_zoo.mlx import utils as U
+
+    class _Backbone(U.nn.Module):
+        pass
+
+    class _LM(U.nn.Module):
+        def __call__(self, x):
+            return x
+
+    class _VLM(U.nn.Module):
+        def __init__(self):
+            super().__init__()
+            backbone = _Backbone()
+            backbone.embed_tokens = U.nn.Embedding(96, 32)
+            language_model = _LM()
+            language_model.model = backbone
+            language_model.lm_head = U.nn.Linear(32, 96, bias=False)
+            self.language_model = language_model
+
+        def get_input_embeddings(self):
+            return None
+
+    model = _VLM()
+    if frozen:
+        adapter = U.nn.Linear(32, 32)
+        adapter.lora_a = U.mx.zeros((4, 32))
+        adapter.lora_b = U.mx.zeros((32, 4))
+        model.language_model.model.proj = adapter
+        model.freeze()
+        adapter.unfreeze(keys=["lora_a", "lora_b"])
+    # The derivation is left real. Pinning it here would only re-assert the literal
+    # `frozen` and would stop the nested `language_model.lm_head` head-prefix
+    # resolution from being covered at all.
+    assert U._is_lm_head_trainable(model) is (not frozen)
+
+    factories = []
+    monkeypatch.setattr(U, "_get_runtime_cce", lambda **kwargs: factories.append(kwargs))
+    U.make_vlm_cce_loss_fn(model)
+    assert {kwargs.get("weight_is_frozen") for kwargs in factories} == {frozen}
+    # A frozen head also builds the training-mode runtime that precomputes the hidden
+    # gradient, which is this PR's actual optimisation. Ordered, not collapsed to a set:
+    # a bare set would still pass with the training arm deleted outright.
+    assert [kwargs.get("precompute_hidden_gradient") for kwargs in factories] == (
+        [None, True] if frozen else [None]
+    )
