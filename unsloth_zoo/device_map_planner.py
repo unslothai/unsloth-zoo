@@ -1666,14 +1666,8 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
 
 
 def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
-    """A copy of ``config`` with the loader's config overrides applied.
-
-    Mirrors what ``PretrainedConfig.from_dict`` does with the leftover kwargs of
-    ``AutoConfig.from_pretrained``: ``dtype`` / ``torch_dtype`` unless "auto",
-    and any other key the config already has. Hub options are not config fields
-    and are dropped. Copied so the caller's config, which the load itself uses
-    next, is never edited by the planner.
-    """
+    """A copy of ``config`` with the loader's overrides applied, as
+    ``PretrainedConfig.from_dict`` does. Hub options are dropped."""
     import copy
 
     config = copy.deepcopy(config)
@@ -1682,7 +1676,7 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
     if dtype is None:
         dtype = overrides.get("torch_dtype", None)
     if isinstance(dtype, Mapping):
-        # The per-module form: from_pretrained loads every module in the "" entry's dtype.
+        # Per-module form: from_pretrained uses the "" entry's dtype
         import torch
 
         dtype = dtype.get("", torch.get_default_dtype())
@@ -1701,8 +1695,7 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
         if not hasattr(config, key):
             continue
         current = getattr(config, key)
-        # A partial dict for a sub-config (text_config = {...}) is merged into it, as
-        # PretrainedConfig.from_dict does, instead of replacing the config object.
+        # Merge a partial sub-config dict instead of replacing the config object
         if isinstance(value, Mapping) and hasattr(current, "to_dict") and not isinstance(current, Mapping):
             setattr(config, key, _merge_sub_config(current, value))
             continue
@@ -1711,12 +1704,8 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
 
 
 def _merge_sub_config(current: Any, override: Mapping[str, Any]) -> Any:
-    """``current`` (a config object) with ``override`` merged in at any depth.
-
-    Rebuilt from ``to_dict()`` as the same class at every level, as
-    ``PretrainedConfig.from_dict`` does, so fields ``__init__`` / ``__post_init__``
-    derive (``layer_types`` from ``num_hidden_layers``) are regenerated and nested
-    sub-configs stay config objects."""
+    """``current`` with ``override`` merged in at any depth. Rebuilt as the same class
+    so derived fields (``layer_types``) are regenerated."""
     merged = current.to_dict()
     for key, value in override.items():
         child = getattr(current, key, None)
@@ -1726,7 +1715,7 @@ def _merge_sub_config(current: Any, override: Mapping[str, Any]) -> Any:
     try:
         return current.__class__(**merged)
     except Exception:
-        # A class that cannot be rebuilt from its own dict keeps the in-place update.
+        # Cannot be rebuilt from its own dict, so update in place
         for key, value in override.items():
             child = getattr(current, key, None)
             if isinstance(value, Mapping) and hasattr(child, "to_dict") and not isinstance(child, Mapping):
@@ -1753,12 +1742,8 @@ def build_meta_model(
     the way the loader honours them, so runtime quantisation of a full-precision
     checkpoint is sized as it will really be loaded.
 
-    ``config`` is the config the load will really use, when that is not the one
-    ``model_name_or_path`` describes: a text-only load of a vision-language
-    checkpoint builds the decoder from ``text_config`` alone, with module names
-    (``model.layers.0``) the full model does not have (``model.language_model
-    .layers.0``). Planning the repo's own config there sizes a vision tower that
-    is never built and names modules the load cannot place.
+    ``config`` overrides the repo's config, eg the ``text_config`` of a text-only
+    load of a vision-language checkpoint.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
@@ -1942,9 +1927,7 @@ def plan_device_map_for_pretrained(
     :func:`build_meta_model`, so a full-precision checkpoint you intend to load
     quantised is sized as it will really be loaded.
 
-    ``config`` plans the model the load builds from an already resolved config
-    (for example the text decoder of a vision-language repo) instead of the
-    repo's own; see :func:`build_meta_model`.
+    ``config`` plans from an already resolved config; see :func:`build_meta_model`.
     """
     if len(_usable_devices(max_memory)) < 2:
         return None

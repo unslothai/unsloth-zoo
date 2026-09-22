@@ -2,14 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""The planner can plan from a resolved config instead of the repo's own.
-
-A text_only load of a vision-language checkpoint builds the standalone decoder from
-``text_config``: ``model.layers.0``, no vision tower. Rebuilt from the repo name the
-planner describes the whole VLM (``model.language_model.layers.0``), so Unsloth had to
-decline, and the "sequential" fallback fills GPU 0 to its whole budget. On a 7 card
-Qwen3.5-397B-A17B-FP8 load that left no room for the per-layer FP8 expert merge and
-the load died with an OOM on GPU 1.
+"""The planner can plan from a resolved config (eg a VLM's text_config) instead of the repo's own.
 
 Meta-device models only: no GPU, no weights, no network.
 """
@@ -135,8 +128,7 @@ def test_dtype_wins_over_torch_dtype_in_either_order():
 
 
 def test_a_per_module_dtype_mapping_resolves_to_its_main_dtype():
-    # from_pretrained loads every module in the "" entry's dtype; a dict left on the
-    # config breaks meta-model construction.
+    # from_pretrained uses the "" entry's dtype; a dict left on the config breaks the meta model
     config = _tiny_vlm_config().get_text_config()
     out = planner._apply_config_overrides(config, {"dtype": {"": torch.bfloat16, "text_config": torch.float16}})
     assert out.torch_dtype == torch.bfloat16
@@ -172,9 +164,7 @@ def test_a_nested_sub_config_override_keeps_every_level_a_config():
 
 
 def test_a_sub_config_override_regenerates_derived_fields():
-    # Gemma3TextConfig derives layer_types from num_hidden_layers at construction; an
-    # override that resets it must come back rebuilt, as from_pretrained does, or the
-    # meta model indexes None.
+    # layer_types is derived from num_hidden_layers and must be rebuilt, not left None
     config = _tiny_vlm_config()
     out = planner._apply_config_overrides(config, {"text_config": {"num_hidden_layers": 2, "layer_types": None}})
     assert out.text_config.num_hidden_layers == 2
