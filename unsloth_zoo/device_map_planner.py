@@ -1665,7 +1665,12 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     return quantization_config
 
 
-def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
+def build_meta_model(
+    model_name_or_path: str,
+    *,
+    config: Any = None,
+    **from_pretrained_kwargs: Any,
+):
     """Instantiate the model on the meta device, quantiser included.
 
     Returns ``(model, hf_quantizer, config)``. Costs no GPU memory and no weight
@@ -1674,12 +1679,21 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` are honoured
     the way the loader honours them, so runtime quantisation of a full-precision
     checkpoint is sized as it will really be loaded.
+
+    ``config`` is the config object the load will really use, when the caller has
+    already prepared one that differs from the repo's ``config.json``. The loader
+    hands one over for a compressed-tensors packed INT4 checkpoint it re-quantizes
+    to bitsandbytes on the fly: it has dropped the checkpoint's own quantization
+    config, and rebuilding from the name here would put it back, at which point
+    ``merge_quantization_configs`` refuses the bitsandbytes runtime config and the
+    plan is lost. Without it the config is rebuilt from the name as before.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
     runtime_qcfg = _runtime_quantization_config(from_pretrained_kwargs)
-    config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
+    if config is None:
+        config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
     trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
     auto_cls = _auto_class_for(config, trust_remote_code=trust_remote_code)
     hf_quantizer = None
@@ -1863,7 +1877,8 @@ def plan_device_map_for_pretrained(
 
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` pass through to
     :func:`build_meta_model`, so a full-precision checkpoint you intend to load
-    quantised is sized as it will really be loaded.
+    quantised is sized as it will really be loaded, and so does ``config`` for a
+    caller that already holds the config object the load will use.
     """
     if len(_usable_devices(max_memory)) < 2:
         return None

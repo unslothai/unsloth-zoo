@@ -110,3 +110,30 @@ def test_pack_quantized_int4_is_sized_at_its_packed_bytes():
     bf16_linears = linear_params * 2
     assert plain - packed > bf16_linears * 0.6, (plain, packed, bf16_linears)
     assert packed < plain
+
+
+def test_a_prepared_config_replaces_the_one_rebuilt_from_the_name():
+    """A loader that re-quantizes a packed INT4 checkpoint to bitsandbytes on the fly drops the
+    checkpoint's own quantization config first. Rebuilding from the name would put it back and
+    `merge_quantization_configs` then refuses the bitsandbytes runtime config, so the plan was
+    lost (Kimi-K2.7-Code fell back to "sequential"). Handing the prepared config over sizes the
+    model as the bitsandbytes load really allocates it."""
+    from transformers import AutoConfig
+
+    with tempfile.TemporaryDirectory() as d:
+        _write_config(d, quantized = True)
+        prepared = AutoConfig.from_pretrained(d)
+        del prepared.quantization_config
+        with pytest.raises(ValueError, match = "CompressedTensorsConfig"):
+            build_meta_model(d, dtype = torch.bfloat16, load_in_4bit = True)
+        model, hf_quantizer, config = build_meta_model(
+            d, config = prepared, dtype = torch.bfloat16, load_in_4bit = True
+        )
+    assert config is prepared
+    assert type(hf_quantizer).__name__ == "Bnb4BitHfQuantizer"
+    q_proj = model.model.layers[0].self_attn.q_proj
+    assert type(q_proj).__name__ == "Linear4bit", type(q_proj)
+    sizes = _compute_module_sizes(model, hf_quantizer)
+    linear_params = _LAYERS * (4 * _HIDDEN * _HIDDEN + 3 * _HIDDEN * _INTER)
+    # 4-bit weights: about half a byte per parameter, nowhere near the bf16 two.
+    assert sizes[""] < linear_params * 1.0 + 2 * _VOCAB * _HIDDEN * 2 + 2 * _HIDDEN * 2 * (_LAYERS * 2 + 1) + 4096
