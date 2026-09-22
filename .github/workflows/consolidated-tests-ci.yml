@@ -1091,6 +1091,7 @@ jobs:
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
+                  tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
