@@ -635,6 +635,7 @@ from .utils import (
 )
 from .preference import (
     FinitePreferenceBatchPlan,
+    FiniteVisionPreferenceBatchPlan,
     PreferenceRunContext,
     build_reference_policy,
     create_preference_batch_plan,
@@ -1354,7 +1355,8 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
 
     Uses ``.shape`` (a tuple under both real mlx and the torch test shim) rather
     than a backend-specific ``.size`` / ``.numel``. Handles the text/preference/
-    GRPO tuple batch (input ids first) and the VLM dict batch (``input_ids`` key);
+    GRPO tuple batch (input ids, or a vision preference dict, first) and the VLM
+    dict batch (``input_ids`` key);
     returns 0 when no input-id tensor is present so the counter simply does not
     advance rather than raising.
     """
@@ -1366,6 +1368,8 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
         attention_mask = batch_data.get("attention_mask")
     elif isinstance(batch_data, (tuple, list)) and batch_data:
         arr = batch_data[0]
+        if isinstance(arr, dict):
+            arr = arr.get("input_ids")
         lengths = batch_data[1] if len(batch_data) > 1 else None
     else:
         arr = None
@@ -2261,6 +2265,19 @@ def _plan_single_process_text_shapes(
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
+    if isinstance(batches, FiniteVisionPreferenceBatchPlan):
+        if compile_policy.mode == "eager":
+            return None, _shape_guard_report(
+                "not_applicable", "compile_disabled", cap, lazy_batches=False,
+            ), True, None
+        if compile_policy.mode == "strict":
+            raise RuntimeError(
+                "Unsloth: strict mx.compile is not supported for vision-language "
+                "preference training."
+            )
+        return None, _shape_guard_report(
+            "eager", "vision_preference", cap, lazy_batches=False,
+        ), False, None
     if is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
@@ -2480,6 +2497,16 @@ class MLXTrainer:
             )
             self._resolved_preference_length_policy = policy
         return policy
+
+    def _preference_vision_options(self):
+        """What a preference plan needs to encode rows for a vision-language model."""
+        if not self._is_vlm:
+            return {}
+        return dict(
+            processor=self._resolve_vlm_processor(),
+            model_config=getattr(self.model, "_config", {}),
+            image_size=getattr(self.args, "image_size", None),
+        )
 
     def _build_dpo_reference(self, model, *, resume_provenance):
         args = self.args
@@ -5334,7 +5361,10 @@ class MLXTrainer:
             self._compile_decision = None
             self._compile_trace = None
             self._compile_auto_tune_applied = []
-            if self._is_vlm and (args.compile or args.compile_trace):
+            if (
+                self._is_vlm and not self.preference_kind
+                and (args.compile or args.compile_trace)
+            ):
                 compile_policy = build_compile_policy(args=args)
                 qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
                 if qual is not None:
@@ -5363,7 +5393,10 @@ class MLXTrainer:
             # setup in between is rank-deterministic and needs no collectives.
             # A strict abort here unwinds through train()'s finally, and the
             # state that persists is idempotent if train() is called again.
-            if self._is_vlm and hasattr(self, "_batches"):
+            if (
+                self._is_vlm and not self.preference_kind
+                and hasattr(self, "_batches")
+            ):
                 preflight_error = None
                 batches = batch_iter = None
                 total_steps = 0
@@ -6950,6 +6983,7 @@ class MLXTrainer:
                                  _capture_generation_prompt(_n, text))
                                 if _samples_prompts else None
                             ),
+                            **self._preference_vision_options(),
                         )
                     if is_vlm:
                         if not _vlm_has_sized_index_space(eval_dataset):
@@ -7530,7 +7564,8 @@ class MLXTrainer:
             try:
                 val_loss, ppl = self._evaluate(
                     current_eval_batches, preference_eval_fn or loss_fn,
-                    is_vlm=is_vlm,
+                    # A preference batch is a tuple even when it carries pixels.
+                    is_vlm=is_vlm and not preference_kind,
                 )
             finally:
                 resume_mlx_training_patches(_paused_window)
@@ -8990,11 +9025,6 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind and is_vlm:
-            raise ValueError(
-                "Unsloth MLX preference: vision-language models are not supported."
-            )
-
         if is_vlm:
             processor = self._resolve_vlm_processor()
         else:
@@ -9079,6 +9109,13 @@ class MLXTrainer:
                     "eval_dataset instead."
                 )
             if _sampling_eval:
+                if is_vlm:
+                    raise ValueError(
+                        "Unsloth MLX preference: generate_during_eval samples "
+                        "from token ids alone, so a vision-language model's "
+                        "prompts would lose their images. Turn it off for this "
+                        "model."
+                    )
                 if self.eval_dataset is None:
                     raise ValueError(
                         "Unsloth MLX preference: generate_during_eval needs an "
@@ -9205,6 +9242,7 @@ class MLXTrainer:
                 seed=args.seed,
                 append_eos=bool(args.append_eos),
                 formatting_func=self.formatting_func,
+                **self._preference_vision_options(),
             ), None
 
         if self._batches is not None:

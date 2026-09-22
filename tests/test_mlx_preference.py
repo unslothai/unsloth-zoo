@@ -2837,3 +2837,22 @@ def test_vision_rows_refuse_media_the_cuda_path_does_not_condition_on(kind, row,
     with pytest.raises(ValueError, match=message):
         tokenize_vision_preference_row(
             VisionProcessor(), row, length_policy=policy(kind))
+
+
+def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path):
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
+    class Model(type(_tiny_model())):
+        _is_vlm_model, pixels = True, []
+        def __call__(self, tokens, pixel_values=None, mask=None, **kwargs):
+            return Model.pixels.append(pixel_values is not None) or super().__call__(tokens)
+    data = [vision_row(), rows(1)[0]]
+    run = MLXDPOTrainer(Model(), Tokenizer(), data, eval_dataset=data, processor=VisionProcessor(),
+                        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)))
+    with pytest.raises(ValueError, match="lose their images"):
+        run._prepare_data(True)
+    run.args.generate_during_eval, run.args.include_num_input_tokens_seen = False, "non_padding"
+    assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1 and sum(Model.pixels) == 2
+    guard, tokens = run._compile_shape_guard_report, run.state.num_input_tokens_seen
+    assert (guard.action, guard.reason) == ("eager", "vision_preference") and tokens > 0
