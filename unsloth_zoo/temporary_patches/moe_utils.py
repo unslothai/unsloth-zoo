@@ -3809,7 +3809,12 @@ def forward_triton_grouped_gemm(
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
-        intermediate_dim = self.gate_up_proj.shape[1] // 2
+        # (E, 2I, H) as most families store it, or (E, H, 2I) transposed (Llama-4);
+        # the same orientation test that picks w1 below.
+        if self.gate_up_proj.shape[-1] == hidden_dim:
+            intermediate_dim = self.gate_up_proj.shape[1] // 2
+        else:
+            intermediate_dim = self.gate_up_proj.shape[-1] // 2
 
         # Autotune first GEMM.
         gemm1_configs = get_or_autotune_moe_kernels(
