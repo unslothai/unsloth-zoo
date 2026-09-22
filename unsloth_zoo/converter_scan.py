@@ -316,11 +316,24 @@ def _aliases_the_environment(tree):
     this is about the bare name. Upstream reads the environment only through
     os.environ, so refusing the aliases costs nothing.
     """
+    called = {
+        id(node.func) for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
     return any(
         (isinstance(node, ast.Name) and node.id in ENV_ALIAS_NAMES)
         or (
             isinstance(node, ast.ImportFrom)
             and any(alias.name in ENV_ALIAS_NAMES for alias in node.names)
+        )
+        # read_secret = os.getenv keeps no reserved spelling anywhere, so the
+        # name it lands under says nothing. An os.getenv that is not called
+        # right here is one going somewhere this does not follow. os.environ is
+        # already covered: _env_reads counts every one it did not account for.
+        or (
+            isinstance(node, ast.Attribute)
+            and node.attr in ("getenv", "getenvb", "environb")
+            and id(node) not in called
         )
         for node in ast.walk(tree)
     )
@@ -346,6 +359,59 @@ MAX_CARRIER_PASSES = 16
 # ceiling the join is simply not folded, so the walk reads its separator and its
 # elements individually and a destination inside one is still seen.
 MAX_FOLDED_JOIN = 1 << 20
+
+
+# A field with a conversion or a format spec is not folded: "{:>1000000000}"
+# .format("x") is a one gigabyte string, and a converter that needs one of those
+# in a URL does not exist. Upstream formats with plain fields in 15 places, so
+# folding rather than refusing is what keeps those files readable here.
+RE_FORMAT_SPEC = re.compile(r"\{[^{}]*[:!][^{}]*\}")
+
+
+def _format_text(node):
+    """The text of a literal `"...".format(...)`, or None.
+
+    Upstream spells plenty of strings this way, so refusing the builder would
+    refuse real converter modules. Folding it reads the destination instead:
+    "{}://{}".format("https", "evil.example/collect") carries its scheme in no
+    single piece, exactly like the join and f-string splits.
+    """
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("format", "format_map")
+    ):
+        return None
+    template = _literal_text(node.func.value)
+    if template is None or RE_FORMAT_SPEC.search(template):
+        return None
+    if node.func.attr == "format_map":
+        if node.keywords or len(node.args) != 1 or not isinstance(node.args[0], ast.Dict):
+            return None
+        mapping = {}
+        for key, value in zip(node.args[0].keys, node.args[0].values):
+            name = _literal_text(key) if key is not None else None
+            text = _literal_text(value)
+            if name is None or text is None:
+                return None
+            mapping[name] = text
+        try:
+            return template.format_map(mapping)
+        except (IndexError, KeyError, ValueError, AttributeError):
+            return None
+    arguments = [_literal_text(argument) for argument in node.args]
+    keywords = {
+        keyword.arg: _literal_text(keyword.value)
+        for keyword in node.keywords if keyword.arg is not None
+    }
+    if any(value is None for value in arguments) or any(
+        value is None for value in keywords.values()
+    ) or len(node.keywords) != len(keywords):
+        return None
+    try:
+        return template.format(*arguments, **keywords)
+    except (IndexError, KeyError, ValueError, AttributeError):
+        return None
 
 
 def _join_nodes(node):
@@ -417,6 +483,9 @@ def _literal_text(node):
                 known = _literal_text(part)
             pieces.append(UNKNOWN_PIECE if known is None else known)
         return "".join(pieces)
+    formatted = _format_text(node)
+    if formatted is not None:
+        return formatted
     parts = _join_parts(node)
     if parts is not None:
         # "".join(("htt", "ps://ev", "il.exa", "mple/c")) is a URL spelled out in
