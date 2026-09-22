@@ -23,7 +23,7 @@ import datasets
 import pytest
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig, PreTrainedModel
+from transformers import AutoModelForCausalLM, LlamaConfig, PreTrainedModel
 
 from unsloth_zoo.tokenizer_utils import fix_untrained_tokens
 
@@ -42,7 +42,24 @@ def _config():
 
 @pytest.fixture(scope = "module")
 def tokenizer():
-    return AutoTokenizer.from_pretrained("hf-internal-testing/llama-tokenizer")
+    """Built locally rather than pulled from the hub.
+
+    None of these tests needs a particular vocabulary, and a hub tokenizer
+    makes the whole file raise OSError under HF_HUB_OFFLINE=1 instead of
+    testing anything.
+    """
+    tokenizers = pytest.importorskip("tokenizers")
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {"<unk>": 0, "<pad>": 1, "hello": 2, "world": 3, "a": 4, "b": 5, "c": 6}
+    backend = Tokenizer(models.WordLevel(vocab, unk_token = "<unk>"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object = backend,
+        unk_token = "<unk>",
+        pad_token = "<pad>",
+    )
 
 
 @pytest.fixture(scope = "module")
