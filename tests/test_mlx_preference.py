@@ -2691,3 +2691,149 @@ def test_a_vision_batch_scores_through_the_vision_forward(objective, monkeypatch
     vision.extra = 1
     with pytest.raises(ValueError, match="cannot be located"):
         score(vision, {"input_ids": ids})
+
+
+class VisionProcessor:
+    """Renders an image part as <img> and encodes it as two image tokens."""
+
+    chat_template = "parts"
+    image_token = "<img>"
+
+    def __init__(self):
+        self.tokenizer = Tokenizer()
+        self.tokenizer.image_token_id = 60
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False,
+                            continue_final_message=False, **kwargs):
+        def text(content):
+            if isinstance(content, str):
+                return content
+            return "".join(
+                "<img>" if part.get("type") == "image" else part.get("text", "")
+                for part in content)
+        rendered = "".join(f"<{m['role']}>{text(m['content'])}" for m in messages)
+        return rendered + ("<assistant>" if add_generation_prompt else "")
+
+    def __call__(self, text=None, images=None, **kwargs):
+        import re
+        import numpy as np
+        rows = []
+        for sample in text:
+            ids, types = [], []
+            for piece in re.split("(<img>)", sample):
+                encoded = [60, 61] if piece == "<img>" else self.tokenizer.encode(
+                    piece, add_special_tokens=False)
+                ids += encoded
+                types += [int(piece == "<img>")] * len(encoded)
+            rows.append((ids, types))
+        width = max(len(ids) for ids, _ in rows)
+        pad = lambda values: values + [0] * (width - len(values))
+        flat = [image for group in images for image in (
+            group if isinstance(group, list) else [group])]
+        return {
+            "input_ids": np.array([pad(ids) for ids, _ in rows]),
+            "attention_mask": np.array([pad([1] * len(ids)) for ids, _ in rows]),
+            "token_type_ids": np.array([pad(types) for _, types in rows]),
+            "pixel_values": np.array([[float(image.width)] for image in flat]),
+        }
+
+
+def vision_row(**extra):
+    from PIL import Image
+    return {
+        "images": [Image.new("RGB", (4, 4))],
+        "prompt": [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "hi"}]}],
+        "chosen": [{"role": "assistant", "content": "yes"}],
+        "rejected": [{"role": "assistant", "content": "no"}],
+        **extra,
+    }
+
+
+def test_an_image_row_encodes_its_prompt_through_the_processor():
+    from unsloth_zoo.mlx.preference import tokenize_vision_preference_row
+
+    encode = Tokenizer().encode
+    prompt = encode("<user>") + [60, 61] + encode("hi<assistant>")
+    types = [0] * 6 + [1, 1] + [0] * 13
+
+    def tokenize(row=vision_row(), processor=VisionProcessor(), **options):
+        return tokenize_vision_preference_row(
+            processor, row, length_policy=policy(**options), media_token_ids={60})
+
+    row = tokenize()
+    assert row.chosen_prompt_ids == row.rejected_prompt_ids == tuple(prompt)
+    assert row.chosen_ids == tuple(encode("yes") + [2])
+    assert row.chosen_prompt_arrays == (("token_type_ids", tuple(types)),)
+    cut = tokenize(max_prompt_length=len(prompt) - 3)
+    assert cut.chosen_prompt_ids == tuple(prompt[3:])
+    assert cut.rejected_prompt_arrays == (("token_type_ids", tuple(types[3:])),)
+    with pytest.raises(ValueError, match="image tokens"):
+        tokenize(max_prompt_length=len(prompt) - 7)
+    longer = tokenize(vision_row(rejected=[{"role": "assistant", "content": "nooo"}]),
+                      max_length=len(prompt) + 4)
+    assert longer.chosen_prompt_arrays == (("token_type_ids", tuple(types)),)
+    assert longer.rejected_prompt_arrays == (("token_type_ids", tuple(types[1:])),)
+    bos = VisionProcessor()
+    bos.tokenizer.bos_token_id = 1
+    bos.tokenizer.encode = lambda text, add_special_tokens=True: (
+        [1] * add_special_tokens + encode(text))
+    row = tokenize(processor=bos)
+    assert row.chosen_prompt_ids == (1, *prompt)
+    assert row.chosen_prompt_arrays == (("token_type_ids", (0, *types)),)
+
+
+def test_a_vision_plan_repeats_the_pixels_for_both_branches():
+    from unsloth_zoo.mlx.preference import (
+        create_preference_batch_plan, precompute_reference_logps,
+        tokenize_preference_row)
+
+    text_row = rows(1)[0]
+    plan = create_preference_batch_plan(
+        [vision_row(), text_row], None, batch_size=2, length_policy=policy(),
+        dataset_order="sequential", grad_accum=1,
+        processor=VisionProcessor(), model_config={})
+    batch, lengths, _ = plan[0]
+    image, text = plan.rows
+    assert text.chosen == tokenize_preference_row(
+        Tokenizer(), text_row, length_policy=policy()).chosen
+    assert batch["input_ids"][1, :len(text.chosen)].tolist() == list(text.chosen)
+    assert batch["pixel_values"].tolist() == [[4.0], [4.0]]
+    types = batch["token_type_ids"].tolist()
+    assert types[0][:21] == types[2][:21] == list(image.chosen_prompt_arrays[0][1])
+    assert not any(types[1] + types[3])
+    assert batch["attention_mask"].sum(axis=1).tolist() == lengths[:, 1].tolist()
+    plan.configure_cce_compaction(True)
+    assert plan.prepare_cce_batch(0, plan[0])[0] is not None
+    with pytest.raises(ValueError, match="image tokens"):
+        create_preference_batch_plan(
+            [vision_row()], None, batch_size=1, length_policy=policy(max_prompt_length=12),
+            grad_accum=1, processor=VisionProcessor(), model_config={})
+
+    seen = []
+
+    class Scorer:
+        model = None
+        def forward(self, model, batch, lengths, **_cce):
+            import mlx.core as mx
+            seen.append("pixel_values" in batch)
+            return mx.zeros((lengths.shape[0],))
+
+    precompute_reference_logps(plan, None, Scorer(), batch_size=1, scorer=object())
+    assert seen == [True, False]
+
+
+@pytest.mark.parametrize("kind,row,message", [
+    ("orpo", vision_row(), "ORPOTrainer has no vision path"),
+    ("dpo", vision_row(chosen=[{"role": "assistant", "content": [
+        {"type": "image"}, {"type": "text", "text": "yes"}]}]), "belong to the prompt"),
+    ("dpo", vision_row(audio=__import__("numpy").zeros(4)), "audio rows"),
+    ("dpo", vision_row(rejected=[{"role": "assistant", "content": [{"type": "image"}]}]),
+     "belong to the prompt"),
+])
+def test_vision_rows_refuse_media_the_cuda_path_does_not_condition_on(kind, row, message):
+    from unsloth_zoo.mlx.preference import tokenize_vision_preference_row
+
+    with pytest.raises(ValueError, match=message):
+        tokenize_vision_preference_row(
+            VisionProcessor(), row, length_policy=policy(kind))

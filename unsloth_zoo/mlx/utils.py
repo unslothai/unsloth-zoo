@@ -5322,6 +5322,7 @@ def _render_vlm_messages(
     messages,
     *,
     add_generation_prompt=False,
+    **template_options,
 ):
     if isinstance(messages, str):
         return messages
@@ -5364,6 +5365,7 @@ def _render_vlm_messages(
                 candidate,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
+                **template_options,
             )
         except Exception as exc:
             error = exc
