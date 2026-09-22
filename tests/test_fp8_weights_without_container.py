@@ -117,18 +117,28 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
     `Fp8Quantize`, and the reversed source pattern `weight` also matches
     `weight_scale_inv`: a container's e4m3 weight was re-quantized with a fresh
     scale and its scale grid quantized to e4m3 with a scale of its own, so the
-    saved weight and scale described different values."""
+    saved weight and scale described different values.
+
+    The packed weight must not sit at the quantizer's own fixed point (a block
+    whose largest element is exactly 448 re-quantizes to itself) and the scale
+    grid must be divisible by the block, or the old reverse op is a no-op by
+    accident and the test proves nothing."""
     from transformers import PretrainedConfig
     from transformers.core_model_loading import WeightConverter, revert_weight_conversion
 
     torch.manual_seed(0)
     model = _Holder()
+    model.proj = FP8Linear(8, 8, block_size = (2, 2))
     model.config = PretrainedConfig()
     model.base_model_prefix = ""
-    q, scale = _block_quantize(torch.randn(8, 8), (4, 4))
+    q = (torch.randn(8, 8) * 100).to(E4M3)
+    scale = torch.rand(4, 4) + 0.5
+    assert bool((q.float().abs().amax() < 448).all())
     with torch.no_grad():
         model.proj.weight.copy_(q)
         model.proj.weight_scale_inv.copy_(scale)
+        # _MoELinear allocates with torch.empty: give the dequantized stack real values.
+        model.experts.weight.copy_(torch.randn(3, 8, 8))
     model._weight_conversions = [
         WeightConverter(
             source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
@@ -142,6 +152,7 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
     # the container: packed weight and scale written exactly as they are
     assert saved["proj.weight"].dtype == E4M3
     assert torch.equal(saved["proj.weight"].view(torch.uint8), state["proj.weight"].view(torch.uint8))
+    assert saved["proj.weight_scale_inv"].dtype == torch.float32
     assert torch.equal(saved["proj.weight_scale_inv"], state["proj.weight_scale_inv"])
     assert "proj.weight_scale_inv_scale_inv" not in saved
     # the expert stack this converter dequantized on load: quantized back, so the
