@@ -29,9 +29,16 @@ CPU only, no GPU, no bitsandbytes CUDA kernels, no network.
 
 from __future__ import annotations
 
-import torch
-
 import pytest
+
+# `importorskip`, not a bare import. Every test here needs torch, and the macOS staging
+# runner does not ship it: a bare `import torch` turns the whole module into a COLLECTION
+# ERROR, which is not the same thing as a skip. The step that runs this suite has an escape
+# for a missing dependency, but it counts `^(FAILED|ERROR) ` lines against the ones that name
+# the module, and a collection error prints only the file path with no message -- so the
+# escape could not fire and the leg went red. Measured on staging-1313 macos-15: "1 skipped,
+# 1 warning, 1 error", exit 2, while windows-latest passed because its install brings torch.
+torch = pytest.importorskip("torch")
 
 from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
 
