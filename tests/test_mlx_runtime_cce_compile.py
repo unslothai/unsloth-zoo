@@ -43,6 +43,8 @@ def _skip_torch_shim():
 @pytest.mark.parametrize("finalize", [False, True])
 def test_single_simd_forward_preserves_each_row(dtype, finalize):
     _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
     from unsloth_zoo.mlx.cce import runtime_cce as rt
 
     mx.random.seed(718)
@@ -75,6 +77,12 @@ def test_single_simd_forward_preserves_each_row(dtype, finalize):
 @pytest.mark.parametrize("frozen,dim", [(False, 512), (False, 1024), (True, 1024)])
 def test_automatic_chunks_reduce_backward_peak(frozen, dim):
     _skip_torch_shim()
+    if not mx.metal.is_available():
+        # Both halves need Metal: the peak assertion needs Metal memory accounting, and
+        # off-Metal the bf16 LSE accumulates at the logits dtype (the float32 cast in
+        # _forward_chunked_fused_finalize is gated on label smoothing), so the loss moves
+        # with the chunk size and the two plans do not agree.
+        pytest.skip("requires Metal memory accounting")
     import gc
     from unsloth_zoo.mlx.cce import _get_runtime_cce
 
