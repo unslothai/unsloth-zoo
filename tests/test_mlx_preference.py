@@ -993,7 +993,8 @@ def test_the_training_loss_and_its_reported_metrics_follow_the_objective():
     # Weights summing to zero separate TRL's per-entry copies from one scaled copy.
     reward_chosen = _ordered(beta * (chosen - ref_chosen), weights)
     reward_rejected = _ordered(beta * (rejected - ref_rejected), weights)
-    logits, _ce, mask = preference._preference_forward(model, batch, lengths)
+    mask = preference._response_mask(batch[:, 1:], lengths)
+    logits, _ce = preference._preference_forward(model, batch, mask)
     rows, vocab = logits.astype(mx.float32).sum(axis=-1), logits.shape[-1]
     _assert_reported_stats("dpo", stats, {
         "rewards/chosen": reward_chosen.sum(),
@@ -2629,3 +2630,64 @@ def test_evaluation_accepts_a_wrapped_model_output(objective):
     assert math.isclose(float(from_bare[0]), float(from_wrapped[0]),
                         rel_tol=1e-6, abs_tol=1e-6)
     assert int(from_bare[1]) == int(from_wrapped[1])
+
+
+class VisionModel(TinyModel):
+    """Takes the full sequence, the pixels and a mask, as an mlx-vlm model does;
+    token 64 is an image placeholder past the 64-entry output head."""
+
+    extra = 0
+
+    def __call__(self, tokens, pixel_values, mask, **kwargs):
+        import mlx.core as mx
+        self.pixels, self.kwargs = pixel_values, kwargs
+        tokens = mx.where(tokens >= 64, 0, tokens)
+        if self.extra:
+            tokens = mx.concatenate([tokens[:, :self.extra], tokens], axis=1)
+        return super().__call__(tokens)
+
+
+@pytest.mark.parametrize("objective", ["orpo", "dpo", "dpo_referenced"])
+def test_a_vision_batch_scores_through_the_vision_forward(objective, monkeypatch):
+    from unsloth_zoo.mlx import preference
+    from unsloth_zoo.mlx.preference import (
+        ReferencePolicy, make_preference_eval_fn, resolve_preference_objective)
+
+    kind = objective.split("_")[0]
+    referenced = objective == "dpo_referenced"
+    text, vision = TinyModel(), VisionModel()
+    vision.embedding, vision.output = text.embedding, text.output
+
+    def score(model, batch):
+        reference = ReferencePolicy(model=model) if referenced else None
+        eval_fn = make_preference_eval_fn(resolve_preference_objective(
+            kind, beta=0.1, reference_free=not referenced), reference_policy=reference)
+        return eval_fn(model, batch, *plan[0][1:])
+
+    import mlx.core as mx
+    plan = build_plan(dataset=rows(2))
+    ids, lengths = plan[0][:2]
+    pairs = ids.shape[0] // 2
+    # A placeholder in the rejected prompts, which no objective scores.
+    placed = lambda token: mx.concatenate([ids[:, :1], mx.concatenate(
+        [ids[:pairs, 1:2], 0 * ids[pairs:, 1:2] + token]), ids[:, 2:]], axis=1)
+    expected = score(text, placed(0))
+    image_ids = placed(64)
+    gathered, cross_entropy = [], preference.nn.losses.cross_entropy
+    monkeypatch.setattr(preference.nn.losses, "cross_entropy",
+                        lambda logits, targets, **kw: gathered.append(targets)
+                        or cross_entropy(logits, targets, **kw))
+    got = score(vision, {"input_ids": image_ids, "pixel_values": "pixels",
+                         "image_grid_thw": "grid", "_unsloth_marker": True})
+    assert vision.pixels == "pixels" and vision.kwargs == {"image_grid_thw": "grid"}
+    scored = preference._response_mask(image_ids[:, 1:], lengths) > 0
+    if kind == "orpo":  # the chosen NLL spans the whole sequence
+        whole = mx.arange(1, ids.shape[1]) < lengths[:, 1:]
+        scored = mx.concatenate([whole[:pairs], scored[pairs:]])
+    assert gathered and all(
+        t.tolist() == mx.where(scored, image_ids[:, 1:], 0).tolist() for t in gathered)
+    assert math.isclose(float(expected[0]), float(got[0]), rel_tol=1e-6, abs_tol=1e-6)
+    assert expected[2].tolist() == pytest.approx(got[2].tolist(), rel=1e-5, abs=1e-5)
+    vision.extra = 1
+    with pytest.raises(ValueError, match="cannot be located"):
+        score(vision, {"input_ids": ids})

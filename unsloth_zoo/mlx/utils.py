@@ -3071,6 +3071,75 @@ def _trim_sequence_aligned_vlm_kwargs(extra_kwargs, seq_len):
     return extra_kwargs
 
 
+def _vlm_forward_logits(model, batch_dict):
+    """Logits for every position of a collated VLM batch dict."""
+    input_ids = batch_dict["input_ids"]
+    pixel_values = batch_dict.get("pixel_values")
+    attention_mask = batch_dict.get("attention_mask")
+
+    # The full sequence, left for the caller to shift (Qwen3-VL mRoPE/deepstack
+    # need it); mirrors `_vlm_hidden_states` so use_cce={True,False} stay in parity.
+    inputs = input_ids
+
+    # Pass through extras (e.g. image_grid_thw); strip the private
+    # `_unsloth_*` carriers, matching _vlm_cce_forward's filter.
+    fwd_kwargs = {
+        k: v for k, v in batch_dict.items()
+        if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
+        and not k.startswith("_unsloth_")
+        and v is not None
+    }
+    _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
+    fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
+    # Always sent: 13 families declare `mask` without a default. None lets
+    # them build the mask they would use for generation.
+    fwd_kwargs["mask"] = (
+        attention_mask if _keeps_forwarded_mask(model) else None
+    )
+    shared_kv = _build_shared_kv_caches(model)
+    if shared_kv is not None:
+        fwd_kwargs["cache"] = shared_kv
+    # gemma3n scales token embeddings by sqrt(hidden_size) on the ids path
+    # only, and `Model.__call__` sends ids through `get_input_embeddings`,
+    # which does not scale. Handing the model ids therefore trains on text
+    # embeddings ~45x too small beside merged features. `_vlm_cce_forward`
+    # already merges and rescales itself; do the same here so
+    # use_cce={True,False} stay in parity instead of differing by that.
+    scaled_embeds = None
+    # Self-routed generation wrappers consume premerged embeddings, not pixels.
+    if (_vlm_embed_scale(model) is not None
+            or getattr(model, "language_model", None) is model):
+        embed_result = model.get_input_embeddings(
+            inputs,
+            pixel_values,
+            mask=fwd_kwargs.get("mask"),
+            **{k: v for k, v in fwd_kwargs.items()
+               if k not in ("mask", "cache")},
+        )
+        merged_embeds, embed_kwargs = _unpack_embed_result(
+            embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+        )
+        scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
+        # per_layer_inputs and friends: the merge produced them, and
+        # recomputing from ids inside the stack would redo the work.
+        for key, value in embed_kwargs.items():
+            fwd_kwargs.setdefault(key, value)
+    if scaled_embeds is not None:
+        # Not `model(...)`: mlx-vlm up to 0.4.4 -- the floor this package
+        # declares -- re-embeds from ids inside `Model.__call__` and drops
+        # a supplied `inputs_embeds`, so the rescale above would be thrown
+        # away on exactly the versions that need it. 0.5.0 onwards honors
+        # it by forwarding straight to the language model; do that here on
+        # every version, which is what `_vlm_cce_forward` already does.
+        output = _get_text_model(model)(
+            inputs, inputs_embeds=scaled_embeds,
+            **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
+        )
+    else:
+        output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
+    return _model_logits(output)
+
+
 def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                               ignore_token_ids=None):
     """Create a standard cross-entropy loss function for VLMs.
@@ -3089,72 +3158,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
 
     def loss_fn(model, batch_dict, return_correct=False):
         input_ids = batch_dict["input_ids"]
-        pixel_values = batch_dict.get("pixel_values")
         attention_mask = batch_dict.get("attention_mask")
         labels = batch_dict.get("labels")
-
-        # Forward full sequence then shift (Qwen3-VL mRoPE/deepstack need it);
-        # mirrors `_vlm_cce_forward` so use_cce={True,False} stay in parity.
-        inputs = input_ids
-
-        # Pass through extras (e.g. image_grid_thw); strip the private
-        # `_unsloth_*` carriers, matching _vlm_cce_forward's filter.
-        fwd_kwargs = {
-            k: v for k, v in batch_dict.items()
-            if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
-            and not k.startswith("_unsloth_")
-            and v is not None
-        }
-        _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
-        fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
-        # Always sent: 13 families declare `mask` without a default. None lets
-        # them build the mask they would use for generation.
-        fwd_kwargs["mask"] = (
-            attention_mask if _keeps_forwarded_mask(model) else None
-        )
-        shared_kv = _build_shared_kv_caches(model)
-        if shared_kv is not None:
-            fwd_kwargs["cache"] = shared_kv
-        # gemma3n scales token embeddings by sqrt(hidden_size) on the ids path
-        # only, and `Model.__call__` sends ids through `get_input_embeddings`,
-        # which does not scale. Handing the model ids therefore trains on text
-        # embeddings ~45x too small beside merged features. `_vlm_cce_forward`
-        # already merges and rescales itself; do the same here so
-        # use_cce={True,False} stay in parity instead of differing by that.
-        scaled_embeds = None
-        # Self-routed generation wrappers consume premerged embeddings, not pixels.
-        if (_vlm_embed_scale(model) is not None
-                or getattr(model, "language_model", None) is model):
-            embed_result = model.get_input_embeddings(
-                inputs,
-                pixel_values,
-                mask=fwd_kwargs.get("mask"),
-                **{k: v for k, v in fwd_kwargs.items()
-                   if k not in ("mask", "cache")},
-            )
-            merged_embeds, embed_kwargs = _unpack_embed_result(
-                embed_result, model, input_ids=inputs, attention_mask=attention_mask,
-            )
-            scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
-            # per_layer_inputs and friends: the merge produced them, and
-            # recomputing from ids inside the stack would redo the work.
-            for key, value in embed_kwargs.items():
-                fwd_kwargs.setdefault(key, value)
-        if scaled_embeds is not None:
-            # Not `model(...)`: mlx-vlm up to 0.4.4 -- the floor this package
-            # declares -- re-embeds from ids inside `Model.__call__` and drops
-            # a supplied `inputs_embeds`, so the rescale above would be thrown
-            # away on exactly the versions that need it. 0.5.0 onwards honors
-            # it by forwarding straight to the language model; do that here on
-            # every version, which is what `_vlm_cce_forward` already does.
-            output = _get_text_model(model)(
-                inputs, inputs_embeds=scaled_embeds,
-                **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
-            )
-        else:
-            output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
-        logits = _model_logits(output)
-        logits = logits.astype(mx.float32)
+        logits = _vlm_forward_logits(model, batch_dict).astype(mx.float32)
         # Drop the final position so logits predict the next token.
         logits = logits[:, :-1, :]
 
@@ -3341,15 +3347,13 @@ def _filter_backbone_kwargs(backbone, kwargs):
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
-def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
-                     assistant_token_id=0):
-    """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
+def _vlm_hidden_states(model, batch_dict):
+    """Pre-lm_head hidden states for every position of a collated VLM batch dict."""
     input_ids = batch_dict["input_ids"]
     pixel_values = batch_dict.get("pixel_values")
     attention_mask = batch_dict.get("attention_mask")
-    labels = batch_dict.get("labels")
 
-    # Forward full sequence then shift hidden[:, :-1] (Qwen3-VL mRoPE/deepstack).
+    # The full sequence, left for the caller to shift (Qwen3-VL mRoPE/deepstack).
     inputs = input_ids
     fwd_attn_mask = attention_mask
 
@@ -3407,13 +3411,21 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     if shared_kv is not None:
         backbone_kwargs["cache"] = shared_kv
 
-    hidden = _forward_text_hidden_states(
+    return _forward_text_hidden_states(
         model,
         inputs,
         inputs_embeds=merged_embeds,
         **backbone_kwargs,
     )
-    hidden = hidden[:, :-1, :]
+
+
+def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
+                     assistant_token_id=0):
+    """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
+    input_ids = batch_dict["input_ids"]
+    attention_mask = batch_dict.get("attention_mask")
+    labels = batch_dict.get("labels")
+    hidden = _vlm_hidden_states(model, batch_dict)[:, :-1, :]
 
     if labels is not None:
         # Extra mask keeps externally supplied labels compatible.

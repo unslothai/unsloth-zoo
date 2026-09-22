@@ -24,11 +24,14 @@ from .utils import (
     _finite_batch_schedule,
     _finite_row_schedule,
     _finite_text_pad_width,
+    _forward_text_hidden_states,
     _get_mlx_dropout_probability,
     _model_logits,
     _normalize_mlx_messages,
     _normalize_seed,
     _torch_randperm_order,
+    _vlm_forward_logits,
+    _vlm_hidden_states,
     collect_mlx_lora_adapter_tensors,
     encode_mlx_text,
     is_mlx_dora_module,
@@ -742,7 +745,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
                 self._cce_capacities[family, width] = capacity
 
     def prepare_cce_batch(self, index, batch):
-        width = batch[0].shape[1]
+        width = _preference_ids(batch[0]).shape[1]
         capacity = self._cce_capacities.get((self.batch_family(index), width))
         if capacity is None:
             return batch
@@ -1219,12 +1222,57 @@ class ReferencePolicy:
             self._store_synced(index, restored)
 
 
-def _response_logps(model, batch, lengths):
-    targets = batch[:, 1:]
-    ce = nn.losses.cross_entropy(
-        _model_logits(model(batch[:, :-1])), targets, reduction="none",
+def _preference_ids(batch):
+    """A vision batch is a dict carrying its token ids beside the pixels."""
+    return batch["input_ids"] if isinstance(batch, Mapping) else batch
+
+
+def _next_token_positions(values, ids, what):
+    """Drop the last position, once the output is known to cover every token.
+
+    A family expanding tokens inside its forward would shift every response
+    position the lengths name, so the scores would silently read other tokens.
+    """
+    if values.shape[1] != ids.shape[1]:
+        raise ValueError(
+            f"Unsloth MLX preference: this model returned {what} for "
+            f"{values.shape[1]} positions from {ids.shape[1]} tokens, so the "
+            "response spans cannot be located in them."
+        )
+    return values[:, :-1]
+
+
+def _preference_logits(model, batch):
+    """Logits predicting each next token, for every position but the last."""
+    if isinstance(batch, Mapping):
+        return _next_token_positions(
+            _vlm_forward_logits(model, batch), batch["input_ids"], "logits",
+        )
+    return _model_logits(model(batch[:, :-1]))
+
+
+def _preference_hidden(model, batch):
+    if isinstance(batch, Mapping):
+        return _next_token_positions(
+            _vlm_hidden_states(model, batch), batch["input_ids"], "hidden states",
+        )
+    return _forward_text_hidden_states(model, batch[:, :-1])
+
+
+def _token_cross_entropy(logits, targets, mask):
+    # An image token may lie past the output head (Mllama's does), so unscored
+    # labels are gathered as token 0, as TRL does.
+    targets = mx.where(mask > 0, targets, 0)
+    return nn.losses.cross_entropy(
+        logits, targets, reduction="none",
     ).reshape(targets.shape)
-    return -(ce * _response_mask(targets, lengths)).sum(axis=1)
+
+
+def _response_logps(model, batch, lengths):
+    targets = _preference_ids(batch)[:, 1:]
+    mask = _response_mask(targets, lengths)
+    ce = _token_cross_entropy(_preference_logits(model, batch), targets, mask)
+    return -(ce * mask).sum(axis=1)
 
 
 # TRL's own warning list, narrower than the set that drops the value.
@@ -1557,6 +1605,8 @@ def _make_preference_cce_scorer(model):
     tm = utils._get_text_model(model)
     if getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model):
         return None
+    if utils._is_vlm_model(model) and not hasattr(model, "get_input_embeddings"):
+        return None
     desc = utils.describe_output_head(model)
     if utils._cce_head_ineligibility(desc) is not None:
         return None
@@ -1584,8 +1634,8 @@ def _make_preference_cce_scorer(model):
         kernel to those rows, which then also limits the logit sums unless
         ``every_position``.
         """
-        targets = batch[:, 1:]
-        hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
+        targets = _preference_ids(batch)[:, 1:]
+        hidden = _preference_hidden(model, batch)
         head = utils._resolve_module_path(model, desc.path)
         # Before compaction: the logit sums below may read every row.
         hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))
@@ -1759,29 +1809,26 @@ def _preference_stats(
     )
 
 
-def _preference_forward(model, batch, lengths):
-    """Logits, per-token cross entropy, and the response mask for one batch."""
-    targets = batch[:, 1:]
-    logits = _model_logits(model(batch[:, :-1]))
-    ce = nn.losses.cross_entropy(
-        logits, targets, reduction="none",
-    ).reshape(targets.shape)
-    return logits, ce, _response_mask(targets, lengths)
+def _preference_forward(model, batch, supervised):
+    """Logits and per-token cross entropy, scoring the ``supervised`` positions."""
+    logits = _preference_logits(model, batch)
+    return logits, _token_cross_entropy(logits, _preference_ids(batch)[:, 1:], supervised)
 
 
 def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
-    pairs = batch.shape[0] // 2
+    ids = _preference_ids(batch)
+    pairs = ids.shape[0] // 2
     nll_mask = (
-        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+        mx.arange(1, ids.shape[1]) < lengths[:pairs, 1:]
     ).astype(mx.float32)
     logits = logit_totals = None
+    mask = _response_mask(ids[:, 1:], lengths)
+    # The chosen NLL spans the whole sequence, not only the response.
+    supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
     if scorer is None:
-        logits, ce, mask = _preference_forward(model, batch, lengths)
+        logits, ce = _preference_forward(model, batch, supervised)
     else:
-        mask = _response_mask(batch[:, 1:], lengths)
-        # The chosen NLL spans the whole sequence, not only the response.
-        supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
         ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
@@ -1805,12 +1852,12 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
                 scorer=None, cce_indices=None, reference=None):
     """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
-    pairs = batch.shape[0] // 2
+    pairs = lengths.shape[0] // 2
     logits = logit_totals = None
+    mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
     if scorer is None:
-        logits, ce, mask = _preference_forward(model, batch, lengths)
+        logits, ce = _preference_forward(model, batch, mask)
     else:
-        mask = _response_mask(batch[:, 1:], lengths)
         ce, sums = scorer(model, batch, mask > 0, cce_indices)
         logit_totals = _logit_totals(sums, mask, scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
@@ -1864,7 +1911,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     scorer = None if model is None else _make_preference_cce_scorer(model)
 
     def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
-        pairs = batch.shape[0] // 2
+        pairs = lengths.shape[0] // 2
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
                 model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
