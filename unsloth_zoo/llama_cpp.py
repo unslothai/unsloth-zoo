@@ -3889,7 +3889,9 @@ def _scan_imported_package(
 # A pin Unsloth set itself, to route the patcher at an install it has just made.
 # Not the same thing as a pin the user set to choose a converter they reviewed,
 # and only the second is a reason to skip the scan.
-_INTERNAL_SCRIPTS_DIR_LOCK = threading.Lock()
+# Reentrant: held across the conversion, and the MLX save path enters this pin inside a
+# caller that already pinned around save_pretrained_gguf; a plain Lock hangs the export there.
+_INTERNAL_SCRIPTS_DIR_LOCK = threading.RLock()
 _internal_scripts_dir_pin = None
 
 
@@ -5303,12 +5305,41 @@ converter = sys.argv[1]
 # characters. stdin has no such ceiling.
 requirements = json.loads(sys.stdin.read() or "[]")
 
-# Reproduce the entrypoint's own self-location exactly, or the probe would
-# measure a different `gguf` than the real run: every llama.cpp converter (and
-# its conversion/base.py) does this before `import gguf`, and `python -c` has no
-# script directory of its own to do it for us.
-if converter and "NO_LOCAL_GGUF" not in os.environ:
-    sys.path.insert(1, os.path.join(os.path.dirname(os.path.abspath(converter)), "gguf-py"))
+# Rebuild the sys.path the CONVERTER will have, or the probe reports a `gguf` the
+# conversion never uses. Only the implicit `-c` entry goes: an explicit '.' on
+# PYTHONPATH is the caller's, and the converter honours it. Dropped here rather
+# than left to PYTHONSAFEPATH because that is ignored before 3.11, where refusing
+# the tree later cannot unrun the `./gguf/__init__.py` this child already executed
+# with the parent's token.
+if not getattr(sys.flags, "safe_path", False) and sys.path and \
+    sys.path[0] in ("", os.getcwd()):
+    del sys.path[0]
+# sys.path now starts at PYTHONPATH, so only the converter's own mode decides where
+# its tree lands: a script has its directory at 0 and inserts the sibling at 1,
+# ahead of all PYTHONPATH, while safe-path mode removes that slot and drops the
+# sibling behind PYTHONPATH's first entry. argv[2] reports which; before 3.11 the
+# converter is always plain.
+converter_safe = (sys.version_info >= (3, 11)
+                  and len(sys.argv) > 2 and sys.argv[2] == "1")
+if converter:
+    # A symlinked converter has two directories and each slot wants its own: the
+    # entrypoint self-locates through `__file__` (the link), while CPython prepends
+    # the script's directory "if it's a symbolic link, resolve symbolic links"
+    # (sys.path docs). That resolution is POSIX only -- measured on windows-latest,
+    # a script reached through a link keeps the LINK's directory at sys.path[0] --
+    # so asking realpath there would model a slot the real run does not have.
+    converter_dir = os.path.dirname(os.path.abspath(converter))
+    script_dir = os.path.dirname(
+        os.path.abspath(converter) if os.name == "nt" else os.path.realpath(converter)
+    )
+    if "NO_LOCAL_GGUF" not in os.environ:
+        sys.path.insert(1 if converter_safe else 0,
+                        os.path.join(converter_dir, "gguf-py"))
+    # Outside the NO_LOCAL_GGUF branch: suppressing the sibling insert does not take
+    # the script's own directory off the real run's path, and a `gguf` sitting there
+    # outranks the sibling.
+    if not converter_safe:
+        sys.path.insert(0, script_dir)
 
 def resolve(expression):
     parts = expression.split(".")
@@ -5369,9 +5400,21 @@ def _probe_child_gguf(python_exe, env, requirements, converter_location = None, 
     """Ask the child interpreter which `gguf` it resolves and what it cannot
     satisfy. Returns a dict with `missing`, `location`, `version`, `error`, or
     None when the probe itself could not run."""
+    # `python -c` puts the WORKING DIRECTORY at the child's sys.path[0], which the
+    # real converter run never has (a script gets its own directory there), so a
+    # `gguf` package dropped in the CWD would outrank the converter's own tree and
+    # be the one this report names. PYTHONSAFEPATH drops that entry; it is ignored
+    # before 3.11, where _trusted_gguf_tree is what holds.
+    env = dict(env) if env is not None else dict(os.environ)
+    # Read BEFORE we set our own: this is the converter child's environment, so a
+    # caller who already runs in safe-path mode gets a converter that does too, and
+    # the probe has to place the sibling tree where THAT run will place it.
+    converter_safe = "1" if env.get("PYTHONSAFEPATH") else "0"
+    env["PYTHONSAFEPATH"] = "1"
     try:
         completed = subprocess.run(
-            [python_exe, "-c", _GGUF_PROBE_SOURCE, str(converter_location or "")],
+            [python_exe, "-c", _GGUF_PROBE_SOURCE,
+             str(converter_location or ""), converter_safe],
             # On stdin for the Windows argv ceiling; see _GGUF_PROBE_SOURCE.
             input = json.dumps(list(requirements)),
             env = env,
@@ -5451,6 +5494,14 @@ def _installed_gguf_tree(python_exe):
     # All Unsloth Zoo code licensed under LGPLv3
     env = dict(os.environ)
     env["NO_LOCAL_GGUF"] = "1"
+    # This probe asks what is INSTALLED; it is not emulating a converter, so it has
+    # no reason to honour a relative PYTHONPATH entry. Those mean the working
+    # directory, and a `gguf` planted there would execute in a child holding the
+    # parent's credentials -- refusing its tree afterwards does not unrun it.
+    env["PYTHONPATH"] = os.pathsep.join(
+        entry for entry in env.get("PYTHONPATH", "").split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    )
     report = _probe_child_gguf(python_exe, env, ())
     location = (report or {}).get("location")
     if not location:
@@ -5458,7 +5509,9 @@ def _installed_gguf_tree(python_exe):
     tree = os.path.dirname(os.path.dirname(os.path.abspath(location)))
     if not os.path.isfile(os.path.join(tree, "gguf", "__init__.py")):
         return None
-    return tree
+    # A tree from here is pinned for the converter child AND swapped into this
+    # process for the read-back, so it answers to the same provenance rule.
+    return _trusted_gguf_tree(tree)
 pass
 
 
@@ -5525,6 +5578,82 @@ def _gguf_readback_tree(report):
     different contents, so all that is known is which package wrote the bytes.
     """
     return _gguf_tree_of_location((report or {}).get("location"))
+
+
+def _importing_gguf_tree():
+    """The resolved directory this process would import `gguf` from right now, or
+    None when it would not import one. Locating a spec does not run the package."""
+    try:
+        spec = importlib.util.find_spec("gguf")
+    except Exception:
+        # A broken parent package or a finder that raises is not an answer.
+        return None
+    if spec is None:
+        return None
+    if spec.origin:
+        return os.path.realpath(os.path.dirname(os.path.dirname(spec.origin)))
+    # Namespace package: no __init__.py, so it has search locations instead.
+    for location in (spec.submodule_search_locations or ()):
+        return os.path.realpath(os.path.dirname(location))
+    return None
+
+
+def _trusted_gguf_tree(tree, converter_location = None):
+    """`tree` when it sits inside a directory Unsloth itself chose, else None.
+
+    The tree the read-back pins comes from a path string a CHILD reported, and the
+    parent puts it at its own sys.path[0] and imports it. Shape says nothing about
+    who owns the directory, so a well-formed `gguf` package anywhere a lower-trust
+    principal can write would execute in the process holding the user's token.
+    Refusing costs nothing: it degrades to the unpinned read-back that ran before
+    the writer's tree was derived at all.
+    """
+    if not tree:
+        return None
+    # Resolved ONCE, and that one result is both checked and returned. The link
+    # belongs to the principal being screened, so a second resolution can answer
+    # differently and hand back a tree the check never approved.
+    resolved = os.path.realpath(tree)
+    roots = [LLAMA_CPP_DEFAULT_DIR, os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")]
+    if converter_location:
+        # Both, because a symlinked converter has two directories and either can
+        # hold the tree the conversion used (`__file__` is the link, the script slot
+        # is the target). No wider: this is the script we run as the converter.
+        roots.append(os.path.dirname(os.path.abspath(converter_location)))
+        roots.append(os.path.dirname(os.path.realpath(converter_location)))
+    # Compared lexically against a separately resolved ROOT, rather than handed back
+    # to `_stays_within`, which would realpath the tree a second time. Resolving it
+    # once is only a guarantee if nothing resolves it again: a component of the
+    # reported path can be swapped between the two calls, so the check answers for
+    # one tree and the returned string still names another.
+    for root in roots:
+        if not root:
+            continue
+        try:
+            root_real = os.path.realpath(os.path.expanduser(root))
+        except OSError:
+            continue
+        if resolved == root_real or \
+            resolved.startswith(root_real.rstrip(os.sep) + os.sep):
+            return resolved
+    # Plus the tree this process would import anyway, where the swap changes nothing.
+    # Both halves are load-bearing: it must WIN resolution, since promoting a
+    # shadowed package to index 0 is what starts running it, and it must be reachable
+    # by an ABSOLUTE entry, since `find_spec` honours the relative '' and '.' that
+    # resolve to the working directory this function exists to exclude. Exact match,
+    # not containment: a project root on `sys.path` does not vouch for what is under it.
+    if _importing_gguf_tree() == resolved and any(
+        entry and os.path.isabs(entry) and os.path.realpath(entry) == resolved
+        for entry in sys.path
+    ):
+        return resolved
+    logger.warning(
+        "Unsloth: the converter resolved its `gguf` from '%s', which is not inside "
+        "a llama.cpp install Unsloth chose. Not adding it to this process's "
+        "sys.path; the GGUF is read back with the gguf already installed here.",
+        tree,
+    )
+    return None
 
 
 def _resolve_converter_and_gguf(converter_location, python_exe, architecture = None,
@@ -6152,7 +6281,11 @@ def convert_to_gguf(
     # no llama.cpp build can load (unsloth#6056, unsloth#8360, unsloth#8513).
     # `_gguf_py_pin` is None when nothing needed pinning; derive the writer's tree
     # from the probe report instead.
-    _readback_tree = _gguf_py_pin or _gguf_readback_tree(_gguf_report)
+    # The report names a directory the child chose, so it only goes on this
+    # process's sys.path when its provenance checks out.
+    _readback_tree = _gguf_py_pin or _trusted_gguf_tree(
+        _gguf_readback_tree(_gguf_report), converter_location,
+    )
     for _files, _description, _required in verify_groups:
         if not _verify_run_outputs(
             _files, _description, _required, quantization_type,

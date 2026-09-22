@@ -400,6 +400,41 @@ def patch_to_dict():
         setattr(PretrainedConfig, "to_dict", wrapped_to_dict)
 pass
 
+# Above this, a dtype cast is staged through host memory so the device copy can
+# be freed before the replacement is allocated. 1 GiB is well clear of any
+# projection or norm and catches the embedding tables that actually matter:
+# gemma-4 E4B's embed_tokens_per_layer is 5.25 GiB.
+_FORCED_FLOAT32_STAGE_BYTES = 1 * 1024 ** 3
+
+
+def _stage_cast_for_test(module, dtype):
+    """The same staged cast the forced-float32 pass uses, reachable by tests.
+
+    The pass builds its helper as a closure so it can see `setted_dtype`; this
+    mirrors it exactly for `tests/test_forced_float32_cast_peak.py`, which has to
+    measure allocator behaviour rather than read the code.
+    """
+    big = []
+    for param in module.parameters(recurse = False):
+        if (
+            param.dtype.is_floating_point
+            and param.dtype != dtype
+            and param.device.type == "cuda"
+            and param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES
+        ):
+            big.append(param)
+    if not big:
+        module.to(dtype)
+        return
+    for param in big:
+        device = param.device
+        staged = param.data.to("cpu", dtype = dtype, copy = True)
+        param.data = torch.empty(0, dtype = dtype, device = device)
+        param.data = staged.to(device, non_blocking = False)
+        del staged
+    module.to(dtype)
+
+
 def patch_model_and_tokenizer(
     model,
     tokenizer,
@@ -451,23 +486,67 @@ def patch_model_and_tokenizer(
     # If we force float32, we first use bfloat16, then downcast to float16
     if do_forced_float32:
         correct_dtype = torch.float16
+
+        def _cast_module(module, dtype):
+            """`module.to(dtype)` with the peak bounded for very large parameters.
+
+            `.to()` builds the destination while the source is still live, so a
+            single parameter momentarily costs twice its size. That is invisible
+            for a projection and fatal for an embedding table: gemma-4 E4B's
+            `embed_tokens_per_layer` is [262144, 10752], 5.25 GiB, and this pass
+            runs AFTER the device map has already placed the weights to its own
+            budget. On two T4s holding a student and a teacher that is the
+            difference between fitting and an OOM the planner cannot foresee.
+
+            Staging the conversion through host memory lets the device copy be
+            released before the new one is allocated, so the peak is
+            max(old, new) rather than old + new. Only parameters above the
+            threshold pay the host round trip; everything else takes the plain
+            path, which is the overwhelming majority of modules.
+            """
+            big = []
+            for param in module.parameters(recurse = False):
+                if (
+                    param.dtype.is_floating_point
+                    and param.dtype != dtype
+                    and param.device.type == "cuda"
+                    and param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES
+                ):
+                    big.append(param)
+            if not big:
+                module.to(dtype)
+                return
+            for param in big:
+                device = param.device
+                staged = param.data.to("cpu", dtype = dtype, copy = True)
+                # Drop the device copy BEFORE the replacement is allocated. The
+                # empty tensor keeps `.data` a real tensor in between.
+                param.data = torch.empty(0, dtype = dtype, device = device)
+                param.data = staged.to(device, non_blocking = False)
+                del staged
+            # Anything left under the threshold, plus buffers.
+            module.to(dtype)
+
         for name, module in model.named_modules():
             if hasattr(module, "_pre_set_compute_dtype"):
                 setted_dtype = module._pre_set_compute_dtype
             else:
                 setted_dtype = torch.float16
             if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
             if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
+            # `embed_tokens` is a substring test, so it also selects gemma-4's
+            # `embed_tokens_per_layer`. That is wanted; it is also why the one
+            # tensor here can be several GiB.
             if "lm_head" in name or "embed_tokens" in name:
-                module.to(setted_dtype)
-            if "embed_tokens" in name or "patch_embedding" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
+            if "patch_embedding" in name:
+                _cast_module(module, setted_dtype)
             if name.endswith("norm") and hasattr(module, "weight"):
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
             if "bias" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
         pass
         # empty_cache() used to run here once per module, and that corrupted memory on a
         # model split across GPUs: the casts above are async, and empty_cache() cudaFrees

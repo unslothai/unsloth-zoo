@@ -20,6 +20,7 @@
 __all__ = [
     "get_peft_regex",
     "SKIP_QUANTIZATION_MODULES",
+    "MOE_ROUTER_MODULES",
     "get_lora_layer_modules",
     "requires_grad_for_gradient_checkpointing",
 ]
@@ -32,6 +33,13 @@ from collections import OrderedDict
 import re
 from .log import logger
 from .empty_model import _get_module_attribute
+
+# Leaf names of MoE routers, kept out of the automatically chosen LoRA targets.
+# A bare "gate" leaf is deliberately absent: it is the router in several families
+# but a plain projection in others, and no model in the sweep failed because of it.
+MOE_ROUTER_MODULES = frozenset((
+    "router",
+))
 
 # Skip some modules sensitive to quantization
 SKIP_QUANTIZATION_MODULES = [
@@ -100,6 +108,10 @@ def get_peft_regex(
         only_linear_modules = []
         projection_modules  = {}
         for j, (proj, count) in enumerate(all_linear_modules.items()):
+            if proj in MOE_ROUTER_MODULES:
+                # Llama 4's and PhiMoE's routers return a tuple, so PEFT's LoRA
+                # forward reads `result.dtype` off one and the model cannot run.
+                continue
             if count != 1:
                 only_linear_modules.append(proj)
             else:
