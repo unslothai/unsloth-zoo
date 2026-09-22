@@ -166,6 +166,23 @@ def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
                 )
                 plans[frozen] = runtime._unsloth_get_chunk_plan(hidden, weight)[0]
             assert plans == {True: 4096, False: 2048}, (budget_mib, plans)
+
+            # Label smoothing never promotes, at any shape the unsmoothed path would.
+            # It routes to _fallback_dlogits, whose float32 intermediates the bound
+            # underestimates by 3-4x, so a wider chunk there is unbounded in practice.
+            for frozen in (True, False):
+                for n_tokens in (256, 512, 1024):
+                    smoothed = _get_runtime_cce(
+                        ignore_index=-100,
+                        logit_softcap=0.0,
+                        chunk_size=0,
+                        weight_is_frozen=frozen,
+                        label_smoothing=0.1,
+                    )
+                    plan = smoothed._unsloth_get_chunk_plan(
+                        mx.zeros((n_tokens, 512), dtype=mx.bfloat16), weight,
+                    )[0]
+                    assert plan == 2048, (budget_mib, frozen, n_tokens, plan)
     finally:
         runtime_cce_module._CHUNK_BUDGET = saved_budget
         clear_cce_cache()
