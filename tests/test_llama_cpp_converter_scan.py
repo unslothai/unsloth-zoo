@@ -4203,6 +4203,41 @@ def test_inlining_a_constant_is_charged_per_use():
     ]
 
 
+def test_a_destination_spelled_in_character_codes_refuses_it():
+    """bytearray([104, 116, 116, 112, 115]).decode() is a URL with no URL in it,
+    and so is "".join(chr(c) for c in codes). The obfuscation rule this scan
+    already had wants exec or eval beside it, which none of these needs: the
+    destination is simply spelled in numbers.
+
+    Narrow at the receiver, because the one upstream file this allowance
+    reaches really does write bytearray(get_data_by_range(...)): only a
+    container written out in the source counts, never bytes that came back from
+    a call.
+    """
+    scan_converter_source = _load(
+        "converter_scan_codes_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = (
+        'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    )
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = bytearray([104, 116, 116, 112, 115]).decode()\n' + send,
+        'url = bytes([104, 116, 116, 112]).decode()\n' + send,
+        'url = "".join(chr(c) for c in [104, 116, 116, 112])\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # What upstream writes: a bytearray over what came back from the hub.
+    assert scan_converter_source(
+        preamble
+        + 'url = f"{HUB}/api"\n'
+        + 'data = bytearray(get_data_by_range(url = url, start = 0))\n'
+        + send
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.

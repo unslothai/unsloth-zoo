@@ -411,6 +411,42 @@ def _imports_an_unvouchable_api(tree):
     return False
 
 
+def _builds_text_from_numbers(tree):
+    """Whether text is assembled out of character codes.
+
+    bytearray([104, 116, 116, 112, 115]).decode() is a URL with no URL in it,
+    and so is "".join(chr(c) for c in codes). The existing obfuscation rule
+    wants exec or eval beside it, which this needs nothing of: the destination
+    is simply spelled in numbers.
+
+    Narrow at the receiver, because upstream really does write
+    bytearray(get_data_by_range(...)) in the one file this allowance reaches:
+    only a container of values written out in the source counts, never bytes
+    that came back from a call. chr is refused outright, and appears in
+    vocab.py and nowhere that harvests the environment.
+    """
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name) and node.id == "chr"
+        ) or (
+            isinstance(node, ast.Attribute) and node.attr == "chr"
+        ):
+            return True
+        if not isinstance(node, ast.Call):
+            continue
+        name = (
+            node.func.attr if isinstance(node.func, ast.Attribute)
+            else node.func.id if isinstance(node.func, ast.Name) else ""
+        )
+        if name in ("bytes", "bytearray") and node.args and isinstance(
+            node.args[0],
+            (ast.List, ast.Tuple, ast.Set, ast.ListComp, ast.SetComp,
+             ast.GeneratorExp, ast.DictComp),
+        ):
+            return True
+    return False
+
+
 def _import_aliases(tree):
     """`{local name: imported name}` for every alias an import binds.
 
@@ -1408,6 +1444,9 @@ def _talks_only_to_the_model_hub_tree(tree, text):
         return False
     if _imports_a_string_builder(tree):
         # A decoder whose only readable name is the import line itself.
+        return False
+    if _builds_text_from_numbers(tree):
+        # A destination spelled in character codes rather than in characters.
         return False
     if _reaches_through_getattr(tree):
         # A lookup this cannot read is a write or a read it cannot see.
