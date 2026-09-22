@@ -364,6 +364,15 @@ STRING_BUILDER_NAMES = frozenset((
 # So the receiver is searched for a carrier only when the method is one that
 # rebuilds a URL, which none of upstream's calls on a URL are. _replace is
 # here for the namedtuple urlparse returns.
+# The result objects urlsplit and urlparse return, which assemble a whole
+# destination out of fields with no URL literal anywhere:
+# ParseResult("https", "evil.example", "/c", "", "", "").geturl(). Upstream
+# reads .scheme and .netloc off a parse result and never calls geturl.
+URL_ASSEMBLERS = frozenset((
+    "ParseResult", "SplitResult", "ParseResultBytes", "SplitResultBytes",
+    "DefragResult", "DefragResultBytes", "geturl",
+))
+
 URL_REWRITE_METHODS = frozenset((
     "copy_with", "copy_set_param", "copy_add_param", "copy_merge_params",
     "with_host", "with_scheme", "with_path", "with_query", "with_port",
@@ -400,6 +409,22 @@ def _imports_an_unvouchable_api(tree):
             if any(unvouchable(alias.name) for alias in node.names):
                 return True
     return False
+
+
+def _import_aliases(tree):
+    """`{local name: imported name}` for every alias an import binds.
+
+    `from urllib.parse import urljoin as j` leaves the call spelled j(...), and
+    comparing the call site against a set of builder names missed it, exactly as
+    the decoder and docstring checks missed their own aliases.
+    """
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.asname:
+                    aliases[alias.asname] = alias.name.split(".")[-1]
+    return aliases
 
 
 def _imports_a_string_builder(tree):
@@ -920,6 +945,15 @@ def _reshapes_a_url(tree):
     the interprocedural residual this allowance already documents.
     """
     carriers = set()
+    aliases = _import_aliases(tree)
+
+    def called_name(node):
+        """The name a call site uses, read through any import alias."""
+        name = (
+            node.func.attr if isinstance(node.func, ast.Attribute)
+            else node.func.id if isinstance(node.func, ast.Name) else ""
+        )
+        return aliases.get(name, name)
 
     def carries(node):
         while isinstance(node, ast.NamedExpr):
@@ -1072,6 +1106,10 @@ def _reshapes_a_url(tree):
             return True
         if _rewrites_a_constant(node):
             return True
+        if isinstance(node, ast.Call) and called_name(node) in URL_ASSEMBLERS:
+            # No carrier and no URL literal: the destination is spelled field by
+            # field and assembled by the object itself.
+            return True
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -1092,11 +1130,7 @@ def _reshapes_a_url(tree):
             # urljoin(HUB, "//evil.example/collect") resolves to evil.example.
             # Only the builders, since upstream passes its URL to urlparse and
             # to its own helpers, and those read it rather than rebuild it.
-            name = (
-                node.func.attr if isinstance(node.func, ast.Attribute)
-                else node.func.id if isinstance(node.func, ast.Name) else ""
-            )
-            if name in URL_BUILDERS:
+            if called_name(node) in URL_BUILDERS:
                 return True
         if isinstance(node, ast.AugAssign) and (
             carries(node.target) or built_from_a_carrier(node.value)

