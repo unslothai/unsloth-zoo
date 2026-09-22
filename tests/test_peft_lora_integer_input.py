@@ -84,15 +84,44 @@ def test_integer_input_under_autocast_takes_the_autocast_dtype_not_compute_dtype
     index_add_ to raise all the same. The cast target under autocast is the autocast dtype."""
     import bitsandbytes as bnb
     from peft import LoraConfig, get_peft_model
+    import peft.tuners.lora.bnb as peft_bnb
 
     _patch()
+    torch.manual_seed(0)
     base = torch.nn.Sequential(bnb.nn.Linear4bit(32, 64, bias = False, compute_dtype = torch.float32, quant_type = "nf4"))
-    base = base.to("cuda")
-    model = get_peft_model(base, LoraConfig(r = 4, target_modules = ["0"]))
-    model = model.to("cuda", dtype = torch.bfloat16)
+    base[0].weight = bnb.nn.Params4bit(torch.randn(64, 32, dtype = torch.bfloat16), requires_grad = False, quant_type = "nf4")
+    base = base.cuda()
+    base.is_loaded_in_4bit = True
+    model = get_peft_model(base, LoraConfig(r = 4, target_modules = ["0"], init_lora_weights = False))
+    assert isinstance(model.base_model.model[0], peft_bnb.Linear4bit)
+    assert model.base_model.model[0].base_layer.compute_dtype == torch.float32
     x = torch.randint(0, 3, (8, 32), device = "cuda", dtype = torch.uint8)
     with torch.autocast("cuda", dtype = torch.bfloat16):
         out = model(x)
         reference = model(x.to(torch.bfloat16))
     assert out.dtype == reference.dtype == torch.bfloat16
     assert torch.equal(out, reference)
+
+
+def test_the_cast_survives_a_regenerated_forward():
+    """patch_lora_forwards regenerates Linear4bit.forward from PEFT's source (getsource follows
+    __wrapped__ past this wrapper), so the cast must be re-applied once the new forward is
+    installed: the patch wraps whatever forward is on the class at the time."""
+    import inspect
+    from unsloth_zoo import compiler
+    from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
+
+    assert "patch_peft_lora_integer_input()" in inspect.getsource(compiler.patch_lora_forwards)
+    cls = _patch()
+    original_wrapped = cls.forward
+
+    def regenerated(self, x, *args, **kwargs):  # what the compiler installs
+        return original_wrapped.__wrapped__(self, x, *args, **kwargs)
+
+    cls.forward = regenerated
+    try:
+        patch_peft_lora_integer_input()
+        assert getattr(cls.forward, "_unsloth_integer_input", False)
+        assert cls.forward.__wrapped__ is regenerated
+    finally:
+        cls.forward = original_wrapped

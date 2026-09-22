@@ -4403,6 +4403,9 @@ def patch_lora_forwards(torch_compile_options):
 
         # Check failed upcasting
         source = _patch_lora_input_cast(source)
+        # `inspect.getsource` unwrapped the integer-input wrapper on Linear4bit.forward to
+        # PEFT's original, so the regenerated forward has no cast; it is put back once the
+        # new forward is installed (see _reapply_integer_input_cast below).
         source = source.replace(
             "self._check_forward_args(x, *args, **kwargs)",
             "",
@@ -4476,6 +4479,15 @@ def patch_lora_forwards(torch_compile_options):
         else:
             could_not_replace_modules.append(parent)
     pass
+    # The regenerated Linear4bit.forward came from PEFT's source (inspect.getsource follows
+    # __wrapped__ past the integer-input wrapper), so the cast an integer input needs on a
+    # 4-bit layer is gone from the installed forward; put the wrapper back on top of it.
+    try:
+        from .temporary_patches.misc import patch_peft_lora_integer_input
+
+        patch_peft_lora_integer_input()
+    except Exception:
+        pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
 
