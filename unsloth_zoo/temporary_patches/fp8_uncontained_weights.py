@@ -118,7 +118,51 @@ def _make_op(Fp8Dequantize):
                             f"ships no scale; loading it with a scale of ones."
                         )
             return out
+
+        @property
+        def reverse_op(self):
+            return _make_reverse_op(Fp8Dequantize)(self.hf_quantizer)
     return Fp8DequantizeWithoutContainer
+
+
+_FP8_DTYPES = tuple(
+    getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, name)
+)
+
+
+def _make_reverse_op(Fp8Dequantize):
+    """What `save_pretrained` runs through this converter in reverse.
+
+    transformers reverses every converter on save and `Fp8Dequantize.reverse_op`
+    is `Fp8Quantize`, which would re-quantize a container's already packed e4m3
+    weight with a fresh scale and, because the reversed source pattern `weight`
+    also matches `weight_scale_inv`, quantize the scale grid itself. A packed
+    weight, a scale and an activation scale are written as they are; only a
+    weight this converter dequantized on load (bf16 now) is quantized back, so
+    the saved checkpoint keeps the FP8 layout its config describes."""
+    from transformers.integrations.finegrained_fp8 import Fp8Quantize
+
+    class Fp8RequantizeWithoutContainer(Fp8Quantize):
+        def convert(self, input_dict, full_layer_name = None, **kwargs):
+            # The reversed source pattern `weight` also matches `weight_scale_inv`, so
+            # every tensor arrives under the key `weight`; `full_layer_name` says what it is.
+            name = full_layer_name or ""
+            out = {}
+            for key, value in input_dict.items():
+                tensor = _first(value)
+                if (
+                    not isinstance(tensor, torch.Tensor)
+                    or tensor.dtype in _FP8_DTYPES
+                    or name.endswith("_scale_inv")
+                    or name.endswith("activation_scale")
+                ):
+                    # Full name on purpose, so the saved key is the parameter's own.
+                    out[name or key] = tensor
+                else:
+                    out.update(self._quantize_one(key, tensor))
+            return out
+
+    return Fp8RequantizeWithoutContainer
 
 
 def patch_fp8_dequantize_weights_without_container():

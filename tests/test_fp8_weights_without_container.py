@@ -112,6 +112,52 @@ def test_container_target_passes_weight_and_scale_through():
     assert out["proj.weight"] is q and out["proj.weight_scale_inv"] is scale
 
 
+def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
+    """save_pretrained reverses every converter. `Fp8Dequantize.reverse_op` is
+    `Fp8Quantize`, and the reversed source pattern `weight` also matches
+    `weight_scale_inv`: a container's e4m3 weight was re-quantized with a fresh
+    scale and its scale grid quantized to e4m3 with a scale of its own, so the
+    saved weight and scale described different values."""
+    from transformers import PretrainedConfig
+    from transformers.core_model_loading import WeightConverter, revert_weight_conversion
+
+    torch.manual_seed(0)
+    model = _Holder()
+    model.config = PretrainedConfig()
+    model.base_model_prefix = ""
+    q, scale = _block_quantize(torch.randn(8, 8), (4, 4))
+    with torch.no_grad():
+        model.proj.weight.copy_(q)
+        model.proj.weight_scale_inv.copy_(scale)
+    model._weight_conversions = [
+        WeightConverter(
+            source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
+            target_patterns = "weight",
+            operations = [_make_op(Fp8Dequantize)(_quantizer())],
+        )
+    ]
+    state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    saved = revert_weight_conversion(model, dict(state))
+
+    # the container: packed weight and scale written exactly as they are
+    assert saved["proj.weight"].dtype == E4M3
+    assert torch.equal(saved["proj.weight"].view(torch.uint8), state["proj.weight"].view(torch.uint8))
+    assert torch.equal(saved["proj.weight_scale_inv"], state["proj.weight_scale_inv"])
+    assert "proj.weight_scale_inv_scale_inv" not in saved
+    # the expert stack this converter dequantized on load: quantized back, so the
+    # checkpoint keeps the fp8 layout its config describes
+    assert saved["experts.weight"].dtype == E4M3
+    assert saved["experts.weight_scale_inv"].dtype == torch.float32
+    assert saved["experts.weight_scale_inv"].shape == (3, 2, 2)
+    torch.testing.assert_close(
+        _reference_dequant(saved["experts.weight"], saved["experts.weight_scale_inv"]),
+        state["experts.weight"].float(),
+        rtol = 0.07,
+        atol = 0.05,
+    )
+    assert torch.equal(saved["norm.weight"], state["norm.weight"])
+
+
 def test_container_without_a_checkpoint_scale_gets_ones():
     model = _Holder()
     op = _make_op(Fp8Dequantize)(_quantizer())
