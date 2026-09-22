@@ -455,6 +455,18 @@ if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
     _forward_generic_experts_eagerly = torch.compiler.disable(_forward_generic_experts_eagerly)
 
 
+def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
+    """Expert parallelism (RouterParallel) marks non-local routes with the index
+    `num_experts`, which the Unsloth backends' per-expert counts cannot hold. Point
+    those slots at expert 0 with zero weight, as transformers' own implementations
+    do, so they contribute nothing. No host sync; a no-op without such slots."""
+    num_experts = getattr(module, "num_experts", None)
+    if num_experts is None:
+        num_experts = module.gate_up_proj.shape[0]
+    sentinel = top_k_index >= num_experts
+    return top_k_index.masked_fill(sentinel, 0), top_k_weights.masked_fill(sentinel, 0)
+
+
 def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
     """Give an experts class that still runs transformers' generic forward a forward that
     sends bnb 4-bit instances through Unsloth's MoE backend. Every other call, including
@@ -470,6 +482,7 @@ def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
 
     def forward(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
         if not args and not kwargs and _moe_uses_bnb4bit_expert_weights(self):
+            top_k_index, top_k_weights = _drop_expert_parallel_sentinel(self, top_k_index, top_k_weights)
             return _forward_generic_experts_eagerly(
                 get_forward_moe_backend, self, hidden_states, top_k_index, top_k_weights
             )

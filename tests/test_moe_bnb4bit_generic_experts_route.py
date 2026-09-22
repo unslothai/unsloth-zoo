@@ -213,3 +213,37 @@ def test_bnb4bit_generic_experts_forward_matches_dequantized_reference(impl):
     hidden = hidden.clone().requires_grad_(True)
     experts(hidden, top_k_index, top_k_weights.to(torch.bfloat16)).float().pow(2).sum().backward()
     assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+
+
+def test_expert_parallel_sentinel_slots_are_dropped():
+    """RouterParallel marks non-local routes with index num_experts and weight 0."""
+    module = SimpleNamespace(num_experts = 4)
+    index = torch.tensor([[0, 4], [3, 4], [4, 4]])
+    weights = torch.tensor([[0.5, 0.0], [1.0, 0.0], [0.0, 0.0]])
+    new_index, new_weights = mb._drop_expert_parallel_sentinel(module, index, weights)
+    assert int(new_index.max()) < 4
+    assert torch.equal(new_weights, torch.tensor([[0.5, 0.0], [1.0, 0.0], [0.0, 0.0]]))
+    assert torch.equal(new_index, torch.tensor([[0, 0], [3, 0], [0, 0]]))
+    # Without sentinels nothing changes.
+    same_index, same_weights = mb._drop_expert_parallel_sentinel(module, index.clamp(max = 3), weights)
+    assert torch.equal(same_index, index.clamp(max = 3)) and torch.equal(same_weights, weights)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "bnb 4-bit needs CUDA")
+def test_bnb4bit_forward_accepts_expert_parallel_sentinel_routes():
+    pytest.importorskip("bitsandbytes")
+    klass = _make_experts_class()
+    model = nn.Module()
+    model.experts = _init(klass(_config("grouped_mm")))
+    _quantize_like_the_loader(model, "cuda")
+    experts = model.experts
+    num_experts = experts.gate_up_proj._original_shape[0] if hasattr(experts.gate_up_proj, "_original_shape") else experts.gate_up_proj.shape[0]
+    hidden, top_k_index, top_k_weights = _routing(64, device = "cuda")
+    hidden = hidden.to(torch.bfloat16)
+    top_k_weights = top_k_weights.to(torch.bfloat16)
+    local = experts(hidden, top_k_index, top_k_weights)
+    # Append a non-local slot per token: sentinel index, zero weight.
+    sentinel_index = torch.cat([top_k_index, torch.full_like(top_k_index[:, :1], num_experts)], dim = 1)
+    sentinel_weights = torch.cat([top_k_weights, torch.zeros_like(top_k_weights[:, :1])], dim = 1)
+    out = experts(hidden, sentinel_index, sentinel_weights)
+    torch.testing.assert_close(out.float(), local.float(), rtol = 2e-2, atol = 2e-3)
