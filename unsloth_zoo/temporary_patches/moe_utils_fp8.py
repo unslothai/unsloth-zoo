@@ -118,8 +118,42 @@ def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
 
 
 # Triton refuses to compile a kernel that builds a tensor larger than this, so a
-# BLOCK_SIZE x BLOCK_SIZE tile is only legal up to BLOCK_SIZE = 1024.
+# BLOCK_SIZE x BLOCK_SIZE tile is only legal up to BLOCK_SIZE = 1024. Fallback
+# only: _triton_max_tensor_numel() below prefers Triton's own value.
 _TRITON_MAX_TENSOR_NUMEL = 1048576
+
+_TRITON_MAX_TENSOR_NUMEL_RESOLVED = None
+
+
+def _triton_max_tensor_numel():
+    """Triton's own cap rather than our literal copy of it.
+
+    validate_block_shape() raises on numel > TRITON_MAX_TENSOR_NUMEL in the
+    Python frontend (triton/_utils.py), before a backend is chosen, so ROCm and
+    CUDA share the value. Reading it anyway costs nothing here -- the caller has
+    already imported the Triton kernel -- and keeps a build that moved the cap
+    either way correct: a lower one would otherwise take a tile that cannot
+    compile, a higher one would decline a tile that would have been fine.
+    Falls back to the literal when Triton is absent or spells it elsewhere.
+    """
+    global _TRITON_MAX_TENSOR_NUMEL_RESOLVED
+    if _TRITON_MAX_TENSOR_NUMEL_RESOLVED is None:
+        import importlib
+
+        resolved = _TRITON_MAX_TENSOR_NUMEL
+        for module_name in ("triton.language", "triton._utils"):
+            try:
+                value = getattr(
+                    importlib.import_module(module_name), "TRITON_MAX_TENSOR_NUMEL", None
+                )
+            except Exception:
+                continue
+            # bool is an int; a stub package can hand back anything.
+            if type(value) is int and value > 0:
+                resolved = value
+                break
+        _TRITON_MAX_TENSOR_NUMEL_RESOLVED = resolved
+    return _TRITON_MAX_TENSOR_NUMEL_RESOLVED
 
 
 def _ceil_div(a, b):
@@ -282,7 +316,7 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
     if bm != bn:
         # weight_dequant_block uses a single BLOCK_SIZE; fall through to caller.
         return None
-    if bm * bn > _TRITON_MAX_TENSOR_NUMEL:
+    if bm * bn > _triton_max_tensor_numel():
         # The kernel materialises a BLOCK_SIZE x BLOCK_SIZE tile, so a coarse
         # scale makes the tile larger than any Triton tensor may be and the
         # launch fails to compile. A per-expert per-tensor scale (p == q == 1)

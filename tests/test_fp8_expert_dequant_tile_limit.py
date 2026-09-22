@@ -30,6 +30,8 @@ fallback answers. Finer scales must keep taking the Triton path unchanged.
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 
@@ -50,12 +52,13 @@ def test_per_tensor_expert_scale_declines_instead_of_failing_to_compile(M, N):
     multiple of 64 past the limit, which pins the boundary rather than a round
     number well clear of it.
     """
-    assert M * N > F._TRITON_MAX_TENSOR_NUMEL
+    limit = F._triton_max_tensor_numel()
+    assert M * N > limit
     w = _weight(2, M, N, "cpu")
     s = torch.ones(2, 1, 1)
     assert F._dequantize_full_expert_weights_unsloth(w, s, torch.bfloat16) is None, (
-        f"a {M}x{N} tile exceeds Triton's {F._TRITON_MAX_TENSOR_NUMEL} element "
-        f"limit but the Triton path still claimed it"
+        f"a {M}x{N} tile exceeds Triton's {limit} element limit but the Triton "
+        f"path still claimed it"
     )
 
 
@@ -75,9 +78,37 @@ def test_a_tile_exactly_at_the_limit_is_still_taken():
 
 
 def test_the_limit_matches_tritons_own():
-    """Derived from Triton rather than trusted as a literal: a future Triton
-    that raises the cap would otherwise leave this declining needlessly."""
-    assert F._TRITON_MAX_TENSOR_NUMEL == 1048576 == 2 ** 20
+    """Read out of Triton, not asserted against our own literal, which would be
+    a tautology. This is what answers the cap on a non-CUDA Triton build: the
+    check lives in the Python frontend (triton/_utils.validate_block_shape), so
+    a ROCm wheel reports the same value, and if one ever did not, this fails
+    here rather than at kernel compile time on that hardware."""
+    triton_language = pytest.importorskip("triton.language")
+    theirs = getattr(triton_language, "TRITON_MAX_TENSOR_NUMEL", None)
+    # Not `is None`: with no GPU visible, unsloth's import_fixes installs a Triton
+    # stub whose every attribute is a placeholder object, so the name resolves to
+    # something that is not a number. Comparing against it would fail here and,
+    # worse, `tile > placeholder` in the resolver would raise TypeError on exactly
+    # the machines that have no Triton, which is why it checks the type too.
+    if type(theirs) is not int:
+        pytest.skip("Triton is stubbed or does not export TRITON_MAX_TENSOR_NUMEL")
+    assert F._triton_max_tensor_numel() == theirs
+
+
+def test_the_fallback_is_used_when_triton_cannot_be_read(monkeypatch):
+    """Absent or broken Triton must leave the literal in place rather than
+    raising: the zoo imports on machines with no Triton at all (macOS arm64)."""
+    monkeypatch.setattr(F, "_TRITON_MAX_TENSOR_NUMEL_RESOLVED", None)
+
+    real_import_module = importlib.import_module
+
+    def _no_triton(name, *args, **kwargs):
+        if name.startswith("triton"):
+            raise ImportError("no triton here")
+        return real_import_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", _no_triton)
+    assert F._triton_max_tensor_numel() == F._TRITON_MAX_TENSOR_NUMEL == 2 ** 20
 
 
 @requires_cuda
