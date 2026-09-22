@@ -3275,3 +3275,111 @@ def test_the_kto_trainer_still_refuses_a_vision_language_model(tmp_path):
         args=MLXKTOConfig(**_generation_common(tmp_path, generate_during_eval=False)))
     with pytest.raises(ValueError, match="KTO: vision-language models are not supported"):
         trainer._prepare_data(True)
+
+
+@pytest.mark.parametrize("loss_type", ["grpo", "bnpo", "dr_grpo", "dapo"])
+@pytest.mark.parametrize("level,beta,with_old,delta", [
+    ("token", 0.0, False, None), ("token", 0.04, True, 1.3), ("sequence", 0.04, True, None),
+])
+def test_grpo_loss_gradient_and_metrics_match_unsloth_cuda(loss_type, level, beta, with_old, delta):
+    import numpy as np
+    import torch
+    import mlx.core as mx
+    from unsloth_zoo.rl_replacements import grpo_compute_loss
+    from unsloth_zoo.mlx.grpo import GRPOObjective, _reduce, grpo_stats, grpo_terms
+
+    g = torch.Generator().manual_seed(0)
+    rows, width, k, items = 4, 6, 2, 17.0
+    new = torch.randn(rows, width, generator=g) * 0.3 - 2
+    old = new + 0.5 * torch.randn(rows, width, generator=g)
+    ref = new + 0.3 * torch.randn(rows, width, generator=g)
+    mask = (torch.rand(rows, width, generator=g) > 0.3).float()
+    mask[:, 0] = 1
+    adv = torch.randn(rows, generator=g)
+    leaf = new.clone().requires_grad_()
+    loss, length, kl, _, _, cuda_coef, _ = grpo_compute_loss(
+        ref, leaf, old if with_old else None, None, torch.zeros(rows, width, dtype=torch.long),
+        mask, beta, adv, loss_type=loss_type, epsilon_low=0.2, epsilon_high=0.28, delta=delta,
+        importance_sampling_level=level, max_completion_length=8, num_items_in_batch=items,
+        current_gradient_accumulation_steps=k,
+    )
+    loss.backward()
+    objective = GRPOObjective(loss_type, beta, 0.2, 0.28, delta, level, max_completion_length=8)
+    as_mx = lambda t: mx.array(t.detach().numpy())  # noqa: E731
+    A, M, O, R = as_mx(adv), as_mx(mask), as_mx(old) if with_old else None, as_mx(ref)
+
+    def scaled(values):
+        per_token, _, _ = grpo_terms(objective, values, A, M, old=O, ref=R)
+        return _reduce(objective, per_token, M, mx.array([float(k), items]))
+
+    assert scaled(as_mx(new)).item() == pytest.approx(k * loss.item(), rel=1e-5)
+    grad = np.array(mx.grad(scaled)(as_mx(new)))
+    assert np.allclose(grad, k * leaf.grad.numpy(), rtol=1e-4, atol=1e-7)
+    _, mx_kl, coef_1 = grpo_terms(objective, as_mx(new), A, M, old=O, ref=R)
+    stats = np.array(grpo_stats(objective, mx_kl, coef_1, A, M))
+    low, high = (cuda_coef < 0.8) & (adv[:, None] < 0), (cuda_coef > 1.28) & (adv[:, None] > 0)
+    clip = [(x.float().mean() if level == "sequence" else (x * mask).sum() / mask.sum()).item() for x in (low, high, low | high)]  # noqa: E501
+    assert stats[:5] == pytest.approx([kl.item(), length.item(), *clip], rel=1e-5, abs=1e-7)
+
+
+def test_grpo_loss_masks_truncated_rows_but_measures_them():
+    import numpy as np
+    import mlx.core as mx
+    from unsloth_zoo.mlx.grpo import GRPOObjective, completion_logps, grpo_metric_values, make_grpo_loss_fn
+
+    class Model:
+        def __call__(self, ids):
+            return mx.stack([ids.astype(mx.float32) * 0.1, -ids.astype(mx.float32) * 0.1, ids.astype(mx.float32) * 0], axis=-1)  # noqa: E501
+
+    objective = GRPOObjective("dapo", beta=0.0, temperature=0.7)
+    loss_fn = make_grpo_loss_fn(objective)
+    batch, lengths = mx.array([[1, 2, 0, 1], [2, 1, 1, 0]]), mx.array([[2, 4], [1, 3]])
+    advantages, normalizers = mx.array([1.0, -1.0]), mx.array([2.0, 5.0])
+    both = loss_fn(Model(), batch, lengths, normalizers, advantages, mx.array([1, 1]))
+    first = loss_fn(Model(), batch, lengths, normalizers, advantages, mx.array([1, 0]))
+    assert both[0].item() == pytest.approx(0.0, abs=1e-6)  # on-policy: -(A * 1) summed over +1/-1 rows
+    assert first[0].item() == pytest.approx(2 * -2 / 5)
+    assert grpo_metric_values(both[2].tolist())["completion_length"] == grpo_metric_values(first[2].tolist())["completion_length"] == 2.0  # noqa: E501
+    assert loss_fn._unsloth_supervised_tokens((batch, lengths)).item() == 4
+    logits = np.array(Model()(batch[:, :-1])) / 0.7
+    expected = logits - np.log(np.exp(logits).sum(-1, keepdims=True))
+    expected = np.take_along_axis(expected, np.array(batch[:, 1:])[..., None], -1)[..., 0]
+    assert np.allclose(np.array(completion_logps(Model(), batch, 0.7)), expected, atol=1e-5)
+
+
+def test_grpo_rewards_advantages_and_reward_inputs_follow_trl():
+    import numpy as np
+    from unsloth_zoo.mlx.grpo import GRPOObjective, calculate_rewards, cut_completion, group_advantages, reward_prompts_and_completions  # noqa: E501
+
+    seen = {}
+
+    def correct(prompts, completions, completion_ids, answer, trainer_state, **kwargs):
+        seen.update(completion_ids=completion_ids, answer=answer, state=trainer_state, extra=kwargs)
+        return [None if i == 1 else float(c[0]["content"].endswith("4")) for i, c in enumerate(completions)]
+
+    prompt = [{"role": "user", "content": "2+2?"}, {"role": "assistant", "content": "It is "}]
+    prompts, completions = reward_prompts_and_completions([prompt] * 4, ["4", "5", "4", "4"])
+    assert prompts[0] == prompt[:1] and len(prompt) == 2 and completions[1][0]["content"] == "It is 5"
+    assert reward_prompts_and_completions(["2+2?"], ["4"]) == (["2+2?"], ["4"])
+    rows = [{"prompt": prompt, "answer": "4", "level": i} for i in range(4)]
+    with pytest.warns(UserWarning, match="every reward function returned None"):
+        rewards = calculate_rewards(
+            [correct, lambda completions, **_: [None, None, 0.5, None]], rows, prompts=prompts, completions=completions,
+            completion_ids=[[1]] * 4, trainer_state="state",
+        )
+    assert seen["answer"] == ["4"] * 4 and seen["state"] == "state" and seen["extra"] == {"level": [0, 1, 2, 3]}
+    advantages, stats = group_advantages(rewards, [1.0, 2.0], 2, "group")
+    assert np.allclose(advantages, np.array([0.5, -0.5, 0.5, -0.5]) / (np.sqrt(0.5) + 1e-4), rtol=1e-6)
+    assert stats == pytest.approx({"reward": 1.0, "reward_std": 0.7071, "frac_reward_zero_std": 0.0}, rel=1e-3)
+    assert group_advantages(np.ones((4, 1), np.float32), [1.0], 2, "group")[1]["frac_reward_zero_std"] == 1.0
+    assert np.allclose(group_advantages(rewards, [1.0, 2.0], 2, "none")[0], [0.5, -0.5, 0.5, -0.5])
+    assert np.allclose(group_advantages(rewards, [1.0, 2.0], 2, "batch")[0], np.array([0.5, -0.5, 0.5, -0.5]) / (np.sqrt(2 / 3) + 1e-4), rtol=1e-6)  # noqa: E501
+    with pytest.raises(ValueError, match="returned 1 rewards for 4"):
+        calculate_rewards([lambda **_: [0.0]], rows, prompts=prompts, completions=completions, completion_ids=[[1]] * 4, trainer_state=None)  # noqa: E501
+    assert cut_completion([5, 9, 7], "stop", eos_id=9, pad_id=0) == ([5, 9], False)
+    assert cut_completion([5, 6], "stop", eos_id=9, pad_id=0) == ([5, 6, 9], False)
+    assert cut_completion([5, 6], "length", eos_id=9, pad_id=0) == ([5, 6], True)
+    assert cut_completion([5, 0], "length", eos_id=9, pad_id=0) == ([5, 0], False)
+    assert GRPOObjective(epsilon=0.3).epsilon_high == 0.3
+    with pytest.raises(ValueError, match="TRL 0.24 supports"):
+        GRPOObjective(loss_type="cispo")
