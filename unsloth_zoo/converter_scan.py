@@ -313,6 +313,31 @@ def _writes_anything(tree):
 SENSITIVE_MODULES = frozenset(("os", "requests", "httpx", "urllib", "socket"))
 
 
+# Modules whose members name a destination as a bare host, or write in a way
+# the method names cannot see. urllib.parse is deliberately absent: it is string
+# manipulation, RE_NETWORK excludes it for the same reason, and upstream's
+# utility.py imports urlparse from it twice.
+UNVOUCHABLE_MODULES = ("socket", "http.client", "http.server", "urllib.request")
+
+
+def _imports_an_unvouchable_api(tree):
+    """Whether a connection API arrives by from-import.
+
+    RE_UNVOUCHABLE_NETWORK reads qualified spellings, so
+    `from socket import create_connection` left nothing for it to match and a
+    token could go to a bare host beside a benign hub GET.
+    """
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or not node.module:
+            continue
+        if any(
+            node.module == module or node.module.startswith(module + ".")
+            for module in UNVOUCHABLE_MODULES
+        ):
+            return True
+    return False
+
+
 def _reaches_through_getattr(tree):
     """Whether a write or the environment is reached by a computed lookup.
 
@@ -449,7 +474,10 @@ def _format_text(node):
             mapping[name] = text
         try:
             return template.format_map(mapping)
-        except (IndexError, KeyError, ValueError, AttributeError):
+        except Exception:
+            # Any exception at all: "{0[x]}".format("a") raises TypeError, and
+            # one unreachable expression like it made the whole scan raise,
+            # which the caller turns into "continue with no findings".
             return None
     arguments = [_literal_text(argument) for argument in node.args]
     keywords = {
@@ -462,8 +490,8 @@ def _format_text(node):
         return None
     try:
         return template.format(*arguments, **keywords)
-    except (IndexError, KeyError, ValueError, AttributeError):
-        return None
+    except Exception:
+        return None                     # see format_map above
 
 
 def _join_nodes(node):
@@ -790,13 +818,15 @@ def _talks_only_to_the_model_hub(text):
         return False                # cannot tell, so do not suppress anything
     try:
         return _talks_only_to_the_model_hub_tree(tree, text)
-    except (RecursionError, MemoryError):
-        # Nothing in here may raise. The walks below recurse through nested
-        # expressions, and 600 operands in one addition is enough to exhaust the
-        # default limit; scan_converter_source does not catch that, and
+    except Exception:
+        # Nothing in here may raise, for ANY reason. 600 operands in one
+        # addition exhausts the recursion limit and "{0[x]}".format("a") raises
+        # TypeError, both from expressions that need never run;
+        # scan_converter_source does not catch either, and
         # warn_on_suspicious_converter catches everything and CONTINUES, so a
-        # payload could have appended one long expression to itself and had the
-        # whole scan report nothing, in strict mode included.
+        # payload could append one such expression to itself and have the whole
+        # scan report nothing, in strict mode included. Refusing is the answer
+        # to every failure here, so the class of failure does not matter.
         return False
 
 
@@ -807,6 +837,9 @@ def _talks_only_to_the_model_hub_tree(tree, text):
         # multi-tenant: a token with write scope can create a public repository
         # there and make it a channel anyone can read back, so "the destination
         # is the hub" is not on its own a reason to say nothing.
+        return False
+    if _imports_an_unvouchable_api(tree):
+        # A destination this allowance never looks at, arriving by another door.
         return False
     if _reaches_through_getattr(tree):
         # A lookup this cannot read is a write or a read it cannot see.
