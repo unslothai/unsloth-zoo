@@ -268,6 +268,10 @@ def _mxfp4_hub_kernel_unreachable():
         return False
     if "get_kernel" not in source:
         return False
+    if hasattr(mxfp4_integration, "_replace_with_mxfp4_linear"):
+        # patch_gpt_oss replaces replace_with_mxfp4_linear with a version built on this helper,
+        # which uses the importable triton_kernels directly and never reaches the hub.
+        return False
     try:
         from transformers.utils import is_kernels_available as _real_is_kernels_available
         return not _real_is_kernels_available()

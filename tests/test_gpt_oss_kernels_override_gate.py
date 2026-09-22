@@ -41,6 +41,11 @@ _RUNNER = textwrap.dedent(
 
     import transformers.utils
     transformers.utils.is_kernels_available = lambda *a, **k: hub_ok
+    import transformers.integrations.mxfp4 as m
+    if sys.argv[2] == "direct" and not hasattr(m, "_replace_with_mxfp4_linear"):
+        m._replace_with_mxfp4_linear = lambda *a, **k: (a[0], True)   # the 4.57 helper
+    elif sys.argv[2] == "hub_only" and hasattr(m, "_replace_with_mxfp4_linear"):
+        del m._replace_with_mxfp4_linear
     import transformers.quantizers.quantizer_mxfp4 as q
     q.is_kernels_available = lambda *a, **k: hub_ok
     original = q.is_kernels_available
@@ -53,9 +58,9 @@ _RUNNER = textwrap.dedent(
 )
 
 
-def _run(mode):
+def _run(mode, layout = "hub_only"):
     proc = subprocess.run(
-        [sys.executable, "-c", _RUNNER, mode], capture_output = True, text = True, timeout = 600,
+        [sys.executable, "-c", _RUNNER, mode, layout], capture_output = True, text = True, timeout = 600,
     )
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-4000:]
     return proc.stdout
@@ -80,3 +85,12 @@ def test_reachable_hub_kernels_still_take_the_native_path():
     pytest.importorskip("transformers.integrations.mxfp4")
     out = _run("hub_ok")
     assert "CLAIMS True" in out, out
+
+
+@pytest.mark.skipif(not _loader_uses_hub_kernel(), reason = "transformers loads MXFP4 kernels without the hub")
+def test_a_direct_replacement_keeps_the_native_path_without_the_hub():
+    """4.57 still ships _replace_with_mxfp4_linear, which patch_gpt_oss builds its own
+    replace_with_mxfp4_linear on; that path uses triton_kernels directly, so a missing hub
+    must not force the bf16 fallback there."""
+    out = _run("hub_missing", "direct")
+    assert "OVERRIDDEN" in out and "CLAIMS True" in out, out
