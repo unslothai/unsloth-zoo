@@ -2,13 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Offloaded gradient checkpointing on a model split over several cards.
-
-The side stream that stages each card's activations was created with a bare
-``torch.cuda.Stream()``, which belongs to the current device, so every card past the
-first issued its offload copies against a cuda:0 stream. These pin each card's stream
-to that card and check the offloaded result still matches plain checkpointing.
-"""
+"""Offloaded gradient checkpointing with side streams on each card of a split model."""
 
 import pytest
 import torch
