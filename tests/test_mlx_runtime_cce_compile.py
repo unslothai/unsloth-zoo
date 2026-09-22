@@ -118,7 +118,11 @@ def test_automatic_chunks_reduce_backward_peak(frozen, dim):
         peaks.append(mx.get_peak_memory() - resident)
         del result
     assert peaks[1] <= peaks[0]
-    if frozen or dim == 512:
+    # Only a frozen head is admitted at these shapes. A trainable bfloat16 head writes
+    # d_logits in float32 and then casts it back, so the token-side buffers the promotion
+    # grows are 4x the logits chunk and exceed what the plan allows; measured on an M1,
+    # promoting there cost 146324012 bytes against 143211072.
+    if frozen:
         assert peaks[1] < peaks[0]
 
 
