@@ -66,6 +66,39 @@ def _load_workflow(path: Path):
         sys.exit(2)
 
 
+def _extract_restore_key_prefixes(path: Path) -> list[str]:
+    """Every prefix a `restore-keys:` block offers as a fallback.
+
+    The exact-key comparison below cannot see these. `restore-keys` restores the newest
+    entry whose key merely STARTS WITH the prefix, so a publish workflow can adopt an
+    entry a pull request wrote without the two keys ever being equal.
+    """
+    text = path.read_text()
+    prefixes: list[str] = []
+    for m in re.finditer(r"(?:^|\n)([ \t]*)restore-keys:[ \t]*(\|-?|>-?)?[ \t]*([^\n]*)\n", text):
+        indent, block, inline = m.group(1), m.group(2), m.group(3).strip()
+        if inline and not block:
+            prefixes.append(inline)
+            continue
+        for line in text[m.end():].split("\n"):
+            if not line.strip():
+                break
+            if len(line) - len(line.lstrip()) <= len(indent):
+                break
+            prefixes.append(line.strip())
+    return [x for x in prefixes if x]
+
+
+def _literal_prefix(key: str) -> str:
+    """The fixed-text head of a key, i.e. everything before the first expression.
+
+    Keys are mostly `literal-${{ something }}`, so comparing whole strings compares the
+    expressions too and almost never matches. The literal head is what decides whether
+    one key can satisfy another's prefix restore.
+    """
+    return re.split(r"\$\{\{", key, maxsplit = 1)[0].strip().strip("'\"")
+
+
 def _extract_cache_keys(path: Path) -> list[str]:
     text = path.read_text()
     keys: list[str] = []
@@ -96,6 +129,7 @@ def main() -> int:
     workflows = sorted(workflows_dir.glob("*.yml"))
     pr_triggered: list[tuple[Path, list[str]]] = []
     publish_triggered: list[tuple[Path, list[str]]] = []
+    publish_restore_prefixes: list[tuple[Path, list[str]]] = []
 
     for path in workflows:
         doc = _load_workflow(path)
@@ -127,6 +161,18 @@ def main() -> int:
         )
         if path.name in PUBLISH_WORKFLOW_NAMES or is_dispatch_only:
             publish_triggered.append((path, _extract_cache_keys(path)))
+            publish_restore_prefixes.append((path, _extract_restore_key_prefixes(path)))
+
+    # A PR-triggered workflow usually delegates its key to a composite action, so the
+    # literal key lives in .github/actions/*/action.yml while the workflow carries only
+    # `${{ steps.x.outputs.key }}`. Those count as pull-request-reachable, because the
+    # workflow using them runs on pull requests. Without this the prefix rule below would
+    # compare against opaque expressions and match nothing.
+    composite_dir = workflows_dir.parent / "actions"
+    composite_keys: list[str] = []
+    if composite_dir.is_dir():
+        for action_path in sorted(composite_dir.rglob("action.y*ml")):
+            composite_keys.extend(_extract_cache_keys(action_path))
 
     pr_keys = {key for _, keys in pr_triggered for key in keys}
     for pub_path, pub_keys in publish_triggered:
@@ -138,6 +184,31 @@ def main() -> int:
                     "and the publish workflow would restore it on next run. "
                     "Add a unique suffix (e.g. '-publish-only') to partition "
                     "the namespaces."
+                )
+
+    # The same trust boundary, reached by prefix instead of by an equal key.
+    pr_key_prefixes = {
+        _literal_prefix(k) for k in list(pr_keys) + composite_keys if _literal_prefix(k)
+    }
+    for pub_path, prefixes in publish_restore_prefixes:
+        for prefix in prefixes:
+            literal = _literal_prefix(prefix)
+            if not literal:
+                findings.append(
+                    f"{pub_path.name}: restore-keys entry {prefix!r} begins with an "
+                    "expression, so what it can restore is not decidable here. Give it "
+                    "a literal prefix."
+                )
+                continue
+            for pr_prefix in sorted(pr_key_prefixes):
+                if pr_prefix.startswith(literal):
+                    findings.append(
+                        f"{pub_path.name}: restore-keys prefix {literal!r} matches "
+                        f"{pr_prefix!r}, a cache key namespace a PR-triggered workflow "
+                        "writes. A prefix restore takes the newest matching entry, so "
+                        "this publish workflow could adopt a cache a pull request "
+                        "produced even though no key is equal. Partition the "
+                        "namespaces, or drop the restore-keys fallback here."
                 )
 
     if findings:

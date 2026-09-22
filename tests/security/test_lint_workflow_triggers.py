@@ -136,3 +136,74 @@ def test_lint_rejects_shared_cache_key_between_pr_and_publish(tmp_path):
     assert proc.returncode == 1
     assert "cache-key" in proc.stderr.lower() or "cache key" in proc.stderr.lower()
     assert "shared-cache-v1" in proc.stderr
+
+
+def _pr_workflow(text_key: str) -> str:
+    return (
+        "name: pr-build\n"
+        "on:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  build:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/cache@v4\n"
+        "        with:\n"
+        "          path: wheels\n"
+        f"          key: {text_key}\n"
+    )
+
+
+def test_lint_rejects_a_publish_restore_keys_prefix_over_a_pr_namespace(tmp_path):
+    """A prefix restore reaches the same cache an equal key would.
+
+    `restore-keys` restores the newest entry whose key merely STARTS WITH the prefix, so
+    a publish workflow can adopt an entry a pull request wrote while no two keys are
+    equal. The exact-key check beside this one compares whole strings and never saw it.
+    """
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    (wf / "pr-build.yml").write_text(_pr_workflow("pip-v2-${{ runner.os }}-abc"))
+    (wf / "wheel-smoke.yml").write_text(
+        "name: wheel-smoke\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "jobs:\n"
+        "  publish:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/cache/restore@v4\n"
+        "        with:\n"
+        "          path: wheels\n"
+        "          key: pip-v2-publish-${{ runner.os }}\n"
+        "          restore-keys: |\n"
+        "            pip-\n"
+    )
+    proc = _run(wf)
+    assert proc.returncode == 1, f"prefix restore accepted:\n{proc.stdout}\n{proc.stderr}"
+    assert "restore-keys" in proc.stderr
+    assert "'pip-'" in proc.stderr
+
+
+def test_a_partitioned_publish_prefix_is_accepted(tmp_path):
+    """The fix must pass, or the rule above is just a ban on restore-keys."""
+    wf = tmp_path / "wf"
+    wf.mkdir()
+    (wf / "pr-build.yml").write_text(_pr_workflow("pip-v2-${{ runner.os }}-abc"))
+    (wf / "wheel-smoke.yml").write_text(
+        "name: wheel-smoke\n"
+        "on:\n"
+        "  workflow_dispatch:\n"
+        "jobs:\n"
+        "  publish:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/cache/restore@v4\n"
+        "        with:\n"
+        "          path: wheels\n"
+        "          key: pip-publish-only-${{ runner.os }}\n"
+        "          restore-keys: |\n"
+        "            pip-publish-only-\n"
+    )
+    proc = _run(wf)
+    assert proc.returncode == 0, f"partitioned prefix rejected:\n{proc.stderr}"
