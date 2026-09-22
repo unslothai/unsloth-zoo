@@ -125,21 +125,62 @@ def test_skip_does_not_depend_on_the_model_family(model_type):
     assert not [t for t in targets if t.rsplit(".")[-1] == "router"]
 
 
-def test_llama4_router_returns_a_tuple_so_peft_cannot_adapt_it():
-    """The upstream fact the skip exists for. If Llama 4's router ever becomes a
-    plain Linear returning a tensor, this fails and the skip can be revisited."""
-    transformers = pytest.importorskip("transformers")
-    modeling = pytest.importorskip("transformers.models.llama4.modeling_llama4")
-    router_cls = getattr(modeling, "Llama4Router", None)
-    if router_cls is None:
-        pytest.skip("this transformers has no Llama4Router")
-    assert issubclass(router_cls, nn.Linear), (
-        "Llama4Router is no longer an nn.Linear, so the automatic search would "
-        "not have picked it up in the first place"
+def _router_class(family):
+    """The family's router class, found by shape rather than by one spelling.
+
+    Llama 4's class has been named both Llama4Router and Llama4TextRouter, and
+    a getattr on a single spelling turns a rename into a silent skip of the one
+    check this file exists to make. Match any Linear-derived *Router in the
+    module instead, so a rename keeps testing and a real removal still skips.
+    """
+    modeling = pytest.importorskip(f"transformers.models.{family}.modeling_{family}")
+    found = sorted(
+        (name, obj) for name, obj in vars(modeling).items()
+        if isinstance(obj, type) and name.endswith("Router")
+        and issubclass(obj, nn.Linear) and obj.__module__ == modeling.__name__
     )
-    import inspect
-    source = inspect.getsource(router_cls.forward)
-    assert "return router_scores, router_logits" in source, (
-        f"Llama4Router.forward no longer returns a tuple on transformers "
-        f"{transformers.__version__}; re-check whether the skip is still needed"
+    if not found:
+        # Either the family has no router at all, or its router stopped being an
+        # nn.Linear -- in which case the automatic search never saw it and the
+        # skip is moot for this family.
+        pytest.skip(f"no nn.Linear router class in modeling_{family}")
+    return modeling, found[0][1]
+
+
+@pytest.mark.parametrize("family,config_cls_name", [
+    ("llama4", "Llama4TextConfig"),
+    ("phimoe", "PhimoeConfig"),
+])
+def test_the_router_returns_a_tuple_so_peft_cannot_adapt_it(family, config_cls_name):
+    """The upstream fact the skip exists for, called rather than read.
+
+    PEFT's lora.Linear.forward does `result.dtype` on whatever the base layer
+    returns, so a router returning a tuple cannot be adapted at all. Asserting
+    on the return value keeps this true across upstream refactors that rename
+    the class or its locals; if a router ever returns a plain tensor again,
+    this fails and the skip can be revisited for that family.
+    """
+    import torch
+
+    transformers = pytest.importorskip("transformers")
+    modeling, router_cls = _router_class(family)
+    config_cls = getattr(
+        pytest.importorskip(f"transformers.models.{family}.configuration_{family}"),
+        config_cls_name, None,
+    )
+    if config_cls is None:
+        pytest.skip(f"this transformers has no {config_cls_name}")
+
+    config = config_cls(hidden_size=8, num_local_experts=4, num_experts_per_tok=2)
+    router = router_cls(config).eval()
+    with torch.no_grad():
+        out = router(torch.randn(4, 8))
+
+    assert isinstance(out, tuple), (
+        f"{router_cls.__name__}.forward returns {type(out).__name__} on "
+        f"transformers {transformers.__version__}, not a tuple; re-check "
+        f"whether the skip is still needed for {family}"
+    )
+    assert not hasattr(out, "dtype"), (
+        "PEFT reads .dtype off this return value; if it has one, LoRA would work"
     )
