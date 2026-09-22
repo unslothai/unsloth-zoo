@@ -288,3 +288,45 @@ def test_absent_marker_survives_copying_the_model(clone):
     assert not hasattr(copied.config.text_config, "use_cache")
     # and the config is still serializable, which the sentinel leak broke
     copied.config.text_config.to_json_string()
+
+
+# A config first reached on a LATER disable_use_cache call. Recording used to
+# happen only when the model carried no record yet, so a config attached after
+# training had already started was disabled but never recorded: restore could
+# not undo it, and it kept use_cache = False for good. For a config that never
+# declared the attribute that also left an invented one behind on every save.
+
+_ABSENT_PARAM = object()
+
+
+@pytest.mark.parametrize(
+    "initial",
+    [pytest.param(True, id = "had_True"), pytest.param(_ABSENT_PARAM, id = "absent")],
+)
+def test_config_first_seen_after_the_first_disable_is_restorable(initial):
+    model = _tiny_llama(use_cache = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+
+    late = _NoUseCacheConfig()
+    if initial is not _ABSENT_PARAM:
+        late.use_cache = initial
+    model.config.text_config = late      # attached while already prepared
+
+    disable_use_cache(model)
+    assert late.use_cache is False       # still disabled for training
+
+    restore_use_cache(model)
+    if initial is _ABSENT_PARAM:
+        assert not hasattr(late, "use_cache")
+    else:
+        assert late.use_cache is initial
+
+
+def test_late_config_does_not_disturb_the_first_baseline():
+    # the config recorded on the first pass keeps its own original value
+    model = _tiny_llama(use_cache = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+    model.config.text_config = _NoUseCacheConfig()
+    disable_use_cache(model)
+    restore_use_cache(model)
+    assert model.config.use_cache is True
