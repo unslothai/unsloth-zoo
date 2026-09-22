@@ -264,23 +264,40 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
+# Marks a config that never had use_cache, as distinct from one holding None.
+# A class, not object(): deepcopy and pickle preserve a class's identity but not
+# an instance's, which broke the `is` check below and wrote this unserializable
+# object into cfg.use_cache (TRL deepcopies a prepared model for its ref model).
+class _ABSENT:
+    """Marker type; never instantiated."""
+
+
 def disable_use_cache(model):
     """Set use_cache = False on every config of the model. KV cache is unused
     under gradient checkpointing. Original values are remembered on the model
-    the first time so restore_use_cache can undo this for inference."""
+    so restore_use_cache can undo this for inference."""
     config = getattr(model, "config", None)
     if config is None:
         return
     originals = getattr(model, "_unsloth_use_cache_originals", None)
-    record = originals is None
-    if record:
+    if originals is None:
         originals = []
+    # Record by identity, not only on the first call: a config first reached
+    # later was disabled but never recorded, so restore could not undo it.
+    recorded = {id(cfg) for cfg, _ in originals}
     for cfg in _iter_configs(config):
-        if getattr(cfg, "use_cache", None):
-            if record:
-                originals.append((cfg, cfg.use_cache))
-            cfg.use_cache = False
-    if record and originals:
+        has_use_cache = hasattr(cfg, "use_cache")
+        if has_use_cache and not cfg.use_cache:
+            continue                      # already disabled, nothing to record
+        if id(cfg) not in recorded:
+            # first baseline wins; _ABSENT so restore deletes rather than invents
+            originals.append((cfg, cfg.use_cache if has_use_cache else _ABSENT))
+            recorded.add(id(cfg))
+        # Set it even when absent: transformers 5 sub-configs inherit no default,
+        # so a forward reading self.config.use_cache raises AttributeError
+        # instead (stepfun-ai/Step-3.7-Flash ships exactly such a text config).
+        cfg.use_cache = False
+    if originals:
         try:
             model._unsloth_use_cache_originals = originals
         except Exception:
@@ -293,7 +310,13 @@ def restore_use_cache(model):
     disabled. The record is kept so disable_use_cache can re-disable
     without re-recording when training resumes."""
     for cfg, value in getattr(model, "_unsloth_use_cache_originals", None) or ():
-        cfg.use_cache = value
+        if value is _ABSENT:
+            try:
+                delattr(cfg, "use_cache")
+            except Exception:
+                pass
+        else:
+            cfg.use_cache = value
 
 
 @torch.no_grad
