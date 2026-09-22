@@ -254,3 +254,202 @@ def test_namespace_alias_never_emits_a_bare_namespace_root():
         for name in added:
             assert name.strip(), f"empty alias from {entry!r}"
             assert not name.endswith("."), f"bare namespace root {name!r} from {entry!r}"
+
+
+# --- the other half of the contract: the aliases must be inert for Transformers ---
+# Every assertion above is about vLLM matching more. Nothing above stops an alias
+# from also making *Transformers* skip more, and Transformers does not match by
+# exact name: `should_convert_module` ends in an unanchored
+# `full_name.endswith(key)`, so an alias only has to be a suffix of a real
+# Linear's dotted path to silently leave a layer in 16 bit on reload. These
+# module trees are the real `nn.Linear` naming of the architectures they name,
+# enumerated on the meta device under transformers 5.x.
+
+MODULE_TREES = {
+    # text only
+    "qwen2": [
+        f"model.layers.{i}.{rest}"
+        for i in range(4)
+        for rest in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                     "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    ] + ["lm_head"],
+    # multimodal: SigLIP-style tower, `encoder.layers.N` under `model.vision_tower`
+    "gemma3": [
+        f"model.language_model.layers.{i}.{rest}"
+        for i in range(4)
+        for rest in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                     "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    ] + [
+        f"model.vision_tower.encoder.layers.{i}.{rest}"
+        for i in range(2)
+        for rest in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                     "self_attn.out_proj", "mlp.fc1", "mlp.fc2")
+    ] + ["model.multi_modal_projector.linear", "lm_head"],
+    # multimodal: ViT-style tower with pre-fused qkv, `blocks.N` under `model.visual`
+    "qwen3_vl": [
+        f"model.language_model.layers.{i}.{rest}"
+        for i in range(4)
+        for rest in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                     "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    ] + [
+        f"model.visual.blocks.{i}.{rest}"
+        for i in range(2)
+        for rest in ("attn.qkv", "attn.proj", "mlp.linear_fc1", "mlp.linear_fc2")
+    ] + ["lm_head"],
+    # a tower that deliberately repeats the text stack's own suffixes
+    "adversarial_suffix": [
+        f"model.language_model.layers.{i}.{rest}"
+        for i in range(2)
+        for rest in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    ] + [
+        # ends in "...model.layers.0.mlp.gate_proj", the exact suffix the
+        # `model.` namespace alias of the text entry collapses to
+        f"model.vision_tower.vision_model.layers.{i}.{rest}"
+        for i in range(2)
+        for rest in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+    ] + ["lm_head"],
+}
+
+
+def _text_layer_prefixes(tree):
+    prefixes = []
+    for name in tree:
+        if ".layers." not in name: continue
+        head, _, tail = name.partition(".layers.")
+        if any(t in head for t in ("visual", "vision", "audio")): continue
+        prefix = f"{head}.layers.{tail.split('.')[0]}"
+        if prefix not in prefixes: prefixes.append(prefix)
+    return prefixes[:2]
+
+
+def _skip_lists(tree):
+    """The two shapes that reach `llm_int8_skip_modules` in practice."""
+    layers = _text_layer_prefixes(tree)
+    leaf = sorted({n for n in tree if any(n.startswith(p + ".") for p in layers)}
+                  | {n for n in tree if n.endswith("lm_head")})
+    parent = sorted({f"{p}.mlp" for p in layers} | {f"{p}.self_attn" for p in layers}
+                    | {"lm_head"})
+    return {"leaf": leaf, "parent": parent}
+
+
+@pytest.mark.parametrize("arch", sorted(MODULE_TREES))
+@pytest.mark.parametrize("shape", ["leaf", "parent"])
+def test_aliases_do_not_widen_the_transformers_skip_set(arch, shape):
+    """No alias may change whether Transformers quantizes a real Linear."""
+    should_convert_module = pytest.importorskip(
+        "transformers.quantizers.quantizers_utils",
+        reason = "needs a transformers exposing should_convert_module",
+    ).should_convert_module
+    from unsloth_zoo.saving_utils import vllm_compatible_skip_modules
+
+    tree = MODULE_TREES[arch]
+    skip = _skip_lists(tree)[shape]
+    aliased = vllm_compatible_skip_modules(skip, module_names = tree)
+
+    changed = [
+        name for name in tree
+        if should_convert_module(name, skip) != should_convert_module(name, aliased)
+    ]
+    assert not changed, (
+        f"{arch}/{shape}: aliases changed the Transformers conversion decision for "
+        f"{changed}. Added names were {[a for a in aliased if a not in set(skip)]}"
+    )
+    # The guard must drop only what it has to: every architecture here still
+    # gets the fused aliases that are the point of the change.
+    added = [a for a in aliased if a not in set(skip)]
+    if shape == "leaf":
+        assert any(a.endswith(".gate_up_proj") for a in added), (
+            f"{arch}/{shape}: the guard dropped the fused aliases too, added={added}"
+        )
+
+
+def test_the_guard_is_what_keeps_the_adversarial_tower_safe():
+    """Without the live tree the `model.` alias does reach the tower.
+
+    This is the behaviour callers get when they cannot supply `module_names`,
+    and the reason the merge writer supplies it.
+    """
+    should_convert_module = pytest.importorskip(
+        "transformers.quantizers.quantizers_utils",
+        reason = "needs a transformers exposing should_convert_module",
+    ).should_convert_module
+    from unsloth_zoo.saving_utils import vllm_compatible_skip_modules
+
+    tree = MODULE_TREES["adversarial_suffix"]
+    skip = _skip_lists(tree)["leaf"]
+
+    unguarded = vllm_compatible_skip_modules(skip)
+    reached = [
+        name for name in tree
+        if should_convert_module(name, skip) != should_convert_module(name, unguarded)
+    ]
+    assert reached, "the adversarial tree no longer exercises the suffix rule"
+    assert all("vision" in name for name in reached)
+
+    guarded = vllm_compatible_skip_modules(skip, module_names = tree)
+    assert not [
+        name for name in tree
+        if should_convert_module(name, skip) != should_convert_module(name, guarded)
+    ]
+
+
+def test_the_widening_probe_can_actually_detect_widening():
+    """Guard the guard: a deliberately over-broad entry must trip the assertion."""
+    should_convert_module = pytest.importorskip(
+        "transformers.quantizers.quantizers_utils",
+        reason = "needs a transformers exposing should_convert_module",
+    ).should_convert_module
+
+    tree = MODULE_TREES["adversarial_suffix"]
+    skip = _skip_lists(tree)["leaf"]
+    over_broad = list(skip) + ["mlp.gate_proj"]  # bare leaf, matches every tower
+    changed = [
+        name for name in tree
+        if should_convert_module(name, skip) != should_convert_module(name, over_broad)
+    ]
+    assert changed, "the probe cannot see widening, so its passes mean nothing"
+
+
+def test_vanilla_skip_matcher_matches_the_stock_transformers_clauses():
+    """The guard folds transformers' three clauses into one precompiled pass.
+
+    Compared against the clauses written out literally rather than against the
+    live `should_convert_module`, because unsloth_zoo.patching_utils replaces
+    that function with a broader one at import time and the comparison would
+    then depend on import order.
+    """
+    import random
+    import re as _re
+
+    from unsloth_zoo.saving_utils import _vanilla_skip_matcher
+
+    def stock(name, entries):
+        return any(
+            _re.match(f"{k}\\.", name) or _re.match(f"{k}", name) or name.endswith(k)
+            for k in entries
+        )
+
+    random.seed(7)
+    parts = ["model", "language_model", "layers", "0", "1", "10", "mlp", "self_attn",
+             "gate_proj", "up_proj", "qkv_proj", "lm_head", "visual", "vision_model",
+             "blocks", "fc1", "proj"]
+
+    def rnd(n):
+        return ".".join(random.choice(parts) for _ in range(random.randint(1, n)))
+
+    names = [rnd(6) for _ in range(500)]
+    for _ in range(150):
+        entries = [rnd(4) for _ in range(random.randint(1, 5))]
+        matches = _vanilla_skip_matcher(entries)
+        for name in random.sample(names, 20):
+            assert matches(name) == bool(stock(name, entries)), (
+                f"fast matcher diverged for entries={entries} name={name!r}"
+            )
+
+
+def test_guard_is_inert_when_no_module_names_are_given():
+    """Callers that cannot supply the tree keep exactly the previous behaviour."""
+    from unsloth_zoo.saving_utils import vllm_compatible_skip_modules
+
+    assert (vllm_compatible_skip_modules(MERGED_LEAF_SKIP_MODULES) ==
+            vllm_compatible_skip_modules(MERGED_LEAF_SKIP_MODULES, module_names = None))
