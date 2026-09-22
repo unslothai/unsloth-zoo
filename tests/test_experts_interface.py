@@ -199,3 +199,24 @@ def test_a_class_marked_for_its_own_gate_counts_as_handled():
     assert _has_custom_gate(Clamped())
     Clamped._unsloth_own_apply_gate = True
     assert not _has_custom_gate(Clamped())
+
+
+def test_bnb_handled_check_defers_to_the_generic_route(monkeypatch):
+    # With the generic bnb 4-bit route present, a class it takes over counts as handled;
+    # without one, a user-forced implementation stays unpacked as before.
+    from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as mb
+
+    m = _experts(None, "transformers.models.x.modeling_x", wrapped = True, implementation = "grouped_mm")
+    monkeypatch.delattr(mb, "_route_generic_bnb4bit_experts_class", raising = False)
+    assert not mb._expert_forward_is_handled(m)
+
+    def route(module):
+        type(module).forward = forward_moe_backend
+        return True
+
+    monkeypatch.setattr(mb, "_route_generic_bnb4bit_experts_class", route, raising = False)
+    assert mb._expert_forward_is_handled(m)
+
+    declined = _experts(None, "transformers.models.x.modeling_x", wrapped = True, implementation = "grouped_mm")
+    monkeypatch.setattr(mb, "_route_generic_bnb4bit_experts_class", lambda module: False, raising = False)
+    assert not mb._expert_forward_is_handled(declined)

@@ -109,7 +109,12 @@ def _expert_forward_is_handled(module: nn.Module) -> bool:
         from unsloth_zoo.temporary_patches.moe_experts_interface import expert_forward_is_handled
     except ImportError:
         return False
-    return expert_forward_is_handled(module)
+    if expert_forward_is_handled(module):
+        return True
+    # The generic bnb 4-bit route, where this module has one, gives a decorated class a
+    # forward that dequantizes; it then counts as Unsloth's.
+    route = globals().get("_route_generic_bnb4bit_experts_class")
+    return route is not None and route(module) and expert_forward_is_handled(module)
 
 
 _UNHANDLED_EXPERT_MODULES_LOGGED = set()
