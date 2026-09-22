@@ -265,18 +265,24 @@ def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
     stall_timeout = 1.5
     calls: list[str] = []
     started = time.monotonic()
+    before = set(threading.enumerate())
     stop = xf.start_watchdog(   # default: repo-wide (watch_new_partials_only = False)
         repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = stall_timeout,
     )
+    watchdog = [t for t in threading.enumerate() if t not in before and t.name == "hf-xet-watchdog"]
+    assert len(watchdog) == 1, f"expected one new watchdog thread, found {watchdog}"
     try:
         time.sleep(stall_timeout + 0.5)   # past stall_timeout, but repo-wide bytes keep growing
     finally:
         stop.set()
-        # After the signal, not before: a runner that preempts the test between the two would give
-        # the watchdog a no-growth interval this measure never sees.
+        # Joined, not just signalled: stop.wait() can return and the thread be preempted mid-tick, so
+        # a callback could still land after the signal. The timestamp follows the join, so the
+        # measured interval covers everything the watchdog saw.
+        watchdog[0].join(timeout = 10)
         stopped = time.monotonic()
         grow_stop.set()
         grower.join(timeout = 5)
+    assert not watchdog[0].is_alive(), "the watchdog thread did not stop"
     # Through the moment the watchdog stopped: a grower starved after its last write leaves a
     # trailing gap the watchdog saw too.
     marks = [started] + [w for w in writes if w < stopped] + [stopped]
