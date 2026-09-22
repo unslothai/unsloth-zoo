@@ -182,9 +182,10 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
             )
         else:
             reduction = "sum" if num_items_in_batch is not None else "mean"
+            # F.cross_entropy wants (N, vocab) and (N,): 3-D logits would read dim 1 as classes.
             loss = torch_nn_functional_cross_entropy(
-                source,
-                target,
+                source.reshape(-1, source.shape[-1]),
+                target.reshape(-1),
                 ignore_index = ignore_index,
                 reduction    = reduction,
             )
