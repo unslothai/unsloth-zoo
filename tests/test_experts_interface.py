@@ -100,3 +100,73 @@ def test_ungated_falls_back_to_transformers():
             ALL_EXPERTS_FUNCTIONS["grouped_mm"] = original
         elif hasattr(ALL_EXPERTS_FUNCTIONS, "_local_mapping"):
             ALL_EXPERTS_FUNCTIONS._local_mapping.pop("grouped_mm", None)
+
+
+def test_custom_gate_falls_back_and_is_not_packed():
+    """DeepSeek-V4, MiniMax-M3 and others override _apply_gate with clamps or an
+    offset; the Unsloth backends would compute plain SiLU gating for them."""
+    from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+    calls = []
+    def fake(self, h, i, w):
+        calls.append("grouped_mm"); return h
+    original = ALL_EXPERTS_FUNCTIONS._local_mapping.get("grouped_mm") if hasattr(ALL_EXPERTS_FUNCTIONS, "_local_mapping") else None
+    ALL_EXPERTS_FUNCTIONS["grouped_mm"] = fake
+    try:
+        m = _experts(None, "transformers.models.x.modeling_x", wrapped = True, implementation = "unsloth")
+        assert expert_forward_is_handled(m)
+        type(m)._apply_gate = lambda self, x: x.clamp(max = 7.0)
+        assert not expert_forward_is_handled(m)
+        h = torch.zeros(2, 4)
+        assert unsloth_experts_forward(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
+        assert calls == ["grouped_mm"]
+        # transformers' own default gate is not a custom gate.
+        from transformers.integrations.moe import _default_apply_gate
+        type(m)._apply_gate = _default_apply_gate
+        assert expert_forward_is_handled(m)
+    finally:
+        if original is not None:
+            ALL_EXPERTS_FUNCTIONS["grouped_mm"] = original
+        elif hasattr(ALL_EXPERTS_FUNCTIONS, "_local_mapping"):
+            ALL_EXPERTS_FUNCTIONS._local_mapping.pop("grouped_mm", None)
+
+
+def test_expert_parallel_keeps_transformers_default():
+    """RouterParallel sends non-local slots to a num_experts sentinel that only
+    transformers' implementations mask."""
+    from transformers.modeling_utils import PreTrainedModel
+    patch_experts_interface()
+    getter = PreTrainedModel.get_correct_experts_implementation
+    ep = types.SimpleNamespace(
+        _grouped_mm_can_dispatch = lambda: True,
+        config = types.SimpleNamespace(distributed_config = types.SimpleNamespace(enable_expert_parallel = True)),
+    )
+    assert getter(ep, None) == "grouped_mm"
+    no_ep = types.SimpleNamespace(
+        _grouped_mm_can_dispatch = lambda: True,
+        config = types.SimpleNamespace(distributed_config = types.SimpleNamespace(enable_expert_parallel = False)),
+    )
+    assert getter(no_ep, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
+
+
+def test_every_transformers_custom_gate_class_is_detected():
+    import importlib
+    from unsloth_zoo.temporary_patches.moe_experts_interface import _has_custom_gate
+    found = []
+    for module_name, class_name in (
+        ("transformers.models.deepseek_v4.modeling_deepseek_v4", "DeepseekV4Experts"),
+        ("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl", "MiniMaxM3VLExperts"),
+        ("transformers.models.openai_privacy_filter.modeling_openai_privacy_filter", "OpenAIPrivacyFilterExperts"),
+    ):
+        try:
+            cls = getattr(importlib.import_module(module_name), class_name)
+        except Exception:
+            continue
+        found.append(class_name)
+        assert _has_custom_gate(cls.__new__(cls)), class_name
+    try:
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+        assert not _has_custom_gate(Qwen3MoeExperts.__new__(Qwen3MoeExperts))
+    except ImportError:
+        pass
+    if not found:
+        pytest.skip("this transformers has none of the custom-gate expert classes")

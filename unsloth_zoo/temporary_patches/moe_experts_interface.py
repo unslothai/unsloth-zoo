@@ -96,11 +96,34 @@ def expert_forward_is_handled(module: nn.Module) -> bool:
     if not hasattr(forward, "__wrapped__"):
         return False
     # Decorated by transformers: the implementation name on the config decides.
-    if getattr(module, "has_gate", True) is False:
+    # A class unsloth_experts_forward hands back to transformers is not handled.
+    if getattr(module, "has_gate", True) is False or _has_custom_gate(module):
         return False
     config = getattr(module, "config", None)
     implementation = getattr(config, "_experts_implementation", None)
     return implementation == UNSLOTH_EXPERTS_IMPLEMENTATION
+
+
+def _has_custom_gate(module) -> bool:
+    """True when the experts class overrides transformers' default `_apply_gate`.
+
+    DeepSeek-V4, GLM-5-Next, HY-V4, MiniMax-M3 and others clamp or offset gate and
+    up; Unsloth's backends implement SiLU (or `act_fn`) and gpt-oss by name only."""
+    try:
+        from transformers.integrations.moe import _default_apply_gate
+    except Exception:
+        return False
+    gate = getattr(type(module), "_apply_gate", None)
+    if gate is None or gate is _default_apply_gate:
+        return False
+    return "GptOss" not in type(module).__name__
+
+
+def _expert_parallel_requested(model) -> bool:
+    """Expert parallelism routes non-local slots to a `num_experts` sentinel that
+    only transformers' own implementations mask."""
+    distributed = getattr(getattr(model, "config", None), "distributed_config", None)
+    return bool(getattr(distributed, "enable_expert_parallel", False))
 
 
 # Kept out of Dynamo like the per-model MoE block patches: a compiled MoE block
@@ -117,8 +140,10 @@ def unsloth_experts_forward(
     """The "unsloth" experts implementation: Unsloth's backend dispatcher
     (bnb 4-bit, FP8, grouped_mm, Triton, or the eager loop), for any decorated
     experts class. An ungated module (up_proj only) is not a shape the grouped
-    path knows, so it takes transformers' own implementation."""
-    if getattr(self, "has_gate", True) is False:
+    path knows, and a class with its own `_apply_gate` (clamped or offset SwiGLU)
+    computes an activation the backends do not reproduce, so both take
+    transformers' own implementation."""
+    if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
         if fallback is None:
@@ -148,7 +173,7 @@ def patch_experts_interface():
     def get_correct_experts_implementation(self, requested_experts):
         # Only the default is ours. A user who asked for a specific implementation
         # keeps it, and the quantizer then leaves those experts unpacked.
-        if requested_experts is None:
+        if requested_experts is None and not _expert_parallel_requested(self):
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         return original(self, requested_experts)
 
