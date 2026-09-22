@@ -37,12 +37,20 @@ from unsloth_zoo.temporary_patches import bitsandbytes as bnb_patch
 
 
 class _FakeLinear4bit(torch.nn.Module):
-    """The shape of a Linear4bit after a load that dropped the quant_state."""
+    """The shape of a Linear4bit after a load that dropped the quant_state.
 
-    def __init__(self, weight, bias = None):
+    ``out_features`` and ``in_features`` are always set, because the real class
+    subclasses ``nn.Linear`` and can never be missing them. Leaving them off made
+    the guard fire through its ``getattr(self, "out_features", -1)`` default, which
+    is a state no real module reaches, so the shape comparison went untested.
+    """
+
+    def __init__(self, weight, bias = None, out_features = 5120, in_features = 5120):
         super().__init__()
         self.weight = torch.nn.Parameter(weight, requires_grad = False)
         self.bias = bias
+        self.out_features = out_features
+        self.in_features = in_features
         self.quant_state = None
         self.quant_storage = torch.uint8
         self.compute_type_is_set = True
@@ -58,13 +66,17 @@ def _patched_forward():
     bitsandbytes = pytest.importorskip("bitsandbytes")
     bnb_patch.patch_bitsandbytes_linear4bit_forward()
     forward = bitsandbytes.nn.modules.Linear4bit.forward
-    return getattr(forward, "__wrapped__", forward)
+    forward = getattr(forward, "__wrapped__", forward)
+    # patch_function can decline and return False, which this patch discards. Without
+    # this assert a test would then silently exercise upstream bitsandbytes and pass.
+    assert forward.__module__ == "unsloth_zoo.temporary_patches.bitsandbytes"
+    return forward
 
 
 def test_packed_weight_without_quant_state_raises_instead_of_a_shape_error():
     """This is the whole point: the reported RuntimeError must not happen again."""
     forward = _patched_forward()
-    module = _FakeLinear4bit(_packed_weight(15728640))
+    module = _FakeLinear4bit(_packed_weight(15728640), out_features = 6144, in_features = 5120)
     x = torch.zeros(8, 5120, dtype = torch.float16)
     with pytest.raises(RuntimeError) as excinfo:
         forward(module, x)
@@ -88,6 +100,13 @@ def test_error_message_names_the_transformers_window_when_installed(monkeypatch)
     # sidecars really are absent reaches this same branch.
     assert "before regenerating anything" in message
     assert "does need rebuilding" in message
+    # transformers 4.57.6 ships no qwen3_5 model at all (the first release carrying it
+    # is 5.3.0), so recommending it to a Qwen3.5 reporter swaps the shape error for an
+    # unrecognised-architecture error. Never offer it as the fallback.
+    assert "4.57" not in message
+    # The claim about where the state was lost is a version inference, not an
+    # observation of the checkpoint, and must stay hedged.
+    assert "most likely" in message
 
 
 def test_error_message_stays_generic_outside_the_window(monkeypatch):
@@ -133,20 +152,29 @@ def test_predicate_never_raises_without_transformers(monkeypatch):
 
 def test_unquantized_layer_still_falls_through():
     """A genuinely unquantized [out, in] weight must keep working, not raise."""
-    weight = torch.randn(16, 8)
-    module = _FakeLinear4bit(weight)
-    # Mirrors the guard in the patched forward: only a packed [N, 1] buffer is an error.
-    assert not (module.weight.dim() == 2 and module.weight.shape[-1] == 1)
-    out = torch.nn.functional.linear(torch.randn(3, 8), module.weight, None)
-    assert out.shape == (3, 16)
+    forward = _patched_forward()
+    module = _FakeLinear4bit(torch.randn(16, 8), out_features = 16, in_features = 8)
+    out = forward(module, torch.randn(3, 8))
+    assert tuple(out.shape) == (3, 16)
 
 
-def test_guard_predicate_matches_the_packed_layout():
-    assert _packed_weight().dim() == 2 and _packed_weight().shape[-1] == 1
-    ordinary = torch.randn(16, 8)
-    assert not (ordinary.dim() == 2 and ordinary.shape[-1] == 1)
-    # A [N, 1] float weight is a legitimate 1-input Linear; the packed case is uint8.
-    assert _packed_weight().dtype == torch.uint8
+def test_packed_blob_whose_rows_equal_out_features_keeps_the_old_behaviour():
+    """The one documented corner where the guard deliberately declines.
+
+    A packed blob has ``(out_features * in_features) // (2 * quant_storage.itemsize)``
+    rows, which equals ``out_features`` exactly when ``in_features`` is twice the
+    storage itemsize: 2 for uint8, 4 for float16/bfloat16, 8 for float32. The guard
+    cannot tell that apart from a legitimate ``in_features == 1`` layer, so it
+    declines and the pre-existing F.linear path runs, unchanged. That is a known
+    false negative, never a false accusation, and this pins it so a future change
+    to the predicate has to decide about it on purpose.
+    """
+    forward = _patched_forward()
+    module = _FakeLinear4bit(_packed_weight(16), out_features = 16, in_features = 2)
+    with pytest.raises(RuntimeError) as excinfo:
+        forward(module, torch.zeros(3, 2, dtype = torch.float16))
+    # Still the old, unhelpful message: the guard did not fire.
+    assert "mat1 and mat2 shapes cannot be multiplied" in str(excinfo.value)
 
 
 def test_unquantized_linear4bit_with_one_input_feature_is_not_accused():
@@ -157,13 +185,12 @@ def test_unquantized_linear4bit_with_one_input_feature_is_not_accused():
     returning, which turns a working model into a hard error and tells the user to
     reinstall transformers over a checkpoint that was never involved.
     """
-    import torch
-    import bitsandbytes as bnb
-    from unsloth_zoo.temporary_patches.bitsandbytes import (
-        patch_bitsandbytes_linear4bit_forward,
-    )
-
-    patch_bitsandbytes_linear4bit_forward()
+    bnb = pytest.importorskip("bitsandbytes")
+    bnb_patch.patch_bitsandbytes_linear4bit_forward()
     module = bnb.nn.Linear4bit(1, 16)
+    # On CPU bitsandbytes leaves the layer unquantized, which is the state under test.
+    # Pin it, so a future bnb that quantizes here fails loudly instead of quietly
+    # exercising the other branch and passing for the wrong reason.
+    assert getattr(module.weight, "quant_state", None) is None
     out = module(torch.randn(4, 1))
     assert tuple(out.shape) == (4, 16)
