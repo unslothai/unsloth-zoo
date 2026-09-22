@@ -117,6 +117,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     # mlx-vlm 0.7.4+ names these as qwen3_5 / qwen3_5_moe's `text_config` decoders.
     "qwen3_5_moe_text",
     "qwen3_5_text",
+    "qwen3_omni_moe",
     "qwen3_vl_moe",
     "qwen3_vl",
     # Ternary Bonsai 2: Qwen3.5's Model with Hadamard-packed linears swapped in.
@@ -275,6 +276,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "qwen3_5_moe": "verify_qwen3_5_moe",
     "qwen3_5_moe_text": "verify_qwen3_5_moe_text",
     "qwen3_5_text": "verify_qwen3_5_text",
+    "qwen3_omni_moe": "verify_qwen3_omni_moe",
     "qwen3_vl_moe": "verify_qwen3_vl_moe",
     "qwen3_vl": "verify_qwen3_vl",
     "smolvlm": "verify_smolvlm",
@@ -3494,6 +3496,10 @@ def _install_qwen3_family_compile_patches():
         qwen3moe_module = None
         qwen3moe_vision_module = None
         qwen3moe_language_module = None
+    omni_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe")
+    omni_thinker_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.thinker")
+    omni_vision_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.vision")
+    omni_language_module = _try_import_module("mlx_vlm.models.qwen3_omni_moe.language")
 
     for generate_name in ("mlx_vlm.generate", "mlx_vlm.generate.ar"):
         try:
@@ -3931,7 +3937,230 @@ def _install_qwen3_family_compile_patches():
             ),
         )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
+    if None not in (omni_module, omni_thinker_module, omni_vision_module, omni_language_module):
+        _install_qwen3_omni_compile_patches(
+            omni_module,
+            omni_thinker_module,
+            omni_vision_module,
+            omni_language_module,
+            (
+                patched_qwen3_attention,
+                patched_qwen3_vision_block_call,
+                patched_qwen3_rot_pos_emb,
+                patched_qwen3_fast_pos_embed_interpolate,
+                patched_qwen3_vision_call,
+            ),
+            patched_qwen3_deepstack,
+        )
     _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"})
+
+
+def _install_qwen3_omni_compile_patches(
+    module, thinker_module, vision_module, language_module, tower_patches, deepstack_patch
+):
+    """Bind the Qwen3 VL patches to Qwen3-Omni's thinker, which carries the same
+    vision tower and deepstack decoder under its own modules."""
+
+    import mlx.core as mx
+
+    attention, block, rot_pos_emb, pos_embed_interpolate, vision_call = tower_patches
+
+    def patched_deepstack(self, hidden_states, visual_pos_masks, visual_embeds):
+        # The patched embedder hands over one mask and one row block per modality.
+        if not isinstance(visual_pos_masks, tuple):
+            return deepstack_patch(self, hidden_states, visual_pos_masks, visual_embeds)
+        for mask, rows in zip(visual_pos_masks, visual_embeds):
+            hidden_states = _add_visual_embeds(hidden_states, mask, rows)
+        return hidden_states
+
+    def patched_backbone_call(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        position_ids=None,
+        visual_pos_masks=None,
+        deepstack_visual_embeds=None,
+        output_hidden_states=False,
+        output_hidden_state_idx=None,
+    ):
+        # Upstream's body without its `mx.eval(h)` every fourth layer, which
+        # cannot run inside a trace and leaves the values unchanged.
+        h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        if cache is None:
+            cache = [None] * len(self.layers)
+        if mask is None:
+            mask = language_module.create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
+
+        all_hidden_states = [] if output_hidden_states else None
+        selected_hidden_state = h if output_hidden_state_idx == 0 else None
+        position_embeddings = None
+        if (
+            position_ids is not None
+            and self.layers
+            and not self.layers[0].self_attn.rotary_emb.fused_apply
+        ):
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
+
+        for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+            if output_hidden_states:
+                all_hidden_states.append(h)
+            h = layer(h, mask, c, position_ids, position_embeddings)
+            if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
+                h = self._deepstack_process(
+                    h, visual_pos_masks, deepstack_visual_embeds[layer_idx]
+                )
+            if output_hidden_state_idx == layer_idx + 1:
+                selected_hidden_state = h
+
+        if output_hidden_states:
+            all_hidden_states.append(h)
+        h = self.norm(h)
+        if output_hidden_states:
+            return h, all_hidden_states
+        if output_hidden_state_idx is not None:
+            if selected_hidden_state is None:
+                raise ValueError(
+                    f"output_hidden_state_idx={output_hidden_state_idx} is out of range"
+                )
+            return h, selected_hidden_state
+        return h
+
+    backbone_cls = language_module.Qwen3VLMoEModel
+    original_backbone_call = backbone_cls.__call__
+
+    @wraps(original_backbone_call)
+    def training_backbone_call(self, *args, **kwargs):
+        call = patched_backbone_call if getattr(self, "training", False) else original_backbone_call
+        return call(self, *args, **kwargs)
+
+    def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        # Audio batches train eagerly, where upstream's merge is the one to run;
+        # its rope index reads the grids as arrays, not the static tuples.
+        if kwargs.get("input_features") is not None:
+            for key in ("image_grid_thw", "video_grid_thw"):
+                if isinstance(kwargs.get(key), tuple):
+                    kwargs[key] = mx.array(kwargs[key], dtype=mx.int32)
+            return original_get_input_embeddings(self, input_ids, pixel_values, **kwargs)
+
+        thinker = self.thinker
+        config = thinker.config
+        image_grid_thw = kwargs.get("image_grid_thw", None)
+        video_grid_thw = kwargs.get("video_grid_thw", None)
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
+        inputs_embeds = thinker.language_model.model.embed_tokens(input_ids)
+        dtype = thinker.vision_tower.patch_embed.proj.weight.dtype
+        # One (mask, per-level rows) pair per modality present; image and video
+        # positions are disjoint, so their deepstack additions are independent.
+        visual_masks, visual_levels = [], []
+
+        for pixels, grid, token_id in (
+            (pixel_values, image_grid_thw, config.image_token_id),
+            (pixel_values_videos, video_grid_thw, config.video_token_id),
+        ):
+            if pixels is None:
+                continue
+            cached = kwargs.get("cached_image_features", None) if pixels is pixel_values else None
+            if cached is not None:
+                embeds, deepstack = cached, None
+            else:
+                embeds, deepstack = thinker.vision_tower(pixels.astype(dtype), grid)
+            embeds = embeds.astype(inputs_embeds.dtype)
+            token_mask = input_ids == token_id
+            # Upstream requires the counts to be equal, for images and videos alike.
+            _raise_on_feature_count_mismatch(token_mask, embeds, inputs_embeds)
+            inputs_embeds = _masked_scatter_no_numpy(
+                inputs_embeds,
+                mx.broadcast_to(mx.expand_dims(token_mask, -1), inputs_embeds.shape),
+                embeds,
+            )
+            if deepstack is not None:
+                visual_masks.append(token_mask)
+                visual_levels.append(deepstack)
+
+        features = thinker_module.InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            visual_pos_masks=tuple(visual_masks) if visual_masks else None,
+            deepstack_visual_embeds=(
+                [tuple(rows) for rows in zip(*visual_levels)] if visual_levels else None
+            ),
+        )
+        return _attach_position_ids(features, kwargs["position_ids"])
+
+    original_language_call = language_module.LanguageModel.__call__
+
+    @wraps(original_language_call)
+    def training_language_call(
+        self, inputs, inputs_embeds=None, mask=None, cache=None,
+        visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs,
+    ):
+        # With explicit positions and no cache, upstream's body reduces to this
+        # minus its `mx.eval(position_ids)`, which cannot run inside a trace.
+        position_ids = kwargs.get("position_ids")
+        if not getattr(self, "training", False) or position_ids is None or cache is not None:
+            return original_language_call(
+                self, inputs, inputs_embeds, mask, cache,
+                visual_pos_masks, deepstack_visual_embeds, **kwargs,
+            )
+        captures = kwargs.get("output_hidden_states", False) or kwargs.get("output_hidden_state_idx") is not None
+        out = self.model(
+            inputs,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            output_hidden_states=kwargs.get("output_hidden_states", False),
+            output_hidden_state_idx=kwargs.get("output_hidden_state_idx"),
+        )
+        out, hidden_states = out if captures else (out, None)
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(out)
+        else:
+            logits = self.lm_head(out)
+        return language_module.LanguageModelOutput(logits=logits, hidden_states=hidden_states)
+
+    original_model_call = module.Model.__call__
+
+    @wraps(original_model_call)
+    def training_model_call(
+        self, input_ids, pixel_values=None, pixel_values_videos=None, mask=None, cache=None, **kwargs
+    ):
+        # Upstream hands the batch to the thinker, whose own merge bypasses the
+        # patched embedder; route through it as Qwen3 VL's `Model.__call__` does.
+        if not getattr(self, "training", False) or kwargs.get("position_ids") is None:
+            return original_model_call(
+                self, input_ids, pixel_values, pixel_values_videos, mask, cache, **kwargs
+            )
+        audio = {
+            key: kwargs.pop(key)
+            for key in ("input_features", "feature_attention_mask", "input_features_mask", "audio_feature_lengths")
+            if key in kwargs
+        }
+        features = self.get_input_embeddings(
+            input_ids, pixel_values, pixel_values_videos=pixel_values_videos, mask=mask, **audio, **kwargs
+        )
+        return self.thinker.language_model(
+            input_ids, mask=mask, cache=cache,
+            **{"pixel_values": pixel_values, "pixel_values_videos": pixel_values_videos,
+               **features.to_dict(), **kwargs},
+        )
+
+    thinker_module.masked_scatter = _masked_scatter_no_numpy
+    _patch_method(vision_module.Attention, "__call__", attention)
+    _patch_method(vision_module.Qwen3VLMoEVisionBlock, "__call__", block)
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "fast_pos_embed_interpolate", pos_embed_interpolate)
+    _patch_method(vision_module.VisionModel, "__call__", vision_call)
+    _patch_method(backbone_cls, "_deepstack_process", patched_deepstack)
+    _patch_method(backbone_cls, "__call__", training_backbone_call)
+    original_get_input_embeddings = module.Model.get_input_embeddings
+    _patch_explicit_position_embeddings(module.Model, patched_get_input_embeddings)
+    _patch_method(language_module.LanguageModel, "__call__", training_language_call)
+    _patch_method(module.Model, "__call__", training_model_call)
+    _PATCHED_ARCHES.add("qwen3_omni_moe")
 
 
 def _install_glm_ocr_compile_patches():

@@ -2735,6 +2735,80 @@ def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, m
     assert relaxed is not exact, method
 
 
+def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch):
+    """Qwen3-Omni reuses the Qwen3 VL patches; its own embedder has to keep
+    upstream's exact count refusal, hand audio to upstream, and its backbone must
+    drop the per-layer eval only while training."""
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    assert "qwen3_omni_moe" in mc._VERIFIED_TRAINING_ARCHES
+    assert "qwen3_family_multimodal_runtime" in {
+        name for bundle in mc._matching_pattern_bundles("qwen3_omni_moe")
+        for name in bundle.runtime_primitive_names}
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    upstream = lambda self, input_ids=None, pixel_values=None, **kwargs: kwargs
+    model_cls = type("Model", (), {"get_input_embeddings": upstream,
+                                   "__call__": lambda self, *a, **k: "thinker"})
+    backbone_cls = type("Backbone", (), {"__call__": lambda self, *a, **k: "original"})
+    lm_cls = type("LanguageModel", (), {"__call__": lambda self, *a, **k: "upstream lm"})
+    language = NS(Qwen3VLMoEModel=backbone_cls, create_attention_mask=lambda h, c: None,
+                  LanguageModel=lm_cls, LanguageModelOutput=NS)
+    vision = NS(**{name: type(name, (), {}) for name in
+                   ("Attention", "Qwen3VLMoEVisionBlock", "VisionModel")})
+    features_cls = type("Features", (NS,), {"to_dict": lambda self: dict(vars(self))})
+    thinker = NS(masked_scatter=None, InputEmbeddingsFeatures=features_cls)
+    mc._install_qwen3_omni_compile_patches(
+        NS(Model=model_cls), thinker, vision, language, (upstream,) * 5, upstream)
+    assert thinker.masked_scatter is mc._masked_scatter_no_numpy
+
+    vision_tower = lambda pixels, grid: (pixels, [pixels * 10])
+    vision_tower.patch_embed = NS(proj=NS(weight=mx.zeros(1)))
+    model = model_cls()
+    model.training = True
+    language_model = lambda ids, mask=None, cache=None, **kwargs: kwargs
+    language_model.model = NS(embed_tokens=lambda ids: mx.zeros((*ids.shape, 1)))
+    model.thinker = NS(config=NS(image_token_id=10, video_token_id=20),
+                       language_model=language_model, vision_tower=vision_tower)
+    images, video = mx.array([[1.0], [2.0]]), mx.array([[3.0]])
+    out = model.get_input_embeddings(
+        mx.array([[10, 5, 20, 10]]), images, pixel_values_videos=video, position_ids="P")
+    assert out.inputs_embeds.tolist() == [[[1.0], [0.0], [3.0], [2.0]]]
+    assert out.position_ids == "P" and len(out.visual_pos_masks) == 2
+    with pytest.raises(ValueError, match="tokens=3, features=2"):
+        model.get_input_embeddings(mx.array([[10, 10, 10]]), images, position_ids="P")
+    audio = model.get_input_embeddings(mx.array([[10]]), images, input_features=video,
+                                       position_ids="P", image_grid_thw=((1, 2, 2),))
+    assert audio["image_grid_thw"].tolist() == [[1, 2, 2]]
+    # Model.__call__ reaches the language model through the patched merge.
+    routed = model(mx.array([[10, 5, 20, 10]]), images, video, position_ids="P")
+    assert routed["inputs_embeds"].tolist() == [[[1.0], [0.0], [3.0], [2.0]]]
+    model.training = False
+    assert model(mx.array([[10]]), images, position_ids="P") == "thinker"
+    model.training = True
+
+    lm = lm_cls()
+    lm.training, lm.args = True, NS(tie_word_embeddings=False)
+    lm.model, lm.lm_head = (lambda inputs, **kw: kw["inputs_embeds"]), (lambda h: h * 2)
+    assert mx.compile(lambda h: lm(None, h, position_ids="P").logits)(mx.ones((1, 1, 1))).tolist() == [[[2.0]]]
+    lm.training = False
+    assert lm(None, position_ids="P") == "upstream lm"
+
+    backbone = backbone_cls()
+    backbone.training = False
+    assert backbone(None) == "original"
+    backbone.training, backbone.norm = True, lambda h: h + 1
+    backbone.layers = [lambda h, *args: h] * 2
+    # Compiled end to end: a per-layer eval would raise, and the embedder's
+    # deepstack rows (vision rows * 10) must land on their own positions, then norm.
+    trained = mx.compile(lambda h: backbone(
+        None, inputs_embeds=h, mask="m", visual_pos_masks=out.visual_pos_masks,
+        deepstack_visual_embeds=out.deepstack_visual_embeds))
+    assert trained(out.inputs_embeds).tolist() == [[[12.0], [1.0], [34.0], [23.0]]]
+
+
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
 def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
     """No compile patch needed: qualification alone decides."""
