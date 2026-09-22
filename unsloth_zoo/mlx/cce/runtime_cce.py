@@ -1015,18 +1015,20 @@ def make_runtime_cce_loss_fused_finalize(
         # (hidden), and the classifier gradient when the head is trained.
         # Each is held to 8 MB, which is what confines this to compact heads.
         #
-        # A trainable bfloat16 head is the one case where the token side is not one
-        # buffer: dlogits_out_dtype below writes d_logits in float32, and the hidden
-        # GEMM then needs it cast back, so logits + d_logits + the cast are live at
-        # once, 4x what counting the logits chunk alone allowed. Promoting there
-        # costs memory rather than saving it: measured on an M1 at n_tokens=512,
+        # A trainable bfloat16 head on the kernel path is the one case where the token
+        # side is not one buffer: dlogits_out_dtype below writes d_logits in float32,
+        # and the hidden GEMM then needs it cast back, so logits + d_logits + the cast
+        # are live at once, 4x what counting the logits chunk alone allowed. Promoting
+        # there costs memory rather than saving it: measured on an M1 at n_tokens=512,
         # hidden=512, vocab=16384, the 4096 plan peaked at 146324012 bytes against
-        # 143211072 for 2048. Everywhere else the derivative matches the logits
-        # dtype and the original single-buffer bound is what applies.
+        # 143211072 for 2048. Everywhere else the derivative matches the logits dtype
+        # and the original single-buffer bound is what applies. Label smoothing is
+        # excluded because it disables the kernels, so dlogits_out_dtype never runs and
+        # compute_bytes is already 4.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
         token_bytes = compute_bytes
-        if hidden.dtype == mx.bfloat16 and not weight_is_frozen:
+        if label_smoothing == 0.0 and hidden.dtype == mx.bfloat16 and not weight_is_frozen:
             token_bytes = compute_bytes + 4 + compute_bytes
         if (chunk_size <= 0 and not quantized
                 and hidden.dtype == weight.dtype and hidden.dtype in (mx.bfloat16, mx.float32)
