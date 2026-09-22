@@ -157,6 +157,22 @@ def _grow_host_buffer(buffer, new_size):
         return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
+def _elements_for(buffer, nbytes):
+    """How many of `buffer`'s own elements it takes to hold `nbytes`."""
+    return -(-nbytes // buffer.element_size())
+
+
+def _view_bytes_as(buffer, nbytes, dtype, shape):
+    """The first `nbytes` of `buffer` reinterpreted as a `dtype` tensor of `shape`.
+
+    The staging buffers are raw storage. They were allocated in whatever dtype checkpointing
+    was initialised with, which is not always the dtype the model runs in (a FORCE_FLOAT32
+    family initialises bfloat16 and runs float16, or float32), so they are never read or
+    written in their own dtype: every activation is copied in and out as the bytes it is.
+    """
+    return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
+
+
 @contextmanager
 def _no_inference_mode():
     # Allocate GC buffers outside inference_mode (but in no_grad) so a later
@@ -770,9 +786,9 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     elif DEVICE_TYPE == "xpu":
         MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])
 
-    # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB
-    n_bytes = torch.finfo(dtype).bits // 8
-    MINIMUM_SIZE = 2 * 1024 * 1024 // n_bytes
+    # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB. In bytes, so the
+    # cutoff is the same amount of memory whatever dtype an activation arrives in.
+    MINIMUM_SIZE = 2 * 1024 * 1024
     USE_UNSLOTH_GC = True
 
     # Don't offload the last layer - uses more VRAM and is slower
@@ -843,17 +859,14 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    new_size = arg.numel()
+                    new_size = arg.numel() * arg.element_size()   # bytes
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
-                    # The staging buffers are raw storage viewed in the activation's own dtype (see
-                    # below), which needs equal element sizes; anything else simply stays on the GPU.
-                    global GPU_BUFFERS
-                    _same_width = arg.element_size() == GPU_BUFFERS[arg.device.index].element_size()
-                    if _same_width and new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
+                    if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
                         use_gpu_buffer = True
                         global CPU_BUFFERS
+                        global GPU_BUFFERS
                         global GPU_BUFFERS_B
                         global USE_DOUBLE_BUFFER
                         global BACKWARD_PASS
@@ -888,28 +901,23 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFERS_B = None
                         pass
 
-                        # Extend buffer size
+                        # Extend buffer size. Sizes are in each buffer's own elements, holding new_size bytes.
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
-                                x = _new_host_buffer(new_size, arg.dtype)
+                                x = _new_host_buffer(_elements_for(GPU_BUFFER, new_size), GPU_BUFFER.dtype)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
-                        if x.element_size() != arg.element_size():
-                            # A slot first sized for another width cannot be viewed as this dtype.
-                            with _no_inference_mode():
-                                x = _new_host_buffer(new_size, arg.dtype)
-                            CPU_BUFFERS[CPU_INDEX] = x
                         shape = arg.shape
-                        if new_size > x.numel():
+                        if _elements_for(x, new_size) > x.numel():
                             with _no_inference_mode():
-                                x = _grow_host_buffer(x, new_size)
+                                x = _grow_host_buffer(x, _elements_for(x, new_size))
                             # Backward reads this slot by index, so store the replacement back.
                             CPU_BUFFERS[CPU_INDEX] = x
-                        if new_size > GPU_BUFFER.numel():
+                        if _elements_for(GPU_BUFFER, new_size) > GPU_BUFFER.numel():
                             try:
-                                GPU_BUFFER.resize_(new_size)
+                                GPU_BUFFER.resize_(_elements_for(GPU_BUFFER, new_size))
                             except RuntimeError as e:
                                 if "out of memory" not in str(e).lower():
                                     raise
@@ -920,15 +928,15 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                         GPU_BUFFERS_B[j].resize_(0)
                                     GPU_BUFFERS_B = None
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
-                                    GPU_BUFFER.resize_(new_size)
+                                    GPU_BUFFER.resize_(_elements_for(GPU_BUFFER, new_size))
                                 else:
                                     raise
                         # Resize buffer B when double buffering; disable + free B on OOM
                         if USE_DOUBLE_BUFFER:
                             GPU_BUFFER_B = GPU_BUFFERS_B[device_index]
-                            if new_size > GPU_BUFFER_B.numel():
+                            if _elements_for(GPU_BUFFER_B, new_size) > GPU_BUFFER_B.numel():
                                 try:
-                                    GPU_BUFFER_B.resize_(new_size)
+                                    GPU_BUFFER_B.resize_(_elements_for(GPU_BUFFER_B, new_size))
                                 except RuntimeError as e:
                                     if "out of memory" not in str(e).lower():
                                         raise
@@ -941,13 +949,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Read the cached flag off the slot itself, before the view is
                         # taken: a view is a fresh object and does not carry the attribute.
                         host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
-                        # Viewed, never cast: the buffers were allocated in the dtype checkpointing
-                        # was initialised with, which is not always the dtype the model runs in (a
-                        # FORCE_FLOAT32 family initialises bfloat16 and runs float16). A cast here
-                        # came back out of backward as the BUFFER's dtype, so the recompute saw
-                        # bfloat16 hidden states: a dtype mismatch at best, and on ROCm gfx10, where
-                        # Triton cannot compile bf16, an LLVM abort with no Python exception.
-                        x = x[:new_size].view(arg.dtype).view(shape)
+                        # Viewed as bytes, never cast (see _view_bytes_as). A cast here came back out
+                        # of backward as the BUFFER's dtype, so the recompute saw bfloat16 hidden
+                        # states: a dtype mismatch at best, and on ROCm gfx10, where Triton cannot
+                        # compile bf16, an LLVM abort with no Python exception.
+                        x = _view_bytes_as(x, new_size, arg.dtype, shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
@@ -1019,13 +1025,13 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             # Select buffer from per-device buffer_slot
             saved_dtype = ctx._saved_dtype
             if USE_DOUBLE_BUFFER and buffer_slot == 1:
-                buffer = GPU_BUFFERS_B[device_index][:new_size].view(saved_dtype).view(shape)
+                buffer = _view_bytes_as(GPU_BUFFERS_B[device_index], new_size, saved_dtype, shape)
             else:
-                buffer = GPU_BUFFERS[device_index][:new_size].view(saved_dtype).view(shape)
+                buffer = _view_bytes_as(GPU_BUFFERS[device_index], new_size, saved_dtype, shape)
 
             host_buffer = CPU_BUFFERS[CPU_INDEX]
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
-            x = host_buffer[:new_size].view(saved_dtype).view(shape)
+            x = _view_bytes_as(host_buffer, new_size, saved_dtype, shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:

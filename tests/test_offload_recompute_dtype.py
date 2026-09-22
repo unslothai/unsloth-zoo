@@ -18,8 +18,9 @@
 
 The staging buffers are allocated in the dtype checkpointing was initialised with. That is
 not always the dtype the model runs in: a FORCE_FLOAT32 family (qwen3_5, gemma3) on a GPU
-without bfloat16 initialises bfloat16 and runs float16. Forward stored the float16 hidden
-states, backward copied them into the bfloat16 GPU buffer and handed THAT to the recompute.
+without bfloat16 initialises bfloat16 and runs float16, or float32. Forward stored the
+float16 hidden states, backward copied them into the bfloat16 GPU buffer and handed THAT to
+the recompute.
 
 So the recompute ran on bfloat16 hidden states against float16 weights. Usually that is
 `RuntimeError: expected mat1 and mat2 to have the same dtype, but got: BFloat16 != Half`.
@@ -29,90 +30,98 @@ exception: `LLVM ERROR: Cannot select: intrinsic %llvm.amdgcn.fdot2.bf16.bf16`.
 
 Only offloaded activations are affected, so it needs a sequence length of 512 or more and an
 activation over 2 MB. Every short test passes.
-"""
-import inspect
 
+The fix treats the buffers as raw bytes, so the tests here drive the real checkpoint
+function and look only at what the recompute receives and what comes back.
+"""
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from unsloth_zoo import gradient_checkpointing as gc
 
-
-def _source(fn):
-    return inspect.getsource(fn)
-
-
-def test_backward_views_the_staging_buffers_in_the_saved_dtype():
-    backward = _source(gc.UnslothCheckpointFunction.backward)
-    assert "saved_dtype = ctx._saved_dtype" in backward
-    for buffer in ("GPU_BUFFERS_B[device_index]", "GPU_BUFFERS[device_index]", "host_buffer"):
-        assert f"{buffer}[:new_size].view(saved_dtype).view(shape)" in backward, (
-            f"{buffer} is handed to the recompute in the buffer's dtype, not the activation's"
-        )
-        assert f"{buffer}[:new_size].view(shape)" not in backward
+_STATE = [
+    "CPU_BUFFERS", "CPU_INDEX", "GPU_BUFFERS", "GPU_BUFFERS_B", "MAIN_STREAMS", "EXTRA_STREAMS",
+    "BACKWARD_PASS", "LAST_GC_INDEX", "FIRST_PASS", "CURRENT_GC_INDEX", "USE_UNSLOTH_GC",
+    "USE_DOUBLE_BUFFER", "MINIMUM_SIZE", "NEXT_BUFFER_SLOT", "BUFFER_EVENTS_A", "BUFFER_EVENTS_B",
+]
+_MISSING = object()
 
 
-def test_forward_records_the_dtype_and_never_casts_into_the_host_slot():
-    forward = _source(gc.UnslothCheckpointFunction.forward)
-    assert "ctx._saved_dtype = arg.dtype" in forward
-    assert "x[:new_size].view(arg.dtype).view(shape)" in forward
-    assert "x = x[:new_size].view(shape)" not in forward
-
-
-def test_only_same_width_activations_are_offloaded():
-    """A view needs equal element sizes. A float32 activation over 16-bit buffers stays on the
-    GPU rather than being cast, and the width check has to come before the offload decision."""
-    forward = _source(gc.UnslothCheckpointFunction.forward)
-    gate = forward.index("_same_width = arg.element_size() ==")
-    decision = forward.index("use_gpu_buffer = True")
-    assert gate < decision
-    assert "if _same_width and new_size > MINIMUM_SIZE" in forward
-
-
-def test_a_bf16_buffer_viewed_as_fp16_is_bit_exact():
-    """What the fix relies on: reinterpreting 16-bit storage loses nothing, where the old
-    float16 -> bfloat16 cast dropped mantissa bits on the way out and again on the way back."""
-    storage = torch.empty(64, dtype = torch.bfloat16)
-    values = torch.randn(64).to(torch.float16)
-    storage.view(torch.float16).copy_(values)
-    assert torch.equal(storage.view(torch.float16), values)
-    assert not torch.equal(values.to(torch.bfloat16).to(torch.float16), values)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason = "drives the real offload path")
-def test_the_recompute_sees_the_dtype_the_forward_saw():
-    names = [
-        "CPU_BUFFERS", "CPU_INDEX", "GPU_BUFFERS", "GPU_BUFFERS_B", "MAIN_STREAMS", "EXTRA_STREAMS",
-        "BACKWARD_PASS", "LAST_GC_INDEX", "FIRST_PASS", "CURRENT_GC_INDEX", "USE_UNSLOTH_GC",
-        "USE_DOUBLE_BUFFER", "MINIMUM_SIZE", "NEXT_BUFFER_SLOT", "BUFFER_EVENTS_A", "BUFFER_EVENTS_B",
-    ]
-    missing = object()
-    saved = {name: getattr(gc, name, missing) for name in names}
+@pytest.fixture
+def offload(request):
+    """Initialise checkpointing in the dtype the test asks for, restore every global after."""
+    saved = {name: getattr(gc, name, _MISSING) for name in _STATE}
+    gc.initialize_unsloth_gradient_checkpointing(request.param)
     try:
-        # Initialised bfloat16, like a FORCE_FLOAT32 load; the model then runs float16.
-        gc.initialize_unsloth_gradient_checkpointing(torch.bfloat16)
-        seen = []
-
-        def layer(hidden):
-            seen.append(hidden.dtype)
-            return hidden * 2
-
-        # Two checkpointed layers: the last one is never offloaded, so the first one is.
-        hidden = torch.randn(2, 1024, 2048, device = "cuda", dtype = torch.float16, requires_grad = True)
-        out = gc.UnslothCheckpointFunction.apply(layer, False, hidden)
-        out = gc.UnslothCheckpointFunction.apply(layer, False, out)
-        out.float().sum().backward()
-        torch.cuda.synchronize()
-
-        assert gc.CPU_BUFFERS, "nothing was offloaded, so this test proved nothing"
-        assert set(seen) == {torch.float16}, f"the recompute ran in {sorted(map(str, set(seen)))}"
-        assert hidden.grad is not None and hidden.grad.dtype == torch.float16
-        assert torch.equal(hidden.grad, torch.full_like(hidden.grad, 4.0))
+        yield gc
     finally:
         for name, value in saved.items():
-            if value is missing:
+            if value is _MISSING:
                 if hasattr(gc, name):
                     delattr(gc, name)
             else:
                 setattr(gc, name, value)
+
+
+def _round_trip(activation_dtype):
+    """Two checkpointed layers over a 2 x 1024 x 2048 activation, big enough to be offloaded.
+
+    Returns the dtypes the layer was re-run with, what the recompute was handed, and the grad.
+    """
+    seen = []
+    handed_back = []
+
+    def layer(hidden):
+        seen.append(hidden.dtype)
+        handed_back.append(hidden.detach().clone())
+        return hidden * 2
+
+    hidden = torch.randn(2, 1024, 2048, device = "cuda", dtype = activation_dtype, requires_grad = True)
+    out = gc.UnslothCheckpointFunction.apply(layer, False, hidden)
+    out = gc.UnslothCheckpointFunction.apply(layer, False, out)
+    out.float().sum().backward()
+    torch.cuda.synchronize()
+    assert gc.CPU_INDEX >= 1, "nothing was offloaded, so this test proved nothing"
+    # Backward runs layer 2's recompute first ([2], fed layer 1's output [1]) then layer 1's
+    # ([3], fed the original input [0]). Both went through the buffers and must be untouched.
+    assert len(handed_back) == 4, "expected two forwards and two recomputes"
+    return seen, handed_back, hidden.grad
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "drives the real offload path")
+@pytest.mark.parametrize("offload", [torch.bfloat16], indirect = True)
+def test_the_recompute_sees_the_dtype_the_forward_saw(offload):
+    """Initialised bfloat16, like a FORCE_FLOAT32 load; the model then runs float16."""
+    seen, handed_back, grad = _round_trip(torch.float16)
+    assert set(seen) == {torch.float16}, f"the recompute ran in {sorted(map(str, set(seen)))}"
+    assert torch.equal(handed_back[2], handed_back[1]), "layer 2's input was changed by the offload"
+    assert torch.equal(handed_back[3], handed_back[0]), "layer 1's input was changed by the offload"
+    assert grad.dtype == torch.float16
+    assert torch.equal(grad, torch.full_like(grad, 4.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "drives the real offload path")
+@pytest.mark.parametrize("offload", [torch.float16], indirect = True)
+def test_a_wider_activation_is_still_offloaded_exactly(offload):
+    """float32 activations over 16-bit buffers: offloaded as bytes, never squeezed into 16 bits."""
+    seen, handed_back, grad = _round_trip(torch.float32)
+    assert set(seen) == {torch.float32}, f"the recompute ran in {sorted(map(str, set(seen)))}"
+    assert torch.equal(handed_back[2], handed_back[1]), "layer 2's input was changed by the offload"
+    assert torch.equal(handed_back[3], handed_back[0]), "layer 1's input was changed by the offload"
+    assert grad.dtype == torch.float32
+    assert torch.equal(grad, torch.full_like(grad, 4.0))
+
+
+def test_the_byte_view_reinterprets_without_casting():
+    """What the fix relies on, on a CPU box: 16-bit storage viewed as another dtype loses nothing,
+    where the old float16 -> bfloat16 cast dropped mantissa bits on the way out and back."""
+    storage = torch.empty(4096, dtype = torch.bfloat16)
+    for dtype in (torch.float16, torch.float32):
+        values = torch.randn(1024, dtype = torch.float32).to(dtype).view(4, 256)
+        nbytes = values.numel() * values.element_size()
+        gc._view_bytes_as(storage, nbytes, dtype, values.shape).copy_(values)
+        assert torch.equal(gc._view_bytes_as(storage, nbytes, dtype, values.shape), values)
+        assert gc._elements_for(storage, nbytes) == nbytes // storage.element_size()
+    values = torch.randn(1024).to(torch.float16)
+    assert not torch.equal(values.to(torch.bfloat16).to(torch.float16), values)
