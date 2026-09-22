@@ -1025,16 +1025,18 @@ def make_runtime_cce_loss_fused_finalize(
         # vocab=16384, the 4096 plan peaked at 146324012 bytes against 143211072 for
         # 2048. Hold that cell to the same 8 MB with its own ratio.
         #
-        # Requiring label_smoothing == 0 keeps this to the path it was measured on.
-        # Smoothing routes to _fallback_dlogits, whose float32 intermediates the bound
-        # already underestimates; widening the estimate there is unmeasured, so it keeps
-        # the behaviour this PR started from rather than tightening it blind.
+        # Label smoothing is excluded outright rather than given its own ratio. It
+        # disables the kernels and routes to _fallback_dlogits, which holds d_capped,
+        # zeros_like(d_capped) and the mx.where result as float32 at once, so its token
+        # side is 12 to 16 bytes where compute_bytes says 4. Widening a chunk under a
+        # bound that low is the same mistake as the trainable bfloat16 cell above, and
+        # nothing here has measured it, so the smoothed path keeps the unpromoted plan.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
         token_bytes = compute_bytes
-        if label_smoothing == 0.0 and hidden.dtype == mx.bfloat16 and not weight_is_frozen:
+        if hidden.dtype == mx.bfloat16 and not weight_is_frozen:
             token_bytes = 4 * compute_bytes
-        if (chunk_size <= 0 and not quantized
+        if (chunk_size <= 0 and not quantized and label_smoothing == 0.0
                 and hidden.dtype == weight.dtype and hidden.dtype in (mx.bfloat16, mx.float32)
                 and n_tokens >= 256 and resolved_chunk_size < promoted_chunk
                 and vocab_size >= 16384
