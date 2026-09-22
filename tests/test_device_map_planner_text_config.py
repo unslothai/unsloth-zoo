@@ -169,3 +169,14 @@ def test_a_nested_sub_config_override_keeps_every_level_a_config():
     assert isinstance(out.thinker_config.text_config, text_type)
     assert out.thinker_config.text_config.max_position_embeddings == 64
     assert config.thinker_config.text_config.max_position_embeddings != 64
+
+
+def test_a_sub_config_override_regenerates_derived_fields():
+    # Gemma3TextConfig derives layer_types from num_hidden_layers at construction; an
+    # override that resets it must come back rebuilt, as from_pretrained does, or the
+    # meta model indexes None.
+    config = _tiny_vlm_config()
+    out = planner._apply_config_overrides(config, {"text_config": {"num_hidden_layers": 2, "layer_types": None}})
+    assert out.text_config.num_hidden_layers == 2
+    assert out.text_config.layer_types is not None
+    assert len(out.text_config.layer_types) == 2
