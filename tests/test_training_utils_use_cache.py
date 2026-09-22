@@ -26,6 +26,8 @@ sets truthy `use_cache` flags to False. These tests pin the contract:
 
 from __future__ import annotations
 
+import copy
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -259,3 +261,30 @@ def test_absent_use_cache_survives_a_disable_restore_cycle():
     assert config.text_config.use_cache is False
     restore_use_cache(model)
     assert not hasattr(config.text_config, "use_cache")
+
+
+@pytest.mark.parametrize(
+    "clone",
+    [
+        pytest.param(lambda m: copy.deepcopy(m), id = "deepcopy"),
+        pytest.param(lambda m: pickle.loads(pickle.dumps(m)), id = "pickle"),
+    ],
+)
+def test_absent_marker_survives_copying_the_model(clone):
+    """The record lives on the model, so it gets copied with it.
+
+    With an `object()` sentinel the copy held a different identity, restore
+    fell through to the else branch and wrote the sentinel itself into
+    cfg.use_cache, which is truthy and not JSON serializable. TRL builds its
+    reference model with deepcopy, so this is on a real path.
+    """
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    copied = clone(model)
+    restore_use_cache(copied)
+    assert not hasattr(copied.config.text_config, "use_cache")
+    # and the config is still serializable, which the sentinel leak broke
+    copied.config.text_config.to_json_string()

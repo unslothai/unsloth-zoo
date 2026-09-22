@@ -266,7 +266,15 @@ def _iter_configs(config):
 
 # Sentinel for "this config had no use_cache at all", so restore_use_cache can
 # tell that apart from a config that genuinely held None.
-_ABSENT = object()
+#
+# A class, not `object()`: the record lives on the model, and `copy.deepcopy`
+# and `pickle` both treat a class as atomic while giving a bare instance a new
+# identity. With an instance, deepcopying a prepared model (TRL builds its
+# reference model that way) or a torch.save/load round trip made the identity
+# check fail, so restore wrote the opaque sentinel itself into cfg.use_cache
+# and the config stopped being JSON serializable.
+class _ABSENT:
+    """Marker type; never instantiated."""
 
 
 def disable_use_cache(model):
