@@ -1028,15 +1028,20 @@ class TokenizedKTORow:
 _UNPAIR_BLOCK = 1000
 
 
+_KTO_LABELS = {"true": True, "1": True, "1.0": True, "yes": True,
+               "false": False, "0": False, "0.0": False, "no": False}
+
+
 def _kto_label(row):
+    # bool("false") is True, so string labels from a CSV are parsed, never truth-tested.
     label = row["label"]
-    if not isinstance(label, (bool, np.bool_)):
-        raise ValueError(
-            "label must be a boolean, True for a desirable completion, not "
-            f"{type(label).__name__}. TRL's KTOTrainer keeps a row only when its "
-            "label is True or False, so any other value drops out of its loss."
-        )
-    return bool(label)
+    if isinstance(label, (bool, int, float, np.bool_, np.integer, np.floating)):
+        return bool(label)
+    if isinstance(label, str) and label.strip().lower() in _KTO_LABELS:
+        return _KTO_LABELS[label.strip().lower()]
+    raise ValueError(
+        f"label {label!r} is not a boolean (use True/False, 1/0 or 'true'/'false')."
+    )
 
 
 def _unpaired_kto_rows(dataset, formatting_func):
@@ -1151,8 +1156,13 @@ def create_kto_batch_plan(
     append_eos=True,
     formatting_func=None,
     prompt_sink=None,
+    dataset_order="default",
+    preserve_dataset_order=False,
+    seed=None,
 ):
     """Build a finite KTO plan over TRL's unpaired rows, visited in dataset order.
+    ``dataset_order="torch_randperm"`` reorders whole batches each epoch, keeping
+    KL partners together.
 
     Each row's KL pair joins its prompt to the previous row's completion within
     ``kl_batch_size`` chunks (TRL's per_device_train_batch_size, for evaluation
@@ -1197,6 +1207,9 @@ def create_kto_batch_plan(
         tokenized.append((prompt, answer, answer_ids, label))
     if not tokenized:
         raise ValueError("Unsloth MLX KTO: the dataset is empty.")
+    order_mode = "sequential" if preserve_dataset_order else dataset_order
+    if order_mode not in ("default", "sequential", "torch_randperm"):
+        raise ValueError(f"Unsloth MLX KTO: unsupported dataset_order {order_mode!r}.")
     rows = []
     for start in range(0, len(tokenized), kl_batch_size):
         chunk = tokenized[start:start + kl_batch_size]
@@ -1216,9 +1229,20 @@ def create_kto_batch_plan(
                         f"{start + offset} could not be formed. {exc}"
                     ) from exc
             rows.append(TokenizedKTORow(prompt, answer, label, kl_prompt, kl_answer))
-    schedule, cycle_length = _finite_row_schedule(
-        len(rows), batch_size, order_for_epoch=lambda epoch: range(len(rows)),
-        num_batches=num_batches, num_epochs=num_epochs, grad_accum=grad_accum,
+    batches = [
+        tuple(range(start, min(start + batch_size, len(rows))))
+        for start in range(0, len(rows), batch_size)
+    ]
+
+    def batches_for_epoch(epoch):
+        if order_mode != "torch_randperm":
+            return batches
+        order = _torch_randperm_order(len(batches), _normalize_seed(seed) + int(epoch))
+        return [batches[index] for index in order]
+
+    schedule, cycle_length = _finite_batch_schedule(
+        batches_for_epoch, num_batches=num_batches, num_epochs=num_epochs,
+        grad_accum=grad_accum,
     )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
@@ -2392,6 +2416,7 @@ def _mark_kto_fn(fn, scorer):
     fn._unsloth_preference_report = kto_metric_values
     # A KTO batch has no chosen/rejected halves to compact.
     fn._unsloth_cce_compaction = False
+    fn._unsloth_cce_scorer = scorer
     if scorer is not None:
         fn._unsloth_cce_backend = "runtime-cce"
     return fn
@@ -2643,8 +2668,10 @@ def build_reference_policy(
                 f"Unsloth MLX {objective_name}: this model carries adapters, so its "
                 "base is "
                 "already the reference and a ref_model doubles the memory. "
-                "Pass ref_model=None, or force_use_ref_model=True to score "
-                "against a different model without this warning.",
+                "Pass ref_model=None" + (
+                    ", or force_use_ref_model=True to score against a different "
+                    "model without this warning." if objective_name == "DPO" else "."
+                ),
                 RuntimeWarning, stacklevel=2,
             )
         ref_model.eval()

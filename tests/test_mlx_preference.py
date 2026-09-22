@@ -1586,7 +1586,7 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
         )),
     )
     synced = []
-    build = trainer._build_dpo_reference
+    build = trainer._build_reference
 
     def capture(*args, **kwargs):
         policy, provenance = build(*args, **kwargs)
@@ -1595,7 +1595,7 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
                 (trainer._global_step, alpha, model is trainer.model))
         return policy, provenance
 
-    trainer._build_dpo_reference = capture
+    trainer._build_reference = capture
     _run_generation_trainer(trainer, monkeypatch, [])
     assert synced == ([(2, 0.25, True), (4, 0.25, True)] if sync is True else [])
     if sync == "reference_free":
@@ -1632,7 +1632,7 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
         )),
     )
     forwards, tables, built = [], [], []
-    build = trainer._build_dpo_reference
+    build = trainer._build_reference
 
     def capture(*args, **kwargs):
         policy, provenance = build(*args, **kwargs)
@@ -1655,7 +1655,7 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
         ))
         return precompute(plan, model, policy, batch_size=batch_size, **kwargs)
 
-    trainer._build_dpo_reference = capture
+    trainer._build_reference = capture
     monkeypatch.setattr(trainer_module, "precompute_reference_logps", recording)
     _run_generation_trainer(trainer, monkeypatch, [])
     assert trainer._global_step == 2
@@ -1863,7 +1863,7 @@ def _run_generation_trainer(
     return trainer.train()
 
 
-@pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig"])
+@pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig", "MLXKTOConfig"])
 def test_a_preference_field_a_dump_predates_still_reads_as_a_wholesale_copy(
         config_cls_name):
     """An unregistered appended field flips the copy detection, losing warmup_ratio."""
@@ -2771,9 +2771,26 @@ def test_a_kto_plan_refuses_a_policy_resolved_without_its_eos():
         )
 
 
-def test_a_kto_label_must_be_a_boolean():
+def test_kto_labels_are_parsed_not_truth_tested():
+    import numpy as np
+    values = ("false", "0", "0.0", "no", " TRUE ", "yes", "1", "1.0", True, 0, 1.0, np.int64(0), np.float32(1), np.bool_(False))
+    plan = kto_plan([{"prompt": "p", "completion": "c", "label": v} for v in values])
+    assert [row.label for row in plan.rows] == [False] * 4 + [True] * 5 + [False, True, False, True, False]
     with pytest.raises(ValueError, match="dataset row 0 .*boolean"):
-        kto_plan([{"prompt": "p", "completion": "c", "label": 1}])
+        kto_plan([{"prompt": "p", "completion": "c", "label": "maybe"}])
+
+
+def test_a_shuffled_kto_plan_moves_whole_batches():
+    rows = [{"prompt": f"p{i}", "completion": "c" * (i + 1), "label": True} for i in range(11)]
+    from unsloth_zoo.mlx.preference import _torch_randperm_order
+    shuffled = dict(dataset_order="torch_randperm", seed=3, num_epochs=3)
+    fixed = [tuple(range(start, min(start + 3, 11))) for start in range(0, 11, 3)]
+    assert kto_plan(rows, **shuffled).schedule == tuple(
+        fixed[index] for epoch in range(3) for index in _torch_randperm_order(4, 3 + epoch))
+    for unshuffled in (dict(num_epochs=3), dict(shuffled, preserve_dataset_order=True)):
+        assert kto_plan(rows, **unshuffled).schedule == tuple(fixed * 3)
+    with pytest.raises(ValueError, match="unsupported dataset_order 'shuffle'"):
+        kto_plan(rows, dataset_order="shuffle")
 
 
 @pytest.mark.parametrize("with_kl", [True, False])
@@ -2884,3 +2901,72 @@ def test_kto_metrics_average_each_side_over_its_own_rows():
     assert kto_metric_values([0, 3.0, 0, -9.0, 0, 30.0, 0.6, 0, 3, 4]) == pytest.approx({
         "rewards/rejected": 1.0, "logps/rejected": -3.0, "logits/rejected": 10.0, "kl": 0.15})
     assert kto_metric_values([4.0, 3.0, 0, 0, 0, 0, 0, 2, 3, 1])["rewards/margins"] == 1.0
+
+
+def kto_rows(n):
+    return [{"prompt": f"question {i}: ", "completion": f"answer{'!' * i}", "label": i % 3 != 1} for i in range(n)]
+
+
+@pytest.mark.parametrize("loss_type,precompute", [("kto", False), ("kto", True), ("apo_zero_unpaired", False)])
+def test_the_kto_trainer_trains_and_evaluates_against_its_reference(
+        tmp_path, monkeypatch, loss_type, precompute):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+    built, plans, calls = [], [], []
+    for name in ("make_kto_loss_fn", "make_kto_cce_loss_fn"):
+        make = getattr(trainer_module, name)
+        monkeypatch.setattr(trainer_module, name, lambda *a, make=make, **kw: (
+            built.append((a[-1], kw["reference_policy"])), make(*a, **kw))[1])
+    plan = trainer_module.create_kto_batch_plan
+    monkeypatch.setattr(trainer_module, "create_kto_batch_plan", lambda *a, **kw: (
+        plans.append((kw, plan(*a, **kw))) or plans[-1][1]))
+    trainer = MLXKTOTrainer(
+        _tiny_model(tail=True), Tokenizer(), kto_rows(6), eval_dataset=kto_rows(5),
+        args=MLXKTOConfig(**_generation_common(
+            tmp_path, generate_during_eval=precompute, loss_type=loss_type,
+            desirable_weight=1.25, undesirable_weight=2.0, per_device_eval_batch_size=5,
+            precompute_ref_log_probs=precompute,
+            dataset_order="torch_randperm" if precompute else "default")))
+    _run_generation_trainer(trainer, monkeypatch, calls)
+    # The training plan takes the run's order; evaluation keeps dataset order.
+    order = ("torch_randperm" if precompute else "default", False, trainer.args.seed)
+    assert [tuple(map(p.get, ("dataset_order", "preserve_dataset_order", "seed"))) for p, _ in plans] == [order, (None,) * 3]
+    (objective, reference), = built
+    assert reference is not None and (objective.loss_types, objective.desirable_weight,
+                                      objective.undesirable_weight) == ((loss_type,), 1.25, 2.0)
+    # Eval rows pair for the KL term in chunks of the training batch size.
+    with_kl = loss_type == "kto"
+    assert [(p["batch_size"], p["kl_batch_size"], p["with_kl"],
+             made._reference is not None) for p, made in plans] == [
+        (2, 2, with_kl, precompute), (5, 2, with_kl, precompute)]
+    assert len(calls) == 2 * precompute and all(
+        sample["reference"] for sample in trainer.last_generation_samples)
+    logged = next(e for e in trainer.state.log_history if "rewards/chosen" in e)
+    evaluated = trainer._last_eval_metrics
+    for name in ("rewards/chosen", "rewards/rejected", "rewards/margins", "logps/chosen",
+                 "logps/rejected", "logits/chosen", "logits/rejected", "kl"):
+        assert name in logged and f"eval_{name}" in evaluated, name
+    assert with_kl or evaluated["eval_kl"] == logged["kl"] == 0
+
+
+@pytest.mark.parametrize("overrides,trainer_kwargs,match", [
+    ({"per_device_train_batch_size": 1}, {}, "needs per_device_train_batch_size > 1"),
+    ({}, {"model_adapter_name": "policy"}, "model_adapter_name names one of several"),
+    ({}, {"ref_adapter_name": "ref"}, "ref_adapter_name replaces"),
+])
+def test_the_kto_trainer_refuses_a_run_trl_would_not_train(
+        tmp_path, monkeypatch, overrides, trainer_kwargs, match):
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+    trainer = MLXKTOTrainer(
+        _tiny_model(), Tokenizer(), kto_rows(4), **trainer_kwargs,
+        args=MLXKTOConfig(**_generation_common(
+            tmp_path, generate_during_eval=False, **overrides)))
+    with pytest.raises(ValueError, match=match):
+        _run_generation_trainer(trainer, monkeypatch, [])
+    # Without a KL term a single-row batch is fine; the config and eval dataset are positional.
+    trainer = MLXKTOTrainer(
+        _tiny_model(), Tokenizer(), kto_rows(4), MLXKTOConfig(**_generation_common(
+            tmp_path, generate_during_eval=False, loss_type="apo_zero_unpaired",
+            per_device_train_batch_size=1)), kto_rows(3))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    assert (trainer._global_step, trainer.args.loss_type, len(trainer.eval_dataset)) == (1, "apo_zero_unpaired", 3)

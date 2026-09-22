@@ -1828,6 +1828,11 @@ def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
         assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
     for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
         assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+    scorer = p.make_kto_cce_loss_fn(model, objective, reference_policy=reference)._unsloth_cce_scorer
+    want = p.precompute_reference_logps(plan, model, reference, batch_size=4)
+    calls.clear()
+    got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=scorer)
+    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
 
 
 @metal_only
