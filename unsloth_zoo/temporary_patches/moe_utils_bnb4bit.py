@@ -98,6 +98,34 @@ def _is_expert_module(module: nn.Module) -> bool:
     )
 
 
+def _expert_forward_is_handled(module: nn.Module) -> bool:
+    """Whether packing this module's expert stacks to 4-bit is safe: only when
+    its forward is Unsloth's (patched by name, or a transformers-decorated class
+    whose config dispatches to the "unsloth" implementation). A structural match
+    alone is not enough: Llama-4's experts have 3-D gate_up_proj / down_proj too,
+    but their forward is the model's own bmm, which cannot read packed bytes."""
+    try:
+        from unsloth_zoo.temporary_patches.moe_experts_interface import expert_forward_is_handled
+    except ImportError:
+        return False
+    return expert_forward_is_handled(module)
+
+
+_UNHANDLED_EXPERT_MODULES_LOGGED = set()
+
+
+def _log_unhandled_expert_module_once(module_name: str, module: nn.Module):
+    key = type(module).__name__
+    if key in _UNHANDLED_EXPERT_MODULES_LOGGED:
+        return
+    _UNHANDLED_EXPERT_MODULES_LOGGED.add(key)
+    logger.warning(
+        f"Unsloth: {key} ({module_name}) keeps its expert weights in the checkpoint dtype: "
+        "its forward is not one Unsloth patches, so 4-bit packing would break it. "
+        "Training works; the experts of this architecture are not quantized."
+    )
+
+
 # ============================================================================
 # Dequantization
 # ============================================================================
@@ -221,6 +249,9 @@ def replace_expert_params_with_bnb_params(
 
         if not _is_expert_module(module):
             continue
+        if not _expert_forward_is_handled(module):
+            _log_unhandled_expert_module_once(module_name, module)
+            continue
 
         gate_up_proj = module.gate_up_proj
         down_proj = module.down_proj
@@ -294,7 +325,7 @@ def patch_bnb4bit_quantize_convert():
             from transformers.quantizers.quantizers_utils import get_module_from_name
             module, _ = get_module_from_name(model, full_layer_name)
 
-            if _is_expert_module(module):
+            if _is_expert_module(module) and _expert_forward_is_handled(module):
                 old_value = model.get_parameter_or_buffer(full_layer_name)
                 old_dict = {k: v for k, v in old_value.__dict__.items()}
                 new_value = Params4bit(value, requires_grad=False, **old_dict).to(value.device)

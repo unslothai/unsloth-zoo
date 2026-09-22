@@ -61,6 +61,37 @@ SKIP_QUANTIZATION_MODULES = [
     "qa_outputs",               # *ForQuestionAnswering head
 ]
 
+_LINEAR_FORWARD_RETURNS_TENSOR_CACHE = {}
+
+def _linear_forward_returns_tensor(cls) -> bool:
+    """False for an nn.Linear subclass whose own forward returns a tuple.
+
+    A LoRA adapter adds lora_B(lora_A(x)) to whatever the base layer returns, so
+    a Linear subclass that returns more than one tensor cannot take one: MoE
+    routers such as Llama4Router and PhimoeTopKRouter return (scores, logits)
+    and PEFT then fails inside the adapter forward ("'tuple' object has no
+    attribute 'to'"). Plain nn.Linear and subclasses that keep its forward are
+    always fine; a subclass whose source cannot be read is assumed fine."""
+    cached = _LINEAR_FORWARD_RETURNS_TENSOR_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    result = True
+    forward = getattr(cls, "forward", None)
+    if forward is not None and forward is not torch.nn.Linear.forward:
+        try:
+            import ast, textwrap
+            tree = ast.parse(textwrap.dedent(inspect.getsource(forward)))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+                    result = False
+                    break
+        except Exception:
+            result = True
+    _LINEAR_FORWARD_RETURNS_TENSOR_CACHE[cls] = result
+    return result
+pass
+
+
 def get_peft_regex(
     model,
     finetune_vision_layers     : bool = True,
@@ -90,7 +121,10 @@ def get_peft_regex(
 
     from collections import Counter
     modules = model.named_modules()
-    linear_modules = [name for name, module in modules if isinstance(module, torch.nn.Linear)]
+    linear_modules = [
+        name for name, module in modules
+        if isinstance(module, torch.nn.Linear) and _linear_forward_returns_tensor(type(module))
+    ]
 
     # Gemma4 ClippableLinear wraps nn.Linear as .linear child -- detect and add those
     try:

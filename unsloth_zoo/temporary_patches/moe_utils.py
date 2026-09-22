@@ -1528,12 +1528,26 @@ def extract_moe_lora_weights_for_grouped_mm(
     )
 
     if canonical_match and reversed_match:
-        if bool(getattr(wrapper, "_did_swap_in_out_features", False)):
-            first_weight, second_weight = _reversed_lora_weights_for_grouped_mm(
+        # A square stack (2 * intermediate == hidden, as on Inkling-Small's
+        # (256, 4096, 4096) gate_up_proj) matches both readings by shape alone.
+        # PEFT's own bookkeeping settles it: when it swapped in/out for an
+        # (E, out, in) stack, or the stack is stored (E, in, out) already,
+        # lora_A is (rank, in) and lora_B is (out, rank), the canonical reading.
+        # Only a PEFT that took the stack's second dim as its input keeps the
+        # reversed reading. Picking reversed on the swap flag applied the LoRA
+        # of every square stack through the wrong dims.
+        swapped = bool(getattr(wrapper, "_did_swap_in_out_features", False))
+        base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
+        stored_in_out = (
+            getattr(base, "is_transposed", None) is True
+            or bool(getattr(base, "_unsloth_grouped_mm_format", False))
+        )
+        if swapped or stored_in_out:
+            first_weight, second_weight = _canonical_lora_weights_for_grouped_mm(
                 weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
             )
         else:
-            first_weight, second_weight = _canonical_lora_weights_for_grouped_mm(
+            first_weight, second_weight = _reversed_lora_weights_for_grouped_mm(
                 weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
             )
         return first_weight, second_weight, scaling, num_experts
@@ -1877,6 +1891,14 @@ def preprocess_weight(
     if needs_transpose is not None:
         return weight.transpose(-2, -1) if needs_transpose else weight
 
+    # A module flagged as grouped_mm layout, or a transformers-decorated experts
+    # class stating is_transposed, already knows: (E, in, out) needs no transpose.
+    if getattr(experts_module, "_unsloth_grouped_mm_format", False):
+        return weight
+    is_transposed = getattr(experts_module, "is_transposed", None)
+    if isinstance(is_transposed, bool):
+        return weight if is_transposed else weight.transpose(-2, -1)
+
     # One sibling is always non-square and reveals the shared layout.
     if experts_module is not None:
         sibling_name = "down_proj" if proj_type == "gate_up" else "gate_up_proj"
@@ -1947,9 +1969,15 @@ def _is_gpt_oss_model(model) -> bool:
 def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
     if module is None:
         return False
-    if module.__class__.__name__ != "GptOssExperts":
-        return False
     if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
+        return False
+    # Any experts module that states its layout is (E, in, out) (transformers'
+    # `is_transposed`, set by @use_experts_implementation or by an Unsloth patch
+    # such as Llama-4's) is in grouped_mm format already.
+    if getattr(module, "is_transposed", None) is True:
+        module._unsloth_grouped_mm_format = True
+        return True
+    if module.__class__.__name__ != "GptOssExperts":
         return False
     # Require the gpt-oss (E, in, out) weight signature: gate_up's out dim is
     # twice down's in dim. Same-named classes with other layouts stay unflagged.
@@ -3356,6 +3384,15 @@ class _MoEGateGradIdentity(torch.autograd.Function):
         return grad_inter, grad_gate
 
 
+def _gate_up_is_interleaved(module) -> bool:
+    """Whether gate_up_proj stores [gate0, up0, gate1, up1, ...] rather than
+    [gate...; up...]. GPT-OSS by class name; any transformers-decorated experts
+    class says so itself through `is_concatenated`."""
+    if "GptOssExperts" in module.__class__.__name__:
+        return True
+    return getattr(module, "is_concatenated", True) is False
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -3481,7 +3518,7 @@ def forward_native_grouped_mm(
             )
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-        if "GptOssExperts" in self.__class__.__name__:
+        if _gate_up_is_interleaved(self):
             gate = mm1_out[..., ::2]
             up = mm1_out[..., 1::2]
         else:
@@ -3527,7 +3564,7 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
 
     # Activation
-    if "GptOssExperts" in self.__class__.__name__:
+    if _gate_up_is_interleaved(self) and "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
         alpha = getattr(self, "alpha", 1.702)
@@ -3941,7 +3978,7 @@ def forward_native_moe_loop(
     grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
 
     # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
-    is_gpt_oss = "GptOssExperts" in self.__class__.__name__
+    is_gpt_oss = _gate_up_is_interleaved(self)
 
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()

@@ -36,6 +36,10 @@ from .deepseek_v3_moe import *
 from .gemma4_moe import *
 from .lfm2_moe import *
 from .mixtral_moe import *
+from .llama4_moe import *
+from .inkling import *
+from .compiled_model_identity import *
+from .bitsandbytes_large_tensors import *
 from .ernie4_5_moe import *
 from .pixtral import *
 from .ministral import *
@@ -43,6 +47,7 @@ from .amd_aiter import *
 from .mxfp4 import *
 from .bitsandbytes import *
 from .moe_utils_bnb4bit import *
+from .moe_experts_interface import *
 from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
 from .flex_attention_bwd import *
