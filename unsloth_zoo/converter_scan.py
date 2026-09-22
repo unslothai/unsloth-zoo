@@ -483,6 +483,10 @@ def _joins_something_unreadable(tree):
     written out is folded, and returning no text for anything else left the
     destination unnamed rather than unreadable.
 
+    The separator is read too: str().join(("htt", "ps://evil.example/c")) is a
+    URL whose scheme is broken in the middle by the hole the separator folded
+    to, so nothing matched a scheme there either.
+
     One argument, which leaves os.path.join(a, b) alone. No file that reaches
     this allowance joins anything: gguf-py/gguf/utility.py has no .join at all.
     """
@@ -496,6 +500,12 @@ def _joins_something_unreadable(tree):
         ):
             continue
         if _join_parts(node) is None:
+            return True
+        if _literal_text(node.func.value) is None:
+            # A separator this cannot read, folded as a hole, hid a whole URL
+            # between two readable pieces: str().join(("htt", "ps://evil.
+            # example/c")) reads as htt<hole>ps://..., where the hole breaks
+            # the scheme and nothing was recorded as a destination.
             return True
     return False
 
