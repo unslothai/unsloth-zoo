@@ -100,3 +100,27 @@ def test_without_the_option_the_rebuilt_mask_is_untouched(monkeypatch, trainer_a
     )
     mask = _loss_mask(monkeypatch, TRL_MASK, **trainer_attrs)
     assert torch.equal(mask.bool(), expected.bool())
+
+
+def test_the_kl_metric_leaves_dropped_rows_out():
+    """A dropped row must not drag the logged KL toward 0, and an all-dropped batch logs 0."""
+    torch.manual_seed(0)
+    B, T = 4, 5
+    new = torch.randn(B, T, dtype = torch.float64)
+    ref = new + 0.3 * torch.randn(B, T, dtype = torch.float64)
+    mask = torch.ones(B, T, dtype = torch.float64)
+    kwargs = dict(loss_type = "dapo", num_items_in_batch = float(mask.sum()), num_processes = 1,
+                  current_gradient_accumulation_steps = 1, max_completion_length = T)
+
+    def kl(m):
+        return _rl.grpo_compute_loss(ref, new, new, None, torch.zeros(B, T, dtype = torch.long),
+                                     m, 0.1, torch.zeros(B, dtype = torch.float64), **kwargs)[2]
+
+    full = kl(mask)
+    kept = mask.clone()
+    kept[1:] = 0
+    only_row0 = kl(mask[:1].expand(B, T) * kept)
+    per_row = (torch.exp(ref - new) - (ref - new) - 1).mean(1)
+    torch.testing.assert_close(full, per_row.mean())
+    torch.testing.assert_close(only_row0, per_row[0])
+    assert kl(torch.zeros_like(mask)).item() == 0.0

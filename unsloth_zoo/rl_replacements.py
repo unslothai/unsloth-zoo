@@ -656,9 +656,15 @@ def grpo_compute_loss(
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return completion_length, x.mean()
             else:
-                # A row dropped by mask_truncated_completions has no tokens; keep it at 0, not nan.
+                # A row dropped by mask_truncated_completions has no tokens: leave it out of the
+                # mean like TRL does, rather than letting 0/0 turn the metric into nan.
                 mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward.clamp(min = 1.0)
-                mean_kl = mean_kl_per_reward.mean()
+                kept_rows = (n_mask_per_reward > 0).sum()
+                mean_kl = torch.where(
+                    kept_rows == n_mask_per_reward.numel(),
+                    mean_kl_per_reward.mean(),
+                    mean_kl_per_reward.sum() / kept_rows.clamp(min = 1),
+                )
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
