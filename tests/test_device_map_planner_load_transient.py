@@ -389,14 +389,20 @@ def test_ernie_vl_fuse_and_split_experts_count_as_merging():
     modeling = pytest.importorskip("transformers.models.ernie4_5_vl_moe.modeling_ernie4_5_vl_moe")
     from accelerate import init_empty_weights
 
-    config = configuration.Ernie4_5_VLMoeConfig(
-        text_config = dict(
-            hidden_size = 256, intermediate_size = 128, moe_intermediate_size = [32, 16],
-            moe_num_experts = 4, num_hidden_layers = 2, num_attention_heads = 2,
-            num_key_value_heads = 1, vocab_size = 256, moe_k = 2,
-        ),
-        vision_config = dict(hidden_size = 32, depth = 1, intermediate_size = 64, num_heads = 2),
-    )
+    try:
+        config = configuration.Ernie4_5_VLMoeConfig(
+            text_config = dict(
+                hidden_size = 256, intermediate_size = 128, moe_intermediate_size = [32, 16],
+                moe_num_experts = 4, num_hidden_layers = 2, num_attention_heads = 2,
+                num_key_value_heads = 1, vocab_size = 256, moe_k = 2,
+            ),
+            vision_config = dict(hidden_size = 32, depth = 1, intermediate_size = 64, num_heads = 2),
+        )
+    except Exception as error:
+        # transformers 5.4's Ernie 4.5-VL config declares `use_bias: int | None` and defaults it
+        # to False, which huggingface_hub's strict dataclass validation (>= 1.x) rejects: even
+        # the default config cannot be built there.
+        pytest.skip(f"this transformers cannot build an Ernie 4.5-VL config ({type(error).__name__})")
     with init_empty_weights():
         model = modeling.Ernie4_5_VLMoeForConditionalGeneration(config)
     patterns = _merged_parameter_patterns(model)
@@ -467,3 +473,41 @@ def test_a_pre_quantized_merge_is_sized_from_its_storage_dtype(monkeypatch):
     transient = planner._load_transient_by_unit(model, units, quantizer)
     assert transient, units
     assert max(transient.values()) == _INTER * _HIDDEN // 2  # 4-bit: half a byte per element
+
+
+@needs_conversion_mapping
+def test_room_to_load_is_never_bought_with_activation_reserve():
+    # The planner's standing contract is that no card keeps less activation reserve than the
+    # previous planner did. The load transient must not break it: a transient plan that would
+    # lower some card's reserve (or move the head) loses to the plan without the transient.
+    import random
+
+    model = _meta_mixtral()
+    _, total = _units(model)
+    cases = [
+        ({0: 2749654, 1: 1981274}, "balanced"),
+        ({0: 1630780, 1: 868481, 2: 1554801}, "balanced"),
+        ({0: 803666, 1: 765534, 2: 1949286}, "balanced"),
+    ]
+    rng = random.Random(0)
+    for _ in range(150):
+        k = rng.choice([2, 3, 4])
+        weights = [rng.uniform(0.3, 1.0) for _ in range(k)]
+        budget = total * rng.uniform(1.05, 2.0)
+        cases.append((
+            {i: int(budget * w / sum(weights)) for i, w in enumerate(weights)},
+            rng.choice(["balanced", "head_max"]),
+        ))
+    checked = 0
+    for max_memory, policy in cases:
+        kwargs = dict(max_memory = max_memory, free_space_policy = policy, headroom_bytes = 0)
+        try:
+            without = plan_device_map(model, reserve_load_transient = False, **kwargs)
+        except Exception:
+            continue
+        with_transient = plan_device_map(model, reserve_load_transient = True, **kwargs)
+        assert with_transient.head_device == without.head_device, max_memory
+        for device, kept in without.activation_reserve_by_device.items():
+            assert with_transient.activation_reserve_by_device[device] >= kept, (max_memory, device)
+        checked += 1
+    assert checked > 100

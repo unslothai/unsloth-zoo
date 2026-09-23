@@ -1452,6 +1452,13 @@ def plan_device_map(
             return {d: _parse_size(value.get(d, 0)) for d in devices}
         return dict.fromkeys(devices, int(value))
 
+    # Per card, the least activation reserve a load-transient search may settle on: what the
+    # plan without the transient keeps (see below). Empty means no floor.
+    reserve_floor: dict[int, int] = {}
+
+    def _below_floor(kept) -> bool:
+        return bool(reserve_floor) and any(kept[d] < reserve_floor.get(d, 0) for d in devices)
+
     def attempt(head_device: int):
         """Try progressively smaller activation reserves on the non-head devices.
 
@@ -1554,12 +1561,16 @@ def plan_device_map(
         # head whole AND lifting the small card 114 over the old answer.
         legacy_kept = None
         for kept in _ordered(legacy):
+            if _below_floor(kept):
+                continue
             if _try(kept) is not None:
                 legacy_kept = kept
                 break
 
         for kept in _ordered(candidates):
             if legacy_kept is not None and any(kept[d] < legacy_kept[d] for d in devices):
+                continue
+            if _below_floor(kept):
                 continue
             r = _try(kept)
             if r is not None:
@@ -1751,8 +1762,33 @@ def plan_device_map(
                     assign.pop(n, None)
             return False
 
+        def place_plain(i: int) -> bool:
+            # No load transient in play: the search this planner ran before it, at the same
+            # speed. Cards alike in reserve room are interchangeable again.
+            nonlocal visited
+            if i == len(order):
+                return True
+            visited += 1
+            if visited > node_budget:
+                raise _SearchExhausted
+            names, size = order[i]
+            tried: set[int] = set()
+            for d in devices:
+                room = remaining[d]
+                if size > room or room in tried:
+                    continue
+                tried.add(room)
+                remaining[d] -= size
+                assign.update(dict.fromkeys(names, d))
+                if place_plain(i + 1):
+                    return True
+                remaining[d] += size
+                for n in names:
+                    assign.pop(n, None)
+            return False
+
         try:
-            fitted = place(0)
+            fitted = place(0) if transient_of else place_plain(0)
         except (_SearchExhausted, RecursionError):
             return None, None
         if not fitted:
@@ -1792,12 +1828,19 @@ def plan_device_map(
     load_transient: dict[int, int] = {}
     result, chosen = None, None
     if unit_transient:
+        # The plan without the transient comes first, and a transient plan is only taken on
+        # its head card and when every card keeps at least that plan's activation reserve:
+        # room to load is never bought with room to train, and the search stays short.
+        baseline, base_head = _search()
         multiples = (
             (_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE,) if _expandable_segments_enabled() else ()
         ) + (_LOAD_TRANSIENT_MULTIPLE, 1)
-        for multiple in multiples:
+        if baseline is not None:
+            reserve_floor.update(baseline[3])
+        for multiple in multiples if baseline is not None else ():
             transient_of = {u: n * multiple for u, n in unit_transient.items()}
-            result, chosen = _search()
+            found = attempt(base_head)
+            result, chosen = (found, base_head) if found is not None else (None, None)
             if result is not None:
                 for unit, device in result[0].items():
                     if transient_of.get(unit, 0):
@@ -1809,19 +1852,27 @@ def plan_device_map(
                     + ")"
                 )
                 break
+        reserve_floor.clear()
         transient_of = {} if result is None else transient_of
-    if result is None:
+    fell_back = result is None
+    if result is None and unit_transient:
+        # The plan without the transient was already searched: take it, or refuse as before
+        # without searching the same ladder a second time.
+        transient_of = {}
+        result, chosen = baseline, base_head
+    elif result is None:
         transient_of = {}
         result, chosen = _search()
-        if result is not None and unit_transient:
-            need = dict.fromkeys(devices, 0)
-            for unit, device in result[0].items():
-                need[device] = max(need[device], unit_transient.get(unit, 0))
-            notes.append(
-                "load transient: no placement keeps "
-                + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in need.items() if n)
-                + " free for merging checkpoint tensors; loading may run out of memory"
-            )
+    if result is not None and unit_transient and fell_back:
+        need = dict.fromkeys(devices, 0)
+        for unit, device in result[0].items():
+            need[device] = max(need[device], unit_transient.get(unit, 0))
+        notes.append(
+            "load transient: no placement keeps "
+            + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in need.items() if n)
+            + " free for merging checkpoint tensors without lowering the activation reserve;"
+            " loading may run out of memory"
+        )
     if result is None:
         # Report the reserve of the first candidate actually tried; it is what
         # the failing arithmetic used.
