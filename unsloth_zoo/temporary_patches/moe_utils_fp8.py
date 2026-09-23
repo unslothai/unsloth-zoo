@@ -586,7 +586,10 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         bias_expanded = _expand_grouped_bias(self.gate_up_proj_bias, num_tokens_per_expert)
         mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-    if "GptOssExperts" in self.__class__.__name__:
+    if getattr(self, "_unsloth_own_apply_gate", False):
+        # The experts module's own gate on [gate; up] (e.g. Step-3.7's post-activation clamp).
+        inter = self._apply_gate(mm1_out)
+    elif "GptOssExperts" in self.__class__.__name__:
         gate = mm1_out[..., ::2]
         up = mm1_out[..., 1::2]
         limit = getattr(self, "limit", 7.0)
@@ -754,7 +757,9 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         else:
             gate_up_out = F.linear(current_state, expert_gate_up, gate_up_bias_expert)
 
-        if "GptOssExperts" in self.__class__.__name__:
+        if getattr(self, "_unsloth_own_apply_gate", False):
+            current_hidden_states = self._apply_gate(gate_up_out)
+        elif "GptOssExperts" in self.__class__.__name__:
             gate = gate_up_out[..., ::2]
             up = gate_up_out[..., 1::2]
             limit = getattr(self, "limit", 7.0)
@@ -792,6 +797,15 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     return final_hidden_states.view(original_shape)
 
 
+def _fp8_experts_own_gate(module) -> bool:
+    """True when the experts class defines its own gate on [gate; up] instead of the default
+    act_fn(gate) * up that use_experts_implementation installs."""
+    if not getattr(module, "has_gate", True) or "GptOss" in type(module).__name__:
+        return False
+    apply_gate = getattr(type(module), "_apply_gate", None)
+    return apply_gate is not None and getattr(apply_gate, "__name__", "") != "_default_apply_gate"
+
+
 @torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
@@ -802,6 +816,12 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         swap_moe_weights_for_call,
         _gate_up_is_interleaved,
     )
+
+    # transformers' FP8Experts (and model classes like MiniMax-M3 or HY-V4) apply the config's
+    # clamped / custom SwiGLU in their own _apply_gate; every backend below must call it
+    # rather than a plain SiLU. GPT-OSS keeps its interleaved gate by name.
+    if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
+        self._unsloth_own_apply_gate = True
 
     backend = select_moe_backend()
 

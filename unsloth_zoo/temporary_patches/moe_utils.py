@@ -3498,6 +3498,7 @@ def forward_native_grouped_mm(
             self.gate_up_proj, num_experts=self.num_experts, experts_module=self
         )
 
+    own_gate_up = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _gate_up_src = self.gate_up_proj
@@ -3572,6 +3573,8 @@ def forward_native_grouped_mm(
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
+        # The class's own gate on [gate; up] (set only on generically routed classes).
+        own_gate_up = mm1_out if getattr(self, "_unsloth_own_apply_gate", False) else None
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -3613,7 +3616,9 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
 
     # Activation
-    if "GptOssExperts" in self.__class__.__name__:
+    if own_gate_up is not None:
+        inter = self._apply_gate(own_gate_up)
+    elif "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
         alpha = getattr(self, "alpha", 1.702)
@@ -3900,7 +3905,10 @@ def forward_triton_grouped_gemm(
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
     # Activation + gate*up.
-    if hasattr(self, 'act_fn') and callable(self.act_fn):
+    if getattr(self, "_unsloth_own_apply_gate", False):
+        # The class's own gate on [gate; up] (set only on generically routed classes).
+        intermediate = self._apply_gate(first_gemm_output)
+    elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
     else:
@@ -4083,6 +4091,9 @@ def forward_native_moe_loop(
             gate = gate.clamp(min=None, max=limit)
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+        elif getattr(self, "_unsloth_own_apply_gate", False):
+            # The class's own gate on [gate; up] (set only on generically routed classes).
+            current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):
             current_hidden_states = self.act_fn(gate) * up
         else:
