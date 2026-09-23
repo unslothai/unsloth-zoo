@@ -111,6 +111,21 @@ def test_peft_sizes_the_lora_on_the_logical_shape():
     assert dims == {8, 64}
 
 
+def test_megamoe_fp4_experts_refuse_a_lora_its_kernel_would_skip():
+    pytest.importorskip("peft")
+    from types import SimpleNamespace
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import patch_peft_param_wrapper_fp4_expert_shape
+    patch_peft_param_wrapper_fp4_expert_shape()
+    from peft.tuners.lora.layer import ParamWrapper
+    from peft import LoraConfig
+    module = _PackedExperts()
+    module.config = SimpleNamespace(_experts_implementation = "deepgemm_megamoe")
+    with pytest.raises(NotImplementedError, match = "deepgemm_megamoe"):
+        ParamWrapper(module, "default", parameter_name = "gate_up_proj", config = LoraConfig(r = 4, target_parameters = ["gate_up_proj"]), r = 4)
+    module.config = SimpleNamespace(_experts_implementation = "grouped_mm")
+    ParamWrapper(module, "default", parameter_name = "gate_up_proj", config = LoraConfig(r = 4, target_parameters = ["gate_up_proj"]), r = 4)
+
+
 def test_fp4_experts_with_their_own_gate_are_refused_until_a_backend_applies_it():
     """DeepSeek-V4 clamps SwiGLU in `_apply_gate`; the dequant route must not train FP4 experts
     on a plain act_fn(gate) * up."""

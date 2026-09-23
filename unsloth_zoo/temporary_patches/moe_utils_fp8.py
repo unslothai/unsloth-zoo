@@ -1248,8 +1248,16 @@ def patch_peft_param_wrapper_fp4_expert_shape():
         # Runs on every expert LoRA forward: one dtype lookup for everything that is not FP4.
         if getattr(param, "dtype", None) not in _FP4_PACKED_DTYPES:
             return param
+        base_layer = self.get_base_layer()
+        # MegaMoE runs its own EP kernel on the packed bytes and never reads an expert LoRA.
+        config = getattr(base_layer, "config", None)
+        if getattr(config, "_experts_implementation", None) == "deepgemm_megamoe":
+            raise NotImplementedError(
+                "Unsloth: LoRA on FP4 experts is not supported with experts_implementation = "
+                "'deepgemm_megamoe', whose kernel would skip the adapter. Load with "
+                "experts_implementation = 'grouped_mm' to train them."
+            )
         try:
-            base_layer = self.get_base_layer()
             shape = fp4_packed_expert_logical_shape(base_layer, self.parameter_name, param)
         except Exception:
             shape = None
