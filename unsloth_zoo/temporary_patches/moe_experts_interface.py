@@ -36,6 +36,8 @@ Two things fix that for every architecture at once:
   module: only experts whose forward is Unsloth's are quantized, everything
   else stays in the checkpoint dtype and trains through its own forward.
 """
+import weakref
+
 import torch
 import torch.nn as nn
 
@@ -136,11 +138,35 @@ def _packs_fp4_experts(model) -> bool:
     return any(getattr(c, "expert_dtype", None) == "fp4" for c in configs if c is not None)
 
 
+# ids of sub-configs (text_config, ...) of a model loaded with expert parallelism: transformers
+# sets distributed_config on the outer config only, and a composite model builds its language
+# model from the same text_config object. Kept off the configs so it is never serialized.
+_EXPERT_PARALLEL_SUBCONFIGS = set()
+
+
+def _mark_subconfigs_expert_parallel(config) -> None:
+    for key in getattr(config, "sub_configs", None) or {}:
+        sub = getattr(config, key, None)
+        if sub is None or id(sub) in _EXPERT_PARALLEL_SUBCONFIGS:
+            continue
+        try:
+            weakref.finalize(sub, _EXPERT_PARALLEL_SUBCONFIGS.discard, id(sub))
+        except TypeError:
+            continue
+        _EXPERT_PARALLEL_SUBCONFIGS.add(id(sub))
+        _mark_subconfigs_expert_parallel(sub)
+
+
 def _expert_parallel_requested(model) -> bool:
     """Expert parallelism routes non-local slots to a `num_experts` sentinel that
-    only transformers' own implementations mask."""
-    distributed = getattr(getattr(model, "config", None), "distributed_config", None)
-    return bool(getattr(distributed, "enable_expert_parallel", False))
+    only transformers' own implementations mask. The outer model's check runs
+    before its nested models are built, so it marks their sub-configs too."""
+    config = getattr(model, "config", None)
+    distributed = getattr(config, "distributed_config", None)
+    if bool(getattr(distributed, "enable_expert_parallel", False)):
+        _mark_subconfigs_expert_parallel(config)
+        return True
+    return config is not None and id(config) in _EXPERT_PARALLEL_SUBCONFIGS
 
 
 # Kept out of Dynamo like the per-model MoE block patches: a compiled MoE block

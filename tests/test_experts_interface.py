@@ -286,3 +286,28 @@ def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
     experts.config = types.SimpleNamespace(expert_dtype = "fp8")
     assert forward(experts, "h", "i", "w") == "unsloth"
     assert calls == ["eager", "unsloth"]
+
+
+def test_expert_parallel_reaches_the_nested_text_model():
+    # transformers sets distributed_config on the outer config only; a composite model then
+    # builds its language model from the same text_config, whose own check runs afterwards.
+    from transformers import PretrainedConfig
+    from transformers.modeling_utils import PreTrainedModel
+    patch_experts_interface()
+    getter = PreTrainedModel.get_correct_experts_implementation
+
+    class Outer(PretrainedConfig):
+        sub_configs = {"text_config": PretrainedConfig}
+
+    text = PretrainedConfig()
+    outer = Outer()
+    outer.text_config = text
+    outer.distributed_config = types.SimpleNamespace(enable_expert_parallel = True)
+    nested = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = text)
+    assert getter(nested, None) == UNSLOTH_EXPERTS_IMPLEMENTATION  # before the outer check
+    assert getter(types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = outer), None) == "grouped_mm"
+    assert getter(nested, None) == "grouped_mm"
+    assert "unsloth" not in str(text.to_dict())
+    # An unrelated config is not affected.
+    other = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = PretrainedConfig())
+    assert getter(other, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
