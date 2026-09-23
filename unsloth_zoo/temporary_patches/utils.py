@@ -172,8 +172,7 @@ from importlib.machinery import ModuleSpec as _ModuleSpec
 # isinstance(weight, AffineQuantizedTensor), which needs a real type.
 class _ROCmSentinelMeta(type):
     def __getattr__(cls, name):
-        # Dunders stay real misses: inspect.unwrap follows __wrapped__, and a
-        # fresh sentinel for it every time is a chain with no end.
+        # Dunders must miss: a sentinel __wrapped__ sends inspect.unwrap down an endless chain.
         if name.startswith("__"):
             raise AttributeError(name)
         child = _ROCmSentinelMeta(name, (), {"__module__": cls.__module__})
@@ -200,15 +199,11 @@ def _rocm_make_torchao_stub(name):
     mod.__path__    = []
     mod.__package__ = name
     mod.__spec__    = _MS(name, loader=None)
-    # Below every minimum anyone checks. With no torchao dist-info, transformers 5
-    # reads __version__ off the module and parses it, so a sentinel here raised
-    # InvalidVersion in is_torchao_available() and broke transformers.modeling_utils.
+    # Below every minimum: without torchao dist-info, transformers 5 parses this.
     mod.__version__ = "0.0.0"
 
     def _getattr(attr):
-        # Dunders stay real misses: transformers probes __file__ and friends on
-        # the package, and a sentinel class there fails as "endswith() takes no
-        # arguments" instead of reading as absent.
+        # Dunders must miss: inspect calls __file__.endswith() on every module in sys.modules.
         if attr.startswith("__"):
             raise AttributeError(attr)
         full = f"{name}.{attr}"

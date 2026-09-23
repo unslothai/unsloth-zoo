@@ -14,17 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The Windows ROCm torchao stub must read as "torchao absent" to transformers.
-
-With no torchao dist-info, transformers 5 imports the package and reads
-``__version__`` (and ``__file__``) off it. The stub answered every attribute,
-dunders included, with a sentinel class, so ``is_torchao_available()`` raised
-InvalidVersion and ``import transformers.modeling_utils`` failed with
-"endswith() takes no arguments", taking every model load down with it.
-
-Only Windows + ROCm installs the stub, so these exec the stub classes out of
-utils.py and install the finder by hand, as the guard there does.
-"""
+"""The Windows ROCm torchao stub must read as absent. Only Windows + ROCm installs it, so these
+exec the stub classes out of utils.py and install the finder by hand, as the guard there does."""
 
 import ast
 import importlib
@@ -44,7 +35,6 @@ WANTED = {
 
 
 def _load_stub():
-    """Exec just the stub classes: importing the module runs every patch in it."""
     tree = ast.parse(UTILS.read_text(encoding="utf-8"))
     nodes = [n for n in tree.body if getattr(n, "name", None) in WANTED]
     ns: dict = {}
@@ -60,7 +50,6 @@ STUB = _load_stub()
 
 @pytest.fixture
 def stubbed_torchao(monkeypatch):
-    """torchao as Windows ROCm sees it: the zoo finder first, no dist-info."""
     saved = {k: v for k, v in sys.modules.items() if k.split(".")[0] == "torchao"}
     for name in saved:
         del sys.modules[name]
@@ -97,9 +86,7 @@ def test_stub_dunders_are_real_misses(stubbed_torchao):
 
 
 def test_a_source_lookup_walks_past_the_stub(stubbed_torchao):
-    """The failure every caller hit, with no torch or transformers in it: for a code object whose
-    file is not on disk, inspect.getsourcefile walks sys.modules reading each __file__, which is
-    what torch.library does when it registers a fake op. A sentinel there raised TypeError."""
+    """torch.library's fake-op registration takes this path; a sentinel __file__ raised TypeError."""
     import torchao.quantization  # noqa: F401  a submodule stub in sys.modules as well
 
     ns: dict = {}
@@ -110,14 +97,12 @@ def test_a_source_lookup_walks_past_the_stub(stubbed_torchao):
 def test_stub_still_answers_the_names_callers_import(stubbed_torchao):
     from torchao.quantization import Float8Tensor, quantize_  # noqa: F401
 
-    # peft does isinstance(weight, AffineQuantizedTensor): a type, never matching.
     assert not isinstance(object(), stubbed_torchao.dtypes.AffineQuantizedTensor)
     assert stubbed_torchao.dtypes.AffineQuantizedTensor.child is not None
 
 
 def test_transformers_reads_the_stub_as_unavailable(stubbed_torchao):
-    # Without torch the probe answers False before reading torchao at all (Apple Silicon ships
-    # the zoo with no torch), which would pass without testing anything.
+    # Without torch (Apple Silicon) the probe answers False before reading torchao: vacuous.
     pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     from packaging.version import Version
@@ -154,7 +139,7 @@ print("OK")
 
 
 def test_transformers_modeling_utils_imports_against_the_stub():
-    """In a fresh interpreter: an earlier import would hide the failure."""
+    """Fresh interpreter: an earlier import would hide the failure."""
     import subprocess
 
     pytest.importorskip("torch")
