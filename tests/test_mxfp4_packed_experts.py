@@ -145,12 +145,15 @@ def test_no_triton_imports_and_falls_back(monkeypatch):
     """)
     result = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, timeout = 300)
     assert result.returncode == 0 and "ok" in result.stdout, result.stderr[-2000:]
-    # With Triton unusable the packed mode stays off by default: the load-time dequant is kept.
+    # With Triton unusable the experts still stay packed; the torch dequant decodes them.
+    import transformers.models.gpt_oss.modeling_gpt_oss as modeling_gpt_oss
     monkeypatch.setattr(mx, "mxfp4_kernel_available", lambda *a, **k: False)
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "grouped_mm")
+    monkeypatch.setattr(modeling_gpt_oss.GptOssExperts, "_unsloth_lora_patched", True, raising = False)
     monkeypatch.setenv("UNSLOTH_MODEL_NAME", "unsloth/gpt-oss-20b")
     monkeypatch.delenv("UNSLOTH_MXFP4_KEEP_PACKED", raising = False)
-    assert mx.keep_mxfp4_experts_packed() is False
+    monkeypatch.delenv("UNSLOTH_ENABLE_FULL_FINETUNING", raising = False)
+    assert mx.keep_mxfp4_experts_packed() is TRANSFORMERS_5
 
 
 # ---------------------------------------------------------------------------------------------
@@ -205,10 +208,13 @@ def test_keep_packed_switch(monkeypatch):
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "native_torch")
     assert mx.keep_mxfp4_experts_packed() is False   # the loop backend indexes the stack directly
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "grouped_mm")
+    # An MXFP4 checkpoint stays MXFP4 where the fused kernel is not verified: ROCm or no Triton.
     monkeypatch.setattr(mx, "mxfp4_kernel_available", lambda *a, **k: False)
+    assert mx.keep_mxfp4_experts_packed() is True
+    monkeypatch.setattr(torch.version, "hip", "6.4")
+    assert mx.keep_mxfp4_experts_packed() is True
+    monkeypatch.setenv("UNSLOTH_MXFP4_KEEP_PACKED", "0")
     assert mx.keep_mxfp4_experts_packed() is False
-    monkeypatch.setenv("UNSLOTH_MXFP4_KEEP_PACKED", "1")
-    assert mx.keep_mxfp4_experts_packed() is True    # explicit opt-in uses the torch dequant
     _gate_env(monkeypatch, lora_patched = False)
     assert mx.keep_mxfp4_experts_packed() is False
 

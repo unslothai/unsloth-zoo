@@ -145,10 +145,10 @@ def keep_mxfp4_experts_packed() -> bool:
     """Whether GPT-OSS MXFP4 experts stay packed in memory (dequantized per layer on the fly by the
     grouped_mm MoE forward, with expert LoRA on top) instead of a bf16 copy made at load.
 
-    On by default for LoRA loads on transformers 5 with the grouped_mm backend, where the fused
-    dequant kernel is verified exact on this device. UNSLOTH_MXFP4_KEEP_PACKED=0 restores the
-    load-time dequant; =1 also keeps them packed where the kernel is not verified (ROCm, or no
-    Triton), using the slower torch dequant there."""
+    On by default for LoRA loads on transformers 5 with the grouped_mm backend: a checkpoint that
+    ships in MXFP4 stays in MXFP4. Where the fused kernel is not verified exact (ROCm, no Triton)
+    the exact torch dequant is used instead. UNSLOTH_MXFP4_KEEP_PACKED=0 restores the load-time
+    dequant."""
     setting = os.environ.get("UNSLOTH_MXFP4_KEEP_PACKED", "")
     if setting == "0" or transformers_version < Version("5.0.0"):
         return False
@@ -172,11 +172,7 @@ def keep_mxfp4_experts_packed() -> bool:
             return False
     except Exception:
         return False
-    if setting == "1":
-        return True
-    if getattr(torch.version, "hip", None) is not None:
-        return False
-    return mxfp4_kernel_available()
+    return True
 
 
 def _dequantize_to_gpt_oss_layout(convert, blocks, scales):
