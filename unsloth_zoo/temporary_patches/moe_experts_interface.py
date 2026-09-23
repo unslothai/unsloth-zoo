@@ -72,7 +72,9 @@ def _forward_is_unsloth(forward) -> bool:
     if getattr(fn, "_unsloth_moe_forward", False):
         return True
     module = getattr(fn, "__module__", "") or ""
-    if module.startswith("unsloth_zoo.") or "moe_utils" in module:
+    # The compiled cache copy loads as `unsloth_cached_moe_utils`, or as the bare `moe_utils`
+    # a generated module imports; any other name that merely contains it is someone's code.
+    if module.startswith("unsloth_zoo.") or module in ("unsloth_cached_moe_utils", "moe_utils"):
         return True
     return getattr(fn, "__name__", "") == "forward_moe_backend"
 
@@ -149,6 +151,12 @@ def unsloth_experts_forward(
     if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
+        if fallback is not None:
+            # transformers' grouped_mm needs the same torch._grouped_mm support Unsloth's
+            # backend selection checks; without it take the class's own eager forward.
+            from .moe_utils import _check_torch_grouped_mm_supported
+            if not _check_torch_grouped_mm_supported():
+                fallback = None
         if fallback is None:
             return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
         return fallback(self, hidden_states, top_k_index, top_k_weights)
@@ -176,7 +184,17 @@ def patch_experts_interface():
     def get_correct_experts_implementation(self, requested_experts):
         # Only the default is ours. A user who asked for a specific implementation
         # keeps it, and the quantizer then leaves those experts unpacked.
-        if requested_experts is None and not _expert_parallel_requested(self):
+        if _expert_parallel_requested(self):
+            if requested_experts == UNSLOTH_EXPERTS_IMPLEMENTATION:
+                # Expert parallel routing emits `num_experts` sentinels that only
+                # transformers' own implementations mask.
+                logger.warning(
+                    "Unsloth: the 'unsloth' experts implementation does not support expert "
+                    "parallelism; using transformers' default instead."
+                )
+                requested_experts = None
+            return original(self, requested_experts)
+        if requested_experts is None:
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         return original(self, requested_experts)
 

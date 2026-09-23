@@ -112,19 +112,28 @@ def patch_llama4_moe():
     if getattr(Llama4TextExperts, "_unsloth_already_patched", False):
         return
 
-    # Separated LoRA on the stacks reads its dims from the module, not the
-    # (E, in, out) shape that the shared extractor would otherwise misread.
-    Llama4TextExperts._unsloth_lora_extractor_fn = staticmethod(_llama4_moe_lora_extractor)
-    # The stacks are (E, in, out). transformers' own name for that layout.
-    Llama4TextExperts.is_transposed = True
-    Llama4TextExperts.is_concatenated = True   # gate, up = chunk(2)
-    Llama4TextExperts.has_bias = False
-    Llama4TextExperts.has_gate = True
-
+    # The two forwards only work together: the MoE forward hands the experts routing
+    # indices and weights, so install both or neither.
+    original_experts_forward = Llama4TextExperts.__dict__.get("forward")
+    original_moe_forward = Llama4TextMoe.__dict__.get("forward")
+    ok = patch_function(Llama4TextMoe, "forward", Llama4TextMoe_forward)
     # Different signature from the model's forward, so force the patch.
-    ok = patch_function(Llama4TextExperts, "forward", get_forward_moe_backend(), force = True)
-    ok = patch_function(Llama4TextMoe, "forward", Llama4TextMoe_forward) and ok
-    Llama4TextExperts._unsloth_already_patched = True
+    ok = ok and patch_function(Llama4TextExperts, "forward", get_forward_moe_backend(), force = True)
+    if not ok:
+        if original_moe_forward is not None:
+            Llama4TextMoe.forward = original_moe_forward
+        if original_experts_forward is not None:
+            Llama4TextExperts.forward = original_experts_forward
+    else:
+        # Separated LoRA on the stacks reads its dims from the module, not the
+        # (E, in, out) shape that the shared extractor would otherwise misread.
+        Llama4TextExperts._unsloth_lora_extractor_fn = staticmethod(_llama4_moe_lora_extractor)
+        # The stacks are (E, in, out). transformers' own name for that layout.
+        Llama4TextExperts.is_transposed = True
+        Llama4TextExperts.is_concatenated = True   # gate, up = chunk(2)
+        Llama4TextExperts.has_bias = False
+        Llama4TextExperts.has_gate = True
+        Llama4TextExperts._unsloth_already_patched = True
 
     if UNSLOTH_ENABLE_LOGGING:
         if ok:
