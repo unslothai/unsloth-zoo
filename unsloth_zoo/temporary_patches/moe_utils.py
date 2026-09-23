@@ -708,12 +708,13 @@ def _in_gc_recompute() -> bool:
 _MOMENTARY_PIN_HEADROOM = 2.0   # free memory must cover this many copies of one layer's stack
 
 
-def _momentary_pin_fits(source) -> bool:
+def _momentary_pin_fits(source, dtype = None) -> bool:
     """Whether one layer's dense expert stack can be held for the moment between a
     gradient-checkpoint replay and that layer's own backward. Measured against what
     the device has free plus what the caching allocator holds unused, with headroom
     for the second projection's stack and the layer's activations. Anything that
-    cannot be measured answers False, which keeps the recompute."""
+    cannot be measured answers False, which keeps the recompute. ``dtype`` is the dtype
+    the stack is dequantized to (the hidden states'); without it the quant state's."""
     try:
         param = source
         while hasattr(param, "base_layer"):
@@ -727,7 +728,7 @@ def _momentary_pin_fits(source) -> bool:
         shape = _logical_expert_shape(param)
         if not shape:
             return False
-        dtype = getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
+        dtype = dtype or getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
         need = math.prod(int(d) for d in shape) * dtype.itemsize
         # mem_get_info plus the allocator's stats cost 0.25 to 0.9 ms per call on a
         # busy B200, and this runs for every bnb expert source of every layer in every
@@ -752,7 +753,7 @@ _MOMENTARY_PIN_FITS_CACHE = {}
 _MOMENTARY_PIN_FITS_TTL_S = 0.5
 
 
-def _moe_recompute_enabled(source) -> bool:
+def _moe_recompute_enabled(source, dtype = None) -> bool:
     """Whether to recompute the dequantized base stack in backward (True) or pin it
     for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
     everything else the pinned eager path is used.
@@ -777,7 +778,7 @@ def _moe_recompute_enabled(source) -> bool:
         if (
             os.environ.get("UNSLOTH_MOE_GC_REPLAY_PIN") == "1"
             and _in_gc_recompute()
-            and _momentary_pin_fits(source)
+            and _momentary_pin_fits(source, dtype = dtype)
         ):
             return False
         return True
@@ -3570,7 +3571,7 @@ def forward_native_grouped_mm(
         def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
             return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
         mm1_out = _base_grouped_mm(
-            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
+            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
         )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
@@ -3746,7 +3747,7 @@ def forward_native_grouped_mm(
         def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
             return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
         mm2_out = _base_grouped_mm(
-            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
+            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
         )
 
         if down_lora is not None:

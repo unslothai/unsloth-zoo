@@ -353,7 +353,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         select_moe_backend() == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
-        and _moe_recompute_enabled(self.gate_up_proj)
+        and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
     ):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
         return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)

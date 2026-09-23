@@ -80,7 +80,7 @@ def test_gc_recompute_pass_recomputes_for_4bit_by_default(monkeypatch):
     # The replay pin raises peak memory, so it is never taken unless asked for.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     monkeypatch.delenv("UNSLOTH_MOE_GC_REPLAY_PIN", raising=False)
-    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: True)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
     with _gradient_checkpoint_recompute_marker():
         assert _run_and_record(monkeypatch) == ["provider"]
 
@@ -89,7 +89,7 @@ def test_gc_recompute_pass_pins_for_4bit_when_asked_and_the_stack_fits(monkeypat
     # The replay's dequant is reused by the same layer's backward: one dequant saved.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     monkeypatch.setenv("UNSLOTH_MOE_GC_REPLAY_PIN", "1")
-    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: True)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
     with _gradient_checkpoint_recompute_marker():
         assert _run_and_record(monkeypatch) == ["swap"]  # momentary pin
 
@@ -97,7 +97,7 @@ def test_gc_recompute_pass_pins_for_4bit_when_asked_and_the_stack_fits(monkeypat
 def test_gc_recompute_pass_recomputes_for_4bit_when_the_stack_does_not_fit(monkeypatch):
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     monkeypatch.setenv("UNSLOTH_MOE_GC_REPLAY_PIN", "1")
-    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: False)
+    monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: False)
     with _gradient_checkpoint_recompute_marker():
         assert _run_and_record(monkeypatch) == ["provider"]  # recompute, no bf16 pin
 
@@ -130,6 +130,27 @@ def test_momentary_pin_fits_measures_xpu_and_refuses_what_it_cannot_measure(monk
         assert mu._momentary_pin_fits(param) is False
     # A device that cannot report free memory keeps the recompute.
     assert mu._momentary_pin_fits(SimpleNamespace(device = torch.device("meta"), quant_state = None)) is False
+
+
+def test_momentary_pin_fits_budgets_the_dtype_the_stack_is_dequantized_to(monkeypatch):
+    # A bf16 quant state dequantized for fp32 hidden states builds an fp32 stack.
+    from types import SimpleNamespace
+
+    backend = getattr(torch, "xpu", None) if not torch.cuda.is_available() else torch.cuda
+    if backend is None:
+        pytest.skip("needs torch.cuda or torch.xpu to patch")
+    monkeypatch.setattr(mu, "_logical_expert_shape", lambda param: (4, 32, 64))
+    need_bf16 = 4 * 32 * 64 * 2
+    free = int(mu._MOMENTARY_PIN_HEADROOM * need_bf16)
+    monkeypatch.setattr(backend, "mem_get_info", lambda device = None: (free, 1 << 40), raising = False)
+    monkeypatch.setattr(backend, "memory_reserved", lambda device = None: 0, raising = False)
+    monkeypatch.setattr(backend, "memory_allocated", lambda device = None: 0, raising = False)
+    mu._MOMENTARY_PIN_FITS_CACHE.clear()
+    kind = "cuda" if backend is torch.cuda else "xpu"
+    param = SimpleNamespace(device = torch.device(kind, 0), quant_state = SimpleNamespace(dtype = torch.bfloat16))
+    assert mu._momentary_pin_fits(param) is True
+    assert mu._momentary_pin_fits(param, dtype = torch.bfloat16) is True
+    assert mu._momentary_pin_fits(param, dtype = torch.float32) is False
 
 
 def test_momentary_pin_fits_does_not_query_the_driver_per_call(monkeypatch):
@@ -168,7 +189,7 @@ def test_pre_dequantized_dense_is_never_recomputed(monkeypatch):
     # The invariant behind the swap path: when the policy says pin, a pre-dequantized
     # dense stack must not be scheduled for a backward recompute (which would re-hold it
     # for no memory benefit).
-    monkeypatch.setattr(mu, "_base_is_recomputable", lambda src: True)
+    monkeypatch.setattr(mu, "_base_is_recomputable", lambda src, dtype = None: True)
     dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)  # requires_grad False
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "0")
     assert mu._moe_recompute_enabled(dense) is False
@@ -197,9 +218,9 @@ def test_4bit_recomputes_outside_gc_and_pins_inside_when_it_fits(monkeypatch):
     dense = torch.randn(4, 32, 64, dtype=torch.bfloat16, device=DEVICE_TYPE_TORCH)  # frozen
     assert mu._moe_recompute_enabled(q) is True           # outside GC -> recompute
     with _gradient_checkpoint_recompute_marker():
-        monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: True)
+        monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
         assert mu._moe_recompute_enabled(q) is False      # fits -> momentary pin
-        monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src: False)
+        monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: False)
         assert mu._moe_recompute_enabled(q) is True       # does not fit -> recompute
         assert mu._moe_recompute_enabled(dense) is False  # dense -> pin (unchanged)
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "0")
