@@ -3780,6 +3780,186 @@ pass
 
 
 @torch.inference_mode
+# ---------------------------------------------------------------------------------------------
+# compressed-tensors packed bases (Kimi-K3's MXFP4 routed experts) under a merged_16bit export
+# ---------------------------------------------------------------------------------------------
+# The staged base shards keep each packed Linear as `weight_packed` + `weight_scale`, which the
+# in-place merge below cannot grow into a 16-bit `weight`, and step 1 drops the quantization
+# config: copied as they are, those modules would reload as missing weights. An MXFP4 base is
+# decoded exactly into a 16-bit `weight` first, with the LoRA of Unsloth's packed expert stacks
+# (which PEFT holds on the stack, not on the per-expert keys) folded in; the other LoRAs then
+# merge onto those keys as on any 16-bit base. Other packed formats refuse.
+
+def _compressed_packed_format(model_name, token = None):
+    """The compressed-tensors ``format`` of a base whose weights are stored packed
+    (``weight_packed``): ``"mxfp4-pack-quantized"`` when every group is MXFP4, else the formats
+    found. None for anything else, or when the config cannot be read."""
+    config = None
+    try:
+        if os.path.isdir(str(model_name)):
+            path = os.path.join(str(model_name), "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+            repo_id, revision = _hub_repo_and_revision(model_name)
+            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token, revision = revision)
+        with open(path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return None
+    quant = config.get("quantization_config") if isinstance(config, dict) else None
+    if not isinstance(quant, dict):
+        return None
+    if str(quant.get("quant_method", "")).lower().replace("_", "-") not in ("compressed-tensors", "sparseml"):
+        return None
+    top = quant.get("format")
+    groups = [g for g in (quant.get("config_groups") or {}).values() if isinstance(g, dict)]
+    formats = {str(g.get("format") or top) for g in groups} or {str(top)}
+    if not any(f.endswith("pack-quantized") for f in formats):
+        return None
+    return "mxfp4-pack-quantized" if formats == {"mxfp4-pack-quantized"} else ",".join(sorted(formats))
+pass
+
+
+def _packed_expert_stack_deltas(model):
+    """``{experts path: (stack, {stack param: summed LoRA delta (E, in, out)}, [wrapper paths])}``
+    for every unsloth_zoo ``Mxfp4StackedExperts`` in ``model``, paths relative to the base model."""
+    inner = find_lora_base_model(model)
+    stacks = {}
+    for name, module in inner.named_modules():
+        if not getattr(type(module), "_unsloth_mxfp4_stacked_experts", False):
+            continue
+        path = name
+        while path.endswith(".base_layer"):
+            path = path[: -len(".base_layer")]
+        deltas, wrappers, holder, holder_name = {}, [], inner.get_submodule(path), path
+        while holder is not module:
+            parameter = getattr(holder, "parameter_name", None)
+            if parameter is not None and hasattr(holder, "lora_A"):
+                wrappers.append(holder_name)
+                for adapter in getattr(holder, "active_adapters", None) or []:
+                    if adapter not in holder.lora_A or adapter in getattr(holder, "merged_adapters", ()):
+                        continue
+                    delta = holder.get_delta_weight(adapter).detach().float()
+                    deltas[parameter] = deltas[parameter] + delta if parameter in deltas else delta
+            holder, holder_name = holder.base_layer, holder_name + ".base_layer"
+        stacks[path] = (module, deltas, wrappers)
+    return stacks
+pass
+
+
+def _expert_delta_for(base_key, stacks, placed):
+    """The LoRA delta ``(out, in)`` of the checkpoint Linear ``<prefix>.experts.<i>.w1|w2|w3`` from
+    its packed stack, or None when it has none."""
+    match = re.match(r"^(.*\.experts)\.(\d+)\.(w[123])$", base_key)
+    if match is None:
+        return None
+    prefix, index, proj = match.group(1), int(match.group(2)), match.group(3)
+    for path, (stack, deltas, _) in stacks.items():
+        if not (path == prefix or path.endswith("." + prefix) or prefix.endswith("." + path)):
+            continue
+        placed.add(path)
+        inter = stack.intermediate_size
+        if proj == "w2":
+            delta = deltas.get("down_proj")
+            return None if delta is None else delta[index].t()
+        delta = deltas.get("gate_up_proj")
+        if delta is None:
+            return None
+        return (delta[index, :, :inter] if proj == "w1" else delta[index, :, inter:]).t()
+    return None
+pass
+
+
+@torch.inference_mode()
+def _dequantize_compressed_mxfp4_shards(save_directory, filenames, lora_weights, model, output_dtype = None):
+    """Rewrite every staged shard so each MXFP4 ``weight_packed`` / ``weight_scale`` pair is the
+    exact 16-bit ``weight`` (plus the packed expert stacks' LoRA), and drop the stacks' LoRA from
+    ``lora_weights`` so nothing merges them twice."""
+    from .mxfp4_dequant import mxfp4_dequantize_torch
+
+    dtype = output_dtype or torch.bfloat16
+    device = _active_merge_device()
+    stacks = _packed_expert_stack_deltas(model)
+    locations = {}
+    for filename in filenames:
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            for key in f.keys():
+                locations[key] = filename
+    packed_bases = {k[: -len(".weight_packed")] for k in locations if k.endswith(".weight_packed")}
+
+    def read(key):
+        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
+            return f.get_tensor(key)
+
+    placed = set()
+    for filename in filenames:
+        path = os.path.join(save_directory, filename)
+        with safe_open(path, framework = "pt", device = "cpu") as f:
+            metadata = f.metadata() or {"format": "pt"}
+            keys = list(f.keys())
+        if not any(k.endswith(".weight_packed") for k in keys):
+            continue
+        tensors = {}
+        for key in keys:
+            base, _, suffix = key.rpartition(".")
+            if base in packed_bases and suffix in ("weight_scale", "weight_shape"):
+                continue
+            if suffix != "weight_packed":
+                tensors[key] = read(key)
+                continue
+            packed = read(key)
+            scale_key = base + ".weight_scale"
+            scale = read(scale_key) if scale_key in locations else None
+            if (
+                scale is None or packed.dtype != torch.uint8 or scale.dtype != torch.uint8
+                or packed.dim() != 2 or scale.shape != (packed.shape[0], packed.shape[1] // 16)
+            ):
+                raise RuntimeError(
+                    f"Unsloth: `{key}` is not an MXFP4 weight (uint8 [out, in / 2] with a uint8 "
+                    "[out, in / 32] scale), so the merged_16bit export cannot decode it. Nothing "
+                    "was merged."
+                )
+            out_features = packed.shape[0]
+            weight = mxfp4_dequantize_torch(
+                packed.to(device).view(out_features, -1, 16), scale.to(device), dtype = torch.float32,
+            ).reshape(out_features, -1)
+            delta = _expert_delta_for(base, stacks, placed)
+            if delta is not None:
+                if tuple(delta.shape) != tuple(weight.shape):
+                    raise RuntimeError(
+                        f"Unsloth: the expert LoRA for `{base}` is {tuple(delta.shape)} but the "
+                        f"checkpoint weight is {tuple(weight.shape)}. Nothing was merged."
+                    )
+                weight = weight + delta.to(weight.device)
+            tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+        save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+        os.replace(path + ".unsloth_tmp", path)
+    unplaced = sorted(p for p, (_, deltas, _) in stacks.items() if deltas and p not in placed)
+    if unplaced:
+        raise RuntimeError(
+            f"Unsloth: the expert LoRA of {unplaced} has no matching `experts.<i>.w1 / w2 / w3` "
+            "weights in the base checkpoint, so the merged export would drop it. Nothing was merged."
+        )
+    for _, (_, _, wrappers) in stacks.items():
+        for wrapper in wrappers:
+            lora_weights.pop(wrapper, None)
+pass
+
+
+def _save_remote_code_files(model, save_directory):
+    """A remote-code model's modeling files next to the merged weights (the config only writes
+    its own file), so ``trust_remote_code`` reloads the export."""
+    base = find_lora_base_model(model)
+    if getattr(base, "_auto_class", None) is None:
+        return
+    try:
+        from transformers.dynamic_module_utils import custom_object_save
+        custom_object_save(base, save_directory)
+    except Exception as error:
+        warnings.warn(f"Unsloth: could not copy the model's remote code files ({error}).")
+pass
+
+
 def merge_and_overwrite_lora(
     get_model_name,
     model,
@@ -4168,6 +4348,7 @@ def merge_and_overwrite_lora(
         base_config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
+        _save_remote_code_files(model, save_directory)
         # #5410: keep trained eos / sampling defaults on reload.
         try:
             gen_cfg = getattr(model, "generation_config", None)
@@ -4207,12 +4388,24 @@ def merge_and_overwrite_lora(
     _has_nested_shard = any(_has_directory_component(_f) for _f in safetensors_list)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
+    # compressed-tensors packed base: MXFP4 is decoded to 16-bit below; anything else refuses
+    # here, before a shard is written, rather than export packed tensors under no config.
+    _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
+    if _ct_packed_format is not None and _ct_packed_format != "mxfp4-pack-quantized":
+        raise RuntimeError(
+            f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "
+            f"({_ct_packed_format}); a merged_16bit export of it is not supported yet, since the "
+            "packed tensors would be written unmerged. Nothing was written. Save the adapter "
+            "with `model.save_pretrained(...)` instead."
+        )
+    _ct_mxfp4_dequant = _ct_packed_format == "mxfp4-pack-quantized"
+
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
     # copying it (regenerated below). FP8 only dequantizes on a merged_16bit save, so an
     # FP8 base saved another way keeps its scales and must reuse the original index.
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
-    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_mxfp4_dequant
     # Before any branch decides whether to copy it: filtering the in-memory list is not
     # enough, since a later from_pretrained joins the raw weight_map values itself.
     # Outside the branch below, which a dequant or splitting export skips. Scoped to
@@ -4379,7 +4572,7 @@ def merge_and_overwrite_lora(
     # so a non-dequantizing FP8 save keeps a correct index instead of none.
     _quant_dequant_index = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
-    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_mxfp4_dequant
     # A dequant or splitting export skips the index-copy block, so regeneration is the
     # only thing that can leave an index behind, and from_pretrained looks for exactly
     # `model.safetensors` then the index at the ROOT, which a nested singleton is neither.
@@ -4438,6 +4631,11 @@ def merge_and_overwrite_lora(
     # tensor is not written; don't treat it as backed there. Read BEFORE the FP8 pre-rewrite,
     # which clears quant_type; same value either way, the two branches are mutually exclusive.
     _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
+
+    if _ct_mxfp4_dequant:
+        _dequantize_compressed_mxfp4_shards(
+            save_directory, final_safetensors_list, lora_weights, model, output_dtype,
+        )
 
     # Refuse a silently partial merge before any staged shard is mutated: the FP8 pre-rewrite
     # below dequantizes EVERY shard, so refusing after it rewrites the whole checkpoint first.

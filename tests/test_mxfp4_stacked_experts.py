@@ -8,6 +8,8 @@ the grouped forward must equal the same grouped GEMM on the dense decode bit for
 come from a recompute (no 16-bit weight saved for backward), chunking and skipped experts must
 not change a value, and expert LoRA from the stash must add the dense delta."""
 
+import os
+
 import pytest
 import torch
 import torch.nn as nn
@@ -334,3 +336,115 @@ def test_peft_merge_is_dense_and_unmerge_restores_the_packed_stack():
         packed_model.base_model.unmerge_adapter()
     assert all(getattr(base, n) is packed[n] for n in packed)
     torch.testing.assert_close(merged.float(), unmerged.float(), atol = 3e-2, rtol = 3e-2)
+
+
+def test_dense_expert_modules_are_the_checkpoint_linears():
+    from unsloth_zoo.mxfp4_stacked_experts import dense_expert_modules
+
+    module, ckpt = _experts()
+    experts = dense_expert_modules(module)
+    assert len(experts) == E
+    for e in range(E):
+        for w in ("w1", "w2", "w3"):
+            linear = getattr(experts[e], w)
+            assert linear.weight.device.type == "cpu" and linear.bias is None
+            want = _ct_decompress(*ckpt[w][e]).to(torch.bfloat16)
+            assert torch.equal(linear.weight, want), (e, w)
+    # A merged (dense) stack is split the same way.
+    gate_up, _ = _dense(module)
+    module.gate_up_proj = nn.Parameter(gate_up + 1, requires_grad = False)
+    experts = dense_expert_modules(module)
+    assert torch.equal(experts[2].w3.weight, (gate_up[2, :, I:] + 1).t().cpu())
+
+
+def _write_expert_shard(root, ckpt, prefix = "model.experts"):
+    from safetensors.torch import save_file
+
+    tensors = {"model.other.weight": torch.ones(4, 4, dtype = torch.bfloat16)}
+    for w in ("w1", "w2", "w3"):
+        for e, (packed, scale) in enumerate(ckpt[w]):
+            tensors[f"{prefix}.{e}.{w}.weight_packed"] = packed
+            tensors[f"{prefix}.{e}.{w}.weight_scale"] = scale
+    save_file(tensors, os.path.join(root, "model.safetensors"), metadata = {"format": "pt"})
+
+
+def test_merged_16bit_rewrite_decodes_mxfp4_and_folds_in_the_expert_lora(tmp_path):
+    from safetensors.torch import load_file
+    from unsloth_zoo.saving_utils import _dequantize_compressed_mxfp4_shards
+
+    packed_model, _ = _peft_pair()
+    ckpt = _checkpoint_bytes(0)
+    _write_expert_shard(str(tmp_path), ckpt)
+    wrappers = [n for n, m in packed_model.base_model.model.named_modules() if hasattr(m, "parameter_name")]
+    assert sorted(wrappers) == ["experts", "experts.base_layer"]
+    lora_weights = {"experts": 1, "experts.base_layer": 2, "model.other": 3}
+    _dequantize_compressed_mxfp4_shards(str(tmp_path), ["model.safetensors"], lora_weights, packed_model)
+    assert lora_weights == {"model.other": 3}  # the stacks' LoRA is merged here, not again later
+    state = load_file(str(tmp_path / "model.safetensors"))
+    assert not any(k.endswith(("weight_packed", "weight_scale")) for k in state)
+    assert torch.equal(state["model.other.weight"], torch.ones(4, 4, dtype = torch.bfloat16))
+
+    deltas = {}
+    holder = packed_model.base_model.model.experts
+    while hasattr(holder, "base_layer"):
+        deltas[holder.parameter_name] = holder.get_delta_weight("default").float().cpu()
+        holder = holder.base_layer
+    with torch.no_grad():
+        packed_model.base_model.merge_adapter()
+        merged_gate_up = holder.gate_up_proj.detach().float().cpu()
+        merged_down = holder.down_proj.detach().float().cpu()
+        packed_model.base_model.unmerge_adapter()
+    for e in range(E):
+        for w in ("w1", "w2", "w3"):
+            decode = _ct_decompress(*ckpt[w][e])
+            if w == "w2":
+                delta, merged = deltas["down_proj"][e].t(), merged_down[e].t()
+            else:
+                cols = slice(0, I) if w == "w1" else slice(I, 2 * I)
+                delta = deltas["gate_up_proj"][e, :, cols].t()
+                merged = merged_gate_up[e, :, cols].t()
+            got = state[f"model.experts.{e}.{w}.weight"]
+            assert delta.abs().sum() > 0
+            assert torch.equal(got, (decode + delta).to(torch.bfloat16)), (e, w)
+            # The same weight PEFT's in-memory merge of the packed stack gives, to bf16 rounding.
+            torch.testing.assert_close(got.float(), merged, atol = 1e-2, rtol = 1e-2)
+
+
+def test_merged_16bit_rewrite_refuses_what_it_cannot_place(tmp_path):
+    from safetensors.torch import save_file
+    from unsloth_zoo.saving_utils import _dequantize_compressed_mxfp4_shards
+
+    packed_model, _ = _peft_pair()
+    ckpt = _checkpoint_bytes(0)
+    # The expert LoRA has no per-expert weights to land on.
+    _write_expert_shard(str(tmp_path), ckpt, prefix = "model.elsewhere")
+    with pytest.raises(RuntimeError, match = "would drop it"):
+        _dequantize_compressed_mxfp4_shards(str(tmp_path), ["model.safetensors"], {}, packed_model)
+    # A packed tensor that is not MXFP4 (int32 words).
+    save_file(
+        {"a.weight_packed": torch.zeros(4, 8, dtype = torch.int32), "a.weight_scale": torch.zeros(4, 1)},
+        str(tmp_path / "model.safetensors"),
+    )
+    with pytest.raises(RuntimeError, match = "not an MXFP4 weight"):
+        _dequantize_compressed_mxfp4_shards(str(tmp_path), ["model.safetensors"], {}, nn.Linear(2, 2))
+
+
+def test_compressed_packed_format_detection(tmp_path):
+    import json
+    from unsloth_zoo.saving_utils import _compressed_packed_format
+
+    def write(quant):
+        (tmp_path / "config.json").write_text(json.dumps({"quantization_config": quant} if quant else {}))
+        return _compressed_packed_format(str(tmp_path))
+
+    group = lambda fmt = None: {"format": fmt, "weights": {"num_bits": 4}}  # noqa: E731
+    assert write({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+                  "config_groups": {"g": group()}}) == "mxfp4-pack-quantized"
+    assert write({"quant_method": "compressed-tensors", "format": "pack-quantized",
+                  "config_groups": {"g": group()}}) == "pack-quantized"
+    assert write({"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+                  "config_groups": {"g": group(), "h": group("pack-quantized")}}) == "mxfp4-pack-quantized,pack-quantized"
+    assert write({"quant_method": "compressed-tensors", "format": "float-quantized",
+                  "config_groups": {"g": group()}}) is None
+    assert write({"quant_method": "bitsandbytes", "load_in_4bit": True}) is None
+    assert write(None) is None

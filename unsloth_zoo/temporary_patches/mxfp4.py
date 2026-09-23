@@ -303,10 +303,110 @@ pass
 TEMPORARY_PATCHES.append(patch_mxfp4_quantizer_element_size)
 
 
+def _dense_packed_linear(module):
+    dense = nn.Linear(module.in_features, module.out_features, bias = False, device = "meta")
+    dense.weight = nn.Parameter(module.dequantize_weight().cpu(), requires_grad = False)
+    if module.bias is not None:
+        dense.bias = module.bias
+    return dense
+
+
+def _swap_out_packed_modules(model):
+    """Replace every Unsloth module that keeps an MXFP4 checkpoint packed (remote-code expert
+    stacks, per-Linear packed modules) with the dense modules the checkpoint names, so a full save
+    writes keys the model's own code reloads. Returns ``[(parent, child, original)]``."""
+    from ..mxfp4_stacked_experts import dense_expert_modules
+
+    swaps = []
+    for name, module in list(model.named_modules()):
+        stacked = getattr(type(module), "_unsloth_mxfp4_stacked_experts", False)
+        if not stacked and not getattr(type(module), "_unsloth_mxfp4_packed", False):
+            continue
+        parent_name, _, child = name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        if stacked and hasattr(parent, "base_layer"):
+            raise RuntimeError(
+                "Unsloth: this model's MXFP4 experts still carry LoRA adapters. Call "
+                "`merge_and_unload()` before a full `save_pretrained`, or save the adapter alone."
+            )
+        dense = dense_expert_modules(module) if stacked else _dense_packed_linear(module)
+        setattr(parent, child, dense)
+        swaps.append((parent, child, module, name))
+    return swaps
+
+
+def _quant_dict(quant):
+    if isinstance(quant, dict):
+        return quant
+    try:
+        return quant.to_dict()
+    except Exception:
+        return {}
+
+
+def _is_mxfp4_compressed_config(quant) -> bool:
+    quant = _quant_dict(quant)
+    inner = quant.get("quantization_config")
+    if isinstance(inner, dict) and "config_groups" in inner:
+        quant = dict(inner, quant_method = quant.get("quant_method"))
+    method = str(quant.get("quant_method", "")).lower().replace("_", "-")
+    groups = [g for g in (quant.get("config_groups") or {}).values() if isinstance(g, dict)]
+    top = quant.get("format")
+    return method == "compressed-tensors" and bool(groups) and all(
+        (g.get("format") or top) == "mxfp4-pack-quantized" for g in groups
+    )
+
+
+def _config_for_dense_save(config, names):
+    """Make the saved quantization config describe the dense modules just swapped in: an MXFP4
+    compressed-tensors config (on the config or any sub-config it was copied onto) no longer
+    applies to anything, and a bitsandbytes one must skip them. Returns a function restoring
+    ``config``."""
+    restores = []
+    seen, stack = set(), [config]
+    while stack:
+        cfg = stack.pop()
+        if cfg is None or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        stack.extend(
+            v for k, v in vars(cfg).items()
+            if not k.startswith("_") and hasattr(v, "to_dict") and hasattr(v, "__dict__")
+        )
+        quant = cfg.__dict__.get("quantization_config", None)
+        if quant is None:
+            continue
+        if _is_mxfp4_compressed_config(quant):
+            del cfg.quantization_config
+            restores.append(lambda cfg = cfg, quant = quant: setattr(cfg, "quantization_config", quant))
+            continue
+        method = str(getattr(_quant_dict(quant).get("quant_method", ""), "value", _quant_dict(quant).get("quant_method", "")))
+        if "bitsandbytes" not in method.lower():
+            continue
+        get = quant.get if isinstance(quant, dict) else (lambda k, d = None: getattr(quant, k, d))
+        skip = get("llm_int8_skip_modules", None)
+        widened = list(skip or []) + [n for n in names if n not in (skip or [])]
+
+        def assign(value, quant = quant):
+            if isinstance(quant, dict):
+                quant["llm_int8_skip_modules"] = value
+            else:
+                quant.llm_int8_skip_modules = value
+
+        assign(widened)
+        restores.append(lambda assign = assign, skip = skip: assign(skip))
+
+    def restore():
+        for undo in reversed(restores):
+            undo()
+    return restore
+
+
 def patch_save_pretrained_mxfp4():
     """A full ``save_pretrained`` of a model whose experts are kept packed writes them dequantized,
     as the load-time path would have, and the packed stacks are put back afterwards. Adapter-only
-    saves (PEFT) never reach this and stay as cheap as before."""
+    saves (PEFT) never reach this and stay as cheap as before. Remote-code expert stacks are
+    written as the checkpoint's per-expert Linears."""
     try:
         from transformers import PreTrainedModel
     except Exception:
@@ -317,6 +417,18 @@ def patch_save_pretrained_mxfp4():
 
     @functools.wraps(original)
     def save_pretrained(self, *args, **kwargs):
+        swaps = _swap_out_packed_modules(self)
+        if swaps:
+            restore_config = _config_for_dense_save(self.config, [name for *_, name in swaps])
+            try:
+                return _save_pretrained_expert_params(self, *args, **kwargs)
+            finally:
+                restore_config()
+                for parent, child, module, _ in swaps:
+                    setattr(parent, child, module)
+        return _save_pretrained_expert_params(self, *args, **kwargs)
+
+    def _save_pretrained_expert_params(self, *args, **kwargs):
         packed = [
             (module, name, param)
             for module in self.modules()

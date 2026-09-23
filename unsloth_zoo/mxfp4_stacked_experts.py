@@ -36,6 +36,7 @@ from .mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequan
 
 __all__ = [
     "Mxfp4StackedExperts",
+    "dense_expert_modules",
     "mxfp4_grouped_linear",
     "stack_packed_expert_blocks",
     "stack_packed_expert_scales",
@@ -263,6 +264,31 @@ class Mxfp4StackedExperts(nn.Module):
             f"num_experts={self.num_experts}, hidden_size={self.hidden_size}, "
             f"intermediate_size={self.intermediate_size}, packed=mxfp4"
         )
+
+
+def _dense_stack(param, dtype):
+    if is_mxfp4_expert_param(param):
+        return param.dequantize(dtype)
+    return param.detach().to(dtype)
+
+
+def dense_expert_modules(experts, device = "cpu"):
+    """The stacks (packed, or dense after a merge) as the per-expert ``w1`` / ``w2`` / ``w3``
+    Linears of the checkpoint they were loaded from, so a full save writes keys the remote code
+    reloads (``experts.<i>.w1.weight``) instead of the stack names."""
+    dtype = experts.mxfp4_dtype
+    I = experts.intermediate_size
+    gate_up = _dense_stack(experts.gate_up_proj, dtype).to(device)  # (E, H, 2I)
+    down = _dense_stack(experts.down_proj, dtype).to(device)  # (E, I, H)
+    out = nn.ModuleList()
+    for e in range(experts.num_experts):
+        expert = nn.Module()
+        for proj, weight in (("w1", gate_up[e, :, :I]), ("w3", gate_up[e, :, I:]), ("w2", down[e])):
+            linear = nn.Linear(weight.shape[0], weight.shape[1], bias = False, device = "meta")
+            linear.weight = nn.Parameter(weight.t().contiguous(), requires_grad = False)
+            setattr(expert, proj, linear)
+        out.append(expert)
+    return out
 
 
 def stack_packed_expert_blocks(per_expert_lists):
