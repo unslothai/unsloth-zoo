@@ -311,13 +311,19 @@ def _dense_packed_linear(module):
     return dense
 
 
+def _restore_modules(swaps):
+    for parent, child, module, _ in reversed(swaps):
+        setattr(parent, child, module)
+
+
 def _swap_out_packed_modules(model):
     """Replace every Unsloth module that keeps an MXFP4 checkpoint packed (remote-code expert
     stacks, per-Linear packed modules) with the dense modules the checkpoint names, so a full save
-    writes keys the model's own code reloads. Returns ``[(parent, child, original)]``."""
+    writes keys the model's own code reloads. Returns ``[(parent, child, original, name)]``; if
+    it raises, nothing is left swapped."""
     from ..mxfp4_stacked_experts import dense_expert_modules
 
-    swaps = []
+    found = []
     for name, module in list(model.named_modules()):
         stacked = getattr(type(module), "_unsloth_mxfp4_stacked_experts", False)
         if not stacked and not getattr(type(module), "_unsloth_mxfp4_packed", False):
@@ -329,10 +335,31 @@ def _swap_out_packed_modules(model):
                 "Unsloth: this model's MXFP4 experts still carry LoRA adapters. Call "
                 "`merge_and_unload()` before a full `save_pretrained`, or save the adapter alone."
             )
-        dense = dense_expert_modules(module) if stacked else _dense_packed_linear(module)
-        setattr(parent, child, dense)
-        swaps.append((parent, child, module, name))
+        found.append((parent, child, module, name, stacked))
+    swaps = []
+    try:
+        for parent, child, module, name, stacked in found:
+            dense = dense_expert_modules(module) if stacked else _dense_packed_linear(module)
+            setattr(parent, child, dense)
+            swaps.append((parent, child, module, name))
+    except BaseException:
+        _restore_modules(swaps)
+        raise
     return swaps
+
+
+def _dense_state_dict(state_dict, swaps):
+    """A caller's ``state_dict`` with each swapped module's entries replaced by its dense
+    module's, so an explicit state dict is saved under the checkpoint's names too."""
+    swapped = {name: (parent, child) for parent, child, _, name in swaps}
+    owners = {key.rpartition(".")[0] for key in state_dict} & swapped.keys()
+    if not owners:
+        return state_dict
+    out = {k: v for k, v in state_dict.items() if k.rpartition(".")[0] not in owners}
+    for name in owners:
+        parent, child = swapped[name]
+        out.update(getattr(parent, child).state_dict(prefix = name + "."))
+    return out
 
 
 def _quant_dict(quant):
@@ -418,15 +445,23 @@ def patch_save_pretrained_mxfp4():
     @functools.wraps(original)
     def save_pretrained(self, *args, **kwargs):
         swaps = _swap_out_packed_modules(self)
-        if swaps:
+        if not swaps:
+            return _save_pretrained_expert_params(self, *args, **kwargs)
+        try:
             restore_config = _config_for_dense_save(self.config, [name for *_, name in swaps])
             try:
+                try:
+                    bound = inspect.signature(original).bind(self, *args, **kwargs)
+                except TypeError:
+                    bound = None
+                if bound is not None and bound.arguments.get("state_dict", None) is not None:
+                    bound.arguments["state_dict"] = _dense_state_dict(bound.arguments["state_dict"], swaps)
+                    args, kwargs = bound.args[1:], bound.kwargs
                 return _save_pretrained_expert_params(self, *args, **kwargs)
             finally:
                 restore_config()
-                for parent, child, module, _ in swaps:
-                    setattr(parent, child, module)
-        return _save_pretrained_expert_params(self, *args, **kwargs)
+        finally:
+            _restore_modules(swaps)
 
     def _save_pretrained_expert_params(self, *args, **kwargs):
         packed = [

@@ -502,3 +502,71 @@ def test_no_routed_tokens_give_an_empty_output(lora):
     assert out.shape == (0, H) and out.dtype == x.dtype
     out.float().sum().backward()
     assert x.grad is not None and x.grad.shape == (0, H)
+
+
+class _Wrapper(nn.Module):
+    """Stands in for a PEFT ParamWrapper around the stack."""
+
+    def __init__(self, base_layer):
+        super().__init__()
+        self.base_layer = base_layer
+
+
+def _tiny_pretrained():
+    from transformers import PretrainedConfig, PreTrainedModel
+
+    class _TinyStacked(PreTrainedModel):
+        config_class = PretrainedConfig
+        base_model_prefix = "model"
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.layers = nn.ModuleList([_Block(_experts(seed = i)[0]) for i in range(2)])
+
+        def _init_weights(self, module):
+            pass
+
+    mx.patch_save_pretrained_mxfp4()
+    return _TinyStacked(PretrainedConfig())
+
+
+def _saved(path):
+    from safetensors.torch import load_file
+
+    return load_file(os.path.join(path, "model.safetensors"))
+
+
+def test_a_refused_or_failed_full_save_leaves_the_model_as_it_was(tmp_path, monkeypatch):
+    import unsloth_zoo.mxfp4_stacked_experts as mse
+
+    model = _tiny_pretrained()
+    stacks = [layer.experts for layer in model.layers]
+    # A later stack still under LoRA: refused, and the earlier stack is not left swapped.
+    model.layers[1].experts = _Wrapper(stacks[1])
+    with pytest.raises(RuntimeError, match = "merge_and_unload"):
+        model.save_pretrained(str(tmp_path / "wrapped"))
+    assert model.layers[0].experts is stacks[0] and model.layers[1].experts.base_layer is stacks[1]
+    model.layers[1].experts = stacks[1]
+    # A failure while the dense modules are built (out of memory) puts the swapped ones back.
+    calls, original = [], mse.dense_expert_modules
+
+    def fail_second(experts, *args, **kwargs):
+        calls.append(experts)
+        if len(calls) == 2:
+            raise torch.OutOfMemoryError("simulated")
+        return original(experts, *args, **kwargs)
+
+    monkeypatch.setattr(mse, "dense_expert_modules", fail_second)
+    with pytest.raises(torch.OutOfMemoryError):
+        model.save_pretrained(str(tmp_path / "oom"))
+    assert [layer.experts for layer in model.layers] == stacks
+
+
+def test_an_explicit_state_dict_is_saved_under_the_checkpoint_names(tmp_path):
+    model = _tiny_pretrained()
+    model.save_pretrained(str(tmp_path / "implicit"))
+    model.save_pretrained(str(tmp_path / "explicit"), state_dict = model.state_dict())
+    implicit, explicit = _saved(str(tmp_path / "implicit")), _saved(str(tmp_path / "explicit"))
+    assert "layers.0.experts.3.w1.weight" in implicit
+    assert explicit.keys() == implicit.keys()
+    assert all(torch.equal(explicit[k], implicit[k]) for k in implicit)
