@@ -14,7 +14,10 @@ def _patched(monkeypatch):
     from bitsandbytes import functional as F
     orig_q, orig_d = F.quantize_4bit, F.dequantize_4bit
     L.patch_bitsandbytes_large_tensors()
-    yield
+    # These tests seed the global RNG; fork it so later test files keep their own draws
+    # (an unseeded NF4 round trip elsewhere drew an outlier past its tolerance after them).
+    with torch.random.fork_rng(devices = [torch.cuda.current_device()]):
+        yield
     F.quantize_4bit, F.dequantize_4bit = orig_q, orig_d
 
 
@@ -64,7 +67,11 @@ def test_chunked_out_buffer_matches_bitsandbytes(monkeypatch, row_packed):
     if row_packed:
         data = data.reshape(1, -1)
     ref_buffer = torch.empty(A.shape, device = "cuda", dtype = A.dtype)
-    ref = orig_d(data, state, out = ref_buffer)
+    try:
+        ref = orig_d(data, state, out = ref_buffer)
+    except RuntimeError as e:
+        # bitsandbytes 0.46 rejects its own out buffer ("Expected out.shape == [...]").
+        pytest.skip(f"bitsandbytes' own dequantize_4bit(out = ...) fails here: {e}")
     monkeypatch.setattr(L, "BNB_INT32_ELEMENT_LIMIT", A.numel() - 1)
     monkeypatch.setattr(L, "_PIECE_ELEMENTS", 2**18)
     buffer = torch.empty(A.shape, device = "cuda", dtype = A.dtype)
@@ -111,3 +118,18 @@ def test_real_tensor_past_int32():
     # The Params4bit path (what the quantizer uses) goes through the same function.
     p = Params4bit(A.cpu(), requires_grad = False, quant_type = "nf4", compress_statistics = True).cuda()
     assert p.quant_state.shape == A.shape and p.data.shape[0] == (A.numel() + 1) // 2
+
+
+def test_small_tensors_keep_the_callers_defaults():
+    """Below the limit the wrapper forwards exactly what it was given. bitsandbytes 0.45 and 0.46
+    declare blocksize = 64 and reject an explicit None, so a wrapper that filled in its own
+    defaults broke every default-argument call there."""
+    from bitsandbytes import functional as F
+    orig_q, orig_d = _original()
+    torch.manual_seed(0)
+    A = torch.randn(64, 64, device = "cuda", dtype = torch.bfloat16)
+    data, state = F.quantize_4bit(A)
+    ref_data, ref_state = orig_q(A)
+    assert torch.equal(data, ref_data) and state.blocksize == ref_state.blocksize
+    assert torch.equal(F.dequantize_4bit(data, state), orig_d(ref_data, ref_state))
+    assert torch.equal(F.dequantize_4bit(data, quant_state = state), orig_d(ref_data, ref_state))
