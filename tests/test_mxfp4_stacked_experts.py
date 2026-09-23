@@ -225,6 +225,12 @@ def test_an_unloaded_stack_is_reported():
     module = Mxfp4StackedExperts(E, H, I, _Situ(), True, device = "meta")
     with pytest.raises(RuntimeError, match = "never loaded"):
         module.finalize()
+    # The failed call leaves the stack as it was, so every later call says so too.
+    assert sorted(module._parameters) == sorted(
+        ["gate_up_blocks", "gate_up_scales", "down_blocks", "down_scales"]
+    )
+    with pytest.raises(RuntimeError, match = "never loaded"):
+        module.finalize()
 
 
 class _Block(nn.Module):

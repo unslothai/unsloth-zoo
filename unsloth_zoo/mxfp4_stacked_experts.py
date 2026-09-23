@@ -218,11 +218,13 @@ class Mxfp4StackedExperts(nn.Module):
         """Wrap the loaded bytes as packed expert parameters. Idempotent."""
         if "gate_up_blocks" not in self._parameters:
             return self
+        # Checked before anything is popped, so a failed call can be retried once loaded.
+        for name in ("gate_up", "down"):
+            if any(self._parameters[f"{name}_{kind}"].is_meta for kind in ("blocks", "scales")):
+                raise RuntimeError(f"Unsloth: MXFP4 expert stack `{name}` was never loaded")
         for name in ("gate_up", "down"):
             blocks = self._parameters.pop(f"{name}_blocks")
             scales = self._parameters.pop(f"{name}_scales")
-            if blocks.is_meta:
-                raise RuntimeError(f"Unsloth: MXFP4 expert stack `{name}` was never loaded")
             self.register_parameter(
                 f"{name}_proj",
                 Mxfp4ExpertParam(blocks.data, mxfp4_scales = scales.data, mxfp4_dtype = self.mxfp4_dtype),
