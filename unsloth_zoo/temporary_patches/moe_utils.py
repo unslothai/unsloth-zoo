@@ -883,6 +883,19 @@ def _check_grouped_gemm_available():
         _GROUPED_GEMM_AVAILABLE = False
         return False
 
+    # The kernels name tl.make_tensor_descriptor in their source, and Triton's JIT resolves
+    # every attribute a kernel mentions while hashing it, whatever branch runs. Triton 3.3
+    # (torch 2.7) only has _experimental_make_tensor_descriptor, so every launch raised
+    # AttributeError there; the native loop is the backend that works.
+    try:
+        import triton.language as tl
+        if not hasattr(tl, "make_tensor_descriptor"):
+            _GROUPED_GEMM_AVAILABLE = False
+            return False
+    except Exception:
+        _GROUPED_GEMM_AVAILABLE = False
+        return False
+
     try:
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True
