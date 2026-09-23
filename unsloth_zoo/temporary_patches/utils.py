@@ -251,9 +251,8 @@ class _ROCmTorchaoFinder(_MetaPathFinder):
 # Only Windows + ROCm (HIP) PyTorch needs this stub -- the one build where
 # `import torchao` crashes on the missing torch.distributed C-extension stack.
 # Elsewhere a failing import just means torchao isn't installed (transformers
-# handles that), and the stub would be harmful: is_torchao_available() reads a
-# sentinel torchao.__version__ and crashes in packaging.version.parse() with
-# "'_ROCmSentinelMeta' object is not iterable".
+# handles that), and the stub would be harmful: it makes torchao look present,
+# so anything probing the package gets stub answers instead of a clean miss.
 _is_windows_rocm = False
 if _sys_rocm_stub.platform == "win32":
     try:
