@@ -172,3 +172,34 @@ def test_aliases_are_installed_with_compilation_disabled():
     env = dict(os.environ, UNSLOTH_COMPILE_DISABLE = "1")
     out = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, env = env, timeout = 600)
     assert "ALIAS_OK" in out.stdout, out.stdout[-2000:] + out.stderr[-2000:]
+
+
+def test_generate_masks_keep_their_per_layer_mapping(patched):
+    """A hybrid config's create_masks_for_generate returns one mask per layer type; a prepared
+    4-D mask with grad-requiring embeddings must not collapse that into a bare tensor."""
+    from transformers import AutoConfig
+
+    original = patched._unsloth_original_create_masks_for_generate
+    params = inspect.signature(original).parameters
+    embeds = "inputs_embeds" if "inputs_embeds" in params else "input_embeds"
+    config = AutoConfig.for_model(
+        "gemma3_text", num_hidden_layers = 2, hidden_size = 8, num_attention_heads = 2,
+        num_key_value_heads = 1, head_dim = 4, sliding_window = 2,
+    )
+    config._attn_implementation = "sdpa"
+    if not getattr(config, "layer_types", None):
+        pytest.skip("this transformers has no per-layer attention types")
+    kwargs = {
+        "config": config,
+        embeds: torch.zeros(1, 4, 8, requires_grad = True),
+        "attention_mask": torch.zeros(1, 1, 4, 4),
+        "past_key_values": None,
+        "position_ids": torch.arange(4).unsqueeze(0),
+    }
+    if "cache_position" in params:
+        kwargs["cache_position"] = torch.arange(4)
+    expected = original(**kwargs)
+    got = patched.create_masks_for_generate(**kwargs)
+    assert type(got) is type(expected)
+    if isinstance(expected, dict):
+        assert set(got) == set(expected)
