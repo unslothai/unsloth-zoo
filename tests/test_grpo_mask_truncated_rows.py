@@ -8,13 +8,11 @@ nothing but truncated completions divided a non-zero sum by 0.
 
 These tests run the real function up to the loss call on CPU and read the mask it hands over.
 """
-import os
 import types
 
 import pytest
 import torch
 
-os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
 import unsloth_zoo.rl_replacements as _rl
 
 HIDDEN, VOCAB = 4, 8
