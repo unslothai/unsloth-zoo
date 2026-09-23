@@ -357,7 +357,22 @@ def test_bnb4bit_own_gate_experts_match_dequantized_reference():
     torch.testing.assert_close(out.float(), expected.float(), rtol = 2e-2, atol = 2e-2)
 
 
+@pytest.fixture
+def _restore_minimax_experts_class():
+    # Routing is recorded on the real transformers class; undo it so later tests see stock.
+    modeling = pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
+    klass = modeling.MiniMaxM3VLExperts
+    saved = {k: klass.__dict__[k] for k in ("forward", "_unsloth_own_apply_gate", "_unsloth_bnb4bit_routed") if k in klass.__dict__}
+    yield
+    for k in ("forward", "_unsloth_own_apply_gate", "_unsloth_bnb4bit_routed"):
+        if k in saved:
+            setattr(klass, k, saved[k])
+        elif k in klass.__dict__:
+            delattr(klass, k)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "bnb 4-bit needs CUDA")
+@pytest.mark.usefixtures("_restore_minimax_experts_class")
 def test_minimax_m3_experts_4bit_match_their_own_forward():
     pytest.importorskip("bitsandbytes")
     modeling = pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
