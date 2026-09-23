@@ -380,3 +380,51 @@ def test_the_pretrained_helper_forwards_the_opt_out(monkeypatch):
         "some/model", max_memory = {0: 1 << 30, 1: 1 << 30}, reserve_load_transient = False,
     )
     assert seen == {"config_kwargs": {}, "reserve_load_transient": False}
+
+
+def test_ernie_vl_fuse_and_split_experts_count_as_merging():
+    # Ernie 4.5-VL stacks and concatenates its text and vision experts on the card in one op.
+    configuration = pytest.importorskip("transformers.models.ernie4_5_vl_moe.configuration_ernie4_5_vl_moe")
+    modeling = pytest.importorskip("transformers.models.ernie4_5_vl_moe.modeling_ernie4_5_vl_moe")
+    from accelerate import init_empty_weights
+
+    config = configuration.Ernie4_5_VLMoeConfig(
+        text_config = dict(
+            hidden_size = 256, intermediate_size = 128, moe_intermediate_size = [32, 16],
+            moe_num_experts = 4, num_hidden_layers = 2, num_attention_heads = 2,
+            num_key_value_heads = 1, vocab_size = 256, moe_k = 2,
+        ),
+        vision_config = dict(hidden_size = 32, depth = 1, intermediate_size = 64, num_heads = 2),
+    )
+    with init_empty_weights():
+        model = modeling.Ernie4_5_VLMoeForConditionalGeneration(config)
+    patterns = _merged_parameter_patterns(model)
+    merged = {n for n, _ in model.named_parameters() if any(p.search(n) for p in patterns)}
+    for branch in ("text_moe", "vision_moe"):
+        for stack in ("gate_up_proj", "down_proj"):
+            assert f"model.language_model.layers.1.mlp.{branch}.experts.{stack}" in merged
+
+
+def test_an_op_built_around_a_concatenate_counts_as_merging(monkeypatch):
+    class Concatenate:
+        pass
+
+    class FuseAndPermute:
+        def __init__(self):
+            self.concat_op = Concatenate()
+            self.dim = 0
+
+    class Transpose:
+        def __init__(self):
+            self.dim = 0
+
+    conversions = [
+        types.SimpleNamespace(target_patterns = [".qkv.weight"], operations = [FuseAndPermute()], force_cpu = False),
+        types.SimpleNamespace(target_patterns = [".o_proj.weight"], operations = [Transpose()], force_cpu = False),
+    ]
+    fake = types.ModuleType("transformers.conversion_mapping")
+    fake.get_model_conversion_mapping = lambda model, key_mapping = None, hf_quantizer = None: conversions
+    monkeypatch.setitem(sys.modules, "transformers.conversion_mapping", fake)
+    patterns = _merged_parameter_patterns(nn.Linear(1, 1))
+    names = ["vision.blocks.0.attn.qkv.weight", "model.layers.0.self_attn.o_proj.weight"]
+    assert [n for n in names if any(p.search(n) for p in patterns)] == names[:1]

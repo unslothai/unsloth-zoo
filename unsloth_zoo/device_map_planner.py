@@ -808,7 +808,25 @@ def _adjust_budgets_for_quantizer(
 # 4.7x in one run.
 _LOAD_TRANSIENT_MULTIPLE = 3
 _LOAD_TRANSIENT_MULTIPLE_EXPANDABLE = 5
-_MERGING_OPS = ("MergeModulelist", "Concatenate")
+# Ernie 4.5-VL's fuse-and-split stacks and concatenates the text and vision experts in one op.
+_MERGING_OPS = ("MergeModulelist", "Concatenate", "ErnieFuseAndSplitTextVisionExperts")
+
+
+def _is_merging_op(op, depth: int = 1) -> bool:
+    """A merging op itself, or one built around one (a fuse op holding a ``Concatenate``)."""
+    if any(base.__name__ in _MERGING_OPS for base in type(op).__mro__):
+        return True
+    if depth <= 0:
+        return False
+    try:
+        members = list(vars(op).values())
+    except TypeError:
+        return False
+    return any(
+        _is_merging_op(member, depth - 1)
+        for member in members
+        if not isinstance(member, (str, bytes, int, float, bool, type(None), torch.Tensor))
+    )
 
 
 def _expandable_segments_enabled() -> bool:
@@ -843,10 +861,7 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
         if getattr(conversion, "force_cpu", False):
             continue
         operations = getattr(conversion, "operations", None) or []
-        if not any(
-            base.__name__ in _MERGING_OPS
-            for op in operations for base in type(op).__mro__
-        ):
+        if not any(_is_merging_op(op) for op in operations):
             continue
         for target in getattr(conversion, "target_patterns", None) or []:
             try:
