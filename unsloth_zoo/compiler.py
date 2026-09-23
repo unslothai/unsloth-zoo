@@ -4404,11 +4404,15 @@ def patch_lora_forwards(torch_compile_options):
         # Check failed upcasting
         source = _patch_lora_input_cast(source)
         # `inspect.getsource` unwrapped the integer-input wrapper on Linear4bit.forward to
-        # PEFT's original, so the regenerated forward has no cast; it is put back once the
-        # new forward is installed (see _reapply_integer_input_cast below).
+        # PEFT's original, so the regenerated forward has no cast. On a 4-bit layer the cast
+        # goes inline where the argument check was (one dtype test per call, no extra frame);
+        # anything else is re-wrapped after the loop.
+        check_forward_args = "self._check_forward_args(x, *args, **kwargs)"
+        integer_input_inline = "4bit" in child.lower() and check_forward_args in source
         source = source.replace(
-            "self._check_forward_args(x, *args, **kwargs)",
-            "",
+            check_forward_args,
+            "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
+            if integer_input_inline else "",
         )
 
         if hash(source) != old_hash:
@@ -4467,6 +4471,11 @@ def patch_lora_forwards(torch_compile_options):
                     "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
                 )
 
+            if integer_input_inline:
+                extra_prepend += (
+                    "\nfrom unsloth_zoo.temporary_patches.misc import "
+                    "_lora_integer_input as _unsloth_lora_integer_input\n"
+                )
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
@@ -4475,13 +4484,15 @@ def patch_lora_forwards(torch_compile_options):
                 prepend=f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n"
                 + extra_prepend,
             ).unsloth_forward
+            if integer_input_inline:
+                # patch_peft_lora_integer_input below sees the inline cast and does not wrap.
+                forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
     pass
-    # The regenerated Linear4bit.forward came from PEFT's source (inspect.getsource follows
-    # __wrapped__ past the integer-input wrapper), so the cast an integer input needs on a
-    # 4-bit layer is gone from the installed forward; put the wrapper back on top of it.
+    # A regenerated Linear4bit.forward without the inline cast (its source had no argument
+    # check to replace) gets the integer-input wrapper back on top; with it this is a no-op.
     try:
         from .temporary_patches.misc import patch_peft_lora_integer_input
 

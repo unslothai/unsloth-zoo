@@ -2637,6 +2637,34 @@ pass
 TEMPORARY_PATCHES.append(patch_relu_squared_activation_dtype)
 
 
+def _lora_integer_input(self, x):
+    """`x` cast to the dtype a 4-bit LoRA layer computes in, when `x` is an integer tensor.
+
+    Under autocast the base result comes back in the autocast dtype whatever the layer's
+    compute_dtype says (bitsandbytes' default is float32), and the LoRA branch in the
+    autocast dtype too; casting to compute_dtype would leave the two to promote to float32
+    and the caller's index_add_ to raise all the same. Also called inline by the LoRA
+    forward `compiler.patch_lora_forwards` regenerates, so it costs nothing on float inputs.
+    """
+    if x.is_floating_point() or x.is_complex():
+        return x
+    dtype = None
+    try:
+        if torch.is_autocast_enabled(x.device.type):
+            dtype = torch.get_autocast_dtype(x.device.type)
+    except Exception:
+        dtype = None
+    if dtype is None:
+        dtype = getattr(self.base_layer, "compute_dtype", None)
+    if dtype is None:
+        for adapter in self.active_adapters:
+            if adapter in self.lora_A:
+                dtype = self.lora_A[adapter].weight.dtype
+                break
+    return x.to(dtype) if dtype is not None else x
+pass
+
+
 def patch_peft_lora_integer_input():
     """An integer input never reaches a LoRA matmul on a bitsandbytes 4-bit layer.
 
@@ -2662,26 +2690,8 @@ def patch_peft_lora_integer_input():
 
     @functools.wraps(original_forward)
     def forward(self, x, *args, **kwargs):
-        if isinstance(x, torch.Tensor) and not (x.is_floating_point() or x.is_complex()):
-            # Under autocast the base result comes back in the autocast dtype whatever the
-            # layer's compute_dtype says (bitsandbytes' default is float32), and the LoRA
-            # branch in the autocast dtype too; casting to compute_dtype would leave the
-            # two to promote to float32 and the caller's index_add_ to raise all the same.
-            dtype = None
-            try:
-                if torch.is_autocast_enabled(x.device.type):
-                    dtype = torch.get_autocast_dtype(x.device.type)
-            except Exception:
-                dtype = None
-            if dtype is None:
-                dtype = getattr(self.base_layer, "compute_dtype", None)
-            if dtype is None:
-                for adapter in self.active_adapters:
-                    if adapter in self.lora_A:
-                        dtype = self.lora_A[adapter].weight.dtype
-                        break
-            if dtype is not None:
-                x = x.to(dtype)
+        if isinstance(x, torch.Tensor) and not x.is_floating_point():
+            x = _lora_integer_input(self, x)
         return original_forward(self, x, *args, **kwargs)
 
     forward._unsloth_integer_input = True
