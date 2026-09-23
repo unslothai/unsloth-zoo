@@ -520,15 +520,99 @@ def _build_dlogits_kernel() -> Callable:
     )
 
 
-def _build_kernel_set() -> tuple[Callable | None, Callable | None, Callable | None]:
+def _with_single_simd_forward(fallback: Callable, finalize: bool) -> Callable:
+    source = """
+        uint gid = thread_position_in_grid.x;
+        uint row = gid / 32;
+        uint n = logits_shape[0];
+        if (row >= n) {
+            return;
+        }
+
+        uint lid = gid % 32;
+        uint tpg = 32;
+        uint chunk_v = logits_shape[1];
+        int base = int(row * chunk_v);
+        int target = targets[row];
+        int v_start = v_start_arr[0];
+        int ignore_index = ignore_index_arr[0];
+        float local_max = -INFINITY;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            local_max = metal::max(local_max, raw);
+        }
+        float chunk_max = simd_max(local_max);
+        float local_sum = 0.0f;
+        for (uint col = lid; col < chunk_v; col += tpg) {
+            float raw = logits[base + int(col)];
+            local_sum += fast::exp(raw - chunk_max);
+        }
+        float chunk_sum = simd_sum(local_sum);
+        bool found_target = target >= v_start && target < v_start + int(chunk_v);
+        float chunk_target = 0.0f;
+        if (lid == 0 && target != ignore_index && found_target) {
+            chunk_target = logits[base + target - v_start];
+        }
+        if (lid == 0) {
+            float old_max = running_max_in[row];
+            float old_sum = running_sum_in[row];
+            float new_max = metal::max(old_max, chunk_max);
+            float new_sum = old_sum * fast::exp(old_max - new_max) +
+                            chunk_sum * fast::exp(chunk_max - new_max);
+            float new_target = target_in[row];
+            if (target != ignore_index && found_target) {
+                new_target = chunk_target;
+            }
+
+            running_max_out[row] = new_max;
+            running_sum_out[row] = new_sum;
+            target_out[row] = new_target;
+    """
+    if finalize:
+        source += """
+            float lse = new_max + fast::log(new_sum + 1e-9f);
+            lse_out[row] = lse;
+            if (target == ignore_index) {
+                loss_out[row] = 0.0f;
+            } else {
+                loss_out[row] = lse - new_target;
+            }
+    """
+    source += "    }\n"
+    output_names = ["running_max_out", "running_sum_out", "target_out"]
+    if finalize:
+        output_names += ["loss_out", "lse_out"]
+    kernel = mx.fast.metal_kernel(
+        name="cce_runtime_forward_single_simd_" + str(finalize),
+        input_names=["logits", "targets", "running_max_in", "running_sum_in",
+                     "target_in", "v_start_arr", "ignore_index_arr", "softcap_arr"],
+        output_names=output_names, source=source, ensure_row_contiguous=True,
+    )
+
+    def call(**kwargs):
+        logits = kwargs["inputs"][0]
+        rows, width = logits.shape
+        # Small grids need more SIMD groups; wide rows need more lanes per row.
+        if rows >= 256 and width <= 2048 and logits.dtype in (mx.float16, mx.bfloat16):
+            kwargs["grid"] = (rows * 32, 1, 1)
+            kwargs["threadgroup"] = (32, 1, 1)
+            return kernel(**kwargs)
+        return fallback(**kwargs)
+    return call
+
+
+def _build_kernel_set(
+    logit_softcap: float = 0.0,
+) -> tuple[Callable | None, Callable | None, Callable | None]:
     if not mx.metal.is_available():
         return None, None, None
 
-    return (
-        _build_forward_update_kernel(),
-        _build_forward_update_finalize_kernel(),
-        _build_dlogits_kernel(),
-    )
+    update = _build_forward_update_kernel()
+    finalize = _build_forward_update_finalize_kernel()
+    if logit_softcap <= 0.0:
+        update = _with_single_simd_forward(update, False)
+        finalize = _with_single_simd_forward(finalize, True)
+    return update, finalize, _build_dlogits_kernel()
 
 
 def _forward_chunked_fused_finalize(
@@ -710,6 +794,118 @@ def _forward_chunked_fused_finalize(
     raise RuntimeError("Unreachable: fused finalize path did not return outputs.")
 
 
+def _forward_with_hidden_gradient(
+    hidden: mx.array,
+    weight: mx.array,
+    targets: mx.array,
+    *,
+    scales: mx.array | None,
+    biases: mx.array | None,
+    group_size: int | None,
+    bits: int | None,
+    mode: str,
+    ignore_index: int,
+    logit_softcap: float,
+    chunk_size: int,
+    forward_update_kernel: Callable,
+    forward_update_finalize_kernel: Callable,
+    dlogits_kernel: Callable,
+) -> tuple[mx.array, mx.array]:
+    """Token losses and each token's loss gradient per unit cotangent.
+
+    With a frozen head the hidden gradient is ``cotangent * (sum_v p_v s'_v w_v -
+    s'_y w_y)``, and the bracket does not depend on the cotangent. It is built here
+    one vocabulary chunk at a time: each chunk's softmax weights are taken against
+    the logsumexp so far, and the running sum is rescaled as that logsumexp grows.
+    No vocabulary-wide buffer outlives its chunk, and the backward is a product.
+    """
+    n, dim = hidden.shape
+    vocab_size = weight.shape[0]
+    if n == 0 or len(targets.shape) != 1 or targets.shape[0] != n:
+        # Shape validation and the empty batch, exactly as the loss-only forward.
+        loss, _ = _forward_chunked_fused_finalize(
+            hidden, weight, targets, scales=scales, biases=biases, group_size=group_size,
+            bits=bits, mode=mode, ignore_index=ignore_index, logit_softcap=logit_softcap,
+            chunk_size=chunk_size, forward_update_kernel=None, forward_update_finalize_kernel=None,
+        )
+        return loss, mx.zeros((n, dim), dtype=hidden.dtype)
+    valid, invalid = _target_validity_masks(targets, vocab_size, ignore_index)
+    targets = targets.astype(mx.int32)
+    ignore_arr = mx.array([ignore_index], dtype=mx.int32)
+    softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
+    # A start no target can reach leaves only the softmax term of the derivative.
+    unreachable_start = mx.array([-(1 << 30)], dtype=mx.int32)
+    unit_cotangent = mx.ones((n,), dtype=mx.float32)
+    quantization = dict(group_size=group_size, bits=bits, mode=mode)
+
+    running_max = mx.full((n,), -mx.inf, dtype=mx.float32)
+    running_sum_exp = mx.zeros((n,), dtype=mx.float32)
+    target_logit = mx.zeros((n,), dtype=mx.float32)
+    lse = mx.full((n,), -mx.inf, dtype=mx.float32)
+    weighted_rows = mx.zeros((n, dim), dtype=mx.float32)
+    for v_start in range(0, vocab_size, chunk_size):
+        v_end = min(v_start + chunk_size, vocab_size)
+        w_chunk = weight[v_start:v_end]
+        scales_chunk = None if scales is None else scales[v_start:v_end]
+        biases_chunk = None if biases is None else biases[v_start:v_end]
+        logits = _chunk_matmul(hidden, w_chunk, scales=scales_chunk, biases=biases_chunk, **quantization)
+        inputs = [
+            logits, targets, running_max, running_sum_exp, target_logit,
+            mx.array([v_start], dtype=mx.int32), ignore_arr, softcap_arr,
+        ]
+        previous_lse = lse
+        if v_end == vocab_size:
+            # The loss-only forward's finalize kernel, so losses match it bit for bit.
+            running_max, running_sum_exp, target_logit, loss, lse = forward_update_finalize_kernel(
+                inputs=inputs,
+                output_shapes=[(n,)] * 5,
+                output_dtypes=[mx.float32] * 5,
+                grid=(n * 256, 1, 1),
+                threadgroup=(256, 1, 1),
+            )
+        else:
+            running_max, running_sum_exp, target_logit = forward_update_kernel(
+                inputs=inputs,
+                output_shapes=[(n,)] * 3,
+                output_dtypes=[mx.float32] * 3,
+                grid=(n * 256, 1, 1),
+                threadgroup=(256, 1, 1),
+            )
+            lse = running_max + mx.log(running_sum_exp + 1e-9)
+        n_reads = 4
+        probs = dlogits_kernel(
+            inputs=[logits, lse, targets, unit_cotangent, unreachable_start, ignore_arr, softcap_arr],
+            output_shapes=[logits.shape],
+            output_dtypes=[logits.dtype],
+            template=[("O", logits.dtype)],
+            grid=((logits.size + n_reads - 1) // n_reads, 1, 1),
+            threadgroup=(256, 1, 1),
+        )[0]
+        chunk_rows = _chunk_matmul(
+            probs.astype(hidden.dtype), w_chunk, scales=scales_chunk, biases=biases_chunk,
+            transpose=False, **quantization,
+        )
+        weighted_rows = mx.exp(previous_lse - lse)[:, None] * weighted_rows + chunk_rows.astype(mx.float32)
+        # Tie each chunk's consumers to its logits so the chunk is freed before the next.
+        weighted_rows, lse, target_logit = mx.depends([weighted_rows, lse, target_logit], [probs])
+
+    safe_targets = mx.where(valid, targets, 0)
+    if scales is None:
+        target_rows = weight[safe_targets].astype(mx.float32)
+    else:
+        target_rows = mx.dequantize(
+            weight[safe_targets], scales[safe_targets],
+            None if biases is None else biases[safe_targets], **quantization,
+        ).astype(mx.float32)
+    if logit_softcap > 0.0:
+        # target_logit is capped, so its tanh is target_logit / softcap.
+        target_rows = target_rows * (1.0 - mx.square(target_logit / logit_softcap))[:, None]
+    loss = mx.where(valid, loss, 0.0)
+    # Held until the backward, so store it at the precision the hidden gradient gets.
+    gradient = mx.where(valid[:, None], weighted_rows - target_rows, 0.0).astype(hidden.dtype)
+    return _poison_invalid_targets(loss, invalid), _poison_invalid_targets(gradient, invalid[:, None])
+
+
 # Requires lse pre-poisoned with NaN for invalid rows: this fallback does not
 # re-check vocab bounds and relies on NaN propagation for the gradient.
 def _fallback_dlogits(
@@ -771,15 +967,18 @@ def make_runtime_cce_loss_fused_finalize(
     bits: int | None = None,
     mode: str = "affine",
     label_smoothing: float = 0.0,
+    weight_is_frozen: bool = False,
+    precompute_hidden_gradient: bool = False,
 ):
     label_smoothing = _normalize_label_smoothing(label_smoothing)
-    forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel = _build_kernel_set()
+    forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel = _build_kernel_set(
+        logit_softcap,
+    )
     if label_smoothing > 0.0:
         # Smoothing lives in the chunked python path; the fused Metal kernels
         # do not carry the vocabulary-sum term. eps=0 keeps the kernel path.
         forward_update_kernel = forward_update_finalize_kernel = dlogits_kernel = None
     use_metal_kernel = dlogits_kernel is not None
-
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
     chunk_plan_cache: OrderedDict[
@@ -809,6 +1008,31 @@ def make_runtime_cce_loss_fused_finalize(
             vocab_size,
             bytes_per_element=compute_bytes,
         )
+        # A split under 4096 gives the GEMM too little work per launch, so widen it
+        # while every buffer it grows stays under 8 MB.
+        #
+        # 8 MB is calibrated against ONE token-side buffer per chunk, not the true live
+        # set: logits and d_logits are always both live. Two cells break that ratio badly
+        # enough to invert the result, so each is held out rather than re-calibrating the
+        # rest. Trainable bfloat16 on the kernel path is 4x, not 2x: dlogits_out_dtype
+        # below writes d_logits float32 and the hidden GEMM casts it back. Label
+        # smoothing is 12-16 bytes, not 4: it disables the kernels, and _fallback_dlogits
+        # holds d_capped, zeros_like(d_capped) and the mx.where result as float32 at
+        # once. Promoting either one costs memory instead of saving it.
+        promoted_chunk = 4096
+        promoted_bytes = promoted_chunk * compute_bytes
+        token_bytes = compute_bytes
+        if hidden.dtype == mx.bfloat16 and not weight_is_frozen:
+            token_bytes = 4 * compute_bytes
+        if (chunk_size <= 0 and not quantized and label_smoothing == 0.0
+                and hidden.dtype == weight.dtype and hidden.dtype in (mx.bfloat16, mx.float32)
+                and n_tokens >= 256 and resolved_chunk_size < promoted_chunk
+                and vocab_size >= 16384
+                and n_tokens * promoted_chunk * token_bytes <= min(8 * 1024 * 1024, _CHUNK_BUDGET)
+                and hidden.shape[1] * promoted_bytes <= 8 * 1024 * 1024
+                and (weight_is_frozen
+                     or hidden.shape[1] * promoted_chunk * 4 <= 8 * 1024 * 1024)):
+            resolved_chunk_size = promoted_chunk
         key = (
             vocab_size,
             resolved_chunk_size,
@@ -852,6 +1076,45 @@ def make_runtime_cce_loss_fused_finalize(
             "misses": cache_stats["misses"],
             "evictions": cache_stats["evictions"],
         }
+
+    if precompute_hidden_gradient and use_metal_kernel and label_smoothing == 0.0 and (quantized or weight_is_frozen):
+        @mx.custom_function
+        def hidden_gradient_loss_full(hidden, weight, scales, biases, targets):
+            return _forward_with_hidden_gradient(
+                hidden,
+                weight,
+                targets,
+                scales=scales,
+                biases=biases,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+                ignore_index=ignore_index,
+                logit_softcap=logit_softcap,
+                chunk_size=get_chunk_plan(hidden, weight)[0],
+                forward_update_kernel=forward_update_kernel,
+                forward_update_finalize_kernel=forward_update_finalize_kernel,
+                dlogits_kernel=dlogits_kernel,
+            )
+
+        @hidden_gradient_loss_full.vjp
+        def hidden_gradient_loss_vjp(primals, cotangents, outputs):
+            hidden = primals[0]
+            grad_output = cotangents[0] if isinstance(cotangents, (tuple, list)) else cotangents
+            if grad_output is None:
+                grad_hidden = mx.zeros_like(hidden)
+            else:
+                grad_hidden = (grad_output.astype(mx.float32)[:, None] * outputs[1]).astype(hidden.dtype)
+            return (grad_hidden, *(None if p is None else mx.zeros_like(p) for p in primals[1:]))
+
+        def hidden_gradient_loss(hidden, weight, *rest):
+            scales, biases, targets = rest if quantized else (None, None, rest[0])
+            losses, gradient = hidden_gradient_loss_full(hidden, weight, scales, biases, targets)
+            # Same guard as the loss-only path: keep the VJP's output live under mx.compile.
+            return losses + gradient[:, 0] * mx.array(0.0, dtype=mx.float32)
+
+        hidden_gradient_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
+        return hidden_gradient_loss, use_metal_kernel
 
     if quantized:
         @mx.custom_function
@@ -967,6 +1230,7 @@ def make_runtime_cce_loss_fused_finalize(
                     mode=mode,
                     transpose=False,
                 )
+                grad_hidden = mx.depends([grad_hidden], [d_logits])[0]
 
             # Quantized weight gradients are zero: correct for LoRA (frozen LM head,
             # gradients flow only through grad_hidden). Full fine-tuning of quantized
@@ -994,6 +1258,7 @@ def make_runtime_cce_loss_fused_finalize(
             return losses + lse * mx.array(0.0, dtype=mx.float32)
 
         runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
+        runtime_cce_loss._unsloth_get_chunk_plan = get_chunk_plan
         return runtime_cce_loss, use_metal_kernel
 
     @mx.custom_function
@@ -1051,7 +1316,8 @@ def make_runtime_cce_loss_fused_finalize(
 
             if dlogits_kernel is not None:
                 total_threads = (logits.size + n_reads - 1) // n_reads
-                dlogits_out_dtype = mx.float32 if logits.dtype == mx.bfloat16 else logits.dtype
+                dlogits_out_dtype = (mx.float32 if logits.dtype == mx.bfloat16
+                                     and not weight_is_frozen else logits.dtype)
                 d_logits = dlogits_kernel(
                     inputs=[
                         logits,
@@ -1093,6 +1359,10 @@ def make_runtime_cce_loss_fused_finalize(
                 start_indices=weight_chunk_starts[chunk_idx],
                 axes=(0, 1),
             )
+            if weight_is_frozen:
+                # Under mx.compile the gradient sum would otherwise run as one
+                # fused chain that keeps every chunk's d_logits alive.
+                grad_hidden = mx.depends([grad_hidden], [d_logits])[0]
 
         return grad_hidden.astype(hidden.dtype), grad_weight.astype(weight.dtype), mx.zeros_like(targets)
 
@@ -1103,6 +1373,7 @@ def make_runtime_cce_loss_fused_finalize(
         return losses + lse * mx.array(0.0, dtype=mx.float32)
 
     runtime_cce_loss._unsloth_chunk_plan_cache_info = get_chunk_plan_cache_info
+    runtime_cce_loss._unsloth_get_chunk_plan = get_chunk_plan
     return runtime_cce_loss, use_metal_kernel
 
 
@@ -1116,8 +1387,16 @@ def make_chunked_cross_entropy_loss(
     bits: int | None = None,
     mode: str = "affine",
     label_smoothing: float = 0.0,
+    weight_is_frozen: bool = False,
+    precompute_hidden_gradient: bool = False,
 ):
-    """Return a standalone chunked CCE loss callable and a kernel-usage flag."""
+    """Return a standalone CCE loss and a kernel-usage flag.
+
+    Set weight_is_frozen only when classifier gradients will not be requested.
+    precompute_hidden_gradient builds a frozen or quantized head's hidden gradient
+    in the forward (Metal kernels, no label smoothing), which saves backward memory
+    but doubles the cost of a call that is never differentiated.
+    """
 
     return make_runtime_cce_loss_fused_finalize(
         ignore_index=ignore_index,
@@ -1128,4 +1407,6 @@ def make_chunked_cross_entropy_loss(
         bits=bits,
         mode=mode,
         label_smoothing=label_smoothing,
+        weight_is_frozen=weight_is_frozen,
+        precompute_hidden_gradient=precompute_hidden_gradient,
     )

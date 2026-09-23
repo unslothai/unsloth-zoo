@@ -23,10 +23,13 @@ except ImportError:
     torch = None
 import functools
 import gc
+import inspect
 import numpy as np
 import itertools
 import datasets
 import re
+
+from .log import logger
 
 __all__ = [
     "mean_of_trained_tokens",
@@ -264,6 +267,22 @@ def _count_input_ids(train_dataset, mapping):
 pass
 
 
+def _requires_arguments(method):
+    """True only when binding zero arguments fails. Unreadable metadata counts as callable."""
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError, AttributeError):
+        # signature() raises TypeError for unreadable metadata too, so the lookup
+        # cannot share a try with bind(): only bind() failing proves arguments.
+        return False
+    try:
+        signature.bind()
+    except TypeError:
+        return True
+    return False
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -271,8 +290,34 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     in the base model. Reset them to the mean of the trained tokens.
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    embedding_matrix = model.get_input_embeddings ().weight
-    lm_head_matrix   = model.get_output_embeddings().weight
+    # Not every checkpoint has a single embedding to reset, and `hasattr` does not
+    # say so: transformers' base get_input_embeddings raises NotImplementedError
+    # for composite models (Qwen3-Omni), and remote code can declare a signature
+    # that cannot be called (stepfun-ai/Step-3.7-Flash).
+    try:
+        # Each accessor judged before its own call: a TypeError from inside a
+        # callable one must never be read as an accessor we could not call.
+        if _requires_arguments(model.get_input_embeddings):
+            raise NotImplementedError("input embedding accessor requires arguments")
+        input_embeddings  = model.get_input_embeddings ()
+        if _requires_arguments(model.get_output_embeddings):
+            raise NotImplementedError("output embedding accessor requires arguments")
+        output_embeddings = model.get_output_embeddings()
+        # None is a legitimate "I have none", and `.weight` on it is an
+        # AttributeError several frames from the cause.
+        if input_embeddings is None or output_embeddings is None:
+            raise NotImplementedError("no input or output embeddings")
+        embedding_matrix = input_embeddings.weight
+        lm_head_matrix   = output_embeddings.weight
+    except NotImplementedError:
+        # Warning, not info: the logger sits at WARNING by default and this run
+        # just lost the NaN guard.
+        logger.warning(
+            f"Unsloth: Skipping the untrained token fix for "
+            f"{type(model).__name__}, which does not expose a single input "
+            f"embedding."
+        )
+        return
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
