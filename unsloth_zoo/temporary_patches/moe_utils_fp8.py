@@ -1071,21 +1071,32 @@ from .utils import logger
 
 
 def _experts_are_fp4(module) -> bool:
-    """FP8Experts built for FP4-packed expert weights (DeepSeek-V4 style)."""
-    return getattr(getattr(module, "config", None), "expert_dtype", "fp8") == "fp4"
+    """FP8Experts built for FP4-packed expert weights (DeepSeek-V4 style) that this FP8
+    backend cannot unpack. Once the backend has its FP4 dequant (#1334), they route to it."""
+    if getattr(getattr(module, "config", None), "expert_dtype", "fp8") != "fp4":
+        return False
+    return globals().get("_dequantize_full_expert_weights_fp4") is None
 
 
 def _experts_are_expert_parallel(module) -> bool:
     """Expert parallelism routes non-local slots to a `num_experts` sentinel that only
-    transformers' own implementations mask; the FP8 backends here would index with it."""
+    transformers' own implementations mask; the FP8 backends here would index with it.
+
+    Asked on every FP8 experts forward, and a module's parallel layout is fixed at load,
+    so the answer is kept on the instance, keyed on the config it was read from."""
+    state = getattr(module, "__dict__", None)
+    config = state.get("config") if state is not None else None
+    cached = state.get("_unsloth_expert_parallel") if state is not None else None
+    if cached is not None and cached[0] is config:
+        return cached[1]
     try:
         from .moe_experts_interface import _expert_parallel_requested
+        answer = bool(_expert_parallel_requested(module))
     except Exception:
-        return False
-    try:
-        return bool(_expert_parallel_requested(module))
-    except Exception:
-        return False
+        answer = False
+    if state is not None:
+        state["_unsloth_expert_parallel"] = (config, answer)
+    return answer
 
 
 def patch_fp8_experts_interface():
