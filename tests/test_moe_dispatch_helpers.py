@@ -65,6 +65,8 @@ def test_compiled_model_is_not_custom_code():
     PreTrainedConfig = getattr(pytest.importorskip("transformers.configuration_utils"), "PreTrainedConfig", None)
     if PreTrainedConfig is None:
         pytest.skip("PreTrainedConfig is transformers 5")
+    if "is_custom_code" not in PreTrainedModel.__dict__:
+        pytest.skip("PreTrainedModel.is_custom_code is newer than this transformers; the patch returns early")
     from unsloth_zoo.temporary_patches.compiled_model_identity import patch_compiled_model_is_custom_code
     saved = PreTrainedModel.__dict__["is_custom_code"]
     patch_compiled_model_is_custom_code()
