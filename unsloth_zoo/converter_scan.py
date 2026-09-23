@@ -833,6 +833,11 @@ def _percent_holes(template):
     return "".join(pieces).replace("%%", "%")
 
 
+# The callable spellings of the plus operator, which build the same string it
+# does. set.add is not one of them: these take two arguments.
+ADD_FUNCTIONS = frozenset(("add", "concat", "iadd", "iconcat"))
+
+
 def _added_text(node):
     """The text of a `+` spelled as a call, or None.
 
@@ -844,10 +849,7 @@ def _added_text(node):
         return None
     if isinstance(node.func, ast.Attribute) and node.func.attr == "__add__":
         operands = [node.func.value, *node.args]
-    elif (
-        isinstance(node.func, ast.Attribute)
-        and node.func.attr in ("add", "concat", "iadd", "iconcat")
-    ):
+    elif isinstance(node.func, ast.Attribute) and node.func.attr in ADD_FUNCTIONS:
         operands = list(node.args)
     else:
         return None
@@ -1580,7 +1582,7 @@ DESCRIPTOR_METHODS = frozenset((
 ))
 
 
-def _bind_descriptor_calls(tree, assignments = None):
+def _bind_descriptor_calls(tree, assignments = None, aliases = None):
     """The tree with `str.format(t, x)` rewritten as `t.format(x)`.
 
     Called unbound, the receiver is the type rather than the template, so every
@@ -1594,6 +1596,8 @@ def _bind_descriptor_calls(tree, assignments = None):
     # could see.
     if assignments is None:
         assignments = _single_assignments(tree)
+    if aliases is None:
+        aliases = _call_aliases(tree, assignments)
     rebound = {}
     for name, value in assignments.items():
         if (
@@ -1612,6 +1616,13 @@ def _bind_descriptor_calls(tree, assignments = None):
             continue
         if isinstance(node.func, ast.Name) and node.func.id in rebound:
             attribute = rebound[node.func.id]
+        elif (
+            _called_name(node, aliases) in ADD_FUNCTIONS
+            and len(node.args) == 2
+        ):
+            # from operator import add, then add("https", "://evil.example/c").
+            # Written as the method it is, so one fold reads every spelling.
+            attribute = "__add__"
         elif (
             isinstance(node.func, ast.Attribute)
             and node.func.attr in DESCRIPTOR_METHODS
@@ -1781,7 +1792,8 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
     # whole tree, and doing that per transformation was over half the time this
     # allowance spent on a 6.4 MB file: 9.3 seconds of 16.
     assignments = _single_assignments(tree)
-    tree = _bind_descriptor_calls(tree, assignments)
+    aliases = _call_aliases(tree, assignments)
+    tree = _bind_descriptor_calls(tree, assignments, aliases)
     tree = _inline_constants(tree, assignments)
     if _writes_anything(tree):
         # Sending TO the hub is not downloading from it. The hub is writable and
@@ -1789,7 +1801,6 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
         # there and make it a channel anyone can read back, so "the destination
         # is the hub" is not on its own a reason to say nothing.
         return False
-    aliases = _call_aliases(tree, assignments)
     if _imports_an_unvouchable_api(tree, aliases):
         # A destination this allowance never looks at, arriving by another door.
         return False
