@@ -100,6 +100,11 @@ if _HAS_TRITON:
         byte_offs = (row[:, None, None] * G + offs_g[None, :, None]) * 16 + offs_b[None, None, :]
         packed = tl.load(blocks_ptr + byte_offs, mask = mask_ng[:, :, None], other = 0).to(tl.int32)
         scale = tl.load(scales_ptr + row[:, None] * G + offs_g[None, :], mask = mask_ng, other = 127).to(tl.int32)
+        # e8m0 255 is 2^128, past the fp32 / bf16 range: scale by 2^127 and then by 2, so a zero
+        # nibble stays zero and 0.5 stays finite, as ldexp gives.
+        top = scale == 255
+        scale = tl.where(top, 254, scale)
+        double = tl.where(top, 2.0, 1.0)
         # 2^(scale - 127) built from its fp32 bits; scale 0 is the fp32 subnormal 2^-127.
         factor = tl.where(scale == 0, 5.877471754111438e-39, ((scale << 23).to(tl.int32, bitcast = True)).to(tl.float32, bitcast = True))
         if BF16_BITS:
@@ -119,9 +124,12 @@ if _HAS_TRITON:
             s16 = tl.maximum(scale << 7, 0x0040).to(tl.uint16).to(tl.bfloat16, bitcast = True)
             lo = lo * s16[:, :, None]
             hi = hi * s16[:, :, None]
+            double16 = double.to(tl.bfloat16)[:, :, None]
+            lo = lo * double16
+            hi = hi * double16
         else:
-            lo = _e2m1_to_f32(packed & 15) * factor[:, :, None]
-            hi = _e2m1_to_f32(packed >> 4) * factor[:, :, None]
+            lo = _e2m1_to_f32(packed & 15) * factor[:, :, None] * double[:, :, None]
+            hi = _e2m1_to_f32(packed >> 4) * factor[:, :, None] * double[:, :, None]
         vals = tl.reshape(tl.join(lo, hi), (BLOCK_N, BLOCK_G * 32)).to(out_ptr.dtype.element_ty)
         offs_k = pid_g * BLOCK_G * 32 + tl.arange(0, BLOCK_G * 32)
         mask = (offs_n[:, None] < N) & (offs_k[None, :] < G * 32)
@@ -160,7 +168,8 @@ def _kernel_verified(device, dtype, transpose):
         else:
             scales = (torch.arange(E * N * G, device = device) * 37) % 255
         scales = scales.to(torch.uint8).reshape(E, N, G)
-        scales.view(-1)[:3] = torch.tensor([0, 127, 254 if dtype != torch.float16 else 135], dtype = torch.uint8)
+        edges = [0, 127, 254, 255] if dtype != torch.float16 else [0, 127, 135, 255]
+        scales.view(-1)[: len(edges)] = torch.tensor(edges, dtype = torch.uint8)
         want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
         got = _kernel_dequantize(blocks, scales, dtype, transpose, None, None, None)
         verified = bool(torch.equal(got.view(torch.uint8), want.view(torch.uint8)))

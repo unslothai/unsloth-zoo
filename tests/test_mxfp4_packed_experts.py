@@ -89,11 +89,14 @@ def test_fused_kernel_is_bit_identical(dtype, transpose):
     if dtype == torch.float16:
         scales = torch.randint(110, 140, (E, N, G), dtype = torch.uint8, device = "cuda")
     else:
-        scales = (torch.arange(E * N * G, device = "cuda") % 255).to(torch.uint8).reshape(E, N, G)
+        scales = (torch.arange(E * N * G, device = "cuda") % 256).to(torch.uint8).reshape(E, N, G)
+    # Every byte under scale 255 (2^128): ldexp keeps a zero nibble zero rather than 0 * inf = NaN.
+    scales.view(-1)[:16] = 255
     want = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
     got = mxd._kernel_dequantize(blocks, scales, dtype, transpose, None, None, None)
     assert got.shape == want.shape and got.dtype == dtype
     assert torch.equal(_bits(got), _bits(want))
+    assert not got.isnan().any()
     assert mxd.mxfp4_kernel_available()
 
 
