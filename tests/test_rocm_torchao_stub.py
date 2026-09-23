@@ -96,6 +96,17 @@ def test_stub_dunders_are_real_misses(stubbed_torchao):
     assert inspect.unwrap(sentinel) is sentinel
 
 
+def test_a_source_lookup_walks_past_the_stub(stubbed_torchao):
+    """The failure every caller hit, with no torch or transformers in it: for a code object whose
+    file is not on disk, inspect.getsourcefile walks sys.modules reading each __file__, which is
+    what torch.library does when it registers a fake op. A sentinel there raised TypeError."""
+    import torchao.quantization  # noqa: F401  a submodule stub in sys.modules as well
+
+    ns: dict = {}
+    exec(compile("def probe():\n    pass\n", "/nowhere/zoo_rocm_stub_probe.py", "exec"), ns)
+    assert inspect.getsourcefile(ns["probe"].__code__) is None
+
+
 def test_stub_still_answers_the_names_callers_import(stubbed_torchao):
     from torchao.quantization import Float8Tensor, quantize_  # noqa: F401
 
