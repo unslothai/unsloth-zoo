@@ -51,6 +51,10 @@ _RUNNER = textwrap.dedent(
         want = stock(flat_logits, flat_labels, V, num_items_in_batch = n_items)
         got = patched(flat_logits, flat_labels, V, num_items_in_batch = n_items)
         torch.testing.assert_close(got, want)
+        # flattened logits with (batch, seq) labels: the stock loss shifts per sequence
+        want = stock(flat_logits, labels, V, num_items_in_batch = n_items)
+        got = patched(flat_logits, labels, V, num_items_in_batch = n_items)
+        torch.testing.assert_close(got, want)
         # A non-default ignore_index takes the F.cross_entropy fallback, flat and 3-D.
         other = labels.masked_fill(labels == -100, -1)
         for lg, lb in ((logits, other), (logits.view(-1, V), other.view(-1))):
