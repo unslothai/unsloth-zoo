@@ -392,6 +392,10 @@ STRING_BUILDER_NAMES = frozenset((
 URL_ASSEMBLERS = frozenset((
     "ParseResult", "SplitResult", "ParseResultBytes", "SplitResultBytes",
     "DefragResult", "DefragResultBytes", "geturl",
+    # And the URL objects the clients build, which take their host as a field:
+    # httpx.URL(scheme = "https", host = "evil.example") spells a destination
+    # no argument of which is a URL. Upstream builds none of these.
+    "URL", "Url", "URI", "Uri",
 ))
 
 URL_REWRITE_METHODS = frozenset((
@@ -1176,7 +1180,11 @@ def _literal_text_uncharged(node):
                 and not isinstance(count_side.value, bool)
             ) else None
             if count is None:
-                return UNKNOWN_PIECE
+                # The text itself and then a hole. Returning only a hole made
+                # the multiplication look fully read, so the walk skipped its
+                # children and "https://evil.example/c" * n named nothing at
+                # all, while at runtime one repetition is the whole URL.
+                return text + UNKNOWN_PIECE
             if count < 0:
                 return ""
             if len(text) * count > MAX_FOLDED_JOIN:
