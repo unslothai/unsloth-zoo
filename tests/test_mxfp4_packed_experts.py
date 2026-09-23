@@ -447,16 +447,19 @@ def _tiny_gpt_oss(device):
     return model, experts
 
 
-@pytest.mark.parametrize("explicit_state_dict", [False, True])
+@pytest.mark.parametrize("explicit_state_dict", [False, True, "positional"])
 def test_full_save_writes_dequantized_experts(tmp_path, explicit_state_dict):
     safetensors = pytest.importorskip("safetensors.torch")
     mx.patch_save_pretrained_mxfp4()
     model, experts = _tiny_gpt_oss("cpu")
     packed = experts.gate_up_proj, experts.down_proj
-    kwargs = {}
-    if explicit_state_dict:
-        kwargs["state_dict"] = model.state_dict()   # as Trainer hands it over
-    model.save_pretrained(tmp_path, **kwargs)
+    if explicit_state_dict == "positional":
+        model.save_pretrained(tmp_path, True, model.state_dict())
+    else:
+        kwargs = {}
+        if explicit_state_dict:
+            kwargs["state_dict"] = model.state_dict()   # as Trainer hands it over
+        model.save_pretrained(tmp_path, **kwargs)
     saved = {}
     for file in os.listdir(tmp_path):
         if file.endswith(".safetensors"):
@@ -505,3 +508,22 @@ def test_bf16_inference_path_dequantizes_packed_experts():
         want = [gpt_oss.moe_forward_inference_bf16(mlp, h).clone() for h in inputs]
     for a, b in zip(got, want):
         assert torch.isfinite(a).all() and torch.equal(a, b)
+
+
+def test_decode_stacks_are_shared_and_freed_with_their_model():
+    import gc
+    import weakref
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    first, second = _packed(4, 128, 64, seed = 1), _packed(4, 128, 64, seed = 2)
+    counts = torch.ones(4, dtype = torch.int32)
+    stack = gpt_oss._mxfp4_decode_stack(first, torch.bfloat16, counts)
+    assert gpt_oss._mxfp4_decode_stack(second, torch.bfloat16, counts) is stack
+    assert torch.equal(stack, second.dequantize(torch.bfloat16))
+    alive = weakref.ref(stack)
+    del stack, first
+    gc.collect()
+    assert alive() is not None   # the second model still decodes into it
+    del second
+    gc.collect()
+    assert alive() is None

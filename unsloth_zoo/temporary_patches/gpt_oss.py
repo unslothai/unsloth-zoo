@@ -19,6 +19,7 @@ import ast
 import functools
 import os
 import stat
+import weakref
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -1827,7 +1828,9 @@ def _unwrap_peft_experts(module):
     return module
 
 
-_MXFP4_DECODE_STACKS = {}
+# Weak values: the packed parameters that decode into a stack hold it, so it is freed with the
+# last model that uses it.
+_MXFP4_DECODE_STACKS = weakref.WeakValueDictionary()
 
 
 def _mxfp4_decode_stack(param, dtype, token_counts):
@@ -1843,6 +1846,10 @@ def _mxfp4_decode_stack(param, dtype, token_counts):
             torch.zeros(param._original_shape, dtype = dtype, device = param.device), requires_grad = False,
         )
         _MXFP4_DECODE_STACKS[key] = stack
+    held = getattr(param, "_unsloth_decode_stacks", None)
+    if held is None:
+        held = param._unsloth_decode_stacks = {}
+    held[key] = stack
     param.dequantize(dtype, token_counts = token_counts, out = stack.data)
     return stack
 

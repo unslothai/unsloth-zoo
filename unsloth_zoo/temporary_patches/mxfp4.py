@@ -281,10 +281,15 @@ def patch_save_pretrained_mxfp4():
                 weight = param.dequantize().cpu()
                 dense[names.get(id(param))] = weight
                 module._parameters[name] = nn.Parameter(weight, requires_grad = False)
-            state_dict = kwargs.get("state_dict", None)
+            # state_dict may come positionally (directory, is_main_process, state_dict).
+            try:
+                bound = inspect.signature(original).bind(self, *args, **kwargs)
+            except TypeError:
+                return original(self, *args, **kwargs)
+            state_dict = bound.arguments.get("state_dict", None)
             if state_dict is not None:
-                kwargs["state_dict"] = {key: dense.get(key, value) for key, value in state_dict.items()}
-            return original(self, *args, **kwargs)
+                bound.arguments["state_dict"] = {key: dense.get(key, value) for key, value in state_dict.items()}
+            return original(*bound.args, **bound.kwargs)
         finally:
             for module, name, param in packed:
                 module._parameters[name] = param
