@@ -76,15 +76,26 @@ def test_unknown_methods_are_recognised():
 def test_a_rewritten_modelopt_checkpoint_is_sized_with_the_callers_config(tmp_path):
     path = _modelopt_checkpoint(tmp_path)
     model, hf_quantizer, config = planner.build_meta_model(
-        path, quantization_config = dict(_FP8_PLAN)
+        path, rewritten_quantization_config = dict(_FP8_PLAN)
     )
     assert type(hf_quantizer).__name__ == "FineGrainedFP8HfQuantizer"
     assert hf_quantizer.pre_quantized
+    assert not hasattr(config, "rewritten_quantization_config")
     assert config.quantization_config["quant_method"] == "fp8"
     # The quantized Linear classes are swapped in, so the size table is the fp8 one.
     proj = model.model.layers[0].self_attn.q_proj
     assert type(proj).__name__ != "Linear"
     assert type(model.lm_head).__name__ == "Linear"
+
+
+@needs_per_tensor_fp8
+def test_a_plain_runtime_config_on_an_unknown_method_quantizes_at_load_like_transformers(tmp_path):
+    # get_hf_quantizer ignores a serialized method it cannot load and applies the caller's
+    # config with pre_quantized = False; only an explicit rewrite is sized as stored weights.
+    path = _modelopt_checkpoint(tmp_path)
+    _, hf_quantizer, config = planner.build_meta_model(path, quantization_config = dict(_FP8_PLAN))
+    assert type(hf_quantizer).__name__ == "FineGrainedFP8HfQuantizer"
+    assert not hf_quantizer.pre_quantized
 
 
 def test_an_unknown_method_without_a_callers_config_still_refuses(tmp_path):

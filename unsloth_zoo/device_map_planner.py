@@ -1700,12 +1700,21 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` are honoured
     the way the loader honours them, so runtime quantisation of a full-precision
     checkpoint is sized as it will really be loaded.
+
+    ``rewritten_quantization_config`` replaces the checkpoint's serialized
+    quantization block, for a caller that rewrites it on the config it loads
+    with (Unsloth turns NVIDIA ModelOpt FP8, which transformers cannot load,
+    into the equivalent ``fp8`` block): the stored weights are then sized as
+    pre-quantized under that block.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
+    rewritten_qcfg = from_pretrained_kwargs.pop("rewritten_quantization_config", None)
     runtime_qcfg = _runtime_quantization_config(from_pretrained_kwargs)
     config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
+    if rewritten_qcfg is not None:
+        config.quantization_config = rewritten_qcfg
     trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
     auto_cls = _auto_class_for(config, trust_remote_code=trust_remote_code)
     hf_quantizer = None
@@ -1719,11 +1728,9 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
         if serialized_qcfg is None:
             hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
         elif runtime_qcfg is not None and not _quantization_method_is_known(serialized_qcfg):
-            # A method transformers cannot load (NVIDIA ModelOpt) that the caller
-            # rewrote into one it can, as Unsloth does for ModelOpt FP8: the load
-            # applies the caller's config to the checkpoint's quantized weights,
-            # so size exactly that instead of failing on the serialized method.
-            hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=True)
+            # As the loader does (get_hf_quantizer): a serialized method it cannot
+            # load is ignored and the caller's config quantizes at load time.
+            hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
             config.quantization_config = runtime_qcfg
         else:
             # The checkpoint's own method wins and the runtime config only
