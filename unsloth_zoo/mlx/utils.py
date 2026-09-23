@@ -1913,11 +1913,18 @@ def _cce_head_ineligibility(desc):
     """Reason fused CCE must not run for this head, or None when eligible."""
     if desc.status == "unknown":
         return "unresolved output-head topology"
-    if not desc.raw:
+    if not desc.raw and not _is_hadamard_packed_linear(desc.module):
         return f"non-raw output-head wrapper ({desc.wrapper_type.__name__})"
     if desc.has_additive_bias:
         return "additive output-head bias"
     return None
+
+
+def _rotate_head_input(head, hidden):
+    """Apply the input rotation a Hadamard-packed head performs before its matmul."""
+    if getattr(head, "block", 0) and _is_hadamard_packed_linear(head):
+        return _hadamard_pack_module().hadamard_transform(hidden, head.block, head.signs)
+    return hidden
 
 
 def _get_lm_head_layer(model):
@@ -2416,6 +2423,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             hidden_flat, targets_flat = _compact_cce_inputs(
                 hidden_flat, targets_flat, cce_indices,
             )
+            hidden_flat = _rotate_head_input(layer, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -4577,6 +4585,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = indices[:, 0] * masked_targets.shape[1] + columns
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
+            hidden_flat = _rotate_head_input(lm_head, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks

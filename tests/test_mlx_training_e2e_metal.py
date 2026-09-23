@@ -852,6 +852,42 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
 
 
 @metal_only
+def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
+    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    from unsloth_zoo.mlx import preference
+    mx.random.seed(611)
+    model = _cce_text_model(2053, 1024, quantized=True)
+    head = pack.HadamardQuantizedLinear(1024, 8192, 512)
+    head.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
+    rotated = pack.hadamard_transform(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
+    head.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
+    head.scales, head.biases = scales.astype(mx.float16), biases.astype(mx.float16)
+    model.lm_head = head
+    ids = mx.random.randint(0, 2053, (2, 65))
+    lengths = mx.array([[0, 65], [0, 40]], dtype=mx.int32)
+    want = nn.value_and_grad(model, make_baseline_loss_fn())(model, ids, lengths)
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_backend == "runtime-cce"
+    got = nn.value_and_grad(model, loss_fn)(model, ids, lengths)
+    mx.eval(want, got)
+    assert got[0][0].item() == pytest.approx(want[0][0].item(), rel=1e-4)
+    for (_, expected), (_, actual) in zip(tree_flatten(want[1]), tree_flatten(got[1])):
+        assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-3).item()
+    score = preference._make_preference_cce_scorer(model)
+    supervised = mx.arange(64)[None] < lengths[:, 1:] - 1
+    ce, _ = score(model, ids, supervised)
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
+    assert mx.allclose(ce, dense * supervised, atol=1e-4, rtol=1e-4).item()
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+        m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+    vlm_loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert vlm_loss._unsloth_cce_backend == "runtime-cce"
+    assert vlm_loss(model, {"input_ids": ids})[0].item() == pytest.approx(dense.mean().item(), rel=1e-4)
+
+
+@metal_only
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("softcap", [0.0, 7.0])
 def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compiled, softcap):
