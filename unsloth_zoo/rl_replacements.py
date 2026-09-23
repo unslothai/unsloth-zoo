@@ -381,7 +381,9 @@ def autotune_batch_and_chunks(
 
     if valid_indices.shape[0] == 0:
         #This means your GPU will OOM
-        return 4, final_m
+        # Never more rows than the batch holds: callers divide total_input_rows by this, and
+        # unsloth's no-grad pass does so without a max(1, ...), so 4 on a 1-3 row batch gave 0.
+        return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())

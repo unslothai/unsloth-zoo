@@ -136,3 +136,22 @@ def test_a_user_set_multiplier_survives_every_step(sized):
     # overwrite it, and the refresh branch would then have dropped it to None.
     assert [c[2] for c in calls] == [8, 8], calls
     assert trainer.args.unsloth_logit_chunk_multiplier == 8
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8, 17])
+def test_the_out_of_memory_fallback_never_asks_for_zero_chunks(monkeypatch, rows):
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo import rl_replacements as rr
+
+    # No accelerator -> the 8 GB fallback budget; one row of this sequence alone exceeds it.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    if hasattr(torch, "xpu"):
+        monkeypatch.setattr(torch.xpu, "is_available", lambda: False)
+    B, multiplier = rr.autotune_batch_and_chunks(rows, 1_000_000, 4096, 151936, 16, None)
+
+    # unsloth's no-grad pass divides with no max(1, ...); now that the plan is sized on every
+    # step, a tight step after the first used to turn 4 on a 1-3 row batch into 0 chunks.
+    assert rows // B >= 1
+    # The zoo path keeps exactly the chunk count it had before.
+    assert max(1, rows // B) == max(1, rows // 4)
+    assert multiplier == max(4, 1_000_000 // 4096)
