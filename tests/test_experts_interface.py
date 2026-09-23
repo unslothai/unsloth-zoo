@@ -12,6 +12,7 @@ from unsloth_zoo.temporary_patches.moe_experts_interface import (
     expert_forward_is_handled,
     patch_experts_interface,
     unsloth_experts_forward,
+    _unsloth_experts_dispatch,
 )
 from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
 
@@ -95,7 +96,7 @@ def test_ungated_falls_back_to_transformers(monkeypatch):
     try:
         m = _experts(None, "transformers.models.x.modeling_x", has_gate = False)
         h = torch.zeros(2, 4)
-        assert unsloth_experts_forward(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
+        assert _unsloth_experts_dispatch(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
         assert calls == ["grouped_mm"]
     finally:
         if original is not None:
@@ -121,7 +122,7 @@ def test_custom_gate_falls_back_and_is_not_packed(monkeypatch):
         type(m)._apply_gate = lambda self, x: x.clamp(max = 7.0)
         assert not expert_forward_is_handled(m)
         h = torch.zeros(2, 4)
-        assert unsloth_experts_forward(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
+        assert _unsloth_experts_dispatch(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
         assert calls == ["grouped_mm"]
         # transformers' own default gate is not a custom gate.
         from transformers.integrations.moe import _default_apply_gate
@@ -164,7 +165,7 @@ def test_fallback_uses_the_eager_forward_without_grouped_mm(monkeypatch):
         calls.append("eager"); return h
     m = _experts(eager, "transformers.models.x.modeling_x", has_gate = False, wrapped = True)
     h = torch.zeros(2, 4)
-    assert unsloth_experts_forward(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
+    assert _unsloth_experts_dispatch(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
     assert calls == ["eager"]
 
 
@@ -393,3 +394,60 @@ def test_expert_parallel_fp8_experts_keep_transformers_path(monkeypatch):
     )
     assert forward(experts, "h", "i", "w") == "unsloth"
     assert calls == ["eager", "unsloth"]
+
+
+def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypatch):
+    """Plain floating point stacks with nothing stashed need nothing from Unsloth's dispatcher:
+    they run transformers' grouped_mm, as every decorated class did before the "unsloth" default."""
+    import unsloth_zoo.temporary_patches.moe_experts_interface as MEI
+    calls = []
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM", lambda self, h, i, w: calls.append("grouped_mm") or h)
+    monkeypatch.setattr(MEI, "_unsloth_experts_dispatch", lambda self, h, i, w: calls.append("unsloth") or h)
+    m = _experts(None, "transformers.models.x.modeling_x", implementation = "unsloth")
+    h, i, w = torch.zeros(2, 4), torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)
+    assert unsloth_experts_forward(m, h, i, w) is h
+    assert calls == ["grouped_mm"]
+
+    # A stashed expert LoRA is only applied by Unsloth's dispatcher.
+    calls.clear()
+    m._unsloth_lora_gate_up_proj = ("A", "B", 1.0)
+    unsloth_experts_forward(m, h, i, w)
+    assert calls == ["unsloth"]
+    del m._unsloth_lora_gate_up_proj
+
+    # Packed or non floating point stacks (a Parameter subclass such as Params4bit, uint8 storage).
+    class Packed(nn.Parameter):
+        pass
+    calls.clear()
+    m.down_proj = Packed(torch.zeros(2, 4, 4))
+    unsloth_experts_forward(m, h, i, w)
+    assert calls == ["unsloth"]
+    calls.clear()
+    m.down_proj = nn.Parameter(torch.zeros(2, 4, 4, dtype = torch.uint8), requires_grad = False)
+    unsloth_experts_forward(m, h, i, w)
+    assert calls == ["unsloth"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "grouped_mm experts forward on CUDA")
+def test_dense_experts_stay_inside_a_fullgraph_compiled_block():
+    """The compiler rewrites a MoE block's forward as fullgraph = True. A graph break inside the
+    experts call (the torch.compiler.disable'd dispatcher) sends the whole block back to eager,
+    which cost about 40% of decode speed on Granite-MoE and OLMoE in 16-bit."""
+    olmoe = pytest.importorskip("transformers.models.olmoe.modeling_olmoe")
+    from transformers.models.olmoe.configuration_olmoe import OlmoeConfig
+    patch_experts_interface()
+    config = OlmoeConfig(hidden_size = 64, intermediate_size = 32, num_experts = 4, num_experts_per_tok = 2)
+    config._experts_implementation = UNSLOTH_EXPERTS_IMPLEMENTATION
+    experts = olmoe.OlmoeExperts(config).cuda().to(torch.bfloat16)
+    for p in experts.parameters():
+        torch.nn.init.normal_(p, std = 0.02)
+    h = torch.randn(8, 64, device = "cuda", dtype = torch.bfloat16)
+    index = torch.randint(0, 4, (8, 2), device = "cuda")
+    weights = torch.rand(8, 2, device = "cuda", dtype = torch.bfloat16)
+    torch._dynamo.reset()
+    compiled = torch.compile(lambda h, i, w: experts(h, i, w), fullgraph = True)
+    with torch.no_grad():
+        got = compiled(h, index, weights)
+        config._experts_implementation = "grouped_mm"
+        expected = experts(h, index, weights)
+    torch.testing.assert_close(got, expected, atol = 2e-2, rtol = 2e-2)

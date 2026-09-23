@@ -186,23 +186,64 @@ def _expert_parallel_requested(model) -> bool:
     return config is not None and id(config) in _EXPERT_PARALLEL_SUBCONFIGS
 
 
-# Kept out of Dynamo like the per-model MoE block patches: a compiled MoE block
-# that inlined the dispatch (dequantization, permutation, grouped GEMM) had
-# AOT autograd save every dequantized expert stack for backward, 13 GB a layer
-# on Inkling-Small, and ran out of memory on the first forward.
-@torch.compiler.disable
+# transformers' own "grouped_mm" experts forward, the default this implementation replaces.
+# Resolved once in patch_experts_interface so the dense route below is a plain call Dynamo traces.
+_TRANSFORMERS_GROUPED_MM = None
+
+_DENSE_STACK_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def _dense_experts_without_expert_lora(module) -> bool:
+    """True when every expert stack is a plain floating point Parameter and no
+    Unsloth expert LoRA is stashed on the module: nothing here needs Unsloth's
+    dispatcher, so transformers' grouped_mm (what these classes ran before the
+    "unsloth" default existed) computes the same thing and stays inside a compiled
+    MoE block. Packed 4-bit stacks are Params4bit, a stashed LoRA sits under
+    `_unsloth_lora_<name>` (moe_utils.moe_lora_stash_name); both keep the dispatcher."""
+    params = module._parameters
+    found = False
+    for name in _EXPERT_STACK_NAMES:
+        param = params.get(name)
+        if param is None:
+            continue
+        if type(param) is not nn.Parameter or param.dtype not in _DENSE_STACK_DTYPES:
+            return False
+        if getattr(module, "_unsloth_lora_" + name, None) is not None:
+            return False
+        found = True
+    return found
+
+
 def unsloth_experts_forward(
     self: nn.Module,
     hidden_states: torch.Tensor,
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """The "unsloth" experts implementation: Unsloth's backend dispatcher
-    (bnb 4-bit, FP8, grouped_mm, Triton, or the eager loop), for any decorated
-    experts class. An ungated module (up_proj only) is not a shape the grouped
-    path knows, and a class with its own `_apply_gate` (clamped or offset SwiGLU)
-    computes an activation the backends do not reproduce, so both take
-    transformers' own implementation."""
+    """The "unsloth" experts implementation. Dense stacks with no expert LoRA take
+    transformers' grouped_mm, which a compiled MoE block inlines as before; packed
+    stacks and expert LoRA take Unsloth's dispatcher, which is kept out of Dynamo."""
+    if _TRANSFORMERS_GROUPED_MM is not None and _dense_experts_without_expert_lora(self):
+        return _TRANSFORMERS_GROUPED_MM(self, hidden_states, top_k_index, top_k_weights)
+    return _unsloth_experts_dispatch(self, hidden_states, top_k_index, top_k_weights)
+
+
+# Kept out of Dynamo like the per-model MoE block patches: a compiled MoE block
+# that inlined the dispatch (dequantization, permutation, grouped GEMM) had
+# AOT autograd save every dequantized expert stack for backward, 13 GB a layer
+# on Inkling-Small, and ran out of memory on the first forward.
+@torch.compiler.disable
+def _unsloth_experts_dispatch(
+    self: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Unsloth's backend dispatcher (bnb 4-bit, FP8, grouped_mm, Triton, or the
+    eager loop), for any decorated experts class. An ungated module (up_proj only)
+    is not a shape the grouped path knows, and a class with its own `_apply_gate`
+    (clamped or offset SwiGLU) computes an activation the backends do not
+    reproduce, so both take transformers' own implementation."""
     if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
@@ -229,6 +270,12 @@ def patch_experts_interface():
     except Exception as e:
         return logger.warning(f"Unsloth: could not patch the experts interface: {e}")
 
+    global _TRANSFORMERS_GROUPED_MM
+    if _TRANSFORMERS_GROUPED_MM is None:
+        try:
+            _TRANSFORMERS_GROUPED_MM = interface["grouped_mm"] if "grouped_mm" in interface else None
+        except Exception:
+            _TRANSFORMERS_GROUPED_MM = None
     if UNSLOTH_EXPERTS_IMPLEMENTATION not in interface:
         interface[UNSLOTH_EXPERTS_IMPLEMENTATION] = unsloth_experts_forward
 
