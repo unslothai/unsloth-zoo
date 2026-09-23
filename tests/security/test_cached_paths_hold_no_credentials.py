@@ -101,6 +101,21 @@ CREDENTIAL_FILES = {
 }
 
 
+# The files each DEFAULT home holds, so a workflow persisting one exactly is caught.
+# The configured-home branch already tested `<home>/<file>`; defaults had no variable to
+# take filenames from, so uploading `~/.cargo/credentials.toml` outright passed both
+# guards -- the default directory is not inside the persisted file, which is the only
+# question that was being asked.
+DEFAULT_HOME_FILES = {
+    "~/.cache/huggingface": ("token", "stored_tokens"),
+    "~/.huggingface": ("token",),
+    "~/.cargo": ("credentials", "credentials.toml"),
+    "~/.docker": ("config.json",),
+    "~/.npmrc": (),
+    "~/.aws": ("credentials",),
+    "~/.config/gh": ("hosts.yml",),
+}
+
 DEFAULT_CREDENTIAL_HOMES = {
     "~/.cache/huggingface": "HF_HOME default; token, stored_tokens",
     "~/.huggingface": "legacy HF_HOME default; token",
@@ -412,6 +427,30 @@ def _units(job, doc, env = None, inputs = None, depth = 0):
     return out
 
 
+
+def _ref_candidates(uses: str):
+    """Every source-tree path a `./...` action reference could name.
+
+    A job that checks this repository out into a subdirectory writes
+    `./unsloth/.github/actions/x`, which is the same action through a layout that only
+    exists on the runner. Probing the reference as written found nothing, so the
+    composite was never flattened: a job could persist its credential home and delegate
+    the login to such a composite with nothing seeing it. `notebooks-ci.yml` and
+    `version-compat-ci.yml` both use this form.
+    """
+    ref = uses.strip()
+    if ref.startswith("./"):
+        ref = ref[2:]
+    ref = ref.rstrip("/")
+    bases = [REPO / ref]
+    parts = ref.split("/")
+    if ".github" in parts[1:]:
+        bases.append(REPO / "/".join(parts[parts.index(".github"):]))
+    for base in bases:
+        for cand in (base, base / "action.yml", base / "action.yaml"):
+            yield cand
+
+
 def _flat_steps(job, inherited = None, inputs = None, stack = None):
     """(step, inherited env, caller inputs) for this job and every local composite it uses.
 
@@ -446,8 +485,7 @@ def _flat_steps(job, inherited = None, inputs = None, stack = None):
         uses = str(step.get("uses") or "").strip().strip("'\"")
         if not uses.startswith("./"):
             continue
-        base = REPO / uses[2:]
-        for cand in (base, base / "action.yml", base / "action.yaml"):
+        for cand in _ref_candidates(uses):
             if not cand.is_file():
                 continue
             if cand in stack:
@@ -744,6 +782,28 @@ def _inside(inner: str, outer: str, files = None) -> bool:
     return any(outer == inner.rstrip("/") + "/" + f for f in (files or ()))
 
 
+
+def _default_home_hits(persisted: str, overridden: set) -> list:
+    """Which default credential homes this persisted path reaches.
+
+    Factored out so the rule can be exercised directly. It was previously inline, and
+    the test that meant to check it asserted on the module's own source text -- which
+    counted the assertion itself and passed whatever the rule did.
+    """
+    hits = []
+    for default, creds in DEFAULT_CREDENTIAL_HOMES.items():
+        # A default is only where the tool looks when nothing overrides it. A job
+        # setting `CARGO_HOME: /tmp/cargo` writes credentials there, so persisting
+        # `~/.cargo` holds none, and flagging it was a false failure.
+        if any(v in overridden for v in DEFAULT_OWNERS.get(default, ())):
+            continue
+        # With the filenames that home holds, so persisting the credential FILE outright
+        # counts as well as persisting the directory.
+        if _inside(default, persisted, DEFAULT_HOME_FILES.get(default, ())):
+            hits.append((default, creds))
+    return hits
+
+
 def _findings():
     """(label, what, detail) for every job persisting a credential home.
 
@@ -801,14 +861,8 @@ def _findings():
             # does not cross that boundary and moves nothing in the callee.
             overridden = {v for v in CREDENTIAL_HOMES if v in job_env}
             for p in (_expand(p, job_env, unit_inputs) for p in raw):
-                for default, creds in DEFAULT_CREDENTIAL_HOMES.items():
-                    # A default is only where the tool looks when nothing overrides it.
-                    # A job setting `CARGO_HOME: /tmp/cargo` writes credentials there, so
-                    # persisting `~/.cargo` holds none.
-                    if any(v in overridden for v in DEFAULT_OWNERS.get(default, ())):
-                        continue
-                    if _inside(default, p):
-                        yield label, f"cached path {p!r}", f"is a default credential home ({creds})"
+                for _default, creds in _default_home_hits(p, overridden):
+                    yield label, f"cached path {p!r}", f"is a default credential home ({creds})"
 
 
 def test_the_scan_finds_the_workflows_it_claims_to():
@@ -2120,3 +2174,77 @@ def test_a_default_home_override_must_come_from_the_same_runner(tmp_path, monkey
             "the caller's variable must not appear in the called job's environment, or "
             "it will be read as overriding a default it cannot move"
         )
+
+
+def test_a_composite_used_from_a_checkout_subdirectory_is_flattened(tmp_path, monkeypatch):
+    """`./unsloth/.github/actions/x` names the same composite, one layout later.
+
+    Probing the reference as written found nothing in the source tree, so the steps were
+    never flattened and a job could persist its credential home while delegating the
+    login to such a composite with nothing seeing it.
+    """
+    import sys
+
+    module = sys.modules[__name__]
+    wf = tmp_path / ".github" / "workflows"
+    act = tmp_path / ".github" / "actions" / "hidden-login"
+    wf.mkdir(parents = True)
+    act.mkdir(parents = True)
+    (act / "action.yml").write_text(
+        "name: hidden login\n"
+        "runs:\n  using: composite\n  steps:\n"
+        "    - run: hf auth login --token x\n      shell: bash\n"
+    )
+    monkeypatch.setattr(module, "REPO", tmp_path)
+
+    job = {
+        "env": {"HF_HOME": "hf-cache"},
+        "steps": [
+            {"uses": "./unsloth/.github/actions/hidden-login"},
+            {"uses": "actions/cache/save@v4", "with": {"path": "hf-cache", "key": "k"}},
+        ],
+    }
+    assert _login_offenders({}, job), (
+        "the prefixed reference names the same composite, which logs in"
+    )
+
+
+def test_a_default_credential_file_persisted_exactly_is_caught():
+    """`path: ~/.cargo/credentials.toml` is the credential, not a directory holding it.
+
+    The configured-home branch was taught to match `<home>/<file>`; defaults had no
+    variable to take filenames from, so persisting the exact default file asked only
+    whether the default DIRECTORY was inside the persisted FILE, which is never true.
+    """
+    assert DEFAULT_HOME_FILES["~/.cargo"] == ("credentials", "credentials.toml")
+    assert _inside(
+        "~/.cargo", "~/.cargo/credentials.toml", DEFAULT_HOME_FILES["~/.cargo"]
+    ) is True
+    assert _inside(
+        "~/.docker", "~/.docker/config.json", DEFAULT_HOME_FILES["~/.docker"]
+    ) is True
+    assert _inside(
+        "~/.cache/huggingface",
+        "~/.cache/huggingface/token",
+        DEFAULT_HOME_FILES["~/.cache/huggingface"],
+    ) is True
+    # Something else under the same home is still not a credential.
+    assert _inside(
+        "~/.cargo", "~/.cargo/registry", DEFAULT_HOME_FILES["~/.cargo"]
+    ) is False
+    # The filenames are load-bearing: without them the same question answers no, which
+    # is exactly what the default-home rule was asking before they were supplied.
+    assert _inside("~/.cargo", "~/.cargo/credentials.toml") is False
+    # Every default this module reports has its filenames recorded.
+    for default in DEFAULT_CREDENTIAL_HOMES:
+        assert default in DEFAULT_HOME_FILES, default
+    # And the rule really consults them. Asserted by calling it, not by reading this
+    # file's own source -- the previous version counted its own assertion text and
+    # passed however the rule behaved.
+    assert _default_home_hits("~/.cargo/credentials.toml", set()), (
+        "persisting the exact default credential file has to be a finding"
+    )
+    assert _default_home_hits("~/.docker/config.json", set())
+    assert not _default_home_hits("~/.cargo/registry", set())
+    # An override still exempts it, so the narrowing from earlier rounds is intact.
+    assert not _default_home_hits("~/.cargo/credentials.toml", {"CARGO_HOME"})
