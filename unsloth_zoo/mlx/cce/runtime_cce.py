@@ -216,9 +216,7 @@ def _chunk_matmul(
     )
 
 
-# fast::tanh is not IEEE-strict (MSL 6.5.1): an overflowing ratio can return NaN
-# rather than saturating. True tanh is already 1.0 to float precision far below
-# 20, so the branch costs no accuracy and keeps a capped logit finite.
+# fast::tanh is not IEEE-strict (MSL 6.5.1): past ~44 it returns 0 or NaN, and true tanh is 1.0f by 20.
 _SOFTCAP_HEADER = """
 inline float cce_softcap_tanh(float ratio) {
     return ratio > 20.0f ? 1.0f : fast::tanh(ratio);
