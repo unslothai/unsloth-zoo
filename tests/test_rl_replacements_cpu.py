@@ -561,10 +561,7 @@ def test_bias_correction_kl_is_not_scaled_by_the_vllm_ratio(mode, use_bias_corre
     "mode", ["token_mask", "token_truncate", "sequence_mask", "sequence_truncate"]
 )
 def test_unscored_vllm_token_does_not_nan_the_loss(mode):
-    # vLLM does not always return a logprob: `sanitize_logprob` maps the missing value to None and
-    # TRL turns that back into nan. One such token used to make the whole step's loss nan, because
-    # `nan * 0` survives the mask, `clamp` passes nan through and `nan < min` / `nan > max` are both
-    # False so the masked modes do not catch it either.
+    # clamp passes nan and `nan < min` is False, so no IS mode caught an unscored token.
     beta = 0.04
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
     sampling = old - 0.01
@@ -593,14 +590,11 @@ def test_unscored_vllm_token_does_not_nan_the_loss(mode):
     assert torch.isfinite(nan_loss), f"{mode}: one unscored token made the loss {nan_loss.item()}"
     assert torch.isfinite(new_nan.grad).all(), f"{mode}: gradient is not finite"
 
-    # The unscored token gets ratio exp(0) = 1, so only its own contribution moves; every other
-    # row keeps the clean gradient.
     assert torch.allclose(new_nan.grad[1:], new_clean.grad[1:], atol=1e-12, rtol=1e-10)
 
 
 def test_unscored_vllm_token_is_neutral_not_dropped():
-    # exp(0) = 1 means "apply no correction to this token", which is what TRL does. Zeroing the
-    # ratio instead would drop the token from the policy term entirely.
+    # A zero ratio would drop the token from the policy term; TRL applies no correction instead.
     beta = 0.0
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
     sampling = old.clone()
@@ -618,8 +612,6 @@ def test_unscored_vllm_token_is_neutral_not_dropped():
         ref, new_vllm, old, sampling, input_ids, mask, beta, advantages, **kwargs
     )[0]
 
-    # sampling == old everywhere else, so every other ratio is exp(0) = 1 too: the corrected loss
-    # must equal the uncorrected one.
     new_plain = new.clone().requires_grad_(True)
     plain_kwargs = dict(kwargs)
     plain_kwargs["use_vllm"] = False
@@ -635,8 +627,6 @@ def test_unscored_vllm_token_is_neutral_not_dropped():
     "mode", ["token_mask", "token_truncate", "sequence_mask", "sequence_truncate"]
 )
 def test_unscored_vllm_token_keeps_the_logged_metrics_finite(mode):
-    # unsloth logs torch.mean / torch.max of `delta` as sampling/sampling_logp_difference, so a nan
-    # left in it logs nan every step even though the loss is fine.
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
     sampling = old - 0.01 * torch.arange(1, old.numel() + 1, dtype=old.dtype).reshape(old.shape)
     kwargs.update(
@@ -650,11 +640,10 @@ def test_unscored_vllm_token_keeps_the_logged_metrics_finite(mode):
         ref, new, old, sampling, input_ids, mask, 0.04, advantages, **kwargs
     )[3]
 
-    # Unscore the token with the largest difference so a nan-aware max has to skip it.
     i, j = divmod(int(clean_delta.argmax()), clean_delta.shape[1])
     unscored = sampling.clone()
     unscored[i, j] = float("nan")
-    # And one padding token: nan * 0 is still nan.
+    # nan * 0 is still nan, so a padding token counts too.
     pad_i, pad_j = (mask == 0).nonzero()[0].tolist()
     unscored[pad_i, pad_j] = float("nan")
     _, _, _, delta, flat_is_ratio, _, _ = rr.grpo_compute_loss(

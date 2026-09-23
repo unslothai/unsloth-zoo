@@ -505,10 +505,7 @@ def grpo_compute_loss(
             # Filter out extra leading prompt tokens after left-padding input_ids.
             # Match TRL: aggregate log-ratios then exp (product), not sum of exp ratios.
             importance_sampling_ratio = (old - sampling_per_token_logps) * mask
-            # vLLM returns no logprob for some tokens; `sanitize_logprob` turns those into None and
-            # TRL maps them back to nan, and `nan * 0` is still nan, so `mask` does not clear them.
-            # Zero the difference the way TRL does (grpo_trainer.py: per_token_logps_diff) so an
-            # unscored token gets ratio exp(0) = 1 instead of turning the whole step's loss nan.
+            # Unscored vLLM tokens arrive as nan and nan * 0 survives the mask: ratio 1, as TRL does.
             importance_sampling_ratio = torch.nan_to_num(importance_sampling_ratio, nan = 0.0)
 
             if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
@@ -625,8 +622,7 @@ def grpo_compute_loss(
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
             delta = delta * mask
-            # An unscored token has no logprob difference: zero it so the logged mean / max stay
-            # finite (delta >= 0, so a zero never wins the max). Same shape, unlike TRL's filter.
+            # Zeroed rather than filtered like TRL, to keep the returned shape.
             delta = torch.nan_to_num(delta, nan = 0.0, posinf = math.inf)
             flat_is_ratio = importance_sampling_ratio * mask
     else:
