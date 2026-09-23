@@ -30,6 +30,7 @@ bit-identical to what one kernel call would produce. Dequantization resolves
 the (possibly nested) absmax once and dequantizes the same pieces. Tensors
 below the limit take bitsandbytes' own path untouched.
 """
+import inspect
 import math
 
 import torch
@@ -63,16 +64,24 @@ def patch_bitsandbytes_large_tensors():
     original_quantize = F.quantize_4bit
     original_dequantize = F.dequantize_4bit
 
-    def quantize_4bit(
+    # Below the limit the caller's own arguments go through untouched: bitsandbytes 0.45 and
+    # 0.46 declare blocksize = 64 and reject an explicit None, 0.47 and later default to None.
+    quantize_signature = inspect.signature(original_quantize)
+    dequantize_signature = inspect.signature(original_dequantize)
+
+    def quantize_4bit(A, *args, **kwargs):
+        n = A.numel()
+        if n <= BNB_INT32_ELEMENT_LIMIT:
+            return original_quantize(A, *args, **kwargs)
+        bound = quantize_signature.bind(A, *args, **kwargs)
+        bound.apply_defaults()
+        return _quantize_large(A, **{k: v for k, v in bound.arguments.items() if k != "A"})
+
+    def _quantize_large(
         A, absmax = None, out = None, blocksize = None, compress_statistics = False,
         quant_type = "fp4", quant_storage = torch.uint8,
     ):
         n = A.numel()
-        if n <= BNB_INT32_ELEMENT_LIMIT:
-            return original_quantize(
-                A, absmax = absmax, out = out, blocksize = blocksize,
-                compress_statistics = compress_statistics, quant_type = quant_type, quant_storage = quant_storage,
-            )
         if blocksize is None:
             blocksize = 64
         input_shape = A.shape
@@ -114,15 +123,25 @@ def patch_bitsandbytes_large_tensors():
             state.absmax = absmax
         return out, state
 
-    def dequantize_4bit(A, quant_state = None, absmax = None, out = None, blocksize = None, quant_type = "fp4"):
-        if quant_state is None:
+    def dequantize_4bit(A, *args, **kwargs):
+        # Positional order (A, quant_state, absmax, out, ...) is the same on every bitsandbytes.
+        quant_state = kwargs["quant_state"] if "quant_state" in kwargs else (args[0] if len(args) > 0 else None)
+        if quant_state is not None:
+            n = math.prod(quant_state.shape)
+        else:
+            out = kwargs["out"] if "out" in kwargs else (args[2] if len(args) > 2 else None)
             n = out.numel() if out is not None else 0
+        if n <= BNB_INT32_ELEMENT_LIMIT:
+            return original_dequantize(A, *args, **kwargs)
+        bound = dequantize_signature.bind(A, *args, **kwargs)
+        bound.apply_defaults()
+        return _dequantize_large(A, **{k: v for k, v in bound.arguments.items() if k != "A"})
+
+    def _dequantize_large(A, quant_state = None, absmax = None, out = None, blocksize = None, quant_type = "fp4"):
+        if quant_state is None:
+            n = out.numel()
         else:
             n = math.prod(quant_state.shape)
-        if n <= BNB_INT32_ELEMENT_LIMIT:
-            return original_dequantize(
-                A, quant_state = quant_state, absmax = absmax, out = out, blocksize = blocksize, quant_type = quant_type,
-            )
         if quant_state is None:
             quant_state = QuantState(
                 absmax = absmax, shape = out.shape, dtype = out.dtype, blocksize = blocksize or 64,

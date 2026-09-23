@@ -17,6 +17,19 @@ from unsloth_zoo.temporary_patches.moe_experts_interface import expert_forward_i
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _fp32_tolerance(default):
+    # The Triton grouped GEMM accumulates at about 1e-3 in fp32 on every MoE (Qwen3-MoE and
+    # Mixtral included); torch grouped_mm and the native loop match the dense forward to 1e-6.
+    # Ask the module the installed experts forward comes from (the compiled cache copy or
+    # unsloth_zoo), since each keeps its own cached backend choice.
+    import sys
+    module = sys.modules.get(getattr(Llama4TextExperts.forward, "__module__", ""), None)
+    select = getattr(module, "select_moe_backend", None)
+    if select is None:
+        from unsloth_zoo.temporary_patches.moe_utils import select_moe_backend as select
+    return 3e-3 if select() == "unsloth_triton" else default
+
+
 @pytest.fixture(autouse = True, scope = "module")
 def _restore_llama4_classes():
     saved = {cls: dict(vars(cls)) for cls in (Llama4TextExperts, Llama4TextMoe)}
@@ -50,10 +63,16 @@ def reference_forward(moe, hidden_states):
     return out, router_logits
 
 
+# Multiples of the Triton grouped GEMM tiles, which is the backend chosen where torch._grouped_mm
+# is unavailable; its kernels assert K % BLOCK_SIZE_K == 0. 2 * 128 == 256 also makes gate_up
+# square, so the declared (E, in, out) layout decides the orientation, not the shape.
+HIDDEN = 256
+
+
 def make_moe(top_k, dtype, seed = 0):
     torch.manual_seed(seed)
     config = Llama4TextConfig(
-        hidden_size = 64, intermediate_size = 96, intermediate_size_mlp = 128,
+        hidden_size = HIDDEN, intermediate_size = 128, intermediate_size_mlp = 256,
         num_local_experts = 4, num_experts_per_tok = top_k, num_hidden_layers = 1,
         num_attention_heads = 2, num_key_value_heads = 1, head_dim = 32, vocab_size = 256,
     )
@@ -72,13 +91,13 @@ def test_patched_forward_matches_reference(top_k, dtype):
     assert Llama4TextExperts.is_transposed is True
     moe = make_moe(top_k, dtype)
     assert expert_forward_is_handled(moe.experts)
-    x = torch.randn(3, 5, 64, device = DEVICE, dtype = dtype)
+    x = torch.randn(3, 5, HIDDEN, device = DEVICE, dtype = dtype)
 
     ref_out, ref_logits = reference_forward(moe, x.clone())
     out, logits = moe(x)
-    assert out.shape == ref_out.shape == (15, 64)
+    assert out.shape == ref_out.shape == (15, HIDDEN)
     assert torch.equal(logits, ref_logits)
-    tol = 1e-5 if dtype is torch.float32 else 2e-2
+    tol = _fp32_tolerance(1e-5) if dtype is torch.float32 else 2e-2
     assert torch.allclose(out.float(), ref_out.float(), atol = tol, rtol = tol), \
         (out.float() - ref_out.float()).abs().max()
 
@@ -86,7 +105,7 @@ def test_patched_forward_matches_reference(top_k, dtype):
 def test_backward_matches_reference_fp32():
     patch_llama4_moe()
     moe = make_moe(1, torch.float32)
-    x = torch.randn(2, 6, 64, device = DEVICE)
+    x = torch.randn(2, 6, HIDDEN, device = DEVICE)
 
     ref_out, _ = reference_forward(moe, x)
     ref_out.square().sum().backward()
@@ -99,7 +118,13 @@ def test_backward_matches_reference_fp32():
 
     for name in ("experts.gate_up_proj", "experts.down_proj", "router.weight", "shared_expert.gate_proj.weight"):
         assert name in ref and name in got, name
-        assert torch.allclose(got[name], ref[name], atol = 1e-4, rtol = 1e-4), \
+        if _fp32_tolerance(None) is None:
+            assert torch.allclose(got[name], ref[name], atol = 1e-4, rtol = 1e-4), \
+                (name, (got[name] - ref[name]).abs().max())
+            continue
+        # Triton: about 4e-3 of the largest gradient on square and non-square stacks alike, where
+        # a wrong orientation would be off by the order of the gradient itself.
+        assert (got[name] - ref[name]).abs().max() <= 1e-2 * ref[name].abs().max(), \
             (name, (got[name] - ref[name]).abs().max())
 
 
@@ -136,3 +161,24 @@ def test_a_failed_moe_patch_leaves_both_forwards_alone(monkeypatch):
     assert Llama4TextExperts.forward is experts_forward
     assert Llama4TextMoe.forward is moe_forward
     assert not Llama4TextExperts._unsloth_already_patched
+
+
+def test_no_patch_before_the_tuple_returning_router(monkeypatch):
+    # Before transformers 4.54 the router is a plain nn.Linear returning logits only and the MoE
+    # returns transposed scores; the patched forward unpacks (scores, logits) and would raise or,
+    # with exactly two tokens, run and return NaN. Those versions keep their own forwards.
+    import transformers.models.llama4.modeling_llama4 as modeling_llama4
+
+    def experts_forward(self, hidden_states):
+        return hidden_states
+
+    def moe_forward(self, hidden_states):
+        return hidden_states
+
+    monkeypatch.setattr(Llama4TextExperts, "forward", experts_forward)
+    monkeypatch.setattr(Llama4TextMoe, "forward", moe_forward)
+    monkeypatch.setattr(Llama4TextExperts, "_unsloth_already_patched", False)
+    monkeypatch.delattr(modeling_llama4, "Llama4Router", raising = False)
+    patch_llama4_moe()
+    assert Llama4TextExperts.forward is experts_forward
+    assert Llama4TextMoe.forward is moe_forward

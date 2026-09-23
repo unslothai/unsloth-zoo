@@ -883,6 +883,19 @@ def _check_grouped_gemm_available():
         _GROUPED_GEMM_AVAILABLE = False
         return False
 
+    # The kernels name tl.make_tensor_descriptor in their source, and Triton's JIT resolves
+    # every attribute a kernel mentions while hashing it, whatever branch runs. Triton 3.3
+    # (torch 2.7) only has _experimental_make_tensor_descriptor, so every launch raised
+    # AttributeError there; the native loop is the backend that works.
+    try:
+        import triton.language as tl
+        if not hasattr(tl, "make_tensor_descriptor"):
+            _GROUPED_GEMM_AVAILABLE = False
+            return False
+    except Exception:
+        _GROUPED_GEMM_AVAILABLE = False
+        return False
+
     try:
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True
@@ -1543,19 +1556,19 @@ def extract_moe_lora_weights_for_grouped_mm(
     if canonical_match and reversed_match:
         # A square stack (2 * intermediate == hidden, as on Inkling-Small's
         # (256, 4096, 4096) gate_up_proj) matches both readings by shape alone.
-        # PEFT's own bookkeeping settles it: when it swapped in/out for an
-        # (E, out, in) stack, or the stack is stored (E, in, out) already,
-        # lora_A is (rank, in) and lora_B is (out, rank), the canonical reading.
-        # Only a PEFT that took the stack's second dim as its input keeps the
-        # reversed reading. Picking reversed on the swap flag applied the LoRA
-        # of every square stack through the wrong dims.
+        # PEFT takes the stack's second dim as its input unless it swaps, and the
+        # canonical reading (lora_A is (rank, in), lora_B is (out, rank)) holds
+        # exactly when that choice and the stored layout disagree: an (E, out, in)
+        # stack PEFT swapped, or an (E, in, out) stack it did not. Which layouts
+        # PEFT swaps changed between releases (0.19.0 swaps is_transposed stacks,
+        # 0.19.1 and later swap the others), so neither flag decides alone.
         swapped = bool(getattr(wrapper, "_did_swap_in_out_features", False))
         base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
         stored_in_out = (
             getattr(base, "is_transposed", None) is True
             or bool(getattr(base, "_unsloth_grouped_mm_format", False))
         )
-        if swapped or stored_in_out:
+        if swapped != stored_in_out:
             first_weight, second_weight = _canonical_lora_weights_for_grouped_mm(
                 weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
             )

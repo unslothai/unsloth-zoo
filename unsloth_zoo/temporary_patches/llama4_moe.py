@@ -106,6 +106,11 @@ def patch_llama4_moe():
 
     try:
         from transformers.models.llama4.modeling_llama4 import Llama4TextExperts, Llama4TextMoe
+        # The forward below reads (scores, logits) from the router. Before transformers 4.54 the
+        # router is a plain nn.Linear returning logits only and the MoE returns the transposed
+        # scores instead; leave those versions on their own forward (their experts then stay
+        # unpacked in 4-bit, since the quantizer only packs experts Unsloth routes).
+        from transformers.models.llama4.modeling_llama4 import Llama4Router
     except Exception:
         return
 
