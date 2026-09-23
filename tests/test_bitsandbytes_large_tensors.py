@@ -53,6 +53,30 @@ def test_chunked_matches_single_call(monkeypatch, dtype, nested, storage):
     assert torch.equal(F.dequantize_4bit(ref_data, ref_state), ref_out)
 
 
+@pytest.mark.parametrize("row_packed", [True, False])
+def test_chunked_out_buffer_matches_bitsandbytes(monkeypatch, row_packed):
+    """With out given, the chunked path fills out and returns it oriented as bitsandbytes does."""
+    from bitsandbytes import functional as F
+    orig_q, orig_d = _original()
+    torch.manual_seed(0)
+    A = torch.randn(1024, 1536, device = "cuda", dtype = torch.bfloat16)
+    data, state = orig_q(A, blocksize = 64, compress_statistics = True, quant_type = "nf4")
+    if row_packed:
+        data = data.reshape(1, -1)
+    ref_buffer = torch.empty(A.shape, device = "cuda", dtype = A.dtype)
+    ref = orig_d(data, state, out = ref_buffer)
+    monkeypatch.setattr(L, "BNB_INT32_ELEMENT_LIMIT", A.numel() - 1)
+    monkeypatch.setattr(L, "_PIECE_ELEMENTS", 2**18)
+    buffer = torch.empty(A.shape, device = "cuda", dtype = A.dtype)
+    got = F.dequantize_4bit(data, state, out = buffer)
+    assert got.shape == ref.shape and torch.equal(got, ref)
+    assert got.data_ptr() == buffer.data_ptr() and torch.equal(buffer, ref_buffer)
+    # An out that cannot be flattened as a view (a transpose) is still written.
+    transposed = torch.empty(A.shape[1], A.shape[0], device = "cuda", dtype = A.dtype).t()
+    got = F.dequantize_4bit(data, state, out = transposed)
+    assert torch.equal(transposed, ref_buffer) and torch.equal(got, ref)
+
+
 def test_small_tensors_take_the_original_path():
     from bitsandbytes import functional as F
     orig_q, _ = _original()

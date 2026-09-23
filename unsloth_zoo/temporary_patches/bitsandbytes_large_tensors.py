@@ -140,7 +140,9 @@ def patch_bitsandbytes_large_tensors():
         values_per_storage = storage_itemsize * 2
         piece = _piece_elements(bs, storage_itemsize)
         flat_packed = A.reshape(-1)
-        result = torch.empty(n, device = A.device, dtype = quant_state.dtype) if out is None else out.reshape(-1)
+        # A non-contiguous out would make reshape(-1) a copy, so fill a scratch buffer and copy back.
+        in_place = out is not None and out.is_contiguous()
+        result = out.view(-1) if in_place else torch.empty(n, device = A.device, dtype = quant_state.dtype)
         for start in range(0, n, piece):
             count = min(piece, n - start)
             sub_state = QuantState(
@@ -152,7 +154,10 @@ def patch_bitsandbytes_large_tensors():
             result[start : start + count] = original_dequantize(sub_packed.reshape(-1, 1), quant_state = sub_state).reshape(-1)
         result = result.reshape(quant_state.shape)
         if out is not None:
-            return out
+            if not in_place:
+                out.copy_(result.reshape(out.shape))
+            result = out
+        # Same orientation as bitsandbytes, which transposes a row-packed A with or without out.
         if A.shape[0] == 1:
             return result.t()
         return result
