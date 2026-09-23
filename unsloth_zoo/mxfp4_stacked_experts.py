@@ -38,8 +38,7 @@ __all__ = [
     "Mxfp4StackedExperts",
     "dense_expert_modules",
     "mxfp4_grouped_linear",
-    "stack_packed_expert_blocks",
-    "stack_packed_expert_scales",
+    "stack_packed_experts",
 ]
 
 # Upper bound on the 16-bit weights one grouped GEMM dequantizes at once. A Kimi-K3 layer's
@@ -296,16 +295,12 @@ def dense_expert_modules(experts, device = "cpu"):
     return out
 
 
-def stack_packed_expert_blocks(per_expert_lists):
-    """[(E tensors (out, in / 2) uint8) per projection] -> (E, sum(out), in / 32, 16)."""
+def stack_packed_experts(per_expert_lists, blocks = True):
+    """[(E tensors (out, n) uint8) per projection] -> (E, sum(out), n), the projections
+    concatenated on out. ``blocks`` (packed bytes, n = in / 2) come out as (E, sum(out), in / 32,
+    16); scales (n = in / 32) as they are."""
     stacks = [torch.stack(list(tensors), dim = 0) for tensors in per_expert_lists]
     stacked = stacks[0] if len(stacks) == 1 else torch.cat(stacks, dim = 1)
-    E, N, half = stacked.shape
-    return stacked.reshape(E, N, half // 16, 16).contiguous()
-
-
-def stack_packed_expert_scales(per_expert_lists):
-    """[(E tensors (out, in / 32) uint8) per projection] -> (E, sum(out), in / 32)."""
-    stacks = [torch.stack(list(tensors), dim = 0) for tensors in per_expert_lists]
-    stacked = stacks[0] if len(stacks) == 1 else torch.cat(stacks, dim = 1)
+    if blocks:
+        stacked = stacked.reshape(*stacked.shape[:2], -1, 16)
     return stacked.contiguous()

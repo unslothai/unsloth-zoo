@@ -326,7 +326,7 @@ def _swap_out_packed_modules(model):
     found = []
     for name, module in list(model.named_modules()):
         stacked = getattr(type(module), "_unsloth_mxfp4_stacked_experts", False)
-        if not stacked and not getattr(type(module), "_unsloth_mxfp4_packed", False):
+        if not stacked and not getattr(type(module), "_unsloth_mxfp4_packed_linear", False):
             continue
         parent_name, _, child = name.rpartition(".")
         parent = model.get_submodule(parent_name) if parent_name else model

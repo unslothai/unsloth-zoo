@@ -16,11 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam, mxfp4_dequantize_torch
-from unsloth_zoo.mxfp4_stacked_experts import (
-    Mxfp4StackedExperts,
-    stack_packed_expert_blocks,
-    stack_packed_expert_scales,
-)
+from unsloth_zoo.mxfp4_stacked_experts import Mxfp4StackedExperts, stack_packed_experts
 from unsloth_zoo.temporary_patches import moe_utils as mu
 from unsloth_zoo.temporary_patches import mxfp4 as mx
 
@@ -73,14 +69,14 @@ def _ct_decompress(packed, scale):
 def _experts(fused = True, seed = 0):
     ckpt = _checkpoint_bytes(seed)
     module = Mxfp4StackedExperts(E, H, I, _Situ() if fused else nn.SiLU(), fused, device = "cpu")
-    module.gate_up_blocks.data = stack_packed_expert_blocks(
+    module.gate_up_blocks.data = stack_packed_experts(
         [[p for p, _ in ckpt["w1"]], [p for p, _ in ckpt["w3"]]]
     )
-    module.gate_up_scales.data = stack_packed_expert_scales(
-        [[s for _, s in ckpt["w1"]], [s for _, s in ckpt["w3"]]]
+    module.gate_up_scales.data = stack_packed_experts(
+        [[s for _, s in ckpt["w1"]], [s for _, s in ckpt["w3"]]], blocks = False
     )
-    module.down_blocks.data = stack_packed_expert_blocks([[p for p, _ in ckpt["w2"]]])
-    module.down_scales.data = stack_packed_expert_scales([[s for _, s in ckpt["w2"]]])
+    module.down_blocks.data = stack_packed_experts([[p for p, _ in ckpt["w2"]]])
+    module.down_scales.data = stack_packed_experts([[s for _, s in ckpt["w2"]]], blocks = False)
     return module.finalize().to(DEVICE), ckpt
 
 
