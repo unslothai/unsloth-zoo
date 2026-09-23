@@ -454,6 +454,13 @@ def test_compressed_packed_format_detection(tmp_path):
                   "config_groups": {"g": group()}}) is None
     assert write({"quant_method": "bitsandbytes", "load_in_4bit": True}) is None
     assert write(None) is None
+    # Kimi-K3 keeps it under text_config only; legacy llm-compressor nests it one level down.
+    mxfp4 = {"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+             "config_groups": {"g": group()}}
+    (tmp_path / "config.json").write_text(json.dumps({"text_config": {"quantization_config": mxfp4}}))
+    assert _compressed_packed_format(str(tmp_path)) == "mxfp4-pack-quantized"
+    legacy = {"quant_method": "compressed-tensors", "quantization_config": dict(mxfp4)}
+    assert write(legacy) == "mxfp4-pack-quantized"
 
 
 def test_merged_exports_still_run_under_inference_mode():

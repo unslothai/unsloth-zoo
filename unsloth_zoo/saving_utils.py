@@ -3789,6 +3789,22 @@ pass
 # (which PEFT holds on the stack, not on the per-expert keys) folded in; the other LoRAs then
 # merge onto those keys as on any 16-bit base. Other packed formats refuse.
 
+def _find_quantization_config(config):
+    """The config's ``quantization_config``, or the first one a sub-config carries (Kimi-K3
+    keeps it under ``text_config`` only)."""
+    if not isinstance(config, dict):
+        return None
+    quant = config.get("quantization_config")
+    if isinstance(quant, dict):
+        return quant
+    for value in config.values():
+        found = _find_quantization_config(value)
+        if found is not None:
+            return found
+    return None
+pass
+
+
 def _compressed_packed_format(model_name, token = None):
     """The compressed-tensors ``format`` of a base whose weights are stored packed
     (``weight_packed``): ``"mxfp4-pack-quantized"`` when every group is MXFP4, else the formats
@@ -3805,9 +3821,13 @@ def _compressed_packed_format(model_name, token = None):
             config = json.load(f)
     except Exception:
         return None
-    quant = config.get("quantization_config") if isinstance(config, dict) else None
-    if not isinstance(quant, dict):
+    quant = _find_quantization_config(config)
+    if quant is None:
         return None
+    # Legacy llm-compressor checkpoints nest the real config one level down.
+    inner = quant.get("quantization_config")
+    if isinstance(inner, dict) and "config_groups" in inner:
+        quant = dict(inner, quant_method = quant.get("quant_method"))
     if str(quant.get("quant_method", "")).lower().replace("_", "-") not in ("compressed-tensors", "sparseml"):
         return None
     top = quant.get("format")
