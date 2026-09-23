@@ -16,9 +16,13 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _peft_original_wrapper_forward():
-    for module in list(sys.modules.values()):
-        original = getattr(module, "_original_param_wrapper_forward", None)
-        if isinstance(module, type(sys)) and callable(original):
+    # Read module dicts directly: getattr on a transformers lazy module imports the attribute,
+    # which fails for vision models when their optional dependencies are absent.
+    for module in [MU, *list(sys.modules.values())]:
+        if not isinstance(module, type(sys)):
+            continue
+        original = vars(module).get("_original_param_wrapper_forward", None)
+        if callable(original):
             return original
     return None
 
