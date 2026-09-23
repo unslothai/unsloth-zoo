@@ -505,6 +505,8 @@ def grpo_compute_loss(
             # Filter out extra leading prompt tokens after left-padding input_ids.
             # Match TRL: aggregate log-ratios then exp (product), not sum of exp ratios.
             importance_sampling_ratio = (old - sampling_per_token_logps) * mask
+            # Unscored vLLM tokens arrive as nan and nan * 0 survives the mask: ratio 1, as TRL does.
+            importance_sampling_ratio = torch.nan_to_num(importance_sampling_ratio, nan = 0.0)
 
             if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
                 importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
@@ -620,6 +622,8 @@ def grpo_compute_loss(
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
             delta = delta * mask
+            # Zeroed rather than filtered like TRL, to keep the returned shape.
+            delta = torch.nan_to_num(delta, nan = 0.0, posinf = math.inf)
             flat_is_ratio = importance_sampling_ratio * mask
     else:
         delta = torch.tensor([]).detach()
