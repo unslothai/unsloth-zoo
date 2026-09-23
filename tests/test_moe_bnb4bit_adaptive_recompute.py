@@ -100,6 +100,26 @@ def test_momentary_pin_fits_reads_the_real_stack_size(monkeypatch):
     assert mu._momentary_pin_fits(q) is False             # and the headroom is honoured
 
 
+def test_momentary_pin_fits_measures_xpu_and_refuses_what_it_cannot_measure(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(mu, "_logical_expert_shape", lambda param: (4, 32, 64))
+    need = 4 * 32 * 64 * 2  # bf16
+    xpu = getattr(torch, "xpu", None)
+    if xpu is not None:
+        free = {"bytes": 0}
+        monkeypatch.setattr(xpu, "mem_get_info", lambda device = None: (free["bytes"], 1 << 40), raising = False)
+        monkeypatch.setattr(xpu, "memory_reserved", lambda device = None: 0, raising = False)
+        monkeypatch.setattr(xpu, "memory_allocated", lambda device = None: 0, raising = False)
+        param = SimpleNamespace(device = torch.device("xpu"), quant_state = None)
+        free["bytes"] = int(mu._MOMENTARY_PIN_HEADROOM * need)
+        assert mu._momentary_pin_fits(param) is True
+        free["bytes"] = need
+        assert mu._momentary_pin_fits(param) is False
+    # A device that cannot report free memory keeps the recompute.
+    assert mu._momentary_pin_fits(SimpleNamespace(device = torch.device("meta"), quant_state = None)) is False
+
+
 def test_env_override_forces_recompute(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", "1")
     with _gradient_checkpoint_recompute_marker():  # override beats the GC pin

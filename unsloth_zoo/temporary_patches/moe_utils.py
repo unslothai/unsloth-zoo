@@ -718,15 +718,18 @@ def _momentary_pin_fits(source) -> bool:
         while hasattr(param, "base_layer"):
             param = param.base_layer
         device = param.device
-        if device.type != "cuda":
-            return True
+        # CUDA (and ROCm through it) or XPU, whichever can report free memory; any other
+        # device cannot be measured and keeps the recompute.
+        backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+        if backend is None or not callable(getattr(backend, "mem_get_info", None)):
+            return False
         shape = _logical_expert_shape(param)
         if not shape:
             return False
         dtype = getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
         need = math.prod(int(d) for d in shape) * torch.empty((), dtype = dtype).element_size()
-        free, _ = torch.cuda.mem_get_info(device)
-        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        free, _ = backend.mem_get_info(device)
+        free += backend.memory_reserved(device) - backend.memory_allocated(device)
         return free >= _MOMENTARY_PIN_HEADROOM * need
     except Exception:
         return False
