@@ -3053,9 +3053,10 @@ def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=Non
 
 
 def _get_backbone_embed_kwarg(backbone):
+    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either.
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return None
     for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
         if name in params and params[name].kind in (
@@ -3068,7 +3069,7 @@ def _get_backbone_embed_kwarg(backbone):
 def _filter_backbone_kwargs(backbone, kwargs):
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return kwargs
     if "image_mask" in params and "image_mask" not in kwargs:
         kwargs = dict(kwargs)
