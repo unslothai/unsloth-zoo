@@ -67,6 +67,9 @@ def test_unknown_methods_are_recognised():
     # Left to transformers: no method, or an already built config object.
     assert planner._quantization_method_is_known({"bits": 4})
     assert planner._quantization_method_is_known(object())
+    # A config that normalised quant_method to transformers' enum is still known.
+    from transformers.utils.quantization_config import QuantizationMethod
+    assert planner._quantization_method_is_known({**_FP8_PLAN, "quant_method": QuantizationMethod.FP8})
 
 
 @needs_per_tensor_fp8

@@ -1683,7 +1683,12 @@ def _quantization_method_is_known(quantization_config: Any) -> bool:
         from transformers.quantizers.auto import AUTO_QUANTIZATION_CONFIG_MAPPING
     except Exception:
         return True
-    return str(method) in AUTO_QUANTIZATION_CONFIG_MAPPING
+    # The value itself, as from_dict looks it up: a QuantizationMethod enum equals its key
+    # while str() of it does not.
+    try:
+        return method in AUTO_QUANTIZATION_CONFIG_MAPPING
+    except TypeError:
+        return True
 
 
 def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
