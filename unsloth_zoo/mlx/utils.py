@@ -14722,6 +14722,41 @@ def _hadamard_dense_weight(layer):
     return weight
 
 
+def _unpack_hadamard_modules(model):
+    """Swap every Hadamard-packed layer for the dense layer it encodes; True if any."""
+    pack = _hadamard_pack_module()
+    if pack is None:
+        return False
+    dense = []
+    for name, module in model.named_modules():
+        if not isinstance(module, pack.HadamardQuantizedLinear):
+            continue
+        weight = _hadamard_dense_weight(module).astype(module.scales.dtype)
+        rows, width = weight.shape
+        if isinstance(module, pack.HadamardQuantizedEmbedding):
+            layer = nn.Embedding(rows, width)
+        else:
+            layer = nn.Linear(width, rows, bias=False)
+        layer.weight = weight
+        dense.append((name, layer))
+    if dense:
+        model.update_modules(mlx.utils.tree_unflatten(dense))
+    return bool(dense)
+
+
+# Pack-only keys; with the layers unpacked the tree is plain mlx-vlm Qwen3.5.
+_HADAMARD_PACK_CONFIG_KEYS = frozenset({
+    "schema_version", "base_model_type", "tensor_namespace", "gdn_activation_layout",
+    "modules", "requires_runtime", "hadamard_config", "components",
+})
+
+
+def _dense_hadamard_pack_config(config):
+    config = {k: v for k, v in config.items() if k not in _HADAMARD_PACK_CONFIG_KEYS}
+    config["model_type"] = "qwen3_5"
+    return config
+
+
 class LoRAHadamardLinear(nn.Module):
     """LoRA for mlx-vlm's ``HadamardQuantizedLinear``.
 
@@ -18518,10 +18553,13 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
         model.update_modules(tree_unflatten(fused_linears))
 
     if dequantize:
+        unpacked = _unpack_hadamard_modules(model)
         model = dequantize_model(model)
         cfg = getattr(model, "_config", None)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
+            if unpacked:
+                model._config = _dense_hadamard_pack_config(model._config)
     elif quantize_unquantized and not _model_has_quantized_module(model):
         # The fuse had nothing to requantize: quantize now or say so, but
         # never write full precision in silence.
