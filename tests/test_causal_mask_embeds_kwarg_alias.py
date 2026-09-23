@@ -72,8 +72,13 @@ def _call(builder, name, **extra):
 def test_the_original_refuses_the_other_spelling(patched):
     """The precondition, on this transformers version."""
     name = _embeds_name()
-    with pytest.raises(TypeError, match = "unexpected keyword argument"):
+    try:
         _call(patched._unsloth_original_create_causal_mask, _other(name))
+    except TypeError as error:
+        assert "unexpected keyword argument" in str(error)
+    else:
+        # 5.4 to 5.5 still map `input_embeds` through a deprecate_kwarg alias of their own.
+        pytest.skip("this transformers still accepts the other spelling itself")
 
 
 def test_the_original_refuses_cache_position_when_it_dropped_it(patched):
