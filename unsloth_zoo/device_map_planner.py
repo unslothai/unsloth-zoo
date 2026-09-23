@@ -134,6 +134,8 @@ Nothing here is specific to one architecture:
 from __future__ import annotations
 
 import inspect
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -410,6 +412,8 @@ class DeviceMapPlan:
     """Reserve the accepted packing really kept free, per device."""
     tied_to_head: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    load_transient_by_device: dict[int, int] = field(default_factory=dict)
+    """Room kept free per device for tensors merged while the checkpoint loads."""
 
     @property
     def free_bytes(self) -> dict[int, int]:
@@ -791,6 +795,107 @@ def _adjust_budgets_for_quantizer(
     return budgets, note
 
 
+# How many times the largest merged tensor a card must keep free while the
+# checkpoint loads. transformers 5 materialises every source tensor of a merging
+# converter (`MergeModulelist`, `Concatenate`) on the target card, then builds
+# the merged parameter next to them, so the allocated peak is one merged tensor
+# above the steady state. The caching allocator cannot reuse most of the holes
+# the freed sources leave, and the reserved peak is what hits the card's limit.
+# Measured on a B200, bf16, 128 experts of 6144 x 3072 (MiniMax-M3's shapes,
+# 9 GiB gate_up stacks): reserved peak 22.5 to 27.0 GiB above the loaded weights
+# at 4 and at 8 layers, so it does not grow with depth; 2.0x to 2.5x at 32
+# experts over 4, 8 and 16 layers. `expandable_segments:True` measured up to
+# 4.7x in one run.
+_LOAD_TRANSIENT_MULTIPLE = 3
+_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE = 5
+_MERGING_OPS = ("MergeModulelist", "Concatenate")
+
+
+def _expandable_segments_enabled() -> bool:
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        value = os.environ.get(var, "").replace(" ", "").lower()
+        if "expandable_segments:true" in value:
+            return True
+    return False
+
+
+def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> list:
+    """Target patterns of the load-time converters that build one parameter out
+    of several checkpoint tensors (per-expert weights stacked into one expert
+    tensor, gate and up concatenated). Empty when the installed transformers has
+    no conversion mapping (4.x) or the model registers none, so the planner is
+    unchanged there. Converters marked ``force_cpu`` merge on the CPU and cost
+    the card nothing."""
+    try:
+        from transformers.conversion_mapping import get_model_conversion_mapping
+    except Exception:
+        return []
+    try:
+        accepted = inspect.signature(get_model_conversion_mapping).parameters
+        kwargs = {"hf_quantizer": hf_quantizer} if (
+            hf_quantizer is not None and "hf_quantizer" in accepted
+        ) else {}
+        conversions = get_model_conversion_mapping(model, **kwargs) or []
+    except Exception:
+        return []
+    patterns = []
+    for conversion in conversions:
+        if getattr(conversion, "force_cpu", False):
+            continue
+        operations = getattr(conversion, "operations", None) or []
+        if not any(
+            base.__name__ in _MERGING_OPS
+            for op in operations for base in type(op).__mro__
+        ):
+            continue
+        for target in getattr(conversion, "target_patterns", None) or []:
+            try:
+                # A backreference to a source capture group matches any text here.
+                patterns.append(re.compile(re.sub(r"\\\d", ".*", str(target))))
+            except re.error:
+                continue
+    return patterns
+
+
+def _load_transient_by_unit(
+    model: nn.Module,
+    units: Sequence[tuple[str, int]],
+    hf_quantizer: Any = None,
+) -> dict[str, int]:
+    """Bytes each placement unit needs free on its card, beyond its own
+    weights, while a merging converter builds its largest parameter. Units with
+    no merged parameter are absent."""
+    patterns = _merged_parameter_patterns(model, hf_quantizer)
+    if not patterns:
+        return {}
+    load_dtype = _model_dtype(model)
+    # A quantiser that loads the checkpoint as stored merges in the storage
+    # dtype; otherwise the sources are cast to the load dtype first and a bnb
+    # quantiser runs on the merged tensor.
+    as_stored = bool(getattr(hf_quantizer, "pre_quantized", False))
+    load_itemsize = (
+        torch.empty((), dtype=load_dtype).element_size()
+        if isinstance(load_dtype, torch.dtype) else None
+    )
+    unit_names = sorted((u for u, _ in units), key=len, reverse=True)
+    out: dict[str, int] = {}
+    for name, tensor in model.named_parameters():
+        if not any(p.search(name) for p in patterns):
+            continue
+        if as_stored or load_itemsize is None or not tensor.dtype.is_floating_point:
+            itemsize = tensor.element_size()
+        else:
+            itemsize = load_itemsize
+        owner = next(
+            (u for u in unit_names if u == "" or name == u or name.startswith(u + ".")),
+            None,
+        )
+        if owner is None:
+            continue
+        out[owner] = max(out.get(owner, 0), tensor.numel() * itemsize)
+    return out
+
+
 def _tied_parameter_groups(model: nn.Module) -> list[list[str]]:
     """Names of every tensor that is one shared object under several names.
 
@@ -912,6 +1017,7 @@ def plan_device_map(
     hf_quantizer: Any = None,
     no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
+    reserve_load_transient: bool = True,
 ) -> DeviceMapPlan | None:
     """Build an explicit device map that reserves logit headroom on the head's card.
 
@@ -955,6 +1061,11 @@ def plan_device_map(
             removes every no-split constraint, so blocks may be split at their
             children; ``None`` (default) detects the classes from the model.
         prefer_head_device: force the head onto this device index.
+        reserve_load_transient: keep room on each card for the tensors
+            transformers 5 builds while it merges checkpoint tensors into one
+            parameter (per-expert weights into an expert stack). Only models
+            whose conversion mapping merges are affected. When no placement
+            keeps that room the plan is returned without it and says so.
 
     Returns:
         A :class:`DeviceMapPlan`, or ``None`` when there are fewer than two
@@ -1400,8 +1511,13 @@ def plan_device_map(
         # headroom the accepted packing did not keep.
         kept = {d: reserve[d] if d == head_device else min(reserve[d], other_reserve)
                 for d in devices}
+        # While the checkpoint loads nothing else is resident, so the load
+        # transient only has to fit in what the reserve and headroom leave free.
         budget = {
-            d: raw_budgets[d] - (kept[d] + headroom if d == head_device else kept[d])
+            d: raw_budgets[d] - max(
+                kept[d] + headroom if d == head_device else kept[d],
+                load_floor.get(d, 0),
+            )
             for d in devices
         }
         budget[head_device] -= pinned_bytes
@@ -1551,15 +1667,75 @@ def plan_device_map(
             f"devices {devices}"
         )
     order = [prefer_head_device] if prefer_head_device is not None else list(reversed(devices))
-    result = None
-    chosen = None
-    for cand in order:
-        if cand not in devices:
-            continue
-        result = attempt(cand)
-        if result is not None:
-            chosen = cand
-            break
+
+    def _search():
+        for cand in order:
+            if cand not in devices:
+                continue
+            found = attempt(cand)
+            if found is not None:
+                return found, cand
+        return None, None
+
+    load_floor: dict[int, int] = {}
+    result, chosen = _search()
+
+    unit_transient: dict[str, int] = {}
+    if result is not None and reserve_load_transient:
+        unit_transient = _load_transient_by_unit(model, units, hf_quantizer)
+    load_transient: dict[int, int] = {}
+    if unit_transient:
+        # Placement decides which card pays which transient, so check the
+        # accepted packing and raise the floor only on the cards that come up
+        # short, until none does. Floors only grow, so this ends. The measured
+        # multiples are tried largest first, then the bare merged tensor (the
+        # allocated peak), and only then the plan without it, which is what
+        # this planner returned before. unsloth_zoo turns expandable segments
+        # on at import, so Unsloth's own loads start from the larger multiple.
+        def _needs(assign, multiple):
+            need = dict.fromkeys(devices, 0)
+            for unit, device in assign.items():
+                need[device] = max(need[device], unit_transient.get(unit, 0) * multiple)
+            return need
+
+        unconstrained = (result, chosen)
+        multiples = (
+            (_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE,) if _expandable_segments_enabled() else ()
+        ) + (_LOAD_TRANSIENT_MULTIPLE, 1)
+        settled = None
+        for multiple in multiples:
+            load_floor = {}
+            result, chosen = unconstrained
+            for _ in range(len(devices) + 1):
+                need = _needs(result[0], multiple)
+                short = {d: n for d, n in need.items() if raw_budgets[d] - result[1][d] < n}
+                if not short:
+                    settled = multiple
+                    break
+                for d, n in short.items():
+                    load_floor[d] = max(load_floor.get(d, 0), n)
+                result, chosen = _search()
+                if result is None:
+                    break
+            if settled is not None:
+                break
+        if settled is None:
+            load_floor = {}
+            result, chosen = unconstrained
+            need = _needs(result[0], 1)
+            notes.append(
+                "load transient: no placement keeps "
+                + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in need.items() if n)
+                + " free for merging checkpoint tensors; loading may run out of memory"
+            )
+        else:
+            load_transient = {d: n for d, n in _needs(result[0], settled).items() if n}
+            notes.append(
+                f"load transient: {settled}x the largest merged tensor kept free per card "
+                "while loading ("
+                + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in load_transient.items())
+                + ")"
+            )
     if result is None:
         # Report the reserve of the first candidate actually tried; it is what
         # the failing arithmetic used.
@@ -1615,6 +1791,7 @@ def plan_device_map(
         activation_reserve_by_device=reserve_kept,
         tied_to_head=tied_to_head,
         notes=notes,
+        load_transient_by_device=load_transient,
     )
 
 
