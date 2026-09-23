@@ -333,7 +333,6 @@ class _WeightedUnpermute(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        triton, _, _, bwd_dy, bwd_dw = _get_kernels()
         if ctx.needs_w:
             y, sorted_indices, w_perm = ctx.saved_tensors
         else:
@@ -342,18 +341,36 @@ class _WeightedUnpermute(torch.autograd.Function):
         (T, H), y_dtype, y_device = ctx.y_meta
         top_k = ctx.top_k
         dout = dout.contiguous()
-        BLOCK_T, BLOCK_H = 16, 512
-        dy = torch.empty((T, H), dtype = y_dtype, device = y_device)
-        bwd_dy[(triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))](
-            dout, sorted_indices, w_perm, dy, T, H, top_k, BLOCK_T, BLOCK_H,
-            num_warps = 4, enable_fp_fusion = False)
-        dw = None
-        if ctx.needs_w:
-            dw32 = torch.empty((T,), device = y_device, dtype = torch.float32)
-            bwd_dw[(T,)](y, dout, sorted_indices, dw32, H, top_k, 1024,
-                         ROUND_PRODUCT = ctx.round_product, enable_fp_fusion = False)
-            dw = dw32.to(w_perm.dtype)
-        return dy, None, dw, None, None, None
+        # The backward kernels compile on first use, inside autograd and outside the forward's
+        # fallback, so a failure here also switches the path off and finishes in eager.
+        if moe_triton_kernels_available(dout.device):
+            try:
+                triton, _, _, bwd_dy, bwd_dw = _get_kernels()
+                BLOCK_T, BLOCK_H = 16, 512
+                dy = torch.empty((T, H), dtype = y_dtype, device = y_device)
+                bwd_dy[(triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))](
+                    dout, sorted_indices, w_perm, dy, T, H, top_k, BLOCK_T, BLOCK_H,
+                    num_warps = 4, enable_fp_fusion = False)
+                dw = None
+                if ctx.needs_w:
+                    dw32 = torch.empty((T,), device = y_device, dtype = torch.float32)
+                    bwd_dw[(T,)](y, dout, sorted_indices, dw32, H, top_k, 1024,
+                                 ROUND_PRODUCT = ctx.round_product, enable_fp_fusion = False)
+                    dw = dw32.to(w_perm.dtype)
+                return dy, None, dw, None, None, None
+            except Exception as exc:
+                _disable("weighted_unpermute backward", exc)
+        return _weighted_unpermute_backward_eager(ctx, dout, y, sorted_indices, w_perm, y_dtype, top_k)
+
+
+def _weighted_unpermute_backward_eager(ctx, dout, y, sorted_indices, w_perm, y_dtype, top_k):
+    # Slot i of the permuted rows belongs to token sorted_indices[i] // top_k.
+    token_rows = dout.float().index_select(0, torch.div(sorted_indices, top_k, rounding_mode = "floor"))
+    dy = (token_rows * w_perm.float().unsqueeze(-1)).to(y_dtype)
+    dw = None
+    if ctx.needs_w:
+        dw = (y.float() * token_rows).sum(-1).to(w_perm.dtype)
+    return dy, None, dw, None, None, None
 
 
 def weighted_unpermute(permuted_output, sorted_indices, permuted_weights, num_tokens, top_k, out_dtype = None):

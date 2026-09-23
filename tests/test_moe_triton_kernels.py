@@ -223,3 +223,39 @@ def test_weighted_unpermute_is_deterministic():
     outs = [weighted_unpermute(y, sorted_indices, w, num_tokens, top_k, out_dtype = torch.bfloat16) for _ in range(5)]
     for o in outs[1:]:
         assert torch.equal(o, outs[0])
+
+
+@cuda
+@pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
+def test_a_backward_kernel_failure_finishes_in_eager(monkeypatch, w_dtype):
+    """The backward kernels compile on first use inside autograd, after the forward's fallback
+    has already returned; a failure there must disable the path and still produce gradients."""
+    _need_triton()
+    monkeypatch.setattr(mk, "_DISABLED_REASON", None)
+    torch.manual_seed(0)
+    num_tokens, top_k, hidden, E = 33, 4, 1500, 16
+    flat = torch.randint(0, E, (num_tokens * top_k,), device = "cuda")
+    sorted_indices = torch.argsort(flat, stable = True)
+    y = torch.randn(num_tokens * top_k, hidden, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+    w = torch.rand(num_tokens * top_k, device = "cuda", dtype = w_dtype, requires_grad = True)
+    out = weighted_unpermute(y, sorted_indices, w, num_tokens, top_k, out_dtype = torch.bfloat16)
+    assert out is not None
+
+    triton, nf4, fwd, _, _ = mk._get_kernels()
+
+    class Broken:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                raise RuntimeError("backward compile failed")
+            return launch
+
+    monkeypatch.setattr(mk, "_get_kernels", lambda: (triton, nf4, fwd, Broken(), Broken()))
+    y2 = y.detach().clone().requires_grad_(True); w2 = w.detach().clone().requires_grad_(True)
+    ref = _reference_combine(y2, sorted_indices, w2, num_tokens, top_k, torch.bfloat16)
+    g = torch.randn_like(ref)
+    out.backward(g); ref.backward(g)
+    assert mk._DISABLED_REASON is not None and "backward compile failed" in mk._DISABLED_REASON
+    assert torch.equal(y.grad, y2.grad)
+    dw_tol = (2 ** -7 if w_dtype != torch.float32 else 1e-4) * w2.grad.float().abs().max().item() + 1e-6
+    assert (w.grad.float() - w2.grad.float()).abs().max().item() <= dw_tol
+    monkeypatch.setattr(mk, "_DISABLED_REASON", None)
