@@ -70,11 +70,13 @@ def test_quantizer_leaves_experts_it_cannot_route_unpacked():
     """Only experts whose forward is Unsloth's are packed: a module with its own forward
     (Llama-4's bmm before its patch, a user-forced transformers implementation) keeps
     its checkpoint dtype."""
-    pytest.importorskip("bitsandbytes")
+    from unsloth_zoo.temporary_patches import moe_utils_bnb4bit
+    if not moe_utils_bnb4bit.HAS_BNB:
+        pytest.skip("bitsandbytes 4-bit is not usable here, so no 4-bit load reaches the quantizer")
     from bitsandbytes.nn import Params4bit
     from transformers import BitsAndBytesConfig
     from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
-    from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import replace_expert_params_with_bnb_params
+    replace_expert_params_with_bnb_params = moe_utils_bnb4bit.replace_expert_params_with_bnb_params
 
     def own_forward(self, hidden_states):
         return torch.bmm(hidden_states, self.gate_up_proj)
