@@ -5,7 +5,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-pytest.importorskip("transformers")
+pytest.importorskip("transformers.integrations.moe")  # transformers 5; a no-op on 4.x
 
 from unsloth_zoo.temporary_patches.moe_experts_interface import (
     UNSLOTH_EXPERTS_IMPLEMENTATION,

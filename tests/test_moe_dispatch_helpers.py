@@ -62,7 +62,9 @@ def test_function_has_tensor_inputs():
 
 def test_compiled_model_is_not_custom_code():
     from transformers.modeling_utils import PreTrainedModel
-    from transformers.configuration_utils import PreTrainedConfig
+    PreTrainedConfig = getattr(pytest.importorskip("transformers.configuration_utils"), "PreTrainedConfig", None)
+    if PreTrainedConfig is None:
+        pytest.skip("PreTrainedConfig is transformers 5")
     from unsloth_zoo.temporary_patches.compiled_model_identity import patch_compiled_model_is_custom_code
     saved = PreTrainedModel.__dict__["is_custom_code"]
     patch_compiled_model_is_custom_code()

@@ -24,7 +24,9 @@ def _peft_original_wrapper_forward():
 
 
 def _experts(hidden, intermediate, num_experts = 4):
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+    Qwen3MoeExperts = getattr(pytest.importorskip("transformers.models.qwen3_moe.modeling_qwen3_moe"), "Qwen3MoeExperts", None)
+    if Qwen3MoeExperts is None:
+        pytest.skip("stacked Qwen3MoeExperts is transformers 5")
     from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
     config = Qwen3MoeConfig(hidden_size = hidden, moe_intermediate_size = intermediate,
                             num_experts = num_experts, num_experts_per_tok = 2)
