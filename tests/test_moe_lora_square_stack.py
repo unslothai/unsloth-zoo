@@ -88,3 +88,73 @@ def test_separated_lora_matches_merged_delta(hidden, intermediate):
         got = model(x, index, weights)
     assert torch.allclose(got, expected, atol = 1e-4, rtol = 1e-4), \
         (hidden, intermediate, (got - expected).abs().max().item(), expected.abs().max().item())
+
+
+def _stacked_experts(hidden, intermediate, stored_in_out, flag):
+    E = 4
+
+    class Experts(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts = E
+            if stored_in_out:   # (E, in, out)
+                self.gate_up_proj = torch.nn.Parameter(torch.randn(E, hidden, 2 * intermediate) * 0.1)
+                self.down_proj = torch.nn.Parameter(torch.randn(E, intermediate, hidden) * 0.1)
+            else:               # (E, out, in)
+                self.gate_up_proj = torch.nn.Parameter(torch.randn(E, 2 * intermediate, hidden) * 0.1)
+                self.down_proj = torch.nn.Parameter(torch.randn(E, hidden, intermediate) * 0.1)
+
+        def forward(self, x):
+            return x
+
+    if flag == "is_transposed":
+        Experts.is_transposed = True
+    elif flag == "grouped_mm_format":
+        Experts._unsloth_grouped_mm_format = True
+
+    class Parent(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = Experts()
+
+        def forward(self, x):
+            return self.experts(x)
+
+    return Parent().to(DEVICE)
+
+
+@pytest.mark.parametrize("flag", [None, "is_transposed", "grouped_mm_format"])
+@pytest.mark.parametrize("hidden,intermediate", [(64, 32), (64, 48)])
+@pytest.mark.parametrize("parameter_name", ["gate_up_proj", "down_proj"])
+def test_extractor_matches_peft_delta_for_every_stored_layout(flag, hidden, intermediate, parameter_name):
+    """Which layouts PEFT swaps in/out for changed between releases: 0.19.0 swaps an
+    is_transposed stack, 0.19.1 and later swap the (E, out, in) ones. The canonical reading
+    holds exactly when PEFT's choice and the stored layout disagree, so each square cell here
+    was wrong on some PEFT between 0.19.0 and 0.21.0 under a rule keyed on either flag alone."""
+    from peft.tuners.lora.layer import ParamWrapper
+    stored_in_out = flag is not None
+    torch.manual_seed(0)
+    model = peft.get_peft_model(
+        _stacked_experts(hidden, intermediate, stored_in_out, flag),
+        peft.LoraConfig(r = 3, lora_alpha = 6, target_modules = [], target_parameters = [f"experts.{parameter_name}"]),
+    )
+    generator = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "lora_" in name:
+                p.copy_(torch.randn(p.shape, generator = generator).to(DEVICE) * 0.3)
+    wrapper = next(m for m in model.modules() if isinstance(m, ParamWrapper))
+    E = wrapper.get_base_layer().num_experts
+    with torch.no_grad():
+        delta = wrapper.get_delta_weight("default")
+        first, second, scaling, _ = MU.extract_moe_lora_weights_for_grouped_mm(
+            wrapper, wrapper.lora_A["default"].weight, wrapper.lora_B["default"].weight,
+            wrapper.scaling["default"], E,
+        )
+        in_dim = hidden if parameter_name == "gate_up_proj" else intermediate
+        x = torch.randn(5, in_dim, device = DEVICE)
+        for e in range(E):
+            expected = x @ delta[e] if stored_in_out else x @ delta[e].T
+            got = (x @ first[e].float() @ second[e].float()) * scaling
+            assert torch.allclose(got, expected, atol = 1e-4, rtol = 1e-4), \
+                (flag, hidden, intermediate, parameter_name, e, (got - expected).abs().max().item())
