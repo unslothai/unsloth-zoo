@@ -1851,6 +1851,18 @@ class _Mxfp4DecodeSlot:
         self.event = None
 
 
+def _device_stream_api(device):
+    """torch.cuda or torch.xpu for a device whose kernels run asynchronously on streams, else None
+    (CPU and MPS run in issue order, so the shared stack needs no event)."""
+    device_type = getattr(device, "type", None)
+    if device_type not in ("cuda", "xpu"):
+        return None
+    api = getattr(torch, device_type, None)
+    if api is None or not hasattr(api, "Event") or not hasattr(api, "current_stream"):
+        return None
+    return api
+
+
 def _mxfp4_decode_slot(param, dtype, role = ""):
     key = (role, tuple(param._original_shape), dtype, param.device)
     slot = _MXFP4_DECODE_SLOTS.get(key)
@@ -1869,8 +1881,9 @@ def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
     rewritten; the kernel weighs every other expert by 0, so what their slices hold does not change
     the result. Callers that launch a kernel on it hold the slot's lock until that is enqueued."""
     slot = slot or _mxfp4_decode_slot(param, dtype, role)
-    if slot.event is not None and param.is_cuda:
-        torch.cuda.current_stream(param.device).wait_event(slot.event)
+    api = _device_stream_api(param.device) if slot.event is not None else None
+    if api is not None:
+        api.current_stream(param.device).wait_event(slot.event)
     param.dequantize(dtype, token_counts = token_counts, out = slot.stack.data)
     return slot.stack
 
@@ -1924,11 +1937,12 @@ def moe_forward_inference_bf16(self, hidden_states):
             moe.alpha,
             moe.hidden_size,
         )
-        if slots and hidden_states.is_cuda:
-            stream = torch.cuda.current_stream(hidden_states.device)
+        api = _device_stream_api(hidden_states.device) if slots else None
+        if api is not None:
+            stream = api.current_stream(hidden_states.device)
             for slot in slots:
                 if slot.event is None:
-                    slot.event = torch.cuda.Event()
+                    slot.event = api.Event()
                 slot.event.record(stream)
     return out
 

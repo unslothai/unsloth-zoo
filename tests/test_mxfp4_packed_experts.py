@@ -577,6 +577,49 @@ def test_the_decode_lock_is_held_until_the_kernel_is_enqueued(monkeypatch):
     assert not any(s.lock.locked() for s in gpt_oss._MXFP4_DECODE_SLOTS.values())
 
 
+def test_stream_events_cover_every_asynchronous_backend(monkeypatch):
+    # XPU runs kernels on streams like CUDA: the decode on the next call must wait on the event
+    # recorded after the last kernel that read the shared stack, whatever the backend.
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    calls = []
+
+    class FakeEvent:
+        def record(self, stream):
+            calls.append(("record", self, stream))
+
+    class FakeStream:
+        def wait_event(self, event):
+            calls.append(("wait", event, self))
+
+    stream = FakeStream()
+
+    class FakeApi:
+        Event = FakeEvent
+
+        @staticmethod
+        def current_stream(device = None):
+            return stream
+
+    assert gpt_oss._device_stream_api(torch.device("cpu")) is None
+    assert gpt_oss._device_stream_api(torch.device("cuda")) is torch.cuda
+    assert gpt_oss._device_stream_api(torch.device("xpu")) is torch.xpu
+
+    model, experts = _tiny_gpt_oss("cpu")
+    mlp = model.model.layers[0].mlp
+    monkeypatch.setattr(gpt_oss, "_device_stream_api", lambda device: FakeApi)
+    monkeypatch.setattr(gpt_oss, "_moe_forward_inference_bf16_kernel", lambda h, *rest: torch.zeros_like(h))
+    h = torch.randn(1, 1, 128, dtype = torch.bfloat16)
+    with torch.no_grad():
+        gpt_oss.moe_forward_inference_bf16(mlp, h)
+        recorded = [c[1] for c in calls if c[0] == "record"]
+        assert len(recorded) == 2 and all(c[2] is stream for c in calls)
+        calls.clear()
+        gpt_oss.moe_forward_inference_bf16(mlp, h)
+    waited = [c[1] for c in calls if c[0] == "wait"]
+    assert sorted(map(id, waited)) == sorted(map(id, recorded))
+
+
 def test_projections_of_the_same_shape_do_not_share_a_stack():
     from unsloth_zoo.temporary_patches import gpt_oss
 
