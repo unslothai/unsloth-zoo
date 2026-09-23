@@ -323,6 +323,11 @@ class Mxfp4ExpertParam(torch.nn.Parameter):
         kwargs["mxfp4_scales"] = self.mxfp4_scales.to(device, non_blocking = non_blocking)
         return Mxfp4ExpertParam(self.data.to(device, non_blocking = non_blocking), **kwargs)
 
+    def detach(self):
+        # nn.Module._apply re-wraps a moved tensor as a Parameter when it cannot assign .data
+        # (a move to or from meta), and Parameter requires detach() to keep the subtype.
+        return Mxfp4ExpertParam(torch.Tensor.detach(self), **self._init_kwargs())
+
     def __deepcopy__(self, memo):
         kwargs = self._init_kwargs()
         kwargs["mxfp4_scales"] = self.mxfp4_scales.clone()

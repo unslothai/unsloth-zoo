@@ -560,3 +560,15 @@ def test_decode_stacks_are_per_stream():
     side.synchronize()
     assert other is not default
     assert gpt_oss._mxfp4_decode_stack(param, torch.bfloat16, counts) is default
+
+
+def test_module_moves_to_and_from_meta_keep_the_packed_param():
+    blocks, scales = _random_mxfp4(2, 64, 64)
+    module = nn.Module()
+    module.w = Mxfp4ExpertParam(blocks, mxfp4_scales = scales)
+    want = module.w.dequantize()
+    module.to("meta")
+    assert isinstance(module.w, Mxfp4ExpertParam) and module.w.is_meta
+    assert module.w.mxfp4_scales.is_meta and tuple(module.w._original_shape) == tuple(want.shape)
+    detached = Mxfp4ExpertParam(blocks, mxfp4_scales = scales).detach()
+    assert isinstance(detached, Mxfp4ExpertParam) and torch.equal(detached.dequantize(), want)
