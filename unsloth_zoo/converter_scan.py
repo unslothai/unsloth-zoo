@@ -416,6 +416,12 @@ def _dynamic_imports(tree, aliases = None):
         aliases = _call_aliases(tree)
     names, unreadable = set(), False
     for node in ast.walk(tree):
+        # builtins.__dict__["__import__"]("smtplib") leaves the importer as a
+        # string and nothing else, exactly as the write methods and the
+        # environment names did. Neither name appears as a string constant
+        # anywhere in the 21 real modules.
+        if _literal_text(node) in ("__import__", "import_module"):
+            return set(), True
         if not isinstance(node, ast.Call):
             continue
         if _called_name(node, aliases) not in ("__import__", "import_module"):
