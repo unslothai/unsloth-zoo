@@ -134,7 +134,6 @@ Nothing here is specific to one architecture:
 from __future__ import annotations
 
 import inspect
-import itertools
 import os
 import re
 from dataclasses import dataclass, field
@@ -1515,10 +1514,7 @@ def plan_device_map(
         # While the checkpoint loads nothing else is resident, so the load
         # transient only has to fit in what the reserve and headroom leave free.
         budget = {
-            d: raw_budgets[d] - max(
-                kept[d] + headroom if d == head_device else kept[d],
-                load_floor.get(d, 0),
-            )
+            d: raw_budgets[d] - (kept[d] + headroom if d == head_device else kept[d])
             for d in devices
         }
         budget[head_device] -= pinned_bytes
@@ -1537,13 +1533,13 @@ def plan_device_map(
             # failed, so a plan that already worked is never rewritten: layout
             # in definition order keeps consecutive layers together, which
             # costs fewer cross-device hops than a size-sorted one.
-            used, assign = _best_fit(free_groups, budget)
+            used, assign = _best_fit(free_groups, budget, head_device)
         if used is None:
             # Best-fit is not exact either: capacities 10 and 10 with units
             # 6, 5, 3, 2, 2, 2 pack 6+3 and 5+2+2 and then reject the last 2,
             # although 6+2+2 and 5+3+2 both fit. Last resort before refusing a
             # model that demonstrably fits.
-            used, assign = _exact_fit(free_groups, budget)
+            used, assign = _exact_fit(free_groups, budget, head_device)
         if used is None:
             return None
         for p in pinned:
@@ -1559,6 +1555,15 @@ def plan_device_map(
         public_budgets[head_device] += pinned_bytes
         return assign, weight_bytes, public_budgets, kept
 
+    def _transient_cap(head_device: int) -> dict[int, int]:
+        # While the checkpoint loads nothing else is resident, so a card's merge transient
+        # only has to fit in its raw budget next to the weights (the head's pinned units
+        # included), not on top of the activation reserve and logit headroom.
+        return {d: raw_budgets[d] - (pinned_bytes if d == head_device else 0) for d in devices}
+
+    def _group_transient(names) -> int:
+        return max((transient_of.get(n, 0) for n in names), default = 0)
+
     def _walk_in_order(free, budget, head_device: int):
         # `head_max` means "push as much weight off the head's card as possible".
         # Walking plain device order defeats that whenever the head is not the
@@ -1569,15 +1574,23 @@ def plan_device_map(
         if free_space_policy == "head_max":
             order = [d for d in devices if d != head_device] + [head_device]
         used = dict.fromkeys(devices, 0)
+        peak = dict.fromkeys(devices, 0)
+        cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         cursor = 0
+
+        def fits(d, size, t):
+            return used[d] + size <= budget[d] and used[d] + size + max(peak[d], t) <= cap[d]
+
         for names, size in free:
+            t = _group_transient(names)
             placed = False
             while cursor < len(order):
                 d = order[cursor]
-                if used[d] + size <= budget[d]:
+                if fits(d, size, t):
                     assign.update(dict.fromkeys(names, d))
                     used[d] += size
+                    peak[d] = max(peak[d], t)
                     placed = True
                     break
                 cursor += 1
@@ -1585,30 +1598,36 @@ def plan_device_map(
                 # Sequential cursor exhausted: try any earlier device that still
                 # has room rather than falling off to CPU.
                 for d in order:
-                    if used[d] + size <= budget[d]:
+                    if fits(d, size, t):
                         assign.update(dict.fromkeys(names, d))
                         used[d] += size
+                        peak[d] = max(peak[d], t)
                         placed = True
                         break
             if not placed:
                 return None, None
         return used, assign
 
-    def _best_fit(free, budget):
+    def _best_fit(free, budget, head_device: int):
         """Largest unit first into the device it leaves least room on."""
         used = dict.fromkeys(devices, 0)
+        peak = dict.fromkeys(devices, 0)
+        cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         for names, size in sorted(free, key=lambda item: -item[1]):
+            t = _group_transient(names)
             room = [(budget[d] - used[d] - size, d) for d in devices
-                    if used[d] + size <= budget[d]]
+                    if used[d] + size <= budget[d]
+                    and used[d] + size + max(peak[d], t) <= cap[d]]
             if not room:
                 return None, None
             _, d = min(room)
             assign.update(dict.fromkeys(names, d))
             used[d] += size
+            peak[d] = max(peak[d], t)
         return used, assign
 
-    def _exact_fit(free, budget, node_budget=20000, max_units=512):
+    def _exact_fit(free, budget, head_device: int, node_budget=20000, max_units=512):
         """Bounded depth-first packing, largest unit first.
 
         Runs only after both heuristics have failed, so it can turn a refusal
@@ -1625,6 +1644,8 @@ def plan_device_map(
         if sum(size for _, size in order) > sum(budget[d] for d in devices):
             return None, None
         remaining = {d: budget[d] for d in devices}
+        peak = dict.fromkeys(devices, 0)
+        cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         visited = 0
 
@@ -1636,17 +1657,25 @@ def plan_device_map(
             if visited > node_budget:
                 raise _SearchExhausted
             names, size = order[i]
-            tried: set[int] = set()
+            t = _group_transient(names)
+            tried: set[tuple[int, int, int]] = set()
             for d in devices:
                 room = remaining[d]
-                if size > room or room in tried:
+                used_d = budget[d] - room
+                # Cards alike in reserve room, transient room and transient held are
+                # interchangeable here.
+                state = (room, cap[d] - used_d, peak[d])
+                if size > room or used_d + size + max(peak[d], t) > cap[d] or state in tried:
                     continue
-                tried.add(room)
+                tried.add(state)
+                previous = peak[d]
                 remaining[d] -= size
+                peak[d] = max(previous, t)
                 assign.update(dict.fromkeys(names, d))
                 if place(i + 1):
                     return True
                 remaining[d] += size
+                peak[d] = previous
                 for n in names:
                     assign.pop(n, None)
             return False
@@ -1678,86 +1707,49 @@ def plan_device_map(
                 return found, cand
         return None, None
 
-    load_floor: dict[int, int] = {}
-    result, chosen = _search()
-
-    unit_transient: dict[str, int] = {}
-    if result is not None and reserve_load_transient:
-        unit_transient = _load_transient_by_unit(model, units, hf_quantizer)
+    # Load transients: the parameters transformers 5 builds on the card while it merges
+    # checkpoint tensors. Each card must keep its largest one (times the allocator's measured
+    # overhead) free next to its weights, and that is part of the packing itself, so the
+    # packers choose placements that leave it. The measured multiples are tried largest first,
+    # then the bare merged tensor (the allocated peak), and only then the plan without it,
+    # which is what this planner returned before. unsloth_zoo turns expandable segments on at
+    # import, so Unsloth's own loads start from the larger multiple.
+    unit_transient: dict[str, int] = (
+        _load_transient_by_unit(model, units, hf_quantizer) if reserve_load_transient else {}
+    )
+    transient_of: dict[str, int] = {}
     load_transient: dict[int, int] = {}
+    result, chosen = None, None
     if unit_transient:
-        # Placement decides which card pays which transient, so check the
-        # accepted packing and raise the floor only on the cards that come up
-        # short, until none does. Floors only grow, so this ends. The measured
-        # multiples are tried largest first, then the bare merged tensor (the
-        # allocated peak), and only then the plan without it, which is what
-        # this planner returned before. unsloth_zoo turns expandable segments
-        # on at import, so Unsloth's own loads start from the larger multiple.
-        def _needs(assign, multiple):
-            need = dict.fromkeys(devices, 0)
-            for unit, device in assign.items():
-                need[device] = max(need[device], unit_transient.get(unit, 0) * multiple)
-            return need
-
-        unconstrained = (result, chosen)
         multiples = (
             (_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE,) if _expandable_segments_enabled() else ()
         ) + (_LOAD_TRANSIENT_MULTIPLE, 1)
-        def _fits(found, multiple):
-            if found is None:
-                return False
-            need = _needs(found[0], multiple)
-            return all(raw_budgets[d] - found[1][d] >= n for d, n in need.items())
-
-        largest = max(unit_transient.values())
-        settled = None
         for multiple in multiples:
-            load_floor = {}
-            result, chosen = unconstrained
-            for _ in range(len(devices) + 1):
-                need = _needs(result[0], multiple)
-                short = {d: n for d, n in need.items() if raw_budgets[d] - result[1][d] < n}
-                if not short:
-                    settled = multiple
-                    break
-                for d, n in short.items():
-                    load_floor[d] = max(load_floor.get(d, 0), n)
-                result, chosen = _search()
-                if result is None:
-                    break
-            if settled is not None:
+            transient_of = {u: n * multiple for u, n in unit_transient.items()}
+            result, chosen = _search()
+            if result is not None:
+                for unit, device in result[0].items():
+                    if transient_of.get(unit, 0):
+                        load_transient[device] = max(load_transient.get(device, 0), transient_of[unit])
+                notes.append(
+                    f"load transient: {multiple}x the largest merged tensor kept free per card "
+                    "while loading ("
+                    + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in sorted(load_transient.items()))
+                    + ")"
+                )
                 break
-            # Floors only grow above, so one left on a card the merging units have since
-            # moved off can rule out a placement that fits. Try the cards jointly instead:
-            # each subset keeps the room on its cards only, and the first packing whose own
-            # needs all fit wins.
-            for size in range(1, len(devices) + 1):
-                for cards in itertools.combinations(devices, size):
-                    load_floor = dict.fromkeys(cards, largest * multiple)
-                    result, chosen = _search()
-                    if _fits(result, multiple):
-                        settled = multiple
-                        break
-                if settled is not None:
-                    break
-            if settled is not None:
-                break
-        if settled is None:
-            load_floor = {}
-            result, chosen = unconstrained
-            need = _needs(result[0], 1)
+        transient_of = {} if result is None else transient_of
+    if result is None:
+        transient_of = {}
+        result, chosen = _search()
+        if result is not None and unit_transient:
+            need = dict.fromkeys(devices, 0)
+            for unit, device in result[0].items():
+                need[device] = max(need[device], unit_transient.get(unit, 0))
             notes.append(
                 "load transient: no placement keeps "
                 + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in need.items() if n)
                 + " free for merging checkpoint tensors; loading may run out of memory"
-            )
-        else:
-            load_transient = {d: n for d, n in _needs(result[0], settled).items() if n}
-            notes.append(
-                f"load transient: {settled}x the largest merged tensor kept free per card "
-                "while loading ("
-                + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in load_transient.items())
-                + ")"
             )
     if result is None:
         # Report the reserve of the first candidate actually tried; it is what

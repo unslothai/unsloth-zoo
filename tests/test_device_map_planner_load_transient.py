@@ -314,3 +314,26 @@ def test_a_floor_left_on_a_card_the_merge_moved_off_does_not_rule_out_a_fit(monk
     device = plan.device_map["layers.6"]
     assert plan.load_transient_by_device == {device: 3 * 8192}
     assert plan.free_bytes[device] >= 3 * 8192
+
+
+def test_the_packers_place_merging_units_where_their_transient_fits(monkeypatch):
+    # Validating a finished packing could only reject it: here the first weight-only fit puts
+    # the merging layer on a card without room for 3x, and 3x was dropped although another
+    # packing keeps it. The transient is now part of the packing itself.
+    import unsloth_zoo.device_map_planner as planner
+
+    with torch.device("meta"):
+        model = _Tiny(layers = 10)
+    layer = 64 * 64 * 4
+    monkeypatch.setattr(
+        planner, "_load_transient_by_unit",
+        lambda model, units, hf_quantizer = None: {u: 8192 for u, _ in units if u == "layers.1"},
+    )
+    budgets = {0: 7 * layer, 1: 3 * layer, 2: 9 * layer, 3: 9 * layer}
+    plan = plan_device_map(
+        model, max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
+        free_space_policy = "head_max",
+    )
+    device = plan.device_map["layers.1"]
+    assert plan.load_transient_by_device == {device: 3 * 8192}
+    assert budgets[device] - plan.weight_bytes[device] >= 3 * 8192
