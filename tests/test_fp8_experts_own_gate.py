@@ -61,11 +61,15 @@ def test_only_classes_with_their_own_gate_are_marked():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "the FP8 MoE backend needs CUDA")
 def test_stock_fp8_experts_keep_the_configured_swiglu_through_the_unsloth_backend():
     finegrained_fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
+    if not hasattr(finegrained_fp8, "FP8Experts"):
+        pytest.skip("FP8Experts is transformers 5")
     from transformers import PretrainedConfig
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import forward_moe_backend_fp8
 
     config = PretrainedConfig()
     config.hidden_size, config.moe_intermediate_size, config.num_experts = FB, FB, E
+    # transformers 5.5 reads intermediate_size as the getattr default, so it must exist.
+    config.intermediate_size = FB
     config.hidden_act = "silu"
     config.swiglu_alpha, config.swiglu_limit = 1.702, 1.0
     experts = finegrained_fp8.FP8Experts(config, block_size = (FB, FB)).cuda()
@@ -96,4 +100,9 @@ def test_stock_fp8_experts_keep_the_configured_swiglu_through_the_unsloth_backen
     out = forward_moe_backend_fp8(experts, hidden, top_k_index, top_k_weights).float()
     err = (out - expected).abs().max().item()
     gap = (plain - expected).abs().max().item()
-    assert gap > 0.1 and err < gap / 5, (err, gap)
+    if gap <= 0.1:
+        # transformers 5.5's FP8Experts gates with plain act_fn(gate) * up; there is no configured
+        # SwiGLU to keep, so only check the backend matches it (FP8 rounding is about 0.6%).
+        assert err < 1e-2 * expected.abs().max().item(), (err, gap)
+        return
+    assert err < gap / 5, (err, gap)
