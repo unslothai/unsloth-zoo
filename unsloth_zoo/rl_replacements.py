@@ -381,8 +381,7 @@ def autotune_batch_and_chunks(
 
     if valid_indices.shape[0] == 0:
         #This means your GPU will OOM
-        # Never more rows than the batch holds: callers divide total_input_rows by this, and
-        # unsloth's no-grad pass does so without a max(1, ...), so 4 on a 1-3 row batch gave 0.
+        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
         return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
@@ -1462,12 +1461,7 @@ def grpo_accumulated_loss(
     vocab_dim = lm_head.shape[0]
 
     if trainer.args.unsloth_grpo_mini_batch is None:
-        # Size the plan from the batch in hand on every call, the way unsloth's own copy of this
-        # function does (unsloth/models/rl_replacements.py). Caching the first step's answer in
-        # `trainer.args` froze it for the whole run: the `elif` meant to refresh it could not run,
-        # because it needed `unsloth_grpo_mini_batch is None` and the branch that set
-        # `_has_autotuned` had made it non-None in the same breath. GRPO completion lengths vary
-        # step to step, so a plan sized on a short first step under-chunks every later long one.
+        # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
         B, multiplier = autotune_batch_and_chunks(
             total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
         )

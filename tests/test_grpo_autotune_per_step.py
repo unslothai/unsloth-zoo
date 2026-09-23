@@ -14,30 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`grpo_accumulated_loss` froze its mini-batch/chunk plan at the first step.
-
-The plan was cached into `trainer.args.unsloth_grpo_mini_batch`, and the branch
-meant to refresh it read
-
-    if trainer.args.unsloth_grpo_mini_batch is None:
-        if not hasattr(trainer, "_has_autotuned"):
-            trainer._has_autotuned = True
-            ...
-            trainer.args.unsloth_grpo_mini_batch = max(1, total_rows//B)
-        elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
-            del trainer._has_autotuned
-            del trainer.args.unsloth_grpo_mini_batch
-            ...
-
-Reaching the `elif` needs `unsloth_grpo_mini_batch is None` *and*
-`_has_autotuned` set, and the only writer of `_has_autotuned` makes the value
-non-None in the same statement, so it never ran. GRPO completion lengths vary
-step to step: a plan sized on a short first step under-chunks every later long
-one (at seq_len 65536 the multiplier stays 4 where the sizing rule asks for 16).
-
-unsloth's own copy of this function, `unsloth/models/rl_replacements.py`, sizes
-per call and caches nothing, which is what this file pins here.
-"""
+"""grpo_accumulated_loss must size its mini-batch/chunk plan per call, never cache it in args."""
 
 import sys
 from pathlib import Path
@@ -109,7 +86,6 @@ def test_the_plan_is_sized_from_the_current_step(sized):
         _call(rr, torch, trainer, seq_len)
 
     assert [c[1] for c in calls] == [16, 4096, 65536], calls
-    # Nothing is written back, so a later step is not handed the earlier answer.
     assert trainer.args.unsloth_grpo_mini_batch is None
     assert trainer.args.unsloth_logit_chunk_multiplier is None
 
@@ -132,8 +108,6 @@ def test_a_user_set_multiplier_survives_every_step(sized):
     _call(rr, torch, trainer, 4096)
     _call(rr, torch, trainer, 65536)
 
-    # Both calls see the config value; caching the autotuned answer back into args used to
-    # overwrite it, and the refresh branch would then have dropped it to None.
     assert [c[2] for c in calls] == [8, 8], calls
     assert trainer.args.unsloth_logit_chunk_multiplier == 8
 
@@ -143,15 +117,13 @@ def test_the_out_of_memory_fallback_never_asks_for_zero_chunks(monkeypatch, rows
     torch = pytest.importorskip("torch")
     from unsloth_zoo import rl_replacements as rr
 
-    # No accelerator -> the 8 GB fallback budget; one row of this sequence alone exceeds it.
+    # No accelerator -> 8 GB budget, which one row of this sequence alone exceeds.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     if hasattr(torch, "xpu"):
         monkeypatch.setattr(torch.xpu, "is_available", lambda: False)
     B, multiplier = rr.autotune_batch_and_chunks(rows, 1_000_000, 4096, 151936, 16, None)
 
-    # unsloth's no-grad pass divides with no max(1, ...); now that the plan is sized on every
-    # step, a tight step after the first used to turn 4 on a 1-3 row batch into 0 chunks.
+    # unsloth's no-grad pass computes rows // B with no max(1, ...).
     assert rows // B >= 1
-    # The zoo path keeps exactly the chunk count it had before.
     assert max(1, rows // B) == max(1, rows // 4)
     assert multiplier == max(4, 1_000_000 // 4096)
