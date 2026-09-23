@@ -40,6 +40,10 @@ from transformers.integrations.finegrained_fp8 import Fp8Dequantize, FP8Linear
 from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 from transformers.utils.quantization_config import FineGrainedFP8Config
 
+if not hasattr(FineGrainedFP8HfQuantizer, "update_weight_conversions"):
+    # The patch does nothing without the hook (transformers 5.8 or later has it).
+    pytest.skip("this transformers has no quantizer weight-conversion hook", allow_module_level = True)
+
 E4M3 = torch.float8_e4m3fn
 patch_fp8_dequantize_weights_without_container()
 
