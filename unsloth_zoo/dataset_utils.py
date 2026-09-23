@@ -863,8 +863,8 @@ def train_on_responses_only(
                         else: break
                     pass
                     for optional_right in A_right_forward:
-                        if k >= n_minus_1: break
-                        if optional_right == input_ids[k+1]: k += 1
+                        if k >= n: break
+                        if optional_right == input_ids[k]: k += 1
                         else: break
                     pass
                     # assistant_j = j
@@ -899,8 +899,8 @@ def train_on_responses_only(
                                 else: break
                             pass
                             for optional_right in Q_right_forward:
-                                if k >= n_minus_1: break
-                                if optional_right == input_ids[k+1]: k += 1
+                                if k >= n: break
+                                if optional_right == input_ids[k]: k += 1
                                 else: break
                             pass
                             user_j = j
