@@ -797,6 +797,15 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     return final_hidden_states.view(original_shape)
 
 
+def _fp8_experts_own_gate(module) -> bool:
+    """True when the experts class defines its own gate on [gate; up] instead of the default
+    act_fn(gate) * up that use_experts_implementation installs."""
+    if not getattr(module, "has_gate", True) or "GptOss" in type(module).__name__:
+        return False
+    apply_gate = getattr(type(module), "_apply_gate", None)
+    return apply_gate is not None and getattr(apply_gate, "__name__", "") != "_default_apply_gate"
+
+
 @torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
@@ -807,6 +816,12 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         swap_moe_weights_for_call,
         _gate_up_is_interleaved,
     )
+
+    # transformers' FP8Experts (and model classes like MiniMax-M3 or HY-V4) apply the config's
+    # clamped / custom SwiGLU in their own _apply_gate; every backend below must call it
+    # rather than a plain SiLU. GPT-OSS keeps its interleaved gate by name.
+    if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
+        self._unsloth_own_apply_gate = True
 
     backend = select_moe_backend()
 
