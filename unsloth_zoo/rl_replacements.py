@@ -381,7 +381,8 @@ def autotune_batch_and_chunks(
 
     if valid_indices.shape[0] == 0:
         #This means your GPU will OOM
-        return 4, final_m
+        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
+        return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
@@ -1475,24 +1476,11 @@ def grpo_accumulated_loss(
     vocab_dim = lm_head.shape[0]
 
     if trainer.args.unsloth_grpo_mini_batch is None:
-        if not hasattr(trainer, "_has_autotuned"):
-            trainer._has_autotuned = True
-            B, multiplier = autotune_batch_and_chunks(
-                total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
-            )
-            trainer.args.unsloth_grpo_mini_batch = max(1, total_rows//B)
-            trainer.args.unsloth_logit_chunk_multiplier = multiplier
-            B = trainer.args.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
-        elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
-            B = trainer.args.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
-            del trainer._has_autotuned
-            del trainer.args.unsloth_grpo_mini_batch
-            del trainer.args.unsloth_logit_chunk_multiplier
-        else:
-            B = trainer.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
+        # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
+        B, multiplier = autotune_batch_and_chunks(
+            total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
+        )
+        B = max(1, total_rows//B)
     else:
         if trainer.args.unsloth_grpo_mini_batch > total_rows:
             B = total_rows
