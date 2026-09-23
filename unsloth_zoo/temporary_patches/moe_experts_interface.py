@@ -138,6 +138,23 @@ def _packs_fp4_experts(model) -> bool:
     return any(getattr(c, "expert_dtype", None) == "fp4" for c in configs if c is not None)
 
 
+_EXPERT_STACK_NAMES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
+
+
+def _holds_packed_4bit_experts(model) -> bool:
+    """Expert stacks already packed as bitsandbytes 4-bit, which only Unsloth's dispatcher
+    decodes; transformers' implementations would multiply the packed bytes."""
+    try:
+        for module in model.modules():
+            for name in _EXPERT_STACK_NAMES:
+                param = module._parameters.get(name) if hasattr(module, "_parameters") else None
+                if param is not None and type(param).__name__ == "Params4bit":
+                    return True
+    except Exception:
+        return False
+    return False
+
+
 # ids of sub-configs (text_config, ...) of a model loaded with expert parallelism: transformers
 # sets distributed_config on the outer config only, and a composite model builds its language
 # model from the same text_config object. Kept off the configs so it is never serialized.
@@ -234,6 +251,14 @@ def patch_experts_interface():
             return original(self, requested_experts)
         if requested_experts is None and not _packs_fp4_experts(self):
             return UNSLOTH_EXPERTS_IMPLEMENTATION
+        if requested_experts not in (None, UNSLOTH_EXPERTS_IMPLEMENTATION) and _holds_packed_4bit_experts(self):
+            # A runtime switch after a 4-bit load: the experts are already packed, and the
+            # quantizer only leaves them unpacked for an implementation chosen at load time.
+            raise RuntimeError(
+                f"Unsloth: cannot switch the experts implementation to {requested_experts!r} "
+                "after the experts were loaded in 4-bit; only the 'unsloth' implementation "
+                "reads packed experts. Reload with `experts_implementation=...` instead."
+            )
         return original(self, requested_experts)
 
     get_correct_experts_implementation._unsloth_patched = True

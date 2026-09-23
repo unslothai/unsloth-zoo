@@ -339,3 +339,27 @@ def test_the_fp8_eager_fallback_survives_repeated_decoration():
     experts.config = types.SimpleNamespace(_experts_implementation = UNSLOTH_EXPERTS_IMPLEMENTATION)
     experts.has_gate = False
     assert experts.forward("h", "i", "w") == "eager"
+
+
+def test_a_runtime_switch_is_refused_once_experts_are_packed_4bit():
+    """set_experts_implementation("grouped_mm") after a 4-bit load would hand transformers'
+    grouped GEMM the packed bytes; the switch is refused instead."""
+    from transformers.modeling_utils import PreTrainedModel
+
+    class Params4bit(nn.Parameter):  # stands in for bitsandbytes' class, matched by name
+        pass
+
+    def model(packed):
+        root = nn.Module()
+        root._grouped_mm_can_dispatch = lambda: True
+        root.experts = _experts(None, "transformers.integrations.moe")
+        if packed:
+            root.experts.gate_up_proj = Params4bit(torch.zeros(8, 1, dtype = torch.uint8), requires_grad = False)
+        return root
+
+    patch_experts_interface()
+    getter = PreTrainedModel.get_correct_experts_implementation
+    with pytest.raises(RuntimeError, match = "4-bit"):
+        getter(model(True), "grouped_mm")
+    assert getter(model(True), None) == UNSLOTH_EXPERTS_IMPLEMENTATION
+    assert getter(model(False), "grouped_mm") == "grouped_mm"
