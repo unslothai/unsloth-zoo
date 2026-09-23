@@ -2175,6 +2175,375 @@ RL_REPLACEMENTS["grpo_accumulated_loss"] = grpo_accumulated_loss
 from .dataset_utils import sft_prepare_dataset
 RL_REPLACEMENTS["sft_prepare_dataset"] = sft_prepare_dataset
 
+
+def _distillation_project_logits(
+    hidden_states,
+    lm_head,
+    lm_head_bias = None,
+    logit_scale: float = 1.0,
+    logit_softcapping: float = 0.0,
+):
+    """``hidden_states @ lm_head.T`` plus the per model logit post processing.
+
+    ``logit_scale`` is Cohere's multiplier (Muse Glimmer's ``output_multiplier``)
+    and ``logit_softcapping`` is Gemma's, both read off the model's own config so a
+    chunk matches that model's full forward. Co-located on the head's device
+    because an accelerate dispatch can separate the head from the hidden states.
+    """
+    hidden_states = hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+    logits = (hidden_states @ lm_head.t()).float()
+    if lm_head_bias is not None:
+        logits = logits + lm_head_bias.float()
+    if logit_scale != 1.0:
+        logits = logits * logit_scale
+    if logit_softcapping is not None and logit_softcapping != 0.0:
+        logits = logit_softcapping * torch.tanh(logits / logit_softcapping)
+    return logits
+
+
+def _distillation_generalized_jsd(student_log_probs, teacher_log_probs, beta: float):
+    """``beta`` = 0 forward KL, 1 reverse KL, anything between generalized JSD.
+
+    The endpoints need their own branches: substituted into the interior
+    expression they collapse the mixture onto one distribution and degenerate to
+    exactly zero. ``F.kl_div(input, target)`` is ``target * (log target - input)``,
+    which is why the arguments read swapped against the paper.
+    """
+    if beta == 0.0:
+        return torch.nn.functional.kl_div(
+            student_log_probs, teacher_log_probs, reduction = "none", log_target = True,
+        )
+    if beta == 1.0:
+        return torch.nn.functional.kl_div(
+            teacher_log_probs, student_log_probs, reduction = "none", log_target = True,
+        )
+    beta_t = torch.tensor(beta, dtype = student_log_probs.dtype, device = student_log_probs.device)
+    mixture_log_probs = torch.logsumexp(
+        torch.stack([
+            student_log_probs + torch.log1p(-beta_t),
+            teacher_log_probs + torch.log(beta_t),
+        ]),
+        dim = 0,
+    )
+    kl_teacher = torch.nn.functional.kl_div(
+        mixture_log_probs, teacher_log_probs, reduction = "none", log_target = True,
+    )
+    kl_student = torch.nn.functional.kl_div(
+        mixture_log_probs, student_log_probs, reduction = "none", log_target = True,
+    )
+    return beta_t * kl_teacher + (1 - beta_t) * kl_student
+
+
+def _distillation_jsd_chunk(
+    student_hidden_states, student_lm_head, student_lm_head_bias,
+    teacher_hidden_states, teacher_lm_head, teacher_lm_head_bias,
+    valid, divisor,
+    student_logit_scale, student_final_logit_softcapping,
+    teacher_logit_scale, teacher_final_logit_softcapping,
+    beta, temperature,
+):
+    """One chunk, already divided by the reduction denominator. Differentiated with ``torch.func.grad_and_value`` in the forward, so the positional order IS the argnums order: student hidden states, then head, then bias. Entropy is aux: a logged metric, not part of the objective."""
+    student_logits = _distillation_project_logits(
+        student_hidden_states, student_lm_head, student_lm_head_bias,
+        student_logit_scale, student_final_logit_softcapping,
+    )
+    # The teacher is a fixed target. Inert inside the grad_and_value transform, which does not differentiate these arguments; kept for direct callers outside it.
+    with torch.no_grad():
+        teacher_logits = _distillation_project_logits(
+            teacher_hidden_states, teacher_lm_head, teacher_lm_head_bias,
+            teacher_logit_scale, teacher_final_logit_softcapping,
+        )
+
+    # Distillation temperature, NOT the sampling one, and no T**2 rescale; applied after each model's own scaling and softcapping.
+    if temperature != 1.0:
+        student_logits = student_logits / temperature
+        teacher_logits = teacher_logits / temperature
+
+    student_log_probs = torch.nn.functional.log_softmax(student_logits, dim = -1)
+    teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim = -1)
+
+    # Reduce on the STUDENT head's device. Each projection above left its result
+    # on its own head's device, which under an accelerate dispatch that splits
+    # the two models is not the same device, and the divergence then raises. The
+    # student's side is the right target because the gradient accumulates there.
+    # Both moves are no-ops when the heads are co-located, which is every
+    # single-device run.
+    if teacher_log_probs.device != student_log_probs.device:
+        teacher_log_probs = teacher_log_probs.to(student_log_probs.device)
+    if valid.device != student_log_probs.device:
+        valid = valid.to(student_log_probs.device)
+
+    jsd = _distillation_generalized_jsd(student_log_probs, teacher_log_probs, beta)
+
+    # The final chunk's tail holds positions packed out of the valid prefix.
+    per_token_jsd = jsd.sum(dim = -1) * valid
+    per_token_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim = -1) * valid
+    return per_token_jsd.sum() / divisor, (per_token_entropy.sum(),)
+pass
+
+
+# grad_and_value_impl is missing from Dynamo's trace rules where grad_impl is present, which surfaces as GB0149 "Unsupported functorch tracing attempt". Idempotent, and fused_losses.cross_entropy_loss makes the same registration.
+try:
+    from torch._dynamo.trace_rules import manual_torch_name_rule_map as _trace_map
+    from torch._dynamo.variables.higher_order_ops import FunctorchHigherOrderVariable as _FHOV
+    _key = "torch._functorch.eager_transforms.grad_and_value_impl"
+    if _key not in _trace_map:
+        _trace_map[_key] = _FHOV
+        torch._dynamo.trace_rules.get_torch_obj_rule_map.cache_clear()
+except Exception:
+    pass
+
+# Keyed by argnums, so Dynamo traces once per gradient shape rather than per call.
+_DISTILLATION_JSD_GRAD_FNS = {}
+
+
+def _distillation_jsd_grad_fn(argnums):
+    """``grad_and_value`` over one chunk, compiled the way the other chunked
+    losses in this repo are.
+
+    ``_maybe_compile`` reads the compile-disable flag for us and, under fullgraph,
+    routes through ``torch_compile_with_fallback`` so cache exhaustion degrades to
+    eager instead of raising mid step.
+
+    Memoized through a module dict rather than ``functools.lru_cache``: the
+    compiler copies a function's decorators verbatim into the generated trainer
+    modules and emits no ``import functools`` for them, so the decorator form
+    becomes a ``NameError`` in the generated module the moment anything splices
+    this in (tests/test_generated_trainer_is_installed.py).
+    """
+    cached = _DISTILLATION_JSD_GRAD_FNS.get(argnums)
+    if cached is not None:
+        return cached
+    eager = torch.func.grad_and_value(
+        _distillation_jsd_chunk, argnums = argnums, has_aux = True,
+    )
+    # dynamic = False, unlike the other compiled regions here, because the caller
+    # pads every chunk to exactly chunk_size: the traced shapes never move, and
+    # asking for dynamic shapes anyway measured 18.0 ms against 11.4 ms on a B200
+    # at a 151936 token vocabulary. Only chunk_size, the hidden width and the
+    # vocabulary reach the trace, and none of those change within a run.
+    compiled = _maybe_compile(
+        dynamic = False, fullgraph = True, options = torch_compile_options,
+    )(eager)
+    _DISTILLATION_JSD_GRAD_FNS[argnums] = compiled
+    return compiled
+pass
+
+
+# Keep ``lru_cache``'s one useful method so callers that need a fresh compile
+# decision, notably anything toggling the compile-disable flag mid process, do
+# not have to know the memo is a dict now.
+_distillation_jsd_grad_fn.cache_clear = _DISTILLATION_JSD_GRAD_FNS.clear
+
+
+class _UnslothDistillationJSD(torch.autograd.Function):
+    # All Unsloth Zoo code licensed under AGPL3
+    """Chunked generalized JSD that differentiates in the forward pass.
+
+    Gradient checkpointing would be the shorter way to bound the logits, but it
+    recomputes each chunk's projection during the backward, and that projection is
+    the expensive part. Measured on a B200 at a 151936 token vocabulary, that
+    version came out slower than materializing the full logits it was meant to
+    replace, 56.0 ms against 29.5 ms, so it bought memory with throughput.
+    Accumulating the gradient while the chunk is already live runs the body once
+    and wins on both, which is the same reason ``UnslothEfficientGRPO`` and the
+    fused cross entropy loss are built this way.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        student_hidden_states, teacher_hidden_states,
+        student_lm_head, teacher_lm_head,
+        completion_mask, beta, chunk_size, num_items_in_batch,
+        student_lm_head_bias, teacher_lm_head_bias,
+        student_logit_scale, teacher_logit_scale,
+        student_final_logit_softcapping, teacher_final_logit_softcapping,
+        temperature,
+    ):
+        flat_student = student_hidden_states.reshape(-1, student_hidden_states.shape[-1])
+        flat_teacher = teacher_hidden_states.reshape(-1, teacher_hidden_states.shape[-1])
+        # The mask decides the packing order for BOTH models, so it has to answer
+        # on the student's device; a dispatched model leaves it wherever the
+        # batch was built, and indexing rejects an index from another device.
+        valid = completion_mask.reshape(-1).to(flat_student.device) != 0
+        n_valid = valid.sum()
+
+        # Pack the valid positions to the front so the masked ones form whole
+        # trailing chunks that can be skipped. argsort on the mask is a static
+        # shape op, unlike flat_student[valid], whose output shape is data
+        # dependent and cannot be traced.
+        order = valid.to(torch.int8).argsort(descending = True, stable = True)
+        flat_student = flat_student[order]
+        # The teacher can sit on another device entirely; index it with its own
+        # copy of the order rather than dragging its hidden states across.
+        flat_teacher = flat_teacher[order.to(flat_teacher.device)]
+        sorted_valid = valid[order]
+
+        # At least one chunk always runs: a fully masked batch still has to reach
+        # every trainable parameter, or backward and the gradient sync that
+        # follows it hang.
+        n_padded = int(max(1, -(-int(n_valid) // chunk_size)) * chunk_size)
+        # Pad the packed rows out to a whole number of chunks so every chunk is
+        # exactly chunk_size and the compiled region sees one static shape. The
+        # tail would otherwise be short whenever batch * seq is not a multiple of
+        # chunk_size, and a second shape means a second Dynamo trace on the first
+        # step plus another on every sequence length after that. The padding rows
+        # carry valid = 0, so they contribute nothing to either the loss or the
+        # gradient; at most chunk_size extra rows are ever added.
+        n_rows = flat_student.shape[0]
+        if n_rows < n_padded:
+            pad = n_padded - n_rows
+            flat_student = torch.cat([flat_student, flat_student.new_zeros(pad, flat_student.shape[-1])])
+            flat_teacher = torch.cat([flat_teacher, flat_teacher.new_zeros(pad, flat_teacher.shape[-1])])
+            sorted_valid = torch.cat([sorted_valid, sorted_valid.new_zeros(pad)])
+
+        # Divide inside the chunk so the accumulated gradient needs no rescale.
+        if num_items_in_batch is None:
+            # Clamped for the same reason a chunk always runs below: a fully
+            # masked batch has to reduce to a finite zero rather than 0 / 0.
+            divisor = n_valid.clamp(min = 1).to(torch.float32)
+        else:
+            if isinstance(num_items_in_batch, torch.Tensor):
+                divisor = num_items_in_batch.to(device = flat_student.device, dtype = torch.float32)
+            else:
+                divisor = torch.tensor(
+                    float(num_items_in_batch), device = flat_student.device, dtype = torch.float32,
+                )
+            # A supplied count is legitimately zero when the whole global batch is
+            # masked, and 0 / 0 is a NaN loss AND NaN gradients, which poison the
+            # optimizer state for the rest of the run rather than costing one step.
+            # Clamp it exactly as the implicit count above is clamped: the
+            # numerator is zero in that case, so the quotient is still zero.
+            divisor = divisor.clamp(min = 1.0)
+
+        head_needs_grad = student_lm_head.requires_grad
+        bias_needs_grad = student_lm_head_bias is not None and student_lm_head_bias.requires_grad
+        # Build the argnums from what actually needs a gradient. A frozen head with
+        # a trainable bias is a real configuration (bias-only tuning, or LoRA with
+        # bias = "all"), and enumerating the combinations by hand had missed it.
+        argnums = (0,) + ((1,) if head_needs_grad else ()) + ((2,) if bias_needs_grad else ())
+        # grads[i] answers to argnums[i], so read the positions rather than
+        # assuming the head is always index 1 and the bias always index 2.
+        head_position = argnums.index(1) if head_needs_grad else None
+        bias_position = argnums.index(2) if bias_needs_grad else None
+        grad_fn = _distillation_jsd_grad_fn(argnums)
+
+        grad_hidden = torch.zeros_like(flat_student)
+        grad_head = torch.zeros_like(student_lm_head) if head_needs_grad else None
+        grad_bias = torch.zeros_like(student_lm_head_bias) if bias_needs_grad else None
+
+        loss = flat_student.new_zeros((), dtype = torch.float32)
+        entropy_sum = flat_student.new_zeros((), dtype = torch.float32)
+
+        for start in range(0, n_padded, chunk_size):
+            stop = start + chunk_size
+            grads, (chunk_loss, (chunk_entropy,)) = grad_fn(
+                flat_student[start : stop], student_lm_head, student_lm_head_bias,
+                flat_teacher[start : stop], teacher_lm_head, teacher_lm_head_bias,
+                sorted_valid[start : stop].to(flat_student.dtype), divisor,
+                student_logit_scale, student_final_logit_softcapping,
+                teacher_logit_scale, teacher_final_logit_softcapping,
+                beta, temperature,
+            )
+            grad_hidden[start : stop] = grads[0]
+            if head_position is not None:
+                grad_head.add_(grads[head_position])
+            if bias_position is not None:
+                grad_bias.add_(grads[bias_position])
+            loss = loss + chunk_loss
+            entropy_sum = entropy_sum + chunk_entropy
+        pass
+
+        # Undo the packing so the caller gets its own row order back, dropping the
+        # padding rows first: they have no counterpart in the caller's tensor.
+        grad_hidden = grad_hidden[: n_rows]
+        unsorted = torch.zeros_like(grad_hidden)
+        unsorted[order] = grad_hidden
+
+        ctx.save_for_backward(
+            unsorted.reshape(student_hidden_states.shape),
+            grad_head if grad_head is not None else flat_student.new_zeros(0),
+            grad_bias if grad_bias is not None else flat_student.new_zeros(0),
+        )
+        ctx.mark_non_differentiable(entropy_sum, n_valid)
+        return loss, entropy_sum, n_valid
+
+    @staticmethod
+    def backward(ctx, grad_output, _grad_entropy, _grad_n_valid):
+        grad_hidden, grad_head, grad_bias = ctx.saved_tensors
+        # Saved as empty rather than None: save_for_backward rejects None, and an
+        # empty tensor is the cheap way to say "this input was not trainable".
+        return (
+            grad_output * grad_hidden,
+            None,
+            grad_output * grad_head if grad_head.numel() != 0 else None,
+            None, None, None, None, None,
+            grad_output * grad_bias if grad_bias.numel() != 0 else None,
+            None, None, None, None, None, None,
+        )
+pass
+
+
+def distillation_chunked_jsd(
+    student_hidden_states,
+    teacher_hidden_states,
+    student_lm_head,
+    teacher_lm_head,
+    completion_mask,
+    beta: float = 0.5,
+    chunk_size: int = 256,
+    num_items_in_batch = None,
+    student_lm_head_bias = None,
+    teacher_lm_head_bias = None,
+    student_logit_scale: float = 1.0,
+    teacher_logit_scale: float = 1.0,
+    student_final_logit_softcapping: float = 0.0,
+    teacher_final_logit_softcapping: float = 0.0,
+    temperature: float = 1.0,
+):
+    """Memory efficient generalized JSD between a student and a frozen teacher.
+
+    Both models are projected ``chunk_size`` positions at a time with the gradient
+    accumulated while each chunk is live, so peak logit memory is
+    ``2 * chunk_size * vocab`` rather than ``2 * batch * seq * vocab``. A frozen
+    student head, the ordinary LoRA case, allocates no dense ``(vocab, hidden)``
+    gradient either. Student and teacher must share a vocabulary but not a hidden
+    width: each is projected through its own head.
+
+    The objective is the one TRL's ``DistillationTrainer`` settled on: pure soft
+    loss with no hard cross entropy term, no implicit ``T**2`` gradient rescale,
+    and the mixture ``M = (1 - beta) * p_student + beta * p_teacher``. Other
+    implementations differ on all three, so the tests check this against a dense
+    reference rather than against any one of them.
+
+    Args:
+        student_hidden_states: ``(batch, seq, hidden)`` before the student's head.
+        teacher_hidden_states: ``(batch, seq, hidden)`` for the same positions.
+        student_lm_head: ``(vocab, hidden)`` student output head weight.
+        teacher_lm_head: ``(vocab, hidden)`` teacher output head weight.
+        completion_mask: ``(batch, seq)``, non zero where a position is trained on.
+        beta: 0 forward KL, 1 reverse KL, in between generalized JSD.
+        chunk_size: valid positions per chunk. Peak memory scales with this.
+        num_items_in_batch: total valid tokens across the global batch. When given
+            the reduction is ``sum / num_items_in_batch``, which is what makes
+            gradient accumulation exact; when ``None`` it is the local mean.
+    Returns:
+        ``(loss, entropy_sum, n_valid_tokens)``. The last two are raw local sums so
+        a distributed caller can reduce them itself.
+    """
+    return _UnslothDistillationJSD.apply(
+        student_hidden_states, teacher_hidden_states,
+        student_lm_head, teacher_lm_head,
+        completion_mask, beta, chunk_size, num_items_in_batch,
+        student_lm_head_bias, teacher_lm_head_bias,
+        student_logit_scale, teacher_logit_scale,
+        student_final_logit_softcapping, teacher_final_logit_softcapping,
+        temperature,
+    )
+pass
+RL_REPLACEMENTS["distillation_chunked_jsd"] = distillation_chunked_jsd
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #

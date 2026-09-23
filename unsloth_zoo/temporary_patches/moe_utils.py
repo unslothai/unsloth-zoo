@@ -873,6 +873,16 @@ def _check_grouped_gemm_available():
     global _GROUPED_GEMM_AVAILABLE
     if _GROUPED_GEMM_AVAILABLE is not None: return _GROUPED_GEMM_AVAILABLE
 
+    # The kernel asserts `X.device.type == "cuda"` on entry, so importable is not the
+    # same as usable: on a CPU box with unsloth installed this used to answer yes,
+    # select_moe_backend picked "unsloth_triton", and the first expert forward died on
+    # "X and W must be on CUDA" instead of taking the native loop. Asked here rather
+    # than at the call site, the way _check_torch_grouped_mm_supported already refuses
+    # without an accelerator.
+    if not torch.cuda.is_available():
+        _GROUPED_GEMM_AVAILABLE = False
+        return False
+
     try:
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True
@@ -1646,6 +1656,31 @@ def _extract_lora_weights(
     return result[0], result[1], result[2]
 
 
+_DEQUANTIZE_4BIT_IN_SLICES = None          # unresolved
+_DEQUANTIZE_4BIT_IN_SLICES_MISSING = False  # resolved, and there is none
+
+
+def _get_dequantize_4bit_in_slices():
+    """The sliced 4-bit read, resolved once.
+
+    Absolute, like the dispatcher above and for the same reason: this file is
+    also copied to unsloth_compiled_cache/moe_utils.py and imported as a
+    top-level module, where a relative import of a sibling raises and the
+    caller would quietly put an oversized stack back on the call that aborts.
+    Only the import is guarded; a real failure inside the helper must propagate.
+    """
+    global _DEQUANTIZE_4BIT_IN_SLICES, _DEQUANTIZE_4BIT_IN_SLICES_MISSING
+    if _DEQUANTIZE_4BIT_IN_SLICES is None and not _DEQUANTIZE_4BIT_IN_SLICES_MISSING:
+        try:
+            from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
+                _dequantize_4bit_in_slices,
+            )
+            _DEQUANTIZE_4BIT_IN_SLICES = _dequantize_4bit_in_slices
+        except ImportError:
+            _DEQUANTIZE_4BIT_IN_SLICES_MISSING = True
+    return _DEQUANTIZE_4BIT_IN_SLICES
+
+
 def _get_base_weight(param, target_dtype=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts."""
@@ -1663,7 +1698,18 @@ def _get_base_weight(param, target_dtype=None):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        # An expert stack of 2**31 elements or more aborts inside the
+        # bitsandbytes dequantize kernel (csrc/ops.cu line 93), and this is the
+        # read the recompute and grouped-mm providers take on every forward and
+        # again on every backward recomputation. Slice it the same way the load
+        # does; the helper returns None for everything smaller, which leaves the
+        # single call below untouched.
+        # Resolved once and memoized rather than imported per call, since this
+        # is a read on every forward and every backward recomputation.
+        slicer = _get_dequantize_4bit_in_slices()
+        weight = slicer(param) if slicer is not None else None
+        if weight is None:
+            weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
         original_shape = getattr(param, "_original_shape", None)
         if original_shape is not None and weight.shape != original_shape:
             weight = weight.reshape(original_shape)

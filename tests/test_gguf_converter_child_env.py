@@ -829,6 +829,17 @@ def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tm
     tree = tmp_path / "site-packages"
     (tree / "gguf").mkdir(parents=True)
     (tree / "gguf" / "__init__.py").write_text("# gguf\n")
+    # A real one is on sys.path, and only a tree with that provenance is accepted.
+    monkeypatch.syspath_prepend(str(tree))
+    # `_importing_gguf_tree` asks `find_spec`, which answers from `sys.modules` before it
+    # ever looks at `sys.path`. So this only prepends a tree for a worker that has not
+    # already imported `gguf`: once any earlier test in the process has, the spec keeps
+    # naming that one, the provenance check refuses this tree and the call returns None.
+    # The tree being on sys.path is the precondition, so say it here rather than inherit
+    # whichever tests happened to run first.
+    monkeypatch.delitem(sys.modules, "gguf", raising = False)
+    for cached in [name for name in sys.modules if name.startswith("gguf.")]:
+        monkeypatch.delitem(sys.modules, cached, raising = False)
 
     def _fake_probe(python_exe, env, requirements, converter_location=None, timeout=120):
         captured["env"] = env
