@@ -109,3 +109,29 @@ def test_peft_sizes_the_lora_on_the_logical_shape():
     # depends on the PEFT release (0.21 swaps the 3-D in/out dims, 0.18 does not).
     dims = {wrapper.lora_A["default"].weight.shape[-1], wrapper.lora_B["default"].weight.shape[0]}
     assert dims == {8, 64}
+
+
+def test_fp4_experts_with_their_own_gate_are_refused_until_a_backend_applies_it():
+    """DeepSeek-V4 clamps SwiGLU in `_apply_gate`; the dequant route must not train FP4 experts
+    on a plain act_fn(gate) * up."""
+    from unsloth_zoo.temporary_patches import moe_utils_fp8 as fp8
+
+    packed = torch.zeros(2, 4, 8, dtype = torch.int8)
+
+    class Clamped(torch.nn.Module):
+        def _apply_gate(self, gate_up):
+            return gate_up
+
+    class Plain(torch.nn.Module):
+        pass
+
+    if "_fp8_experts_own_gate" in vars(fp8):
+        fp8._refuse_fp4_with_an_unapplied_gate(Clamped(), packed)  # the backends apply it
+        return
+    with pytest.raises(NotImplementedError, match = "own gate"):
+        fp8._refuse_fp4_with_an_unapplied_gate(Clamped(), packed)
+    flagged = Clamped()
+    flagged._unsloth_own_apply_gate = True
+    fp8._refuse_fp4_with_an_unapplied_gate(flagged, packed)
+    fp8._refuse_fp4_with_an_unapplied_gate(Plain(), packed)
+    fp8._refuse_fp4_with_an_unapplied_gate(Clamped(), torch.zeros(2, 4, 8, dtype = torch.bfloat16))

@@ -855,6 +855,24 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
 
 
 @torch.compiler.disable
+def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
+    """FP4 experts whose class clamps or offsets SwiGLU in its own `_apply_gate` (DeepSeek-V4)
+    would train on a plain `act_fn(gate) * up` in the backends below unless they apply that
+    gate themselves (`_fp8_experts_own_gate`); refuse rather than train on a different model."""
+    if not _is_fp4_packed_tensor(gate_up_weight):
+        return
+    if "_fp8_experts_own_gate" in globals() or getattr(module, "_unsloth_own_apply_gate", False):
+        return
+    apply_gate = getattr(type(module), "_apply_gate", None)
+    if apply_gate is None or getattr(apply_gate, "__name__", "") == "_default_apply_gate":
+        return
+    raise NotImplementedError(
+        f"Unsloth: {type(module).__name__} stores FP4 experts with its own gate activation "
+        "(clamped SwiGLU), which this unsloth_zoo's MoE backends do not apply yet. "
+        "Update unsloth_zoo to train it."
+    )
+
+
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
         select_moe_backend,
@@ -885,6 +903,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     target_dtype = _get_fp8_dequant_target_dtype(hidden_states)
     gate_up_base, gate_up_quant, gate_up_qkind = _get_moe_weight_and_quant_info(self, "gate_up_proj")
     down_base, down_quant, down_qkind = _get_moe_weight_and_quant_info(self, "down_proj")
+    _refuse_fp4_with_an_unapplied_gate(self, gate_up_base)
     gate_up_weight = _dequantize_full_expert_weights(gate_up_base, gate_up_quant, target_dtype, quant_kind=gate_up_qkind)
     down_weight = _dequantize_full_expert_weights(down_base, down_quant, target_dtype, quant_kind=down_qkind)
 
