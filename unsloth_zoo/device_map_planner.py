@@ -872,6 +872,47 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
     return patterns
 
 
+def _storage_bytes_per_element(model: nn.Module, hf_quantizer: Any):
+    """Bytes per element each parameter is stored in: the quantiser's own
+    ``param_element_size`` (transformers 5), else accelerate's `compute_module_sizes` rules on
+    its `dtype` / `special_dtypes` (see :func:`_quantized_size_kwargs`). ``None`` when there
+    is nothing to say, so the caller keeps the tensor's own size."""
+    per_param = getattr(hf_quantizer, "param_element_size", None)
+    if callable(per_param):
+        def size_of(name: str, tensor: torch.Tensor) -> float:
+            try:
+                return float(per_param(model, name, tensor))
+            except Exception:
+                return tensor.element_size()
+        return size_of
+    size_kwargs = _quantized_size_kwargs(model, hf_quantizer)
+    if not size_kwargs:
+        return None
+    try:
+        from accelerate.utils.modeling import dtype_byte_size, _get_proper_dtype
+    except Exception:
+        return None
+    try:
+        target = size_kwargs.get("dtype")
+        target_size = dtype_byte_size(_get_proper_dtype(target)) if target is not None else None
+        special = {
+            key: dtype_byte_size(_get_proper_dtype(value))
+            for key, value in (size_kwargs.get("special_dtypes") or {}).items()
+        }
+    except Exception:
+        return None
+
+    def size(name: str, tensor: torch.Tensor) -> float:
+        own = dtype_byte_size(tensor.dtype)
+        if name in special:
+            return special[name]
+        if target_size is None or not (tensor.dtype.is_floating_point or tensor.dtype.is_complex):
+            return own
+        return min(target_size, own)
+
+    return size
+
+
 def _load_transient_by_unit(
     model: nn.Module,
     units: Sequence[tuple[str, int]],
@@ -892,12 +933,18 @@ def _load_transient_by_unit(
         torch.empty((), dtype=load_dtype).element_size()
         if isinstance(load_dtype, torch.dtype) else None
     )
+    # A pre-quantized load merges the checkpoint's storage tensors, but `preprocess_model` left
+    # the meta parameters at their unpacked shape (a meta Params4bit is float32), so size them
+    # the way `_compute_module_sizes` does: through the quantiser's storage dtype.
+    stored_size = _storage_bytes_per_element(model, hf_quantizer) if as_stored else None
     unit_names = sorted((u for u, _ in units), key=len, reverse=True)
     out: dict[str, int] = {}
     for name, tensor in model.named_parameters():
         if not any(p.search(name) for p in patterns):
             continue
-        if as_stored or load_itemsize is None or not tensor.dtype.is_floating_point:
+        if stored_size is not None:
+            itemsize = stored_size(name, tensor)
+        elif as_stored or load_itemsize is None or not tensor.dtype.is_floating_point:
             itemsize = tensor.element_size()
         else:
             itemsize = load_itemsize
@@ -907,7 +954,7 @@ def _load_transient_by_unit(
         )
         if owner is None:
             continue
-        out[owner] = max(out.get(owner, 0), tensor.numel() * itemsize)
+        out[owner] = max(out.get(owner, 0), int(tensor.numel() * itemsize))
     return out
 
 

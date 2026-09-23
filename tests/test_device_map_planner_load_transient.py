@@ -25,6 +25,7 @@ the sources leave. MiniMax-M3 16-bit ran out of memory mid-load on exactly this
 while its steady-state plan fitted. Meta-device models only, no GPU needed.
 """
 import importlib.util
+import re
 import sys
 import types
 
@@ -428,3 +429,41 @@ def test_an_op_built_around_a_concatenate_counts_as_merging(monkeypatch):
     patterns = _merged_parameter_patterns(nn.Linear(1, 1))
     names = ["vision.blocks.0.attn.qkv.weight", "model.layers.0.self_attn.o_proj.weight"]
     assert [n for n in names if any(p.search(n) for p in patterns)] == names[:1]
+
+
+@needs_conversion_mapping
+def test_a_pre_quantized_merge_is_sized_from_its_storage_dtype(monkeypatch):
+    # preprocess_model leaves a meta Params4bit at its unpacked shape in float32, so the live
+    # tensor reads 8x the packed bytes a pre-quantized checkpoint actually merges.
+    pytest.importorskip("bitsandbytes")
+    import unsloth_zoo.device_map_planner as planner
+    from accelerate import init_empty_weights
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from transformers.quantizers import AutoHfQuantizer
+    from transformers.utils.quantization_config import BitsAndBytesConfig
+
+    config = LlamaConfig(
+        hidden_size = _HIDDEN, intermediate_size = _INTER, num_hidden_layers = 2,
+        num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 256,
+    )
+    with init_empty_weights():
+        model = LlamaForCausalLM(config).to(torch.bfloat16)
+    quantizer = AutoHfQuantizer.from_config(
+        BitsAndBytesConfig(load_in_4bit = True, bnb_4bit_compute_dtype = torch.bfloat16),
+        pre_quantized = True,
+    )
+    try:
+        quantizer.preprocess_model(model = model, device_map = None, dtype = torch.bfloat16)
+    except TypeError:
+        quantizer.preprocess_model(model, device_map = None)
+    weight = model.model.layers[0].mlp.gate_proj.weight
+    if type(weight).__name__ != "Params4bit":
+        pytest.skip("this transformers / bitsandbytes does not preprocess to Params4bit")
+    monkeypatch.setattr(
+        planner, "_merged_parameter_patterns",
+        lambda model, hf_quantizer = None: [re.compile(r"mlp\.gate_proj\.weight$")],
+    )
+    units, _ = _units(model)
+    transient = planner._load_transient_by_unit(model, units, quantizer)
+    assert transient, units
+    assert max(transient.values()) == _INTER * _HIDDEN // 2  # 4-bit: half a byte per element
