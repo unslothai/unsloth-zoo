@@ -509,6 +509,38 @@ def test_grpo_generation_normalizer_unchanged_on_a_normal_batch(loss_type):
     )
 
 
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo"])
+@pytest.mark.parametrize("steps_per_generation, grad_accum", [(2, 2), (4, 2), (1, 2)])
+def test_grpo_generation_normalizer_covers_one_accumulation_window(
+    loss_type, steps_per_generation, grad_accum,
+):
+    """One optimizer window of dapo/cispo is the token mean over that window (TRL #6024),
+    though num_items_in_batch counts a whole generation batch of steps_per_generation.
+    Every micro-batch holds 10 tokens, so TRL's expected window count is exact here."""
+    torch.manual_seed(0)
+    B, T = 3, 5
+    micro = []
+    for _ in range(max(steps_per_generation, grad_accum)):
+        mask = (torch.randperm(B * T) < 10).reshape(B, T).to(torch.float64)
+        micro.append((torch.randn(B, T, dtype = torch.float64), mask, torch.randn(B, dtype = torch.float64)))
+    window = micro[:grad_accum]
+    accumulated = 0.0
+    for i, (new, mask, advantages) in enumerate(window):
+        first = (i // steps_per_generation) * steps_per_generation
+        generation_batch = micro[first : first + steps_per_generation]
+        accumulated += rr.grpo_compute_loss(
+            None, new, None, None, torch.zeros(B, T, dtype = torch.long), mask, 0.0, advantages,
+            loss_type = loss_type, epsilon_high = 5.0, num_processes = 1,
+            num_items_in_batch = float(sum(m.sum() for _, m, _ in generation_batch)),
+            current_gradient_accumulation_steps = grad_accum,
+            steps_per_generation = steps_per_generation,
+        )[0]
+    # old is None and beta is 0, so coef_1 == 1: dapo's per-token loss is -A, cispo's -A * logp.
+    per_token = [-a[:, None] * (1 if loss_type == "dapo" else new) * m for new, m, a in window]
+    expected = sum(x.sum() for x in per_token) / sum(m.sum() for _, m, _ in window)
+    torch.testing.assert_close(accumulated, expected)
+
+
 # Per TRL _compute_loss (main @ f782735): kl_i *= the pre-clamp non-detached coef_1,
 # before the loss_type dispatch, feeding both the beta term and the kl metric.
 
