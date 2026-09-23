@@ -926,16 +926,20 @@ def _rewrites_a_constant(node):
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in ("replace", "translate", "decode", "encode")
+        and node.func.attr in (
+            "replace", "translate", "decode", "encode",
+            "split", "rsplit", "partition", "rpartition", "splitlines",
+        )
     ):
         return False
     if _literal_text(node.func.value) is None:
         return False
-    if node.func.attr in ("decode", "encode"):
-        # A literal decoded is a destination this cannot read: bytes holding
-        # UTF-16 for an attacker URL are read here as UTF-8 replacement text,
-        # and nothing in the file then spells a host. Upstream decodes what
-        # came back from the hub, which is not a literal.
+    if node.func.attr not in ("replace", "translate"):
+        # A literal taken apart is a destination this cannot read: bytes
+        # holding UTF-16 for an attacker URL are read here as UTF-8 replacement
+        # text, and "https|://evil.example/c".split("|") puts a whole URL back
+        # together out of pieces indexed from a call. Upstream decodes and
+        # splits what came back from the hub, which is not a literal.
         return True
     return any(
         _literal_text(argument) is None

