@@ -192,16 +192,16 @@ def test_extractor_disambiguates_square_dims_via_did_swap(did_swap):
     assert first.shape == (E, dim, R)
     assert second.shape == (E, R, dim)
 
-    # Reference: under PEFT 0.18 the reshape is the canonical permutation;
-    # under PEFT 0.19 swapped, weight_A and weight_B roles are flipped.
+    # Reference: what PEFT's own get_delta_weight adds to an (E, out, in) square stack.
+    # PEFT 0.19+ (swap flag set) adds B @ A per expert; PEFT 0.18 adds (B @ A).T.
     x = torch.randn(5, dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]
         Be = wB[:, moe_lora_b_expert_columns(e, E, R)]
         if did_swap:
-            naive = x @ Be @ Ae   # PEFT 0.19 reversed
+            naive = x @ Ae.T @ Be.T
         else:
-            naive = x @ Ae.T @ Be.T  # PEFT 0.18 canonical
+            naive = x @ Be @ Ae
         via = (x @ first[e]) @ second[e]
         torch.testing.assert_close(via, naive, atol=1e-4, rtol=1e-4)
 

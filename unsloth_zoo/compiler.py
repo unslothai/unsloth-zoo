@@ -201,6 +201,56 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def function_has_tensor_inputs(source: str) -> bool:
+    """False when every parameter of the function carries a non-tensor
+    annotation (ints, strs, bools, lists of them), so Dynamo has nothing to
+    trace and Inductor nothing to fuse. Such functions are configuration
+    helpers, like Inkling's `plan_out_scales(temporal_patch_size: int, ...)`
+    called from `__init__`; compiling them with fullgraph = True fails on the
+    first Python-int operation (`math.isqrt`) and takes the model load with it.
+    An unannotated parameter, *args or **kwargs, or unparseable source counts
+    as a tensor input, so only fully annotated scalar helpers are skipped."""
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except Exception:
+        return True
+    function = next((n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if function is None:
+        return True
+    args = function.args
+    if args.vararg is not None or args.kwarg is not None:
+        return True
+    positional = list(args.posonlyargs) + list(args.args)
+    parameters = positional + list(args.kwonlyargs)
+    if len(parameters) == 0:
+        return True
+    if parameters[0].arg in ("self", "cls"):
+        return True
+    # A default that is a literal (device = "cpu", eps = 1e-6) tells the type
+    # of an unannotated parameter; anything else unannotated may be a tensor.
+    defaults = {}
+    for parameter, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
+        defaults[parameter.arg] = default
+    for parameter, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is not None:
+            defaults[parameter.arg] = default
+    scalar_names = {"int", "float", "bool", "str", "bytes", "None", "list", "tuple", "dict", "set", "Sequence", "Iterable", "Mapping", "device", "dtype"}
+    for parameter in parameters:
+        if parameter.annotation is None:
+            default = defaults.get(parameter.arg)
+            if isinstance(default, ast.Constant) and not isinstance(default.value, type(Ellipsis)):
+                continue
+            return True
+        annotation = ast.unparse(parameter.annotation)
+        names = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", annotation))
+        if "Tensor" in annotation or "tensor" in annotation:
+            return True
+        if not names <= scalar_names | {"Optional", "Union", "List", "Tuple", "Dict", "Set", "torch", "typing"}:
+            return True
+    return False
+pass
+
+
 def calls_mask_creation_function(source):
     """`transformers.masking_utils` `create*` factories that `source` CALLS.
 
@@ -6492,6 +6542,11 @@ def unsloth_compile_transformers(
                     bad_reason = (
                         f"it builds attention masks via {', '.join(mask_builders)}"
                     )
+            pass
+            if not bad and module not in disable_compile_functions:
+                if not function_has_tensor_inputs(source):
+                    bad = True
+                    bad_reason = "it takes no tensor inputs"
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented

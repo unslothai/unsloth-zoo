@@ -800,6 +800,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
         swap_moe_weights_for_call,
+        _gate_up_is_interleaved,
     )
 
     backend = select_moe_backend()
@@ -830,7 +831,8 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         if backend == "grouped_mm":
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-grouped_mm.")
             forward_fn = forward_native_grouped_mm
-        elif backend == "unsloth_triton":
+        # Interleaved gate_up (GPT-OSS) has no Triton path; the eager loop implements it.
+        elif backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-Triton grouped GEMM.")
             forward_fn = forward_triton_grouped_gemm
         else:
@@ -1060,7 +1062,9 @@ def patch_fp8_experts_interface():
     def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
         return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
-    for key in ("grouped_mm", "batched_mm", "deepgemm"):
+    # "unsloth" is the default experts implementation Unsloth registers on transformers 5, and
+    # the FP8Experts swap keeps the config's key, so it has to resolve in this registry too.
+    for key in ("grouped_mm", "batched_mm", "deepgemm", "unsloth"):
         try:
             ALL_FP8_EXPERTS_FUNCTIONS[key] = _unsloth_fp8_dispatch
         except Exception:
