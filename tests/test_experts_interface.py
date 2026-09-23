@@ -402,13 +402,22 @@ def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypat
     """Plain floating point stacks with nothing stashed need nothing from Unsloth's dispatcher:
     they run transformers' grouped_mm, as every decorated class did before the "unsloth" default."""
     import unsloth_zoo.temporary_patches.moe_experts_interface as MEI
+    import unsloth_zoo.temporary_patches.moe_utils as moe_utils
     calls = []
     monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM", lambda self, h, i, w: calls.append("grouped_mm") or h)
     monkeypatch.setattr(MEI, "_unsloth_experts_dispatch", lambda self, h, i, w: calls.append("unsloth") or h)
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", True)
     m = _experts(None, "transformers.models.x.modeling_x", implementation = "unsloth")
     h, i, w = torch.zeros(2, 4), torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)
     assert unsloth_experts_forward(m, h, i, w) is h
     assert calls == ["grouped_mm"]
+
+    # Without torch._grouped_mm on this device (pre-Hopper, CPU) the dispatcher's fallback runs.
+    calls.clear()
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", False)
+    unsloth_experts_forward(m, h, i, w)
+    assert calls == ["unsloth"]
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", True)
 
     # A stashed expert LoRA is only applied by Unsloth's dispatcher.
     calls.clear()

@@ -250,9 +250,24 @@ def unsloth_experts_forward(
     """The "unsloth" experts implementation. Dense stacks with no expert LoRA take
     transformers' grouped_mm, which a compiled MoE block inlines as before; packed
     stacks and expert LoRA take Unsloth's dispatcher, which is kept out of Dynamo."""
-    if _TRANSFORMERS_GROUPED_MM is not None and _dense_experts_without_expert_lora(self):
+    if (
+        _TRANSFORMERS_GROUPED_MM is not None
+        and _dense_experts_without_expert_lora(self)
+        and _grouped_mm_supported()
+    ):
         return _TRANSFORMERS_GROUPED_MM(self, hidden_states, top_k_index, top_k_weights)
     return _unsloth_experts_dispatch(self, hidden_states, top_k_index, top_k_weights)
+
+
+def _grouped_mm_supported() -> bool:
+    """torch._grouped_mm works on this device (not pre-Hopper, CPU or an older torch); without
+    it the dispatcher's own fallback runs. Reads the cached probe first, so a compiled MoE
+    block sees a constant."""
+    moe_utils = _moe_utils_module()
+    supported = moe_utils._TORCH_GROUPED_MM_SUPPORTED
+    if supported is None:
+        supported = moe_utils._check_torch_grouped_mm_supported()
+    return bool(supported)
 
 
 # Kept out of Dynamo like the per-model MoE block patches: a compiled MoE block
