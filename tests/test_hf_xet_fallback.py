@@ -102,6 +102,57 @@ def _wait(predicate, timeout: float = 2.0, step: float = 0.02) -> bool:
     return predicate()
 
 
+def _watch_while_growing(grown: Path, **watchdog_kwargs) -> "tuple[list[str], float, float]":
+    """Grow *grown* every 0.05 s under a watchdog for past its stall timeout.
+
+    Returns ``(stall calls, longest gap between writes, stall_timeout)``. A stall is no growth for
+    stall_timeout, so a claim that growth keeps the watchdog quiet needs the grower to have kept
+    writing with no gap that long. On a loaded xdist runner a starved grower is a real stall and the
+    watchdog is right to fire; the gap tells the two apart (#1349).
+    """
+    grow_stop = threading.Event()
+    writes: list[float] = []
+
+    def _grow():
+        size = grown.stat().st_size
+        while not grow_stop.wait(0.05):
+            size += 4096
+            grown.write_bytes(b"\0" * size)
+            writes.append(time.monotonic())
+
+    grower = threading.Thread(target = _grow, daemon = True)
+    grower.start()
+
+    # 1.5 s against a 0.05 s grower leaves a thirty-fold margin.
+    stall_timeout = 1.5
+    calls: list[str] = []
+    started = time.monotonic()
+    before = set(threading.enumerate())
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = stall_timeout,
+        **watchdog_kwargs,
+    )
+    watchdog = [t for t in threading.enumerate() if t not in before and t.name == "hf-xet-watchdog"]
+    assert len(watchdog) == 1, f"expected one new watchdog thread, found {watchdog}"
+    try:
+        time.sleep(stall_timeout + 0.5)
+    finally:
+        stop.set()
+        # Joined, not just signalled: stop.wait() can return and the thread be preempted mid-tick, so
+        # a callback could still land after the signal. The timestamp follows the join, so the
+        # measured interval covers everything the watchdog saw.
+        watchdog[0].join(timeout = 10)
+        stopped = time.monotonic()
+        grow_stop.set()
+        grower.join(timeout = 5)
+    assert not watchdog[0].is_alive(), "the watchdog thread did not stop"
+    # Through the moment the watchdog stopped: a grower starved after its last write leaves a
+    # trailing gap the watchdog saw too.
+    marks = [started] + [w for w in writes if w < stopped] + [stopped]
+    gap = max(b - a for a, b in zip(marks, marks[1:]))
+    return calls, gap, stall_timeout
+
+
 def test_constant_incomplete_fires_stall(hf_cache):
     blobs = _blobs_dir(hf_cache)
     (blobs / "deadbeef.incomplete").write_bytes(b"\0" * 1024)  # never grows
@@ -124,27 +175,11 @@ def test_growing_incomplete_never_stalls(hf_cache):
     part = blobs / "growing.incomplete"
     part.write_bytes(b"\0" * 1024)
 
-    grow_stop = threading.Event()
-
-    def _grow():
-        size = 1024
-        while not grow_stop.wait(0.05):
-            size += 4096
-            part.write_bytes(b"\0" * size)
-
-    grower = threading.Thread(target = _grow, daemon = True)
-    grower.start()
-
-    calls: list[str] = []
-    stop = xf.start_watchdog(
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5
+    calls, gap, stall_timeout = _watch_while_growing(part)
+    assert gap < stall_timeout, (
+        f"the partial went {gap:.2f}s without growing, so this run never tested the claim"
     )
-    try:
-        time.sleep(1.0)  # well past stall_timeout, but bytes keep growing
-        assert calls == [], "watchdog fired despite continuous progress"
-    finally:
-        stop.set()
-        grow_stop.set()
+    assert calls == [], "watchdog fired despite continuous progress"
 
 
 def test_no_incomplete_never_stalls(hf_cache):
@@ -245,48 +280,8 @@ def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
     sibling.write_bytes(b"\0" * 1024)
     (blobs / "child.incomplete").write_bytes(b"\0" * 2048)   # constant
 
-    grow_stop = threading.Event()
-    writes: list[float] = []
-
-    def _grow():
-        size = 1024
-        while not grow_stop.wait(0.05):
-            size += 4096
-            sibling.write_bytes(b"\0" * size)
-            writes.append(time.monotonic())
-
-    grower = threading.Thread(target = _grow, daemon = True)
-    grower.start()
-
-    # A stall is no growth for stall_timeout, so the claim needs the sibling to keep growing with no
-    # gap that long. On a loaded xdist runner a 0.5 s timeout against a 0.05 s grower was a coin
-    # flip: a starved grower is a real stall, and the watchdog was right to fire. 1.5 s leaves a
-    # thirty-fold margin, and the gap check below says which of the two happened.
-    stall_timeout = 1.5
-    calls: list[str] = []
-    started = time.monotonic()
-    before = set(threading.enumerate())
-    stop = xf.start_watchdog(   # default: repo-wide (watch_new_partials_only = False)
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = stall_timeout,
-    )
-    watchdog = [t for t in threading.enumerate() if t not in before and t.name == "hf-xet-watchdog"]
-    assert len(watchdog) == 1, f"expected one new watchdog thread, found {watchdog}"
-    try:
-        time.sleep(stall_timeout + 0.5)   # past stall_timeout, but repo-wide bytes keep growing
-    finally:
-        stop.set()
-        # Joined, not just signalled: stop.wait() can return and the thread be preempted mid-tick, so
-        # a callback could still land after the signal. The timestamp follows the join, so the
-        # measured interval covers everything the watchdog saw.
-        watchdog[0].join(timeout = 10)
-        stopped = time.monotonic()
-        grow_stop.set()
-        grower.join(timeout = 5)
-    assert not watchdog[0].is_alive(), "the watchdog thread did not stop"
-    # Through the moment the watchdog stopped: a grower starved after its last write leaves a
-    # trailing gap the watchdog saw too.
-    marks = [started] + [w for w in writes if w < stopped] + [stopped]
-    gap = max(b - a for a, b in zip(marks, marks[1:]))
+    # default: repo-wide (watch_new_partials_only = False)
+    calls, gap, stall_timeout = _watch_while_growing(sibling)
     assert gap < stall_timeout, (
         f"the sibling went {gap:.2f}s without growing, so this run never tested the claim"
     )
