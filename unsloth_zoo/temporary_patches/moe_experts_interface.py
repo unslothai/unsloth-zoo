@@ -72,7 +72,9 @@ def _forward_is_unsloth(forward) -> bool:
     if getattr(fn, "_unsloth_moe_forward", False):
         return True
     module = getattr(fn, "__module__", "") or ""
-    if module.startswith("unsloth_zoo.") or "moe_utils" in module:
+    # The compiled cache copy loads as `unsloth_cached_moe_utils`, or as the bare `moe_utils`
+    # a generated module imports; any other name that merely contains it is someone's code.
+    if module.startswith("unsloth_zoo.") or module in ("unsloth_cached_moe_utils", "moe_utils"):
         return True
     return getattr(fn, "__name__", "") == "forward_moe_backend"
 

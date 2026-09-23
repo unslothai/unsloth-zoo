@@ -240,3 +240,17 @@ def test_bnb_handled_check_defers_to_the_generic_route(monkeypatch):
     declined = _experts(None, "transformers.models.x.modeling_x", wrapped = True, implementation = "grouped_mm")
     monkeypatch.setattr(mb, "_route_generic_bnb4bit_experts_class", lambda module: False, raising = False)
     assert not mb._expert_forward_is_handled(declined)
+
+
+def test_only_the_cached_dispatcher_module_counts_as_unsloth():
+    """A custom forward living in some other module whose name merely contains `moe_utils`
+    is the model's own code, and must keep its weights unpacked."""
+    from unsloth_zoo.temporary_patches.moe_experts_interface import _forward_is_unsloth
+    def forward(self, hidden_states, top_k_index, top_k_weights):
+        return hidden_states
+    for ours in ("unsloth_cached_moe_utils", "moe_utils"):
+        forward.__module__ = ours
+        assert _forward_is_unsloth(forward), ours
+    for other in ("my_project.moe_utils", "transformers_modules.x.custom_moe_utils"):
+        forward.__module__ = other
+        assert not _forward_is_unsloth(forward), other
