@@ -87,6 +87,19 @@ def hf_cache(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _supervised_child(monkeypatch, *partials: str) -> int:
+    """A child that exists and writes exactly *partials*, whatever else is running on the host.
+
+    These tests pass a pid only to reach the data branch. A made-up pid (4242) left the outcome to
+    the runner: when some process of ours happened to hold it, psutil read it as a live child owning
+    no partial, the watchdog took the test's fresh partial for a peer's download and held the clock,
+    and three "must trip" tests failed together on a CI runner. Own the partials explicitly and use
+    a pid that is certainly alive, so the watchdog asks the question each test means to ask.
+    """
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set(partials))
+    return os.getpid()
+
+
 def _blobs_dir(root: Path, repo_id: str = REPO) -> Path:
     d = root / f"models--{repo_id.replace('/', '--')}" / "blobs"
     d.mkdir(parents = True, exist_ok = True)
@@ -4901,7 +4914,7 @@ def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "buffering.incomplete"),
     )
     try:
         time.sleep(1.2)  # 4x the stall deadline
@@ -4921,7 +4934,7 @@ def test_a_child_that_stops_receiving_still_trips(hf_cache, monkeypatch):
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "hung.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "a hung child never tripped"
@@ -4941,7 +4954,7 @@ def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeyp
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "hung.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "unreadable RSS must not disarm the stall"
@@ -5089,7 +5102,7 @@ def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monke
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         time.sleep(0.15)
@@ -5124,7 +5137,7 @@ def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.6, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "slow.incomplete"),
     )
     try:
         time.sleep(1.0)
@@ -5249,7 +5262,7 @@ def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch)
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         for _ in range(30):                      # ~1.5s, nearly 4x the short deadline
@@ -5274,7 +5287,7 @@ def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch)
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "a frozen child was given the patient deadline"
