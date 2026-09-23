@@ -292,3 +292,25 @@ def test_a_transformers_without_conversion_mapping_reserves_nothing(monkeypatch)
     units, _ = _units(model)
     assert _merged_parameter_patterns(model) == []
     assert _load_transient_by_unit(model, units) == {}
+
+
+def test_a_floor_left_on_a_card_the_merge_moved_off_does_not_rule_out_a_fit(monkeypatch):
+    # Floors only grew while re-planning, so one kept on a card whose merging layer had
+    # moved elsewhere made 3x look infeasible here and the plan fell back to 1x.
+    import unsloth_zoo.device_map_planner as planner
+
+    with torch.device("meta"):
+        model = _Tiny(layers = 10)
+    layer = 64 * 64 * 4
+    monkeypatch.setattr(
+        planner, "_load_transient_by_unit",
+        lambda model, units, hf_quantizer = None: {u: 8192 for u, _ in units if u == "layers.6"},
+    )
+    budgets = {0: 8 * layer, 1: 8 * layer, 2: 3 * layer, 3: 9 * layer}
+    plan = plan_device_map(
+        model, max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
+        free_space_policy = "head_max",
+    )
+    device = plan.device_map["layers.6"]
+    assert plan.load_transient_by_device == {device: 3 * 8192}
+    assert plan.free_bytes[device] >= 3 * 8192

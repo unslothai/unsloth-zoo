@@ -134,6 +134,7 @@ Nothing here is specific to one architecture:
 from __future__ import annotations
 
 import inspect
+import itertools
 import os
 import re
 from dataclasses import dataclass, field
@@ -1702,6 +1703,13 @@ def plan_device_map(
         multiples = (
             (_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE,) if _expandable_segments_enabled() else ()
         ) + (_LOAD_TRANSIENT_MULTIPLE, 1)
+        def _fits(found, multiple):
+            if found is None:
+                return False
+            need = _needs(found[0], multiple)
+            return all(raw_budgets[d] - found[1][d] >= n for d, n in need.items())
+
+        largest = max(unit_transient.values())
         settled = None
         for multiple in multiples:
             load_floor = {}
@@ -1716,6 +1724,21 @@ def plan_device_map(
                     load_floor[d] = max(load_floor.get(d, 0), n)
                 result, chosen = _search()
                 if result is None:
+                    break
+            if settled is not None:
+                break
+            # Floors only grow above, so one left on a card the merging units have since
+            # moved off can rule out a placement that fits. Try the cards jointly instead:
+            # each subset keeps the room on its cards only, and the first packing whose own
+            # needs all fit wins.
+            for size in range(1, len(devices) + 1):
+                for cards in itertools.combinations(devices, size):
+                    load_floor = dict.fromkeys(cards, largest * multiple)
+                    result, chosen = _search()
+                    if _fits(result, multiple):
+                        settled = multiple
+                        break
+                if settled is not None:
                     break
             if settled is not None:
                 break
