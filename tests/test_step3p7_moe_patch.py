@@ -93,6 +93,20 @@ def test_patch_routes_the_forward_and_keeps_the_class_gate():
     assert klass.forward is forward
 
 
+def test_a_rejected_forward_leaves_the_class_unmarked_and_retryable(monkeypatch):
+    from unsloth_zoo.temporary_patches import step3p7_moe
+
+    klass = modeling.Step3p7Experts
+    for name in ("_unsloth_already_patched", "_unsloth_own_apply_gate", "_unsloth_lora_extractor_fn"):
+        monkeypatch.delattr(klass, name, raising = False)
+    forward = klass.forward
+    monkeypatch.setattr(step3p7_moe, "patch_function", lambda *args, **kwargs: False)
+    patch_step3p7_moe()
+    assert klass.forward is forward
+    for name in ("_unsloth_already_patched", "_unsloth_own_apply_gate", "_unsloth_lora_extractor_fn"):
+        assert name not in vars(klass), name
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "the MoE backends need CUDA")
 @pytest.mark.parametrize("limit", [None, 1.0])
 @pytest.mark.parametrize("backend", ["grouped_mm", "unsloth_triton", "native_torch"])

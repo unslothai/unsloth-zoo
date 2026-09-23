@@ -171,7 +171,15 @@ def patch_step3p7_moe():
 
     # Pass the function object directly (no closure): patch_function serializes the source into
     # the compiled cache, so a closure var would be a NameError there. Mirrors qwen3_moe.py.
-    patch_function(Step3p7Experts, "forward", get_forward_moe_backend())
+    if not patch_function(Step3p7Experts, "forward", get_forward_moe_backend()):
+        # The native forward stays; drop the markers so the backends do not read them and a
+        # later call can retry.
+        for name in ("_unsloth_lora_extractor_fn", "_unsloth_own_apply_gate"):
+            if name in vars(Step3p7Experts):
+                delattr(Step3p7Experts, name)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning("Unsloth: Could not patch Step-3.7 MoE experts; keeping the native forward.")
+        return
     Step3p7Experts._unsloth_already_patched = True
 
     if UNSLOTH_ENABLE_LOGGING:
