@@ -142,6 +142,11 @@ MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
 # saying what an allowed destination looks like is not.
 RE_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 RE_AUTHORITY_END = re.compile(r"[/?#]")
+
+# How far back a scheme can reach from its separator. The longest one anybody
+# writes is a few characters, and reading a hole this far back is what catches
+# a scheme supplied a character at a time.
+MAX_SCHEME = 12
 RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
 # A URL whose authority is already over: what follows cannot change the host.
 RE_AUTHORITY_CLOSED = re.compile(r"https?://[^/?#]*[/?#]", re.IGNORECASE)
@@ -910,11 +915,17 @@ def _rewrites_a_constant(node):
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in ("replace", "translate")
+        and node.func.attr in ("replace", "translate", "decode", "encode")
     ):
         return False
     if _literal_text(node.func.value) is None:
         return False
+    if node.func.attr in ("decode", "encode"):
+        # A literal decoded is a destination this cannot read: bytes holding
+        # UTF-16 for an attacker URL are read here as UTF-8 replacement text,
+        # and nothing in the file then spells a host. Upstream decodes what
+        # came back from the hub, which is not a literal.
+        return True
     return any(
         _literal_text(argument) is None
         for argument in [*node.args, *(k.value for k in node.keywords)]
@@ -1776,6 +1787,22 @@ def _talks_only_to_the_model_hub(text):
         return False
 
 
+def _scheme_hides_a_hole(literal):
+    """Whether a hole sits inside the scheme of any URL in this text.
+
+    A hole immediately before :// was not the only way to spell one: "%cttps"
+    supplies a single character of it, and "\x00ttps://evil.example/c" matched
+    no scheme either. A scheme is short, so the whole of it is read back from
+    the separator rather than only the character before it.
+    """
+    index = literal.find("://")
+    while index != -1:
+        if UNKNOWN_PIECE in literal[max(0, index - MAX_SCHEME):index]:
+            return True
+        index = literal.find("://", index + 1)
+    return False
+
+
 def _talks_only_to_the_model_hub_tree(tree, text):
     """The parsed half of the allowance. See the caller."""
     previous = getattr(_fold_state, "budget", None)
@@ -1856,7 +1883,7 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
 
     try:
         for literal in folded_literals():
-            if UNKNOWN_PIECE + "://" in literal:
+            if _scheme_hides_a_hole(literal):
                 # The scheme itself came out of a piece this cannot read, so
                 # the destination is not merely unnamed, it is hidden: nothing
                 # in the file spells a URL for the walk below to look at. Every

