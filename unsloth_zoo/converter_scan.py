@@ -436,6 +436,17 @@ def _dynamic_imports(tree, aliases = None):
     return names, unreadable
 
 
+# Connection APIs that name a bare host from a module too ordinary to refuse
+# whole: asyncio is imported for all sorts of reasons, and open_connection(
+# "evil.example", 443) is not one of them. Checked by name, through aliases,
+# so the from-import and the qualified call are the same thing.
+BARE_HOST_APIS = frozenset((
+    "open_connection", "open_unix_connection", "create_connection",
+    "create_unix_connection", "start_server", "start_unix_server",
+    "sock_connect", "create_datagram_endpoint",
+))
+
+
 def _imports_an_unvouchable_api(tree, aliases = None):
     """Whether a connection API arrives by from-import.
 
@@ -453,6 +464,15 @@ def _imports_an_unvouchable_api(tree, aliases = None):
     dynamic, unreadable = _dynamic_imports(tree, aliases)
     if unreadable or any(unvouchable(name) for name in dynamic):
         return True
+    if aliases is None:
+        aliases = _call_aliases(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _called_name(node, aliases) in BARE_HOST_APIS:
+            return True
+        if isinstance(node, ast.ImportFrom) and any(
+            alias.name in BARE_HOST_APIS for alias in node.names
+        ):
+            return True
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module:
             # The member counts with its parent: from http import client is

