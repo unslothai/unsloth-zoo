@@ -348,6 +348,15 @@ def _swap_out_packed_modules(model):
     return swaps
 
 
+# Unsloth's per-Linear packed module keeps its packed bytes here once a PEFT merge has made it a
+# plain dense nn.Linear; the full save must describe it as dense too.
+_DENSIFIED_STATE = "_unsloth_mxfp4_packed_state"
+
+
+def _densified_module_names(model):
+    return [name for name, module in model.named_modules() if _DENSIFIED_STATE in module.__dict__]
+
+
 def _dense_state_dict(state_dict, swaps):
     """A caller's ``state_dict`` with each swapped module's entries replaced by its dense
     module's, so an explicit state dict is saved under the checkpoint's names too."""
@@ -445,10 +454,11 @@ def patch_save_pretrained_mxfp4():
     @functools.wraps(original)
     def save_pretrained(self, *args, **kwargs):
         swaps = _swap_out_packed_modules(self)
-        if not swaps:
+        dense_names = [name for *_, name in swaps] + _densified_module_names(self)
+        if not dense_names:
             return _save_pretrained_expert_params(self, *args, **kwargs)
         try:
-            restore_config = _config_for_dense_save(self.config, [name for *_, name in swaps])
+            restore_config = _config_for_dense_save(self.config, dense_names)
             try:
                 try:
                     bound = inspect.signature(original).bind(self, *args, **kwargs)

@@ -740,3 +740,31 @@ def test_merged_16bit_rewrite_computes_each_stacks_lora_per_shard(tmp_path, monk
         )
     saving._dequantize_compressed_mxfp4_shards(str(tmp_path), ["l0.safetensors", "l1.safetensors"], {}, model)
     assert events == [("delta", 0), ("write", "l0.safetensors"), ("delta", 1), ("write", "l1.safetensors")]
+
+
+def test_a_full_save_describes_linears_a_merge_made_dense(tmp_path):
+    """Unsloth's per-Linear packed module becomes a plain dense nn.Linear on a PEFT merge (its
+    packed bytes kept aside in `_unsloth_mxfp4_packed_state`). A full save must not describe it
+    as packed: a bitsandbytes config skips it, an MXFP4 compressed-tensors config is dropped,
+    even when no packed module is left to swap."""
+    import json
+    from transformers import BitsAndBytesConfig
+
+    model = _tiny_pretrained()
+    model.layers[0].proj = nn.Linear(H, H, bias = False)
+    model.layers[0].proj.__dict__["_unsloth_mxfp4_packed_state"] = ("packed", "scale", torch.bfloat16)
+    model.config.quantization_config = BitsAndBytesConfig(load_in_4bit = True, llm_int8_skip_modules = ["lm_head"])
+    model.save_pretrained(str(tmp_path / "bnb"))
+    skip = json.load(open(tmp_path / "bnb" / "config.json"))["quantization_config"]["llm_int8_skip_modules"]
+    assert "layers.0.proj" in skip and "layers.0.experts" in skip
+    assert model.config.quantization_config.llm_int8_skip_modules == ["lm_head"]
+    # Nothing packed left at all (every stack merged away): still described as dense.
+    for layer in model.layers:
+        layer.experts = nn.Identity()
+    model.config.quantization_config = {
+        "quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
+        "config_groups": {"g": {"format": "mxfp4-pack-quantized", "weights": {"num_bits": 4}}},
+    }
+    model.save_pretrained(str(tmp_path / "ct"))
+    assert "quantization_config" not in json.load(open(tmp_path / "ct" / "config.json"))
+    assert model.config.quantization_config["format"] == "mxfp4-pack-quantized"
