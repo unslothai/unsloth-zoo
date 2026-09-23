@@ -827,3 +827,57 @@ def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, froz
     assert [kwargs.get("precompute_hidden_gradient") for kwargs in factories] == (
         [None, True] if frozen else [None]
     )
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_saturated_softcap_stays_finite_on_the_training_path(quantized):
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    # Ratios far past the saturation branch, where fast::tanh may not saturate.
+    hidden = mx.full((64, 128), 300, dtype=mx.float16)
+    weight = mx.full((8192, 128), 300, dtype=mx.float16)
+    targets = (mx.arange(64) * 61).astype(mx.int32)
+    arguments = (hidden, weight, targets)
+    if quantized:
+        packed, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+        arguments = (hidden, packed, scales, biases, targets)
+    runtime, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100, logit_softcap=9.0, chunk_size=2048,
+        quantized=quantized, group_size=64 if quantized else None,
+        bits=4 if quantized else None,
+    )
+    losses, grad = mx.value_and_grad(
+        lambda h: runtime(h, *arguments[1:]).sum()
+    )(hidden)
+    mx.eval(losses, grad)
+    assert mx.all(mx.isfinite(losses)).item()
+    assert mx.all(mx.isfinite(grad)).item()
+    # Every logit saturates to the same cap, so the loss is a uniform log V.
+    assert losses.item() == pytest.approx(64 * math.log(8192), rel=1e-3)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("ratio", [44.2, 60.0])
+def test_finite_logits_past_the_cap_match_the_saturated_loss(dtype, ratio):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    # Finite logits: even classes at ratio * cap, odd classes at 0. Near 44 fast::tanh
+    # returns 0 (a finite, wrong loss) and past about 44.4 it returns NaN.
+    cap, rows, dim, vocab = 9.0, 64, 128, 8192
+    hidden = mx.ones((rows, dim), dtype=dtype)
+    even = (mx.arange(vocab) % 2 == 0)[:, None]
+    weight = mx.where(even, ratio * cap / dim, 0.0).astype(dtype) * mx.ones((vocab, dim), dtype=dtype)
+    targets = (mx.arange(rows) * 2).astype(mx.int32)
+    runtime, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100, logit_softcap=cap, chunk_size=2048,
+    )
+    losses, grad = mx.value_and_grad(lambda h: runtime(h, weight, targets).sum())(hidden)
+    mx.eval(losses, grad)
+    assert mx.all(mx.isfinite(grad)).item()
+    # Even classes saturate to the cap, odd ones stay at 0.
+    expected = math.log(vocab / 2 * (1.0 + math.exp(-cap)))
+    assert losses.item() == pytest.approx(rows * expected, rel=1e-4)
