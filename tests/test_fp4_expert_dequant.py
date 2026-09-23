@@ -12,6 +12,20 @@ import torch
 pytest.importorskip("transformers")
 
 
+def _transformers_fp4_reference():
+    try:
+        from transformers.integrations.finegrained_fp8 import Fp8Dequantize
+    except Exception:
+        return None
+    return Fp8Dequantize if hasattr(Fp8Dequantize, "_dequantize_one") else None
+
+
+# The comparisons against transformers' own FP4 unpack need a transformers that has one.
+needs_fp4_reference = pytest.mark.skipif(
+    _transformers_fp4_reference() is None, reason = "this transformers has no FP4 expert dequant"
+)
+
+
 def _reference_dequant(packed, scale, dtype):
     from transformers.integrations.finegrained_fp8 import Fp8Dequantize
     op = Fp8Dequantize.__new__(Fp8Dequantize)
@@ -27,6 +41,7 @@ def _fixture(E = 3, M = 8, K = 64, group = 32):
     return packed, scale
 
 
+@needs_fp4_reference
 def test_fp4_unpack_matches_transformers_reference():
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _dequantize_full_expert_weights_fp4
     packed, scale = _fixture()
@@ -35,6 +50,7 @@ def test_fp4_unpack_matches_transformers_reference():
     torch.testing.assert_close(out, _reference_dequant(packed, scale, torch.float32))
 
 
+@needs_fp4_reference
 def test_the_generic_entry_point_now_handles_fp4():
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import _dequantize_full_expert_weights
     packed, scale = _fixture()
@@ -89,6 +105,7 @@ def test_peft_sizes_the_lora_on_the_logical_shape():
     assert wrapper.num_experts == 2
     assert wrapper.get_param().shape == (2, 8, 64)
     assert module.gate_up_proj._original_shape == (2, 8, 64)
-    # lora_A contracts with the logical K = 64, not the packed 32.
-    assert wrapper.lora_A["default"].weight.shape[-1] == 64
-    assert wrapper.lora_B["default"].weight.shape[0] == 8
+    # The LoRA is sized on the logical K = 64, never the packed 32. Which factor carries K
+    # depends on the PEFT release (0.21 swaps the 3-D in/out dims, 0.18 does not).
+    dims = {wrapper.lora_A["default"].weight.shape[-1], wrapper.lora_B["default"].weight.shape[0]}
+    assert dims == {8, 64}

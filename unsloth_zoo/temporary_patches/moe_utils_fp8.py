@@ -352,11 +352,13 @@ _FP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1
 _FP4_EXPERT_CHUNK = 16
 
 
+_FP4_PACKED_DTYPES = frozenset(
+    dtype for dtype in (torch.int8, getattr(torch, "float4_e2m1fn_x2", None)) if dtype is not None
+)
+
+
 def _is_fp4_packed_tensor(tensor) -> bool:
-    if not isinstance(tensor, torch.Tensor):
-        return False
-    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
-    return tensor.dtype == torch.int8 or (fp4_dtype is not None and tensor.dtype == fp4_dtype)
+    return isinstance(tensor, torch.Tensor) and tensor.dtype in _FP4_PACKED_DTYPES
 
 
 def _fp4_pair_table(target_dtype, device):
@@ -1224,7 +1226,8 @@ def patch_peft_param_wrapper_fp4_expert_shape():
 
     def _patched_get_param(self):
         param = _original_get_param(self)
-        if not _is_fp4_packed_tensor(param):
+        # Runs on every expert LoRA forward: one dtype lookup for everything that is not FP4.
+        if getattr(param, "dtype", None) not in _FP4_PACKED_DTYPES:
             return param
         try:
             base_layer = self.get_base_layer()
