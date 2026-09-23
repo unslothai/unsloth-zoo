@@ -254,3 +254,35 @@ def test_only_the_cached_dispatcher_module_counts_as_unsloth():
     for other in ("my_project.moe_utils", "transformers_modules.x.custom_moe_utils"):
         forward.__module__ = other
         assert not _forward_is_unsloth(forward), other
+
+
+def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
+    # DeepSeek-V4 style expert_dtype = "fp4" stores two values per int8, which the Unsloth FP8
+    # backends do not decode: neither the default nor the FP8 registry may send them there.
+    from transformers.modeling_utils import PreTrainedModel
+    fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
+    from unsloth_zoo.temporary_patches import moe_utils_fp8
+
+    patch_experts_interface()
+    getter = PreTrainedModel.get_correct_experts_implementation
+    fp4 = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = types.SimpleNamespace(expert_dtype = "fp4"))
+    fp8_model = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = types.SimpleNamespace(expert_dtype = "fp8"))
+    assert getter(fp4, None) == "grouped_mm"
+    assert getter(fp8_model, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
+
+    moe_utils_fp8.patch_fp8_experts_interface()
+    calls = []
+    monkeypatch.setattr(moe_utils_fp8, "forward_moe_backend_fp8", lambda *a: calls.append("unsloth") or "unsloth")
+
+    class Experts:
+        def forward(self, *a):
+            raise AssertionError("dispatched forward")
+        forward.__wrapped__ = lambda self, *a: calls.append("eager") or "eager"
+
+    experts = Experts()
+    forward = fp8.ALL_FP8_EXPERTS_FUNCTIONS.get_interface("unsloth", None)
+    experts.config = types.SimpleNamespace(expert_dtype = "fp4")
+    assert forward(experts, "h", "i", "w") == "eager"
+    experts.config = types.SimpleNamespace(expert_dtype = "fp8")
+    assert forward(experts, "h", "i", "w") == "unsloth"
+    assert calls == ["eager", "unsloth"]
