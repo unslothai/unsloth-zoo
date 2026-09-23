@@ -337,3 +337,46 @@ def test_the_packers_place_merging_units_where_their_transient_fits(monkeypatch)
     device = plan.device_map["layers.1"]
     assert plan.load_transient_by_device == {device: 3 * 8192}
     assert budgets[device] - plan.weight_bytes[device] >= 3 * 8192
+
+
+def test_a_merge_into_a_pinned_unit_keeps_its_room_on_the_head_card(monkeypatch):
+    # Pinned units skip the packers, whose peaks started at zero, so a converter merging into
+    # lm_head was reported as reserved on a head card the packing had filled to the limit.
+    import unsloth_zoo.device_map_planner as planner
+
+    with torch.device("meta"):
+        model = _Tiny(layers = 10)
+    layer = 64 * 64 * 4
+    monkeypatch.setattr(
+        planner, "_load_transient_by_unit",
+        lambda model, units, hf_quantizer = None: {u: 8192 for u, _ in units if u == "lm_head"},
+    )
+    budgets = {0: 16 * layer, 1: 20 * layer}
+    plan = plan_device_map(
+        model, max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
+        prefer_head_device = 0,
+    )
+    assert plan.device_map["lm_head"] == 0
+    assert plan.load_transient_by_device == {0: 3 * 8192}
+    assert budgets[0] - plan.weight_bytes[0] >= 3 * 8192
+
+
+def test_the_pretrained_helper_forwards_the_opt_out(monkeypatch):
+    import unsloth_zoo.device_map_planner as planner
+
+    seen = {}
+
+    def build_meta_model(name, trust_remote_code = False, **config_kwargs):
+        seen["config_kwargs"] = config_kwargs
+        return object(), None, None
+
+    def plan(model, **kwargs):
+        seen["reserve_load_transient"] = kwargs.get("reserve_load_transient")
+        return None
+
+    monkeypatch.setattr(planner, "build_meta_model", build_meta_model)
+    monkeypatch.setattr(planner, "plan_device_map", plan)
+    planner.plan_device_map_for_pretrained(
+        "some/model", max_memory = {0: 1 << 30, 1: 1 << 30}, reserve_load_transient = False,
+    )
+    assert seen == {"config_kwargs": {}, "reserve_load_transient": False}

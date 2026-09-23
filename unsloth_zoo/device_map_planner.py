@@ -1520,6 +1520,8 @@ def plan_device_map(
         budget[head_device] -= pinned_bytes
         if any(b < 0 for b in budget.values()):
             return None
+        if _group_transient(pinned) > _transient_cap(head_device)[head_device]:
+            return None
         used, assign = _walk_in_order(free_groups, budget, head_device)
         if used is None:
             # The in-order walk is next-fit with a first-fit rescue, and neither
@@ -1564,6 +1566,13 @@ def plan_device_map(
     def _group_transient(names) -> int:
         return max((transient_of.get(n, 0) for n in names), default = 0)
 
+    def _start_peak(head_device: int) -> dict[int, int]:
+        # The pinned units never go through the packers, but a converter can still merge
+        # into one of them (a concatenated lm_head), so the head's card starts at their peak.
+        peak = dict.fromkeys(devices, 0)
+        peak[head_device] = _group_transient(pinned)
+        return peak
+
     def _walk_in_order(free, budget, head_device: int):
         # `head_max` means "push as much weight off the head's card as possible".
         # Walking plain device order defeats that whenever the head is not the
@@ -1574,7 +1583,7 @@ def plan_device_map(
         if free_space_policy == "head_max":
             order = [d for d in devices if d != head_device] + [head_device]
         used = dict.fromkeys(devices, 0)
-        peak = dict.fromkeys(devices, 0)
+        peak = _start_peak(head_device)
         cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         cursor = 0
@@ -1611,7 +1620,7 @@ def plan_device_map(
     def _best_fit(free, budget, head_device: int):
         """Largest unit first into the device it leaves least room on."""
         used = dict.fromkeys(devices, 0)
-        peak = dict.fromkeys(devices, 0)
+        peak = _start_peak(head_device)
         cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         for names, size in sorted(free, key=lambda item: -item[1]):
@@ -1644,7 +1653,7 @@ def plan_device_map(
         if sum(size for _, size in order) > sum(budget[d] for d in devices):
             return None, None
         remaining = {d: budget[d] for d in devices}
-        peak = dict.fromkeys(devices, 0)
+        peak = _start_peak(head_device)
         cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         visited = 0
@@ -2028,6 +2037,7 @@ def plan_device_map_for_pretrained(
     free_space_policy: str = "balanced",
     no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
+    reserve_load_transient: bool = True,
     trust_remote_code: bool = False,
     **config_kwargs: Any,
 ) -> DeviceMapPlan | None:
@@ -2036,10 +2046,11 @@ def plan_device_map_for_pretrained(
     Builds the model on the meta device, so this is cheap and touches no GPU.
     Returns ``None`` when fewer than two GPUs are usable.
 
-    Takes the same ``no_split_module_classes`` override as :func:`plan_device_map`
-    (``[]`` to allow splitting inside a block that fits on no single card). It has
-    to be declared here: routed through ``**config_kwargs`` it would go to
-    ``AutoConfig`` instead, and the plan would silently use the detected classes.
+    Takes the same ``no_split_module_classes`` override and ``reserve_load_transient``
+    switch as :func:`plan_device_map` (``[]`` to allow splitting inside a block that
+    fits on no single card). Both have to be declared here: routed through
+    ``**config_kwargs`` they would go to ``AutoConfig`` instead, and the plan would
+    silently use the detected classes and reserve the load transient anyway.
 
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` pass through to
     :func:`build_meta_model`, so a full-precision checkpoint you intend to load
@@ -2066,4 +2077,5 @@ def plan_device_map_for_pretrained(
         hf_quantizer=hf_quantizer,
         no_split_module_classes=no_split_module_classes,
         prefer_head_device=prefer_head_device,
+        reserve_load_transient=reserve_load_transient,
     )
