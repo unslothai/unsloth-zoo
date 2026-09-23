@@ -108,3 +108,31 @@ def test_patch_is_idempotent():
     before = Llama4TextExperts.forward
     patch_llama4_moe()
     assert Llama4TextExperts.forward is before
+
+
+def test_a_failed_moe_patch_leaves_both_forwards_alone(monkeypatch):
+    # The patched experts forward needs routing indices and weights that only the patched MoE
+    # forward passes, so a refused MoE patch must not leave the experts one installed.
+    import unsloth_zoo.temporary_patches.llama4_moe as llama4_moe
+
+    def experts_forward(self, hidden_states):
+        return hidden_states
+
+    def moe_forward(self, hidden_states):
+        return hidden_states
+
+    monkeypatch.setattr(Llama4TextExperts, "forward", experts_forward)
+    monkeypatch.setattr(Llama4TextMoe, "forward", moe_forward)
+    monkeypatch.setattr(Llama4TextExperts, "_unsloth_already_patched", False)
+    real_patch_function = llama4_moe.patch_function
+
+    def refuse_moe(target, name, *args, **kwargs):
+        if target is Llama4TextMoe:
+            return False
+        return real_patch_function(target, name, *args, **kwargs)
+
+    monkeypatch.setattr(llama4_moe, "patch_function", refuse_moe)
+    llama4_moe.patch_llama4_moe()
+    assert Llama4TextExperts.forward is experts_forward
+    assert Llama4TextMoe.forward is moe_forward
+    assert not Llama4TextExperts._unsloth_already_patched
