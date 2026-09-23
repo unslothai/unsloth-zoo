@@ -1394,6 +1394,12 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
             return True
         if _rewrites_a_constant(node):
             return True
+        if isinstance(node, ast.Call) and called_name(node) in ("reduce", "accumulate"):
+            # functools.reduce(operator.add, ["https", "://evil.example/c"])
+            # builds a string out of pieces this walk reads one at a time, and
+            # the fold cannot follow a callable applied pairwise. No file in
+            # llama.cpp imports functools at all.
+            return True
         if isinstance(node, ast.Call) and called_name(node) in URL_ASSEMBLERS:
             # No carrier and no URL literal: the destination is spelled field by
             # field and assembled by the object itself.
