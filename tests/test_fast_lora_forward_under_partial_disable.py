@@ -19,6 +19,8 @@ def test_lora_patch_is_gated_on_full_disable_only():
 
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs a GPU to load a 4-bit model")
 def test_partial_disable_still_patches_lora_forward(tmp_path, monkeypatch):
+    # gemma4 is not in every supported transformers (5.4.0, the CI pin, has none).
+    pytest.importorskip("transformers.models.gemma4")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "partial")
     import torch

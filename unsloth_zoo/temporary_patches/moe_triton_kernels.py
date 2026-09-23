@@ -239,6 +239,15 @@ def _on_device(device, *tensors):
     return all(isinstance(t, torch.Tensor) and t.device == device for t in tensors)
 
 
+def _launch_device(device):
+    """Triton launches on the current CUDA device and its current stream, not on
+    the device of the pointers it is handed. A model split over several GPUs
+    (device_map, the multi-GPU planner) runs a layer on cuda:1 while cuda:0 is
+    current, so launch under the tensors' own device, as the other Unsloth
+    Triton kernels do (torch_gpu_device / torch_cuda_device)."""
+    return torch.cuda.device(device)
+
+
 def nf4_dequant_triton(packed, quant_state, out_shape = None):
     """Dequantize bitsandbytes NF4 `packed` (any shape; any quant_storage dtype,
     the bytes are viewed as uint8) with `quant_state` to a tensor of `out_shape`
@@ -286,11 +295,12 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
     try:
         triton, kernel, _, _, _ = _get_kernels()
         out = torch.empty(numel, dtype = quant_state.dtype, device = device)
-        kernel[(triton.cdiv(n_bytes, BLOCK),)](
-            q, out, code, absmax, code2, absmax2, offset, n_bytes,
-            NESTED = nested, BLOCKSIZE2 = (quant_state.state2.blocksize if nested else 1),
-            BLOCK = BLOCK, num_warps = 4, enable_fp_fusion = False,
-        )
+        with _launch_device(device):
+            kernel[(triton.cdiv(n_bytes, BLOCK),)](
+                q, out, code, absmax, code2, absmax2, offset, n_bytes,
+                NESTED = nested, BLOCKSIZE2 = (quant_state.state2.blocksize if nested else 1),
+                BLOCK = BLOCK, num_warps = 4, enable_fp_fusion = False,
+            )
     except Exception as exc:
         _disable("nf4_dequant_triton", exc)
         return None
@@ -316,10 +326,11 @@ class _WeightedUnpermute(torch.autograd.Function):
         inv.scatter_(0, sorted_indices, torch.arange(sorted_indices.numel(), device = y.device, dtype = sorted_indices.dtype))
         out = torch.empty((num_tokens, H), device = y.device, dtype = out_dtype or y.dtype)
         BLOCK_T, BLOCK_H = 8, 512
-        fwd[(triton.cdiv(num_tokens, BLOCK_T), triton.cdiv(H, BLOCK_H))](
-            y, inv, w_perm, out, num_tokens, H, top_k, BLOCK_T, BLOCK_H,
-            ROUND_PRODUCT = _round_product(w_perm, y), num_warps = 4, enable_fp_fusion = False,
-        )
+        with _launch_device(y.device):
+            fwd[(triton.cdiv(num_tokens, BLOCK_T), triton.cdiv(H, BLOCK_H))](
+                y, inv, w_perm, out, num_tokens, H, top_k, BLOCK_T, BLOCK_H,
+                ROUND_PRODUCT = _round_product(w_perm, y), num_warps = 4, enable_fp_fusion = False,
+            )
         # y is only read by the routing-weight gradient. When the router is
         # frozen or detached (the gate-grad identity path hands us a detached
         # weight on purpose, so that Y is not pinned on the tape), keep only
@@ -348,15 +359,16 @@ class _WeightedUnpermute(torch.autograd.Function):
                 triton, _, _, bwd_dy, bwd_dw = _get_kernels()
                 BLOCK_T, BLOCK_H = 16, 512
                 dy = torch.empty((T, H), dtype = y_dtype, device = y_device)
-                bwd_dy[(triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))](
-                    dout, sorted_indices, w_perm, dy, T, H, top_k, BLOCK_T, BLOCK_H,
-                    num_warps = 4, enable_fp_fusion = False)
                 dw = None
-                if ctx.needs_w:
-                    dw32 = torch.empty((T,), device = y_device, dtype = torch.float32)
-                    bwd_dw[(T,)](y, dout, sorted_indices, dw32, H, top_k, 1024,
-                                 ROUND_PRODUCT = ctx.round_product, enable_fp_fusion = False)
-                    dw = dw32.to(w_perm.dtype)
+                with _launch_device(y_device):
+                    bwd_dy[(triton.cdiv(T, BLOCK_T), triton.cdiv(H, BLOCK_H))](
+                        dout, sorted_indices, w_perm, dy, T, H, top_k, BLOCK_T, BLOCK_H,
+                        num_warps = 4, enable_fp_fusion = False)
+                    if ctx.needs_w:
+                        dw32 = torch.empty((T,), device = y_device, dtype = torch.float32)
+                        bwd_dw[(T,)](y, dout, sorted_indices, dw32, H, top_k, 1024,
+                                     ROUND_PRODUCT = ctx.round_product, enable_fp_fusion = False)
+                        dw = dw32.to(w_perm.dtype)
                 return dy, None, dw, None, None, None
             except Exception as exc:
                 _disable("weighted_unpermute backward", exc)

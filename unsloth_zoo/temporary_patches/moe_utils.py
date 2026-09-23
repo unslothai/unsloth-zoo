@@ -23,6 +23,7 @@ import shutil
 import stat
 import tempfile
 import sys
+import time
 import warnings
 import importlib
 import importlib.util
@@ -727,12 +728,28 @@ def _momentary_pin_fits(source) -> bool:
         if not shape:
             return False
         dtype = getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
-        need = math.prod(int(d) for d in shape) * torch.empty((), dtype = dtype).element_size()
+        need = math.prod(int(d) for d in shape) * dtype.itemsize
+        # mem_get_info plus the allocator's stats cost 0.25 to 0.9 ms per call on a
+        # busy B200, and this runs for every bnb expert source of every layer in every
+        # gradient-checkpoint replay (more than the dequant it saves). The answer only
+        # moves with the step's memory high-water mark, so it is kept per device and
+        # stack size for a short interval; the headroom covers the drift inside it.
+        key = (device.type, device.index, need, _MOMENTARY_PIN_HEADROOM)
+        now = time.monotonic()
+        hit = _MOMENTARY_PIN_FITS_CACHE.get(key)
+        if hit is not None and now - hit[1] < _MOMENTARY_PIN_FITS_TTL_S:
+            return hit[0]
         free, _ = backend.mem_get_info(device)
         free += backend.memory_reserved(device) - backend.memory_allocated(device)
-        return free >= _MOMENTARY_PIN_HEADROOM * need
+        fits = free >= _MOMENTARY_PIN_HEADROOM * need
+        _MOMENTARY_PIN_FITS_CACHE[key] = (fits, now)
+        return fits
     except Exception:
         return False
+
+
+_MOMENTARY_PIN_FITS_CACHE = {}
+_MOMENTARY_PIN_FITS_TTL_S = 0.5
 
 
 def _moe_recompute_enabled(source) -> bool:
@@ -741,11 +758,12 @@ def _moe_recompute_enabled(source) -> bool:
     everything else the pinned eager path is used.
 
     A bnb 4-bit base recomputes by default: pinning it would hold the full bf16
-    expert dequant, which the 4-bit storage exists to avoid. The one cheap pin is
+    expert dequant, which the 4-bit storage exists to avoid. The one cheaper pin is
     inside a gradient-checkpoint replay, where the stack the replay just built is
     what the same layer's backward needs moments later; holding it there costs one
     layer's stack transiently and removes one of the three dequants per layer per
-    step. That pin is taken only when the stack fits with headroom
+    step. It raises peak memory by that stack, so it is opt-in through
+    UNSLOTH_MOE_GC_REPLAY_PIN=1 and taken only when the stack fits with headroom
     (_momentary_pin_fits). UNSLOTH_MOE_RECOMPUTE overrides everything: "1" always
     recomputes, "0" always pins."""
     if not _base_is_recomputable(source):
@@ -756,7 +774,11 @@ def _moe_recompute_enabled(source) -> bool:
     if override == "0":
         return False
     if _source_pins_large_dequant(source):
-        if _in_gc_recompute() and _momentary_pin_fits(source):
+        if (
+            os.environ.get("UNSLOTH_MOE_GC_REPLAY_PIN") == "1"
+            and _in_gc_recompute()
+            and _momentary_pin_fits(source)
+        ):
             return False
         return True
     return _moe_recompute_default()
