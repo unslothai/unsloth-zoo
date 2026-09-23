@@ -2877,3 +2877,23 @@ def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
     mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
     assert Gemma4TextModel._make_masks is upstream
     assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]
+
+
+def test_cce_only_compile_family_is_refused_on_the_standard_loss():
+    """ernie's upstream forward, which `use_cce=False` runs, still reads on the
+    host; compile must be refused up front rather than fail mid-run."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    ernie = type("Model", (), {"__module__": "mlx_vlm.models.ernie4_5_moe_vl.ernie4_5_moe_vl"})()
+    ernie.config = NS(model_type="ernie4_5_moe_vl")
+    policy = mc.MLXVLMCompilePolicy(mode="best_effort")
+    assert mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=True)).enabled
+    refused = mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=False))
+    assert not refused.enabled and refused.fallback_allowed
+    assert "use_cce=False" in refused.reason
+    other = type("Model", (), {"__module__": "mlx_vlm.models.glm_ocr.glm_ocr"})()
+    other.config = NS(model_type="glm_ocr")
+    assert mc.resolve_training_compile(other, policy=policy, args=NS(use_cce=False)).enabled

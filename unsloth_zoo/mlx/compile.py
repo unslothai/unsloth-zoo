@@ -125,6 +125,12 @@ _MODEL_REPO_TRAINING_COMPILE_BLOCKLIST: tuple[tuple[str, str], ...] = (
     ),
 )
 
+# Compiled training here is qualified on the CCE loss only: `use_cce=False` runs
+# the upstream `Model.__call__`, which still reads these values on the host.
+_CCE_ONLY_TRAINING_COMPILE_ARCHES: dict[str, str] = {
+    "ernie4_5_moe_vl": "its token types and rotary positions",
+}
+
 
 _BACKEND_CONFIG_KEYS = (
     "text_config",
@@ -1871,6 +1877,19 @@ def resolve_training_compile(
             strict_requested=strict_requested,
             should_raise=strict_requested,
             reason=reason,
+            qualification=qualification,
+            backend_qualifications=backend_qualifications,
+        )
+    host_reads = _CCE_ONLY_TRAINING_COMPILE_ARCHES.get(arch)
+    if host_reads is not None and getattr(args, "use_cce", True) is False:
+        return finalize(
+            arch_name=arch,
+            enabled=False,
+            policy_mode=policy_mode,
+            fallback_allowed=fallback_allowed,
+            strict_requested=strict_requested,
+            should_raise=strict_requested,
+            reason=f"use_cce=False reads {host_reads} on the host",
             qualification=qualification,
             backend_qualifications=backend_qualifications,
         )
