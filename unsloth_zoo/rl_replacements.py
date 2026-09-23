@@ -644,7 +644,8 @@ def grpo_compute_loss(
         normalizer = num_items_in_batch/ num_processes
         loss = (loss_i * mask).sum() / normalizer
     elif loss_type == "luspo":
-        loss = (loss_i * mask.sum(1, keepdim=True)).mean()
+        # loss_i is (B, T) unless sequence level with beta 0, so mask elementwise (TRL >= 1.10).
+        loss = (loss_i * mask).sum(-1).mean()
         normalizer = current_gradient_accumulation_steps
         loss = loss / normalizer
     else:

@@ -1176,3 +1176,63 @@ def test_sampling_logps_gated_on_actual_consumer():
     assert 'getattr(trainer.args,"off_policy_mask_threshold",None)isnotNone' in flat
     # The gate must actually condition the read (not keep sampling unconditionally).
     assert 'kwargs.get("sampling_per_token_logps",None)if_sampling_logps_usedelseNone' in flat
+
+
+def _luspo_reference(ref, new, old, mask, advantages, beta, level):
+    """TRL 1.13.0 GRPOTrainer._compute_loss for loss_type="luspo", in float64."""
+    log_ratio = new - old
+    if level == "sequence":
+        log_ratio = (log_ratio * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp(min=1.0)
+    coef_1 = torch.exp(log_ratio)
+    coef_2 = coef_1.clamp(1 - 0.2, 1 + 0.2)
+    per_token = -torch.min(coef_1 * advantages, coef_2 * advantages)
+    if beta != 0.0:
+        per_token = per_token + beta * (torch.expm1(ref - new) - (ref - new))
+    return (per_token * mask).sum(-1).mean()
+
+
+@pytest.mark.parametrize("level", ["token", "sequence"])
+@pytest.mark.parametrize("beta", [0.0, 0.04])
+def test_luspo_matches_trl_aggregation(level, beta, disable_dynamo):
+    # `loss_i * mask.sum(1)` only equals TRL when loss_i is (B, 1); token level or beta > 0 make it (B, T).
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("luspo")
+    kwargs["importance_sampling_level"] = level
+
+    loss, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    expected = _luspo_reference(ref, new, old, mask, advantages.unsqueeze(1), beta, level)
+    assert torch.allclose(loss.double(), expected, atol=1e-12, rtol=0), (
+        f"luspo {level} level, beta {beta}: got {loss.item()}, TRL gives {expected.item()}"
+    )
+
+
+@pytest.mark.parametrize("level", ["token", "sequence"])
+@pytest.mark.parametrize("beta", [0.0, 0.04])
+def test_luspo_ignores_fully_masked_columns(level, beta, disable_dynamo):
+    # Padding a batch out to a longer completion length must not move the loss.
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("luspo")
+    kwargs["importance_sampling_level"] = level
+    loss, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+
+    pad = 4
+    B = mask.shape[0]
+    tail = torch.randn(B, pad, dtype=new.dtype)
+    padded = dict(kwargs)
+    padded["max_completion_length"] = mask.shape[1] + pad
+    loss_padded, *_ = rr.grpo_compute_loss(
+        torch.cat([ref, tail], 1),
+        torch.cat([new, tail], 1),
+        torch.cat([old, tail], 1),
+        None,
+        torch.cat([input_ids, torch.zeros(B, pad, dtype=input_ids.dtype)], 1),
+        torch.cat([mask, torch.zeros(B, pad, dtype=mask.dtype)], 1),
+        beta,
+        advantages,
+        **padded,
+    )
+    assert torch.allclose(loss.double(), loss_padded.double(), atol=1e-12, rtol=0), (
+        f"luspo {level} level, beta {beta}: padding moved the loss from {loss.item()} to {loss_padded.item()}"
+    )
