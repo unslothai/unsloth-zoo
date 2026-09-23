@@ -14685,6 +14685,79 @@ class LoRAPointwiseConv2d(nn.Module):
         return conv
 
 
+def _hadamard_pack_module():
+    """mlx-vlm's Hadamard-packed layer module (Ternary Bonsai 2), once loaded."""
+    module = sys.modules.get("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    if isinstance(getattr(module, "HadamardQuantizedLinear", None), type):
+        return module
+    return None
+
+
+def _is_hadamard_packed_linear(module):
+    pack = _hadamard_pack_module()
+    # Exact type: the packed embedding subclasses the linear.
+    return pack is not None and type(module) is pack.HadamardQuantizedLinear
+
+
+def _hadamard_dense_weight(layer):
+    """The float32 dense weight a Hadamard-packed layer encodes, in the unrotated basis."""
+    weight = mx.dequantize(
+        layer.weight, layer.scales, layer.biases,
+        group_size=layer.group_size, bits=layer.bits, mode=layer.mode,
+    ).astype(mx.float32)
+    if layer.block:
+        weight = _hadamard_pack_module().hadamard_transform(
+            weight, layer.block, layer.signs, inverse=True,
+        )
+    return weight
+
+
+class LoRAHadamardLinear(nn.Module):
+    """LoRA for mlx-vlm's ``HadamardQuantizedLinear``.
+
+    The base rotates its own input, so the adapter reads the unrotated activation
+    and fusing has to rotate the dequantized weight back first.
+    """
+
+    @staticmethod
+    def supports(module):
+        return _is_hadamard_packed_linear(module)
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAHadamardLinear.supports(linear):
+            raise ValueError("LoRA requires mlx-vlm's HadamardQuantizedLinear.")
+        output_dims, packed_dims = linear.weight.shape
+        input_dims = packed_dims * 32 // linear.bits
+        module = LoRAHadamardLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(input_dims, r))
+        module.lora_b = mx.zeros((r, output_dims))
+        return module
+
+    def __call__(self, x):
+        y = self.linear(x)
+        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        if not dequantize:
+            # Measured on Ternary Bonsai 2 27B: re-packing into 2 bits rounds away almost all of a trained adapter.
+            raise ValueError(
+                "Unsloth: merging LoRA back into 2-bit Hadamard-packed weights discards the adapter. "
+                "Save with save_method='merged_16bit', or keep the LoRA adapter."
+            )
+        linear = self.linear
+        weight = _hadamard_dense_weight(linear) + (self.scale * self.lora_b.T) @ self.lora_a.T
+        output_dims, input_dims = weight.shape
+        fused = nn.Linear(input_dims, output_dims, bias=False)
+        fused.weight = weight.astype(linear.scales.dtype)
+        return fused
+
+
 def _extract_mlx_lora_parameters(model):
     """Extract global rank, scale, and dropout from the model's first LoRA module."""
     rank, scale, dropout = 8, 1.0, 0.0
