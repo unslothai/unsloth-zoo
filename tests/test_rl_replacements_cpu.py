@@ -631,6 +631,45 @@ def test_unscored_vllm_token_is_neutral_not_dropped():
     assert torch.allclose(loss_vllm, loss_plain, atol=1e-12, rtol=1e-10)
 
 
+@pytest.mark.parametrize(
+    "mode", ["token_mask", "token_truncate", "sequence_mask", "sequence_truncate"]
+)
+def test_unscored_vllm_token_keeps_the_logged_metrics_finite(mode):
+    # unsloth logs torch.mean / torch.max of `delta` as sampling/sampling_logp_difference, so a nan
+    # left in it logs nan every step even though the loss is fine.
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    sampling = old - 0.01 * torch.arange(1, old.numel() + 1, dtype=old.dtype).reshape(old.shape)
+    kwargs.update(
+        use_vllm=True,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode=mode,
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+    )
+    clean_delta = rr.grpo_compute_loss(
+        ref, new, old, sampling, input_ids, mask, 0.04, advantages, **kwargs
+    )[3]
+
+    # Unscore the token with the largest difference so a nan-aware max has to skip it.
+    i, j = divmod(int(clean_delta.argmax()), clean_delta.shape[1])
+    unscored = sampling.clone()
+    unscored[i, j] = float("nan")
+    # And one padding token: nan * 0 is still nan.
+    pad_i, pad_j = (mask == 0).nonzero()[0].tolist()
+    unscored[pad_i, pad_j] = float("nan")
+    _, _, _, delta, flat_is_ratio, _, _ = rr.grpo_compute_loss(
+        ref, new, old, unscored, input_ids, mask, 0.04, advantages, **kwargs
+    )
+
+    assert torch.isfinite(delta).all(), f"{mode}: delta carries {delta.isnan().sum()} nan"
+    assert torch.isfinite(flat_is_ratio).all(), f"{mode}: IS ratio metric is not finite"
+    expected = clean_delta.clone()
+    expected[i, j] = 0.0
+    assert delta.shape == clean_delta.shape
+    assert torch.equal(delta, expected)
+    assert torch.max(delta) < torch.max(clean_delta)
+
+
 @pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
 @pytest.mark.parametrize("use_bias_correction_kl", [False, True])
 def test_grpo_compute_loss_bias_correction_kl_matches_trl_mirror(

@@ -625,6 +625,9 @@ def grpo_compute_loss(
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
             delta = delta * mask
+            # An unscored token has no logprob difference: zero it so the logged mean / max stay
+            # finite (delta >= 0, so a zero never wins the max). Same shape, unlike TRL's filter.
+            delta = torch.nan_to_num(delta, nan = 0.0, posinf = math.inf)
             flat_is_ratio = importance_sampling_ratio * mask
     else:
         delta = torch.tensor([]).detach()
