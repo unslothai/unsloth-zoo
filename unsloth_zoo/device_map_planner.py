@@ -494,6 +494,14 @@ def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]
         for child, name in zip(mod, names):
             if name in declared:
                 continue
+            # A container class name would make every such container atomic model-wide.
+            if isinstance(child, (nn.ModuleList, nn.ModuleDict, nn.Sequential)):
+                continue
+            # A wrapper around a declared block (Zamba's hybrid layer holds the shared
+            # attention block) is already split at that block; keeping it whole ties every
+            # wrapper to the shared weights' card and can make a fitting model infeasible.
+            if any(type(sub).__name__ in declared for sub in child.modules()):
+                continue
             if any(True for _ in child.parameters(recurse=True)):
                 found.add(name)
     return found

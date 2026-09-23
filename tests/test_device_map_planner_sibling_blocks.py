@@ -118,3 +118,36 @@ def test_an_explicit_override_is_left_alone():
         no_split_module_classes = ["_Block"],
     )
     assert "_MTPLayer" not in plan.no_split_module_classes
+
+
+class _SharedWrapper(nn.Module):
+    """Zamba-style hybrid layer: wraps a declared block that every wrapper shares."""
+
+    def __init__(self, shared):
+        super().__init__()
+        self.shared = shared
+        self.linear = nn.Linear(H, H, bias = False)
+        self.mamba = _Block()
+
+
+class _Hybrid(nn.Module):
+    _no_split_modules = ["_Block"]
+
+    def __init__(self, vocab = 512):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(vocab, H)
+        shared = _Block()
+        self.layers = nn.ModuleList(
+            [_Block(), _SharedWrapper(shared), _Block(), _SharedWrapper(shared)]
+            + [nn.ModuleList([nn.Linear(H, H, bias = False)])]
+        )
+        self.lm_head = nn.Linear(H, vocab, bias = False)
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+
+def test_a_wrapper_around_a_declared_block_and_a_container_are_not_added():
+    with torch.device("meta"):
+        model = _Hybrid()
+    assert resolve_no_split_classes(model) == ["_Block"]
