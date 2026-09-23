@@ -97,6 +97,33 @@ def get_mxfp4_config_for_training():
 
     return Mxfp4Config(dequantize=dequantize)
 
+# Whether the device map of the load in progress offloads to "cpu" or "disk"; set by the
+# _get_device_map wrapper below, which transformers calls before converting any weight.
+_LOAD_OFFLOADS = [False]
+
+
+def patch_mxfp4_offload_guard():
+    try:
+        import transformers.modeling_utils as modeling_utils
+    except Exception:
+        return
+    original = getattr(modeling_utils, "_get_device_map", None)
+    if original is None or getattr(original, "_unsloth_mxfp4_patched", False):
+        return
+
+    @functools.wraps(original)
+    def _get_device_map(*args, **kwargs):
+        device_map = original(*args, **kwargs)
+        values = device_map.values() if isinstance(device_map, dict) else ()
+        _LOAD_OFFLOADS[0] = any(str(value) in ("cpu", "disk") for value in values)
+        return device_map
+
+    _get_device_map._unsloth_mxfp4_patched = True
+    modeling_utils._get_device_map = _get_device_map
+pass
+TEMPORARY_PATCHES.append(patch_mxfp4_offload_guard)
+
+
 def keep_mxfp4_experts_packed() -> bool:
     """Whether GPT-OSS MXFP4 experts stay packed in memory (dequantized per layer on the fly by the
     grouped_mm MoE forward, with expert LoRA on top) instead of a bf16 copy made at load.
@@ -107,6 +134,10 @@ def keep_mxfp4_experts_packed() -> bool:
     Triton), using the slower torch dequant there."""
     setting = os.environ.get("UNSLOTH_MXFP4_KEEP_PACKED", "")
     if setting == "0" or transformers_version < Version("5.0.0"):
+        return False
+    # CPU / disk offload stores the bare uint8 blocks without their scales, so an offloaded
+    # packed stack could not be decoded again; such loads keep the load-time dequant.
+    if _LOAD_OFFLOADS[0]:
         return False
     name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
     if "gpt_oss" not in name or "_load_in_4bit_" in name:

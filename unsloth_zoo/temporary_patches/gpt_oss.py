@@ -1839,7 +1839,10 @@ def _mxfp4_decode_stack(param, dtype, token_counts):
     reads in place (any other tensor is copied into the graph on every call), and only the experts
     this call routes to are rewritten. The kernel weighs every other expert by 0, so what their
     slices hold does not change the result."""
-    key = (tuple(param._original_shape), dtype, param.device)
+    # Per stream too: two decodes running concurrently on different streams must not rewrite
+    # one another's stack while the other kernel reads it.
+    stream = torch.cuda.current_stream(param.device).cuda_stream if param.is_cuda else None
+    key = (tuple(param._original_shape), dtype, param.device, stream)
     stack = _MXFP4_DECODE_STACKS.get(key)
     if stack is None:
         stack = nn.Parameter(

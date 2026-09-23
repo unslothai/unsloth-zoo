@@ -527,3 +527,36 @@ def test_decode_stacks_are_shared_and_freed_with_their_model():
     del second
     gc.collect()
     assert alive() is None
+
+
+@pytest.mark.skipif(not TRANSFORMERS_5, reason = "packing is transformers 5 only")
+def test_offloaded_loads_keep_the_load_time_dequant(monkeypatch):
+    import transformers.modeling_utils as modeling_utils
+
+    _gate_env(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_MXFP4_KEEP_PACKED", "1")
+    monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [False])
+    assert mx.keep_mxfp4_experts_packed() is True
+    for device_map, offloads in (({"model.layers.0": 0, "model.layers.1": "cpu"}, True),
+                                 ({"model.layers.0": 0, "lm_head": "disk"}, True),
+                                 ({"": 0}, False)):
+        monkeypatch.setattr(modeling_utils, "_get_device_map", lambda *a, _m = device_map, **k: _m)
+        mx.patch_mxfp4_offload_guard()
+        assert modeling_utils._get_device_map(None, "auto", None, None) == device_map
+        assert mx._LOAD_OFFLOADS[0] is offloads
+        assert mx.keep_mxfp4_experts_packed() is (not offloads)
+
+
+@needs_cuda
+def test_decode_stacks_are_per_stream():
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    param = _packed(4, 128, 64, device = "cuda", seed = 3)
+    counts = torch.ones(4, dtype = torch.int32, device = "cuda")
+    default = gpt_oss._mxfp4_decode_stack(param, torch.bfloat16, counts)
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        other = gpt_oss._mxfp4_decode_stack(param, torch.bfloat16, counts)
+    side.synchronize()
+    assert other is not default
+    assert gpt_oss._mxfp4_decode_stack(param, torch.bfloat16, counts) is default
