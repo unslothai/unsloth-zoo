@@ -83,8 +83,10 @@ def test_not_handled_when_forward_is_the_models_own():
     assert not expert_forward_is_handled(m)
 
 
-def test_ungated_falls_back_to_transformers():
+def test_ungated_falls_back_to_transformers(monkeypatch):
     from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+    import unsloth_zoo.temporary_patches.moe_utils as moe_utils
+    monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: True)
     calls = []
     def fake(self, h, i, w):
         calls.append("grouped_mm"); return h
@@ -102,10 +104,12 @@ def test_ungated_falls_back_to_transformers():
             ALL_EXPERTS_FUNCTIONS._local_mapping.pop("grouped_mm", None)
 
 
-def test_custom_gate_falls_back_and_is_not_packed():
+def test_custom_gate_falls_back_and_is_not_packed(monkeypatch):
     """DeepSeek-V4, MiniMax-M3 and others override _apply_gate with clamps or an
     offset; the Unsloth backends would compute plain SiLU gating for them."""
     from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+    import unsloth_zoo.temporary_patches.moe_utils as moe_utils
+    monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: True)
     calls = []
     def fake(self, h, i, w):
         calls.append("grouped_mm"); return h
@@ -146,6 +150,22 @@ def test_expert_parallel_keeps_transformers_default():
         config = types.SimpleNamespace(distributed_config = types.SimpleNamespace(enable_expert_parallel = False)),
     )
     assert getter(no_ep, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
+    # An explicit request cannot bring the sentinel-unaware path back under expert parallelism.
+    assert getter(ep, UNSLOTH_EXPERTS_IMPLEMENTATION) == "grouped_mm"
+
+
+def test_fallback_uses_the_eager_forward_without_grouped_mm(monkeypatch):
+    """Without torch._grouped_mm support, transformers' grouped_mm would fail on the missing
+    operator; an ungated module then runs its own wrapped eager forward."""
+    import unsloth_zoo.temporary_patches.moe_utils as moe_utils
+    monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: False)
+    calls = []
+    def eager(self, h, i, w):
+        calls.append("eager"); return h
+    m = _experts(eager, "transformers.models.x.modeling_x", has_gate = False, wrapped = True)
+    h = torch.zeros(2, 4)
+    assert unsloth_experts_forward(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
+    assert calls == ["eager"]
 
 
 def test_every_transformers_custom_gate_class_is_detected():
