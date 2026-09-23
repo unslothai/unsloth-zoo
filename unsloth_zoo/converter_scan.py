@@ -916,35 +916,28 @@ def _replace_text(node):
 
 
 def _rewrites_a_constant(node):
-    """Whether a literal string is rewritten by arguments this cannot read.
+    """Whether a literal string is transformed into text this cannot read.
 
-    "httpsX//evil.example/c".replace(marker, colon) manufactures its scheme out
-    of names, and _replace_text can only fold the arguments it can read. The
-    receiver being a literal is what makes this narrow: upstream rewrites
-    parameters, never constants.
+    Named methods were losing one at a time. replace with dynamic arguments,
+    decode of UTF-16 bytes, split indexed back together, and then ljust(6, ":")
+    turning "https" into a scheme: the tail of string methods that build a URL
+    out of a constant has no end, so this asks the other question. The receiver
+    is a literal, the result is not readable, and a transformation this cannot
+    follow is not one it can vouch for.
+
+    Everything the folds do read stays readable: format, join, replace with
+    literal arguments and the operator methods all return text. Upstream is
+    unaffected because it transforms parameters, never constants: every
+    .replace(), .strip() and .format() receiver in gguf-py/gguf/utility.py is
+    an argument, and what it decodes and splits came back from the hub.
     """
     if not (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in (
-            "replace", "translate", "decode", "encode",
-            "split", "rsplit", "partition", "rpartition", "splitlines",
-        )
+        and _literal_text(node.func.value) is not None
     ):
         return False
-    if _literal_text(node.func.value) is None:
-        return False
-    if node.func.attr not in ("replace", "translate"):
-        # A literal taken apart is a destination this cannot read: bytes
-        # holding UTF-16 for an attacker URL are read here as UTF-8 replacement
-        # text, and "https|://evil.example/c".split("|") puts a whole URL back
-        # together out of pieces indexed from a call. Upstream decodes and
-        # splits what came back from the hub, which is not a literal.
-        return True
-    return any(
-        _literal_text(argument) is None
-        for argument in [*node.args, *(k.value for k in node.keywords)]
-    )
+    return _literal_text(node) is None
 
 
 def _format_holes(node, template):
@@ -1907,6 +1900,12 @@ def _talks_only_to_the_model_hub_parsed(tree, text):
                 # upstream "://" is preceded by a readable http, https or ssh.
                 return False
             for match in RE_URL_SCHEME.finditer(literal):
+                if match.group().lower().startswith("http://"):
+                    # A token sent to the hub over plaintext is a token anyone
+                    # on the path can read, and this allowance exists to say
+                    # nothing about a file that sends one. Upstream's
+                    # BASE_DOMAIN is https, and so is every URL it builds.
+                    return False
                 rest = literal[match.end():]
                 end = RE_AUTHORITY_END.search(rest)
                 if end is None and rest:

