@@ -21,6 +21,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 """
 
 import ast
+import copy
 import gc
 import hashlib
 import json
@@ -3036,6 +3037,15 @@ class _NativeVLMWeightSanitizer:
                 for key in tuple(native) if key.endswith(".weight")
                 for suffix in ("scales", "biases")
             })
+            import mlx.core as mx
+
+            # Snapshot 1-D values: sanitizers shift them with in-place `+=`.
+            converted = bool(weights) and all(key in native for key in weights)
+            source = dict(weights) if converted else None
+            before = {
+                key: mx.array(value)
+                for key, value in weights.items() if value.ndim == 1
+            } if converted else None
             sources = {}
             for key, value in weights.items():
                 if key in native:
@@ -3048,9 +3058,45 @@ class _NativeVLMWeightSanitizer:
                     original = candidates[0]
                     if original not in sanitized:
                         sanitized[original] = sanitized.pop(key)
+            if converted:
+                _restore_reapplied_offsets(
+                    source, before, sanitized,
+                    lambda probe: self.original.__get__(copy.copy(model), owner)(probe),
+                )
             return sanitized
 
         return preserving_native_names
+
+
+def _restore_reapplied_offsets(source, before, sanitized, replay):
+    """Undo a constant sanitize adds again to an already-converted checkpoint.
+
+    If every key is native and sanitize moves no multi-dimensional tensor, the
+    checkpoint was written after conversion, so a 1-D shift it measures
+    (mlx-vlm 0.6.4's Qwen3.5 RMSNorm +1) is being applied a second time.
+    """
+    import mlx.core as mx
+    from .utils import _mlx_measure_norm_offsets
+
+    for key, value in source.items():
+        if value.ndim != 1 and key in sanitized and sanitized[key] is not value:
+            return
+    try:
+        # Copies, so an in-place sanitizer cannot write through the replay.
+        offsets = _mlx_measure_norm_offsets(
+            replay, {key: mx.array(value) for key, value in source.items()}
+        )
+    except Exception as exc:
+        print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
+        return
+    restored = [key for key in offsets if key in before]
+    for key in restored:
+        sanitized[key] = before[key]
+    if restored:
+        print(
+            f"Unsloth: mlx-vlm re-shifted {len(restored)} weight(s) of an "
+            "already-converted checkpoint; keeping the checkpoint's values."
+        )
 
 
 def _ensure_native_vlm_weight_names(model_type: str) -> None:

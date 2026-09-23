@@ -118,6 +118,65 @@ def test_native_name_sanitizer_preserves_vlm_expert_export(monkeypatch, tmp_path
         assert mx.array_equal(actual[name], source[name]).item()
 
 
+@pytest.mark.parametrize("source_form", ["converted", "unsanitized_layout", "extra_key"])
+def test_native_name_sanitizer_keeps_converted_norms(source_form):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import loader
+
+    class Reshifting(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.RMSNorm(2)
+            self.dt_bias = mx.zeros((2,))
+            self.proj = nn.Linear(3, 2)
+            self.head = nn.Linear(2, 2, bias=False)
+
+        def sanitize(self, weights):
+            # Like mlx-vlm 0.6.4's Qwen3.5: an unconditional in-place norm shift.
+            out = {}
+            for key, value in weights.items():
+                # Dropped like a tied lm_head, which does not mean unconverted.
+                if key.startswith("mtp.") or key == "head.weight":
+                    continue
+                if key == "proj.weight" and value.shape != (2, 3):
+                    value = value.T
+                if key.endswith("norm.weight"):
+                    value += 1.0
+                if key == "dt_bias":
+                    value = value * 2.0
+                out[key] = value
+            return out
+
+    Reshifting.sanitize = loader._NativeVLMWeightSanitizer(Reshifting.__dict__["sanitize"])
+    # (w + 1) - 1 rounds away 1.0078125 in bfloat16, so only a restore is exact.
+    norm = mx.array([1.0078125, -0.5], dtype=mx.bfloat16)
+    proj = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+    source = {
+        "norm.weight": norm,
+        "dt_bias": mx.array([0.5, 0.25]),
+        "proj.weight": proj.T if source_form == "unsanitized_layout" else proj,
+        "proj.bias": mx.zeros((2,)),
+        "proj.scales": mx.ones((2, 1)),
+        "head.weight": mx.ones((2, 2)),
+    }
+    if source_form == "extra_key":
+        source["mtp.0.norm.weight"] = mx.array([0.5, 0.25])
+    expected = {
+        "norm.weight": mx.array(norm) if source_form == "converted" else norm + 1.0,
+        # Not an added constant, so never restored.
+        "dt_bias": mx.array([1.0, 0.5]),
+        "proj.weight": proj,
+        "proj.bias": mx.zeros((2,)),
+        "proj.scales": mx.ones((2, 1)),
+    }
+
+    sanitized = Reshifting().sanitize(source)
+
+    assert sanitized.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value).item(), key
+
+
 def _stage_merged_moe_model(path, shards=1):
     from mlx_lm.models import qwen3_moe
 
