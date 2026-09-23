@@ -1616,7 +1616,15 @@ def _single_assignments(tree):
             else:
                 for name in _bound_names(node.target):
                     bind(name)
-        elif isinstance(node, (ast.AugAssign, ast.NamedExpr, ast.For,
+        elif isinstance(node, ast.NamedExpr):
+            # (scheme := "https") binds a value like any other assignment, and
+            # dropping it left the name unreadable and the URL it built with it.
+            if isinstance(node.target, ast.Name):
+                bind(node.target.id, node.value)
+            else:
+                for name in _bound_names(node.target):
+                    bind(name)
+        elif isinstance(node, (ast.AugAssign, ast.For,
                                ast.AsyncFor, ast.comprehension)):
             for name in _bound_names(node.target):
                 bind(name)
@@ -1733,8 +1741,42 @@ def _inline_constants(tree, assignments = None):
 
     if assignments is None:
         assignments = _single_assignments(tree)
+
+    class Inliner(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and node.id in texts:
+                return ast.copy_location(ast.Constant(texts[node.id]), node)
+            return node
+
+    # To a fixed point, because one constant can be assigned through another:
+    # scheme = "https"; alias = scheme leaves alias unreadable until scheme has
+    # been substituted, and the assembled URL was invisible for want of one
+    # more pass. Bounded like the carrier fixpoint, and real files settle in
+    # the first pass.
     texts, budget = {}, MAX_FOLDED_JOIN
+    for _ in range(MAX_CARRIER_PASSES):
+        if not _fold_constants(assignments, texts, uses, budget):
+            break
+        budget = MAX_FOLDED_JOIN - sum(
+            len(text) * uses.get(name, 0) for name, text in texts.items()
+        )
+        inliner = Inliner()
+        tree = inliner.visit(tree)
+        # The values are visited again on their own because a bare alias IS the
+        # node this map points at: the tree pass replaces it inside its parent
+        # and leaves the map holding the name it used to be.
+        assignments = {
+            name: inliner.visit(value) for name, value in assignments.items()
+        }
+    return tree
+
+
+def _fold_constants(assignments, texts, uses, budget):
+    """Read what each unread name holds, into `texts`. True if any was new."""
+    found = False
     for name, value in assignments.items():
+        if name in texts:
+            continue
         text = _literal_text(value)
         if text is None or UNKNOWN_PIECE in text:
             continue
@@ -1749,16 +1791,8 @@ def _inline_constants(tree, assignments = None):
             # of scheme, separator and host bought exactly that.
             raise _FoldBudgetExceeded("substituted more text than one file may")
         texts[name] = text
-    if not texts:
-        return tree
-
-    class Inliner(ast.NodeTransformer):
-        def visit_Name(self, node):
-            if isinstance(node.ctx, ast.Load) and node.id in texts:
-                return ast.copy_location(ast.Constant(texts[node.id]), node)
-            return node
-
-    return Inliner().visit(tree)
+        found = True
+    return found
 
 
 def _literal_texts(tree, skip = frozenset()):

