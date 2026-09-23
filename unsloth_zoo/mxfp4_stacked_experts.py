@@ -257,7 +257,7 @@ class Mxfp4StackedExperts(nn.Module):
 
         unsorted = torch.empty_like(out)
         unsorted[order] = out
-        weighted = unsorted.view(num_tokens, top_k, -1).to(torch.float32) * topk_weight.to(
+        weighted = unsorted.view(num_tokens, top_k, out.shape[-1]).to(torch.float32) * topk_weight.to(
             torch.float32
         ).unsqueeze(-1)
         return weighted.sum(dim = 1).to(hidden_states.dtype)

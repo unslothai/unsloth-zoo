@@ -474,3 +474,18 @@ def test_indexing_an_expert_after_a_merge_uses_the_merged_weights():
         want = base._activate(x @ gate_up[3].to(x.dtype)) @ down[3].to(x.dtype)
         packed_model.base_model.unmerge_adapter()
     torch.testing.assert_close(got, want, atol = 0, rtol = 0)
+
+
+@pytest.mark.parametrize("lora", [False, True])
+def test_no_routed_tokens_give_an_empty_output(lora):
+    module, _ = _experts()
+    x, idx, weight = _routing()
+    x, idx, weight = x[:0].clone().requires_grad_(True), idx[:0], weight[:0]
+    if lora:
+        first = torch.zeros(E, H, 4, device = DEVICE, dtype = torch.bfloat16, requires_grad = True)
+        second = torch.zeros(E, 4, 2 * I, device = DEVICE, dtype = torch.bfloat16, requires_grad = True)
+        setattr(module, mu.moe_lora_stash_name("gate_up_proj"), (first, second, 2.0, E))
+    out = module(x, idx, weight)
+    assert out.shape == (0, H) and out.dtype == x.dtype
+    out.float().sum().backward()
+    assert x.grad is not None and x.grad.shape == (0, H)
