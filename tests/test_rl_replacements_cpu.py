@@ -478,14 +478,7 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
 @pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
 @pytest.mark.parametrize("items", [0.0, torch.tensor(0.0)], ids=["python", "tensor"])
 def test_grpo_generation_normalizer_survives_an_empty_batch(loss_type, items):
-    """A fully masked generation batch must contribute 0, not nan.
-
-    `num_items_in_batch` is the gathered sum of the loss mask, so it is 0 when every completion
-    in the batch is masked out, which is what `mask_truncated_completions` does to a batch of
-    truncated completions. The numerator is 0 too, and dividing by an unclamped 0 puts a nan in
-    the loss and in every gradient. TRL floors the same count at 1; grpo, bnpo, dr_grpo and luspo
-    already divide by something that cannot reach 0.
-    """
+    """A fully masked generation batch (count 0) must contribute 0, not nan."""
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
     mask = torch.zeros_like(mask)
     kwargs["num_items_in_batch"] = items

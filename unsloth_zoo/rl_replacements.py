@@ -631,12 +631,7 @@ def grpo_compute_loss(
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type in ["cispo", "dapo", "vespo"]:
-        # Floor the token count at 1 like TRL does. `num_items_in_batch` is the gathered sum of the
-        # loss mask, so it is 0 whenever a whole generation batch is masked out, which is what
-        # `mask_truncated_completions` does to every truncated completion. The numerator is 0 there
-        # too, and 0/0 puts a nan in the loss and in every gradient rather than the 0 that an empty
-        # batch should contribute. Every other loss type here already clamps or divides by a count
-        # that cannot reach 0.
+        # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
         else:
@@ -656,8 +651,7 @@ def grpo_compute_loss(
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return completion_length, x.mean()
             else:
-                # A row dropped by mask_truncated_completions has no tokens: leave it out of the
-                # mean like TRL does, rather than letting 0/0 turn the metric into nan.
+                # Rows with no tokens (mask_truncated_completions) are left out, as in TRL.
                 mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward.clamp(min = 1.0)
                 kept_rows = (n_mask_per_reward > 0).sum()
                 mean_kl = torch.where(
@@ -1440,10 +1434,8 @@ def grpo_accumulated_loss(
         else:
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
 
-    # `mask_truncated_completions` zeroes a truncated completion's whole row in the incoming
-    # completion_mask. The text path below rebuilds the mask from token ids, which would bring
-    # those rows back into the loss while TRL >= 1.9 already left them out of num_items_in_batch.
-    # Remember which rows TRL kept and drop the rest right before the loss.
+    # The text path rebuilds completion_mask from token ids, which would undo TRL's
+    # mask_truncated_completions row zeroing; keep TRL's rows and reapply them before the loss.
     kept_completion_rows = None
     if (
         pixel_values is None

@@ -1,13 +1,20 @@
-"""`mask_truncated_completions` must reach the loss on the text path.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-TRL drops a truncated completion by zeroing its whole row in `completion_mask`, and from TRL 1.9
-it also leaves that row out of `num_items_in_batch`. The text branch of `grpo_accumulated_loss`
-rebuilds the mask from token ids, which used to bring the row back: the loss trained on a
-completion the user asked to drop, divided by a count that did not include it, and a batch of
-nothing but truncated completions divided a non-zero sum by 0.
-
-These tests run the real function up to the loss call on CPU and read the mask it hands over.
-"""
+"""mask_truncated_completions must survive the text path's mask rebuild in grpo_accumulated_loss."""
 import types
 
 import pytest
