@@ -102,10 +102,14 @@ def _wait(predicate, timeout: float = 2.0, step: float = 0.02) -> bool:
     return predicate()
 
 
-def _watch_while_growing(grown: Path, **watchdog_kwargs) -> "tuple[list[str], float, float]":
+def _watch_while_growing(
+    grown: Path, **watchdog_kwargs
+) -> "tuple[list[str], float, float, list[int]]":
     """Grow *grown* every 0.05 s under a watchdog for past its stall timeout.
 
-    Returns ``(stall calls, longest gap between writes, stall_timeout)``. A stall is no growth for
+    Returns ``(stall calls, longest gap between writes, stall_timeout, sizes read after each write)``,
+    the last being what the watchdog's own reader saw, so a firing says whether the grower paused
+    or the size the watchdog reads did not move. A stall is no growth for
     stall_timeout, so a claim that growth keeps the watchdog quiet needs the grower to have kept
     writing with no gap that long. On a loaded xdist runner a starved grower is a real stall and the
     watchdog is right to fire; the gap tells the two apart (#1349).
@@ -113,12 +117,21 @@ def _watch_while_growing(grown: Path, **watchdog_kwargs) -> "tuple[list[str], fl
     grow_stop = threading.Event()
     writes: list[float] = []
 
+    sizes: list[int] = []
+
+    # Appended and flushed, the way a download grows a partial. The watchdog reads st_blocks
+    # (sparse-aware), and rewriting the whole file with O_TRUNC every 0.05 s left that number to
+    # the filesystem's allocation: #1367's first CI run saw the repo-wide watchdog fire with the
+    # grower never idle for 1.5 s. Not reproduced on XFS here; fsync pins each write's blocks, and
+    # the sizes recorded below say which side moved if it happens again.
     def _grow():
-        size = grown.stat().st_size
-        while not grow_stop.wait(0.05):
-            size += 4096
-            grown.write_bytes(b"\0" * size)
-            writes.append(time.monotonic())
+        with open(grown, "ab") as out:
+            while not grow_stop.wait(0.05):
+                out.write(os.urandom(4096))
+                out.flush()
+                os.fsync(out.fileno())
+                writes.append(time.monotonic())
+                sizes.append(xf.blob_bytes_present(grown))
 
     grower = threading.Thread(target = _grow, daemon = True)
     grower.start()
@@ -150,7 +163,7 @@ def _watch_while_growing(grown: Path, **watchdog_kwargs) -> "tuple[list[str], fl
     # trailing gap the watchdog saw too.
     marks = [started] + [w for w in writes if w < stopped] + [stopped]
     gap = max(b - a for a, b in zip(marks, marks[1:]))
-    return calls, gap, stall_timeout
+    return calls, gap, stall_timeout, sizes
 
 
 def test_constant_incomplete_fires_stall(hf_cache):
@@ -175,11 +188,14 @@ def test_growing_incomplete_never_stalls(hf_cache):
     part = blobs / "growing.incomplete"
     part.write_bytes(b"\0" * 1024)
 
-    calls, gap, stall_timeout = _watch_while_growing(part)
+    calls, gap, stall_timeout, sizes = _watch_while_growing(part)
     assert gap < stall_timeout, (
         f"the partial went {gap:.2f}s without growing, so this run never tested the claim"
     )
-    assert calls == [], "watchdog fired despite continuous progress"
+    assert calls == [], (
+        f"watchdog fired despite continuous progress; its size reader saw {len(set(sizes))} "
+        f"distinct values over {len(sizes)} writes"
+    )
 
 
 def test_no_incomplete_never_stalls(hf_cache):
@@ -281,11 +297,14 @@ def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
     (blobs / "child.incomplete").write_bytes(b"\0" * 2048)   # constant
 
     # default: repo-wide (watch_new_partials_only = False)
-    calls, gap, stall_timeout = _watch_while_growing(sibling)
+    calls, gap, stall_timeout, sizes = _watch_while_growing(sibling)
     assert gap < stall_timeout, (
         f"the sibling went {gap:.2f}s without growing, so this run never tested the claim"
     )
-    assert calls == [], "repo-wide watchdog should be reset by the growing sibling"
+    assert calls == [], (
+        f"repo-wide watchdog should be reset by the growing sibling; its size reader saw "
+        f"{len(set(sizes))} distinct values over {len(sizes)} writes"
+    )
 
 
 def test_file_watchdog_ignores_baseline_only_partials(hf_cache):
