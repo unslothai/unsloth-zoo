@@ -636,7 +636,7 @@ def patch_transformers_masks():
         original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
     )
 
-    def wrap(f, original):
+    def wrap(f, original, prepared_mask_shortcut = True):
         # transformers named the embeddings argument `input_embeds` up to 5.1 and
         # `inputs_embeds` from 5.2 (huggingface/transformers#43916). Remote modeling
         # code is written against one of them (Nemotron-H's
@@ -674,7 +674,11 @@ def patch_transformers_masks():
             for name in drop:
                 kwargs.pop(name, None)
             input_embeds = kwargs.get("inputs_embeds", kwargs.get("input_embeds", None))
-            if input_embeds is not None and getattr(input_embeds, "requires_grad", False):
+            if (
+                prepared_mask_shortcut
+                and input_embeds is not None
+                and getattr(input_embeds, "requires_grad", False)
+            ):
                 attention_mask = kwargs.get("attention_mask", None)
                 if isinstance(attention_mask, BlockMask) or (
                     isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
@@ -712,8 +716,12 @@ def patch_transformers_masks():
         masking_utils.create_masks_for_generate,
     )
     masking_utils._unsloth_original_create_masks_for_generate = original_create_masks_for_generate
+    # No prepared-mask shortcut here: this one returns a dict keyed by layer type for
+    # hybrid configs, and transformers already passes a prepared 4-D mask through per layer.
     masking_utils.create_masks_for_generate = wrap(
-        masking_utils.create_masks_for_generate, original_create_masks_for_generate
+        masking_utils.create_masks_for_generate,
+        original_create_masks_for_generate,
+        prepared_mask_shortcut = False,
     )
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
     # Multi-GPU device_map flex_attention fix: offset tensors may live on a
