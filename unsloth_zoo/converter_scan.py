@@ -838,35 +838,46 @@ def _percent_holes(template):
     return "".join(pieces).replace("%%", "%")
 
 
-# The callable spellings of the plus operator, which build the same string it
-# does. set.add is not one of them: these take two arguments.
-ADD_FUNCTIONS = frozenset(("add", "concat", "iadd", "iconcat"))
+# The callable spellings of the operators that build a string, each mapped to
+# the method it really is. set.add is not one of them: these take two arguments.
+OPERATOR_FUNCTIONS = {
+    "add": "__add__", "concat": "__add__",
+    "iadd": "__add__", "iconcat": "__add__",
+    "mod": "__mod__", "imod": "__mod__",
+    "mul": "__mul__", "imul": "__mul__",
+}
+
+# And the methods themselves, read by folding the operator they stand for
+# rather than by repeating its rules here.
+OPERATOR_METHODS = {
+    "__add__": ast.Add, "__mod__": ast.Mod, "__mul__": ast.Mult,
+}
 
 
-def _added_text(node):
-    """The text of a `+` spelled as a call, or None.
+def _operator_text(node):
+    """The text of an operator spelled as a call, or None.
 
-    operator.add("https", "://evil.example/c") and
-    "https".__add__("://evil.example/c") build the same string the operator
-    does, and reading only the operator left neither literal holding a URL.
+    operator.add("https", "://evil.example/c"), "https".__add__(...) and
+    operator.mod("%s://%s/c", ("https", "evil.example")) build the same strings
+    the operators do, and reading only the operators left no literal holding a
+    URL. Folded by standing the operator back up and reading that, so the
+    ceilings and the holes are the ones the operator already has.
     """
-    if not isinstance(node, ast.Call) or node.keywords:
+    if not (
+        isinstance(node, ast.Call)
+        and not node.keywords
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in OPERATOR_METHODS
+        and len(node.args) == 1
+    ):
         return None
-    if isinstance(node.func, ast.Attribute) and node.func.attr == "__add__":
-        operands = [node.func.value, *node.args]
-    elif isinstance(node.func, ast.Attribute) and node.func.attr in ADD_FUNCTIONS:
-        operands = list(node.args)
-    else:
-        return None
-    if len(operands) != 2:
-        return None
-    left = _literal_text(operands[0])
-    right = _literal_text(operands[1])
-    if left is None or right is None:
-        return None
-    if len(left) + len(right) > MAX_FOLDED_JOIN:
-        return None                     # the same output ceiling as the join
-    return left + right
+    return _literal_text_uncharged(
+        ast.BinOp(
+            left = node.func.value,
+            op = OPERATOR_METHODS[node.func.attr](),
+            right = node.args[0],
+        )
+    )
 
 
 def _replace_text(node):
@@ -1104,9 +1115,9 @@ def _literal_text_uncharged(node):
         # treat the pieces around it as the whole string.
         separator, elements = parts
         return separator.join(elements)
-    added = _added_text(node)
-    if added is not None:
-        return added
+    operated = _operator_text(node)
+    if operated is not None:
+        return operated
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
         # "https" * 1 + "://evil.example/c" carries its scheme in a repetition,
         # which was neither folded nor refused, so no literal in the file held
@@ -1589,7 +1600,8 @@ def _single_assignments(tree):
 # The string methods this file folds or refuses, which are also the ones worth
 # spelling in unbound form to miss those rules.
 DESCRIPTOR_METHODS = frozenset((
-    "format", "format_map", "join", "replace", "translate", "__add__",
+    "format", "format_map", "join", "replace", "translate",
+    "__add__", "__mod__", "__mul__",
 ))
 
 
@@ -1628,12 +1640,13 @@ def _bind_descriptor_calls(tree, assignments = None, aliases = None):
         if isinstance(node.func, ast.Name) and node.func.id in rebound:
             attribute = rebound[node.func.id]
         elif (
-            _called_name(node, aliases) in ADD_FUNCTIONS
+            _called_name(node, aliases) in OPERATOR_FUNCTIONS
             and len(node.args) == 2
         ):
-            # from operator import add, then add("https", "://evil.example/c").
-            # Written as the method it is, so one fold reads every spelling.
-            attribute = "__add__"
+            # from operator import add, then add("https", "://evil.example/c"),
+            # and the same for mod and mul. Written as the method it is, so one
+            # fold reads every spelling.
+            attribute = OPERATOR_FUNCTIONS[_called_name(node, aliases)]
         elif (
             isinstance(node.func, ast.Attribute)
             and node.func.attr in DESCRIPTOR_METHODS
