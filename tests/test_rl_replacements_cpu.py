@@ -1201,9 +1201,9 @@ def _luspo_reference(ref, new, old, mask, advantages, beta, level):
 def test_luspo_matches_trl_aggregation(level, beta, disable_dynamo):
     # luspo weighted the whole row by its own token count (`loss_i * mask.sum(1)`), which
     # only equals TRL's elementwise mask when loss_i really is (B, 1). The token level (the
-    # TRL default), a nonzero beta, token level vLLM ratios and the off policy mask all
-    # broadcast loss_i to (B, T), and there the row weighting both drops the mask and
-    # squares the token count. Everything here is float64, so 1e-12 is far above the
+    # TRL default), a nonzero beta and token level vLLM ratios all broadcast loss_i to
+    # (B, T), and there the row weighting drops the mask and scales every column, padding
+    # included, by the row's token count. Everything here is float64, so 1e-12 is far above the
     # roughly 2.2e-16 eps that a sum over five columns can accumulate.
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("luspo")
     kwargs["importance_sampling_level"] = level
