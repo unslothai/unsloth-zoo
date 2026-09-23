@@ -33,6 +33,7 @@ import pathlib
 import textwrap
 
 import pytest
+import torch
 
 # Importing unsloth_zoo on a GPU host runs its full init, which asserts Unsloth
 # is present. Set the flag defensively so the test is self-contained.
@@ -1218,12 +1219,15 @@ def test_rdna1_takes_the_pure_torch_gated_delta_path(monkeypatch):
         fla_vendor, "_disable_already_imported_gated_delta", lambda *a, **k: calls.append(("unbind", k))
     )
     monkeypatch.setattr(fla_vendor, "_inject_vendored_fla", lambda: calls.append(("inject", None)) or (False, False))
+    monkeypatch.setattr(
+        fla_vendor, "_patch_l2norm_fp32_on_torch_path", lambda *a, **k: calls.append(("l2norm", None)) or []
+    )
     monkeypatch.setattr(fla_vendor, "_FLA_DISABLED_REASON", None)
 
     fla_vendor._patch_vendor_fla()
 
     kinds = [kind for kind, _ in calls]
-    assert kinds[:2] == ["probe", "unbind"]
+    assert kinds[:3] == ["probe", "unbind", "l2norm"]
     assert "inject" not in kinds
     assert calls[0][1] == (fla_vendor._unavailable_probe,)
     assert "RDNA1" in calls[1][1]["why"] or "dot instructions" in calls[1][1]["why"]
@@ -1247,3 +1251,75 @@ def test_gpus_with_dot_instructions_do_not_trip_the_rdna1_path(monkeypatch):
 
     assert marked == []
     assert fla_vendor.fla_unavailable_reason() is None
+
+
+def _transformers_style_l2norm(x, dim = -1, eps = 1e-6):
+    """Verbatim shape of transformers' pure-torch l2norm: reduction in the input dtype."""
+    inv_norm = torch.rsqrt((x * x).sum(dim = dim, keepdim = True) + eps)
+    return x * inv_norm
+
+
+def test_fp32_l2norm_matches_fp32_reference_and_keeps_dtype():
+    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
+
+    x = torch.randn(4, 128, dtype = torch.float16)
+    out = _fp32_l2norm(x)
+    assert out.dtype == torch.float16
+    ref = _transformers_style_l2norm(x.float())
+    torch.testing.assert_close(out.float(), ref, atol = 2e-3, rtol = 2e-3)
+    # Rows end up unit length, as l2norm promises.
+    torch.testing.assert_close(out.float().norm(dim = -1), torch.ones(4), atol = 5e-3, rtol = 0)
+
+
+def test_fp32_l2norm_survives_the_float16_overflow_that_gives_nan_grads():
+    """128 * 300^2 = 1.15e7 overflows float16 (max 65504), so transformers' version stores
+    inv_norm = rsqrt(inf) = 0: a finite forward. fp16 training then backpropagates a
+    loss-scaled gradient; sum(x * grad) overflows to inf in float16 and inf * 0 inside
+    RsqrtBackward is the NaN seen on the RX 5700 XT. The loss itself is float32 in a
+    real trainer, so the scale is applied to a float32 sum here as well."""
+    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
+
+    loss_scale = 1024.0
+    x = torch.full((2, 128), 300.0, dtype = torch.float16, requires_grad = True)
+    bad = _transformers_style_l2norm(x)
+    assert torch.isfinite(bad).all()          # the forward looks fine ...
+    (bad.float().sum() * loss_scale).backward()
+    assert not torch.isfinite(x.grad).all()  # ... the backward is not
+
+    x2 = torch.full((2, 128), 300.0, dtype = torch.float16, requires_grad = True)
+    good = _fp32_l2norm(x2)
+    (good.float().sum() * loss_scale).backward()
+    assert torch.isfinite(good).all()
+    assert torch.isfinite(x2.grad).all()
+    torch.testing.assert_close(good.float().norm(dim = -1), torch.ones(2), atol = 5e-3, rtol = 0)
+
+
+def test_l2norm_patch_rebinds_only_imported_gated_delta_modules(monkeypatch):
+    import types
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    fake_pkg = "unsloth_test_gated_delta"
+    modname = f"transformers.models.{fake_pkg}.modeling_{fake_pkg}"
+    mod = types.ModuleType(modname)
+    mod.l2norm = _transformers_style_l2norm
+    monkeypatch.setitem(sys.modules, modname, mod)
+    plain_pkg = "unsloth_test_no_l2norm"
+    plain_name = f"transformers.models.{plain_pkg}.modeling_{plain_pkg}"
+    plain = types.ModuleType(plain_name)
+    monkeypatch.setitem(sys.modules, plain_name, plain)
+
+    # unsloth's compiled copy of a model module carries its own l2norm and is what runs.
+    compiled_name = "unsloth_compiled_module_unsloth_test_gated_delta"
+    compiled = types.ModuleType(compiled_name)
+    compiled.l2norm = _transformers_style_l2norm
+    monkeypatch.setitem(sys.modules, compiled_name, compiled)
+
+    patched = fla_vendor._patch_l2norm_fp32_on_torch_path(packages = (fake_pkg, plain_pkg, "never_imported_pkg"))
+
+    assert modname in patched and compiled_name in patched
+    assert mod.l2norm is fla_vendor._fp32_l2norm
+    assert compiled.l2norm is fla_vendor._fp32_l2norm
+    assert not hasattr(plain, "l2norm")
+    # Idempotent: a second pass finds nothing left to do.
+    assert fla_vendor._patch_l2norm_fp32_on_torch_path(packages = (fake_pkg, plain_pkg)) == []
+    assert mod.l2norm is fla_vendor._fp32_l2norm

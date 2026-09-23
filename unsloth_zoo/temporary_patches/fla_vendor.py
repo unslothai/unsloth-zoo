@@ -280,6 +280,76 @@ def _mark_fla_disabled_no_dot_instructions():
         logger.warning(_FLA_DISABLED_REASON)
 
 
+# transformers' pure-torch gated-delta path normalises q and k with a module-level
+# ``l2norm`` that runs in the INPUT dtype:  x * rsqrt((x * x).sum(-1) + eps).  The fla
+# kernel it stands in for does that sum in float32. In float16 the sum of squares
+# overflows to inf well within normal activations (128 * 23^2 already exceeds 65504),
+# rsqrt(inf) gives a finite 0 forward, and the scaled gradient of fp16 training turns
+# inf * 0 into NaN in RsqrtBackward. Seen on an RX 5700 XT through Unsloth Studio:
+# loss finite at step 1, grad_norm NaN, NaN from step 2. torch.compile hides it
+# (Inductor upcasts the reduction); eager mode, which Unsloth Studio forces on Windows
+# ROCm via TORCHDYNAMO_DISABLE, does not.
+_L2NORM_FP32_MARK = "_unsloth_fp32_l2norm"
+
+
+def _fp32_l2norm(x, dim = -1, eps = 1e-6):
+    """``l2norm`` with the reduction in float32, result in the input dtype: what fla's kernel does."""
+    import torch
+
+    xf = x.float()
+    inv_norm = torch.rsqrt((xf * xf).sum(dim = dim, keepdim = True) + eps)
+    return (xf * inv_norm).to(x.dtype)
+
+
+setattr(_fp32_l2norm, _L2NORM_FP32_MARK, True)
+
+
+# unsloth's compiler copies the modeling source into its own module,
+# ``unsloth_compiled_module_<model_type>`` (unsloth_zoo.compiler.COMBINED_UNSLOTH_NAME),
+# l2norm included, and the model runs THAT copy. Patching transformers' module alone
+# leaves the live one untouched, which is exactly what happened on the first try.
+_UNSLOTH_COMPILED_MODULE_PREFIX = "unsloth_compiled_module"
+
+
+def _l2norm_modules(packages = None):
+    """Modules whose ``l2norm`` the pure-torch gated-delta path can run: transformers'
+    gated-delta modeling modules and unsloth's compiled copies of them, imported or not."""
+    if packages is None:
+        packages = _GATED_DELTA_MODELING
+    names = [f"transformers.models.{pkg}.modeling_{pkg}" for pkg in packages]
+    names += sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and name not in names
+    )
+    return names
+
+
+def _patch_l2norm_fp32_on_torch_path(packages = None):
+    """Rebind ``l2norm`` on every already-imported gated-delta module, transformers' and
+    unsloth's compiled copy alike, to the float32-safe version. Idempotent; modules
+    without an ``l2norm`` are left alone. Returns the module names patched this call.
+
+    Runs from every temporary-patch phase: the modeling module is imported by
+    ``pre_compile``, the compiled copy exists by ``post_compile``, both before the
+    first forward."""
+    patched = []
+    for modname in _l2norm_modules(packages):
+        mod = sys.modules.get(modname)
+        if mod is None:
+            continue
+        current = getattr(mod, "l2norm", None)
+        if current is None or getattr(current, _L2NORM_FP32_MARK, False):
+            continue
+        try:
+            setattr(mod, "l2norm", _fp32_l2norm)
+        except Exception:
+            continue
+        patched.append(modname)
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Unsloth: {modname}.l2norm now reduces in float32 (pure-torch gated delta, float16 safe).")
+    return patched
+
+
 def _hopper_dqkwg_suspect_here():
     """``_hopper_dqkwg_suspect`` for the live interpreter, or False if unknowable."""
     try:
@@ -1209,6 +1279,9 @@ def _patch_vendor_fla(phase=None):
         _mark_fla_disabled_no_dot_instructions()
         _patch_is_available(_unavailable_probe)
         _disable_already_imported_gated_delta(why="no dot instructions on this GPU (RDNA1)")
+        # The pure-torch path is only correct in float16 (all these GPUs have) with the
+        # q/k l2norm reducing in float32, as the fla kernel it replaces does.
+        _patch_l2norm_fp32_on_torch_path()
         return
     if _flag("UNSLOTH_DISABLE_HOPPER_FLA_BWD") and _hopper_dqkwg_suspect_here():
         # Sample the layout BEFORE _patch_is_available, which assigns the probe
