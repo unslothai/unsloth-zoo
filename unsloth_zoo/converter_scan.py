@@ -915,10 +915,11 @@ def _replace_text(node):
         return None
 
 
-def _rewrites_a_constant(node):
+def _rewrites_a_constant(node, aliases = None):
     """Whether a literal string is transformed into text this cannot read.
 
-    Named methods were losing one at a time. replace with dynamic arguments,
+    Named methods were losing one at a time, and the constructors spell the
+    same transformation with no method in sight. replace with dynamic arguments,
     decode of UTF-16 bytes, split indexed back together, and then ljust(6, ":")
     turning "https" into a scheme: the tail of string methods that build a URL
     out of a constant has no end, so this asks the other question. The receiver
@@ -931,11 +932,17 @@ def _rewrites_a_constant(node):
     .replace(), .strip() and .format() receiver in gguf-py/gguf/utility.py is
     an argument, and what it decodes and splits came back from the hub.
     """
-    if not (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and _literal_text(node.func.value) is not None
-    ):
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Attribute):
+        receiver = node.func.value
+    elif _called_name(node, aliases or {}) in ("str", "bytes", "bytearray"):
+        # str(payload, "utf-16le") is the same decode through the constructor,
+        # and the type name is the only place the method appears at all.
+        receiver = node.args[0] if node.args else None
+    else:
+        return False
+    if receiver is None or _literal_text(receiver) is None:
         return False
     return _literal_text(node) is None
 
@@ -1413,7 +1420,7 @@ def _reshapes_a_url(tree, assignments = None, aliases = None):
             # text written out. Upstream slices what came back from the hub,
             # raw_data[:8], which is not a literal.
             return True
-        if _rewrites_a_constant(node):
+        if _rewrites_a_constant(node, aliases):
             return True
         if isinstance(node, ast.Call) and called_name(node) in ("reduce", "accumulate"):
             # functools.reduce(operator.add, ["https", "://evil.example/c"])

