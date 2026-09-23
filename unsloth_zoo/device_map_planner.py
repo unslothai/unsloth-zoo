@@ -1665,6 +1665,27 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     return quantization_config
 
 
+def _quantization_method_is_known(quantization_config: Any) -> bool:
+    """Whether transformers can build a quantizer for a serialized config.
+
+    Mirrors ``AutoQuantizationConfig.from_dict``: bitsandbytes flags win, then
+    ``quant_method`` is looked up in the installed mapping. Anything already
+    built, or without a method, is left to transformers to accept or refuse.
+    """
+    if not isinstance(quantization_config, Mapping):
+        return True
+    if quantization_config.get("load_in_8bit") or quantization_config.get("load_in_4bit"):
+        return True
+    method = quantization_config.get("quant_method")
+    if method is None:
+        return True
+    try:
+        from transformers.quantizers.auto import AUTO_QUANTIZATION_CONFIG_MAPPING
+    except Exception:
+        return True
+    return str(method) in AUTO_QUANTIZATION_CONFIG_MAPPING
+
+
 def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     """Instantiate the model on the meta device, quantiser included.
 
@@ -1692,6 +1713,13 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
         # also what stops a calibration-free quantiser taking the wrong path.
         if serialized_qcfg is None:
             hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
+        elif runtime_qcfg is not None and not _quantization_method_is_known(serialized_qcfg):
+            # A method transformers cannot load (NVIDIA ModelOpt) that the caller
+            # rewrote into one it can, as Unsloth does for ModelOpt FP8: the load
+            # applies the caller's config to the checkpoint's quantized weights,
+            # so size exactly that instead of failing on the serialized method.
+            hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=True)
+            config.quantization_config = runtime_qcfg
         else:
             # The checkpoint's own method wins and the runtime config only
             # overlays its loading attributes -- an 8-bit checkpoint handed a
