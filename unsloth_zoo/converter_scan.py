@@ -365,7 +365,9 @@ UNVOUCHABLE_MODULES = (
 # match and `d("aHR0cHM6...")` decoded an attacker URL beside an unused hub
 # literal. Modules whose members rebuild a string, and the member names that do
 # it under any module. Upstream imports none of these anywhere.
-STRING_BUILDER_MODULES = ("base64", "binascii", "codecs", "quopri", "uu")
+STRING_BUILDER_MODULES = (
+    "base64", "binascii", "codecs", "quopri", "uu", "struct",
+)
 STRING_BUILDER_NAMES = frozenset((
     "b64decode", "b64encode", "b32decode", "b16decode", "b85decode",
     "a85decode", "standard_b64decode", "urlsafe_b64decode", "decodebytes",

