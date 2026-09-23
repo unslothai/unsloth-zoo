@@ -458,3 +458,19 @@ def test_merged_exports_still_run_under_inference_mode():
 
     assert inspect.unwrap(saving_utils.merge_and_overwrite_lora) is not saving_utils.merge_and_overwrite_lora
     assert inspect.unwrap(saving_utils._compressed_packed_format) is saving_utils._compressed_packed_format
+
+
+def test_indexing_an_expert_after_a_merge_uses_the_merged_weights():
+    packed_model, _ = _peft_pair()
+    x, _, _ = _routing()
+    base = packed_model.base_model.model.experts
+    while hasattr(base, "base_layer"):
+        base = base.base_layer
+    with torch.no_grad():
+        packed_model.base_model.merge_adapter()
+        gate_up, down = base.gate_up_proj, base.down_proj
+        assert not isinstance(gate_up, Mxfp4ExpertParam)
+        got = base[3](x)
+        want = base._activate(x @ gate_up[3].to(x.dtype)) @ down[3].to(x.dtype)
+        packed_model.base_model.unmerge_adapter()
+    torch.testing.assert_close(got, want, atol = 0, rtol = 0)

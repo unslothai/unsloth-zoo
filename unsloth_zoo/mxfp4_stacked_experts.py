@@ -152,6 +152,9 @@ class _ExpertView:
         self.index = index
 
     def _weight(self, param, dtype):
+        if not is_mxfp4_expert_param(param):
+            # A merged adapter left a dense (E, in, out) stack.
+            return param[self.index].t().to(dtype)
         start, end = self.index, self.index + 1
         return mxfp4_dequantize(
             param.data[start:end], param.mxfp4_scales.to(param.device)[start:end],
