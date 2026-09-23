@@ -36,6 +36,8 @@ Two things fix that for every architecture at once:
   module: only experts whose forward is Unsloth's are quantized, everything
   else stays in the checkpoint dtype and trains through its own forward.
 """
+import contextlib
+import functools
 import weakref
 
 import torch
@@ -213,6 +215,14 @@ def _expert_parallel_requested(model) -> bool:
 # transformers' own "grouped_mm" experts forward, the default this implementation replaces.
 # Resolved once in patch_experts_interface so the dense route below is a plain call Dynamo traces.
 _TRANSFORMERS_GROUPED_MM = None
+# transformers 5.3 and later run grouped_mm on any device through their own fallback (what
+# these classes ran before "unsloth" became the default); 5.2 has none, so there the dense
+# route needs torch._grouped_mm itself.
+_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK = False
+# generate() swaps "grouped_mm" for "batched_mm" while decoding on a GPU, which it cannot do
+# for "unsloth"; the dense route follows the same switch through this depth counter.
+_TRANSFORMERS_BATCHED_MM = None
+_DECODING_DEPTH = 0
 
 _DENSE_STACK_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -247,14 +257,17 @@ def unsloth_experts_forward(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """The "unsloth" experts implementation. Dense stacks with no expert LoRA take
-    transformers' grouped_mm, which a compiled MoE block inlines as before; packed
-    stacks and expert LoRA take Unsloth's dispatcher, which is kept out of Dynamo."""
+    """The "unsloth" experts implementation. Dense stacks with no expert LoRA run what
+    transformers' own default would (grouped_mm, and batched_mm while generate() decodes),
+    which a compiled MoE block inlines as before; packed stacks and expert LoRA take
+    Unsloth's dispatcher, which is kept out of Dynamo."""
     if (
         _TRANSFORMERS_GROUPED_MM is not None
         and _dense_experts_without_expert_lora(self)
-        and _grouped_mm_supported()
+        and (_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK or _grouped_mm_supported())
     ):
+        if _DECODING_DEPTH and _TRANSFORMERS_BATCHED_MM is not None and not torch.is_grad_enabled():
+            return _TRANSFORMERS_BATCHED_MM(self, hidden_states, top_k_index, top_k_weights)
         return _TRANSFORMERS_GROUPED_MM(self, hidden_states, top_k_index, top_k_weights)
     return _unsloth_experts_dispatch(self, hidden_states, top_k_index, top_k_weights)
 
@@ -300,6 +313,44 @@ def _unsloth_experts_dispatch(
     return _moe_utils_module().get_forward_moe_backend()(self, hidden_states, top_k_index, top_k_weights)
 
 
+def _implementation_values(model):
+    getter = getattr(model, "get_experts_implementation", None)
+    try:
+        implementation = getter() if callable(getter) else getattr(model.config, "_experts_implementation", None)
+    except Exception:
+        implementation = getattr(getattr(model, "config", None), "_experts_implementation", None)
+    return list(implementation.values()) if isinstance(implementation, dict) else [implementation]
+
+
+def _patch_decode_switch():
+    """Follow generate()'s grouped_mm -> batched_mm switch for the decoding stage."""
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except Exception:
+        return
+    original = GenerationMixin.__dict__.get("_optimize_model_for_decode")
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    @functools.wraps(original)
+    @contextlib.contextmanager
+    def _optimize_model_for_decode(self, *args, **kwargs):
+        global _DECODING_DEPTH
+        with original(self, *args, **kwargs):
+            # The same condition transformers uses for its own switch, on our name.
+            switch = self.device.type != "cpu" and UNSLOTH_EXPERTS_IMPLEMENTATION in _implementation_values(self)
+            if switch:
+                _DECODING_DEPTH += 1
+            try:
+                yield
+            finally:
+                if switch:
+                    _DECODING_DEPTH -= 1
+
+    _optimize_model_for_decode._unsloth_patched = True
+    GenerationMixin._optimize_model_for_decode = _optimize_model_for_decode
+
+
 def patch_experts_interface():
     """Register the implementation and make it transformers' default choice."""
     interface = _experts_interface()
@@ -310,12 +361,19 @@ def patch_experts_interface():
     except Exception as e:
         return logger.warning(f"Unsloth: could not patch the experts interface: {e}")
 
-    global _TRANSFORMERS_GROUPED_MM
+    global _TRANSFORMERS_GROUPED_MM, _TRANSFORMERS_BATCHED_MM, _TRANSFORMERS_GROUPED_MM_HAS_FALLBACK
     if _TRANSFORMERS_GROUPED_MM is None:
         try:
             _TRANSFORMERS_GROUPED_MM = interface["grouped_mm"] if "grouped_mm" in interface else None
+            _TRANSFORMERS_BATCHED_MM = interface["batched_mm"] if "batched_mm" in interface else None
         except Exception:
-            _TRANSFORMERS_GROUPED_MM = None
+            _TRANSFORMERS_GROUPED_MM = _TRANSFORMERS_BATCHED_MM = None
+        try:
+            import transformers.integrations.moe as transformers_moe
+            _TRANSFORMERS_GROUPED_MM_HAS_FALLBACK = hasattr(transformers_moe, "_can_use_grouped_mm")
+        except Exception:
+            _TRANSFORMERS_GROUPED_MM_HAS_FALLBACK = False
+    _patch_decode_switch()
     if UNSLOTH_EXPERTS_IMPLEMENTATION not in interface:
         interface[UNSLOTH_EXPERTS_IMPLEMENTATION] = unsloth_experts_forward
 

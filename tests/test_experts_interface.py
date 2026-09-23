@@ -412,9 +412,16 @@ def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypat
     assert unsloth_experts_forward(m, h, i, w) is h
     assert calls == ["grouped_mm"]
 
-    # Without torch._grouped_mm on this device (pre-Hopper, CPU) the dispatcher's fallback runs.
+    # Without torch._grouped_mm on this device (pre-Hopper, CPU, torch < 2.8), transformers 5.3+
+    # still run grouped_mm through their own fallback, which is what these classes ran before.
     calls.clear()
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", False)
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK", True)
+    unsloth_experts_forward(m, h, i, w)
+    assert calls == ["grouped_mm"]
+    # transformers 5.2 has no such fallback: the dispatcher's own path runs.
+    calls.clear()
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK", False)
     unsloth_experts_forward(m, h, i, w)
     assert calls == ["unsloth"]
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", True)
@@ -484,3 +491,64 @@ def test_nested_recheck_of_unsloth_does_not_reach_a_fixed_list_validator(monkeyp
     assert getter(model, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
     assert getter(model, UNSLOTH_EXPERTS_IMPLEMENTATION) == UNSLOTH_EXPERTS_IMPLEMENTATION
     assert getter(model, "eager") == "eager"
+
+
+def test_dense_stacks_follow_generates_decode_switch_to_batched_mm(monkeypatch):
+    """generate() swaps "grouped_mm" for "batched_mm" while decoding on a GPU; the dense route
+    follows the same switch for "unsloth", and training (grad enabled) never sees it."""
+    import unsloth_zoo.temporary_patches.moe_experts_interface as MEI
+    calls = []
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM", lambda self, h, i, w: calls.append("grouped_mm") or h)
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_BATCHED_MM", lambda self, h, i, w: calls.append("batched_mm") or h)
+    monkeypatch.setattr(MEI, "_unsloth_experts_dispatch", lambda self, h, i, w: calls.append("unsloth") or h)
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK", True)
+    m = _experts(None, "transformers.models.x.modeling_x", implementation = "unsloth")
+    h, i, w = torch.zeros(2, 4), torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)
+
+    monkeypatch.setattr(MEI, "_DECODING_DEPTH", 1)
+    with torch.no_grad():
+        unsloth_experts_forward(m, h, i, w)
+    unsloth_experts_forward(m, h, i, w)
+    m._unsloth_lora_gate_up_proj = ("A", "B", 1.0)
+    with torch.no_grad():
+        unsloth_experts_forward(m, h, i, w)
+    assert calls == ["batched_mm", "grouped_mm", "unsloth"]
+
+
+def test_decode_switch_wrapper_counts_only_unsloth_models_off_cpu(monkeypatch):
+    import contextlib
+    import unsloth_zoo.temporary_patches.moe_experts_interface as MEI
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except Exception:
+        pytest.skip("no GenerationMixin")
+    seen = []
+
+    @contextlib.contextmanager
+    def original(self, *args, **kwargs):
+        seen.append(self.device.type)
+        yield
+
+    monkeypatch.setattr(GenerationMixin, "_optimize_model_for_decode", original, raising = False)
+    MEI._patch_decode_switch()
+    wrapped = GenerationMixin.__dict__["_optimize_model_for_decode"]
+    assert getattr(wrapped, "_unsloth_patched", False)
+    MEI._patch_decode_switch()
+    assert GenerationMixin.__dict__["_optimize_model_for_decode"] is wrapped
+
+    def model(device, impl):
+        return types.SimpleNamespace(
+            device = torch.device(device), get_experts_implementation = lambda: impl,
+        )
+    depths = []
+    for device, impl in [("cuda", "unsloth"), ("cuda", {"text": "unsloth"}), ("cpu", "unsloth"), ("cuda", "grouped_mm")]:
+        with wrapped(model(device, impl)):
+            depths.append(MEI._DECODING_DEPTH)
+        assert MEI._DECODING_DEPTH == 0
+    assert depths == [1, 1, 0, 0]
+    assert seen == ["cuda", "cuda", "cpu", "cuda"]
+    # An exception inside generate() still restores the depth.
+    with pytest.raises(RuntimeError):
+        with wrapped(model("cuda", "unsloth")):
+            raise RuntimeError
+    assert MEI._DECODING_DEPTH == 0
