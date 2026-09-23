@@ -570,3 +570,173 @@ def test_an_explicit_state_dict_is_saved_under_the_checkpoint_names(tmp_path):
     assert "layers.0.experts.3.w1.weight" in implicit
     assert explicit.keys() == implicit.keys()
     assert all(torch.equal(explicit[k], implicit[k]) for k in implicit)
+
+
+def _write_expert_shards(root, ckpt, files, prefix = "model.experts"):
+    """``files``: {filename: [checkpoint keys]}; every key of ``ckpt`` must be placed once."""
+    from safetensors.torch import save_file
+
+    tensors = {"model.other.weight": torch.ones(4, 4, dtype = torch.bfloat16)}
+    for w in ("w1", "w2", "w3"):
+        for e, (packed, scale) in enumerate(ckpt[w]):
+            tensors[f"{prefix}.{e}.{w}.weight_packed"] = packed
+            tensors[f"{prefix}.{e}.{w}.weight_scale"] = scale
+    placed = [k for keys in files.values() for k in keys]
+    assert sorted(placed) == sorted(tensors), set(tensors) ^ set(placed)
+    for filename, keys in files.items():
+        save_file({k: tensors[k] for k in keys}, os.path.join(root, filename), metadata = {"format": "pt"})
+    return list(files)
+
+
+def _stack_merge_reference(packed_model, ckpt):
+    """{checkpoint key: fp32 decode + the stack's PEFT delta} for every expert weight."""
+    deltas = {}
+    holder = packed_model.base_model.model.experts
+    while hasattr(holder, "base_layer"):
+        deltas[holder.parameter_name] = holder.get_delta_weight("default").float().cpu()
+        holder = holder.base_layer
+    want = {}
+    for e in range(E):
+        for w in ("w1", "w2", "w3"):
+            if w == "w2":
+                delta = deltas["down_proj"][e].t()
+            else:
+                delta = deltas["gate_up_proj"][e, :, slice(0, I) if w == "w1" else slice(I, 2 * I)].t()
+            want[f"model.experts.{e}.{w}.weight"] = (_ct_decompress(*ckpt[w][e]) + delta).to(torch.bfloat16)
+    return want
+
+
+def _read_shards(root, filenames):
+    from safetensors.torch import load_file
+
+    state = {}
+    for filename in filenames:
+        part = load_file(os.path.join(root, filename))
+        assert not state.keys() & part.keys()
+        state.update(part)
+    return state
+
+
+def _all_expert_keys(prefix = "model.experts"):
+    return [f"{prefix}.{e}.{w}.weight_{k}" for e in range(E) for w in ("w1", "w2", "w3") for k in ("packed", "scale")]
+
+
+def test_merged_16bit_rewrite_reads_scales_from_any_shard(tmp_path):
+    """A scale stored in another shard than its packed bytes (or in a shard with no packed
+    bytes at all) is still found and dropped, whatever order the shards are rewritten in."""
+    from unsloth_zoo.saving_utils import _dequantize_compressed_mxfp4_shards
+
+    packed_model, _ = _peft_pair()
+    ckpt = _checkpoint_bytes(0)
+    key = lambda e, w, kind: f"model.experts.{e}.{w}.weight_{kind}"  # noqa: E731
+    everything = lambda e: [key(e, w, k) for w in ("w1", "w2", "w3") for k in ("packed", "scale")]  # noqa: E731
+    files = {
+        "a.safetensors": ["model.other.weight", *everything(0), *everything(1), key(2, "w1", "scale")],
+        "b.safetensors": [k for k in everything(2) if k != key(2, "w1", "scale")] + [
+            k for e in range(3, E) for k in everything(e) if k != key(7, "w2", "scale")
+        ],
+        "c.safetensors": [key(7, "w2", "scale")],
+    }
+    filenames = _write_expert_shards(str(tmp_path), ckpt, files)
+    want = _stack_merge_reference(packed_model, ckpt)
+    _dequantize_compressed_mxfp4_shards(str(tmp_path), filenames, {}, packed_model)
+    state = _read_shards(str(tmp_path), filenames)
+    assert not any(k.endswith(("weight_packed", "weight_scale")) for k in state)
+    for k, v in want.items():
+        assert torch.equal(state[k], v), k
+
+
+def test_merged_16bit_rewrite_refuses_before_writing_a_shard(tmp_path):
+    from safetensors.torch import save_file
+    from unsloth_zoo.saving_utils import _dequantize_compressed_mxfp4_shards
+
+    packed_model, _ = _peft_pair()
+    ckpt = _checkpoint_bytes(0)
+    all_keys = _all_expert_keys()
+    # Expert 7's w3 is missing from the checkpoint: its LoRA has nowhere to go.
+    files = {"a.safetensors": ["model.other.weight"] + all_keys[: len(all_keys) // 2],
+             "b.safetensors": all_keys[len(all_keys) // 2 :]}
+    filenames = _write_expert_shards(str(tmp_path), ckpt, files)
+    save_file(
+        {k: v for k, v in _read_shards(str(tmp_path), ["b.safetensors"]).items() if ".7.w3." not in k},
+        str(tmp_path / "b.safetensors"), metadata = {"format": "pt"},
+    )
+    before = {f: (tmp_path / f).read_bytes() for f in filenames}
+    with pytest.raises(RuntimeError, match = "would drop it"):
+        _dequantize_compressed_mxfp4_shards(str(tmp_path), filenames, {}, packed_model)
+    assert {f: (tmp_path / f).read_bytes() for f in filenames} == before
+    # A later shard that is not MXFP4 refuses before the first one is rewritten either.
+    files = {"a.safetensors": ["model.other.weight"] + all_keys, "b.safetensors": []}
+    filenames = _write_expert_shards(str(tmp_path), ckpt, files)
+    save_file({"z.weight_packed": torch.zeros(4, 8, dtype = torch.int32),
+               "z.weight_scale": torch.zeros(4, 1)}, str(tmp_path / "b.safetensors"))
+    before = {f: (tmp_path / f).read_bytes() for f in filenames}
+    with pytest.raises(RuntimeError, match = "not an MXFP4 weight"):
+        _dequantize_compressed_mxfp4_shards(str(tmp_path), filenames, {}, packed_model)
+    assert {f: (tmp_path / f).read_bytes() for f in filenames} == before
+
+
+def test_merged_16bit_rewrite_keeps_an_adapter_merged_in_memory(tmp_path):
+    """After merge_adapter() the stacks' LoRA is in the in-memory weights only; the export rebuilds
+    the weights from the checkpoint, so it must fold that adapter in all the same."""
+    from unsloth_zoo.saving_utils import _dequantize_compressed_mxfp4_shards
+
+    packed_model, _ = _peft_pair()
+    ckpt = _checkpoint_bytes(0)
+    want = _stack_merge_reference(packed_model, ckpt)
+    filenames = _write_expert_shards(
+        str(tmp_path), ckpt, {"model.safetensors": ["model.other.weight"] + _all_expert_keys()}
+    )
+    with torch.no_grad():
+        packed_model.base_model.merge_adapter()
+    try:
+        _dequantize_compressed_mxfp4_shards(str(tmp_path), filenames, {}, packed_model)
+    finally:
+        packed_model.base_model.unmerge_adapter()
+    state = _read_shards(str(tmp_path), filenames)
+    for k, v in want.items():
+        assert torch.equal(state[k], v), k
+
+
+def test_merged_16bit_rewrite_computes_each_stacks_lora_per_shard(tmp_path, monkeypatch):
+    """The stacks' LoRA deltas are built as the shards that need them are rewritten, not all
+    up front (a real MoE's fp32 deltas do not fit in memory at once)."""
+    peft = pytest.importorskip("peft")
+    import unsloth_zoo.saving_utils as saving
+
+    mx.patch_peft_param_wrapper_mxfp4()
+    assert mu.patch_param_wrapper_for_moe()
+    body = nn.Module()
+    body.layers = nn.ModuleList([_Block(_experts(seed = i)[0]) for i in range(2)])
+    model = peft.get_peft_model(body, peft.LoraConfig(
+        r = 4, lora_alpha = 8, target_modules = [], target_parameters = ["experts.gate_up_proj"],
+    ))
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if "lora_B" in name:
+                param.normal_(0, 0.05)
+    events = []
+    real_replace = os.replace
+
+    def replace(a, b):
+        events.append(("write", os.path.basename(b)))
+        return real_replace(a, b)
+
+    monkeypatch.setattr(saving.os, "replace", replace)
+    for layer in (0, 1):
+        wrapper = model.base_model.model.layers[layer].experts
+        real = wrapper.get_delta_weight
+
+        def delta(adapter, real = real, layer = layer):
+            events.append(("delta", layer))
+            return real(adapter)
+
+        monkeypatch.setattr(wrapper, "get_delta_weight", delta)
+        prefix = f"model.layers.{layer}.experts"
+        _write_expert_shards(
+            str(tmp_path), _checkpoint_bytes(layer),
+            {"other.safetensors": ["model.other.weight"], f"l{layer}.safetensors": _all_expert_keys(prefix)},
+            prefix = prefix,
+        )
+    saving._dequantize_compressed_mxfp4_shards(str(tmp_path), ["l0.safetensors", "l1.safetensors"], {}, model)
+    assert events == [("delta", 0), ("write", "l0.safetensors"), ("delta", 1), ("write", "l1.safetensors")]

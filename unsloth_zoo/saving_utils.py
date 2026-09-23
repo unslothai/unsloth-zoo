@@ -3839,9 +3839,10 @@ def _compressed_packed_format(model_name, token = None):
 pass
 
 
-def _packed_expert_stack_deltas(model):
-    """``{experts path: (stack, {stack param: summed LoRA delta (E, in, out)}, [wrapper paths])}``
-    for every unsloth_zoo ``Mxfp4StackedExperts`` in ``model``, paths relative to the base model."""
+def _packed_expert_stacks(model):
+    """``{experts path: (stack, [(wrapper, stack param, [adapters])], [wrapper paths])}`` for every
+    unsloth_zoo ``Mxfp4StackedExperts`` in ``model``, paths relative to the base model. Adapters
+    already merged in memory count too: the export rebuilds the weights from the checkpoint."""
     inner = find_lora_base_model(model)
     stacks = {}
     for name, module in inner.named_modules():
@@ -3850,42 +3851,61 @@ def _packed_expert_stack_deltas(model):
         path = name
         while path.endswith(".base_layer"):
             path = path[: -len(".base_layer")]
-        deltas, wrappers, holder, holder_name = {}, [], inner.get_submodule(path), path
+        loras, wrappers, holder, holder_name = [], [], inner.get_submodule(path), path
         while holder is not module:
             parameter = getattr(holder, "parameter_name", None)
             if parameter is not None and hasattr(holder, "lora_A"):
                 wrappers.append(holder_name)
-                for adapter in getattr(holder, "active_adapters", None) or []:
-                    if adapter not in holder.lora_A or adapter in getattr(holder, "merged_adapters", ()):
-                        continue
-                    delta = holder.get_delta_weight(adapter).detach().float()
-                    deltas[parameter] = deltas[parameter] + delta if parameter in deltas else delta
+                adapters = list(getattr(holder, "active_adapters", None) or [])
+                adapters += list(getattr(holder, "merged_adapters", None) or [])
+                adapters = [a for a in dict.fromkeys(adapters) if a in holder.lora_A]
+                if adapters:
+                    loras.append((holder, parameter, adapters))
             holder, holder_name = holder.base_layer, holder_name + ".base_layer"
-        stacks[path] = (module, deltas, wrappers)
+        stacks[path] = (module, loras, wrappers)
     return stacks
 pass
 
 
-def _expert_delta_for(base_key, stacks, placed):
-    """The LoRA delta ``(out, in)`` of the checkpoint Linear ``<prefix>.experts.<i>.w1|w2|w3`` from
-    its packed stack, or None when it has none."""
+def _expert_target(base_key, stacks):
+    """``(stack path, expert index, "w1" | "w2" | "w3")`` of the checkpoint Linear
+    ``<prefix>.experts.<i>.w1|w2|w3`` when a packed stack holds it, else None."""
     match = re.match(r"^(.*\.experts)\.(\d+)\.(w[123])$", base_key)
     if match is None:
         return None
-    prefix, index, proj = match.group(1), int(match.group(2)), match.group(3)
-    for path, (stack, deltas, _) in stacks.items():
-        if not (path == prefix or path.endswith("." + prefix) or prefix.endswith("." + path)):
-            continue
-        placed.add(path)
-        inter = stack.intermediate_size
-        if proj == "w2":
-            delta = deltas.get("down_proj")
-            return None if delta is None else delta[index].t()
-        delta = deltas.get("gate_up_proj")
-        if delta is None:
-            return None
-        return (delta[index, :, :inter] if proj == "w1" else delta[index, :, inter:]).t()
+    prefix = match.group(1)
+    for path in stacks:
+        if path == prefix or path.endswith("." + prefix) or prefix.endswith("." + path):
+            return path, int(match.group(2)), match.group(3)
     return None
+pass
+
+
+def _stack_parameter(proj):
+    return "down_proj" if proj == "w2" else "gate_up_proj"
+pass
+
+
+def _stack_lora_delta(loras, parameter):
+    """The summed LoRA delta ``(E, in, out)`` of one stack parameter, in fp32 on the CPU (it is
+    built on the adapters' device, one parameter at a time)."""
+    total = None
+    for holder, name, adapters in loras:
+        if name != parameter:
+            continue
+        for adapter in adapters:
+            delta = holder.get_delta_weight(adapter).detach().float()
+            total = delta if total is None else total + delta
+    return None if total is None else total.cpu()
+pass
+
+
+def _expert_slice(delta, stack, index, proj):
+    """``(out, in)`` of one expert's projection from a stack delta ``(E, in, out)``."""
+    if proj == "w2":
+        return delta[index].t()
+    inter = stack.intermediate_size
+    return (delta[index, :, :inter] if proj == "w1" else delta[index, :, inter:]).t()
 pass
 
 
@@ -3893,72 +3913,119 @@ pass
 def _dequantize_compressed_mxfp4_shards(save_directory, filenames, lora_weights, model, output_dtype = None):
     """Rewrite every staged shard so each MXFP4 ``weight_packed`` / ``weight_scale`` pair is the
     exact 16-bit ``weight`` (plus the packed expert stacks' LoRA), and drop the stacks' LoRA from
-    ``lora_weights`` so nothing merges them twice."""
+    ``lora_weights`` so nothing merges them twice. Everything that can refuse is checked before
+    the first shard is rewritten; scales stored in another shard than their packed bytes are read
+    up front, so the shards can be rewritten in any order."""
     from .mxfp4_dequant import mxfp4_dequantize_torch
 
     dtype = output_dtype or torch.bfloat16
     device = _active_merge_device()
-    stacks = _packed_expert_stack_deltas(model)
-    locations = {}
+    stacks = _packed_expert_stacks(model)
+    locations, shapes, dtypes, keys_of = {}, {}, {}, {}
     for filename in filenames:
         with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
-            for key in f.keys():
+            keys_of[filename] = list(f.keys())
+            for key in keys_of[filename]:
                 locations[key] = filename
+                if key.endswith((".weight_packed", ".weight_scale")):
+                    view = f.get_slice(key)
+                    shapes[key], dtypes[key] = tuple(view.get_shape()), view.get_dtype()
     packed_bases = {k[: -len(".weight_packed")] for k in locations if k.endswith(".weight_packed")}
 
-    def read(key):
-        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
-            return f.get_tensor(key)
-
-    placed = set()
-    for filename in filenames:
-        path = os.path.join(save_directory, filename)
-        with safe_open(path, framework = "pt", device = "cpu") as f:
-            metadata = f.metadata() or {"format": "pt"}
-            keys = list(f.keys())
-        if not any(k.endswith(".weight_packed") for k in keys):
-            continue
-        tensors = {}
-        for key in keys:
-            base, _, suffix = key.rpartition(".")
-            if base in packed_bases and suffix in ("weight_scale", "weight_shape"):
-                continue
-            if suffix != "weight_packed":
-                tensors[key] = read(key)
-                continue
-            packed = read(key)
-            scale_key = base + ".weight_scale"
-            scale = read(scale_key) if scale_key in locations else None
-            if (
-                scale is None or packed.dtype != torch.uint8 or scale.dtype != torch.uint8
-                or packed.dim() != 2 or scale.shape != (packed.shape[0], packed.shape[1] // 16)
-            ):
-                raise RuntimeError(
-                    f"Unsloth: `{key}` is not an MXFP4 weight (uint8 [out, in / 2] with a uint8 "
-                    "[out, in / 32] scale), so the merged_16bit export cannot decode it. Nothing "
-                    "was merged."
-                )
-            out_features = packed.shape[0]
-            weight = mxfp4_dequantize_torch(
-                packed.to(device).view(out_features, -1, 16), scale.to(device), dtype = torch.float32,
-            ).reshape(out_features, -1)
-            delta = _expert_delta_for(base, stacks, placed)
-            if delta is not None:
-                if tuple(delta.shape) != tuple(weight.shape):
-                    raise RuntimeError(
-                        f"Unsloth: the expert LoRA for `{base}` is {tuple(delta.shape)} but the "
-                        f"checkpoint weight is {tuple(weight.shape)}. Nothing was merged."
-                    )
-                weight = weight + delta.to(weight.device)
-            tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
-        save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
-        os.replace(path + ".unsloth_tmp", path)
-    unplaced = sorted(p for p, (_, deltas, _) in stacks.items() if deltas and p not in placed)
+    targets = {}
+    for base in sorted(packed_bases):
+        packed_shape, scale_key = shapes[base + ".weight_packed"], base + ".weight_scale"
+        if (
+            scale_key not in locations
+            or dtypes[base + ".weight_packed"] != "U8" or dtypes[scale_key] != "U8"
+            or len(packed_shape) != 2 or shapes[scale_key] != (packed_shape[0], packed_shape[1] // 16)
+        ):
+            raise RuntimeError(
+                f"Unsloth: `{base}.weight_packed` is not an MXFP4 weight (uint8 [out, in / 2] with a "
+                "uint8 [out, in / 32] scale), so the merged_16bit export cannot decode it. Nothing "
+                "was merged."
+            )
+        target = _expert_target(base, stacks)
+        if target is not None:
+            targets[base] = target
+    # Every expert projection a stack's LoRA covers must be a packed weight of the checkpoint.
+    needed = {
+        (path, index, proj)
+        for path, (stack, loras, _) in stacks.items()
+        for parameter in {name for _, name, _ in loras}
+        for proj in (("w2",) if parameter == "down_proj" else ("w1", "w3"))
+        for index in range(stack.num_experts)
+    }
+    unplaced = sorted({path for path, _, _ in needed - set(targets.values())})
     if unplaced:
         raise RuntimeError(
             f"Unsloth: the expert LoRA of {unplaced} has no matching `experts.<i>.w1 / w2 / w3` "
             "weights in the base checkpoint, so the merged export would drop it. Nothing was merged."
         )
+    for base, (path, index, proj) in targets.items():
+        stack = stacks[path][0]
+        want = (stack.intermediate_size, stack.hidden_size)
+        want = want[::-1] if proj == "w2" else want
+        packed_shape = shapes[base + ".weight_packed"]
+        if (path, index, proj) in needed and (packed_shape[0], packed_shape[1] * 2) != want:
+            raise RuntimeError(
+                f"Unsloth: the expert LoRA for `{base}` is {want} but the checkpoint weight is "
+                f"{(packed_shape[0], packed_shape[1] * 2)}. Nothing was merged."
+            )
+
+    def read(key):
+        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
+            return f.get_tensor(key)
+
+    elsewhere = {
+        base + ".weight_scale": read(base + ".weight_scale")
+        for base in packed_bases
+        if locations[base + ".weight_scale"] != locations[base + ".weight_packed"]
+    }
+    def dropped(key):
+        base, _, suffix = key.rpartition(".")
+        return base in packed_bases and suffix in ("weight_scale", "weight_shape")
+
+    deltas = {}
+    for filename in filenames:
+        keys = keys_of[filename]
+        if not any(k.endswith(".weight_packed") or dropped(k) for k in keys):
+            continue
+        # Only the stack deltas this shard needs are kept, each built when first needed.
+        bases = [k[: -len(".weight_packed")] for k in keys if k.endswith(".weight_packed")]
+        now = {(targets[b][0], _stack_parameter(targets[b][2])) for b in bases if b in targets}
+        for stale in [k for k in deltas if k not in now]:
+            del deltas[stale]
+        path = os.path.join(save_directory, filename)
+        tensors = {}
+        with safe_open(path, framework = "pt", device = "cpu") as f:
+            metadata = f.metadata() or {"format": "pt"}
+            for key in keys:
+                base, _, suffix = key.rpartition(".")
+                if dropped(key):
+                    continue
+                if suffix != "weight_packed":
+                    tensors[key] = f.get_tensor(key)
+                    continue
+                packed = f.get_tensor(key)
+                scale_key = base + ".weight_scale"
+                scale = elsewhere[scale_key] if scale_key in elsewhere else f.get_tensor(scale_key)
+                out_features = packed.shape[0]
+                weight = mxfp4_dequantize_torch(
+                    packed.to(device).view(out_features, -1, 16), scale.to(device), dtype = torch.float32,
+                ).reshape(out_features, -1)
+                target = targets.get(base)
+                if target is not None:
+                    stack_path, index, proj = target
+                    cache_key = (stack_path, _stack_parameter(proj))
+                    if cache_key not in deltas:
+                        deltas[cache_key] = _stack_lora_delta(stacks[stack_path][1], cache_key[1])
+                    if deltas[cache_key] is not None:
+                        delta = _expert_slice(deltas[cache_key], stacks[stack_path][0], index, proj)
+                        weight = weight + delta.to(weight.device)
+                tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+        save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+        os.replace(path + ".unsloth_tmp", path)
     for _, (_, _, wrappers) in stacks.items():
         for wrapper in wrappers:
             lora_weights.pop(wrapper, None)
