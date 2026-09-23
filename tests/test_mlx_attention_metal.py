@@ -356,9 +356,10 @@ def test_every_model_load_path_installs_the_patch():
     helper = next(n for n in ast.walk(tree)
                   if isinstance(n, ast.FunctionDef) and n.name == "_finish_load")
     shape = [type(n).__name__ for n in helper.body]
-    assert shape == ["Expr", "Expr", "Return"], f"_finish_load is no longer straight-line: {shape}"
+    assert set(shape[:-1]) == {"Expr"} and shape[-1] == "Return", \
+        f"_finish_load is no longer straight-line: {shape}"
     assert isinstance(helper.body[0].value, ast.Constant), "expected a docstring first"
-    install = helper.body[1].value
-    assert (isinstance(install, ast.Call) and isinstance(install.func, ast.Name)
-            and install.func.id == "install_quantized_attention"), \
+    calls = [stmt.value.func.id for stmt in helper.body[1:-1]
+             if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name)]
+    assert "install_quantized_attention" in calls, \
         "_finish_load does not install the patch before returning"

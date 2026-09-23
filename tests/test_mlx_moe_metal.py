@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import functools
+import gc
 import sys
 import threading
 from types import FunctionType, SimpleNamespace
@@ -155,6 +156,96 @@ def test_nested_scopes_restore_all_modules_after_exception(native):
         assert type(module) is native.SwitchGLU
         assert set(module.__dict__) == keys
         _equal(module(x, indices), answer)
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_that_fails_partway_leaves_every_module_native(native, monkeypatch):
+    """A refused scope must put back the modules it had already patched."""
+    first, second = _model(native), _model(native)
+    root = nn.Sequential(first, second)
+    root.eval()
+    before = [set(module.__dict__) for module in (first, second)]
+    x, indices = _sample()
+    expected = [module(x, indices) for module in (first, second)]
+    mx.eval(expected)
+
+    native_init, built = fusion._PackedMoEGateUp.__init__, []
+
+    def refuse_the_second(self, module):
+        built.append(module)
+        if len(built) > 1:
+            raise RuntimeError("injected: no headroom")
+        native_init(self, module)
+
+    monkeypatch.setattr(fusion._PackedMoEGateUp, "__init__", refuse_the_second)
+    with pytest.raises(RuntimeError, match = "injected"):
+        with fused_moe_gate_up(root):
+            pass  # pragma: no cover
+    assert len(built) == 2
+    for module, keys, answer in zip((first, second), before, expected):
+        assert type(module) is native.SwitchGLU
+        assert set(module.__dict__) == keys
+        _equal(module(x, indices), answer)
+
+
+def _cache_limit():
+    current = mx.set_cache_limit(0)
+    mx.set_cache_limit(current)
+    return current
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_retains_nothing_it_replaces(native, monkeypatch):
+    """Cached rather than returned, the replaced arrays are a second copy of the packed half of
+    the model."""
+    modules = [_model(native) for _ in range(4)]
+    root = nn.Sequential(*modules)
+    root.eval()
+    one_layer = max(
+        sum(module.gate_proj[name].nbytes + module.up_proj[name].nbytes
+            for name in fusion._MOE_PROJECTION_FIELDS if module.gate_proj.get(name) is not None)
+        for module in modules
+    )
+
+    footprints = []
+    attach = fusion._PackedMoEGateUp.attach
+
+    def record(self):
+        attach(self)
+        footprints.append(mx.get_active_memory() + mx.get_cache_memory())
+
+    monkeypatch.setattr(fusion._PackedMoEGateUp, "attach", record)
+    gc.collect()
+    mx.clear_cache()
+    # room for every layer, so no inherited limit explains a flat footprint
+    previous_limit = mx.set_cache_limit(8 * one_layer)
+    try:
+        before = mx.get_active_memory() + mx.get_cache_memory()
+        with fused_moe_gate_up(root):
+            end = mx.get_active_memory() + mx.get_cache_memory()
+            fused = [type(module) for module in modules]
+    finally:
+        mx.set_cache_limit(previous_limit)
+
+    assert all(cls is not native.SwitchGLU for cls in fused)
+    assert len(footprints) == len(modules)
+    assert [footprint - before for footprint in footprints] == [0] * len(modules)
+    assert end == before
+
+
+@pytest.mark.parametrize("native", [lm, vlm])
+def test_packing_restores_the_cache_limit_it_borrowed(native):
+    """Process-global: left at zero it would stop MLX reusing any buffer at all."""
+    root = nn.Sequential(_model(native))
+    root.eval()
+    borrowed = 8 << 20
+    previous_limit = mx.set_cache_limit(borrowed)
+    try:
+        with fused_moe_gate_up(root):
+            assert _cache_limit() == borrowed
+        assert _cache_limit() == borrowed
+    finally:
+        mx.set_cache_limit(previous_limit)
 
 
 @pytest.mark.parametrize("native", [lm, vlm])
@@ -445,6 +536,36 @@ def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
             partitions.clear()
             _check(block, samples)
             assert not partitions
+
+
+@pytest.mark.parametrize("native", [vlm_gemma, lm_gemma])
+def test_router_packing_that_fails_partway_leaves_every_module_native(native, monkeypatch):
+    """The router holds the same contract as the gate/up pack, through its own cleanup: it
+    builds a norm scale per Gemma module after swapping the class, so it too can fail with
+    modules already patched."""
+    first, second = _router(native), _router(native)
+    root = nn.Sequential(first, second)
+    root.eval()
+    before = [set(module.__dict__) for module in (first, second)]
+    samples = [_routing_samples(module) for module in (first, second)]
+
+    native_init, built = fusion._RouterNormScale.__init__, []
+
+    def refuse_the_second(self, module):
+        built.append(module)
+        if len(built) > 1:
+            raise RuntimeError("injected: no headroom")
+        native_init(self, module)
+
+    monkeypatch.setattr(fusion._RouterNormScale, "__init__", refuse_the_second)
+    with pytest.raises(RuntimeError, match = "injected"):
+        with fusion.fused_moe_router(root):
+            pass  # pragma: no cover
+    assert len(built) == 2
+    for module, keys, pairs in zip((first, second), before, samples):
+        assert type(module) is native.Router
+        assert set(module.__dict__) == keys
+        _check(module, pairs)
 
 
 @pytest.mark.parametrize("native, scale_dtype", [(vlm_gemma, mx.bfloat16), (lm_gemma, mx.float32)])

@@ -690,6 +690,64 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
     assert plan.prepare_cce_batch(1, batch) is batch
 
 
+@metal_only
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 7.0])
+def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compiled, softcap):
+    import gc
+    from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx.cce.runtime_cce import make_chunked_cross_entropy_loss
+
+    stored, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(runtime_cce, "_forward_with_hidden_gradient",
+                        lambda *args, **kwargs: (out := forward(*args, **kwargs), stored.append(out[1].dtype))[0])
+
+    mx.random.seed(719)
+    hidden = (mx.random.normal((256, 128)) * 0.2).astype(mx.bfloat16)
+    weight = (mx.random.normal((8192, 128)) * 0.1).astype(mx.bfloat16)
+    targets = mx.where(mx.arange(256) % 5 == 0, -100, mx.arange(256) * 29)
+    cotangent = mx.where(mx.arange(256) % 2 == 0, 1.0, -0.5)
+    mx.eval(hidden, weight, targets, cotangent)
+    functions = []
+    for frozen, precompute in ((False, False), (True, False), (True, True)):
+        runtime, _ = make_chunked_cross_entropy_loss(
+            chunk_size=2048, weight_is_frozen=frozen, logit_softcap=softcap,
+            precompute_hidden_gradient=precompute,
+        )
+        def loss(h, runtime=runtime):
+            return (runtime(h, weight, targets) * cotangent).sum()
+        grad = mx.value_and_grad(loss)
+        functions.append(mx.compile(grad) if compiled else grad)
+    expected, actual, precomputed = [fn(hidden) for fn in functions]
+    reference, _ = make_chunked_cross_entropy_loss(chunk_size=2048, logit_softcap=softcap)
+    exact = mx.grad(lambda h: (reference(h, weight.astype(mx.float32), targets) * cotangent).sum())(
+        hidden.astype(mx.float32)
+    )
+    mx.eval(expected, actual, precomputed, exact)
+    for left, right in zip(expected, actual):
+        assert mx.array_equal(left, right).item()
+    assert mx.array_equal(precomputed[0], expected[0]).item()
+    assert mx.allclose(precomputed[1].astype(mx.float32), exact, atol=2e-3, rtol=0).item()
+    # Held until the backward, the gradient is stored at the hidden dtype.
+    assert stored == [mx.bfloat16]
+    assert mx.all(actual[1][::5] == 0).item()
+    assert mx.any(actual[1][1:] > 0).item() and mx.any(actual[1][1:] < 0).item()
+    del expected, actual, precomputed, exact, left, right
+    # Head-only peaks cover the release; precomputing saves memory only across a compiled model step.
+    peaks = []
+    for fn in functions[:2]:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        result = fn(hidden)
+        mx.eval(result)
+        peaks.append(mx.get_peak_memory() - resident)
+        del result
+    assert peaks[1] < peaks[0]
+
+
 def _norm_model(seed=77, dtype=None):
     class _TinyLM(nn.Module):
         def __init__(self):
@@ -1880,6 +1938,29 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
     # supervised one to a value computed outside the loss.
     expected = nn.losses.cross_entropy(logits, ids[:, 1:]).mean()
     assert mx.allclose(baseline(wrapped, ids, lengths)[0], expected)
+
+
+@metal_only
+def test_cce_loss_precomputes_the_hidden_gradient_only_in_training(monkeypatch):
+    from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx.utils import make_cce_loss_fn
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    ids = mx.array([tokenizer.encode("the capital of France is Paris")])
+    lengths = mx.array([[0, ids.shape[1]]], dtype=mx.int32)
+    calls, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(
+        runtime_cce, "_forward_with_hidden_gradient",
+        lambda *args, **kwargs: (calls.append(model.training), forward(*args, **kwargs))[1],
+    )
+    loss_fn = make_cce_loss_fn(model)
+    losses = []
+    for training in (True, False):
+        model.train(training)
+        losses.append(loss_fn(model, ids, lengths)[0])
+    mx.eval(losses)
+    assert calls == [True]
+    assert mx.array_equal(*losses).item()
 
 
 @metal_only

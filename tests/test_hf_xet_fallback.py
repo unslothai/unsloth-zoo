@@ -246,26 +246,51 @@ def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
     (blobs / "child.incomplete").write_bytes(b"\0" * 2048)   # constant
 
     grow_stop = threading.Event()
+    writes: list[float] = []
 
     def _grow():
         size = 1024
         while not grow_stop.wait(0.05):
             size += 4096
             sibling.write_bytes(b"\0" * size)
+            writes.append(time.monotonic())
 
     grower = threading.Thread(target = _grow, daemon = True)
     grower.start()
 
+    # A stall is no growth for stall_timeout, so the claim needs the sibling to keep growing with no
+    # gap that long. On a loaded xdist runner a 0.5 s timeout against a 0.05 s grower was a coin
+    # flip: a starved grower is a real stall, and the watchdog was right to fire. 1.5 s leaves a
+    # thirty-fold margin, and the gap check below says which of the two happened.
+    stall_timeout = 1.5
     calls: list[str] = []
+    started = time.monotonic()
+    before = set(threading.enumerate())
     stop = xf.start_watchdog(   # default: repo-wide (watch_new_partials_only = False)
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5,
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = stall_timeout,
     )
+    watchdog = [t for t in threading.enumerate() if t not in before and t.name == "hf-xet-watchdog"]
+    assert len(watchdog) == 1, f"expected one new watchdog thread, found {watchdog}"
     try:
-        time.sleep(1.0)   # past stall_timeout, but repo-wide bytes keep growing
-        assert calls == [], "repo-wide watchdog should be reset by the growing sibling"
+        time.sleep(stall_timeout + 0.5)   # past stall_timeout, but repo-wide bytes keep growing
     finally:
         stop.set()
+        # Joined, not just signalled: stop.wait() can return and the thread be preempted mid-tick, so
+        # a callback could still land after the signal. The timestamp follows the join, so the
+        # measured interval covers everything the watchdog saw.
+        watchdog[0].join(timeout = 10)
+        stopped = time.monotonic()
         grow_stop.set()
+        grower.join(timeout = 5)
+    assert not watchdog[0].is_alive(), "the watchdog thread did not stop"
+    # Through the moment the watchdog stopped: a grower starved after its last write leaves a
+    # trailing gap the watchdog saw too.
+    marks = [started] + [w for w in writes if w < stopped] + [stopped]
+    gap = max(b - a for a, b in zip(marks, marks[1:]))
+    assert gap < stall_timeout, (
+        f"the sibling went {gap:.2f}s without growing, so this run never tested the claim"
+    )
+    assert calls == [], "repo-wide watchdog should be reset by the growing sibling"
 
 
 def test_file_watchdog_ignores_baseline_only_partials(hf_cache):

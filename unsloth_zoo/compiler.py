@@ -178,6 +178,14 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_window_index",
     "get_vision_interpolation_indices_and_weights",
     "get_vision_bilinear_indices_and_weights",
+
+    # Locally defined grid helpers get their own compile decorators. Listing them
+    # disables helper compilation and allows graph breaks in their callers.
+    # Keep temporal_merge_index listed: it fails on supported torch 2.9.1 even
+    # though it traces on 2.10.0 and 2.13.0.
+    "get_vision_pixel_shuffle_index",   # muse_glimmer
+    "get_vision_frame_index",           # kimi_k25
+    "get_vision_temporal_merge_index",  # kimi_k25
 ]
 
 

@@ -47,6 +47,24 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.fixture(autouse = True)
+def _no_cached_gguf(monkeypatch):
+    """Drop any `gguf` an earlier test in this worker imported.
+
+    Every assertion here turns on what this process would import, which
+    `_trusted_gguf_tree` asks through `_importing_gguf_tree` -> `find_spec`. That
+    consults `sys.modules` before it ever looks at `sys.path`, so a `gguf` already
+    imported anywhere in the run keeps naming itself and the trees these tests plant
+    are refused no matter where they sit. Run alone the file passes, because nothing
+    has imported one yet; in the full suite it does not. The prepended tree being the
+    one that resolves is the precondition, so state it rather than inherit whichever
+    tests happened to run first.
+    """
+    monkeypatch.delitem(sys.modules, "gguf", raising = False)
+    for cached in [name for name in sys.modules if name.startswith("gguf.")]:
+        monkeypatch.delitem(sys.modules, cached, raising = False)
+
+
 @pytest.fixture(scope = "module")
 def llama_cpp():
     """Loaded by path: importing the package would run its device detection."""

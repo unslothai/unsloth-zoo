@@ -277,6 +277,17 @@ def _fused_moe_gate_up_class(original_class, projection_type, gather_sort, scatt
 
 
 @contextmanager
+def _uncached_allocations():
+    """Free buffers to the driver: a pack replaces two arrays with one of their combined size,
+    which neither freed buffer can serve, so cached they only accumulate."""
+    previous_limit = mx.set_cache_limit(0)
+    try:
+        yield
+    finally:
+        mx.set_cache_limit(previous_limit)
+
+
+@contextmanager
 def fused_moe_gate_up(model):
     """Fuse quantized MoE gate and up projections while their weights stay fixed.
 
@@ -285,7 +296,7 @@ def fused_moe_gate_up(model):
     """
     patched = []
     try:
-        with _MOE_GATE_UP_LOCK:
+        with _MOE_GATE_UP_LOCK, _uncached_allocations():
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 specs = _moe_switch_specs()
                 modules = model.named_modules() if hasattr(model, "named_modules") else ()
