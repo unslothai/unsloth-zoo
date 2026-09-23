@@ -108,18 +108,35 @@ def patch_mxfp4_offload_guard():
     except Exception:
         return
     original = getattr(modeling_utils, "_get_device_map", None)
-    if original is None or getattr(original, "_unsloth_mxfp4_patched", False):
+    if original is not None and not getattr(original, "_unsloth_mxfp4_patched", False):
+
+        @functools.wraps(original)
+        def _get_device_map(*args, **kwargs):
+            device_map = original(*args, **kwargs)
+            values = device_map.values() if isinstance(device_map, dict) else ()
+            _LOAD_OFFLOADS[0] = any(str(value) in ("cpu", "disk") for value in values)
+            return device_map
+
+        _get_device_map._unsloth_mxfp4_patched = True
+        modeling_utils._get_device_map = _get_device_map
+
+    # _get_device_map only runs for a load given a device map, so the flag is cleared where
+    # every MXFP4 load passes first: the quantizer's environment check, before any weight.
+    try:
+        from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
+    except Exception:
+        return
+    validate = Mxfp4HfQuantizer.validate_environment
+    if getattr(validate, "_unsloth_mxfp4_patched", False):
         return
 
-    @functools.wraps(original)
-    def _get_device_map(*args, **kwargs):
-        device_map = original(*args, **kwargs)
-        values = device_map.values() if isinstance(device_map, dict) else ()
-        _LOAD_OFFLOADS[0] = any(str(value) in ("cpu", "disk") for value in values)
-        return device_map
+    @functools.wraps(validate)
+    def validate_environment(self, *args, **kwargs):
+        _LOAD_OFFLOADS[0] = False
+        return validate(self, *args, **kwargs)
 
-    _get_device_map._unsloth_mxfp4_patched = True
-    modeling_utils._get_device_map = _get_device_map
+    validate_environment._unsloth_mxfp4_patched = True
+    Mxfp4HfQuantizer.validate_environment = validate_environment
 pass
 TEMPORARY_PATCHES.append(patch_mxfp4_offload_guard)
 

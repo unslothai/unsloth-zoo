@@ -572,3 +572,14 @@ def test_module_moves_to_and_from_meta_keep_the_packed_param():
     assert module.w.mxfp4_scales.is_meta and tuple(module.w._original_shape) == tuple(want.shape)
     detached = Mxfp4ExpertParam(blocks, mxfp4_scales = scales).detach()
     assert isinstance(detached, Mxfp4ExpertParam) and torch.equal(detached.dequantize(), want)
+
+
+@pytest.mark.skipif(not TRANSFORMERS_5, reason = "packing is transformers 5 only")
+def test_a_later_load_without_a_device_map_clears_the_offload_flag(monkeypatch):
+    from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
+
+    monkeypatch.setattr(Mxfp4HfQuantizer, "validate_environment", lambda self, *a, **k: None)
+    mx.patch_mxfp4_offload_guard()
+    monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [True])   # left by an earlier offloaded load
+    Mxfp4HfQuantizer.validate_environment(object.__new__(Mxfp4HfQuantizer), device_map = None)
+    assert mx._LOAD_OFFLOADS[0] is False
