@@ -1075,6 +1075,19 @@ def _experts_are_fp4(module) -> bool:
     return getattr(getattr(module, "config", None), "expert_dtype", "fp8") == "fp4"
 
 
+def _experts_are_expert_parallel(module) -> bool:
+    """Expert parallelism routes non-local slots to a `num_experts` sentinel that only
+    transformers' own implementations mask; the FP8 backends here would index with it."""
+    try:
+        from .moe_experts_interface import _expert_parallel_requested
+    except Exception:
+        return False
+    try:
+        return bool(_expert_parallel_requested(module))
+    except Exception:
+        return False
+
+
 def patch_fp8_experts_interface():
     try:
         from transformers.integrations.finegrained_fp8 import ALL_FP8_EXPERTS_FUNCTIONS
@@ -1087,10 +1100,15 @@ def patch_fp8_experts_interface():
 
     def _dispatch_for(original):
         def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
-            # FP4-packed experts (config.expert_dtype = "fp4", two values per int8) and ungated
-            # ones (has_gate = False: up_proj only, e.g. Nemotron-H) are not something the FP8
-            # backends handle; they keep transformers' own path.
-            if _experts_are_fp4(self) or getattr(self, "has_gate", True) is False:
+            # FP4-packed experts (config.expert_dtype = "fp4", two values per int8), ungated
+            # ones (has_gate = False: up_proj only, e.g. Nemotron-H) and expert-parallel ones
+            # (sentinel-masked routing) are not something the FP8 backends handle; they keep
+            # transformers' own path.
+            if (
+                _experts_are_fp4(self)
+                or getattr(self, "has_gate", True) is False
+                or _experts_are_expert_parallel(self)
+            ):
                 if original is not None:
                     return original(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
                 # replace_with_fp8_linear re-decorates the shared FP8Experts class for every layer,

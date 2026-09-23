@@ -363,3 +363,33 @@ def test_a_runtime_switch_is_refused_once_experts_are_packed_4bit():
         getter(model(True), "grouped_mm")
     assert getter(model(True), None) == UNSLOTH_EXPERTS_IMPLEMENTATION
     assert getter(model(False), "grouped_mm") == "grouped_mm"
+
+
+def test_expert_parallel_fp8_experts_keep_transformers_path(monkeypatch):
+    # Under expert parallelism the routing carries a num_experts sentinel that only transformers'
+    # implementations mask; the FP8 registry must not send those experts to the Unsloth backend.
+    fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
+    from unsloth_zoo.temporary_patches import moe_utils_fp8
+
+    moe_utils_fp8.patch_fp8_experts_interface()
+    calls = []
+    monkeypatch.setattr(moe_utils_fp8, "forward_moe_backend_fp8", lambda *a: calls.append("unsloth") or "unsloth")
+
+    class Experts:
+        def forward(self, *a):
+            raise AssertionError("dispatched forward")
+        forward.__wrapped__ = lambda self, *a: calls.append("eager") or "eager"
+
+    forward = fp8.ALL_FP8_EXPERTS_FUNCTIONS.get_interface("unsloth", None)
+    experts = Experts()
+    experts.config = types.SimpleNamespace(
+        expert_dtype = "fp8",
+        distributed_config = types.SimpleNamespace(enable_expert_parallel = True),
+    )
+    assert forward(experts, "h", "i", "w") == "eager"
+    experts.config = types.SimpleNamespace(
+        expert_dtype = "fp8",
+        distributed_config = types.SimpleNamespace(enable_expert_parallel = False),
+    )
+    assert forward(experts, "h", "i", "w") == "unsloth"
+    assert calls == ["eager", "unsloth"]
