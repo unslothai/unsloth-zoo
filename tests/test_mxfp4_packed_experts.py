@@ -437,6 +437,36 @@ def test_merge_and_unmerge(grouped_mm_device):
         assert torch.equal(a, b)
 
 
+def test_unmerge_after_a_model_move_restores_on_the_current_device(grouped_mm_device):
+    # The packed stack saved at merge() is outside the module; unmerge after model.to() must put
+    # it (and its scales) where the model now is, not where it was.
+    packed_model, _ = _peft_pair(grouped_mm_device)
+    base = packed_model.base_model.model.experts
+    while hasattr(base, "base_layer"):
+        base = base.base_layer
+    want = {n: getattr(base, n).dequantize() for n in ("gate_up_proj", "down_proj")}
+    packed_model.base_model.merge_adapter()
+    packed_model.to("meta")
+    packed_model.base_model.unmerge_adapter()
+    for name in want:
+        param = getattr(base, name)
+        assert isinstance(param, Mxfp4ExpertParam)
+        assert param.is_meta and param.mxfp4_scales.is_meta
+    if grouped_mm_device == "cuda":
+        packed_model, _ = _peft_pair(grouped_mm_device)
+        base = packed_model.base_model.model.experts
+        while hasattr(base, "base_layer"):
+            base = base.base_layer
+        packed_model.base_model.merge_adapter()
+        packed_model.to("cpu")
+        packed_model.base_model.unmerge_adapter()
+        for name in want:
+            param = getattr(base, name)
+            assert param.device.type == "cpu"
+            # Scales follow the blocks lazily on the next dequantize.
+            assert torch.equal(param.dequantize(), want[name].cpu())
+
+
 def _tiny_gpt_oss(device):
     transformers = pytest.importorskip("transformers")
     if not hasattr(transformers, "GptOssConfig"):

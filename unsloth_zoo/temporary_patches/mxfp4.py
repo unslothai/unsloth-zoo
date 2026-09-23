@@ -252,7 +252,15 @@ def patch_peft_param_wrapper_mxfp4():
         packed = self.__dict__.get("_unsloth_mxfp4_packed", {}).pop(self.parameter_name, None)
         if packed is None:
             return original_unmerge(self)
-        setattr(self.get_base_layer(), self.parameter_name, packed)
+        base_layer = self.get_base_layer()
+        current = getattr(base_layer, self.parameter_name, None)
+        if current is not None and current.device != packed.device:
+            # The saved stack sits outside the module, so a model move since merge() left it
+            # behind; move it (blocks and scales) the way a module move would.
+            holder = nn.Module()
+            holder.param = packed
+            packed = holder.to(current.device).param
+        setattr(base_layer, self.parameter_name, packed)
         self.merged_adapters.clear()
 
     get_param._unsloth_mxfp4_patched = True
