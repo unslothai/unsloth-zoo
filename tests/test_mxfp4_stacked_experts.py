@@ -448,3 +448,13 @@ def test_compressed_packed_format_detection(tmp_path):
                   "config_groups": {"g": group()}}) is None
     assert write({"quant_method": "bitsandbytes", "load_in_4bit": True}) is None
     assert write(None) is None
+
+
+def test_merged_exports_still_run_under_inference_mode():
+    """The compressed-tensors helpers sit above `merge_and_overwrite_lora`: its decorator must
+    stay on it, not move onto the first helper."""
+    import inspect
+    from unsloth_zoo import saving_utils
+
+    assert inspect.unwrap(saving_utils.merge_and_overwrite_lora) is not saving_utils.merge_and_overwrite_lora
+    assert inspect.unwrap(saving_utils._compressed_packed_format) is saving_utils._compressed_packed_format

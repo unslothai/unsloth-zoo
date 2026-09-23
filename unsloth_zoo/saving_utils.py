@@ -3779,7 +3779,6 @@ def _export_index_atomically(source_path, destination, payload, mode_from = None
 pass
 
 
-@torch.inference_mode
 # ---------------------------------------------------------------------------------------------
 # compressed-tensors packed bases (Kimi-K3's MXFP4 routed experts) under a merged_16bit export
 # ---------------------------------------------------------------------------------------------
@@ -3960,6 +3959,7 @@ def _save_remote_code_files(model, save_directory):
 pass
 
 
+@torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
     model,
