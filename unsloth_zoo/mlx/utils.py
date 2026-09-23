@@ -3955,6 +3955,7 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_5",
     "qwen3_5_moe",
     "qwen4_exp",
+    "prism_hadamard_qwen35",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}

@@ -3371,6 +3371,14 @@ def test_qwen3_vl_training_compile_verified():
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_hadamard_packed_qwen3_5_trains_through_the_qwen3_5_compile_and_position_paths():
+    import unsloth_zoo.mlx.compile as mc
+    from unsloth_zoo.mlx.utils import _VLM_QWEN_POSITION_MODEL_TYPES
+
+    assert "prism_hadamard_qwen35" in mc._VERIFIED_TRAINING_ARCHES
+    assert "prism_hadamard_qwen35" in _VLM_QWEN_POSITION_MODEL_TYPES
+
+
 def test_qwen3_visual_window_preserves_batched_row_ownership():
     import mlx.core as mx
     import unsloth_zoo.mlx.compile as mc

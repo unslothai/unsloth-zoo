@@ -107,6 +107,8 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "qwen3_5_moe",
     "qwen3_vl_moe",
     "qwen3_vl",
+    # Ternary Bonsai 2: Qwen3.5's Model with Hadamard-packed linears swapped in.
+    "prism_hadamard_qwen35",
 }
 _VERIFIED_GENERATION_ARCHES: set[str] = set()
 
@@ -3828,7 +3830,7 @@ def _install_qwen3_family_compile_patches():
             ),
         )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
-    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
+    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"})
 
 
 def _install_glm_ocr_compile_patches():
@@ -5977,7 +5979,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             name="qwen3_family_multimodal",
             description="Qwen3 VL family merge, deepstack, and vision patch set.",
             matcher=lambda arch, report: (
-                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe"}
+                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"}
                 or (arch.startswith("qwen3") and "qwen3_deepstack_multimodal" in report.pattern_traits)
             ),
             primitive_names=(
