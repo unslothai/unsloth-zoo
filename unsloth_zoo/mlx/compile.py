@@ -612,6 +612,10 @@ def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
             name="padded_image_filtering",
             description="Replace Python-side padded image filtering with compile-safe MLX operations.",
         ),
+        CompilePatchPrimitive(
+            name="training_presence_check_bypass",
+            description="Drop a training-time host check for whether a token kind is present when its answer cannot change the result.",
+        ),
     )
 
 
@@ -4980,6 +4984,47 @@ def _install_gemma3n_compile_patches():
     _PATCHED_ARCHES.add("gemma3n")
 
 
+def _install_gemma4_compile_patches():
+    """Build gemma4's training attention masks without a host read.
+
+    Upstream asks the host whether any vision token is present before it
+    overlays bidirectional vision blocks, which raises under mx.compile on the
+    `use_cce=False` loss, the one that forwards `mm_token_type_ids`.
+    """
+
+    language_module = _try_import_module("mlx_vlm.models.gemma4.language")
+    text_model_cls = getattr(language_module, "Gemma4TextModel", None)
+    original_make_masks = getattr(text_model_cls, "_make_masks", None)
+    if original_make_masks is None:
+        return
+
+    def patched_make_masks(self, h, cache, mm_token_type_ids=None):
+        if not getattr(self, "training", False) or any(c is not None for c in cache):
+            return original_make_masks(self, h, cache, mm_token_type_ids)
+        if (
+            getattr(self.config, "use_bidirectional_attention", None) != "vision"
+            or mm_token_type_ids is None
+            or h.shape[1] <= 1
+        ):
+            # Upstream reads the ids only for the vision overlay.
+            return original_make_masks(self, h, cache, None)
+        # Overlaid unconditionally: without a vision token it adds nothing.
+        masks, built = [], {}
+        for layer in self.layers:
+            kind = layer.layer_type
+            if kind not in built:
+                window = self.window_size if kind == "sliding_attention" else None
+                built[kind] = self._apply_blockwise_bidirectional_overlay(
+                    language_module.create_causal_mask(h.shape[1], window_size=window),
+                    mm_token_type_ids,
+                )
+            masks.append(built[kind])
+        return masks
+
+    _patch_method(text_model_cls, "_make_masks", patched_make_masks)
+    _PATCHED_ARCHES.add("gemma4")
+
+
 def _install_deepseek_ocr_compile_patches():
     """Install DeepSeek OCR compile patches for SAM/projector/image merging."""
 
@@ -5965,6 +6010,13 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             runtime_primitive_names=("deepseek_ocr_multimodal_runtime",),
         ),
         CompilePatternBundle(
+            name="gemma4_training_masks",
+            description="Gemma 4 attention masks built without a host read while training.",
+            matcher=lambda arch, report: arch == "gemma4",
+            primitive_names=("training_presence_check_bypass",),
+            runtime_primitive_names=("gemma4_training_masks_runtime",),
+        ),
+        CompilePatternBundle(
             name="masked_scatter_multimodal",
             description="Shared compile-safe flattened masked-scatter replacement.",
             matcher=lambda arch, report: (
@@ -6129,6 +6181,7 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "single_image_token_merge_runtime": _install_llama_pixtral_mistral_compile_patches,
         "mistral4_attention_backend_runtime": _install_mistral4_compile_patches,
         "gemma3n_multiscale_fusion_runtime": _install_gemma3n_compile_patches,
+        "gemma4_training_masks_runtime": _install_gemma4_compile_patches,
         "deepseek_ocr_multimodal_runtime": _install_deepseek_ocr_compile_patches,
         "masked_scatter_multimodal_runtime": _install_masked_scatter_multimodal_patches,
         "padded_image_filtering_runtime": _install_idefics_family_compile_patches,

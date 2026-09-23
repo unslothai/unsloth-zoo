@@ -2609,3 +2609,56 @@ def test_nested_text_decoder_qualification_decides_its_parent():
     refused = resolve_training_compile(gemma4_over(unqualified[0]), policy=policy)
     assert not refused.enabled
     assert unqualified[0] in refused.reason
+
+
+def test_gemma4_training_masks_match_upstream_without_a_host_read(monkeypatch):
+    """`use_cce=False` runs upstream `Model.__call__`, whose mask builder asks the
+    host whether a vision token is present; while training the masks must match
+    upstream's under mx.compile."""
+    _skip_if_mlx_core_was_replaced()
+    from functools import partial
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    language = pytest.importorskip("mlx_vlm.models.gemma4.language")
+    text_model = language.Gemma4TextModel
+    upstream = text_model._make_masks
+    monkeypatch.setattr(text_model, "_make_masks", upstream)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    assert "gemma4_training_masks_runtime" in {
+        name for bundle in mc._matching_pattern_bundles("gemma4")
+        for name in bundle.runtime_primitive_names}
+    mc._runtime_patch_primitive_installers()["gemma4_training_masks_runtime"]()
+    patched = text_model._make_masks
+
+    def stack(bidirectional, training):
+        model = NS(config=NS(use_bidirectional_attention=bidirectional), window_size=2,
+                   training=training, layers=[NS(layer_type="sliding_attention"),
+                                              NS(layer_type="full_attention")])
+        for name in ("_apply_blockwise_bidirectional_overlay", "_block_sequence_ids_for_mask"):
+            setattr(model, name, partial(getattr(text_model, name), model))
+        return model
+
+    def arrays(masks):
+        return [m.tolist() if isinstance(m, mx.array) else m for m in masks]
+
+    h, cache = mx.zeros((2, 5, 1)), [None, None]
+    # Row 0 carries a 3-token image block wider than the sliding window.
+    ids = mx.array([[0, 1, 1, 1, 0], [0, 0, 0, 2, 2]])
+    for bidirectional in ("vision", None):
+        want = arrays(upstream(stack(bidirectional, False), h, cache, ids))
+        traced = mx.compile(lambda h, ids: [
+            m for m in patched(stack(bidirectional, True), h, cache, ids)
+            if isinstance(m, mx.array)])
+        assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
+        assert arrays(patched(stack(bidirectional, True), h, cache, ids)) == want
+    # Without a vision token the overlay adds nothing to the causal masks, while
+    # inference keeps upstream's cheaper string form.
+    text_only = mx.zeros((2, 5), dtype=mx.int32)
+    traced = mx.compile(lambda h, ids: patched(stack("vision", True), h, cache, ids))
+    assert arrays(traced(h, text_only)) == [
+        mx.broadcast_to(language.create_causal_mask(5, window_size=window), (2, 1, 5, 5)).tolist()
+        for window in (2, None)]
+    assert patched(stack("vision", False), h, cache, text_only)[1] == "causal"
