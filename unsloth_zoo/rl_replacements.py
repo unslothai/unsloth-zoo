@@ -656,7 +656,8 @@ def grpo_compute_loss(
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return completion_length, x.mean()
             else:
-                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward
+                # A row dropped by mask_truncated_completions has no tokens; keep it at 0, not nan.
+                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward.clamp(min = 1.0)
                 mean_kl = mean_kl_per_reward.mean()
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
@@ -1433,6 +1434,20 @@ def grpo_accumulated_loss(
         else:
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
 
+    # `mask_truncated_completions` zeroes a truncated completion's whole row in the incoming
+    # completion_mask. The text path below rebuilds the mask from token ids, which would bring
+    # those rows back into the loss while TRL >= 1.9 already left them out of num_items_in_batch.
+    # Remember which rows TRL kept and drop the rest right before the loss.
+    kept_completion_rows = None
+    if (
+        pixel_values is None
+        and getattr(trainer, "mask_truncated_completions", False)
+        and torch.is_tensor(completion_mask)
+        and completion_mask.dim() == 2
+        and completion_mask.shape[0] == input_ids.shape[0]
+    ):
+        kept_completion_rows = completion_mask.sum(dim = 1, keepdim = True) > 0
+
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
 
@@ -2088,6 +2103,11 @@ def grpo_accumulated_loss(
     if new_logprobs is None:
         # padded fallback (packing disabled / unsupported / not verified for this length)
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
+
+    if kept_completion_rows is not None:
+        completion_mask = completion_mask * kept_completion_rows.to(
+            device = completion_mask.device, dtype = completion_mask.dtype,
+        )
 
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
