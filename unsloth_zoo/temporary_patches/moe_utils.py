@@ -28,6 +28,7 @@ import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
 from unsloth_zoo.mlx import is_mlx_available
+from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
@@ -632,6 +633,8 @@ def _base_is_recomputable(source) -> bool:
         if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
             if getattr(param, "quant_state", None) is None:
                 return False
+            return not param.requires_grad
+        if is_mxfp4_expert_param(param):
             return not param.requires_grad
         if isinstance(param, torch.Tensor):
             return (not param.requires_grad) and param.dtype in (
@@ -1457,6 +1460,8 @@ def _get_param_shape_from_module(module, parameter_name):
         param = param.get_param()
     elif hasattr(param, "weight"):
         param = param.weight
+    if is_mxfp4_expert_param(param):
+        return tuple(param._original_shape)
     return tuple(param.shape)
 
 
@@ -1681,13 +1686,17 @@ def _get_dequantize_4bit_in_slices():
     return _DEQUANTIZE_4BIT_IN_SLICES
 
 
-def _get_base_weight(param, target_dtype=None):
+def _get_base_weight(param, target_dtype=None, token_counts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
-    providers) restores the packed Params4bit to its logical shape and casts."""
+    providers) restores the packed Params4bit to its logical shape and casts. A packed MXFP4
+    stack is dequantized in one pass; token_counts skips experts no token was routed to."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
         param = param.base_layer
+
+    if is_mxfp4_expert_param(param):
+        return param.dequantize(dtype = target_dtype, token_counts = token_counts)
 
     if HAS_BNB and isinstance(param, Params4bit):
         if getattr(param, "quant_state", None) is None:
@@ -2096,6 +2105,9 @@ def _is_moe_experts_module(module) -> bool:
         param = module.gate_up_proj
         # 4-bit params are packed into 2D tensors.
         if HAS_BNB and isinstance(param, Params4bit) and param.ndim == 2:
+            return True
+        # Packed MXFP4 stacks are 4D (num_experts, out, blocks, 16) uint8.
+        if is_mxfp4_expert_param(param):
             return True
         # Standard MoE weights are 3D (num_experts, in, out).
         if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
@@ -2834,6 +2846,8 @@ def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool
         return False
     if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
         return False
+    if is_mxfp4_expert_param(param):
+        return False
     return True
 
 
@@ -3464,8 +3478,8 @@ def forward_native_grouped_mm(
 
         # Provider re-derives the base weight on demand so Fix 3 can recompute it in
         # backward instead of pinning it (grouped_mm needs contiguous weights).
-        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
-            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n), "gate_up", _h, _mt, experts_module=_mod)
         mm1_out = _base_grouped_mm(
             permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
         )
@@ -3640,8 +3654,8 @@ def forward_native_grouped_mm(
     if hasattr(self, "down_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _down_src = self.down_proj
-        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
-            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n), "down", _h, _mt, experts_module=_mod)
         mm2_out = _base_grouped_mm(
             inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
         )

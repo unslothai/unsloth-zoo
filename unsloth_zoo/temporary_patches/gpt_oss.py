@@ -36,6 +36,7 @@ from .common import (
 )
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
+from ..mxfp4_dequant import is_mxfp4_expert_param
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -1826,6 +1827,26 @@ def _unwrap_peft_experts(module):
     return module
 
 
+_MXFP4_DECODE_STACKS = {}
+
+
+def _mxfp4_decode_stack(param, dtype, token_counts):
+    """Dense stack of a packed MXFP4 expert projection for the bf16 inference kernel. One
+    zero-initialised stack per shape is kept as a frozen Parameter, which the CUDA-graphed kernel
+    reads in place (any other tensor is copied into the graph on every call), and only the experts
+    this call routes to are rewritten. The kernel weighs every other expert by 0, so what their
+    slices hold does not change the result."""
+    key = (tuple(param._original_shape), dtype, param.device)
+    stack = _MXFP4_DECODE_STACKS.get(key)
+    if stack is None:
+        stack = nn.Parameter(
+            torch.zeros(param._original_shape, dtype = dtype, device = param.device), requires_grad = False,
+        )
+        _MXFP4_DECODE_STACKS[key] = stack
+    param.dequantize(dtype, token_counts = token_counts, out = stack.data)
+    return stack
+
+
 def moe_forward_inference_bf16(self, hidden_states):
     """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
@@ -1845,6 +1866,15 @@ def moe_forward_inference_bf16(self, hidden_states):
         down_proj = down_proj.get_param()
     elif hasattr(down_proj, "weight"):
         down_proj = down_proj.weight
+
+    # Experts kept as packed MXFP4 (temporary_patches/mxfp4.py).
+    if is_mxfp4_expert_param(gate_up_proj) or is_mxfp4_expert_param(down_proj):
+        from .moe_utils import count_tokens_per_expert
+        counts = count_tokens_per_expert(router_indices.reshape(-1), routing_weights.shape[1], torch.int32)
+        if is_mxfp4_expert_param(gate_up_proj):
+            gate_up_proj = _mxfp4_decode_stack(gate_up_proj, hidden_states.dtype, counts)
+        if is_mxfp4_expert_param(down_proj):
+            down_proj = _mxfp4_decode_stack(down_proj, hidden_states.dtype, counts)
 
     return _moe_forward_inference_bf16_kernel(
         hidden_states,

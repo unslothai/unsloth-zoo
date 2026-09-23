@@ -16,6 +16,7 @@
 
 import re
 from typing import Union, List, Optional, Tuple
+import functools
 import inspect
 import torch
 import torch.nn as nn
@@ -25,6 +26,7 @@ from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
+from ..mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize, mxfp4_kernel_available
 
 transformers_version = Version(importlib_version("transformers"))
 
@@ -95,6 +97,204 @@ def get_mxfp4_config_for_training():
 
     return Mxfp4Config(dequantize=dequantize)
 
+def keep_mxfp4_experts_packed() -> bool:
+    """Whether GPT-OSS MXFP4 experts stay packed in memory (dequantized per layer on the fly by the
+    grouped_mm MoE forward, with expert LoRA on top) instead of a bf16 copy made at load.
+
+    On by default for LoRA loads on transformers 5 with the grouped_mm backend, where the fused
+    dequant kernel is verified exact on this device. UNSLOTH_MXFP4_KEEP_PACKED=0 restores the
+    load-time dequant; =1 also keeps them packed where the kernel is not verified (ROCm, or no
+    Triton), using the slower torch dequant there."""
+    setting = os.environ.get("UNSLOTH_MXFP4_KEEP_PACKED", "")
+    if setting == "0" or transformers_version < Version("5.0.0"):
+        return False
+    name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
+    if "gpt_oss" not in name or "_load_in_4bit_" in name:
+        return False
+    if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
+        return False
+    try:
+        # Only the grouped_mm forward (patch_gpt_oss_moe_for_lora) reads experts through
+        # _get_base_weight; the loop and Triton backends index the stack directly.
+        from .moe_utils import select_moe_backend
+        import transformers.models.gpt_oss.modeling_gpt_oss as modeling_gpt_oss
+        if not getattr(modeling_gpt_oss.GptOssExperts, "_unsloth_lora_patched", False):
+            return False
+        if select_moe_backend() != "grouped_mm":
+            return False
+    except Exception:
+        return False
+    if setting == "1":
+        return True
+    if getattr(torch.version, "hip", None) is not None:
+        return False
+    return mxfp4_kernel_available()
+
+
+def _dequantize_to_gpt_oss_layout(convert, blocks, scales):
+    """GPT-OSS's (E, in, out) expert stack: the fused kernel writes it transposed in one pass;
+    otherwise ``convert`` (the un-transposed Unsloth variant) plus a transposing copy."""
+    if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.dim() == 4:
+        return mxfp4_dequantize(blocks, scales, transpose = True)
+    return convert(blocks, scales).transpose(1, 2).contiguous()
+
+
+class _Mxfp4ShapeProxy:
+    """What PEFT's ParamWrapper sees for a packed stack: its logical shape and compute dtype."""
+
+    def __init__(self, param):
+        self._param = param
+        self.shape = param._original_shape
+        self.ndim = len(self.shape)
+
+    @property
+    def dtype(self):
+        return self._param.mxfp4_dtype
+
+    def __getattr__(self, name):
+        return getattr(self._param, name)
+
+
+def patch_peft_param_wrapper_mxfp4():
+    """LoRA on packed MXFP4 experts through PEFT ``target_parameters``. ``get_param`` reports the
+    logical (E, in, out) shape so the adapters match the bf16 stack's. Merging adds the delta to
+    the dequantized stack and installs it as a bf16 parameter (a merged weight is not MXFP4);
+    unmerging restores the untouched packed stack."""
+    try:
+        from peft.tuners.lora.layer import ParamWrapper, check_adapters_to_merge
+    except Exception:
+        return
+    if getattr(ParamWrapper.get_param, "_unsloth_mxfp4_patched", False):
+        return
+    original_get_param = ParamWrapper.get_param
+    original_merge = ParamWrapper.merge
+    original_unmerge = ParamWrapper.unmerge
+
+    # wraps(): the bnb 4-bit patches check the signature before layering on top.
+    @functools.wraps(original_get_param)
+    def get_param(self):
+        param = original_get_param(self)
+        if is_mxfp4_expert_param(param):
+            self.num_experts = param._original_shape[0]
+            return _Mxfp4ShapeProxy(param)
+        return param
+
+    @functools.wraps(original_merge)
+    def merge(self, safe_merge = False, adapter_names = None):
+        base_layer = self.get_base_layer()
+        param = getattr(base_layer, self.parameter_name, None)
+        if not is_mxfp4_expert_param(param):
+            return original_merge(self, safe_merge = safe_merge, adapter_names = adapter_names)
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            return
+        merged = param.dequantize()
+        applied = []
+        for adapter in adapter_names:
+            if adapter not in self.lora_A.keys():
+                continue
+            merged = merged + self.get_delta_weight(adapter).to(device = merged.device, dtype = merged.dtype)
+            applied.append(adapter)
+        if not applied:
+            return
+        if safe_merge and not torch.isfinite(merged).all():
+            raise ValueError(f"NaNs detected in the merged weights. The adapters {applied} seem to be broken")
+        self.__dict__.setdefault("_unsloth_mxfp4_packed", {})[self.parameter_name] = param
+        setattr(base_layer, self.parameter_name, nn.Parameter(merged, requires_grad = False))
+        self.merged_adapters.extend(applied)
+
+    @functools.wraps(original_unmerge)
+    def unmerge(self):
+        packed = self.__dict__.get("_unsloth_mxfp4_packed", {}).pop(self.parameter_name, None)
+        if packed is None:
+            return original_unmerge(self)
+        setattr(self.get_base_layer(), self.parameter_name, packed)
+        self.merged_adapters.clear()
+
+    get_param._unsloth_mxfp4_patched = True
+    merge._unsloth_mxfp4_patched = True
+    unmerge._unsloth_mxfp4_patched = True
+    ParamWrapper.get_param = get_param
+    ParamWrapper.merge = merge
+    ParamWrapper.unmerge = unmerge
+pass
+TEMPORARY_PATCHES.append(patch_peft_param_wrapper_mxfp4)
+
+
+def patch_mxfp4_quantizer_element_size():
+    """transformers pre-allocates the model's size on the GPU before loading
+    (caching_allocator_warmup), counting dequantized experts as bf16. Experts kept packed take
+    17 / 32 bytes per value (4-bit values plus one e8m0 scale per 32), so count that instead;
+    otherwise loading needs the bf16 model's memory the packed experts exist to avoid."""
+    try:
+        from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
+    except Exception:
+        return
+    original = getattr(Mxfp4HfQuantizer, "param_element_size", None)
+    if original is None or getattr(original, "_unsloth_mxfp4_patched", False):
+        return
+
+    @functools.wraps(original)
+    def param_element_size(self, model, param_name, param):
+        if (
+            param_name.endswith((".gate_up_proj", ".down_proj"))
+            and getattr(self, "pre_quantized", False)
+            and getattr(getattr(self, "quantization_config", None), "dequantize", False)
+            and keep_mxfp4_experts_packed()
+        ):
+            return 17 / 32
+        return original(self, model, param_name, param)
+
+    param_element_size._unsloth_mxfp4_patched = True
+    Mxfp4HfQuantizer.param_element_size = param_element_size
+pass
+TEMPORARY_PATCHES.append(patch_mxfp4_quantizer_element_size)
+
+
+def patch_save_pretrained_mxfp4():
+    """A full ``save_pretrained`` of a model whose experts are kept packed writes them dequantized,
+    as the load-time path would have, and the packed stacks are put back afterwards. Adapter-only
+    saves (PEFT) never reach this and stay as cheap as before."""
+    try:
+        from transformers import PreTrainedModel
+    except Exception:
+        return
+    original = PreTrainedModel.save_pretrained
+    if getattr(original, "_unsloth_mxfp4_patched", False):
+        return
+
+    @functools.wraps(original)
+    def save_pretrained(self, *args, **kwargs):
+        packed = [
+            (module, name, param)
+            for module in self.modules()
+            for name, param in list(module._parameters.items())
+            if is_mxfp4_expert_param(param)
+        ]
+        if not packed:
+            return original(self, *args, **kwargs)
+        names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
+                 if is_mxfp4_expert_param(param)}
+        dense = {}
+        try:
+            for module, name, param in packed:
+                weight = param.dequantize().cpu()
+                dense[names.get(id(param))] = weight
+                module._parameters[name] = nn.Parameter(weight, requires_grad = False)
+            state_dict = kwargs.get("state_dict", None)
+            if state_dict is not None:
+                kwargs["state_dict"] = {key: dense.get(key, value) for key, value in state_dict.items()}
+            return original(self, *args, **kwargs)
+        finally:
+            for module, name, param in packed:
+                module._parameters[name] = param
+
+    save_pretrained._unsloth_mxfp4_patched = True
+    PreTrainedModel.save_pretrained = save_pretrained
+pass
+TEMPORARY_PATCHES.append(patch_save_pretrained_mxfp4)
+
+
 def patch_convert_moe_packed_tensors():
     """Pin the GPU convert_moe_packed_tensors with a smaller default chunk."""
     try:
@@ -115,6 +315,9 @@ def patch_convert_moe_packed_tensors():
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
+        # One fused Triton pass, bit-identical to the loop below, with no int64 / fp32 temporaries.
+        if blocks.is_cuda and blocks.dtype == torch.uint8 and dtype in (torch.bfloat16, torch.float16):
+            return mxfp4_dequantize(blocks, scales, dtype = dtype)
 
         scales = scales.to(torch.int32) - 127
 
@@ -194,16 +397,18 @@ def patch_convert_moe_packed_tensors():
             # 5.0.0. Mirrors upstream's own body (empty_cache before the move, and the
             # result placed on target_device) with the transpose added back.
             def dequantize_convertops(blocks, scales, target_device):
-                dequantized = convert_moe_packed_tensors(blocks, scales)
-                dequantized = dequantized.transpose(1, 2).contiguous()
+                if blocks.dtype == torch.uint8 and blocks.dim() == 4 and keep_mxfp4_experts_packed():
+                    return Mxfp4ExpertParam(blocks.to(target_device), mxfp4_scales = scales.to(target_device))
+                dequantized = _dequantize_to_gpt_oss_layout(convert_moe_packed_tensors, blocks, scales)
                 if target_device == "cpu" and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 return torch.nn.Parameter(dequantized.to(target_device))
         else:
             # 5.1.0 and newer. Upstream leaves placement to its caller here.
             def dequantize_convertops(blocks, scales):
-                dequantized = convert_moe_packed_tensors(blocks, scales)
-                return torch.nn.Parameter(dequantized.transpose(1, 2).contiguous())
+                if blocks.dtype == torch.uint8 and blocks.dim() == 4 and keep_mxfp4_experts_packed():
+                    return Mxfp4ExpertParam(blocks, mxfp4_scales = scales)
+                return torch.nn.Parameter(_dequantize_to_gpt_oss_layout(convert_moe_packed_tensors, blocks, scales))
         patch_function(transformers.integrations.mxfp4, "dequantize_convertops", dequantize_convertops)
 
     if transformers_version < Version("5.0.0"):
