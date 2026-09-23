@@ -1179,12 +1179,7 @@ def test_sampling_logps_gated_on_actual_consumer():
 
 
 def _luspo_reference(ref, new, old, mask, advantages, beta, level):
-    """TRL 1.13.0 GRPOTrainer._compute_loss for loss_type="luspo", in float64.
-
-    The aggregation is `(per_token_loss * mask).sum(-1).mean()`: TRL applies the mask
-    elementwise because `per_token_loss` is only (B, 1) in the sequence level, beta 0
-    setup, and broadcasts to (B, T) otherwise.
-    """
+    """TRL 1.13.0 GRPOTrainer._compute_loss for loss_type="luspo", in float64."""
     log_ratio = new - old
     if level == "sequence":
         log_ratio = (log_ratio * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp(min=1.0)
@@ -1199,12 +1194,7 @@ def _luspo_reference(ref, new, old, mask, advantages, beta, level):
 @pytest.mark.parametrize("level", ["token", "sequence"])
 @pytest.mark.parametrize("beta", [0.0, 0.04])
 def test_luspo_matches_trl_aggregation(level, beta, disable_dynamo):
-    # luspo weighted the whole row by its own token count (`loss_i * mask.sum(1)`), which
-    # only equals TRL's elementwise mask when loss_i really is (B, 1). The token level (the
-    # TRL default), a nonzero beta and token level vLLM ratios all broadcast loss_i to
-    # (B, T), and there the row weighting drops the mask and scales every column, padding
-    # included, by the row's token count. Everything here is float64, so 1e-12 is far above the
-    # roughly 2.2e-16 eps that a sum over five columns can accumulate.
+    # `loss_i * mask.sum(1)` only equals TRL when loss_i is (B, 1); token level or beta > 0 make it (B, T).
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("luspo")
     kwargs["importance_sampling_level"] = level
 
@@ -1220,8 +1210,7 @@ def test_luspo_matches_trl_aggregation(level, beta, disable_dynamo):
 @pytest.mark.parametrize("level", ["token", "sequence"])
 @pytest.mark.parametrize("beta", [0.0, 0.04])
 def test_luspo_ignores_fully_masked_columns(level, beta, disable_dynamo):
-    # Padding a batch out to a longer completion length must not move the loss. Weighting a
-    # row by its token count let the padded columns into the sum through loss_i.
+    # Padding a batch out to a longer completion length must not move the loss.
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("luspo")
     kwargs["importance_sampling_level"] = level
     loss, *_ = rr.grpo_compute_loss(
