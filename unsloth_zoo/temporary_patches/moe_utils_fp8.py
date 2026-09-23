@@ -1069,6 +1069,11 @@ from .common import (
 from .utils import logger
 
 
+def _experts_are_fp4(module) -> bool:
+    """FP8Experts built for FP4-packed expert weights (DeepSeek-V4 style)."""
+    return getattr(getattr(module, "config", None), "expert_dtype", "fp8") == "fp4"
+
+
 def patch_fp8_experts_interface():
     try:
         from transformers.integrations.finegrained_fp8 import ALL_FP8_EXPERTS_FUNCTIONS
@@ -1079,14 +1084,26 @@ def patch_fp8_experts_interface():
     if getattr(ALL_FP8_EXPERTS_FUNCTIONS, sentinel, False):
         return
 
-    def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
-        return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
+    def _dispatch_for(original):
+        def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
+            # FP4-packed experts (config.expert_dtype = "fp4", two values per int8) are not
+            # something the FP8 backends decode; they keep transformers' own path.
+            if _experts_are_fp4(self):
+                if original is not None:
+                    return original(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
+                return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
+            return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
+        return _unsloth_fp8_dispatch
 
     # "unsloth" is the default experts implementation Unsloth registers on transformers 5, and
     # the FP8Experts swap keeps the config's key, so it has to resolve in this registry too.
     for key in ("grouped_mm", "batched_mm", "deepgemm", "unsloth"):
         try:
-            ALL_FP8_EXPERTS_FUNCTIONS[key] = _unsloth_fp8_dispatch
+            original = ALL_FP8_EXPERTS_FUNCTIONS[key] if key in ALL_FP8_EXPERTS_FUNCTIONS else None
+        except Exception:
+            original = None
+        try:
+            ALL_FP8_EXPERTS_FUNCTIONS[key] = _dispatch_for(original)
         except Exception:
             pass
 

@@ -124,6 +124,18 @@ def _has_custom_gate(module) -> bool:
     return "GptOss" not in type(module).__name__
 
 
+def _packs_fp4_experts(model) -> bool:
+    """A config that stores experts as FP4 (``expert_dtype = "fp4"``, DeepSeek-V4): the FP8
+    experts module holds them as packed int8, which only transformers' dispatchers decode."""
+    config = getattr(model, "config", None)
+    configs = [config]
+    try:
+        configs.append(config.get_text_config())
+    except Exception:
+        pass
+    return any(getattr(c, "expert_dtype", None) == "fp4" for c in configs if c is not None)
+
+
 def _expert_parallel_requested(model) -> bool:
     """Expert parallelism routes non-local slots to a `num_experts` sentinel that
     only transformers' own implementations mask."""
@@ -194,7 +206,7 @@ def patch_experts_interface():
                 )
                 requested_experts = None
             return original(self, requested_experts)
-        if requested_experts is None:
+        if requested_experts is None and not _packs_fp4_experts(self):
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         return original(self, requested_experts)
 
