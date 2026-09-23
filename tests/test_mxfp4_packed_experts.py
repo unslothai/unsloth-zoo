@@ -547,19 +547,58 @@ def test_offloaded_loads_keep_the_load_time_dequant(monkeypatch):
         assert mx.keep_mxfp4_experts_packed() is (not offloads)
 
 
-@needs_cuda
-def test_decode_stacks_are_per_stream():
+def test_the_decode_lock_is_held_until_the_kernel_is_enqueued(monkeypatch):
+    # Two host threads sharing a stream: the slot's lock spans decode and kernel launch, so a
+    # second decode cannot rewrite the stack between them.
     from unsloth_zoo.temporary_patches import gpt_oss
 
-    param = _packed(4, 128, 64, device = "cuda", seed = 3)
-    counts = torch.ones(4, dtype = torch.int32, device = "cuda")
-    default = gpt_oss._mxfp4_decode_stack(param, torch.bfloat16, counts)
-    side = torch.cuda.Stream()
-    with torch.cuda.stream(side):
-        other = gpt_oss._mxfp4_decode_stack(param, torch.bfloat16, counts)
-    side.synchronize()
-    assert other is not default
-    assert gpt_oss._mxfp4_decode_stack(param, torch.bfloat16, counts) is default
+    model, experts = _tiny_gpt_oss("cpu")
+    mlp = model.model.layers[0].mlp
+    seen = []
+
+    def kernel(hidden_states, routing_weights, gate_up, gate_up_bias, down, *rest):
+        slots = [s for s in gpt_oss._MXFP4_DECODE_SLOTS.values() if s.stack is gate_up or s.stack is down]
+        seen.append((len(slots), all(s.lock.locked() for s in slots)))
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(gpt_oss, "_moe_forward_inference_bf16_kernel", kernel)
+    with torch.no_grad():
+        gpt_oss.moe_forward_inference_bf16(mlp, torch.randn(1, 1, 128, dtype = torch.bfloat16))
+    assert seen == [(2, True)]
+    assert not any(s.lock.locked() for s in gpt_oss._MXFP4_DECODE_SLOTS.values())
+
+
+def test_projections_of_the_same_shape_do_not_share_a_stack():
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    a, b = _packed(4, 64, 64, seed = 1), _packed(4, 64, 64, seed = 2)
+    counts = torch.ones(4, dtype = torch.int32)
+    gate_up = gpt_oss._mxfp4_decode_stack(a, torch.bfloat16, counts, role = "gate_up")
+    down = gpt_oss._mxfp4_decode_stack(b, torch.bfloat16, counts, role = "down")
+    assert gate_up is not down
+    assert torch.equal(gate_up, a.dequantize(torch.bfloat16))
+
+
+@needs_cuda
+def test_another_stream_waits_for_the_last_kernel_on_the_shared_stack():
+    # One stack per shape whatever the stream (no copy per stream to leak); a decode on another
+    # stream waits on the event recorded after the last kernel that read it.
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    model, experts = _tiny_gpt_oss("cuda")
+    mlp = model.model.layers[0].mlp
+    h = torch.randn(1, 1, 128, device = "cuda", dtype = torch.bfloat16)
+    with torch.no_grad():
+        want = gpt_oss.moe_forward_inference_bf16(mlp, h).clone()
+        slots = list(gpt_oss._MXFP4_DECODE_SLOTS.values())
+        assert slots and all(s.event is not None for s in slots)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            got = gpt_oss.moe_forward_inference_bf16(mlp, h)
+        side.synchronize()
+    assert sorted(map(id, gpt_oss._MXFP4_DECODE_SLOTS.values())) == sorted(map(id, slots))
+    assert torch.equal(got, want)
 
 
 def test_module_moves_to_and_from_meta_keep_the_packed_param():

@@ -16,9 +16,11 @@
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
+import contextlib
 import functools
 import os
 import stat
+import threading
 import weakref
 import torch
 import torch.nn as nn
@@ -1828,33 +1830,49 @@ def _unwrap_peft_experts(module):
     return module
 
 
-# Weak values: the packed parameters that decode into a stack hold it, so it is freed with the
+# Weak values: the packed parameters that decode into a slot hold it, so it is freed with the
 # last model that uses it.
-_MXFP4_DECODE_STACKS = weakref.WeakValueDictionary()
+_MXFP4_DECODE_SLOTS = weakref.WeakValueDictionary()
 
 
-def _mxfp4_decode_stack(param, dtype, token_counts):
-    """Dense stack of a packed MXFP4 expert projection for the bf16 inference kernel. One
-    zero-initialised stack per shape is kept as a frozen Parameter, which the CUDA-graphed kernel
-    reads in place (any other tensor is copied into the graph on every call), and only the experts
-    this call routes to are rewritten. The kernel weighs every other expert by 0, so what their
-    slices hold does not change the result."""
-    # Per stream too: two decodes running concurrently on different streams must not rewrite
-    # one another's stack while the other kernel reads it.
-    stream = torch.cuda.current_stream(param.device).cuda_stream if param.is_cuda else None
-    key = (tuple(param._original_shape), dtype, param.device, stream)
-    stack = _MXFP4_DECODE_STACKS.get(key)
-    if stack is None:
-        stack = nn.Parameter(
-            torch.zeros(param._original_shape, dtype = dtype, device = param.device), requires_grad = False,
-        )
-        _MXFP4_DECODE_STACKS[key] = stack
+class _Mxfp4DecodeSlot:
+    """The dense stack a packed projection decodes into for the bf16 inference kernel, shared by
+    every layer of that shape. `lock` is held from the decode until the kernel reading it is
+    enqueued, so host threads cannot interleave; `event` marks the last kernel that read it, so
+    a decode on another stream waits for that kernel instead of overwriting under it."""
+
+    __slots__ = ("stack", "lock", "event", "__weakref__")
+
+    def __init__(self, shape, dtype, device):
+        # A frozen Parameter: the CUDA-graphed kernel reads it in place, where any other tensor is
+        # copied into the graph on every call.
+        self.stack = nn.Parameter(torch.zeros(shape, dtype = dtype, device = device), requires_grad = False)
+        self.lock = threading.Lock()
+        self.event = None
+
+
+def _mxfp4_decode_slot(param, dtype, role = ""):
+    key = (role, tuple(param._original_shape), dtype, param.device)
+    slot = _MXFP4_DECODE_SLOTS.get(key)
+    if slot is None:
+        slot = _Mxfp4DecodeSlot(param._original_shape, dtype, param.device)
+        _MXFP4_DECODE_SLOTS[key] = slot
     held = getattr(param, "_unsloth_decode_stacks", None)
     if held is None:
         held = param._unsloth_decode_stacks = {}
-    held[key] = stack
-    param.dequantize(dtype, token_counts = token_counts, out = stack.data)
-    return stack
+    held[key] = slot
+    return slot
+
+
+def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
+    """Dense stack of a packed MXFP4 expert projection. Only the experts this call routes to are
+    rewritten; the kernel weighs every other expert by 0, so what their slices hold does not change
+    the result. Callers that launch a kernel on it hold the slot's lock until that is enqueued."""
+    slot = slot or _mxfp4_decode_slot(param, dtype, role)
+    if slot.event is not None and param.is_cuda:
+        torch.cuda.current_stream(param.device).wait_event(slot.event)
+    param.dequantize(dtype, token_counts = token_counts, out = slot.stack.data)
+    return slot.stack
 
 
 def moe_forward_inference_bf16(self, hidden_states):
@@ -1878,25 +1896,41 @@ def moe_forward_inference_bf16(self, hidden_states):
         down_proj = down_proj.weight
 
     # Experts kept as packed MXFP4 (temporary_patches/mxfp4.py).
+    slots = []
     if is_mxfp4_expert_param(gate_up_proj) or is_mxfp4_expert_param(down_proj):
         from .moe_utils import count_tokens_per_expert
         counts = count_tokens_per_expert(router_indices.reshape(-1), routing_weights.shape[1], torch.int32)
         if is_mxfp4_expert_param(gate_up_proj):
-            gate_up_proj = _mxfp4_decode_stack(gate_up_proj, hidden_states.dtype, counts)
+            slots.append(_mxfp4_decode_slot(gate_up_proj, hidden_states.dtype, "gate_up"))
         if is_mxfp4_expert_param(down_proj):
-            down_proj = _mxfp4_decode_stack(down_proj, hidden_states.dtype, counts)
+            slots.append(_mxfp4_decode_slot(down_proj, hidden_states.dtype, "down"))
 
-    return _moe_forward_inference_bf16_kernel(
-        hidden_states,
-        routing_weights,
-        gate_up_proj,
-        moe.gate_up_proj_bias,
-        down_proj,
-        moe.down_proj_bias,
-        moe.limit,
-        moe.alpha,
-        moe.hidden_size,
-    )
+    with contextlib.ExitStack() as held:
+        # Fixed order, so two threads never wait on each other's second lock.
+        for slot in sorted(slots, key = id):
+            held.enter_context(slot.lock)
+        if is_mxfp4_expert_param(gate_up_proj):
+            gate_up_proj = _mxfp4_decode_stack(gate_up_proj, hidden_states.dtype, counts, slot = slots[0])
+        if is_mxfp4_expert_param(down_proj):
+            down_proj = _mxfp4_decode_stack(down_proj, hidden_states.dtype, counts, slot = slots[-1])
+        out = _moe_forward_inference_bf16_kernel(
+            hidden_states,
+            routing_weights,
+            gate_up_proj,
+            moe.gate_up_proj_bias,
+            down_proj,
+            moe.down_proj_bias,
+            moe.limit,
+            moe.alpha,
+            moe.hidden_size,
+        )
+        if slots and hidden_states.is_cuda:
+            stream = torch.cuda.current_stream(hidden_states.device)
+            for slot in slots:
+                if slot.event is None:
+                    slot.event = torch.cuda.Event()
+                slot.event.record(stream)
+    return out
 
 
 
