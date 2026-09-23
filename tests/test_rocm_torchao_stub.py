@@ -105,6 +105,9 @@ def test_stub_still_answers_the_names_callers_import(stubbed_torchao):
 
 
 def test_transformers_reads_the_stub_as_unavailable(stubbed_torchao):
+    # Without torch the probe answers False before reading torchao at all (Apple Silicon ships
+    # the zoo with no torch), which would pass without testing anything.
+    pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
     from packaging.version import Version
 
@@ -143,6 +146,7 @@ def test_transformers_modeling_utils_imports_against_the_stub():
     """In a fresh interpreter: an earlier import would hide the failure."""
     import subprocess
 
+    pytest.importorskip("torch")
     pytest.importorskip("transformers")
     out = subprocess.run(
         [sys.executable, "-c", _FRESH, str(UTILS), *sorted(WANTED)],
