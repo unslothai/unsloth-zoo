@@ -56,11 +56,13 @@ __all__ = [
 
 def _experts_interface():
     """transformers' registry, or None below transformers 5."""
-    try:
-        from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
-        return ALL_EXPERTS_FUNCTIONS
-    except Exception:
-        return None
+    if "experts_interface" not in _LAZY:
+        try:
+            from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+        except Exception:
+            ALL_EXPERTS_FUNCTIONS = None
+        _LAZY["experts_interface"] = ALL_EXPERTS_FUNCTIONS
+    return _LAZY["experts_interface"]
 
 
 def _forward_is_unsloth(forward) -> bool:
@@ -108,14 +110,36 @@ def expert_forward_is_handled(module: nn.Module) -> bool:
     return implementation == UNSLOTH_EXPERTS_IMPLEMENTATION
 
 
+# Resolved once: these run on every experts forward, where a function-level import
+# costs about a microsecond per MoE layer.
+_LAZY = {}
+
+
+def _default_apply_gate_or_none():
+    if "default_apply_gate" not in _LAZY:
+        try:
+            from transformers.integrations.moe import _default_apply_gate
+        except Exception:
+            _default_apply_gate = None
+        _LAZY["default_apply_gate"] = _default_apply_gate
+    return _LAZY["default_apply_gate"]
+
+
+def _moe_utils_module():
+    module = _LAZY.get("moe_utils")
+    if module is None:
+        from . import moe_utils as module
+        _LAZY["moe_utils"] = module
+    return module
+
+
 def _has_custom_gate(module) -> bool:
     """True when the experts class overrides transformers' default `_apply_gate`.
 
     DeepSeek-V4, GLM-5-Next, HY-V4, MiniMax-M3 and others clamp or offset gate and
     up; Unsloth's backends implement SiLU (or `act_fn`) and gpt-oss by name only."""
-    try:
-        from transformers.integrations.moe import _default_apply_gate
-    except Exception:
+    _default_apply_gate = _default_apply_gate_or_none()
+    if _default_apply_gate is None:
         return False
     gate = getattr(type(module), "_apply_gate", None)
     if gate is None or gate is _default_apply_gate:
@@ -201,6 +225,7 @@ def _dense_experts_without_expert_lora(module) -> bool:
     MoE block. Packed 4-bit stacks are Params4bit, a stashed LoRA sits under
     `_unsloth_lora_<name>` (moe_utils.moe_lora_stash_name); both keep the dispatcher."""
     params = module._parameters
+    state = module.__dict__
     found = False
     for name in _EXPERT_STACK_NAMES:
         param = params.get(name)
@@ -208,7 +233,9 @@ def _dense_experts_without_expert_lora(module) -> bool:
             continue
         if type(param) is not nn.Parameter or param.dtype not in _DENSE_STACK_DTYPES:
             return False
-        if getattr(module, "_unsloth_lora_" + name, None) is not None:
+        # The stash is a plain attribute: read the instance dict, not nn.Module.__getattr__,
+        # whose miss costs about 0.7 us on every dense experts forward.
+        if state.get("_unsloth_lora_" + name) is not None:
             return False
         found = True
     return found
@@ -250,14 +277,12 @@ def _unsloth_experts_dispatch(
         if fallback is not None:
             # transformers' grouped_mm needs the same torch._grouped_mm support Unsloth's
             # backend selection checks; without it take the class's own eager forward.
-            from .moe_utils import _check_torch_grouped_mm_supported
-            if not _check_torch_grouped_mm_supported():
+            if not _moe_utils_module()._check_torch_grouped_mm_supported():
                 fallback = None
         if fallback is None:
             return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
         return fallback(self, hidden_states, top_k_index, top_k_weights)
-    from .moe_utils import get_forward_moe_backend
-    return get_forward_moe_backend()(self, hidden_states, top_k_index, top_k_weights)
+    return _moe_utils_module().get_forward_moe_backend()(self, hidden_states, top_k_index, top_k_weights)
 
 
 def patch_experts_interface():

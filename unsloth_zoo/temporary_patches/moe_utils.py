@@ -3433,13 +3433,27 @@ class _MoEGateGradIdentity(torch.autograd.Function):
         return grad_inter, grad_gate
 
 
+_FLAG_MISSING = object()
+
+
+def _module_flag(module, name, default = None):
+    """`getattr(module, name, default)` for plain flags set on the instance or its class.
+
+    These are read on every experts forward of every MoE model; on an nn.Module a missing
+    attribute goes through `nn.Module.__getattr__`, whose miss costs about 0.7 us."""
+    value = module.__dict__.get(name, _FLAG_MISSING)
+    if value is _FLAG_MISSING:
+        value = getattr(type(module), name, default)
+    return value
+
+
 def _gate_up_is_interleaved(module) -> bool:
     """Whether gate_up_proj stores [gate0, up0, gate1, up1, ...] rather than
     [gate...; up...]. GPT-OSS by class name; any transformers-decorated experts
     class says so itself through `is_concatenated`."""
     if "GptOssExperts" in module.__class__.__name__:
         return True
-    return getattr(module, "is_concatenated", True) is False
+    return _module_flag(module, "is_concatenated", True) is False
 
 
 def forward_native_grouped_mm(
@@ -3574,7 +3588,7 @@ def forward_native_grouped_mm(
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
         # The class's own gate on [gate; up] (set only on generically routed classes).
-        own_gate_up = mm1_out if getattr(self, "_unsloth_own_apply_gate", False) else None
+        own_gate_up = mm1_out if _module_flag(self, "_unsloth_own_apply_gate", False) else None
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -3773,9 +3787,9 @@ def _experts_are_input_major(module, name, in_dim) -> bool:
     """Whether the expert stack `name` is stored (E, in, out) rather than (E, out, in).
     The declared layout wins; the shape only decides when nothing is declared, since a
     square stack (Llama-4 with 2I == H) looks the same either way."""
-    if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
+    if bool(_module_flag(module, "_unsloth_grouped_mm_format", False)):
         return True
-    declared = getattr(module, "is_transposed", None)
+    declared = _module_flag(module, "is_transposed", None)
     if isinstance(declared, bool):
         return declared
     return getattr(module, name).shape[-1] != in_dim
@@ -3905,7 +3919,7 @@ def forward_triton_grouped_gemm(
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
     # Activation + gate*up.
-    if getattr(self, "_unsloth_own_apply_gate", False):
+    if _module_flag(self, "_unsloth_own_apply_gate", False):
         # The class's own gate on [gate; up] (set only on generically routed classes).
         intermediate = self._apply_gate(first_gemm_output)
     elif hasattr(self, 'act_fn') and callable(self.act_fn):
@@ -4049,12 +4063,13 @@ def forward_native_moe_loop(
     # rather than F.linear's (E, out, in) and set _unsloth_grouped_mm_format=True.
     # Prefer it over the shape check, which is unsafe when intermediate_dim == hidden_dim.
     # A declared (E, in, out) layout wins over the shape test, which a square stack defeats.
-    grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False)) or (
-        getattr(self, "is_transposed", None) is True
+    grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
+        _module_flag(self, "is_transposed", None) is True
     )
 
     # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
     is_gpt_oss = _gate_up_is_interleaved(self)
+    own_apply_gate = bool(_module_flag(self, "_unsloth_own_apply_gate", False))
 
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()
@@ -4091,7 +4106,7 @@ def forward_native_moe_loop(
             gate = gate.clamp(min=None, max=limit)
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
-        elif getattr(self, "_unsloth_own_apply_gate", False):
+        elif own_apply_gate:
             # The class's own gate on [gate; up] (set only on generically routed classes).
             current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):

@@ -282,14 +282,16 @@ def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
 
     experts = Experts()
     forward = fp8.ALL_FP8_EXPERTS_FUNCTIONS.get_interface("unsloth", None)
+    # Once the FP8 backend can unpack FP4 itself (#1334), FP4 experts route to it instead.
+    fp4_route = "unsloth" if hasattr(moe_utils_fp8, "_dequantize_full_expert_weights_fp4") else "eager"
     experts.config = types.SimpleNamespace(expert_dtype = "fp4")
-    assert forward(experts, "h", "i", "w") == "eager"
+    assert forward(experts, "h", "i", "w") == fp4_route
     experts.config = types.SimpleNamespace(expert_dtype = "fp8")
     assert forward(experts, "h", "i", "w") == "unsloth"
     # Ungated FP8 experts (up_proj only, Nemotron-H) keep transformers' path as well.
     experts.has_gate = False
     assert forward(experts, "h", "i", "w") == "eager"
-    assert calls == ["eager", "unsloth", "eager"]
+    assert calls == [fp4_route, "unsloth", "eager"]
 
 
 def test_expert_parallel_reaches_the_nested_text_model():

@@ -73,6 +73,9 @@ def test_quantizer_leaves_experts_it_cannot_route_unpacked():
     from unsloth_zoo.temporary_patches import moe_utils_bnb4bit
     if not moe_utils_bnb4bit.HAS_BNB:
         pytest.skip("bitsandbytes 4-bit is not usable here, so no 4-bit load reaches the quantizer")
+    if not moe_utils_bnb4bit.is_transformers_v5_moe_quantization_available():
+        # transformers 4.x quantizes experts through its own path; this hook is never installed there.
+        pytest.skip("transformers has no v5 MoE quantization hooks")
     from bitsandbytes.nn import Params4bit
     from transformers import BitsAndBytesConfig
     from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
