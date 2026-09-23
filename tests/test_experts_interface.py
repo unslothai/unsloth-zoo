@@ -451,3 +451,25 @@ def test_dense_experts_stay_inside_a_fullgraph_compiled_block():
         config._experts_implementation = "grouped_mm"
         expected = experts(h, index, weights)
     torch.testing.assert_close(got, expected, atol = 2e-2, rtol = 2e-2)
+
+
+def test_nested_recheck_of_unsloth_does_not_reach_a_fixed_list_validator(monkeypatch):
+    """The outer model writes "unsloth" to the config and each nested model asks again with
+    that value. transformers 5.0 to 5.6 validates against a fixed list of names, so
+    handing it "unsloth" raised "Specified experts_implementation="unsloth" is not supported"
+    and every MoE load failed, 16-bit included."""
+    from transformers.modeling_utils import PreTrainedModel
+
+    def fixed_list_original(self, requested_experts):
+        applicable = "grouped_mm" if requested_experts is None else requested_experts
+        if applicable not in ["eager", "grouped_mm", "batched_mm", "deepgemm"]:
+            raise ValueError(f'Specified `experts_implementation="{applicable}"` is not supported.')
+        return applicable
+
+    monkeypatch.setattr(PreTrainedModel, "get_correct_experts_implementation", fixed_list_original)
+    patch_experts_interface()
+    getter = PreTrainedModel.get_correct_experts_implementation
+    model = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = types.SimpleNamespace())
+    assert getter(model, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
+    assert getter(model, UNSLOTH_EXPERTS_IMPLEMENTATION) == UNSLOTH_EXPERTS_IMPLEMENTATION
+    assert getter(model, "eager") == "eager"

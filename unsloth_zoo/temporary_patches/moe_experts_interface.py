@@ -298,6 +298,11 @@ def patch_experts_interface():
             return original(self, requested_experts)
         if requested_experts is None and not _packs_fp4_experts(self):
             return UNSLOTH_EXPERTS_IMPLEMENTATION
+        if requested_experts == UNSLOTH_EXPERTS_IMPLEMENTATION:
+            # Nested models re-check the value their outer model wrote to the config.
+            # transformers 5.0 to 5.6 validates against a fixed list of names rather
+            # than the registry, so it would reject a registered "unsloth" there.
+            return UNSLOTH_EXPERTS_IMPLEMENTATION
         if requested_experts not in (None, UNSLOTH_EXPERTS_IMPLEMENTATION) and _holds_packed_4bit_experts(self):
             # A runtime switch after a 4-bit load: the experts are already packed, and the
             # quantizer only leaves them unpacked for an implementation chosen at load time.
