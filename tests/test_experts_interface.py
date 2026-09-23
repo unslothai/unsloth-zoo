@@ -285,7 +285,10 @@ def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
     assert forward(experts, "h", "i", "w") == "eager"
     experts.config = types.SimpleNamespace(expert_dtype = "fp8")
     assert forward(experts, "h", "i", "w") == "unsloth"
-    assert calls == ["eager", "unsloth"]
+    # Ungated FP8 experts (up_proj only, Nemotron-H) keep transformers' path as well.
+    experts.has_gate = False
+    assert forward(experts, "h", "i", "w") == "eager"
+    assert calls == ["eager", "unsloth", "eager"]
 
 
 def test_expert_parallel_reaches_the_nested_text_model():

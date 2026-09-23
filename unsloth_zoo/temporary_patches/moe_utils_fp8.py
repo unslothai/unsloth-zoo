@@ -1086,9 +1086,10 @@ def patch_fp8_experts_interface():
 
     def _dispatch_for(original):
         def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
-            # FP4-packed experts (config.expert_dtype = "fp4", two values per int8) are not
-            # something the FP8 backends decode; they keep transformers' own path.
-            if _experts_are_fp4(self):
+            # FP4-packed experts (config.expert_dtype = "fp4", two values per int8) and ungated
+            # ones (has_gate = False: up_proj only, e.g. Nemotron-H) are not something the FP8
+            # backends handle; they keep transformers' own path.
+            if _experts_are_fp4(self) or getattr(self, "has_gate", True) is False:
                 if original is not None:
                     return original(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
                 return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
