@@ -314,3 +314,28 @@ def test_expert_parallel_reaches_the_nested_text_model():
     # An unrelated config is not affected.
     other = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = PretrainedConfig())
     assert getter(other, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
+
+
+def test_the_fp8_eager_fallback_survives_repeated_decoration():
+    # replace_with_fp8_linear decorates the shared FP8Experts class once per layer, so the
+    # fallback must reach the eager forward rather than another dispatching wrapper.
+    fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
+    from transformers.integrations.moe import use_experts_implementation
+    from unsloth_zoo.temporary_patches import moe_utils_fp8
+
+    moe_utils_fp8.patch_fp8_experts_interface()
+
+    class Ungated(torch.nn.Module):
+        def forward(self, hidden_states, top_k_index, top_k_weights):
+            return "eager"
+
+    for _ in range(3):
+        Ungated = use_experts_implementation(
+            experts_class = Ungated, experts_interface = fp8.ALL_FP8_EXPERTS_FUNCTIONS,
+            has_bias = False, has_gate = False,
+        )
+    experts = Ungated.__new__(Ungated)
+    torch.nn.Module.__init__(experts)
+    experts.config = types.SimpleNamespace(_experts_implementation = UNSLOTH_EXPERTS_IMPLEMENTATION)
+    experts.has_gate = False
+    assert experts.forward("h", "i", "w") == "eager"

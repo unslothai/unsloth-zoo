@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import inspect
 from typing import Optional
 
 import torch
@@ -1092,7 +1093,10 @@ def patch_fp8_experts_interface():
             if _experts_are_fp4(self) or getattr(self, "has_gate", True) is False:
                 if original is not None:
                     return original(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
-                return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
+                # replace_with_fp8_linear re-decorates the shared FP8Experts class for every layer,
+                # so one __wrapped__ is another dispatching wrapper; unwrap to the eager forward.
+                eager = inspect.unwrap(type(self).forward)
+                return eager(self, hidden_states, top_k_index, top_k_weights)
             return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
         return _unsloth_fp8_dispatch
 
