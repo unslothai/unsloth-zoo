@@ -4403,10 +4403,7 @@ def patch_lora_forwards(torch_compile_options):
 
         # Check failed upcasting
         source = _patch_lora_input_cast(source)
-        # `inspect.getsource` unwrapped the integer-input wrapper on Linear4bit.forward to
-        # PEFT's original, so the regenerated forward has no cast. On a 4-bit layer the cast
-        # goes inline where the argument check was (one dtype test per call, no extra frame);
-        # anything else is re-wrapped after the loop.
+        # getsource unwrapped the integer-input wrapper, so on 4-bit re-add the cast inline.
         check_forward_args = "self._check_forward_args(x, *args, **kwargs)"
         integer_input_inline = "4bit" in child.lower() and check_forward_args in source
         source = source.replace(
@@ -4485,14 +4482,12 @@ def patch_lora_forwards(torch_compile_options):
                 + extra_prepend,
             ).unsloth_forward
             if integer_input_inline:
-                # patch_peft_lora_integer_input below sees the inline cast and does not wrap.
                 forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
     pass
-    # A regenerated Linear4bit.forward without the inline cast (its source had no argument
-    # check to replace) gets the integer-input wrapper back on top; with it this is a no-op.
+    # Re-wrap a regenerated Linear4bit.forward that got no inline cast.
     try:
         from .temporary_patches.misc import patch_peft_lora_integer_input
 

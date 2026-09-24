@@ -585,9 +585,7 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
-    # Under UNSLOTH_COMPILE_DISABLE=1 `_torch_compile` is a no-op, so the builders stay eager;
-    # the keyword aliases and the multi-device offset fix below are still needed, since
-    # remote code calls the builders the same way whether or not anything is compiled.
+    # No UNSLOTH_COMPILE_DISABLE early return: the kwarg aliases and device fix are still needed.
     try:
         import transformers.masking_utils as masking_utils
         import transformers.generation.utils as generation_utils
@@ -637,20 +635,8 @@ def patch_transformers_masks():
     )
 
     def wrap(f, original, prepared_mask_shortcut = True):
-        # transformers named the embeddings argument `input_embeds` up to 5.1 and
-        # `inputs_embeds` from 5.2 (huggingface/transformers#43916). Remote modeling
-        # code is written against one of them (Nemotron-H's
-        # `create_causal_mask(input_embeds = ...)` on 5.17 raised "unexpected keyword
-        # argument 'input_embeds'"), so pass whichever this transformers accepts, and
-        # read both here.
-        # `cache_position` is a separate, later change: the builders took it up to 5.8
-        # and derive the positions from past_key_values and position_ids from 5.9
-        # (#45884), so 5.2 through 5.8 is a real band where the new spelling and
-        # cache_position coexist. Remote code written against the older signature
-        # (Step-3.7, Nemotron-H) raised "unexpected keyword argument 'cache_position'".
-        # Both are decided from the signature, never from a version number: drop
-        # cache_position when this transformers has no parameter for it and no
-        # **kwargs to absorb it.
+        # input_embeds -> inputs_embeds in 5.2 (transformers#43916), cache_position removed in
+        # 5.9 (#45884); remote code uses either signature. Decide from the signature, not version.
         try:
             parameters = inspect.signature(original).parameters
         except (TypeError, ValueError):
@@ -694,11 +680,7 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(
         compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
     )
-    # The chunked builder takes the same call shape and the same rename, and
-    # create_masks_for_generate routes to it for a model with attention_chunk_size
-    # (the Llama 4 family), so remote code written against the older spelling hits
-    # the very TypeError the wrapper above exists to remove. Guard on the symbol:
-    # it does not exist on every supported transformers.
+    # create_masks_for_generate routes attention_chunk_size models (Llama 4) here; not on every version.
     if hasattr(masking_utils, "create_chunked_causal_mask"):
         original_create_chunked_causal_mask = getattr(
             masking_utils, "_unsloth_original_create_chunked_causal_mask",
@@ -709,15 +691,13 @@ def patch_transformers_masks():
             masking_utils.create_chunked_causal_mask, original_create_chunked_causal_mask
         )
     pass
-    # Stashed like the two above, so a re-apply reads the pristine signature and not
-    # the wrapper's (*args, **kwargs), which would silently disable this layer's rename.
+    # Stash the original: a re-apply reading the wrapper's (*args, **kwargs) disables the rename.
     original_create_masks_for_generate = getattr(
         masking_utils, "_unsloth_original_create_masks_for_generate",
         masking_utils.create_masks_for_generate,
     )
     masking_utils._unsloth_original_create_masks_for_generate = original_create_masks_for_generate
-    # No prepared-mask shortcut here: this one returns a dict keyed by layer type for
-    # hybrid configs, and transformers already passes a prepared 4-D mask through per layer.
+    # No prepared-mask shortcut: hybrid configs expect a dict keyed by layer type back.
     masking_utils.create_masks_for_generate = wrap(
         masking_utils.create_masks_for_generate,
         original_create_masks_for_generate,
@@ -2617,16 +2597,7 @@ TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
 
 
 def patch_relu_squared_activation_dtype():
-    """`relu2` keeps the dtype of its input under autocast.
-
-    transformers spells the Nemotron-H expert activation as `torch.square(relu(x))`, and
-    `square` is on autocast's float32 list, so a bf16 expert stack hands float32 to the
-    down projection and to whatever combines the experts. Modeling code that accumulates
-    the routed outputs in the router's dtype (the Nemotron-H hub checkpoints do, with
-    `index_add_` into a bf16 buffer) then stops with "self (BFloat16) and source (Float)
-    must have the same scalar type". `y * y` is the same product rounded once at the
-    same width the down projection would have cast it to, so the numbers do not move.
-    """
+    """`torch.square` autocasts to float32, breaking Nemotron-H's bf16 `index_add_`; use y * y."""
     try:
         import transformers.activations as activations_module
     except Exception:
@@ -2646,14 +2617,7 @@ TEMPORARY_PATCHES.append(patch_relu_squared_activation_dtype)
 
 
 def _lora_integer_input(self, x):
-    """`x` cast to the dtype a 4-bit LoRA layer computes in, when `x` is an integer tensor.
-
-    Under autocast the base result comes back in the autocast dtype whatever the layer's
-    compute_dtype says (bitsandbytes' default is float32), and the LoRA branch in the
-    autocast dtype too; casting to compute_dtype would leave the two to promote to float32
-    and the caller's index_add_ to raise all the same. Also called inline by the LoRA
-    forward `compiler.patch_lora_forwards` regenerates, so it costs nothing on float inputs.
-    """
+    """Prefer the autocast dtype: casting to compute_dtype (float32 default) promotes the output."""
     if x.is_floating_point() or x.is_complex():
         return x
     dtype = None
@@ -2674,17 +2638,7 @@ pass
 
 
 def patch_peft_lora_integer_input():
-    """An integer input never reaches a LoRA matmul on a bitsandbytes 4-bit layer.
-
-    PEFT's `Linear4bit.forward` casts the input to the adapter dtype only when autocast is
-    off; under autocast it trusts autocast, which leaves integer tensors alone, so the LoRA
-    branch runs `F.linear(uint8, bf16)` and stops with "expected mat1 and mat2 to have the
-    same dtype". The base 4-bit layer takes the same input without complaint, because it
-    casts to its compute dtype itself. Modeling code does produce such inputs: the Nemotron-H
-    hub checkpoints run every idle expert on `zeros(...).to(expert.down_proj.weight.dtype)`,
-    and on a 4-bit expert that dtype is uint8. The cast lands on the compute dtype of the
-    base layer, falling back to the adapter's dtype; floating inputs are untouched.
-    """
+    """Nemotron-H feeds uint8 zeros to idle 4-bit experts; PEFT LoRA under autocast then fails."""
     try:
         import peft.tuners.lora.bnb as peft_bnb
         Linear4bit = getattr(peft_bnb, "Linear4bit", None)

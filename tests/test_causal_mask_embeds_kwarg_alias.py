@@ -12,22 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The patched mask builders take the call shape of every transformers since 4.57.
-
-transformers called the embeddings argument `input_embeds` up to 5.0 and
-`inputs_embeds` after, and dropped `cache_position` from the builders after
-5.0. Remote modeling code is written against one shape: Nemotron-H calls
-`create_causal_mask(input_embeds = ..., cache_position = ...)`, which on
-transformers 5.17 raised "unexpected keyword argument 'input_embeds'" and,
-once that was renamed, "unexpected keyword argument 'cache_position'" (the
-Step-3.7 failure) on the first training step. The patched builder now passes
-whichever embeddings name this transformers accepts, drops `cache_position`
-when it has no parameter for it, and the requires_grad short cut reads both
-spellings.
-
-Each test states which arm it measures; the failing arm is a tree whose
-wrapper forwards the caller's spelling unchanged.
-"""
+"""Mask builders accept remote code's older call shape (input_embeds, cache_position)."""
 import inspect
 
 import pytest
@@ -70,7 +55,6 @@ def _call(builder, name, **extra):
 
 
 def test_the_original_refuses_the_other_spelling(patched):
-    """The precondition, on this transformers version."""
     name = _embeds_name()
     try:
         _call(patched._unsloth_original_create_causal_mask, _other(name))
@@ -82,7 +66,6 @@ def test_the_original_refuses_the_other_spelling(patched):
 
 
 def test_the_original_refuses_cache_position_when_it_dropped_it(patched):
-    """The precondition of the Step-3.7 failure, on a transformers past 5.0."""
     params = inspect.signature(patched._unsloth_original_create_causal_mask).parameters
     if "cache_position" in params:
         pytest.skip("this transformers still takes cache_position")
@@ -91,14 +74,12 @@ def test_the_original_refuses_cache_position_when_it_dropped_it(patched):
 
 
 def test_patched_builder_takes_the_older_call_shape(patched):
-    """Remote code's exact call: the older spelling plus cache_position."""
     name = _embeds_name()
     out = _call(patched.create_causal_mask, _other(name))
     assert out is None or isinstance(out, torch.Tensor)
 
 
 def test_patched_builder_accepts_both_spellings(patched):
-    """The arm that fails on a tree whose wrapper forwards the caller's spelling."""
     name = _embeds_name()
     native = _call(patched.create_causal_mask, name)
     remote = _call(patched.create_causal_mask, _other(name))
@@ -129,13 +110,11 @@ def test_sliding_window_builder_accepts_both_spellings(patched):
 
 
 def test_requires_grad_short_cut_reads_both_spellings(patched):
-    """A 4-D mask handed in with grad-tracking embeddings comes straight back."""
     name = _embeds_name()
     mask = torch.zeros(1, 1, 4, 4)
     embeds = torch.zeros(1, 4, 8, requires_grad = True)
     for spelling in (name, _other(name)):
         out = _call(patched.create_causal_mask, spelling, attention_mask = mask)
-        # the value under the other spelling is renamed first, so the short cut sees it
         assert out is mask or torch.equal(out, mask)
         out = patched.create_causal_mask(
             config = None, **{spelling: embeds}, attention_mask = mask,
@@ -145,9 +124,7 @@ def test_requires_grad_short_cut_reads_both_spellings(patched):
 
 
 def test_aliases_are_installed_with_compilation_disabled():
-    """UNSLOTH_COMPILE_DISABLE=1 is a supported setting; the patch used to return before
-    installing the aliases, so the remote-code call shapes failed there. One fresh
-    interpreter, because the flag is read at import."""
+    """Fresh interpreter: the flag is read at import."""
     import subprocess, sys, os
     code = (
         "import os; os.environ['UNSLOTH_COMPILE_DISABLE'] = '1'\n"
@@ -175,8 +152,6 @@ def test_aliases_are_installed_with_compilation_disabled():
 
 
 def test_generate_masks_keep_their_per_layer_mapping(patched):
-    """A hybrid config's create_masks_for_generate returns one mask per layer type; a prepared
-    4-D mask with grad-requiring embeddings must not collapse that into a bare tensor."""
     from transformers import AutoConfig
 
     original = patched._unsloth_original_create_masks_for_generate

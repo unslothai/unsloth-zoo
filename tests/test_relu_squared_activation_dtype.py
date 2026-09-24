@@ -1,12 +1,4 @@
-"""`relu2` keeps its input dtype under autocast.
-
-transformers spells it `torch.square(relu(x))`; `square` is on autocast's float32 list, so
-a bf16 Nemotron-H expert handed float32 to the down projection and to the routed-expert
-combine. The Nemotron-H hub modeling code accumulates that combine in the router's dtype
-with `index_add_`, which then fails with "self (BFloat16) and source (Float) must have the
-same scalar type". The patched form is the same product rounded once at the width the down
-projection would have cast it to.
-"""
+"""`relu2` keeps its input dtype under autocast (Nemotron-H bf16 `index_add_` combine)."""
 import pytest
 import torch
 
@@ -60,5 +52,5 @@ def test_nemotron_h_style_combine_no_longer_fails_under_autocast():
     with torch.autocast("cuda", dtype = torch.bfloat16):
         out = torch.zeros_like(x, dtype = router_w.dtype)
         expert = down(act(up(x))) * router_w
-        out.index_add_(0, torch.arange(16, device = "cuda"), expert)  # raised before the patch
+        out.index_add_(0, torch.arange(16, device = "cuda"), expert)
     assert out.dtype == torch.bfloat16

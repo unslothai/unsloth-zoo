@@ -1,12 +1,4 @@
-"""An integer input never reaches a LoRA matmul on a bitsandbytes 4-bit layer.
-
-PEFT's `Linear4bit.forward` casts the input to the adapter dtype only when autocast is off.
-Under autocast it trusts autocast, which leaves integer tensors alone, so the LoRA branch runs
-`F.linear(uint8, bf16)` and stops with "expected mat1 and mat2 to have the same dtype". The
-Nemotron-H hub checkpoints feed every idle expert `zeros(...).to(expert.down_proj.weight.dtype)`,
-which on a 4-bit expert is uint8, so the first step of a 512-expert model on a 512-token batch
-hit this on every layer.
-"""
+"""Integer inputs to a bitsandbytes 4-bit LoRA layer under autocast (Nemotron-H idle experts)."""
 import pytest
 import torch
 
@@ -27,7 +19,7 @@ def _lora_4bit_linear():
     base = torch.nn.Sequential(bnb.nn.Linear4bit(32, 64, bias = False, compute_dtype = torch.bfloat16, quant_type = "nf4"))
     base[0].weight = bnb.nn.Params4bit(torch.randn(64, 32, dtype = torch.bfloat16), requires_grad = False, quant_type = "nf4")
     base = base.cuda()
-    base.is_loaded_in_4bit = True  # what PEFT's dispatcher keys the bitsandbytes Linear4bit wrapper on
+    base.is_loaded_in_4bit = True  # PEFT's dispatcher keys Linear4bit on this
     model = get_peft_model(base, LoraConfig(r = 4, target_modules = ["0"], init_lora_weights = False))
     import peft.tuners.lora.bnb as peft_bnb
     assert isinstance(model.base_model.model[0], peft_bnb.Linear4bit)
@@ -78,10 +70,6 @@ def test_original_forward_fails_on_the_integer_input():
 
 @cuda
 def test_integer_input_under_autocast_takes_the_autocast_dtype_not_compute_dtype():
-    """bitsandbytes' default compute dtype is float32. Under a bfloat16 autocast the base
-    result comes back in the autocast dtype regardless, so casting the integer input to
-    compute_dtype left the base and LoRA branches to promote to float32 and the caller's
-    index_add_ to raise all the same. The cast target under autocast is the autocast dtype."""
     import bitsandbytes as bnb
     from peft import LoraConfig, get_peft_model
     import peft.tuners.lora.bnb as peft_bnb
@@ -104,9 +92,7 @@ def test_integer_input_under_autocast_takes_the_autocast_dtype_not_compute_dtype
 
 
 def test_the_cast_survives_a_regenerated_forward():
-    """patch_lora_forwards regenerates Linear4bit.forward from PEFT's source (getsource follows
-    __wrapped__ past this wrapper), so the cast must be re-applied once the new forward is
-    installed: the patch wraps whatever forward is on the class at the time."""
+    """getsource follows __wrapped__, so patch_lora_forwards must re-apply the wrapper."""
     import inspect
     from unsloth_zoo import compiler
     from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
@@ -115,7 +101,7 @@ def test_the_cast_survives_a_regenerated_forward():
     cls = _patch()
     original_wrapped = cls.forward
 
-    def regenerated(self, x, *args, **kwargs):  # what the compiler installs
+    def regenerated(self, x, *args, **kwargs):
         return original_wrapped.__wrapped__(self, x, *args, **kwargs)
 
     cls.forward = regenerated
