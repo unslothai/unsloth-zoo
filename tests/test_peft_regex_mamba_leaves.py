@@ -12,17 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The automatic LoRA targets of a Mamba-family model leave out out_proj and conv1d.
-
-A Mamba mixer hands out_proj.weight and conv1d straight to its fused kernels,
-so a LoRA wrapper on them never runs, and PEFT refuses both names on
-falcon_h1 / mamba / mamba2 / falcon_mamba / nemotron_h:
-"[PEFT:PeftType.LORA] Module 'out_proj' is incompatible with Mamba-based
-models". nvidia/Nemotron-3-Nano-Omni-30B-A3B's NemotronHForCausalLM died there
-right after the target regex was built.
-
-Small models, no downloads; each test states which arm it measures.
-"""
+"""Automatic LoRA targets of a Mamba-family model leave out out_proj and conv1d, which PEFT refuses."""
 import re
 from types import SimpleNamespace
 
@@ -65,7 +55,6 @@ def _matched(model, regex):
 
 
 def test_nemotron_h_leaves_out_proj_and_conv1d_out():
-    """The arm that fails on a tree without the exclusion: out_proj was a target."""
     model = _Model("nemotron_h")
     matched = _matched(model, get_peft_regex(model))
     assert matched
@@ -103,7 +92,6 @@ def test_model_without_config_is_untouched():
 
 
 class _Tower(nn.Module):
-    """A vision or audio attention block that owns an out_proj of its own."""
     def __init__(self, dim):
         super().__init__()
         self.q_proj = nn.Linear(dim, dim)
@@ -127,8 +115,6 @@ class _Wrapper(nn.Module):
 
 
 def test_nested_mamba_excludes_only_the_mixer_out_proj():
-    """A wrapper with a Mamba language model keeps the vision tower's out_proj: PEFT keys its
-    refusal off the outer model_type, and that tower feeds nothing to a fused kernel."""
     model = _Wrapper()
     regex = get_peft_regex(model, finetune_vision_layers = True, finetune_language_layers = True)
     matched = _matched(model, regex)

@@ -284,21 +284,9 @@ pass
 
 
 def _get_embedding_modules(model):
-    """Input embedding and output head of `model`, looking through wrappers.
+    """(input embeddings, lm_head), looking through wrappers with no head (Nemotron-3-Nano-Omni).
 
-    Multimodal remote-code models (nvidia/Nemotron-3-Nano-Omni-30B-A3B) wrap a
-    complete CausalLM as `language_model` and define neither accessor, so the
-    transformers defaults find `embed_tokens` but return None for the head as the
-    wrapper has no `lm_head` of its own. The first nested module whose own
-    `get_output_embeddings` answers is the language model that owns the head;
-    its input embeddings are taken from the same module so both come from one
-    vocabulary. Returns (None, None) when no module owns a head.
-
-    An accessor is judged before its own call: one that needs arguments
-    (stepfun-ai/Step-3.7-Flash) or raises NotImplementedError (transformers'
-    base implementation on composite models such as Qwen3-Omni) answers None,
-    while any other exception from inside a callable accessor propagates, so a
-    genuine failure is never read as "no embeddings".
+    Only an accessor needing arguments or raising NotImplementedError reads as None; other errors propagate.
     """
     def _own(module, name):
         getter = getattr(module, name, None)
@@ -315,14 +303,8 @@ def _get_embedding_modules(model):
             nested_head = _own(module, "get_output_embeddings")
             if nested_head is None: continue
             candidates.append((nested_head, _own(module, "get_input_embeddings")))
-        # named_modules() is registration order, so "the first module that answers"
-        # is whichever sub-model happens to be declared first. A wrapper that
-        # registers a head-owning vision decoder before `language_model` would hand
-        # back that decoder's matrices, and fix_untrained_tokens would write its mean
-        # embeddings into the wrong sub-model: the vocabularies are only compared by
-        # min(len) further down, so nothing raises. Prefer the module that owns the
-        # embeddings the model's OWN accessor already returned - that is the language
-        # model this tokenizer indexes - and fall back to the first answer otherwise.
+        # Prefer the sub-model owning the top-level input embeddings; first-registered could be a
+        # vision decoder, silently corrupted since vocab sizes are only compared by min(len).
         for nested_head, nested_embeddings in candidates:
             if embeddings is not None and nested_embeddings is embeddings:
                 return embeddings, nested_head
@@ -342,9 +324,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     # All Unsloth Zoo code licensed under LGPLv3
     # Not every checkpoint has a single embedding to reset, and `hasattr` does not
     # say so: transformers' base get_input_embeddings raises NotImplementedError
-    # for composite models (Qwen3-Omni), remote code can declare a signature
-    # that cannot be called (stepfun-ai/Step-3.7-Flash), and a multimodal
-    # wrapper may own no head itself while its language model does.
+    # for composite models (Qwen3-Omni), and remote code can declare a signature
+    # that cannot be called (stepfun-ai/Step-3.7-Flash).
     embeddings, lm_head = _get_embedding_modules(model)
     # None is a legitimate "I have none", and `.weight` on it is an
     # AttributeError several frames from the cause.

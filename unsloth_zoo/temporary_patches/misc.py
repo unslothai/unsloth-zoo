@@ -585,9 +585,7 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
-    # Under UNSLOTH_COMPILE_DISABLE=1 `_torch_compile` is a no-op, so the builders stay eager;
-    # the keyword aliases and the multi-device offset fix below are still needed, since
-    # remote code calls the builders the same way whether or not anything is compiled.
+    # No UNSLOTH_COMPILE_DISABLE early return: `_torch_compile` is already a no-op there, and the kwarg fixes still apply.
     try:
         import transformers.masking_utils as masking_utils
         import transformers.generation.utils as generation_utils
@@ -637,20 +635,8 @@ def patch_transformers_masks():
     )
 
     def wrap(f, original, prepared_mask_shortcut = True):
-        # transformers named the embeddings argument `input_embeds` up to 5.1 and
-        # `inputs_embeds` from 5.2 (huggingface/transformers#43916). Remote modeling
-        # code is written against one of them (Nemotron-H's
-        # `create_causal_mask(input_embeds = ...)` on 5.17 raised "unexpected keyword
-        # argument 'input_embeds'"), so pass whichever this transformers accepts, and
-        # read both here.
-        # `cache_position` is a separate, later change: the builders took it up to 5.8
-        # and derive the positions from past_key_values and position_ids from 5.9
-        # (#45884), so 5.2 through 5.8 is a real band where the new spelling and
-        # cache_position coexist. Remote code written against the older signature
-        # (Step-3.7, Nemotron-H) raised "unexpected keyword argument 'cache_position'".
-        # Both are decided from the signature, never from a version number: drop
-        # cache_position when this transformers has no parameter for it and no
-        # **kwargs to absorb it.
+        # Remote code uses either `input_embeds` (<= 5.1) or `inputs_embeds` (5.2+, transformers#43916),
+        # and passes `cache_position`, removed in 5.9 (#45884). Decide from the signature, not the version.
         try:
             parameters = inspect.signature(original).parameters
         except (TypeError, ValueError):
@@ -694,11 +680,7 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(
         compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
     )
-    # The chunked builder takes the same call shape and the same rename, and
-    # create_masks_for_generate routes to it for a model with attention_chunk_size
-    # (the Llama 4 family), so remote code written against the older spelling hits
-    # the very TypeError the wrapper above exists to remove. Guard on the symbol:
-    # it does not exist on every supported transformers.
+    # Llama 4 (attention_chunk_size) routes here too; not every supported transformers has it.
     if hasattr(masking_utils, "create_chunked_causal_mask"):
         original_create_chunked_causal_mask = getattr(
             masking_utils, "_unsloth_original_create_chunked_causal_mask",
@@ -709,15 +691,13 @@ def patch_transformers_masks():
             masking_utils.create_chunked_causal_mask, original_create_chunked_causal_mask
         )
     pass
-    # Stashed like the two above, so a re-apply reads the pristine signature and not
-    # the wrapper's (*args, **kwargs), which would silently disable this layer's rename.
+    # Stash the original: a re-apply must read its signature, not the wrapper's (*args, **kwargs).
     original_create_masks_for_generate = getattr(
         masking_utils, "_unsloth_original_create_masks_for_generate",
         masking_utils.create_masks_for_generate,
     )
     masking_utils._unsloth_original_create_masks_for_generate = original_create_masks_for_generate
-    # No prepared-mask shortcut here: this one returns a dict keyed by layer type for
-    # hybrid configs, and transformers already passes a prepared 4-D mask through per layer.
+    # No prepared-mask shortcut: hybrid configs need the per-layer-type dict this returns.
     masking_utils.create_masks_for_generate = wrap(
         masking_utils.create_masks_for_generate,
         original_create_masks_for_generate,

@@ -12,18 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""fix_untrained_tokens must find the output head of a wrapped CausalLM.
-
-nvidia/Nemotron-3-Nano-Omni-30B-A3B wraps a complete NemotronHForCausalLM as
-`language_model` inside a PreTrainedModel that defines neither embedding
-accessor. transformers' default `get_input_embeddings` finds `embed_tokens`
-through the wrapper, but `get_output_embeddings` returns None because the
-wrapper has no `lm_head` of its own, so SFTTrainer's untrained-token pass died
-with "'NoneType' object has no attribute 'weight'" right after get_peft_model.
-
-Built on small PreTrainedModels, no downloads; each test states which arm it
-measures.
-"""
+"""fix_untrained_tokens must find the head of a wrapped CausalLM (Nemotron-3-Nano-Omni)."""
 import pytest
 import torch
 import torch.nn as nn
@@ -55,7 +44,6 @@ class _CausalLM(PreTrainedModel):
 
 
 class _Wrapper(PreTrainedModel):
-    """The Nemotron-Omni shape: a wrapper with no accessors of its own."""
     config_class = _Cfg
 
     def __init__(self, config):
@@ -81,13 +69,12 @@ def _model_with_untrained_rows():
     with torch.no_grad():
         lm.embed_tokens.weight.normal_()
         lm.lm_head.weight.normal_()
-        lm.embed_tokens.weight[VOCAB - 2:].zero_()   # two untrained tokens
+        lm.embed_tokens.weight[VOCAB - 2:].zero_()
         lm.lm_head.weight[VOCAB - 2:].zero_()
     return model
 
 
 def test_wrapper_alone_has_no_head():
-    """The precondition: transformers cannot see the head through the wrapper."""
     model = _model_with_untrained_rows()
     assert model.get_output_embeddings() is None
 
@@ -105,16 +92,11 @@ def test_resolver_prefers_the_model_s_own_accessors():
 
 
 class _TwoSubModels(PreTrainedModel):
-    """A wrapper that registers a head-owning sub-model BEFORE its language model.
-
-    named_modules() is registration order, so "the first nested module that
-    answers" is whichever sub-model happens to be declared first.
-    """
     config_class = _Cfg
 
     def __init__(self, config):
         super().__init__(config)
-        self.vision_decoder = _CausalLM(config)     # registered first, own head
+        self.vision_decoder = _CausalLM(config)  # must register before language_model
         self.language_model = _CausalLM(config)
 
     def get_input_embeddings(self):
@@ -122,7 +104,6 @@ class _TwoSubModels(PreTrainedModel):
 
 
 def test_resolver_prefers_the_submodel_the_model_points_at():
-    """The arm that fails when the search takes the first answer it finds."""
     model = _TwoSubModels(_Cfg())
     embeddings, lm_head = _get_embedding_modules(model)
     assert embeddings is model.language_model.embed_tokens
@@ -130,8 +111,6 @@ def test_resolver_prefers_the_submodel_the_model_points_at():
 
 
 def test_fix_untrained_tokens_writes_into_the_right_submodel():
-    """A wrong head is silent, not loud: vocabularies are only compared by min(len),
-    so the mean embeddings land in the other sub-model and nothing raises."""
     torch.manual_seed(0)
     model = _TwoSubModels(_Cfg(_name_or_path = "test/two-submodels"))
     for sub in (model.vision_decoder, model.language_model):
@@ -156,14 +135,12 @@ def test_resolver_returns_none_when_nothing_owns_a_head():
 
 
 def test_fix_untrained_tokens_runs_through_the_wrapper():
-    """The arm that fails on a tree without the resolver."""
     model = _model_with_untrained_rows()
     lm = model.language_model
     before = lm.lm_head.weight[VOCAB - 2:].clone()
     assert torch.all(before == 0)
     ds = Dataset.from_dict({"input_ids": [[1, 2, VOCAB - 1, VOCAB - 2]]})
     fix_untrained_tokens(model, _Tokenizer(), ds)
-    # the untrained rows that the dataset uses were reset to the trained mean
     assert not torch.all(lm.lm_head.weight[VOCAB - 2:] == 0)
     assert not torch.all(lm.embed_tokens.weight[VOCAB - 2:] == 0)
 
@@ -178,13 +155,11 @@ def test_fix_untrained_tokens_skips_a_headless_model(caplog):
             self.encoder = nn.Linear(DIM, DIM)
     ds = Dataset.from_dict({"input_ids": [[1, 2]]})
     with caplog.at_level(logging.WARNING, logger = tokenizer_utils.logger.name):
-        fix_untrained_tokens(_Headless(_Cfg()), _Tokenizer(), ds)   # no raise
+        fix_untrained_tokens(_Headless(_Cfg()), _Tokenizer(), ds)
     assert any("Skipping the untrained token fix" in r.message for r in caplog.records)
 
 
 def test_resolver_lets_a_type_error_inside_an_accessor_propagate():
-    """A TypeError raised inside a callable accessor is a real failure, not
-    "no embeddings": the main-line guard must survive the wrapper search."""
     class _Broken(PreTrainedModel):
         config_class = _Cfg
         def __init__(self, config):
