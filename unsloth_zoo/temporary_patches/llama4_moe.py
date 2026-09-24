@@ -79,6 +79,18 @@ def _llama4_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts
 
 @torch.compiler.disable
 def Llama4TextMoe_forward(self, hidden_states):
+    if not getattr(type(self.experts), "_unsloth_already_patched", False):
+        # Pre-quantized per-expert checkpoints (bnb-community) get transformers'
+        # SequentialLlama4TextExperts, which takes only the hidden states: run the
+        # model's own dense routing (router score scales the input of every expert).
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_scores, router_logits = self.router(hidden_states)
+        routed_in = hidden_states.repeat(router_scores.shape[1], 1)
+        routed_in = routed_in * router_scores.transpose(0, 1).reshape(-1, 1)
+        routed_out = self.experts(routed_in)
+        out = self.shared_expert(hidden_states)
+        out.add_(routed_out.reshape(router_scores.shape[1], -1, routed_out.shape[-1]).sum(dim = 0))
+        return out, router_logits
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     router_scores, router_logits = self.router(hidden_states)
     # router_scores is (T, E): sigmoid(logit) for the top_k experts, 0 elsewhere,

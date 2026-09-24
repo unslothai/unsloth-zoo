@@ -182,3 +182,37 @@ def test_no_patch_before_the_tuple_returning_router(monkeypatch):
     patch_llama4_moe()
     assert Llama4TextExperts.forward is experts_forward
     assert Llama4TextMoe.forward is moe_forward
+
+
+def test_per_expert_experts_keep_the_models_own_forward():
+    """Pre-quantized per-expert checkpoints get transformers' SequentialLlama4TextExperts,
+    which only takes hidden states: the patched MoE forward must run the model's dense
+    routing for them instead of calling them with routing arguments."""
+    try:
+        from transformers.quantizers.base import SequentialLlama4TextExperts
+    except Exception as e:
+        pytest.skip(f"no SequentialLlama4TextExperts in this transformers: {e}")
+    patch_llama4_moe()
+    assert Llama4TextMoe.forward is Llama4TextMoe_forward
+    moe = make_moe(1, torch.float32)
+    config = Llama4TextConfig(
+        hidden_size = HIDDEN, intermediate_size = 128, intermediate_size_mlp = 256,
+        num_local_experts = 4, num_experts_per_tok = 1, num_hidden_layers = 1,
+        num_attention_heads = 2, num_key_value_heads = 1, head_dim = 32, vocab_size = 256,
+    )
+    moe.experts = SequentialLlama4TextExperts(config).to(DEVICE)
+    with torch.no_grad():
+        for p in moe.experts.parameters():
+            p.normal_(0, 0.05)
+    x = torch.randn(3, 5, HIDDEN, device = DEVICE)
+    out, logits = moe(x)
+    # Per token: shared expert plus each selected expert on the input scaled by its score.
+    flat = x.reshape(-1, HIDDEN)
+    ref_logits = torch.nn.functional.linear(flat, moe.router.weight)
+    top_value, top_index = torch.topk(ref_logits, 1, dim = 1)
+    ref_out = moe.shared_expert(flat)
+    for t in range(flat.shape[0]):
+        e = int(top_index[t, 0])
+        ref_out[t] += moe.experts[e](flat[t : t + 1] * torch.sigmoid(top_value[t, 0]))[0]
+    assert torch.equal(logits, ref_logits)
+    assert torch.allclose(out, ref_out, atol = 1e-5, rtol = 1e-5), (out - ref_out).abs().max()
