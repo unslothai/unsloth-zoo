@@ -24,6 +24,7 @@ standard backend after on-the-fly dequantization.
 
 import os
 import re
+import threading
 from typing import Optional, List, Union
 
 import torch
@@ -1327,6 +1328,7 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
 # An experts module key with no expert index after `experts.`, and the per-expert
 # form. The leading `(?:^|\.)` keeps `shared_experts.` (DeepSeek-style) out.
 _FUSED_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.(?:gate_up_proj|gate_proj|up_proj|down_proj)(?:\.|$)")
+_KEEP_FUSED_LOCK = threading.RLock()
 _PER_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.\d+\.")
 
 
@@ -1400,6 +1402,12 @@ def patch_bnb4bit_keep_fused_experts():
         return
 
     def patched_preprocess_model(self, model, dtype = None, **kwargs):
+        # The swap table is process-global: hold one lock across pop, load and
+        # restore so a concurrent pre-quantized load never sees it popped.
+        with _KEEP_FUSED_LOCK:
+            return _keep_fused_preprocess(self, model, dtype, **kwargs)
+
+    def _keep_fused_preprocess(self, model, dtype = None, **kwargs):
         kept = {}
         if getattr(self, "pre_quantized", False):
             names = _swappable_fused_expert_classes(model, swap_table)
