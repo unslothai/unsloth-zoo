@@ -78,6 +78,40 @@ def test_torch_reference_matches_transformers():
     assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = True)), _bits(_reference(blocks, scales)))
 
 
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])
+def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_bytes):
+    # Chunks of 1 row, of a row count that does not divide N (so a transposed chunk is cut at an
+    # expert edge), and of the whole stack all write the unchunked result, into a fresh or given buffer.
+    monkeypatch.setattr(mxd, "_TORCH_CHUNK_BYTES", chunk_bytes)
+    blocks, scales = _random_mxfp4(3, 7, 64, low = 0, high = 255)
+    want = _reference(blocks, scales)
+    if not transpose:
+        want = want.transpose(-2, -1).contiguous()
+    assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = transpose)), _bits(want))
+    out = torch.full_like(want, float("nan"))
+    assert mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = out) is out
+    assert torch.equal(_bits(out), _bits(want))
+    # A non-contiguous buffer and a 2-D (rows, G, 16) input.
+    strided = torch.empty(want.shape[:-1] + (want.shape[-1] * 2,), dtype = want.dtype)[..., ::2]
+    mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = strided)
+    assert torch.equal(_bits(strided), _bits(want))
+    two_d = mxfp4_dequantize_torch(blocks[0], scales[0], transpose = transpose)
+    assert torch.equal(_bits(two_d), _bits(want[0]))
+
+
+@needs_cuda
+def test_torch_fallback_never_materialises_a_whole_stack_of_indices():
+    # One 64 MB packed stack: unchunked, its int64 indices alone are 512 MB.
+    blocks, scales = _random_mxfp4(8, 1024, 8192, device = "cuda")
+    out = torch.empty(8, 8192, 1024, dtype = torch.bfloat16, device = "cuda")
+    torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    mxfp4_dequantize_torch(blocks, scales, transpose = True, out = out)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - base < 4 * mxd._TORCH_CHUNK_BYTES
+
 @needs_cuda
 @needs_triton
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

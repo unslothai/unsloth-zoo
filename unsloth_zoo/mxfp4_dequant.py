@@ -47,18 +47,44 @@ except Exception:
     _HAS_TRITON = False
 
 
-def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False):
-    """Reference: the same arithmetic as transformers' convert_moe_packed_tensors."""
+# Rows per step of the torch path: bounds its int64 index and scaled temporaries to ~256 MB
+# instead of materialising them for a whole expert stack (8.5 GB for a gpt-oss-120b projection).
+_TORCH_CHUNK_BYTES = 256 << 20
+
+
+def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None):
+    """Reference: the same arithmetic as transformers' convert_moe_packed_tensors, done in row
+    chunks written straight into the output."""
     lut = torch.tensor(_FP4_VALUES, dtype = dtype, device = blocks.device)
     *prefix, G, B = blocks.shape
-    out = torch.empty(*prefix, G, B * 2, dtype = dtype, device = blocks.device)
-    out[..., 0::2] = lut[(blocks & 0x0F).long()]
-    out[..., 1::2] = lut[(blocks >> 4).long()]
-    out = torch.ldexp(out, (scales.to(torch.int32) - 127).unsqueeze(-1)).to(dtype)
-    out = out.reshape(*prefix, G * B * 2)
-    if transpose:
-        out = out.transpose(-2, -1).contiguous()
-    return out
+    if transpose and not prefix:
+        raise ValueError("Unsloth: transpose needs MXFP4 blocks with a row dim")
+    N = prefix[-1] if prefix else 1
+    R = blocks.numel() // (G * B)
+    shape = (*prefix[:-1], G * B * 2, N) if transpose else (*prefix, G * B * 2)
+    buf = out if out is not None and out.is_contiguous() and out.dtype == dtype else torch.empty(shape, dtype = dtype, device = blocks.device)
+    rows_in = blocks.reshape(R, G, B)
+    scales_in = scales.reshape(R, G)
+    # Transposed: row r lands in column r % N of expert r // N; a chunk never crosses an expert.
+    dst = buf.view(R // N, G * B * 2, N) if transpose else buf.view(R, G * B * 2)
+    step = max(1, min(N if transpose else R, _TORCH_CHUNK_BYTES // (G * B * 2 * 8)))
+    for r0 in range(0, R, step):
+        r1 = min(r0 + step, (r0 // N + 1) * N if transpose else R)
+        b = rows_in[r0:r1]
+        piece = torch.empty(r1 - r0, G, B * 2, dtype = dtype, device = blocks.device)
+        piece[..., 0::2] = lut[(b & 0x0F).long()]
+        piece[..., 1::2] = lut[(b >> 4).long()]
+        piece = torch.ldexp(piece, (scales_in[r0:r1].to(torch.int32) - 127).unsqueeze(-1)).to(dtype)
+        piece = piece.reshape(r1 - r0, G * B * 2)
+        if transpose:
+            e, i0 = divmod(r0, N)
+            dst[e, :, i0:i0 + (r1 - r0)] = piece.T
+        else:
+            dst[r0:r1] = piece
+    if out is not None and buf is not out:
+        out.copy_(buf)
+        return out
+    return buf
 
 
 if _HAS_TRITON:
@@ -211,20 +237,12 @@ def mxfp4_dequantize(
         not _triton_usable(blocks) or blocks.dim() < 3
         or not _kernel_verified(blocks.device, dtype, transpose)
     ):
-        full = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
-        if out is not None:
-            out.copy_(full)
-            return out
-        return full
+        return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
     try:
         return _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out)
     except Exception as exception:
         _kernel_fail(exception)
-        full = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
-        if out is not None:
-            out.copy_(full)
-            return out
-        return full
+        return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
 
 
 def _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out):
