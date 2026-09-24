@@ -30,12 +30,15 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+import unsloth_zoo.saving_utils as saving_utils
 from unsloth_zoo.saving_utils import (
-    _rewrite_shards_text_only,
+    TextOnlyRemapError,
+    _stage_shards_text_only,
     _write_text_only_index,
     renumber_safetensor_files,
 )
@@ -66,6 +69,32 @@ def _keys_in(path):
         return set(f.keys())
 
 
+def _file_hashes(directory):
+    import hashlib
+    hashes = {}
+    for name in os.listdir(directory):
+        with open(os.path.join(directory, name), "rb") as f:
+            hashes[name] = hashlib.sha256(f.read()).hexdigest()
+    return hashes
+
+
+def _staging_files(directory):
+    return [f for f in os.listdir(directory) if f.startswith(".unsloth-shard-")]
+
+
+def _commit(directory, staged):
+    """Mirror the commit half of the post-merge block: replace, delete, return kept names."""
+    kept = []
+    for filename, staging_path in staged.items():
+        file_path = os.path.join(directory, filename)
+        if staging_path is None:
+            if os.path.exists(file_path): os.remove(file_path)
+            continue
+        os.replace(staging_path, file_path)
+        kept.append(filename)
+    return kept
+
+
 def test_a_shard_holding_only_vision_weights_is_deleted(tmp_path):
     d = str(tmp_path)
     names = _write_shards(d, [
@@ -74,7 +103,7 @@ def test_a_shard_holding_only_vision_weights_is_deleted(tmp_path):
         [KEY_MAP[TEXT[1]], KEY_MAP[TEXT[2]]],
     ])
 
-    kept = _rewrite_shards_text_only(d, names, KEY_MAP)
+    kept = _commit(d, _stage_shards_text_only(d, names, KEY_MAP))
 
     assert kept == [names[0], names[2]], f"kept {kept}"
     assert not os.path.exists(os.path.join(d, names[1])), "the all-vision shard is still on disk"
@@ -98,7 +127,7 @@ def test_the_index_follows_the_shards_through_the_renumber(tmp_path):
             **{KEY_MAP[TEXT[1]] : names[2], KEY_MAP[TEXT[2]] : names[2]},
         }}, f)
 
-    kept = _rewrite_shards_text_only(d, names, KEY_MAP)
+    kept = _commit(d, _stage_shards_text_only(d, names, KEY_MAP))
     final = renumber_safetensor_files(kept, d)
     _write_text_only_index(d, final)
 
@@ -121,10 +150,58 @@ def test_a_single_surviving_shard_loses_the_index_entirely(tmp_path):
     with open(index_path, "w") as f:
         json.dump({"metadata" : {}, "weight_map" : {k : names[0] for k in _vision(2)}}, f)
 
-    final = renumber_safetensor_files(_rewrite_shards_text_only(d, names, KEY_MAP), d)
+    kept = _commit(d, _stage_shards_text_only(d, names, KEY_MAP))
+    final = renumber_safetensor_files(kept, d)
     _write_text_only_index(d, final)
 
     assert final == ["model.safetensors"], f"final list is {final}"
     assert sorted(f for f in os.listdir(d) if f.endswith(".safetensors")) == ["model.safetensors"]
     assert not os.path.exists(index_path), "a one-shard checkpoint kept its index"
     assert _keys_in(os.path.join(d, "model.safetensors")) == set(TEXT)
+
+
+def test_a_write_failure_mid_staging_leaves_every_shard_untouched(tmp_path, monkeypatch):
+    """Regression for the #1097 review: a failure must not have rewritten anything yet.
+
+    Drives `_stage_shards_text_only` directly rather than the full merge function, which
+    needs a real model and hub plumbing this unit test has no reason to construct; the
+    helper is exactly the stage/verify unit the review asked to make crash-safe, and the
+    commit half (`_commit` above) is proven inert on a raised exception by never running.
+    """
+    d = str(tmp_path)
+    names = _write_shards(d, [
+        [KEY_MAP[TEXT[0]]] + _vision(1),
+        [KEY_MAP[TEXT[1]], KEY_MAP[TEXT[2]]],
+    ])
+    before = _file_hashes(d)
+    calls = {"n" : 0}
+    real_save_file = saving_utils.save_file
+
+    def _flaky_save_file(tensors, path, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError(28, "No space left on device")
+        return real_save_file(tensors, path, *args, **kwargs)
+
+    monkeypatch.setattr(saving_utils, "save_file", _flaky_save_file)
+
+    with pytest.raises(OSError):
+        _stage_shards_text_only(d, names, KEY_MAP)
+
+    assert _file_hashes(d) == before, "an original shard was modified before the raise"
+    assert _staging_files(d) == [], "a staging file survived the failure"
+
+
+def test_a_verification_mismatch_leaves_every_shard_untouched(tmp_path):
+    """A plan the shards cannot satisfy must not commit a partial rewrite either."""
+    d = str(tmp_path)
+    names = _write_shards(d, [[KEY_MAP[TEXT[0]]], [KEY_MAP[TEXT[1]], KEY_MAP[TEXT[2]]]])
+    before = _file_hashes(d)
+    # A key whose base tensor is on none of the shards: staging can never satisfy this plan.
+    bad_plan = dict(KEY_MAP, **{"model.layers.1.self_attn.q_proj.weight" : "language_model.model.layers.1.self_attn.q_proj.weight"})
+
+    with pytest.raises(TextOnlyRemapError):
+        _stage_shards_text_only(d, names, bad_plan)
+
+    assert _file_hashes(d) == before, "an original shard was modified on a plan mismatch"
+    assert _staging_files(d) == [], "a staging file survived the mismatch"
