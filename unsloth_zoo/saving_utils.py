@@ -3826,9 +3826,7 @@ def _text_only_key_map(text_keys, base_keys, tie_word_embeddings = False):
     """
     base_keys = set(base_keys)
     text_keys = set(text_keys)
-    # A tied head owns no tensor anywhere: gemma3 ships 883 keys and not one is an lm_head,
-    # because the reload reties it from the embeddings. Its absence is the checkpoint being
-    # right, not a key this failed to place.
+    # A tied head owns no tensor anywhere (gemma3 has no lm_head, reload reties it), so its absence is correct, not unplaced.
     tied = {
         key for key in text_keys
         if tie_word_embeddings and key.rpartition(".")[0].rpartition(".")[2] == "lm_head"
@@ -3873,9 +3871,7 @@ def _text_only_key_map(text_keys, base_keys, tie_word_embeddings = False):
         return key_map
     pass
 
-    # Several prefix pairs can describe the same rewrite (a longer text prefix against a
-    # correspondingly longer base one). That is harmless while they agree; disagreeing means
-    # the checkpoint admits two readings and guessing between them is how #969 happened.
+    # Several prefix pairs can describe the same rewrite; agreeing is harmless, disagreeing means two readings and guessing is how #969 happened.
     resolved = []
     for text_prefix, base_prefix in sorted(candidates):
         key_map = _build(text_prefix, base_prefix)
@@ -4373,9 +4369,7 @@ def merge_and_overwrite_lora(
             base_config = config
         else:
             _carry_over_vocab_size(base_config, config)
-        # Kept for the text-only drop after the merge, which needs to know the weights came
-        # from a composite checkpoint. The `except` above sets this to `config` itself, and
-        # `_is_text_only_export` reads that as "not composite", which is right.
+        # Kept for the text-only drop after the merge to know if the weights came from a composite checkpoint; the `except` above sets this to `config`, read as not composite.
         _text_only_base_config = base_config
         base_config.save_pretrained(save_directory)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
@@ -4792,14 +4786,7 @@ def merge_and_overwrite_lora(
         if push_to_hub:
             upload_items("model.safetensors.index.json")
 
-    # `text_only = True` asked for a text model. #1073 made the export loadable by declaring
-    # the VLM architecture the weights actually carry; this brings the weights to the request
-    # instead, dropping the vision and audio tensors and renaming what is left into the
-    # text-only namespace, so the checkpoint is the model that was asked for (#969, second
-    # direction). How much smaller that makes it is entirely the model's business: it is 10%
-    # off gemma-3-4b-it, whose SigLIP tower is small next to the decoder, and far more off an
-    # omni model carrying audio and speech stacks. Anything that cannot be mapped leaves the
-    # export exactly as #1073 writes it.
+    # `text_only = True` asked for a text model: this reverses #1073 on this path, dropping vision/audio tensors and renaming what remains into the text-only namespace; anything unmappable keeps the #1073 export as written (#969).
     if save_method == "merged_16bit" and _is_text_only_export(config, _text_only_base_config):
         if low_disk_space_usage and push_to_hub:
             warnings.warn(
