@@ -280,6 +280,8 @@ def dense_expert_modules(experts, device = "cpu"):
     """The stacks (packed, or dense after a merge) as the per-expert ``w1`` / ``w2`` / ``w3``
     Linears of the checkpoint they were loaded from, so a full save writes keys the remote code
     reloads (``experts.<i>.w1.weight``) instead of the stack names."""
+    # A stack saved before its first forward still holds the raw loaded bytes.
+    experts.finalize()
     dtype = experts.mxfp4_dtype
     I = experts.intermediate_size
     gate_up = _dense_stack(experts.gate_up_proj, dtype).to(device)  # (E, H, 2I)

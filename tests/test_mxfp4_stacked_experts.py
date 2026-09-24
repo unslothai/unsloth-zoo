@@ -66,7 +66,7 @@ def _ct_decompress(packed, scale):
     return comp.decompress({"weight_packed": packed, "weight_scale": scale}, scheme)["weight"].float()
 
 
-def _experts(fused = True, seed = 0):
+def _experts(fused = True, seed = 0, finalize = True):
     ckpt = _checkpoint_bytes(seed)
     module = Mxfp4StackedExperts(E, H, I, _Situ() if fused else nn.SiLU(), fused, device = "cpu")
     module.gate_up_blocks.data = stack_packed_experts(
@@ -77,7 +77,7 @@ def _experts(fused = True, seed = 0):
     )
     module.down_blocks.data = stack_packed_experts([[p for p, _ in ckpt["w2"]]])
     module.down_scales.data = stack_packed_experts([[s for _, s in ckpt["w2"]]], blocks = False)
-    return module.finalize().to(DEVICE), ckpt
+    return (module.finalize() if finalize else module).to(DEVICE), ckpt
 
 
 def _dense(module):
@@ -352,6 +352,11 @@ def test_dense_expert_modules_are_the_checkpoint_linears():
             assert linear.weight.device.type == "cpu" and linear.bias is None
             want = _ct_decompress(*ckpt[w][e]).to(torch.bfloat16)
             assert torch.equal(linear.weight, want), (e, w)
+    # A stack saved before its first forward still holds the raw loaded bytes.
+    unfinalized, _ = _experts(finalize = False)
+    assert "gate_up_blocks" in unfinalized._parameters
+    experts = dense_expert_modules(unfinalized)
+    assert torch.equal(experts[1].w2.weight, _ct_decompress(*ckpt["w2"][1]).to(torch.bfloat16))
     # A merged (dense) stack is split the same way.
     gate_up, _ = _dense(module)
     module.gate_up_proj = nn.Parameter(gate_up + 1, requires_grad = False)
