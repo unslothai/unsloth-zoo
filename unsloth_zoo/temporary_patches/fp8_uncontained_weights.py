@@ -12,28 +12,8 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""FP8 checkpoints whose quantized tensors have no FP8 module to land in.
-
-transformers gives a pre-quantized fine-grained FP8 checkpoint two homes for a
-`weight` plus `weight_scale_inv` pair: `FP8Linear` (an `nn.Linear` it swapped
-in) and `FP8Experts` (a transformers experts class it knows). A remote-code
-module that keeps its expert stack as a bare 3-D parameter (stepfun-ai/
-Step-3.7-Flash-FP8: `MoELinear.weight`, e4m3 `(288, 1280, 4096)` with a
-`(288, 10, 32)` fp32 block-scale grid) gets neither. The loader then casts the
-e4m3 bytes to the parameter's bf16 unscaled and reports the scale as
-UNEXPECTED, and the model trains from wrong weights: 15.1 loss on the first
-step where the bf16 checkpoint gives 1.7.
-
-With `dequantize = True` transformers already appends a generic
-`weight$ + weight_scale_inv -> weight` converter that folds the scale in. This
-patch appends the same converter when `dequantize` is off, with one twist: a
-target that owns its own scale (`FP8Linear`, `FP8Experts`) passes through
-untouched so the FP8 kernels keep their packed weights, and only a target
-without a container is dequantized into its own dtype. A container whose
-checkpoint tensor arrives without a scale (the checkpoint's
-`modules_to_not_convert` forgot it, so the bf16 weight is cast to e4m3) gets a
-scale of ones instead of the uninitialised memory it would otherwise read.
-"""
+"""Dequantize FP8 weights with no FP8 container (Step-3.7-Flash-FP8's bare 3-D `MoELinear.weight`), which the
+loader would otherwise cast to bf16 unscaled. FP8Linear / FP8Experts targets keep their packed weights."""
 import torch
 
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
@@ -59,8 +39,6 @@ def _scale_attr_for(attr):
 
 
 def _target_owns_scale(model, full_layer_name):
-    """True when the parameter's module carries the matching `*_scale_inv`,
-    which is how `FP8Linear` and `FP8Experts` store a packed weight."""
     module, attr = _module_and_attr(model, full_layer_name)
     if module is None or attr is None:
         return False
@@ -73,15 +51,7 @@ def _first(value):
 
 
 def _dequantized_targets(model):
-    """The names this converter folded a checkpoint scale into on load.
-
-    Kept on the MODEL, not on the op. transformers' loader takes a deepcopy of
-    the converter for every target key ("each target key gets its own converter
-    instance", core_model_loading.py), so a set written by `convert` lives on a
-    copy that is discarded, while `model._weight_conversions` keeps the
-    ORIGINAL op and is what `save_pretrained` reverses. The model is the only
-    object that survives from the load to the save.
-    """
+    # On the model, not the op: the loader deepcopies the op per target key, but save reverses the original.
     if model is None:
         return set()
     names = getattr(model, "_unsloth_fp8_dequantized_targets", None)
@@ -91,29 +61,19 @@ def _dequantized_targets(model):
     try:
         model._unsloth_fp8_dequantized_targets = names
     except Exception:
-        # A model that refuses attributes still saves correctly: an empty set
-        # means "quantize nothing back", which writes every tensor as it is.
         return set()
     return names
 
 
 def _make_op(Fp8Dequantize):
     class Fp8DequantizeWithoutContainer(Fp8Dequantize):
-        """`Fp8Dequantize` for targets with no FP8 container; pass-through otherwise."""
-
         def convert(self, input_dict, full_layer_name = None, model = None, **kwargs):
             if _target_owns_scale(model, full_layer_name):
                 return self._pass_through(input_dict, full_layer_name, model)
             out = super().convert(input_dict, full_layer_name = full_layer_name, model = model, **kwargs)
-            # Provenance for the reverse op on save: only a weight that arrived with a scale was
-            # dequantized here and is quantized back; a weight the checkpoint excluded from FP8
-            # (modules_to_not_convert) has no scale and is written as it is.
+            # Only a weight that arrived with a scale is quantized back on save (modules_to_not_convert ones have none).
             has_scale = any("scale_inv" in (k[:-1] if k.endswith("$") else k) for k in input_dict)
-            # An FP4-packed weight (int8 / float4_e2m1fn_x2) is unpacked by Fp8Dequantize too, but
-            # the reverse op only knows how to write float8_e4m3fn, so it is left dequantized on
-            # save rather than silently changing format under a config that still says FP4.
-            # Only the weight entry decides: an MXFP8 checkpoint stores its E8M0 scale as uint8,
-            # and that must not read as a packed weight.
+            # Packed FP4 is not recorded: the reverse op only writes e4m3. Skip scales, MXFP8's E8M0 scale is uint8.
             arrived_packed_fp4 = any(
                 isinstance(_first(v), torch.Tensor) and _first(v).dtype in _PACKED_FP4_DTYPES
                 for k, v in input_dict.items()
@@ -124,9 +84,7 @@ def _make_op(Fp8Dequantize):
             return out
 
         def _pass_through(self, input_dict, full_layer_name, model):
-            # Full names on purpose: the loader derives prefix and suffix from the
-            # first output key found inside the layer name, and a full name gives it
-            # an empty prefix and suffix, so every key here lands as written.
+            # Full names give the loader an empty prefix and suffix, so every key lands as written.
             module, attr = _module_and_attr(model, full_layer_name)
             base = full_layer_name[: -len(attr)] if attr and full_layer_name.endswith(attr) else full_layer_name + "."
             out = {}
@@ -146,9 +104,7 @@ def _make_op(Fp8Dequantize):
                 else:
                     out[base + pattern] = value
             if scale is None and weight is not None and module is not None:
-                # The container will quantize the bf16 tensor it got into e4m3 with
-                # whatever scale it finds; an uninitialised one is wrong by an
-                # arbitrary factor, ones is exact up to e4m3 rounding.
+                # Ones, not the uninitialised scale the container would otherwise quantize with.
                 container_scale = getattr(module, _scale_attr_for(attr), None)
                 if isinstance(container_scale, torch.Tensor):
                     out[base + _scale_attr_for(attr)] = torch.ones(
@@ -176,21 +132,12 @@ _FP8_DTYPES = tuple(
 
 
 def _make_reverse_op(Fp8Dequantize):
-    """What `save_pretrained` runs through this converter in reverse.
-
-    transformers reverses every converter on save and `Fp8Dequantize.reverse_op`
-    is `Fp8Quantize`, which would re-quantize a container's already packed e4m3
-    weight with a fresh scale and, because the reversed source pattern `weight`
-    also matches `weight_scale_inv`, quantize the scale grid itself. A packed
-    weight, a scale and an activation scale are written as they are; only a
-    weight this converter dequantized on load (bf16 now) is quantized back, so
-    the saved checkpoint keeps the FP8 layout its config describes."""
+    """Stock `Fp8Quantize` would re-quantize packed weights and the scale grid; only re-quantize what we dequantized."""
     from transformers.integrations.finegrained_fp8 import Fp8Quantize
 
     class Fp8RequantizeWithoutContainer(Fp8Quantize):
         def convert(self, input_dict, full_layer_name = None, model = None, **kwargs):
-            # The reversed source pattern `weight` also matches `weight_scale_inv`, so
-            # every tensor arrives under the key `weight`; `full_layer_name` says what it is.
+            # Every tensor arrives under the key `weight`; only `full_layer_name` says what it is.
             name = full_layer_name or ""
             dequantized = _dequantized_targets(model)
             out = {}
@@ -201,11 +148,8 @@ def _make_reverse_op(Fp8Dequantize):
                     or tensor.dtype in _FP8_DTYPES
                     or name.endswith("_scale_inv")
                     or name.endswith("activation_scale")
-                    # A full-precision weight this converter never dequantized (the checkpoint's
-                    # modules_to_not_convert) is written as it is, not quantized for the first time.
                     or name not in dequantized
                 ):
-                    # Full name on purpose, so the saved key is the parameter's own.
                     out[name or key] = tensor
                 else:
                     out.update(self._quantize_one(key, tensor))

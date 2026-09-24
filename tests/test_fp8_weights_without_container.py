@@ -12,11 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A pre-quantized FP8 checkpoint whose expert stacks live on a module
-transformers cannot give an FP8 container (stepfun-ai/Step-3.7-Flash-FP8's
-`MoELinear.weight`) must be dequantized into that module's dtype at load,
-while `FP8Linear` targets keep their packed weight and scale.
-"""
+"""Uncontained FP8 expert stacks (Step-3.7-Flash-FP8) dequantize at load; FP8Linear targets stay packed."""
 import json
 import os
 
@@ -28,7 +24,7 @@ import torch.nn.functional as F
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("transformers.integrations.finegrained_fp8")
 
-import unsloth_zoo  # noqa: F401  registers the temporary patches
+import unsloth_zoo  # noqa: F401
 from unsloth_zoo.temporary_patches.fp8_uncontained_weights import (
     _dequantized_targets,
     patch_fp8_dequantize_weights_without_container,
@@ -41,7 +37,6 @@ from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQu
 from transformers.utils.quantization_config import FineGrainedFP8Config
 
 if not hasattr(FineGrainedFP8HfQuantizer, "update_weight_conversions"):
-    # The patch does nothing without the hook (transformers 5.8 or later has it).
     pytest.skip("this transformers has no quantizer weight-conversion hook", allow_module_level = True)
 
 E4M3 = torch.float8_e4m3fn
@@ -49,7 +44,6 @@ patch_fp8_dequantize_weights_without_container()
 
 
 def _block_quantize(weight, block):
-    """(rows, cols) or (E, rows, cols) fp32 -> e4m3 plus a per-block fp32 scale grid."""
     rows, cols = weight.shape[-2:]
     br, bc = block
     assert rows % br == 0 and cols % bc == 0
@@ -71,7 +65,6 @@ def _reference_dequant(q, scale):
 
 
 class _MoELinear(nn.Module):
-    """Step-3.7's expert stack: a bare 3-D parameter indexed by expert id."""
     def __init__(self, num_experts, in_features, out_features):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(num_experts, out_features, in_features))
@@ -118,16 +111,7 @@ def test_container_target_passes_weight_and_scale_through():
 
 
 def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
-    """save_pretrained reverses every converter. `Fp8Dequantize.reverse_op` is
-    `Fp8Quantize`, and the reversed source pattern `weight` also matches
-    `weight_scale_inv`: a container's e4m3 weight was re-quantized with a fresh
-    scale and its scale grid quantized to e4m3 with a scale of its own, so the
-    saved weight and scale described different values.
-
-    The packed weight must not sit at the quantizer's own fixed point (a block
-    whose largest element is exactly 448 re-quantizes to itself) and the scale
-    grid must be divisible by the block, or the old reverse op is a no-op by
-    accident and the test proves nothing."""
+    """Weight must avoid the amax == 448 fixed point and the scale grid be block-divisible, or the old bug hides."""
     from transformers import PretrainedConfig
     from transformers.core_model_loading import WeightConverter, revert_weight_conversion
 
@@ -143,8 +127,7 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
     with torch.no_grad():
         model.proj.weight.copy_(q)
         model.proj.weight_scale_inv.copy_(scale)
-        # The expert stack goes through the op on load, as a real load does: that is what
-        # marks it for quantization on save.
+        # Loading through the op is what marks the stack for re-quantization on save.
         eq, escale = _block_quantize(torch.randn(3, 8, 8), (4, 4))
         loaded = op.convert({"weight$": [eq], "weight_scale_inv": [escale]}, full_layer_name = "experts.weight", model = model)
         model.experts.weight.copy_(loaded["experts.weight"])
@@ -158,14 +141,11 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
     state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     saved = revert_weight_conversion(model, dict(state))
 
-    # the container: packed weight and scale written exactly as they are
     assert saved["proj.weight"].dtype == E4M3
     assert torch.equal(saved["proj.weight"].view(torch.uint8), state["proj.weight"].view(torch.uint8))
     assert saved["proj.weight_scale_inv"].dtype == torch.float32
     assert torch.equal(saved["proj.weight_scale_inv"], state["proj.weight_scale_inv"])
     assert "proj.weight_scale_inv_scale_inv" not in saved
-    # the expert stack this converter dequantized on load: quantized back, so the
-    # checkpoint keeps the fp8 layout its config describes
     assert saved["experts.weight"].dtype == E4M3
     assert saved["experts.weight_scale_inv"].dtype == torch.float32
     assert saved["experts.weight_scale_inv"].shape == (3, 2, 2)
@@ -179,9 +159,6 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
 
 
 def test_save_leaves_an_excluded_full_precision_weight_alone():
-    """A block-divisible bf16 weight the checkpoint excluded from FP8 (modules_to_not_convert)
-    has no scale: it passes through on load and must not be quantized for the first time on
-    save. The reverse op consults which names this converter dequantized."""
     from transformers import PretrainedConfig
     from transformers.core_model_loading import WeightConverter, revert_weight_conversion
 
@@ -193,7 +170,6 @@ def test_save_leaves_an_excluded_full_precision_weight_alone():
     op = _make_op(Fp8Dequantize)(_quantizer())
     with torch.no_grad():
         model.experts.weight.copy_(torch.randn(3, 8, 8))
-    # Load: the excluded weight arrives without a scale and passes through; the expert stack is dequantized.
     w = model.skip.weight.detach().clone()
     out = op.convert({"weight$": [w]}, full_layer_name = "skip.weight", model = model)
     assert out["skip.weight"] is w
@@ -261,9 +237,6 @@ def test_fallback_converter_only_for_prequantized_packed_loads(pre_quantized, de
         assert ours[0] is conversions[-1]
 
 
-# ---------------------------------------------------------------------------
-# End to end through from_pretrained: a tiny remote-code shaped model.
-# ---------------------------------------------------------------------------
 from transformers import PretrainedConfig, PreTrainedModel
 
 
@@ -295,9 +268,7 @@ class _TinyModel(PreTrainedModel):
 
 
 def _write_fp8_checkpoint(reference, path, block):
-    """Experts and proj quantized with block scales; vis left bf16 and left out
-    of modules_to_not_convert, the way the Step-3.7 checkpoint forgets its
-    vision tower."""
+    """vis stays bf16 but is missing from modules_to_not_convert, as in Step-3.7's vision tower."""
     from safetensors.torch import save_file
     sd = {}
     q, s = _block_quantize(reference.experts.weight.detach().float(), block)
@@ -325,16 +296,7 @@ def _write_fp8_checkpoint(reference, path, block):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "FP8 loading needs a CUDA device")
 def test_save_after_a_real_load_keeps_the_fp8_layout(tmp_path):
-    """The save round trip through the real loader, not a hand-built converter.
-
-    transformers deepcopies the converter for every target key ("each target key
-    gets its own converter instance", core_model_loading.py), and keeps the
-    ORIGINAL on `model._weight_conversions`. Provenance recorded on the op is
-    therefore written on a copy that is thrown away, and the reverse op sees an
-    empty set: the dequantized expert stack was saved as bf16 with its scale
-    grid dropped, while the saved config still advertised fp8. Recording on the
-    model is what survives from the load to the save.
-    """
+    """The real loader deepcopies the op per target key, so provenance kept on the op never reaches the save."""
     from safetensors.torch import load_file
 
     torch.manual_seed(0)
@@ -347,12 +309,11 @@ def test_save_after_a_real_load_keeps_the_fp8_layout(tmp_path):
     _write_fp8_checkpoint(reference, ckpt, block)
 
     loaded = _TinyModel.from_pretrained(ckpt, dtype = torch.bfloat16, device_map = {"": 0})
-    assert loaded.experts.weight.dtype == torch.bfloat16   # dequantized on load
+    assert loaded.experts.weight.dtype == torch.bfloat16
     out = str(tmp_path / "saved")
     loaded.save_pretrained(out, safe_serialization = True)
     saved = load_file(os.path.join(out, "model.safetensors"))
 
-    # The stack this converter dequantized is quantized back, with its grid.
     assert saved["experts.weight"].dtype == E4M3, saved["experts.weight"].dtype
     assert saved["experts.weight_scale_inv"].shape == (3, 2, 2)
     torch.testing.assert_close(
@@ -360,7 +321,6 @@ def test_save_after_a_real_load_keeps_the_fp8_layout(tmp_path):
         loaded.experts.weight.detach().cpu().float(),
         rtol = 0.07, atol = 0.05,
     )
-    # The container keeps its packed bytes untouched.
     original = load_file(os.path.join(ckpt, "model.safetensors"))
     assert torch.equal(saved["proj.weight"].view(torch.uint8), original["proj.weight"].view(torch.uint8))
     assert torch.equal(saved["proj.weight_scale_inv"], original["proj.weight_scale_inv"])
@@ -379,40 +339,31 @@ def test_from_pretrained_gives_the_dequantized_experts(tmp_path):
 
     loaded = _TinyModel.from_pretrained(ckpt, dtype = torch.bfloat16, device_map = {"": 0})
 
-    # Experts: bare parameter, so dequantized into bf16 with the scale folded in.
     expert_w = loaded.experts.weight
     assert expert_w.dtype == torch.bfloat16 and expert_w.shape == (3, 16, 16)
     q, s = _block_quantize(reference.experts.weight.detach().float(), block)
     torch.testing.assert_close(expert_w.detach().cpu().float(), _reference_dequant(q, s).to(torch.bfloat16).float())
-    # Without the scale folded in the values are off by the per-block factor.
     assert not torch.allclose(expert_w.detach().cpu().float(), q.float().to(torch.bfloat16).float())
 
-    # proj: an FP8Linear keeps its packed weight and the checkpoint's scale.
     assert isinstance(loaded.proj, FP8Linear)
     assert loaded.proj.weight.dtype == E4M3
     torch.testing.assert_close(loaded.proj.weight_scale_inv.detach().cpu().float(), _block_quantize(reference.proj.weight.detach().float(), block)[1])
 
-    # vis: FP8Linear the checkpoint forgot to exclude; scale of ones, not garbage.
     assert isinstance(loaded.vis, FP8Linear)
     assert bool((loaded.vis.weight_scale_inv.detach().cpu() == 1).all())
 
-    # The expert forward matches the reference up to e4m3 rounding. (FP8Linear's own
-    # forward wants the `kernels` package, which is not what this test is about.)
+    # Experts only: FP8Linear's forward needs the `kernels` package.
     x = torch.randn(4, 16, dtype = torch.bfloat16)
     with torch.no_grad():
         want = reference.experts(x, expert_id = 1).float()
         got = loaded.experts(x.to("cuda:0"), expert_id = 1).float().cpu()
     torch.testing.assert_close(got, want, rtol = 0.15, atol = 0.15 * want.abs().max().item())
-    # And the unscaled bytes would not: the block scales are far from one.
     with torch.no_grad():
         wrong = F.linear(x.float(), q[1].float())
     assert not torch.allclose(wrong, want, rtol = 0.15, atol = 0.15 * want.abs().max().item())
 
 
 def test_an_fp4_packed_weight_is_not_marked_for_fp8_requantization():
-    """Fp8Dequantize unpacks packed e2m1 FP4 too, but the reverse op only writes
-    float8_e4m3fn: recording such a weight would save an FP8 tensor under a config that
-    still says FP4. It stays dequantized on save instead."""
     model = _Holder()
     op = _make_op(Fp8Dequantize)(_quantizer())
     packed = torch.zeros(8, 4, dtype = torch.int8)
@@ -420,7 +371,7 @@ def test_an_fp4_packed_weight_is_not_marked_for_fp8_requantization():
     try:
         op.convert({"weight$": [packed], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
     except Exception:
-        pass  # the unpack itself is transformers' business; only the provenance is under test
+        pass  # only the provenance is under test
     assert "experts.weight" not in _dequantized_targets(model)
     fp8 = torch.zeros(8, 8).to(E4M3)
     op.convert({"weight$": [fp8], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
@@ -428,7 +379,6 @@ def test_an_fp4_packed_weight_is_not_marked_for_fp8_requantization():
 
 
 def test_a_uint8_scale_does_not_read_as_a_packed_weight():
-    """MXFP8 stores its E8M0 scale as uint8; the weight is still e4m3 and is recorded."""
     model = _Holder()
     op = _make_op(Fp8Dequantize)(_quantizer())
     fp8 = torch.zeros(8, 8).to(E4M3)
