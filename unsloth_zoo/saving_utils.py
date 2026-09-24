@@ -4447,6 +4447,9 @@ def merge_and_overwrite_lora(
     pass
 
     # Default handle 16 bit merge and save/push
+    # Read before Step 1: an in-place export (save_directory == model_name) overwrites the
+    # source config.json there and strips its quantization config.
+    _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
         # `config` is `model.config`, already the nested text config under `text_only = True`,
@@ -4514,7 +4517,6 @@ def merge_and_overwrite_lora(
 
     # compressed-tensors packed base: MXFP4 is decoded to 16-bit below; anything else refuses
     # here, before a shard is written, rather than export packed tensors under no config.
-    _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
     if _ct_packed_format is not None and _ct_packed_format != "mxfp4-pack-quantized":
         raise RuntimeError(
             f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "

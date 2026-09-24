@@ -835,3 +835,19 @@ def test_the_lora_completeness_check_sees_the_decoded_export_before_any_rewrite(
             calls.setdefault(node.func.id, []).append(node.lineno)
     assert "_dequantize_compressed_mxfp4_shards" not in calls
     assert max(calls["_check_lora_merge_is_complete"]) < min(calls["_rewrite_compressed_mxfp4_shard"])
+
+
+def test_the_packed_format_is_read_before_the_export_writes_its_config():
+    """An in-place export (save_directory == model_name) overwrites the source config.json and
+    strips its quantization config, so the packed format must be read from it first."""
+    import ast
+    import inspect
+    import textwrap
+    from unsloth_zoo import saving_utils
+
+    source = textwrap.dedent(inspect.getsource(inspect.unwrap(saving_utils.merge_and_overwrite_lora)))
+    calls = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            calls.setdefault(node.func.id, []).append(node.lineno)
+    assert max(calls["_compressed_packed_format"]) < min(calls["_remove_quantization_config"])
