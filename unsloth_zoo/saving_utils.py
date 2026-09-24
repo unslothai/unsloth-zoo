@@ -3485,15 +3485,17 @@ def _loaded_with_trust_remote_code(model):
 pass
 
 
-def _read_export_base_config(model_name, token, model):
+def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False):
     # Config of the checkpoint the merged weights come from. Built-in configs read exactly as before;
-    # only when that fails and the load itself ran this repo's code (a text_only load of a repo-code
-    # composite such as Nemotron-Omni or InternVL) is the same repo's config read with its code again.
+    # only when that fails, the load itself ran repo code (a text_only load of a repo-code composite
+    # such as Nemotron-Omni or InternVL), AND the export reads the very repo that load trusted, is its
+    # config read with its code again. A resolved sibling (FP8 -> 16bit) or a name-mapped repo is a
+    # different repository, whose code was never approved, so it keeps the untrusted path.
     from transformers import AutoConfig
     try:
         return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
     except Exception:
-        if not _loaded_with_trust_remote_code(model): raise
+        if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
     return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = True)
 pass
 
@@ -3903,6 +3905,8 @@ def merge_and_overwrite_lora(
                     logger.info(f"Unsloth: FP8 base detected; merging onto 16bit sibling `{_sibling}`.")
                 model_name = _sibling
                 final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token, save_method)
+        # Repo code may only be re-run for the repo the load itself trusted (see _read_export_base_config).
+        _export_source_is_loaded_repo = model_name == getattr(model.config, "_name_or_path", None)
         # merged_16bit only, which the nf4/fp4 fallback in
         # `determine_base_model_source` never answers for, so a Hub outage can never
         # arrive here carrying a local 4bit copy.
@@ -4208,7 +4212,9 @@ def merge_and_overwrite_lora(
         # a text-only config beside VLM weights and every tensor was silently re-initialized on
         # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
         try:
-            base_config = _read_export_base_config(model_name, token, model)
+            base_config = _read_export_base_config(
+                model_name, token, model, source_is_loaded_repo = _export_source_is_loaded_repo,
+            )
         except Exception as base_config_error:
             warnings.warn(
                 f"Unsloth: Could not read the base config from `{model_name}` "

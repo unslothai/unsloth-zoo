@@ -187,3 +187,17 @@ def test_trust_marker_found_through_peft_layers():
     assert not SU._loaded_with_trust_remote_code(NS(base_model = NS(model = NS())))
     # Only a real True counts (a MagicMock-like truthy attribute does not).
     assert not SU._loaded_with_trust_remote_code(NS(_unsloth_trust_remote_code = "yes"))
+
+
+def test_trust_is_not_carried_to_a_different_repo(tmp_path):
+    # The load trusted `base`; an export reading another repo (a resolved FP8 -> 16bit sibling, a
+    # name-mapped repo) must not run that repo's code on the strength of the first approval.
+    from unsloth_zoo import saving_utils as S
+    H.set_offline_cpu_env()
+    os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")
+    base, state = _write_base(tmp_path)
+    pm = _text_only_peft(base, state, trusted = True)
+    assert type(S._read_export_base_config(base, None, pm, source_is_loaded_repo = True)).__name__.startswith("TinyOmni")
+    with pytest.raises(Exception):
+        S._read_export_base_config(base, None, pm, source_is_loaded_repo = False)
+    assert not os.path.isdir(os.path.join(str(tmp_path), "modules", "transformers_modules", "base"))
