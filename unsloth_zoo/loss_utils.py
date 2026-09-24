@@ -201,6 +201,12 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
     ):
         if labels is None: return None
+        # Stock ForCausalLMLoss flattens, so callers may pass (tokens, vocab) logits with flat
+        # labels (the Ling-2.6-flash MTP head). The fast kernel wants (batch, seq, vocab):
+        # one row keeps the stock shift over the flattened tokens.
+        if logits.dim() == 2:
+            logits = logits.unsqueeze(0)
+            labels = labels.reshape(1, -1)
         shift_logits = logits
         shift_labels = torch.empty_like(labels)
         shift_labels[..., :-1] = labels[..., 1:]
