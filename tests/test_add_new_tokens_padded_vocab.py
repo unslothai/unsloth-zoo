@@ -160,3 +160,20 @@ def test_frozen_token_validation_uses_magnitude(row_value: float, untrained: boo
     else:
         fix_untrained_tokens(model, tokenizer, dataset)
     torch.testing.assert_close(model.get_input_embeddings().weight, original)
+
+
+def test_interpolation_mixes_in_the_pieces_the_token_replaces():
+    """interpolation sets a new row to mean(trained) * (1 - a) + mean(pieces) * a,
+    where pieces are the ids the string split into before it was added."""
+    model, tokenizer = _build(8, 8)
+    with torch.no_grad():
+        for i in range(8):
+            model.get_input_embeddings().weight[i].fill_(i + 1)
+    assert tokenizer("tok6 tok7", add_special_tokens=False).input_ids == [6, 7]
+    add_new_tokens(model, tokenizer, new_tokens=["tok6 tok7"],
+                   method="interpolation", interpolation=0.5)
+    new_id = tokenizer.convert_tokens_to_ids("tok6 tok7")
+    # mean(1..8) = 4.5, mean(7, 8) = 7.5, so 0.5 * 4.5 + 0.5 * 7.5 = 6.0.
+    expected = torch.full((model.config.hidden_size,), 6.0)
+    torch.testing.assert_close(model.get_input_embeddings().weight[new_id], expected)
+    torch.testing.assert_close(model.get_output_embeddings().weight[new_id], expected)

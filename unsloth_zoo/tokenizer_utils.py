@@ -138,6 +138,13 @@ def add_new_tokens(
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
         or (model.config.tie_word_embeddings)
 
+    # Split each new token into its existing pieces now: once added, it
+    # tokenizes to its own fresh id and the interpolation mean would read that.
+    if method == "interpolation":
+        new_token_pieces = [
+            tokenizer(token, add_special_tokens = False).input_ids for token in new_tokens
+        ]
+
     # Add tokens!
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
@@ -181,8 +188,7 @@ def add_new_tokens(
             "Unsloth: You are using interpolation to add new tokens.\n"\
             f"We shall set new tokens = mean(embeddings)*{1-interpolation} + mean(new_tokens)*{interpolation}"
         )
-        for j, token in enumerate(new_tokens):
-            input_ids = tokenizer(token, add_special_tokens = False).input_ids
+        for j, input_ids in enumerate(new_token_pieces):
             mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
             mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
 
