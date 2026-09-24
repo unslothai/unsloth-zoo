@@ -1,19 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""The vendored fla snapshot also serves ``fla.ops.simple_gla``.
-
-Remote-code lightning-attention models (inclusionAI Ling 2.5 / 2.6,
-``BailingMoeV2_5``) do ``from fla.ops.simple_gla.chunk import chunk_simple_gla``
-and ``from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla``
-at import time, so without these files ``trust_remote_code`` loading stops with
-"requires the following packages that were not found in your environment: fla"
-unless the user installs flash-linear-attention separately.
-
-The CPU part checks the files are vendored and narrowed. The GPU part runs the
-injection in a fresh interpreter (as test_vendor_fla.py does) and compares both
-kernels, forward and backward, against a float64 recurrence.
-"""
+"""Vendored fla serves fla.ops.simple_gla, which Ling 2.5 / 2.6 (BailingMoeV2_5) remote code imports."""
 
 import os
 import pathlib
@@ -54,7 +42,6 @@ def test_simple_gla_closure_is_vendored():
         ("ops", "common", "fused_recurrent.py"),
     ):
         assert (VENDORED.joinpath(*rel)).is_file(), rel
-    # The narrowed __init__ must not pull the unvendored fused_chunk / parallel kernels.
     init = (VENDORED / "ops" / "simple_gla" / "__init__.py").read_text()
     code = "\n".join(ln for ln in init.splitlines() if not ln.lstrip().startswith("#"))
     assert "fused_chunk" not in code and "parallel" not in code

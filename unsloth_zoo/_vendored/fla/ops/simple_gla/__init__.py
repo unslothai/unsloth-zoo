@@ -5,14 +5,7 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 #
-# Modified by Unsloth: narrowed exports. The upstream __init__ also imported
-# fused_chunk_simple_gla and parallel_simple_gla, whose closures (fla.ops.common
-# .fused_chunk and the parallel attention kernels) are not vendored. This copy
-# exposes only the two entry points remote-code lightning-attention models import
-# (for example inclusionAI Ling 2.5 / 2.6, `BailingMoeV2_5`):
-# `from fla.ops.simple_gla.chunk import chunk_simple_gla` and
-# `from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla`.
-# Original MIT header preserved above.
+# Modified by Unsloth: dropped the fused_chunk and parallel imports (their closures are not vendored).
 
 from .chunk import chunk_simple_gla
 from .fused_recurrent import fused_recurrent_simple_gla
