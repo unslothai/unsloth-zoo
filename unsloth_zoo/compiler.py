@@ -4343,6 +4343,36 @@ def _patch_lora_input_cast(source, force_float32 = None):
 pass
 
 
+def _patch_lora_base_layer_input_cast(source):
+    """Outside autocast, cast x to the base layer's weight dtype before calling it.
+
+    Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder): when autocast is
+    disabled and base_layer has float32 weights, cast x to match the weight dtype to prevent a
+    dtype mismatch. Quantized storage must never become the activation dtype: 4-bit weights are
+    packed uint8 bytes (quant_state), and FP8 weights (transformers FP8Linear, FbgemmFp8Linear, an
+    unconverted fp8 Linear) are 1-byte floats whose forward quantizes the activation itself; casting
+    x to float8 there returned float8 outputs and failed with "Promotion for Float8 Types is not
+    supported" in any plain no-grad forward after get_peft_model. Only 16/32/64-bit float weights
+    take the cast.
+    """
+    _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
+    _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
+    if not _m:
+        return source
+    _ind = _m.group(1)
+    return source.replace(
+        _base_layer_call,
+        f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+        f"and self.base_layer.weight is not None "
+        f"and not hasattr(self.base_layer.weight, 'quant_state') "
+        f"and self.base_layer.weight.is_floating_point() "
+        f"and self.base_layer.weight.element_size() > 1 "
+        f"and x.dtype != self.base_layer.weight.dtype:\n"
+        f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
+        f"{_ind}{_base_layer_call}",
+    )
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -4432,25 +4462,8 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
-            # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
-            # When autocast is disabled and base_layer has float32 weights,
-            # cast x to match the weight dtype to prevent dtype mismatch.
             # For 8-bit layers, the base_layer call was already replaced above.
-            # For 4-bit layers, weight.dtype is uint8 (packed quantized bytes),
-            # so we must skip the cast to avoid corrupting input values.
-            _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
-            _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
-            if _m:
-                _ind = _m.group(1)
-                source = source.replace(
-                    _base_layer_call,
-                    f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
-                    f"and self.base_layer.weight is not None "
-                    f"and not hasattr(self.base_layer.weight, 'quant_state') "
-                    f"and x.dtype != self.base_layer.weight.dtype:\n"
-                    f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
-                    f"{_ind}{_base_layer_call}",
-                )
+            source = _patch_lora_base_layer_input_cast(source)
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
