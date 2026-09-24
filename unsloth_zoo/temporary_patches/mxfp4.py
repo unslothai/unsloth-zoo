@@ -388,7 +388,8 @@ def _is_mxfp4_compressed_config(quant) -> bool:
     method = str(quant.get("quant_method", "")).lower().replace("_", "-")
     groups = [g for g in (quant.get("config_groups") or {}).values() if isinstance(g, dict)]
     top = quant.get("format")
-    return method == "compressed-tensors" and bool(groups) and all(
+    # SparseML is compressed-tensors' former name; checkpoints still carry either spelling.
+    return method in ("compressed-tensors", "sparseml") and bool(groups) and all(
         (g.get("format") or top) == "mxfp4-pack-quantized" for g in groups
     )
 
