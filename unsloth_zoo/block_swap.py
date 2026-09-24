@@ -139,6 +139,15 @@ class BlockSwap:
         # number of blocks with that signature: a signature with fewer than
         # depth + 1 blocks can never have more than that many slots live, and
         # over-allocating just holds extra device copies for nothing.
+        # Drop the original device weights before allocating the pool. While
+        # they are all still resident, originals + pool is a higher peak than
+        # the steady state (unswapped weights + depth + 1 slots) and can OOM in
+        # exactly the memory-constrained setups this is meant to fit. Eviction
+        # is safe here: every block's slot is still None, so _release frees
+        # device storage without touching the not-yet-built pool.
+        for b in self.blocks:
+            self._release(b)
+
         sigs = [b.sig for b in self.blocks]
         for sig in set(sigs):
             self.free[sig] = [
@@ -146,8 +155,6 @@ class BlockSwap:
                 for _ in range(min(self.depth + 1, sigs.count(sig)))
             ]
 
-        for b in self.blocks:
-            self._release(b)
         self._arm(forward = True)
 
     def _release(self, block):
