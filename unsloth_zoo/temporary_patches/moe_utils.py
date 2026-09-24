@@ -3403,11 +3403,7 @@ class _MoEGateGradIdentity(torch.autograd.Function):
 
 
 def _uses_own_apply_gate(module) -> bool:
-    """Whether the MoE backends apply `module`'s own `_apply_gate` to [gate; up].
-
-    Read once per experts forward on every MoE model, so it avoids `nn.Module.__getattr__`,
-    whose miss path costs about 0.7 us: the flag lives on the class (the bnb 4-bit generic
-    route) or, for FP8 experts, on the instance."""
+    """Own-gate flag on the class or (FP8) instance; hot path, so no nn.Module.__getattr__."""
     return bool(
         module.__dict__.get("_unsloth_own_apply_gate", False)
         or getattr(type(module), "_unsloth_own_apply_gate", False)
@@ -3545,7 +3541,6 @@ def forward_native_grouped_mm(
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
-        # The class's own gate on [gate; up] (set only on generically routed classes).
         own_gate_up = mm1_out if _uses_own_apply_gate(self) else None
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
@@ -3862,7 +3857,6 @@ def forward_triton_grouped_gemm(
 
     # Activation + gate*up.
     if _uses_own_apply_gate(self):
-        # The class's own gate on [gate; up] (set only on generically routed classes).
         intermediate = self._apply_gate(first_gemm_output)
     elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
@@ -4046,7 +4040,6 @@ def forward_native_moe_loop(
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
         elif own_apply_gate:
-            # The class's own gate on [gate; up] (set only on generically routed classes).
             current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):
             current_hidden_states = self.act_fn(gate) * up

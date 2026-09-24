@@ -1,16 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""bnb 4-bit experts of a family Unsloth has no model-specific MoE patch for.
-
-replace_expert_params_with_bnb_params quantizes the gate_up_proj / down_proj of every
-transformers v5 experts module, but only the patched families (qwen3_moe, glm4_moe,
-lfm2_moe, ...) had their forward routed through forward_moe_backend, which dequantizes.
-Any other family, tencent/Hy3's HYV3Experts among them, kept transformers' generic
-experts forward and matmul'd the packed uint8 storage:
-"Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Byte".
-
-The class is now routed when its experts are prepared for 4-bit, only when its layout is
-the one forward_moe_backend computes, and 16-bit instances keep the original forward.
-"""
+"""bnb 4-bit experts of families without a model-specific MoE patch (tencent/Hy3 HYV3Experts)."""
 import copy
 import os
 from types import SimpleNamespace
@@ -80,9 +69,6 @@ def _routing(n_tokens, seed = 1, device = "cpu"):
     return hidden.to(device), top_k_index.to(device), top_k_weights.to(device)
 
 
-# ----------------------------------------------------------------------------- classifier
-
-
 def test_generic_forward_is_recognised_and_others_are_not():
     klass = _make_experts_class()
     assert mb._is_generic_transformers_experts_forward(klass.__dict__["forward"])
@@ -96,10 +82,9 @@ def test_only_the_standard_layout_is_routable():
         try:
             klass = _make_experts_class(**kwargs)
         except TypeError:
-            continue  # this transformers has no such flag
+            continue
         assert not mb._experts_layout_is_standard(klass(_config())), kwargs
 
-    # A class with its own gate on [gate; up] is routable: the backends apply that gate.
     custom_gate = _make_experts_class()
     custom_gate._apply_gate = lambda self, x: x[..., : x.shape[-1] // 2]
     assert mb._experts_layout_is_standard(custom_gate(_config()))
@@ -124,15 +109,12 @@ def test_routing_leaves_16bit_instances_on_the_original_forward():
     assert mb._route_generic_bnb4bit_experts_class(routed)
     assert klass._unsloth_bnb4bit_routed
     torch.testing.assert_close(routed(*args), expected, rtol = 0, atol = 0)
-    # Idempotent: a second module of the same class does not wrap the wrapper.
     forward = klass.forward
     assert mb._route_generic_bnb4bit_experts_class(klass(_config()))
     assert klass.forward is forward
 
 
 def test_routed_forward_is_seen_to_apply_the_expert_lora_stash():
-    # The ParamWrapper patch answers this statically on a compiled first call; "not read"
-    # there makes the forward and the checkpoint recompute trace different graphs.
     from unsloth_zoo.temporary_patches import moe_utils as mu
 
     klass = _make_experts_class()
@@ -145,7 +127,7 @@ def test_routed_forward_is_seen_to_apply_the_expert_lora_stash():
 def test_the_backend_call_is_kept_out_of_compiled_regions():
     fn = mb._forward_generic_experts_eagerly
     if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
-        assert getattr(fn, "__wrapped__", None) is not None  # torch.compiler.disable wrapper
+        assert getattr(fn, "__wrapped__", None) is not None
 
 
 def test_a_class_with_its_own_forward_is_not_touched():
@@ -165,12 +147,7 @@ def test_a_class_with_its_own_forward_is_not_touched():
     assert not getattr(Patched, "_unsloth_bnb4bit_routed", False)
 
 
-# ----------------------------------------------------------------------------- 4-bit forward
-
-
 def _quantize_like_the_loader(model, device):
-    """What from_pretrained does on a 4-bit load: meta Params4bit placeholders from
-    replace_expert_params_with_bnb_params, then the checkpoint weight quantized into them."""
     from bitsandbytes.nn import Params4bit
     from transformers import BitsAndBytesConfig
 
@@ -200,7 +177,6 @@ def test_bnb4bit_generic_experts_forward_matches_dequantized_reference(impl):
     experts = model.experts
     assert mb._moe_uses_bnb4bit_expert_weights(experts)
 
-    # Reference: the original forward on the dequantized weights.
     reference = klass(_config("eager")).to("cuda", torch.bfloat16)
     with torch.no_grad():
         reference.gate_up_proj.copy_(mb._dequantize_bnb4bit_expert_weights(experts.gate_up_proj, torch.bfloat16))
@@ -219,7 +195,6 @@ def test_bnb4bit_generic_experts_forward_matches_dequantized_reference(impl):
 
 
 def test_expert_parallel_sentinel_slots_are_dropped():
-    """RouterParallel marks non-local routes with index num_experts and weight 0."""
     module = SimpleNamespace(num_experts = 4)
     index = torch.tensor([[0, 4], [3, 4], [4, 4]])
     weights = torch.tensor([[0.5, 0.0], [1.0, 0.0], [0.0, 0.0]])
@@ -227,7 +202,6 @@ def test_expert_parallel_sentinel_slots_are_dropped():
     assert int(new_index.max()) < 4
     assert torch.equal(new_weights, torch.tensor([[0.5, 0.0], [1.0, 0.0], [0.0, 0.0]]))
     assert torch.equal(new_index, torch.tensor([[0, 0], [3, 0], [0, 0]]))
-    # Without sentinels nothing changes.
     same_index, same_weights = mb._drop_expert_parallel_sentinel(module, index.clamp(max = 3), weights)
     assert torch.equal(same_index, index.clamp(max = 3)) and torch.equal(same_weights, weights)
 
@@ -245,14 +219,10 @@ def test_bnb4bit_forward_accepts_expert_parallel_sentinel_routes():
     hidden = hidden.to(torch.bfloat16)
     top_k_weights = top_k_weights.to(torch.bfloat16)
     local = experts(hidden, top_k_index, top_k_weights)
-    # Append a non-local slot per token: sentinel index, zero weight.
     sentinel_index = torch.cat([top_k_index, torch.full_like(top_k_index[:, :1], num_experts)], dim = 1)
     sentinel_weights = torch.cat([top_k_weights, torch.zeros_like(top_k_weights[:, :1])], dim = 1)
     out = experts(hidden, sentinel_index, sentinel_weights)
     torch.testing.assert_close(out.float(), local.float(), rtol = 2e-2, atol = 2e-3)
-
-
-# ----------------------------------------------------------------------------- own _apply_gate
 
 
 LIMIT, ALPHA = 7.0, 1.702
@@ -325,12 +295,10 @@ def test_every_backend_applies_the_class_gate(backend, monkeypatch):
     hidden, top_k_index, top_k_weights = _routing(64, device = "cuda")
     hidden = (hidden * 2).to(torch.bfloat16)
     top_k_weights = top_k_weights.to(torch.bfloat16)
-    # transformers' own eager forward, which calls the class gate.
     expected = module(hidden, top_k_index, top_k_weights)
     klass._unsloth_own_apply_gate = True
     out = mu.forward_moe_backend(module, hidden, top_k_index, top_k_weights)
     torch.testing.assert_close(out.float(), expected.float(), rtol = 2e-2, atol = 2e-2)
-    # Without the marker the backend would apply silu(gate) * up, which differs here.
     klass._unsloth_own_apply_gate = False
     wrong = mu.forward_moe_backend(module, hidden, top_k_index, top_k_weights)
     assert (wrong.float() - expected.float()).abs().max() > 0.1
@@ -359,7 +327,6 @@ def test_bnb4bit_own_gate_experts_match_dequantized_reference():
 
 @pytest.fixture
 def _restore_minimax_experts_class():
-    # Routing is recorded on the real transformers class; undo it so later tests see stock.
     modeling = pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
     klass = modeling.MiniMaxM3VLExperts
     saved = {k: klass.__dict__[k] for k in ("forward", "_unsloth_own_apply_gate", "_unsloth_bnb4bit_routed") if k in klass.__dict__}
