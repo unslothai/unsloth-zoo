@@ -1895,3 +1895,32 @@ def test_a_config_that_hands_back_itself_terminates():
             return self
 
     assert detect_logit_transforms(_Circular())["logit_softcapping"] == 20.0
+
+
+class _MTPLayer(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.eh_proj = nn.Linear(2 * hidden, hidden, bias = False)
+        self.mlp = nn.Linear(hidden, hidden, bias = False)
+
+
+def test_a_sibling_of_a_declared_block_is_atomic_too():
+    """Ling-2.6-flash declares only its decoder layer class but appends a multi-token-
+    prediction layer of another class to the same ModuleList. Split across cards, that
+    layer's attention adds a mask no hook moved and raises a device mismatch."""
+    model = _meta(layers = 8)
+    with torch.device("meta"):
+        model.layers.append(_MTPLayer(64))
+    assert resolve_no_split_classes(model) == ["_Block", "_MTPLayer"]
+    plan = plan_device_map(model, max_memory = {0: "8GiB", 1: "8GiB"})
+    assert plan is not None
+    assert "layers.8" in plan.device_map
+    assert not any(k.startswith("layers.8.") for k in plan.device_map)
+
+
+def test_declared_classes_outside_a_module_list_are_kept_as_declared():
+    model = _meta(layers = 4)
+    model._no_split_modules = ["_Block", "LayerNorm"]
+    assert resolve_no_split_classes(model) == ["LayerNorm", "_Block"]
+    model._no_split_modules = ["LayerNorm"]
+    assert resolve_no_split_classes(model) == ["LayerNorm"]

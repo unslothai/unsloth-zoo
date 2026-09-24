@@ -482,7 +482,20 @@ def resolve_no_split_classes(model: nn.Module) -> list[str]:
     # transformers models do (camembert, colpali, colqwen2, efficientnet, fuyu).
     # Only `None`, the base-class default, means "not declared, go and detect".
     if classes is not None:
-        return sorted(str(c) for c in classes)
+        declared = {str(c) for c in classes}
+        # A declared block marks its ModuleList as the block stack, so a sibling of another
+        # class there (the multi-token-prediction layer Ling-2.6-flash appends after its
+        # decoder layers) is a block too. Split, its attention reads a mask no hook moved.
+        if declared:
+            for _, mod in model.named_modules():
+                if not isinstance(mod, nn.ModuleList):
+                    continue
+                if not any(type(child).__name__ in declared for child in mod):
+                    continue
+                for child in mod:
+                    if any(True for _ in child.parameters(recurse=True)):
+                        declared.add(type(child).__name__)
+        return sorted(declared)
     # Fallback: every distinct child class of every nn.ModuleList that holds
     # more than one entry. That is where repeated transformer blocks live.
     found: set[str] = set()
