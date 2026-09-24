@@ -77,3 +77,14 @@ def test_num_items_in_batch_is_honoured_for_flat_logits(patched_loss):
         unsloth(flat_logits, flat_labels, vocab, num_items_in_batch = n),
         stock(flat_logits, flat_labels, vocab, num_items_in_batch = n),
     )
+
+
+def test_flat_logits_with_batched_labels_keep_row_boundaries(patched_loss):
+    """Stock shifts each label row on its own, so the last token of a row predicts
+    nothing, not the first token of the next row."""
+    stock, unsloth = patched_loss
+    logits, labels, vocab = _inputs()
+    flat_logits = logits.reshape(-1, vocab)
+    expected = stock(flat_logits, labels, vocab)
+    torch.testing.assert_close(expected, stock(logits, labels, vocab))
+    torch.testing.assert_close(unsloth(flat_logits, labels, vocab), expected)
