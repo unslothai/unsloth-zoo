@@ -511,6 +511,34 @@ def test_full_save_writes_dequantized_experts(tmp_path, explicit_state_dict):
     assert experts.gate_up_proj is packed[0] and experts.down_proj is packed[1]
 
 
+@pytest.mark.skipif(not TRANSFORMERS_5, reason = "weight conversions are transformers 5")
+def test_full_save_of_a_loaded_model_writes_experts_under_their_own_names(tmp_path):
+    """from_pretrained records the Mxfp4Dequantize converters, and save_pretrained reverses them:
+    transformers 5.4 raised NotImplementedError, 5.17 wrote the stacks under "gate_up_proj$"."""
+    safetensors = pytest.importorskip("safetensors.torch")
+    from transformers.core_model_loading import WeightConverter
+    from transformers.integrations.mxfp4 import Mxfp4Dequantize
+    mx.patch_save_pretrained_mxfp4()
+    model, experts = _tiny_gpt_oss("cpu")
+    conversions = [
+        WeightConverter(
+            source_patterns = [f"{proj}_blocks", f"{proj}_scales"], target_patterns = rf"{proj}$",
+            operations = [Mxfp4Dequantize(None)],
+        )
+        for proj in ("down_proj", "gate_up_proj")
+    ]
+    model._weight_conversions = conversions   # as a load of a pre-quantized checkpoint leaves it
+    packed = experts.gate_up_proj, experts.down_proj
+    model.save_pretrained(tmp_path)
+    saved = safetensors.load_file(os.path.join(tmp_path, "model.safetensors"))
+    assert not any(key.endswith("$") for key in saved)
+    for name, param in zip(("gate_up_proj", "down_proj"), packed):
+        assert torch.equal(saved[f"model.layers.0.mlp.experts.{name}"], param.dequantize())
+    assert "quantization_config" not in open(os.path.join(tmp_path, "config.json")).read()
+    assert model._weight_conversions is conversions
+    assert experts.gate_up_proj is packed[0] and experts.down_proj is packed[1]
+
+
 def test_adapter_save_never_dequantizes(tmp_path, monkeypatch):
     peft = pytest.importorskip("peft")
     mx.patch_peft_param_wrapper_mxfp4()
@@ -704,3 +732,4 @@ def test_a_later_load_without_a_device_map_clears_the_offload_flag(monkeypatch):
     monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [True])   # left by an earlier offloaded load
     Mxfp4HfQuantizer.validate_environment(object.__new__(Mxfp4HfQuantizer), device_map = None)
     assert mx._LOAD_OFFLOADS[0] is False
+

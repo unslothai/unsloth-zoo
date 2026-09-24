@@ -328,6 +328,16 @@ def patch_save_pretrained_mxfp4():
         names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
                  if is_mxfp4_expert_param(param)}
         dense = {}
+        # from_pretrained records the Mxfp4Dequantize converters, and save_pretrained reverses them:
+        # transformers 5.4 raises NotImplementedError, 5.17 writes the experts under "down_proj$" /
+        # "gate_up_proj$" (one layer's stack, the rest dropped). The stacks saved here are dense, so
+        # they are written under their own names.
+        conversions = self.__dict__.get("_weight_conversions", None)
+        if isinstance(conversions, (list, tuple)):
+            self._weight_conversions = [
+                conversion for conversion in conversions
+                if not any(type(op).__name__ == "Mxfp4Dequantize" for op in getattr(conversion, "operations", ()) or ())
+            ]
         try:
             for module, name, param in packed:
                 weight = param.dequantize().cpu()
@@ -345,6 +355,8 @@ def patch_save_pretrained_mxfp4():
         finally:
             for module, name, param in packed:
                 module._parameters[name] = param
+            if isinstance(conversions, (list, tuple)):
+                self._weight_conversions = conversions
 
     save_pretrained._unsloth_mxfp4_patched = True
     PreTrainedModel.save_pretrained = save_pretrained
