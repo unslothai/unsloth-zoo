@@ -3958,9 +3958,13 @@ def _write_text_only_index(save_directory, filenames):
         with safe_open(file_path, framework = "pt", device = "cpu") as f:
             for key in f.keys(): weight_map[key] = filename
     pass
-    # Same shape the dequant/split path writes at Step 6, empty metadata included.
-    with open(index_path, "w", encoding = "utf-8") as f:
-        json.dump({"metadata" : {}, "weight_map" : weight_map}, f, indent = 4)
+    # Same shape and atomic write the dequant/split path uses at Step 6.
+    _mode_donor = os.path.join(save_directory, filenames[0])
+    _export_index_atomically(
+        None, index_path,
+        json.dumps({"metadata" : {}, "weight_map" : weight_map}, indent = 4).encode("utf-8"),
+        mode_from = _mode_donor,
+    )
     return index_path
 pass
 
