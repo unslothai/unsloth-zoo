@@ -5886,11 +5886,13 @@ def test_typed_role_fallback_preserves_existing_render(monkeypatch, legacy_rende
 
 
 @pytest.mark.parametrize("remote", [False, True])
-def test_missing_processor_template_recovers_legacy_json(tmp_path, remote):
+@pytest.mark.parametrize("template", ["source template", {"tool_use": "tool template", "default": "source template"}])
+def test_missing_processor_template_recovers_legacy_json(tmp_path, remote, template):
+    import json
     from types import SimpleNamespace
     from unsloth_zoo.mlx.utils import normalize_vlm_processor_chat_template
 
-    (tmp_path / "chat_template.json").write_text('{"chat_template":"source template"}')
+    (tmp_path / "chat_template.json").write_text(json.dumps({"chat_template": template}))
     tokenizer = SimpleNamespace(chat_template=None)
     processor = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
     kwargs = {"model_name": "org/model", "model_path": str(tmp_path)} if remote else {"model_name": str(tmp_path)}

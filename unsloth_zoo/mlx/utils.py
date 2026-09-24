@@ -4562,7 +4562,9 @@ def normalize_mlx_chat_template(
                 if template_path.is_file():
                     from .loader import _read_json_file
                     template = _read_json_file(template_path).get("chat_template")
-                    if isinstance(template, (str, dict)) and template:
+                    if isinstance(template, dict):
+                        template = template.get("default")
+                    if isinstance(template, str) and template:
                         tokenizer.chat_template = template
                         break
         if not _has_chat_template(target) and _has_chat_template(tokenizer):
