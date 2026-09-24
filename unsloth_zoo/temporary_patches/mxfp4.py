@@ -26,7 +26,7 @@ from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
-from ..mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize, mxfp4_kernel_available
+from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize, mxfp4_kernel_available
 
 transformers_version = Version(importlib_version("transformers"))
 
