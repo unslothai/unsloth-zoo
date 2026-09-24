@@ -962,6 +962,7 @@ def _merge_and_overwrite_lora(
     length_of_header = 0
 
     try:
+        _ensure_shard_writable(filename_original)
         # Memory-map for in-place overwrite
         raw_pointer = open(filename_original, "r+b")
         mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
@@ -3711,6 +3712,38 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     )
 
 
+def _ensure_shard_writable(file_path):
+    """Make a shard in the output directory safe to overwrite in place.
+
+    huggingface_hub 1.x stores cache blobs read-only (0444), and every way a shard gets here
+    keeps that mode: `shutil.copy2` and `copystat` from the cache or a local model directory,
+    and `hf_hub_download(local_dir = ...)`. The in-place merge then opens it "r+b" and fails
+    with EACCES. A shard sharing its inode with another link (a hard link into the cache) is
+    first replaced by a private copy, so the in-place write can never change the other link.
+    """
+    st = os.stat(file_path)
+    mode = stat.S_IMODE(st.st_mode) | stat.S_IWUSR
+    if st.st_nlink > 1:
+        _fd, staging = tempfile.mkstemp(
+            dir = os.path.dirname(file_path) or os.curdir, prefix = ".unsloth-private-",
+        )
+        try:
+            with os.fdopen(_fd, "wb") as _staging_file, open(file_path, "rb") as _source:
+                shutil.copyfileobj(_source, _staging_file)
+            os.chmod(staging, mode)
+            os.replace(staging, file_path)
+        except BaseException:
+            if os.path.exists(staging):
+                try:
+                    os.remove(staging)
+                except OSError:
+                    pass
+            raise
+    elif not st.st_mode & stat.S_IWUSR:
+        os.chmod(file_path, mode)
+pass
+
+
 def _assert_shard_is_inside(file_path, save_directory):
     """Last check before a writer opens a shard. Every write sink calls this.
 
@@ -4733,9 +4766,24 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
     if not os.access(src_path, os.R_OK):
          raise PermissionError(f"No read permission for source file: {src_path}")
     # Target dir creation and permission check is handled by caller (_try_copy_all_from_cache)
+    # Staged then `os.replace`d: `copy2` straight onto `dst_path` opens it for writing, which
+    # fails when an earlier step already put a read-only copy there (cache blobs are 0444).
+    # The staged copy keeps the source's mode plus owner-write, so later in-place writers work.
+    _staging = None
     try:
-        shutil.copy2(str(src_path), dst_path) # Use string paths for shutil
+        _fd, _staging = tempfile.mkstemp(
+            dir = os.path.dirname(dst_path) or os.curdir, prefix = ".unsloth-copy-",
+        )
+        os.close(_fd)
+        shutil.copy2(str(src_path), _staging) # Use string paths for shutil
+        os.chmod(_staging, stat.S_IMODE(os.stat(_staging).st_mode) | stat.S_IWUSR)
+        os.replace(_staging, dst_path)
     except Exception as e:
+        if _staging is not None and os.path.exists(_staging):
+            try:
+                os.remove(_staging)
+            except OSError:
+                pass
         raise IOError(f"Failed to copy {src_path} to {dst_path}: {e}") from e
 pass
 
