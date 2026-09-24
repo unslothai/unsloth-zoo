@@ -1,8 +1,4 @@
-"""The fast LoRA forward does not depend on torch.compile, so `UNSLOTH_COMPILE_DISABLE=partial`
-must keep it. Before, "partial" (set for aya_vision, modernbert, granite-vision, csm and
-Gemma-3 on RDNA) also dropped the addmm LoRA forward and left PEFT's, which casts the
-activation to the float32 LoRA dtype and runs the LoRA matmuls as fp32 SIMT GEMMs.
-"""
+"""`UNSLOTH_COMPILE_DISABLE=partial` must keep the fast LoRA forward; it does not need torch.compile."""
 import inspect
 import re
 
@@ -19,7 +15,6 @@ def test_lora_patch_is_gated_on_full_disable_only():
 
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs a GPU to load a 4-bit model")
 def test_partial_disable_still_patches_lora_forward(tmp_path, monkeypatch):
-    # gemma4 is not in every supported transformers (5.4.0, the CI pin, has none).
     pytest.importorskip("transformers.models.gemma4")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "partial")

@@ -1,19 +1,5 @@
 """The bnb4bit grouped-mm dispatcher follows the pin-vs-recompute policy, biased to
-recompute for the 4-bit base.
-
-forward_moe_backend_bnb4bit must not pre-dequantize the packed Params4bit into a dense
-bf16 stack and then re-hold that stack for a backward recompute. Outside a
-gradient-checkpoint replay it keeps the 4-bit weights and defers dequant to
-forward_native_grouped_mm's providers: pinning there would hold the full bf16 expert
-stack across the whole backward, which the 4-bit storage exists to avoid. Inside a
-replay the stack the replay just built is what the same layer's backward needs moments
-later, so with UNSLOTH_MOE_GC_REPLAY_PIN=1 it is pinned (the pre-dequantize-then-pin
-path) when it fits with headroom, which removes one of the three dequants per layer per
-step; by default, or when it does not fit, the recompute is kept. UNSLOTH_MOE_RECOMPUTE=0 forces the pin everywhere,
-UNSLOTH_MOE_RECOMPUTE=1 forces the recompute everywhere. In the pin case recompute is
-disabled, so the dense stack is never re-held for a backward recompute with no memory
-benefit.
-"""
+recompute for the 4-bit base; it never pre-dequantizes and then re-holds the stack."""
 import os
 
 import pytest
@@ -77,7 +63,6 @@ def test_default_non_gc_uses_recompute_provider(monkeypatch):
 
 
 def test_gc_recompute_pass_recomputes_for_4bit_by_default(monkeypatch):
-    # The replay pin raises peak memory, so it is never taken unless asked for.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     monkeypatch.delenv("UNSLOTH_MOE_GC_REPLAY_PIN", raising=False)
     monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
@@ -86,7 +71,6 @@ def test_gc_recompute_pass_recomputes_for_4bit_by_default(monkeypatch):
 
 
 def test_gc_recompute_pass_pins_for_4bit_when_asked_and_the_stack_fits(monkeypatch):
-    # The replay's dequant is reused by the same layer's backward: one dequant saved.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     monkeypatch.setenv("UNSLOTH_MOE_GC_REPLAY_PIN", "1")
     monkeypatch.setattr(mu, "_momentary_pin_fits", lambda src, dtype = None: True)
@@ -126,14 +110,12 @@ def test_momentary_pin_fits_measures_xpu_and_refuses_what_it_cannot_measure(monk
         free["bytes"] = int(mu._MOMENTARY_PIN_HEADROOM * need)
         assert mu._momentary_pin_fits(param) is True
         free["bytes"] = need
-        mu._MOMENTARY_PIN_FITS_CACHE.clear()  # the answer is memoized for a short interval
+        mu._MOMENTARY_PIN_FITS_CACHE.clear()
         assert mu._momentary_pin_fits(param) is False
-    # A device that cannot report free memory keeps the recompute.
     assert mu._momentary_pin_fits(SimpleNamespace(device = torch.device("meta"), quant_state = None)) is False
 
 
 def test_momentary_pin_fits_budgets_the_dtype_the_stack_is_dequantized_to(monkeypatch):
-    # A bf16 quant state dequantized for fp32 hidden states builds an fp32 stack.
     from types import SimpleNamespace
 
     backend = getattr(torch, "xpu", None) if not torch.cuda.is_available() else torch.cuda
@@ -154,8 +136,6 @@ def test_momentary_pin_fits_budgets_the_dtype_the_stack_is_dequantized_to(monkey
 
 
 def test_momentary_pin_fits_does_not_query_the_driver_per_call(monkeypatch):
-    # It runs for every bnb expert source of every layer in every checkpoint replay, and
-    # mem_get_info alone measured 0.25 to 0.9 ms on a busy B200.
     from types import SimpleNamespace
 
     backend = getattr(torch, "xpu", None) if not torch.cuda.is_available() else torch.cuda
@@ -208,10 +188,6 @@ def test_source_pins_large_dequant_classifies_4bit_only(monkeypatch):
 
 
 def test_4bit_recomputes_outside_gc_and_pins_inside_when_it_fits(monkeypatch):
-    # The scope guard: outside a GC replay the 4-bit base recomputes (a pin there
-    # spans the whole backward); inside a replay it pins when the stack fits and
-    # recomputes when it does not. A dense (already bf16) base keeps the
-    # speed-oriented adaptive policy and pins under a GC replay regardless.
     monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising=False)
     monkeypatch.setenv("UNSLOTH_MOE_GC_REPLAY_PIN", "1")
     q = _quantized_expert_param()

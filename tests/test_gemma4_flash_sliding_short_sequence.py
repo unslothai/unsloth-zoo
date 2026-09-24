@@ -1,12 +1,4 @@
-"""A sequence no longer than the sliding window must still leave the masked SDPA path.
-
-The router only engaged when `seq_len > sliding_window`. At or below the window
-(1024 tokens for gemma-4, the usual SFT length) every sliding layer went to the
-wrapped SDPA with an explicit mask, which cannot use its flash kernel and drops to
-the memory-efficient one: 4.2 ms vs 0.45 ms forward+backward per layer at
-2 x 1024 x 16 x 256 on a B200. The band with `w >= S` is the plain causal triangle,
-so FA2's window kernel and mask-free causal SDPA are both exact.
-"""
+"""A sequence no longer than the sliding window must still leave the masked SDPA path."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -48,7 +40,6 @@ def _route(gf, module, q, k, v, scaling, mask=None):
 @pytest.mark.parametrize("S,w", [(1024, 1024), (512, 1024)])
 @pytest.mark.parametrize("banded", [False, True])
 def test_short_sequence_leaves_masked_sdpa(monkeypatch, S, w, banded):
-    """The arm that fails without the fix: the router raised through `_boom`."""
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1"); gf._enabled.cache_clear()
     if banded:
@@ -83,7 +74,6 @@ def test_short_sequence_leaves_masked_sdpa(monkeypatch, S, w, banded):
 
 
 def test_short_sequence_with_explicit_causal_mask_engages(monkeypatch):
-    """What the compiled model passes: a dense causal mask with no padding."""
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1"); gf._enabled.cache_clear()
     monkeypatch.setenv("UNSLOTH_BANDED_SDPA", "1"); gf._force_banded.cache_clear()

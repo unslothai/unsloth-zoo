@@ -709,19 +709,12 @@ _MOMENTARY_PIN_HEADROOM = 2.0   # free memory must cover this many copies of one
 
 
 def _momentary_pin_fits(source, dtype = None) -> bool:
-    """Whether one layer's dense expert stack can be held for the moment between a
-    gradient-checkpoint replay and that layer's own backward. Measured against what
-    the device has free plus what the caching allocator holds unused, with headroom
-    for the second projection's stack and the layer's activations. Anything that
-    cannot be measured answers False, which keeps the recompute. ``dtype`` is the dtype
-    the stack is dequantized to (the hidden states'); without it the quant state's."""
+    """Whether one layer's dequantized stack fits in free + cached-unused memory; unmeasurable means False."""
     try:
         param = source
         while hasattr(param, "base_layer"):
             param = param.base_layer
         device = param.device
-        # CUDA (and ROCm through it) or XPU, whichever can report free memory; any other
-        # device cannot be measured and keeps the recompute.
         backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
         if backend is None or not callable(getattr(backend, "mem_get_info", None)):
             return False
@@ -730,11 +723,7 @@ def _momentary_pin_fits(source, dtype = None) -> bool:
             return False
         dtype = dtype or getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
         need = math.prod(int(d) for d in shape) * dtype.itemsize
-        # mem_get_info plus the allocator's stats cost 0.25 to 0.9 ms per call on a
-        # busy B200, and this runs for every bnb expert source of every layer in every
-        # gradient-checkpoint replay (more than the dequant it saves). The answer only
-        # moves with the step's memory high-water mark, so it is kept per device and
-        # stack size for a short interval; the headroom covers the drift inside it.
+        # Cached briefly: mem_get_info per source per replay costs more than the dequant it saves.
         key = (device.type, device.index, need, _MOMENTARY_PIN_HEADROOM)
         now = time.monotonic()
         hit = _MOMENTARY_PIN_FITS_CACHE.get(key)
@@ -756,17 +745,9 @@ _MOMENTARY_PIN_FITS_TTL_S = 0.5
 def _moe_recompute_enabled(source, dtype = None) -> bool:
     """Whether to recompute the dequantized base stack in backward (True) or pin it
     for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
-    everything else the pinned eager path is used.
-
-    A bnb 4-bit base recomputes by default: pinning it would hold the full bf16
-    expert dequant, which the 4-bit storage exists to avoid. The one cheaper pin is
-    inside a gradient-checkpoint replay, where the stack the replay just built is
-    what the same layer's backward needs moments later; holding it there costs one
-    layer's stack transiently and removes one of the three dequants per layer per
-    step. It raises peak memory by that stack, so it is opt-in through
-    UNSLOTH_MOE_GC_REPLAY_PIN=1 and taken only when the stack fits with headroom
-    (_momentary_pin_fits). UNSLOTH_MOE_RECOMPUTE overrides everything: "1" always
-    recomputes, "0" always pins."""
+    everything else the pinned eager path is used. A bnb 4-bit base recomputes unless
+    UNSLOTH_MOE_GC_REPLAY_PIN=1 and, inside a gradient-checkpoint replay, the stack fits:
+    the pin then saves a dequant for the same layer's backward but raises peak memory."""
     if not _base_is_recomputable(source):
         return False
     override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
@@ -1767,12 +1748,7 @@ def _get_base_weight(param, target_dtype=None):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        # The Triton dequant is bit-identical to bitsandbytes and about twice
-        # as fast on an expert stack. None means "not this state" (unsupported
-        # blocksize, no Triton, a failed launch), and bitsandbytes takes over.
-        # Absolute import: this file is also copied to
-        # unsloth_compiled_cache/moe_utils.py and imported as a top-level
-        # module, where a relative import of a sibling raises.
+        # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
         weight = None
         try:
             from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
@@ -3432,9 +3408,7 @@ _WEIGHTED_UNPERMUTE = None
 
 
 def weighted_unpermute(*args, **kwargs):
-    """Fused Triton combine; None (caller falls back to the eager reduction) when
-    the kernel module or the Triton path is unavailable. Absolute import: this
-    file is also copied into unsloth_compiled_cache and imported top-level."""
+    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
     global _WEIGHTED_UNPERMUTE
     if _WEIGHTED_UNPERMUTE is None:
         try:
@@ -3813,9 +3787,6 @@ def forward_native_grouped_mm(
         flat_weights = top_k_weights.reshape(-1)
         permuted_weights = flat_weights[sorted_indices]
 
-    # One fused pass (weights applied and the top_k slots of each token summed in
-    # fp32, rounded once) where Triton is available; otherwise the eager spelling,
-    # which promotes the whole permuted output to the router dtype first.
     final_hidden_states = weighted_unpermute(
         mm2_out,
         sorted_indices,

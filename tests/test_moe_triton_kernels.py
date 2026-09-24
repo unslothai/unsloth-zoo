@@ -1,13 +1,4 @@
-"""The Triton MoE kernels must match the eager path they replace.
-
-nf4_dequant_triton is held to bit-identity with bitsandbytes (same fp32
-product, one rounding), nested and non-nested absmax, every dtype bnb emits,
-every quant_storage dtype, a serialised-and-reloaded QuantState, and shapes
-that are not a multiple of the launch block. weighted_unpermute is held to
-bit-identity in forward and dY for every router/activation dtype pairing, with
-dw within fp32 reduction-order tolerance. Anything the kernels do not handle,
-and any failed launch, must make them return None rather than raise.
-"""
+"""The Triton MoE kernels must match the eager path they replace, or return None."""
 import os
 
 import pytest
@@ -27,8 +18,6 @@ from bitsandbytes.functional import QuantState, dequantize_4bit, quantize_4bit  
 
 @pytest.fixture(autouse = True)
 def _release_cuda_cache():
-    """The full-size stack cases allocate several GiB each; hand it back between
-    tests so the file also passes on a shared or small GPU."""
     yield
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -53,8 +42,7 @@ def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
     assert out is not None
     assert out.shape == ref.shape and out.dtype == ref.dtype
     if dtype == torch.float16:
-        # bitsandbytes' fp16 kernel rounds a handful of elements (about 5 in a
-        # million) one ulp differently; bf16 and fp32 are bit-identical.
+        # bitsandbytes' fp16 kernel rounds a few elements one ulp differently.
         assert (out.float() - ref.float()).abs().max().item() <= 2 ** -10 * ref.float().abs().max().item()
     else:
         assert torch.equal(out, ref)
@@ -63,7 +51,6 @@ def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
 @cuda
 @pytest.mark.parametrize("storage", [torch.bfloat16, torch.float16, torch.float32])
 def test_nf4_dequant_other_quant_storage_dtypes(storage):
-    """bnb_4bit_quant_storage changes only how the packed bytes are typed."""
     _need_triton()
     w = torch.randn(4, 64, 256, device = "cuda", dtype = torch.bfloat16)
     q, qs = quantize_4bit(w, blocksize = 64, compress_statistics = True, quant_type = "nf4", quant_storage = storage)
@@ -162,12 +149,11 @@ def test_weighted_unpermute_matches_eager(num_tokens, top_k, hidden, E, w_dtype)
     assert out is not None and out.shape == (num_tokens, hidden) and out.dtype == torch.bfloat16
     y2 = y.detach().clone().requires_grad_(True); w2 = w.detach().clone().requires_grad_(True)
     ref = _reference_combine(y2, sorted_indices, w2, num_tokens, top_k, torch.bfloat16)
-    # Same products, same accumulation order as torch.sum, one rounding: bit-identical.
     assert torch.equal(out, ref)
     g = torch.randn_like(ref)
     out.backward(g); ref.backward(g)
-    assert torch.equal(y.grad, y2.grad)                       # w * g, one rounding, both paths
-    # Same products, same fp32 accumulation, different summation order over hidden.
+    assert torch.equal(y.grad, y2.grad)
+    # dw sums over hidden in a different order, so it gets a tolerance.
     dw_tol = (2 ** -7 if w_dtype != torch.float32 else 1e-4) * w2.grad.float().abs().max().item() + 1e-6
     assert (w.grad.float() - w2.grad.float()).abs().max().item() <= dw_tol
 
@@ -176,9 +162,7 @@ def test_weighted_unpermute_matches_eager(num_tokens, top_k, hidden, E, w_dtype)
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("y_dtype", [torch.bfloat16, torch.float16])
 def test_weighted_unpermute_dtype_pairings(w_dtype, y_dtype):
-    """Each product is rounded exactly when torch's promoted dtype is narrower
-    than fp32, so a bf16 router with fp16 activations (promotes to fp32) must
-    not round, while matching dtypes must."""
+    """bf16 router with fp16 activations promotes to fp32 and must not round the product."""
     _need_triton()
     torch.manual_seed(1)
     num_tokens, top_k, hidden = 33, 4, 1500
@@ -191,7 +175,6 @@ def test_weighted_unpermute_dtype_pairings(w_dtype, y_dtype):
 
 @cuda
 def test_weighted_unpermute_empty_experts():
-    """Experts that received no tokens change nothing about the combine."""
     _need_triton()
     num_tokens, top_k, hidden = 256, 8, 512
     sorted_indices = torch.argsort(torch.randint(0, 3, (num_tokens * top_k,), device = "cuda"), stable = True)
@@ -228,8 +211,7 @@ def test_weighted_unpermute_is_deterministic():
 @cuda
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
 def test_a_backward_kernel_failure_finishes_in_eager(monkeypatch, w_dtype):
-    """The backward kernels compile on first use inside autograd, after the forward's fallback
-    has already returned; a failure there must disable the path and still produce gradients."""
+    """A backward compile failure happens after the forward's fallback; it must still produce gradients."""
     _need_triton()
     monkeypatch.setattr(mk, "_DISABLED_REASON", None)
     torch.manual_seed(0)

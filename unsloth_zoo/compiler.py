@@ -5415,11 +5415,7 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Patch PEFT lora forwards. Gated on the full disable, not the partial one:
-    # the replacement is plain addmm in the base dtype (torch.compile is
-    # deliberately left off it), so it needs nothing that "partial" turns off.
-    # Skipping it there left PEFT's own forward, which casts the whole activation
-    # to the float32 LoRA dtype and runs both matmuls as fp32 SIMT GEMMs.
+    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
     if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)

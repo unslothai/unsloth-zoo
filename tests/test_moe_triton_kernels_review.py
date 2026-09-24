@@ -1,7 +1,4 @@
-"""Review findings on the Triton MoE kernels: memory, cold compile, cache.
-
-Each test states which arm it measures; all fail on the tree before the fix.
-"""
+"""Triton MoE kernels: saved tensors, cold fullgraph compile, gategrad cache."""
 import os
 
 import pytest
@@ -21,9 +18,6 @@ def _inputs(T = 64, top_k = 4, H = 96, dtype = torch.bfloat16, w_requires_grad =
 
 @cuda
 def test_detached_routing_weights_do_not_pin_the_expert_output():
-    """The gate-grad identity path hands the combine a detached weight so that Y
-    is not kept on the tape. The fused combine must honour that: with
-    w.requires_grad False, y must not be among the saved tensors."""
     from unsloth_zoo.temporary_patches.moe_triton_kernels import _WeightedUnpermute, moe_triton_kernels_available
     if not moe_triton_kernels_available(torch.device("cuda")):
         pytest.skip("Triton MoE kernels unavailable here")
@@ -32,7 +26,6 @@ def test_detached_routing_weights_do_not_pin_the_expert_output():
     node = out.grad_fn
     saved = [t for t in (getattr(node, "saved_tensors", None) or ()) if isinstance(t, torch.Tensor)]
     assert not any(t.data_ptr() == y.data_ptr() for t in saved), "y was saved although no weight gradient is needed"
-    # and the gradient into y is still right: d out.sum() / d y[i] = w[i]
     out.sum().backward()
     torch.testing.assert_close(y.grad.float(), w.unsqueeze(-1).expand_as(y).float(), rtol = 0, atol = 0)
 
@@ -71,12 +64,7 @@ print("COLD_OK")
 
 @cuda
 def test_cold_fullgraph_compile_does_not_trace_the_kernel_definitions():
-    """The very first call in a process, under torch.compile(fullgraph=True).
-
-    A fresh interpreter is required: any earlier use in this process would
-    have built the kernels already and hide the defect (the lazy build defined
-    the @triton.jit functions inside the traced region, which Dynamo rejects).
-    """
+    """Needs a fresh interpreter: any earlier use in this process would have built the kernels already."""
     import subprocess, sys
     out = subprocess.run([sys.executable, "-c", _COLD], capture_output = True, text = True,
                          env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})

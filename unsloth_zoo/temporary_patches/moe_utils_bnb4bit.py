@@ -340,15 +340,8 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     if not target_dtype.is_floating_point:
         target_dtype = torch.bfloat16
 
-    # Defer dequant into forward_native_grouped_mm's providers instead of
-    # pre-dequantizing the full bf16 stack up front, unless the policy says pin.
-    # The same per-source decision forward_native_grouped_mm makes: recompute by
-    # default, so the packed Params4bit is kept and the dense stack rebuilt on
-    # demand; pin inside a gradient-checkpoint replay when one layer's stack fits,
-    # so the replay's dequant is reused by the same layer's backward instead of
-    # being built a third time; UNSLOTH_MOE_RECOMPUTE overrides both ways. The
-    # pre-dequantize path below is only taken when the policy says pin, so a dense
-    # stack is never built and then re-held for a backward recompute.
+    # Same recompute-vs-pin policy as forward_native_grouped_mm: when recomputing, keep the
+    # packed Params4bit so a dense stack is never built and then re-held for backward.
     if (
         select_moe_backend() == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
