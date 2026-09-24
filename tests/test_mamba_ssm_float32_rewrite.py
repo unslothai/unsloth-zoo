@@ -47,6 +47,8 @@ _MODS = ("mamba_ssm", "mamba_ssm.ops", "mamba_ssm.ops.triton", "mamba_ssm.ops.tr
 
 # Enough kernel-like lines that a write takes a while, like the real 107 KB file.
 _KERNEL = "".join(
+    f"@_Autotune\n"
+    f"@_JIT\n"
     f"def _kernel_{i}(a, b, cb, x, dout, c):\n"
     f"    acc = tl.dot(cb, x)\n"
     f"    acc += tl.dot(dout, c)\n"
@@ -55,8 +57,17 @@ _KERNEL = "".join(
     for i in range(400)
 )
 _MODULE = (
+    "import inspect\n"
     "from pathlib import Path\n"
-    "UPCAST = 'to(tl.float32)' in Path(__file__).read_text()\n"
+    "UPCAST = ('to(tl.' + 'float32)') in Path(__file__).read_text()  # split, so this line never matches\n"
+    "class _JIT:\n"
+    "    # Like triton.JITFunction: keeps the source the kernel was compiled from.\n"
+    "    def __init__(self, fn):\n"
+    "        self.src = inspect.getsource(fn)\n"
+    "class _Autotune:\n"
+    "    # Like triton.autotune: wraps the JIT function in `.fn`.\n"
+    "    def __init__(self, fn):\n"
+    "        self.fn = fn\n"
     "def _chunk_scan_fwd():\n"
     "    return 1\n\n"
     + _KERNEL
@@ -201,3 +212,38 @@ def test_concurrent_processes_never_truncate_the_module(tmp_path):
     assert "def _chunk_scan_fwd" in final, "the module was left truncated"
     assert "tl.float32" in final
     assert short_reads == 0, f"a reader saw a truncated module {short_reads} times"
+
+
+def _upcast_text(text):
+    patch_ns = {}
+    exec("import re", patch_ns)
+    return re.sub(
+        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
+        lambda m: f" {m.group(1)} = tl.dot({m.group(3)}.to(tl.float32), {m.group(4)}.to(tl.float32)"
+                  + ("" if m.group(2) == "=" else f", acc = {m.group(1)}") + ")",
+        text,
+    )
+
+
+def test_a_module_imported_before_a_peer_rewrite_is_reloaded(fake_mamba):
+    # This process imports the original, another process then upcasts the file: the file needs no
+    # rewrite, but the kernels this process holds are still the original ones and must be reloaded.
+    import mamba_ssm.ops.triton.ssd_chunk_scan as mod
+    assert mod.UPCAST is False
+    tmp = fake_mamba.with_name(".peer.tmp")
+    tmp.write_text(_upcast_text(fake_mamba.read_text(encoding = "utf-8")), encoding = "utf-8")
+    os.replace(tmp, fake_mamba)
+    _load()()
+    mod = sys.modules["mamba_ssm.ops.triton.ssd_chunk_scan"]
+    assert mod.UPCAST is True
+    assert "to(tl.float32)" in mod._kernel_0.fn.src
+
+
+def test_an_upcast_module_is_not_reloaded(fake_mamba, monkeypatch):
+    patch = _load()
+    patch()
+    reloads = []
+    real_reload = importlib.reload
+    monkeypatch.setattr(importlib, "reload", lambda m: reloads.append(m) or real_reload(m))
+    patch()
+    assert reloads == []

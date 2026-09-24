@@ -1544,10 +1544,8 @@ def fix_mamba_ssm_float32():
     original_file = file
 
     # Find `dst = tl.dot(a, b)` / `dst += tl.dot(a, b)`
-    matches = list(re.finditer(
-        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
-        file)
-    )
+    plain_dot = r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)"
+    matches = list(re.finditer(plain_dot, file))
     for match in matches:
         old = match.group(0)
         dst, adder, a, b = match.groups()
@@ -1560,8 +1558,27 @@ def fix_mamba_ssm_float32():
         file = file.replace(old, new)
     pass
 
-    # Already upcast (every import after the first), so leave the installed file alone.
+    # Already upcast (every import after the first), so leave the installed file alone. Another
+    # process may have rewritten it after this one imported the original, so reload unless the
+    # kernels in memory were compiled from upcast source (Triton keeps it on each JIT function).
     if file == original_file:
+        module = mamba_ssm.ops.triton.ssd_chunk_scan
+        sources = []
+        for value in list(vars(module).values()):
+            # Autotuner / Heuristics wrap the JITFunction in `.fn`; the JITFunction holds `.src`.
+            for _ in range(4):
+                src = getattr(value, "src", None)
+                if isinstance(src, str):
+                    if "tl.dot" in src: sources.append(src)
+                    break
+                value = getattr(value, "fn", None)
+                if value is None: break
+        if sources and not any(re.search(plain_dot, src) for src in sources):
+            return
+        try:
+            importlib.reload(module)
+        except Exception as e:
+            return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
         return
 
     # This edits site-packages, and other processes may import or patch the same file
