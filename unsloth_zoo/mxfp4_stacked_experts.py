@@ -48,7 +48,7 @@ def _experts_per_chunk(param, dtype):
 
 def _grouped_mm(inputs, weight, offsets):
     # Imported late: moe_utils imports this package's mxfp4_dequant at module load.
-    from .temporary_patches.moe_utils import _grouped_mm_with_backward_fix
+    from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
     return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
@@ -115,7 +115,7 @@ def mxfp4_grouped_linear(inputs, param, counts, ends):
 
 
 def _lora_delta(experts, name, inputs, ends_device):
-    from .temporary_patches.moe_utils import _apply_lora_grouped_mm, take_moe_lora_stash
+    from unsloth_zoo.temporary_patches.moe_utils import _apply_lora_grouped_mm, take_moe_lora_stash
     lora = take_moe_lora_stash(experts, name)
     if lora is None:
         return None

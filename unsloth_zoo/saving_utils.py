@@ -3882,9 +3882,9 @@ def _one_expert_lora_delta(holder, adapter, index):
     # PEFT's layout: lora_A (experts, rank, in), lora_B (out, rank, experts).
     weight_A = weight_A.reshape(num, -1, weight_A.shape[-1])[index]
     grouped = False
-    from .temporary_patches.moe_utils import _cast_delta_weight_like_param
+    from unsloth_zoo.temporary_patches.moe_utils import _cast_delta_weight_like_param
     try:
-        from .temporary_patches.moe_utils import (
+        from unsloth_zoo.temporary_patches.moe_utils import (
             LORA_B_LAYOUT_GROUPED_BY_EXPERT, _legacy_lora_b_layout_requested, moe_lora_b_layout_for_wrapper,
         )
         grouped = _legacy_lora_b_layout_requested() and (

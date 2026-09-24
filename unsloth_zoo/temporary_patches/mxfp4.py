@@ -296,7 +296,7 @@ def _restore_modules(swaps):
 
 def _swap_out_packed_modules(model):
     """Swap packed modules for the dense ones the checkpoint names, so the model's own code reloads the save."""
-    from ..mxfp4_stacked_experts import dense_expert_modules
+    from unsloth_zoo.mxfp4_stacked_experts import dense_expert_modules
 
     found = []
     for name, module in list(model.named_modules()):
