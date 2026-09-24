@@ -12,7 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Automatic LoRA targets of a Mamba-family model leave out out_proj and conv1d."""
+"""Automatic LoRA targets of a Mamba-family model leave out out_proj and conv1d, which PEFT refuses."""
 import re
 from types import SimpleNamespace
 

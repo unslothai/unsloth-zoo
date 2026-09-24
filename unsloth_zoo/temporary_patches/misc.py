@@ -585,7 +585,7 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
-    # No UNSLOTH_COMPILE_DISABLE early return: the kwarg aliases and device fix are still needed.
+    # No UNSLOTH_COMPILE_DISABLE early return: `_torch_compile` is already a no-op there, and the kwarg fixes still apply.
     try:
         import transformers.masking_utils as masking_utils
         import transformers.generation.utils as generation_utils
@@ -635,8 +635,8 @@ def patch_transformers_masks():
     )
 
     def wrap(f, original, prepared_mask_shortcut = True):
-        # input_embeds -> inputs_embeds in 5.2 (transformers#43916), cache_position removed in
-        # 5.9 (#45884); remote code uses either signature. Decide from the signature, not version.
+        # Remote code uses either `input_embeds` (<= 5.1) or `inputs_embeds` (5.2+, transformers#43916),
+        # and passes `cache_position`, removed in 5.9 (#45884). Decide from the signature, not the version.
         try:
             parameters = inspect.signature(original).parameters
         except (TypeError, ValueError):
@@ -680,7 +680,7 @@ def patch_transformers_masks():
     masking_utils.create_sliding_window_causal_mask = wrap(
         compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
     )
-    # create_masks_for_generate routes attention_chunk_size models (Llama 4) here; not on every version.
+    # Llama 4 (attention_chunk_size) routes here too; not every supported transformers has it.
     if hasattr(masking_utils, "create_chunked_causal_mask"):
         original_create_chunked_causal_mask = getattr(
             masking_utils, "_unsloth_original_create_chunked_causal_mask",
@@ -691,13 +691,13 @@ def patch_transformers_masks():
             masking_utils.create_chunked_causal_mask, original_create_chunked_causal_mask
         )
     pass
-    # Stash the original: a re-apply reading the wrapper's (*args, **kwargs) disables the rename.
+    # Stash the original: a re-apply must read its signature, not the wrapper's (*args, **kwargs).
     original_create_masks_for_generate = getattr(
         masking_utils, "_unsloth_original_create_masks_for_generate",
         masking_utils.create_masks_for_generate,
     )
     masking_utils._unsloth_original_create_masks_for_generate = original_create_masks_for_generate
-    # No prepared-mask shortcut: hybrid configs expect a dict keyed by layer type back.
+    # No prepared-mask shortcut: hybrid configs need the per-layer-type dict this returns.
     masking_utils.create_masks_for_generate = wrap(
         masking_utils.create_masks_for_generate,
         original_create_masks_for_generate,

@@ -284,9 +284,9 @@ pass
 
 
 def _get_embedding_modules(model):
-    """(embeddings, head), looking into wrappers like Nemotron-3-Nano-Omni that own no lm_head.
+    """(input embeddings, lm_head), looking through wrappers with no head (Nemotron-3-Nano-Omni).
 
-    Only NotImplementedError / required-args accessors answer None; other errors propagate.
+    Only an accessor needing arguments or raising NotImplementedError reads as None; other errors propagate.
     """
     def _own(module, name):
         getter = getattr(module, name, None)
@@ -303,8 +303,8 @@ def _get_embedding_modules(model):
             nested_head = _own(module, "get_output_embeddings")
             if nested_head is None: continue
             candidates.append((nested_head, _own(module, "get_input_embeddings")))
-        # Prefer the sub-model owning the top-level embeddings: the first by registration order
-        # may be a vision decoder, and the min(len) vocab compare below would not catch it.
+        # Prefer the sub-model owning the top-level input embeddings; first-registered could be a
+        # vision decoder, silently corrupted since vocab sizes are only compared by min(len).
         for nested_head, nested_embeddings in candidates:
             if embeddings is not None and nested_embeddings is embeddings:
                 return embeddings, nested_head

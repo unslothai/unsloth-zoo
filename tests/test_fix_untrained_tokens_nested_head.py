@@ -69,7 +69,7 @@ def _model_with_untrained_rows():
     with torch.no_grad():
         lm.embed_tokens.weight.normal_()
         lm.lm_head.weight.normal_()
-        lm.embed_tokens.weight[VOCAB - 2:].zero_()   # two untrained tokens
+        lm.embed_tokens.weight[VOCAB - 2:].zero_()
         lm.lm_head.weight[VOCAB - 2:].zero_()
     return model
 
@@ -96,7 +96,7 @@ class _TwoSubModels(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.vision_decoder = _CausalLM(config)     # registered first, owns a head
+        self.vision_decoder = _CausalLM(config)  # must register before language_model
         self.language_model = _CausalLM(config)
 
     def get_input_embeddings(self):
@@ -155,7 +155,7 @@ def test_fix_untrained_tokens_skips_a_headless_model(caplog):
             self.encoder = nn.Linear(DIM, DIM)
     ds = Dataset.from_dict({"input_ids": [[1, 2]]})
     with caplog.at_level(logging.WARNING, logger = tokenizer_utils.logger.name):
-        fix_untrained_tokens(_Headless(_Cfg()), _Tokenizer(), ds)   # no raise
+        fix_untrained_tokens(_Headless(_Cfg()), _Tokenizer(), ds)
     assert any("Skipping the untrained token fix" in r.message for r in caplog.records)
 
 

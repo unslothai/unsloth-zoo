@@ -12,7 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A bare `proj` group entry must not match Nemotron-H's Identity `fc1_latent_proj`."""
+"""The LoRA target group must match a whole leaf name, so a bare `proj` skips Nemotron-H's Identity fc1_latent_proj."""
 import re
 
 import pytest
@@ -27,7 +27,6 @@ class _Mixer(nn.Module):
         super().__init__()
         self.in_proj = nn.Linear(dim, dim)
         self.out_proj = nn.Linear(dim, dim)
-        # Nemotron-H: a Linear on latent layers, an nn.Identity placeholder otherwise.
         self.fc1_latent_proj = nn.Linear(dim, dim) if latent else nn.Identity()
         self.fc2_latent_proj = nn.Linear(dim, dim) if latent else nn.Identity()
 
@@ -39,8 +38,6 @@ class _Layer(nn.Module):
 
 
 class _VisionBlock(nn.Module):
-    """Its leaf `proj` is what puts the bare `proj` in the group."""
-
     def __init__(self, dim):
         super().__init__()
         self.qkv = nn.Linear(dim, dim * 3)
@@ -83,7 +80,7 @@ def test_identity_placeholders_are_not_selected():
 
 
 def test_every_real_target_is_still_selected():
-    # Two latent layers: a leaf name on a single Linear is left out as a projection head.
+    # Two latent layers: a leaf name on a single Linear is treated as a head and left out of the group.
     model = _Model(latent_layers = (0, 1))
     matched = _matched(model, get_peft_regex(model))
     for layer in range(4):

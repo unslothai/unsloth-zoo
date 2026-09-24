@@ -12,7 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Mask builders accept remote code's older call shape (input_embeds, cache_position)."""
+"""Patched mask builders accept both `input_embeds` / `inputs_embeds` and a stale `cache_position`."""
 import inspect
 
 import pytest
@@ -124,7 +124,7 @@ def test_requires_grad_short_cut_reads_both_spellings(patched):
 
 
 def test_aliases_are_installed_with_compilation_disabled():
-    """Fresh interpreter: the flag is read at import."""
+    # Fresh interpreter: the flag is read at import.
     import subprocess, sys, os
     code = (
         "import os; os.environ['UNSLOTH_COMPILE_DISABLE'] = '1'\n"

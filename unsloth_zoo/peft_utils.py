@@ -41,17 +41,15 @@ MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
 
-# Kept in step with PEFT's _check_lora_target_modules_mamba (peft/tuners/tuners_utils.py).
+# Mirrors PEFT's _check_lora_target_modules_mamba in peft/tuners/tuners_utils.py.
 MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
 MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
-
-
-# Mamba, Mamba2, Nemotron-H use `mixer`; Falcon-H1, Bamba, Zamba2 use `mamba`.
+# Mamba, Mamba2, Nemotron-H name the mixer `mixer`; Falcon-H1, Bamba, Zamba2 `mamba`.
 MAMBA_MIXER_NAMES = ("mixer", "mamba")
 
 
 def _mamba_scope(model):
-    """"root" (model is a Mamba family), "nested" (inside a wrapper's sub-config) or None."""
+    """Return "root" (model is a Mamba family), "nested" (in a sub-config) or None."""
     config = getattr(model, "config", None)
     if config is None:
         return None
@@ -77,7 +75,6 @@ def _mamba_only_leaves(model):
 
 
 def _mamba_subtree_exclusion(leaves):
-    """Exclude `leaves` inside Mamba mixers only; a vision tower's out_proj stays a target."""
     return (
         r"(?!.*\.(?:" + "|".join(MAMBA_MIXER_NAMES) + r")\.(?:"
         + "|".join(re.escape(x) for x in sorted(leaves)) + r")$)"
@@ -165,8 +162,7 @@ def get_peft_regex(
         only_linear_modules = list(target_modules)
     pass
 
-    # Mamba mixers feed out_proj / conv1d to fused kernels (LoRA never runs) and PEFT >= 0.17
-    # refuses them; only auto targets are filtered, an explicit list is the caller's decision.
+    # Mamba fused kernels read out_proj / conv1d weights directly (LoRA never runs) and PEFT >= 0.17 refuses them.
     mamba_nested_exclusion = None
     if target_modules is None:
         mamba_scope = _mamba_scope(model)
@@ -176,7 +172,7 @@ def get_peft_regex(
             if mamba_scope == "root":
                 only_linear_modules = [x for x in only_linear_modules if x not in mamba_leaves]
             elif dropped:
-                # A vision / audio tower may own a real out_proj, so exclude the Mamba subtree only.
+                # Only the Mamba subtree: a vision/audio tower's own out_proj stays a target.
                 mamba_nested_exclusion = _mamba_subtree_exclusion(mamba_leaves)
             if dropped:
                 logger.info(
@@ -201,8 +197,8 @@ def get_peft_regex(
     # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
     # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
     # so ending at the group keeps every real target and drops same-prefix non-linear modules.
-    # The "." before the group anchors a whole leaf name: without it a bare "proj" entry matched
-    # Nemotron-H's fc1_latent_proj Identity -> "Target module Identity() is not supported".
+    # The "." before the group anchors whole leaf names: a bare "proj" entry otherwise matched
+    # Nemotron-H's nn.Identity fc1_latent_proj -> "Target module Identity() is not supported".
     if regex_model_parts == "":
         # No vision/language model-part selected (e.g. audio-only finetuning):
         # the standard matcher would degenerate into matching every attention/mlp
@@ -324,8 +320,7 @@ def get_peft_regex(
                 r").*?\." + match_linear_modules
     pass
 
-    # Exclude parameter-free leaves by exact name (Nemotron-H's Identity fc1_latent_proj);
-    # the same leaf name stays targetable wherever it is a real Linear.
+    # Exclude parameter-free leaves by exact name only (Nemotron-H's Identity fc1_latent_proj is a Linear elsewhere).
     placeholders = [
         name for name, module in model.named_modules()
         if name
