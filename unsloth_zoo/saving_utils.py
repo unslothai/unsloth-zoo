@@ -3858,7 +3858,9 @@ def _text_only_key_map(text_keys, base_keys, tie_word_embeddings = False):
             )
     pass
     if candidates is None:
-        # Nothing to strip, so dropping by this map would be a no-op the caller must not run.
+        # Every text key already matches its base name; only worth it if vision/audio keys remain.
+        if base_keys - text_keys:
+            return {key : key for key in text_keys if key in base_keys}
         raise TextOnlyRemapError("the base checkpoint is already text-only")
 
     def _build(text_prefix, base_prefix):

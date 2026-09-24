@@ -157,3 +157,18 @@ def test_an_already_text_only_checkpoint_is_an_error():
     """There is nothing to drop, and an identity map would rewrite every shard to achieve it."""
     with pytest.raises(TextOnlyRemapError):
         _text_only_key_map(TEXT_KEYS, set(TEXT_KEYS), tie_word_embeddings = False)
+
+
+@pytest.mark.parametrize("extra, expect_error", [
+    (set(), True),
+    (_vision("visual."), False),
+], ids = ["pure_text_base_raises", "identity_with_vision_extras_returns_identity"])
+def test_a_checkpoint_already_named_like_the_text_config(extra, expect_error):
+    """Qwen2-VL-style: every text key already matches, so the fallback only fires with nothing to drop."""
+    base_keys = TEXT_KEYS | extra
+    if expect_error:
+        with pytest.raises(TextOnlyRemapError):
+            _text_only_key_map(TEXT_KEYS, base_keys, tie_word_embeddings = False)
+    else:
+        key_map = _text_only_key_map(TEXT_KEYS, base_keys, tie_word_embeddings = False)
+        assert key_map == {key : key for key in TEXT_KEYS}, f"expected an identity map, got {key_map}"
