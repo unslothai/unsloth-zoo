@@ -222,3 +222,58 @@ def test_trust_is_not_carried_to_a_substituted_source(tmp_path, monkeypatch):
         H.run_merge(pm, base, out, save_dtype = torch.float32)
     assert any("Could not read the base config" in str(w.message) and "substituted" in str(w.message) for w in caught)
     assert not any(f.endswith(".py") for f in os.listdir(out))
+
+
+def test_a_relative_load_path_is_the_same_trusted_source(tmp_path, monkeypatch):
+    # Loaded as `./base`, resolved to an absolute directory by the source lookup: still the repo the
+    # load trusted, so the export is the composite with its code, not the text-only fallback.
+    H.set_offline_cpu_env()
+    os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")
+    base, state = _write_base(tmp_path)
+    monkeypatch.chdir(os.path.dirname(base))
+    pm = _text_only_peft(base, state, trusted = True)
+    pm.config._name_or_path = os.path.join(".", os.path.basename(base))
+    out = os.path.join(str(tmp_path), "merged")
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        H.run_merge(pm, os.path.abspath(base), out, save_dtype = torch.float32)
+    assert not any("Could not read the base config" in str(w.message) for w in caught)
+    assert json.load(open(os.path.join(out, "config.json")))["architectures"] == ["TinyOmni"]
+    assert os.path.isfile(os.path.join(out, "modeling_tiny_omni.py"))
+
+
+def test_hub_repo_code_is_pinned_to_the_loaded_commit(monkeypatch, tmp_path):
+    # A Hub repo is re-read, and its code copied, at the commit the trusted load ran, never the
+    # branch head; with no known commit the trusted re-read is refused.
+    import transformers
+    import huggingface_hub
+    from unsloth_zoo import saving_utils as S
+    calls = []
+
+    def from_pretrained(name, **kwargs):
+        calls.append(kwargs)
+        if not kwargs.get("trust_remote_code"): raise ValueError("needs repo code")
+        return "config"
+    monkeypatch.setattr(transformers.AutoConfig, "from_pretrained", from_pretrained)
+    model = torch.nn.Linear(1, 1)
+    model.config = type("C", (), {"_name_or_path": "org/repo"})()
+    model._unsloth_trust_remote_code = True
+    assert S._is_export_source_loaded_repo("org/repo", model)
+    assert not S._is_export_source_loaded_repo("org/repo-bf16", model)
+    with pytest.raises(ValueError):
+        S._read_export_base_config("org/repo", None, model, source_is_loaded_repo = True)
+    assert len(calls) == 1
+
+    commit = "a" * 40
+    model._unsloth_trust_remote_code_commit = commit
+    assert S._read_export_base_config("org/repo", None, model, source_is_loaded_repo = True) == "config"
+    assert calls[-1]["revision"] == commit and calls[-1]["code_revision"] == commit
+
+    seen = []
+    monkeypatch.setattr(huggingface_hub.HfApi, "list_repo_files",
+                        lambda self, name, token = None, revision = None: seen.append(revision) or ["modeling_x.py", "sub/y.py"])
+    src = tmp_path / "modeling_x.py"; src.write_text("# code")
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda name, file, token = None, revision = None: seen.append(revision) or str(src))
+    assert S._copy_remote_code_files("org/repo", str(tmp_path / "out"), revision = commit) == ["modeling_x.py"]
+    assert seen == [commit, commit]

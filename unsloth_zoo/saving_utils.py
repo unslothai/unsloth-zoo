@@ -3474,14 +3474,42 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
 
 def _loaded_with_trust_remote_code(model):
     # The load's own trust_remote_code decision (Unsloth records it), found through PEFT wrappers.
+    return _find_load_marker(model, "_unsloth_trust_remote_code") is True
+pass
+
+
+def _find_load_marker(model, attr):
     seen, queue = set(), [model]
     while queue and len(seen) < 8:
         node = queue.pop(0)
         if node is None or id(node) in seen: continue
         seen.add(id(node))
-        if getattr(node, "_unsloth_trust_remote_code", False) is True: return True
-        queue.extend(getattr(node, attr, None) for attr in ("base_model", "model"))
-    return False
+        value = getattr(node, attr, None)
+        if value is not None and value is not False: return value
+        queue.extend(getattr(node, a, None) for a in ("base_model", "model"))
+    return None
+pass
+
+
+def _trusted_code_commit(model):
+    # The commit whose repo code the trusted load ran: Unsloth stamps it (the composite's own commit
+    # under text_only, whose nested config carries none); else the loaded config's resolved commit.
+    commit = _find_load_marker(model, "_unsloth_trust_remote_code_commit")
+    if commit is None:
+        commit = getattr(getattr(model, "config", None), "_commit_hash", None)
+    return commit if isinstance(commit, str) and commit else None
+pass
+
+
+def _is_export_source_loaded_repo(model_name, model):
+    # The export reads the very checkpoint the load trusted: the same Hub id, or the same local
+    # directory however it is spelled (`./base` at load, an absolute path after source resolution).
+    loaded = getattr(getattr(model, "config", None), "_name_or_path", None)
+    if not isinstance(loaded, str) or not isinstance(model_name, str): return False
+    if os.path.isdir(model_name) or os.path.isdir(loaded):
+        try: return os.path.samefile(model_name, loaded)
+        except OSError: return False
+    return model_name == loaded
 pass
 
 
@@ -3490,13 +3518,18 @@ def _read_export_base_config(model_name, token, model, source_is_loaded_repo = F
     # only when that fails, the load itself ran repo code (a text_only load of a repo-code composite
     # such as Nemotron-Omni or InternVL), AND the export reads the very repo that load trusted, is its
     # config read with its code again. A resolved sibling (FP8 -> 16bit) or a name-mapped repo is a
-    # different repository, whose code was never approved, so it keeps the untrusted path.
+    # different repository, whose code was never approved, so it keeps the untrusted path. A Hub repo
+    # is re-read at the commit the load ran, never its current head; without a known commit, not at all.
     from transformers import AutoConfig
     try:
         return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
     except Exception:
         if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
-    return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = True)
+        commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
+        if commit is None and not os.path.isdir(model_name): raise
+    return AutoConfig.from_pretrained(
+        model_name, token = token, trust_remote_code = True, revision = commit, code_revision = commit,
+    )
 pass
 
 
@@ -3506,7 +3539,7 @@ def _is_remote_code_config(config):
 pass
 
 
-def _copy_remote_code_files(model_name, save_directory, token = None):
+def _copy_remote_code_files(model_name, save_directory, token = None, revision = None):
     # A repo-code config.json is only loadable next to its code: carry the repo's top-level *.py files
     # (auto_map modules and the files they import) into the export. Returns the copied names.
     os.makedirs(save_directory, exist_ok = True)
@@ -3521,9 +3554,10 @@ def _copy_remote_code_files(model_name, save_directory, token = None):
             copied.append(name)
         return copied
     from huggingface_hub import HfApi, hf_hub_download
-    for name in sorted(HfApi().list_repo_files(model_name, token = token)):
+    for name in sorted(HfApi().list_repo_files(model_name, token = token, revision = revision)):
         if not name.endswith(".py") or "/" in name: continue
-        shutil.copyfile(hf_hub_download(model_name, name, token = token), os.path.join(save_directory, name))
+        path = hf_hub_download(model_name, name, token = token, revision = revision)
+        shutil.copyfile(path, os.path.join(save_directory, name))
         copied.append(name)
     return copied
 pass
@@ -4214,7 +4248,7 @@ def merge_and_overwrite_lora(
             # against the source actually read here, after every sibling / local / name remap.
             base_config = _read_export_base_config(
                 model_name, token, model,
-                source_is_loaded_repo = model_name == getattr(model.config, "_name_or_path", None),
+                source_is_loaded_repo = _is_export_source_loaded_repo(model_name, model),
             )
         except Exception as base_config_error:
             warnings.warn(
@@ -4228,7 +4262,11 @@ def merge_and_overwrite_lora(
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             # config.json names the repo's own classes, so the export needs their code beside it.
-            _copied = _copy_remote_code_files(model_name, save_directory, token = token)
+            # The code beside config.json is the code of the commit that config was read at.
+            _copied = _copy_remote_code_files(
+                model_name, save_directory, token = token,
+                revision = None if os.path.isdir(model_name) else _trusted_code_commit(model),
+            )
             if UNSLOTH_ENABLE_LOGGING:
                 logger.info(f"Unsloth: copied repo code {_copied} from `{model_name}` into the export.")
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
