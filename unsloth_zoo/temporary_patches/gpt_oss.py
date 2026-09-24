@@ -39,7 +39,7 @@ from .common import (
 )
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
-from ..mxfp4_dequant import is_mxfp4_expert_param
+from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
