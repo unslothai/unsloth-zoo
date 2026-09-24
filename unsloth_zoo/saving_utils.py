@@ -3472,6 +3472,61 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
+def _loaded_with_trust_remote_code(model):
+    # The load's own trust_remote_code decision (Unsloth records it), found through PEFT wrappers.
+    seen, queue = set(), [model]
+    while queue and len(seen) < 8:
+        node = queue.pop(0)
+        if node is None or id(node) in seen: continue
+        seen.add(id(node))
+        if getattr(node, "_unsloth_trust_remote_code", False) is True: return True
+        queue.extend(getattr(node, attr, None) for attr in ("base_model", "model"))
+    return False
+pass
+
+
+def _read_export_base_config(model_name, token, model):
+    # Config of the checkpoint the merged weights come from. Built-in configs read exactly as before;
+    # only when that fails and the load itself ran this repo's code (a text_only load of a repo-code
+    # composite such as Nemotron-Omni or InternVL) is the same repo's config read with its code again.
+    from transformers import AutoConfig
+    try:
+        return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
+    except Exception:
+        if not _loaded_with_trust_remote_code(model): raise
+    return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = True)
+pass
+
+
+def _is_remote_code_config(config):
+    module = getattr(type(config), "__module__", None)
+    return isinstance(module, str) and module.startswith("transformers_modules")
+pass
+
+
+def _copy_remote_code_files(model_name, save_directory, token = None):
+    # A repo-code config.json is only loadable next to its code: carry the repo's top-level *.py files
+    # (auto_map modules and the files they import) into the export. Returns the copied names.
+    os.makedirs(save_directory, exist_ok = True)
+    copied = []
+    if os.path.isdir(model_name):
+        for name in sorted(os.listdir(model_name)):
+            src = os.path.join(model_name, name)
+            if not name.endswith(".py") or not os.path.isfile(src): continue
+            dst = os.path.join(save_directory, name)
+            if os.path.exists(dst) and os.path.samefile(src, dst): continue
+            shutil.copyfile(src, dst)
+            copied.append(name)
+        return copied
+    from huggingface_hub import HfApi, hf_hub_download
+    for name in sorted(HfApi().list_repo_files(model_name, token = token)):
+        if not name.endswith(".py") or "/" in name: continue
+        shutil.copyfile(hf_hub_download(model_name, name, token = token), os.path.join(save_directory, name))
+        copied.append(name)
+    return copied
+pass
+
+
 def _text_configs(config):
     # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
     # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
@@ -3479,6 +3534,9 @@ def _text_configs(config):
     try: holders.append(config.get_text_config())
     except Exception: pass
     holders.append(getattr(config, "text_config", None))
+    # Repo-code composites (InternVL, Nemotron-Nano-VL) keep the decoder under llm_config / language_config.
+    holders.append(getattr(config, "llm_config", None))
+    holders.append(getattr(config, "language_config", None))
     seen = []
     for holder in holders:
         if holder is not None and not any(holder is s for s in seen): seen.append(holder)
@@ -4149,13 +4207,8 @@ def merge_and_overwrite_lora(
         # while the weights come from `model_name` and keep their VLM prefixes. Saving it wrote
         # a text-only config beside VLM weights and every tensor was silently re-initialized on
         # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
-        from transformers import AutoConfig
         try:
-            base_config = AutoConfig.from_pretrained(
-                model_name,
-                token = token,
-                trust_remote_code = False,
-            )
+            base_config = _read_export_base_config(model_name, token, model)
         except Exception as base_config_error:
             warnings.warn(
                 f"Unsloth: Could not read the base config from `{model_name}` "
@@ -4166,6 +4219,11 @@ def merge_and_overwrite_lora(
         else:
             _carry_over_vocab_size(base_config, config)
         base_config.save_pretrained(save_directory)
+        if _is_remote_code_config(base_config):
+            # config.json names the repo's own classes, so the export needs their code beside it.
+            _copied = _copy_remote_code_files(model_name, save_directory, token = token)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.info(f"Unsloth: copied repo code {_copied} from `{model_name}` into the export.")
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         # #5410: keep trained eos / sampling defaults on reload.
