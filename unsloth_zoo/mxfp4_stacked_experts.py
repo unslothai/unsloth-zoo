@@ -14,18 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Routed MoE experts kept as MXFP4, one packed stack per projection.
-
-A remote-code MoE whose experts are a ``ModuleList`` of ``w1`` (gate) / ``w2`` (down) / ``w3``
-(up) Linears, each stored as compressed-tensors ``mxfp4-pack-quantized`` (Kimi-K3), is loaded
-into one ``Mxfp4StackedExperts`` per layer: ``gate_up_proj`` holds the w1 and w3 blocks
-concatenated on the output dim, ``down_proj`` the w2 blocks, both as ``Mxfp4ExpertParam``
-(logical ``(E, in, out)``). The forward sorts the routed rows by expert and runs one grouped
-GEMM per projection, dequantizing only experts that received rows, a bounded number of experts
-at a time. Backward rebuilds the transposed stack from the packed bytes instead of saving a
-16-bit copy. Expert LoRA from PEFT ``target_parameters`` is added on top as a separate grouped
-GEMM through the MoE LoRA stash.
-"""
+"""Remote-code MoE experts (Kimi-K3 compressed-tensors MXFP4 w1 / w2 / w3) kept as packed stacks."""
 
 import os
 import torch
@@ -41,8 +30,6 @@ __all__ = [
     "stack_packed_experts",
 ]
 
-# Upper bound on the 16-bit weights one grouped GEMM dequantizes at once. A Kimi-K3 layer's
-# gate_up stack is 39.5 GB in bf16; a chunk of experts keeps the transient near this size.
 _DEFAULT_CHUNK_BYTES = 1 << 31
 
 
@@ -76,8 +63,6 @@ def _dequantize_chunk(param, start, end, dtype, transpose, counts):
 
 
 def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
-    """rows of expert e times its (dequantized) weight, for every expert, chunk by chunk.
-    ``ends`` is the host list of cumulative row counts, ``counts`` the same counts on device."""
     E = len(ends)
     out_dim = param._original_shape[-1] if transpose else param._original_shape[-2]
     out = inputs.new_empty((inputs.shape[0], out_dim))
@@ -99,8 +84,7 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
 
 
 class _Mxfp4GroupedLinear(torch.autograd.Function):
-    """y = x @ W_e for the rows of each expert e, W frozen and packed. Saves no weight: the
-    backward dequantizes W_e^T again (the untransposed layout, so no copy) for dX."""
+    """Saves no weight: backward dequantizes W_e^T again."""
 
     @staticmethod
     def forward(ctx, inputs, param, counts, ends):
@@ -123,9 +107,7 @@ class _Mxfp4GroupedLinear(torch.autograd.Function):
 
 
 def mxfp4_grouped_linear(inputs, param, counts, ends):
-    """Grouped ``inputs @ W_e`` over expert-sorted rows for a packed ``Mxfp4ExpertParam``.
-    ``counts`` is the per-expert row count (device), ``ends`` its cumulative sum as a list.
-    A merged adapter replaces the stack with a dense (E, in, out) weight; that runs as is."""
+    """Grouped ``inputs @ W_e`` over expert-sorted rows; ``ends`` is the host cumsum of ``counts``."""
     if not is_mxfp4_expert_param(param):
         offsets = torch.cumsum(counts, 0, dtype = torch.int32)
         return _grouped_mm(inputs.contiguous(), param.to(inputs.dtype), offsets)
@@ -144,15 +126,12 @@ def _lora_delta(experts, name, inputs, ends_device):
 
 
 class _ExpertView:
-    """``experts[i]`` for code that still loops over experts (the port's own ``moe_infer``)."""
-
     def __init__(self, experts, index):
         self.experts = experts
         self.index = index
 
     def _weight(self, param, dtype):
         if not is_mxfp4_expert_param(param):
-            # A merged adapter left a dense (E, in, out) stack.
             return param[self.index].t().to(dtype)
         start, end = self.index, self.index + 1
         return mxfp4_dequantize(
@@ -168,13 +147,7 @@ class _ExpertView:
 
 
 class Mxfp4StackedExperts(nn.Module):
-    """The routed experts of one MoE layer as two packed MXFP4 stacks.
-
-    Loaded through ``gate_up_blocks`` / ``gate_up_scales`` / ``down_blocks`` / ``down_scales``
-    (uint8, the checkpoint's bytes reshaped to ``(E, out, in / 32, 16)`` and ``(E, out, in / 32)``);
-    ``finalize()`` turns them into the ``gate_up_proj`` / ``down_proj`` ``Mxfp4ExpertParam`` the
-    forward and PEFT read. Called as ``experts(hidden_states, topk_idx, topk_weight)`` and returns
-    the routing-weighted sum, the contract of the DeepSeek-style ``moe_infer``."""
+    """One MoE layer's experts as packed ``gate_up_proj`` / ``down_proj``; forward follows DeepSeek ``moe_infer``."""
 
     _unsloth_mxfp4_stacked_experts = True
     # Stacks are (E, in, out): how the MoE LoRA extraction orients PEFT's factors.
@@ -214,10 +187,8 @@ class Mxfp4StackedExperts(nn.Module):
         return _ExpertView(self, index)
 
     def finalize(self):
-        """Wrap the loaded bytes as packed expert parameters. Idempotent."""
         if "gate_up_blocks" not in self._parameters:
             return self
-        # Checked before anything is popped, so a failed call can be retried once loaded.
         for name in ("gate_up", "down"):
             if any(self._parameters[f"{name}_{kind}"].is_meta for kind in ("blocks", "scales")):
                 raise RuntimeError(f"Unsloth: MXFP4 expert stack `{name}` was never loaded")
@@ -277,15 +248,12 @@ def _dense_stack(param, dtype):
 
 
 def dense_expert_modules(experts, device = "cpu"):
-    """The stacks (packed, or dense after a merge) as the per-expert ``w1`` / ``w2`` / ``w3``
-    Linears of the checkpoint they were loaded from, so a full save writes keys the remote code
-    reloads (``experts.<i>.w1.weight``) instead of the stack names."""
-    # A stack saved before its first forward still holds the raw loaded bytes.
+    """Per-expert ``w1`` / ``w2`` / ``w3`` Linears, so a full save writes keys the remote code reloads."""
     experts.finalize()
     dtype = experts.mxfp4_dtype
     I = experts.intermediate_size
-    gate_up = _dense_stack(experts.gate_up_proj, dtype).to(device)  # (E, H, 2I)
-    down = _dense_stack(experts.down_proj, dtype).to(device)  # (E, I, H)
+    gate_up = _dense_stack(experts.gate_up_proj, dtype).to(device)
+    down = _dense_stack(experts.down_proj, dtype).to(device)
     out = nn.ModuleList()
     for e in range(experts.num_experts):
         expert = nn.Module()
@@ -298,9 +266,7 @@ def dense_expert_modules(experts, device = "cpu"):
 
 
 def stack_packed_experts(per_expert_lists, blocks = True):
-    """[(E tensors (out, n) uint8) per projection] -> (E, sum(out), n), the projections
-    concatenated on out. ``blocks`` (packed bytes, n = in / 2) come out as (E, sum(out), in / 32,
-    16); scales (n = in / 32) as they are."""
+    """Per-projection lists of E (out, n) uint8 -> (E, sum(out), n); ``blocks`` reshapes to (..., in / 32, 16)."""
     stacks = [torch.stack(list(tensors), dim = 0) for tensors in per_expert_lists]
     stacked = stacks[0] if len(stacks) == 1 else torch.cat(stacks, dim = 1)
     if blocks:

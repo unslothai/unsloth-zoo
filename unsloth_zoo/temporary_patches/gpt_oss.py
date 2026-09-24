@@ -1830,30 +1830,24 @@ def _unwrap_peft_experts(module):
     return module
 
 
-# Weak values: the packed parameters that decode into a slot hold it, so it is freed with the
-# last model that uses it.
+# Weak values: freed with the last packed parameter (and so model) that holds the slot.
 _MXFP4_DECODE_SLOTS = weakref.WeakValueDictionary()
 
 
 class _Mxfp4DecodeSlot:
-    """The dense stack a packed projection decodes into for the bf16 inference kernel, shared by
-    every layer of that shape. `lock` is held from the decode until the kernel reading it is
-    enqueued, so host threads cannot interleave; `event` marks the last kernel that read it, so
-    a decode on another stream waits for that kernel instead of overwriting under it."""
+    """Shared dense decode target: `lock` spans decode to kernel enqueue, `event` guards cross-stream reuse."""
 
     __slots__ = ("stack", "lock", "event", "__weakref__")
 
     def __init__(self, shape, dtype, device):
-        # A frozen Parameter: the CUDA-graphed kernel reads it in place, where any other tensor is
-        # copied into the graph on every call.
+        # A Parameter so the CUDA-graphed kernel reads it in place; other tensors are copied every call.
         self.stack = nn.Parameter(torch.zeros(shape, dtype = dtype, device = device), requires_grad = False)
         self.lock = threading.Lock()
         self.event = None
 
 
 def _device_stream_api(device):
-    """torch.cuda or torch.xpu for a device whose kernels run asynchronously on streams, else None
-    (CPU and MPS run in issue order, so the shared stack needs no event)."""
+    """None for CPU and MPS: they run in issue order, so the shared stack needs no event."""
     device_type = getattr(device, "type", None)
     if device_type not in ("cuda", "xpu"):
         return None
@@ -1877,9 +1871,7 @@ def _mxfp4_decode_slot(param, dtype, role = ""):
 
 
 def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
-    """Dense stack of a packed MXFP4 expert projection. Only the experts this call routes to are
-    rewritten; the kernel weighs every other expert by 0, so what their slices hold does not change
-    the result. Callers that launch a kernel on it hold the slot's lock until that is enqueued."""
+    """Only routed experts are rewritten; the kernel weighs the others by 0, so stale slices are harmless."""
     slot = slot or _mxfp4_decode_slot(param, dtype, role)
     api = _device_stream_api(param.device) if slot.event is not None else None
     if api is not None:
@@ -1908,7 +1900,6 @@ def moe_forward_inference_bf16(self, hidden_states):
     elif hasattr(down_proj, "weight"):
         down_proj = down_proj.weight
 
-    # Experts kept as packed MXFP4 (temporary_patches/mxfp4.py).
     slots = []
     if is_mxfp4_expert_param(gate_up_proj) or is_mxfp4_expert_param(down_proj):
         from .moe_utils import count_tokens_per_expert

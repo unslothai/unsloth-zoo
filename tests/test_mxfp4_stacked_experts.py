@@ -2,11 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Remote-code MoE experts (w1 / w2 / w3 Linears, Kimi-K3) kept as one packed MXFP4 stack per
-projection. The stacked bytes must decode to exactly the per-expert compressed-tensors weights,
-the grouped forward must equal the same grouped GEMM on the dense decode bit for bit, dX must
-come from a recompute (no 16-bit weight saved for backward), chunking and skipped experts must
-not change a value, and expert LoRA from the stash must add the dense delta."""
+"""Remote-code MoE experts (w1 / w2 / w3 Linears, Kimi-K3) kept as one packed MXFP4 stack per projection."""
 
 import os
 
@@ -32,7 +28,6 @@ class _Situ(nn.Module):
 
 
 def _checkpoint_bytes(seed = 0):
-    """Per-expert compressed-tensors tensors: packed (out, in / 2) and scale (out, in / 32)."""
     g = torch.Generator().manual_seed(seed)
 
     def one(out_f, in_f):
@@ -46,7 +41,6 @@ def _checkpoint_bytes(seed = 0):
 
 
 def _ct_decompress(packed, scale):
-    """The checkpoint's own decode: compressed-tensors when installed, else the same LUT."""
     try:
         from compressed_tensors.compressors import BaseCompressor
         from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
@@ -97,7 +91,6 @@ def _routing(tokens = 48, top_k = 2, experts = None, seed = 1):
 
 
 def _grouped_reference(module, x, idx, weight, gate_up_w, down_w, lora = None):
-    """The same dispatch on dense (E, in, out) stacks through the zoo grouped GEMM."""
     T, k = idx.shape
     order = torch.argsort(idx.reshape(-1), stable = True)
     rows = x[order // k]
@@ -178,7 +171,6 @@ def test_chunked_and_skipped_experts_change_nothing(monkeypatch):
     x, idx, weight = _routing(experts = [0, 3, 5, 7])
     with torch.no_grad():
         whole = module(x, idx, weight)
-    # One expert's gate_up is 128 * 128 * 2 bytes: a 1 MB budget still packs many, so force 1.
     monkeypatch.setattr("unsloth_zoo.mxfp4_stacked_experts._chunk_bytes", lambda: 1)
     x.requires_grad_(True)
     chunked = module(x, idx, weight)
@@ -221,7 +213,6 @@ def test_an_unloaded_stack_is_reported():
     module = Mxfp4StackedExperts(E, H, I, _Situ(), True, device = "meta")
     with pytest.raises(RuntimeError, match = "never loaded"):
         module.finalize()
-    # The failed call leaves the stack as it was, so every later call says so too.
     assert sorted(module._parameters) == sorted(
         ["gate_up_blocks", "gate_up_scales", "down_blocks", "down_scales"]
     )
@@ -239,8 +230,6 @@ class _Block(nn.Module):
 
 
 class _DenseStackedExperts(nn.Module):
-    """The same dispatch on dense stacks: the bf16 decompressed reference."""
-
     _unsloth_grouped_mm_format = True
 
     def __init__(self, packed):
@@ -352,12 +341,10 @@ def test_dense_expert_modules_are_the_checkpoint_linears():
             assert linear.weight.device.type == "cpu" and linear.bias is None
             want = _ct_decompress(*ckpt[w][e]).to(torch.bfloat16)
             assert torch.equal(linear.weight, want), (e, w)
-    # A stack saved before its first forward still holds the raw loaded bytes.
     unfinalized, _ = _experts(finalize = False)
     assert "gate_up_blocks" in unfinalized._parameters
     experts = dense_expert_modules(unfinalized)
     assert torch.equal(experts[1].w2.weight, _ct_decompress(*ckpt["w2"][1]).to(torch.bfloat16))
-    # A merged (dense) stack is split the same way.
     gate_up, _ = _dense(module)
     module.gate_up_proj = nn.Parameter(gate_up + 1, requires_grad = False)
     experts = dense_expert_modules(module)
@@ -386,7 +373,7 @@ def test_merged_16bit_rewrite_decodes_mxfp4_and_folds_in_the_expert_lora(tmp_pat
     assert sorted(wrappers) == ["experts", "experts.base_layer"]
     lora_weights = {"experts": 1, "experts.base_layer": 2, "model.other": 3}
     _dequantize_compressed_mxfp4_shards(str(tmp_path), ["model.safetensors"], lora_weights, packed_model)
-    assert lora_weights == {"model.other": 3}  # the stacks' LoRA is merged here, not again later
+    assert lora_weights == {"model.other": 3}
     state = load_file(str(tmp_path / "model.safetensors"))
     assert not any(k.endswith(("weight_packed", "weight_scale")) for k in state)
     assert torch.equal(state["model.other.weight"], torch.ones(4, 4, dtype = torch.bfloat16))
@@ -413,7 +400,6 @@ def test_merged_16bit_rewrite_decodes_mxfp4_and_folds_in_the_expert_lora(tmp_pat
             got = state[f"model.experts.{e}.{w}.weight"]
             assert delta.abs().sum() > 0
             assert torch.equal(got, (decode + delta).to(torch.bfloat16)), (e, w)
-            # The same weight PEFT's in-memory merge of the packed stack gives, to bf16 rounding.
             torch.testing.assert_close(got.float(), merged, atol = 1e-2, rtol = 1e-2)
 
 
@@ -423,11 +409,9 @@ def test_merged_16bit_rewrite_refuses_what_it_cannot_place(tmp_path):
 
     packed_model, _ = _peft_pair()
     ckpt = _checkpoint_bytes(0)
-    # The expert LoRA has no per-expert weights to land on.
     _write_expert_shard(str(tmp_path), ckpt, prefix = "model.elsewhere")
     with pytest.raises(RuntimeError, match = "would drop it"):
         _dequantize_compressed_mxfp4_shards(str(tmp_path), ["model.safetensors"], {}, packed_model)
-    # A packed tensor that is not MXFP4 (int32 words).
     save_file(
         {"a.weight_packed": torch.zeros(4, 8, dtype = torch.int32), "a.weight_scale": torch.zeros(4, 1)},
         str(tmp_path / "model.safetensors"),
@@ -455,7 +439,6 @@ def test_compressed_packed_format_detection(tmp_path):
                   "config_groups": {"g": group()}}) is None
     assert write({"quant_method": "bitsandbytes", "load_in_4bit": True}) is None
     assert write(None) is None
-    # Kimi-K3 keeps it under text_config only; legacy llm-compressor nests it one level down.
     mxfp4 = {"quant_method": "compressed-tensors", "format": "mxfp4-pack-quantized",
              "config_groups": {"g": group()}}
     (tmp_path / "config.json").write_text(json.dumps({"text_config": {"quantization_config": mxfp4}}))
@@ -465,8 +448,7 @@ def test_compressed_packed_format_detection(tmp_path):
 
 
 def test_merged_exports_still_run_under_inference_mode():
-    """The compressed-tensors helpers sit above `merge_and_overwrite_lora`: its decorator must
-    stay on it, not move onto the first helper."""
+    """The helpers sit above `merge_and_overwrite_lora`: its decorator must not move onto them."""
     import inspect
     from unsloth_zoo import saving_utils
 
@@ -506,8 +488,6 @@ def test_no_routed_tokens_give_an_empty_output(lora):
 
 
 class _Wrapper(nn.Module):
-    """Stands in for a PEFT ParamWrapper around the stack."""
-
     def __init__(self, base_layer):
         super().__init__()
         self.base_layer = base_layer
@@ -542,13 +522,11 @@ def test_a_refused_or_failed_full_save_leaves_the_model_as_it_was(tmp_path, monk
 
     model = _tiny_pretrained()
     stacks = [layer.experts for layer in model.layers]
-    # A later stack still under LoRA: refused, and the earlier stack is not left swapped.
     model.layers[1].experts = _Wrapper(stacks[1])
     with pytest.raises(RuntimeError, match = "merge_and_unload"):
         model.save_pretrained(str(tmp_path / "wrapped"))
     assert model.layers[0].experts is stacks[0] and model.layers[1].experts.base_layer is stacks[1]
     model.layers[1].experts = stacks[1]
-    # A failure while the dense modules are built (out of memory) puts the swapped ones back.
     calls, original = [], mse.dense_expert_modules
 
     def fail_second(experts, *args, **kwargs):
@@ -574,7 +552,6 @@ def test_an_explicit_state_dict_is_saved_under_the_checkpoint_names(tmp_path):
 
 
 def _write_expert_shards(root, ckpt, files, prefix = "model.experts"):
-    """``files``: {filename: [checkpoint keys]}; every key of ``ckpt`` must be placed once."""
     from safetensors.torch import save_file
 
     tensors = {"model.other.weight": torch.ones(4, 4, dtype = torch.bfloat16)}
@@ -590,7 +567,6 @@ def _write_expert_shards(root, ckpt, files, prefix = "model.experts"):
 
 
 def _stack_merge_reference(packed_model, ckpt):
-    """{checkpoint key: fp32 decode + the stack's PEFT delta} for every expert weight."""
     deltas = {}
     holder = packed_model.base_model.model.experts
     while hasattr(holder, "base_layer"):
@@ -623,8 +599,6 @@ def _all_expert_keys(prefix = "model.experts"):
 
 
 def test_merged_16bit_rewrite_reads_scales_from_any_shard(tmp_path):
-    """A scale stored in another shard than its packed bytes (or in a shard with no packed
-    bytes at all) is still found and dropped, whatever order the shards are rewritten in."""
     from unsloth_zoo.saving_utils import _dequantize_compressed_mxfp4_shards
 
     packed_model, _ = _peft_pair()
@@ -654,7 +628,6 @@ def test_merged_16bit_rewrite_refuses_before_writing_a_shard(tmp_path):
     packed_model, _ = _peft_pair()
     ckpt = _checkpoint_bytes(0)
     all_keys = _all_expert_keys()
-    # Expert 7's w3 is missing from the checkpoint: its LoRA has nowhere to go.
     files = {"a.safetensors": ["model.other.weight"] + all_keys[: len(all_keys) // 2],
              "b.safetensors": all_keys[len(all_keys) // 2 :]}
     filenames = _write_expert_shards(str(tmp_path), ckpt, files)
@@ -666,7 +639,6 @@ def test_merged_16bit_rewrite_refuses_before_writing_a_shard(tmp_path):
     with pytest.raises(RuntimeError, match = "would drop it"):
         _dequantize_compressed_mxfp4_shards(str(tmp_path), filenames, {}, packed_model)
     assert {f: (tmp_path / f).read_bytes() for f in filenames} == before
-    # A later shard that is not MXFP4 refuses before the first one is rewritten either.
     files = {"a.safetensors": ["model.other.weight"] + all_keys, "b.safetensors": []}
     filenames = _write_expert_shards(str(tmp_path), ckpt, files)
     save_file({"z.weight_packed": torch.zeros(4, 8, dtype = torch.int32),
@@ -678,8 +650,7 @@ def test_merged_16bit_rewrite_refuses_before_writing_a_shard(tmp_path):
 
 
 def test_merged_16bit_rewrite_keeps_an_adapter_merged_in_memory(tmp_path):
-    """After merge_adapter() the stacks' LoRA is in the in-memory weights only; the export rebuilds
-    the weights from the checkpoint, so it must fold that adapter in all the same."""
+    """The export rebuilds weights from the checkpoint, so an in-memory merge_adapter() must still be folded in."""
     from unsloth_zoo.saving_utils import _dequantize_compressed_mxfp4_shards
 
     packed_model, _ = _peft_pair()
@@ -700,9 +671,6 @@ def test_merged_16bit_rewrite_keeps_an_adapter_merged_in_memory(tmp_path):
 
 
 def test_merged_16bit_rewrite_computes_each_stacks_lora_per_shard(tmp_path, monkeypatch):
-    """The stacks' LoRA deltas are built one expert at a time from the low-rank factors as the
-    shards are rewritten: a real MoE's whole-stack fp32 delta (79 GB for one Kimi-K3 gate_up
-    stack) is never materialised, and each expert equals PEFT's get_delta_weight slice."""
     peft = pytest.importorskip("peft")
     import unsloth_zoo.saving_utils as saving
 
@@ -749,10 +717,7 @@ def test_merged_16bit_rewrite_computes_each_stacks_lora_per_shard(tmp_path, monk
 
 
 def test_a_full_save_describes_linears_a_merge_made_dense(tmp_path):
-    """Unsloth's per-Linear packed module becomes a plain dense nn.Linear on a PEFT merge (its
-    packed bytes kept aside in `_unsloth_mxfp4_packed_state`). A full save must not describe it
-    as packed: a bitsandbytes config skips it, an MXFP4 compressed-tensors config is dropped,
-    even when no packed module is left to swap."""
+    """A Linear a PEFT merge made dense must not be described as packed, even with nothing left to swap."""
     import json
     from transformers import BitsAndBytesConfig
 
@@ -764,7 +729,6 @@ def test_a_full_save_describes_linears_a_merge_made_dense(tmp_path):
     skip = json.load(open(tmp_path / "bnb" / "config.json"))["quantization_config"]["llm_int8_skip_modules"]
     assert "layers.0.proj" in skip and "layers.0.experts" in skip
     assert model.config.quantization_config.llm_int8_skip_modules == ["lm_head"]
-    # Nothing packed left at all (every stack merged away): still described as dense.
     for layer in model.layers:
         layer.experts = nn.Identity()
     model.config.quantization_config = {
@@ -774,7 +738,6 @@ def test_a_full_save_describes_linears_a_merge_made_dense(tmp_path):
     model.save_pretrained(str(tmp_path / "ct"))
     assert "quantization_config" not in json.load(open(tmp_path / "ct" / "config.json"))
     assert model.config.quantization_config["format"] == "mxfp4-pack-quantized"
-    # The legacy SparseML spelling of the same config is dropped too.
     model.config.quantization_config = dict(model.config.quantization_config, quant_method = "sparseml")
     model.save_pretrained(str(tmp_path / "sparseml"))
     assert "quantization_config" not in json.load(open(tmp_path / "sparseml" / "config.json"))
@@ -782,8 +745,6 @@ def test_a_full_save_describes_linears_a_merge_made_dense(tmp_path):
 
 
 def test_merged_16bit_rewrite_streams_one_shard_at_a_time(tmp_path):
-    """Low-disk exports upload and remove each shard as soon as it is merged: rewriting one shard
-    leaves the others packed, and a shard whose scales another shard needs can already be gone."""
     from unsloth_zoo.saving_utils import _plan_compressed_mxfp4_rewrite, _rewrite_compressed_mxfp4_shard
 
     packed_model, _ = _peft_pair()
@@ -802,7 +763,7 @@ def test_merged_16bit_rewrite_streams_one_shard_at_a_time(tmp_path):
     _rewrite_compressed_mxfp4_shard(str(tmp_path), "a.safetensors", plan)
     assert (tmp_path / "b.safetensors").read_bytes() == b_before
     got = _read_shards(str(tmp_path), ["a.safetensors"])
-    os.remove(tmp_path / "a.safetensors")  # uploaded and removed, as in low-disk mode
+    os.remove(tmp_path / "a.safetensors")
     _rewrite_compressed_mxfp4_shard(str(tmp_path), "b.safetensors", plan)
     got.update(_read_shards(str(tmp_path), ["b.safetensors"]))
     assert not any(k.endswith(("weight_packed", "weight_scale")) for k in got)
@@ -811,8 +772,6 @@ def test_merged_16bit_rewrite_streams_one_shard_at_a_time(tmp_path):
 
 
 def test_the_lora_completeness_check_sees_the_decoded_export_before_any_rewrite(tmp_path):
-    """merge_and_overwrite_lora checks every LoRA target against the export as it will be once
-    decoded, then rewrites: an unplaceable adapter refuses with every shard still packed."""
     import ast
     import inspect
     import textwrap
@@ -832,7 +791,6 @@ def test_the_lora_completeness_check_sees_the_decoded_export_before_any_rewrite(
     _dequantize_compressed_mxfp4_shards(str(tmp_path), filenames, {}, packed_model)
     assert view == _disk_module_shapes(str(tmp_path), filenames)
 
-    # In merge_and_overwrite_lora the check runs before the first shard is rewritten.
     source = textwrap.dedent(inspect.getsource(inspect.unwrap(saving_utils.merge_and_overwrite_lora)))
     calls = {}
     for node in ast.walk(ast.parse(source)):
@@ -843,8 +801,6 @@ def test_the_lora_completeness_check_sees_the_decoded_export_before_any_rewrite(
 
 
 def test_the_packed_format_is_read_before_the_export_writes_its_config():
-    """An in-place export (save_directory == model_name) overwrites the source config.json and
-    strips its quantization config, so the packed format must be read from it first."""
     import ast
     import inspect
     import textwrap

@@ -1688,8 +1688,7 @@ def _get_dequantize_4bit_in_slices():
 
 def _get_base_weight(param, target_dtype=None, token_counts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
-    providers) restores the packed Params4bit to its logical shape and casts. A packed MXFP4
-    stack is dequantized in one pass; token_counts skips experts no token was routed to."""
+    providers) restores the packed Params4bit to its logical shape and casts."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):

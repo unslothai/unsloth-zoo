@@ -97,8 +97,6 @@ def get_mxfp4_config_for_training():
 
     return Mxfp4Config(dequantize=dequantize)
 
-# Whether the device map of the load in progress offloads to "cpu" or "disk"; set by the
-# _get_device_map wrapper below, which transformers calls before converting any weight.
 _LOAD_OFFLOADS = [False]
 
 
@@ -120,8 +118,7 @@ def patch_mxfp4_offload_guard():
         _get_device_map._unsloth_mxfp4_patched = True
         modeling_utils._get_device_map = _get_device_map
 
-    # _get_device_map only runs for a load given a device map, so the flag is cleared where
-    # every MXFP4 load passes first: the quantizer's environment check, before any weight.
+    # _get_device_map only runs given a device map, so clear the flag where every MXFP4 load passes first.
     try:
         from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
     except Exception:
@@ -142,18 +139,11 @@ TEMPORARY_PATCHES.append(patch_mxfp4_offload_guard)
 
 
 def keep_mxfp4_experts_packed() -> bool:
-    """Whether GPT-OSS MXFP4 experts stay packed in memory (dequantized per layer on the fly by the
-    grouped_mm MoE forward, with expert LoRA on top) instead of a bf16 copy made at load.
-
-    On by default for LoRA loads on transformers 5 with the grouped_mm backend: a checkpoint that
-    ships in MXFP4 stays in MXFP4. Where the fused kernel is not verified exact (ROCm, no Triton)
-    the exact torch dequant is used instead. UNSLOTH_MXFP4_KEEP_PACKED=0 restores the load-time
-    dequant."""
+    """GPT-OSS MXFP4 experts stay packed, dequantized per layer by grouped_mm. UNSLOTH_MXFP4_KEEP_PACKED=0 opts out."""
     setting = os.environ.get("UNSLOTH_MXFP4_KEEP_PACKED", "")
     if setting == "0" or transformers_version < Version("5.0.0"):
         return False
-    # CPU / disk offload stores the bare uint8 blocks without their scales, so an offloaded
-    # packed stack could not be decoded again; such loads keep the load-time dequant.
+    # Offload stores the uint8 blocks without their scales, so they could not be decoded again.
     if _LOAD_OFFLOADS[0]:
         return False
     name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
@@ -162,8 +152,7 @@ def keep_mxfp4_experts_packed() -> bool:
     if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
         return False
     try:
-        # Only the grouped_mm forward (patch_gpt_oss_moe_for_lora) reads experts through
-        # _get_base_weight; the loop and Triton backends index the stack directly.
+        # Only grouped_mm reads experts through _get_base_weight; loop and Triton index the stack.
         from .moe_utils import select_moe_backend
         import transformers.models.gpt_oss.modeling_gpt_oss as modeling_gpt_oss
         if not getattr(modeling_gpt_oss.GptOssExperts, "_unsloth_lora_patched", False):
@@ -176,16 +165,12 @@ def keep_mxfp4_experts_packed() -> bool:
 
 
 def _dequantize_to_gpt_oss_layout(convert, blocks, scales):
-    """GPT-OSS's (E, in, out) expert stack: the fused kernel writes it transposed in one pass;
-    otherwise ``convert`` (the un-transposed Unsloth variant) plus a transposing copy."""
     if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.dim() == 4:
         return mxfp4_dequantize(blocks, scales, transpose = True)
     return convert(blocks, scales).transpose(1, 2).contiguous()
 
 
 class _Mxfp4ShapeProxy:
-    """What PEFT's ParamWrapper sees for a packed stack: its logical shape and compute dtype."""
-
     def __init__(self, param):
         self._param = param
         self.shape = param._original_shape
@@ -200,10 +185,7 @@ class _Mxfp4ShapeProxy:
 
 
 def patch_peft_param_wrapper_mxfp4():
-    """LoRA on packed MXFP4 experts through PEFT ``target_parameters``. ``get_param`` reports the
-    logical (E, in, out) shape so the adapters match the bf16 stack's. Merging adds the delta to
-    the dequantized stack and installs it as a bf16 parameter (a merged weight is not MXFP4);
-    unmerging restores the untouched packed stack."""
+    """Merge installs a bf16 parameter (a merged weight is not MXFP4); unmerge restores the packed stack."""
     try:
         from peft.tuners.lora.layer import ParamWrapper, check_adapters_to_merge
     except Exception:
@@ -255,8 +237,7 @@ def patch_peft_param_wrapper_mxfp4():
         base_layer = self.get_base_layer()
         current = getattr(base_layer, self.parameter_name, None)
         if current is not None and current.device != packed.device:
-            # The saved stack sits outside the module, so a model move since merge() left it
-            # behind; move it (blocks and scales) the way a module move would.
+            # The saved stack sits outside the module, so a model move since merge() left it behind.
             holder = nn.Module()
             holder.param = packed
             packed = holder.to(current.device).param
@@ -274,10 +255,7 @@ TEMPORARY_PATCHES.append(patch_peft_param_wrapper_mxfp4)
 
 
 def patch_mxfp4_quantizer_element_size():
-    """transformers pre-allocates the model's size on the GPU before loading
-    (caching_allocator_warmup), counting dequantized experts as bf16. Experts kept packed take
-    17 / 32 bytes per value (4-bit values plus one e8m0 scale per 32), so count that instead;
-    otherwise loading needs the bf16 model's memory the packed experts exist to avoid."""
+    """caching_allocator_warmup counts experts as bf16; packed ones take 17 / 32 bytes per value."""
     try:
         from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
     except Exception:
@@ -317,10 +295,7 @@ def _restore_modules(swaps):
 
 
 def _swap_out_packed_modules(model):
-    """Replace every Unsloth module that keeps an MXFP4 checkpoint packed (remote-code expert
-    stacks, per-Linear packed modules) with the dense modules the checkpoint names, so a full save
-    writes keys the model's own code reloads. Returns ``[(parent, child, original, name)]``; if
-    it raises, nothing is left swapped."""
+    """Swap packed modules for the dense ones the checkpoint names, so the model's own code reloads the save."""
     from ..mxfp4_stacked_experts import dense_expert_modules
 
     found = []
@@ -348,8 +323,7 @@ def _swap_out_packed_modules(model):
     return swaps
 
 
-# Unsloth's per-Linear packed module keeps its packed bytes here once a PEFT merge has made it a
-# plain dense nn.Linear; the full save must describe it as dense too.
+# Set on a per-Linear packed module a PEFT merge made dense; the full save must describe it as dense.
 _DENSIFIED_STATE = "_unsloth_mxfp4_packed_state"
 
 
@@ -358,8 +332,6 @@ def _densified_module_names(model):
 
 
 def _dense_state_dict(state_dict, swaps):
-    """A caller's ``state_dict`` with each swapped module's entries replaced by its dense
-    module's, so an explicit state dict is saved under the checkpoint's names too."""
     swapped = {name: (parent, child) for parent, child, _, name in swaps}
     owners = {key.rpartition(".")[0] for key in state_dict} & swapped.keys()
     if not owners:
@@ -388,17 +360,13 @@ def _is_mxfp4_compressed_config(quant) -> bool:
     method = str(quant.get("quant_method", "")).lower().replace("_", "-")
     groups = [g for g in (quant.get("config_groups") or {}).values() if isinstance(g, dict)]
     top = quant.get("format")
-    # SparseML is compressed-tensors' former name; checkpoints still carry either spelling.
     return method in ("compressed-tensors", "sparseml") and bool(groups) and all(
         (g.get("format") or top) == "mxfp4-pack-quantized" for g in groups
     )
 
 
 def _config_for_dense_save(config, names):
-    """Make the saved quantization config describe the dense modules just swapped in: an MXFP4
-    compressed-tensors config (on the config or any sub-config it was copied onto) no longer
-    applies to anything, and a bitsandbytes one must skip them. Returns a function restoring
-    ``config``."""
+    """Drop MXFP4 compressed-tensors configs (sub-configs too), make bnb skip the dense modules; returns an undo."""
     restores = []
     seen, stack = set(), [config]
     while stack:
@@ -440,10 +408,7 @@ def _config_for_dense_save(config, names):
 
 
 def patch_save_pretrained_mxfp4():
-    """A full ``save_pretrained`` of a model whose experts are kept packed writes them dequantized,
-    as the load-time path would have, and the packed stacks are put back afterwards. Adapter-only
-    saves (PEFT) never reach this and stay as cheap as before. Remote-code expert stacks are
-    written as the checkpoint's per-expert Linears."""
+    """Full saves write packed experts dequantized, then restore them; adapter-only saves never reach this."""
     try:
         from transformers import PreTrainedModel
     except Exception:
@@ -491,7 +456,6 @@ def patch_save_pretrained_mxfp4():
                 weight = param.dequantize().cpu()
                 dense[names.get(id(param))] = weight
                 module._parameters[name] = nn.Parameter(weight, requires_grad = False)
-            # state_dict may come positionally (directory, is_main_process, state_dict).
             try:
                 bound = inspect.signature(original).bind(self, *args, **kwargs)
             except TypeError:
@@ -530,7 +494,6 @@ def patch_convert_moe_packed_tensors():
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
-        # One fused Triton pass, bit-identical to the loop below, with no int64 / fp32 temporaries.
         if blocks.is_cuda and blocks.dtype == torch.uint8 and dtype in (torch.bfloat16, torch.float16):
             return mxfp4_dequantize(blocks, scales, dtype = dtype)
 

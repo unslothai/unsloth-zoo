@@ -3779,19 +3779,11 @@ def _export_index_atomically(source_path, destination, payload, mode_from = None
 pass
 
 
-# ---------------------------------------------------------------------------------------------
-# compressed-tensors packed bases (Kimi-K3's MXFP4 routed experts) under a merged_16bit export
-# ---------------------------------------------------------------------------------------------
-# The staged base shards keep each packed Linear as `weight_packed` + `weight_scale`, which the
-# in-place merge below cannot grow into a 16-bit `weight`, and step 1 drops the quantization
-# config: copied as they are, those modules would reload as missing weights. An MXFP4 base is
-# decoded exactly into a 16-bit `weight` first, with the LoRA of Unsloth's packed expert stacks
-# (which PEFT holds on the stack, not on the per-expert keys) folded in; the other LoRAs then
-# merge onto those keys as on any 16-bit base. Other packed formats refuse.
+# merged_16bit drops the quantization config, so packed `weight_packed` shards would reload as
+# missing weights: MXFP4 ones are decoded to a 16-bit `weight` first; other packed formats refuse.
 
 def _find_quantization_config(config):
-    """The config's ``quantization_config``, or the first one a sub-config carries (Kimi-K3
-    keeps it under ``text_config`` only)."""
+    """Kimi-K3 keeps ``quantization_config`` under ``text_config`` only."""
     if not isinstance(config, dict):
         return None
     quant = config.get("quantization_config")
@@ -3806,9 +3798,7 @@ pass
 
 
 def _compressed_packed_format(model_name, token = None):
-    """The compressed-tensors ``format`` of a base whose weights are stored packed
-    (``weight_packed``): ``"mxfp4-pack-quantized"`` when every group is MXFP4, else the formats
-    found. None for anything else, or when the config cannot be read."""
+    """``"mxfp4-pack-quantized"`` if every packed group is MXFP4, else the formats found; None if unpacked."""
     config = None
     try:
         if os.path.isdir(str(model_name)):
@@ -3840,9 +3830,7 @@ pass
 
 
 def _packed_expert_stacks(model):
-    """``{experts path: (stack, [(wrapper, stack param, [adapters])], [wrapper paths])}`` for every
-    unsloth_zoo ``Mxfp4StackedExperts`` in ``model``, paths relative to the base model. Adapters
-    already merged in memory count too: the export rebuilds the weights from the checkpoint."""
+    """Merged-in-memory adapters count too: the export rebuilds the weights from the checkpoint."""
     inner = find_lora_base_model(model)
     stacks = {}
     for name, module in inner.named_modules():
@@ -3868,8 +3856,6 @@ pass
 
 
 def _expert_target(base_key, stacks):
-    """``(stack path, expert index, "w1" | "w2" | "w3")`` of the checkpoint Linear
-    ``<prefix>.experts.<i>.w1|w2|w3`` when a packed stack holds it, else None."""
     match = re.match(r"^(.*\.experts)\.(\d+)\.(w[123])$", base_key)
     if match is None:
         return None
@@ -3887,13 +3873,10 @@ pass
 
 
 def _one_expert_lora_delta(holder, adapter, index):
-    """``get_delta_weight(adapter)[index]`` of a PEFT ParamWrapper over an expert stack, in fp32,
-    built from that expert's slice of the low-rank factors: the full ``(E, in, out)`` delta of a
-    real MoE (79 GB in fp32 for one Kimi-K3 gate_up stack) is never materialised."""
+    """``get_delta_weight(adapter)[index]`` in fp32 from one expert's factor slice; the full delta is too big."""
     num = int(getattr(holder, "num_experts", 1) or 1)
     if num <= 1:
         return holder.get_delta_weight(adapter).detach().float()[index]
-    # In the factors' own dtype, as get_delta_weight computes it, then fp32.
     weight_A = holder.lora_A[adapter].weight.detach()
     weight_B = holder.lora_B[adapter].weight.detach()
     # PEFT's layout: lora_A (experts, rank, in), lora_B (out, rank, experts).
@@ -3910,7 +3893,7 @@ def _one_expert_lora_delta(holder, adapter, index):
     except Exception:
         pass
     if grouped:
-        # The legacy (out, experts, rank) packing the zoo's get_delta_weight patch reads.
+        # Legacy (out, experts, rank) packing.
         weight_B = weight_B.reshape(weight_B.shape[0], num, -1)[:, index, :]
     else:
         weight_B = weight_B.reshape(weight_B.shape[0], -1, num)[:, :, index]
@@ -3918,14 +3901,11 @@ def _one_expert_lora_delta(holder, adapter, index):
         delta = torch.einsum("o r, r i -> o i", weight_B, weight_A)
     else:
         delta = torch.einsum("o r, r i -> i o", weight_B, weight_A)
-    # get_delta_weight's own tail (the parameter's dtype, unless it is a low-precision one).
     return _cast_delta_weight_like_param(delta * holder.scaling[adapter], holder.get_param()).float()
 pass
 
 
 def _expert_lora_delta(loras, parameter, index):
-    """The summed LoRA delta of one expert of one stack parameter, as ``get_delta_weight``
-    would give it for that expert, or None when no adapter covers the parameter."""
     total = None
     for holder, name, adapters in loras:
         if name != parameter:
@@ -3938,7 +3918,6 @@ pass
 
 
 def _expert_slice(delta, stack, index, proj):
-    """``(out, in)`` of one expert's projection from a stack delta ``(E, in, out)``."""
     if proj == "w2":
         return delta[index].t()
     inter = stack.intermediate_size
@@ -3948,10 +3927,7 @@ pass
 
 @torch.inference_mode()
 def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
-    """Everything the merged_16bit export of a compressed-tensors MXFP4 base can refuse on,
-    checked before any shard is touched, plus what the per-shard rewrite needs. Scales stored in
-    another shard than their packed bytes are read up front, so the shards can be rewritten (and,
-    in low-disk mode, uploaded and removed) one at a time in any order."""
+    """All refusals happen here, before any shard is touched; cross-shard scales are read up front."""
     stacks = _packed_expert_stacks(model)
     locations, shapes, dtypes, keys_of = {}, {}, {}, {}
     for filename in filenames:
@@ -3980,7 +3956,6 @@ def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
         target = _expert_target(base, stacks)
         if target is not None:
             targets[base] = target
-    # Every expert projection a stack's LoRA covers must be a packed weight of the checkpoint.
     needed = {
         (path, index, proj)
         for path, (stack, loras, _) in stacks.items()
@@ -4023,8 +3998,6 @@ pass
 
 
 def _compressed_mxfp4_disk_view(save_directory, filenames, plan):
-    """``_disk_module_shapes`` of the export as it will be once every packed pair is its 16-bit
-    ``weight``, so the LoRA completeness check can run before the rewrite."""
     keys, shapes = _disk_module_shapes(save_directory, filenames)
     for base in plan["packed_bases"]:
         for suffix in (".weight_packed", ".weight_scale", ".weight_shape"):
@@ -4037,9 +4010,6 @@ pass
 
 
 def _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype = None):
-    """Rewrite one staged shard so each MXFP4 ``weight_packed`` / ``weight_scale`` pair is the
-    exact 16-bit ``weight``, plus the packed expert stacks' LoRA. A shard with nothing packed is
-    left alone."""
     from .mxfp4_dequant import mxfp4_dequantize_torch
 
     dtype = output_dtype or torch.bfloat16
@@ -4077,7 +4047,6 @@ def _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype
             target = targets.get(base)
             if target is not None:
                 stack_path, index, proj = target
-                # One expert's delta at a time; w1 and w3 share the gate_up one.
                 cache_key = (stack_path, _stack_parameter(proj), index)
                 if cache_key not in deltas:
                     deltas.clear()
@@ -4092,9 +4061,6 @@ pass
 
 
 def _dequantize_compressed_mxfp4_shards(save_directory, filenames, lora_weights, model, output_dtype = None):
-    """Every staged shard rewritten by ``_rewrite_compressed_mxfp4_shard``, and the stacks' LoRA
-    dropped from ``lora_weights`` so nothing merges them twice. Nothing is written if anything
-    refuses."""
     plan = _plan_compressed_mxfp4_rewrite(save_directory, filenames, model)
     for filename in filenames:
         _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype)
@@ -4104,8 +4070,7 @@ pass
 
 
 def _save_remote_code_files(model, save_directory):
-    """A remote-code model's modeling files next to the merged weights (the config only writes
-    its own file), so ``trust_remote_code`` reloads the export."""
+    """The config only writes its own file; ``trust_remote_code`` reload needs the modeling files too."""
     base = find_lora_base_model(model)
     if getattr(base, "_auto_class", None) is None:
         return
@@ -4481,8 +4446,7 @@ def merge_and_overwrite_lora(
     pass
 
     # Default handle 16 bit merge and save/push
-    # Read before Step 1: an in-place export (save_directory == model_name) overwrites the
-    # source config.json there and strips its quantization config.
+    # Before Step 1: an in-place export overwrites the source config.json without its quantization config.
     _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
@@ -4549,8 +4513,6 @@ def merge_and_overwrite_lora(
     _has_nested_shard = any(_has_directory_component(_f) for _f in safetensors_list)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
-    # compressed-tensors packed base: MXFP4 is decoded to 16-bit below; anything else refuses
-    # here, before a shard is written, rather than export packed tensors under no config.
     if _ct_packed_format is not None and _ct_packed_format != "mxfp4-pack-quantized":
         raise RuntimeError(
             f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "
@@ -4792,9 +4754,7 @@ def merge_and_overwrite_lora(
     # which clears quant_type; same value either way, the two branches are mutually exclusive.
     _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
 
-    # A compressed-tensors MXFP4 base is decoded shard by shard inside the merge loop, so the
-    # low-disk upload / remove still streams. Its checks run now, and the stacks' LoRA (folded in
-    # by that decode) leaves lora_weights so nothing merges it twice.
+    # Decoded per shard inside the merge loop so low-disk upload still streams; the decode folds in stack LoRAs.
     _mxfp4_rewrite = _disk_view = None
     if _ct_mxfp4_dequant:
         _mxfp4_rewrite = _plan_compressed_mxfp4_rewrite(save_directory, final_safetensors_list, model)
@@ -6204,7 +6164,6 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
     NOT ahead of everything: on a push, Step 2 has already uploaded config.json and the
     tokenizer, since `final_safetensors_list` is built after that upload.
     """
-    # `disk`: the (keys, shapes) the shards will have once a pending rewrite has run.
     disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list)
     unresolved = _unresolved_lora_targets(
         lora_weights,
