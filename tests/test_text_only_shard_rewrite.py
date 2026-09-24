@@ -205,3 +205,17 @@ def test_a_verification_mismatch_leaves_every_shard_untouched(tmp_path):
 
     assert _file_hashes(d) == before, "an original shard was modified on a plan mismatch"
     assert _staging_files(d) == [], "a staging file survived the mismatch"
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "POSIX permission bits are not meaningful on Windows")
+def test_a_committed_shard_keeps_the_original_mode(tmp_path):
+    """mkstemp stages at 0o600; the commit must not narrow a kept shard to owner-only."""
+    d = str(tmp_path)
+    names = _write_shards(d, [[KEY_MAP[TEXT[0]]], [KEY_MAP[TEXT[1]], KEY_MAP[TEXT[2]]]])
+    for name in names: os.chmod(os.path.join(d, name), 0o644)
+
+    kept = _commit(d, _stage_shards_text_only(d, names, KEY_MAP))
+
+    for name in kept:
+        mode = os.stat(os.path.join(d, name)).st_mode & 0o777
+        assert mode == 0o644, f"{name} ended up {oct(mode)} instead of the shard's original 0o644"

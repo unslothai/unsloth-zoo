@@ -3943,6 +3943,8 @@ def _stage_shards_text_only(save_directory, filenames, key_map):
             # Tracked before the write so a failure mid-write still reaches the cleanup below.
             staged[filename] = staging_path
             save_file(tensors, staging_path, metadata = {"format" : "pt"})
+            # mkstemp creates at 0o600; carry the shard's real mode so os.replace does not narrow it.
+            shutil.copymode(file_path, staging_path)
             staged_keys.update(tensors.keys())
             del tensors
         pass
