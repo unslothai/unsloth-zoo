@@ -482,6 +482,9 @@ jobs:
             tests/test_undefined_name_gate.py \
             tests/test_safe_serialization_none.py \
             tests/test_published_version_window.py \
+            tests/test_text_only_key_map.py \
+            tests/test_text_only_shard_rewrite.py \
+            tests/test_merge_e2e_text_only_config.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
