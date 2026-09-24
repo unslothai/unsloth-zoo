@@ -476,12 +476,7 @@ def _name_of_module(model: nn.Module, target: nn.Module) -> str | None:
 
 
 def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]:
-    """Classes that share a layer list with a declared no-split block but are not declared.
-
-    Remote MoE ports often append a multi-token-prediction layer to the decoder list and
-    declare only the decoder class; split across cards, its attention gets the mask on
-    the wrong device. A block in the same list is the same kind of unit, so keep it whole.
-    """
+    """Undeclared classes sharing a ModuleList with a declared block, e.g. an appended MTP layer."""
     found: set[str] = set()
     if not declared:
         return found
@@ -497,9 +492,7 @@ def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]
             # A container class name would make every such container atomic model-wide.
             if isinstance(child, (nn.ModuleList, nn.ModuleDict, nn.Sequential)):
                 continue
-            # A wrapper around a declared block (Zamba's hybrid layer holds the shared
-            # attention block) is already split at that block; keeping it whole ties every
-            # wrapper to the shared weights' card and can make a fitting model infeasible.
+            # Zamba-style wrappers of a shared block: keeping them whole can make a model not fit.
             if any(type(sub).__name__ in declared for sub in child.modules()):
                 continue
             if any(True for _ in child.parameters(recurse=True)):

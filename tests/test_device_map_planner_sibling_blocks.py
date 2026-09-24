@@ -2,15 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""A block appended to the decoder list but missing from ``_no_split_modules`` stays whole.
-
-Remote MoE ports such as inclusionAI/Ling-2.6-flash keep a multi-token-prediction
-layer at ``model.layers[-1]`` and declare only the decoder layer as atomic. The
-planner then spread that layer's attention, norms and experts over several cards,
-and because accelerate only moves the inputs of a placement unit, the causal mask
-reached the attention on another card and the first forward failed with
-"Expected all tensors to be on the same device".
-"""
+"""An undeclared MTP layer appended to the decoder list (Ling-2.6-flash) must stay on one card."""
 
 import pytest
 import torch
@@ -74,9 +66,7 @@ def _meta(**kw):
 
 
 def _plan(model):
-    # float32: embedding 128 KiB, each block 16 KiB, the MTP layer ~128 KiB, head 128 KiB.
-    # Card 0 holds the embedding and the four blocks with 48 KiB to spare, so an
-    # in-order walk that may descend into the MTP layer puts its first children there.
+    # Card 0 has 48 KiB spare after the blocks, so a splittable MTP layer would straddle cards.
     return plan_device_map(
         model,
         max_memory = {0: 240 * KiB, 1: 300 * KiB},
@@ -121,8 +111,6 @@ def test_an_explicit_override_is_left_alone():
 
 
 class _SharedWrapper(nn.Module):
-    """Zamba-style hybrid layer: wraps a declared block that every wrapper shares."""
-
     def __init__(self, shared):
         super().__init__()
         self.shared = shared
