@@ -44,6 +44,9 @@ def test_probe_body_runs_eagerly_under_compile(fresh_probes, monkeypatch, check,
         return not compiling
 
     monkeypatch.setattr(M, probe, fake_probe)
+    # Pretend an accelerator with the op exists, so the check reaches its (fake) kernel probe.
+    monkeypatch.setattr(M, "_TORCH_GROUPED_MM_AVAILABLE", True)
+    monkeypatch.setattr(M, "_grouped_mm_probe_device", lambda: torch.device("cpu"))
     fn = getattr(M, check)
 
     def f(x):
@@ -106,3 +109,25 @@ def test_first_moe_forward_inside_compile_matches_reference(fresh_probes):
     assert M.select_moe_backend() == "grouped_mm"
     rel = ((out - ref).norm() / ref.norm()).item()
     assert rel < 2e-2, rel
+
+
+def test_definitive_negative_does_not_break_a_fullgraph_trace(monkeypatch):
+    """With no accelerator (or no torch._grouped_mm) the answer is known without a kernel
+    probe, so a fullgraph trace must get False instead of an Unsupported graph break."""
+    import torch
+    from unsloth_zoo.temporary_patches import moe_utils
+
+    monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
+    monkeypatch.setattr(moe_utils, "_grouped_mm_probe_device", lambda: None)
+    torch._dynamo.reset()
+
+    @torch.compile(fullgraph = True, backend = "eager")
+    def f(x):
+        if moe_utils._check_torch_grouped_mm_supported() or moe_utils._transposed_view_grouped_mm_is_safe():
+            return x + 1
+        return x - 1
+
+    assert torch.equal(f(torch.zeros(2)), torch.full((2,), -1.0))
+    assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is False
+    assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is False

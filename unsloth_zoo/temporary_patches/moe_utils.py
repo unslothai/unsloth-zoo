@@ -760,9 +760,25 @@ def _run_probe_eagerly(probe):
     return probe()
 
 
+def _grouped_mm_probe_device():
+    """The accelerator a grouped_mm probe would run on, or None when there is none."""
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu", torch.xpu.current_device())
+    return None
+
+
 def _check_torch_grouped_mm_supported():
     """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
+    global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
+    # Definitive negatives stay traceable, so a fullgraph trace on a host without the op or an
+    # accelerator is not broken; only a real kernel probe needs the eager helper.
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
@@ -770,16 +786,8 @@ def _probe_torch_grouped_mm_supported():
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
-    if not _TORCH_GROUPED_MM_AVAILABLE:
-        _TORCH_GROUPED_MM_SUPPORTED = False
-        return False
-
-    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
-    if torch.cuda.is_available():
-        device = torch.device("cuda", torch.cuda.current_device())
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        device = torch.device("xpu", torch.xpu.current_device())
-    else:
+    device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
+    if device is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -808,8 +816,12 @@ _TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
 
 
 def _transposed_view_grouped_mm_is_safe():
+    global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
+        _TRANSPOSED_VIEW_GROUPED_MM_SAFE = False
+        return False
     # Eager for the same reason as _check_torch_grouped_mm_supported: under a trace the
     # comparison would run on FakeTensors.
     return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
@@ -822,12 +834,7 @@ def _probe_transposed_view_grouped_mm_is_safe():
 
     safe = False
     try:
-        if torch.cuda.is_available():
-            device = torch.device("cuda", torch.cuda.current_device())
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = torch.device("xpu", torch.xpu.current_device())
-        else:
-            device = None
+        device = _grouped_mm_probe_device()
         if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
