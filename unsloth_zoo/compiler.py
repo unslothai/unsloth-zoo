@@ -4349,11 +4349,12 @@ def _patch_lora_base_layer_input_cast(source):
     Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder): when autocast is
     disabled and base_layer has float32 weights, cast x to match the weight dtype to prevent a
     dtype mismatch. Quantized storage must never become the activation dtype: 4-bit weights are
-    packed uint8 bytes (quant_state), and FP8 weights (transformers FP8Linear, FbgemmFp8Linear, an
-    unconverted fp8 Linear) are 1-byte floats whose forward quantizes the activation itself; casting
-    x to float8 there returned float8 outputs and failed with "Promotion for Float8 Types is not
-    supported" in any plain no-grad forward after get_peft_model. Only 16/32/64-bit float weights
-    take the cast.
+    packed uint8 bytes (quant_state), and FP8 layers (transformers FP8Linear, FbgemmFp8Linear) keep
+    1-byte float weights and quantize the activation themselves; casting x to float8 there returned
+    float8 outputs and failed with "Promotion for Float8 Types is not supported" in any plain no-grad
+    forward after get_peft_model. Only 16/32/64-bit float weights take the cast. A plain nn.Linear
+    holding fp8 values cannot run F.linear in any activation dtype, so it must be dequantized at load
+    (Unsloth does this for orphaned FP8 weights); no input cast can serve it.
     """
     _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
     _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
