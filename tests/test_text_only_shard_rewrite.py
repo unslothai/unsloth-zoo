@@ -281,3 +281,28 @@ def test_a_replace_failure_mid_commit_raises_and_cleans_up(tmp_path, monkeypatch
         _commit_staged_shards_text_only(d, staged, _FakeConfig(), "FakeArch")
 
     assert _staging_files(d) == [], "a staging file survived the failure"
+
+
+@pytest.mark.parametrize("target", ["_write_text_only_index", "_export_text_only_config"])
+def test_a_failure_after_every_replace_still_names_the_export_incomplete(tmp_path, monkeypatch, target):
+    """Neither the index write nor the config export runs until every os.replace has already
+    landed, so a failure there has nothing left to roll back: the message naming the
+    directory incomplete is the only thing telling the user to merge again.
+    """
+    d = str(tmp_path)
+    names = _write_shards(d, [[KEY_MAP[TEXT[0]]], [KEY_MAP[TEXT[1]], KEY_MAP[TEXT[2]]]])
+    staged = _stage_shards_text_only(d, names, KEY_MAP)
+    original_error = ValueError("boom")
+
+    def _fail(*args, **kwargs):
+        raise original_error
+
+    monkeypatch.setattr(saving_utils, target, _fail)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _commit_staged_shards_text_only(d, staged, _FakeConfig(), "FakeArch")
+
+    assert d in str(excinfo.value), "the error should name the incomplete directory"
+    assert excinfo.value.__cause__ is original_error, "the RuntimeError should chain the original error"
+    assert _keys_in(os.path.join(d, names[0])) == {TEXT[0]}
+    assert _keys_in(os.path.join(d, names[1])) == {TEXT[1], TEXT[2]}
