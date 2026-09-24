@@ -4489,7 +4489,7 @@ def patch_lora_forwards(torch_compile_options):
     pass
     # Re-wrap a regenerated Linear4bit.forward that got no inline cast.
     try:
-        from .temporary_patches.misc import patch_peft_lora_integer_input
+        from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
 
         patch_peft_lora_integer_input()
     except Exception:
