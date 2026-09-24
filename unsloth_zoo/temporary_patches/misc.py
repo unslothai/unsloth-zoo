@@ -1541,6 +1541,7 @@ def fix_mamba_ssm_float32():
         with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
     except Exception as e:
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+    original_file = file
 
     # Find `dst = tl.dot(a, b)` / `dst += tl.dot(a, b)`
     matches = list(re.finditer(
@@ -1559,11 +1560,31 @@ def fix_mamba_ssm_float32():
         file = file.replace(old, new)
     pass
 
+    # Already upcast (every import after the first), so leave the installed file alone.
+    if file == original_file:
+        return
+
+    # This edits site-packages, and other processes may import or patch the same file
+    # at the same moment. Writing in place truncates it first: a concurrent reader then
+    # sees an empty module and writes the empty string back, which leaves mamba_ssm
+    # permanently broken ("cannot import name '_chunk_scan_fwd'"). Write a sibling file
+    # and rename it over the original so readers see the old or the new source only.
+    import tempfile
+    tmp_file = None
     try:
+        fd, tmp_file = tempfile.mkstemp(
+            dir = os.path.dirname(ssd_chunk_scan_file), prefix = ".ssd_chunk_scan.", suffix = ".tmp",
+        )
+        with os.fdopen(fd, "w", encoding = "utf-8") as f: f.write(file)
+        os.chmod(tmp_file, os.stat(ssd_chunk_scan_file).st_mode & 0o7777)
+        os.replace(tmp_file, ssd_chunk_scan_file)
+        tmp_file = None
         # Reload module since we editted it
-        with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
         importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
     except Exception as e:
+        if tmp_file is not None:
+            try: os.unlink(tmp_file)
+            except OSError: pass
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
 pass
 TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
