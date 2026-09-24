@@ -346,8 +346,7 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
     return out
 
 
-# E2M1 (FP4) value table, low nibble first, the packing transformers' finegrained_fp8
-# loader uses for `config.expert_dtype = "fp4"` experts (DeepSeek-V4).
+# E2M1 values, low nibble first, matching transformers' finegrained_fp8 FP4 packing.
 _FP4_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 _FP4_EXPERT_CHUNK = 16
 
@@ -362,26 +361,19 @@ def _is_fp4_packed_tensor(tensor) -> bool:
 
 
 def _fp4_pair_table(target_dtype, device):
-    """(256, 2) table: byte -> (low nibble value, high nibble value)."""
     values = torch.tensor(_FP4_E2M1_VALUES, dtype = torch.float32, device = device)
     codes = torch.arange(256, dtype = torch.int64, device = device)
     return torch.stack([values[codes & 0xF], values[(codes >> 4) & 0xF]], dim = -1).to(target_dtype)
 
 
 def _fp4_scale_to_float(scale: torch.Tensor) -> torch.Tensor:
-    """UE8M0 scales as fp32 multipliers, whether stored as float8_e8m0fnu or raw uint8 exponents."""
     if scale.dtype == torch.uint8:
         return (scale.to(torch.float32) - 127.0).exp2()
     return scale.to(torch.float32)
 
 
 def _dequantize_full_expert_weights_fp4(weight: torch.Tensor, scale, target_dtype: torch.dtype):
-    """Unpack FP4-packed experts `(E, M, K // 2)` int8 with per-row `(E, M, K // g)` scales to `(E, M, K)`.
-
-    Done in expert chunks: the byte -> value lookup needs an integer index tensor,
-    and the full stack (DeepSeek-V4-Flash: 256 x 4096 x 2048 bytes per layer) would
-    need gigabytes of indices at once.
-    """
+    """(E, M, K // 2) packed -> (E, M, K); chunked over experts since whole-stack int indices take GBs."""
     if weight.ndim != 3 or not _is_fp4_packed_tensor(weight):
         return None
     if not isinstance(scale, torch.Tensor) or scale.ndim != 3 or scale.shape[0] != weight.shape[0]:
@@ -407,7 +399,6 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
     if weight.ndim != 3:
         return None
 
-    # FP4-packed experts (DeepSeek-V4): no FP8 kernel understands them, unpack directly.
     result = _dequantize_full_expert_weights_fp4(weight, quant_state, target_dtype)
     if result is not None:
         return result
@@ -856,9 +847,7 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
 
 @torch.compiler.disable
 def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
-    """FP4 experts whose class clamps or offsets SwiGLU in its own `_apply_gate` (DeepSeek-V4)
-    would train on a plain `act_fn(gate) * up` in the backends below unless they apply that
-    gate themselves (`_fp8_experts_own_gate`); refuse rather than train on a different model."""
+    """A custom `_apply_gate` (DeepSeek-V4 clamped SwiGLU) would silently become plain act_fn(gate) * up."""
     if not _is_fp4_packed_tensor(gate_up_weight):
         return
     if "_fp8_experts_own_gate" in globals() or getattr(module, "_unsloth_own_apply_gate", False):
@@ -1194,11 +1183,6 @@ def patch_fp8_validate_quantization_for_training():
 
 
 class _Fp4ParamShapeProxy:
-    """Expose an FP4-packed expert parameter's logical shape and compute dtype to PEFT.
-
-    The stored tensor is `(E, M, K // 2)` int8; LoRA has to be sized on `(E, M, K)`.
-    """
-
     def __init__(self, param, shape, dtype):
         self._param = param
         self._shape = shape
@@ -1221,7 +1205,6 @@ class _Fp4ParamShapeProxy:
 
 
 def fp4_packed_expert_logical_shape(experts_module, parameter_name, param):
-    """`(E, M, K)` for an FP4-packed `(E, M, K // 2)` expert stack with a per-row scale next to it, else None."""
     if not _is_fp4_packed_tensor(param) or param.ndim != 3:
         return None
     scale = getattr(experts_module, f"{parameter_name}_scale_inv", None)
@@ -1233,7 +1216,7 @@ def fp4_packed_expert_logical_shape(experts_module, parameter_name, param):
 
 
 def patch_peft_param_wrapper_fp4_expert_shape():
-    """PEFT sizes a target parameter's LoRA from `param.shape`; FP4-packed experts store half of K."""
+    """PEFT sizes LoRA from `param.shape`; FP4-packed experts store half of K."""
     try:
         from peft.tuners.lora.layer import ParamWrapper
     except (ImportError, AttributeError):
@@ -1245,7 +1228,7 @@ def patch_peft_param_wrapper_fp4_expert_shape():
 
     def _patched_get_param(self):
         param = _original_get_param(self)
-        # Runs on every expert LoRA forward: one dtype lookup for everything that is not FP4.
+        # Hot path on every expert LoRA forward: keep the non-FP4 exit to one dtype check.
         if getattr(param, "dtype", None) not in _FP4_PACKED_DTYPES:
             return param
         base_layer = self.get_base_layer()

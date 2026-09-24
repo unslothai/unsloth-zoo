@@ -1,11 +1,4 @@
-"""FP4-packed experts (DeepSeek-V4) dequantize to the same values transformers produces.
-
-DeepSeek-V4-Flash ships its experts as `config.expert_dtype = "fp4"`: int8 bytes
-holding two e2m1 nibbles with per-row UE8M0 scales every 32 values. The zoo's
-FP8 MoE backend only knew float8_e4m3fn weights, so every dequant helper
-returned None and the dispatcher fell through to the per-expert fp8_linear loop,
-which refuses to run with LoRA attached.
-"""
+"""FP4-packed experts (DeepSeek-V4) dequantize to the same values transformers produces."""
 import pytest
 import torch
 
@@ -20,7 +13,6 @@ def _transformers_fp4_reference():
     return Fp8Dequantize if hasattr(Fp8Dequantize, "_dequantize_one") else None
 
 
-# The comparisons against transformers' own FP4 unpack need a transformers that has one.
 needs_fp4_reference = pytest.mark.skipif(
     _transformers_fp4_reference() is None, reason = "this transformers has no FP4 expert dequant"
 )
@@ -80,8 +72,6 @@ def test_fp8_and_mismatched_scales_are_declined():
 
 
 class _PackedExperts(torch.nn.Module):
-    """FP8Experts' storage for `expert_dtype = "fp4"`: int8 `(E, M, K // 2)` plus `(E, M, K // 32)` scales."""
-
     def __init__(self, E = 2, M = 8, K = 64):
         super().__init__()
         packed, scale = _fixture(E, M, K)
@@ -94,7 +84,6 @@ class _PackedExperts(torch.nn.Module):
 
 
 def test_peft_sizes_the_lora_on_the_logical_shape():
-    """Fails on main: lora_A is sized on the packed K // 2, so the delta cannot contract with the input."""
     pytest.importorskip("peft")
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import patch_peft_param_wrapper_fp4_expert_shape
     patch_peft_param_wrapper_fp4_expert_shape()
@@ -105,8 +94,7 @@ def test_peft_sizes_the_lora_on_the_logical_shape():
     assert wrapper.num_experts == 2
     assert wrapper.get_param().shape == (2, 8, 64)
     assert module.gate_up_proj._original_shape == (2, 8, 64)
-    # The LoRA is sized on the logical K = 64, never the packed 32. Which factor carries K
-    # depends on the PEFT release (0.21 swaps the 3-D in/out dims, 0.18 does not).
+    # PEFT 0.21 swaps the 3-D in/out dims vs 0.18, so check the set, never the packed 32.
     dims = {wrapper.lora_A["default"].weight.shape[-1], wrapper.lora_B["default"].weight.shape[0]}
     assert dims == {8, 64}
 
@@ -127,8 +115,6 @@ def test_megamoe_fp4_experts_refuse_a_lora_its_kernel_would_skip():
 
 
 def test_fp4_experts_with_their_own_gate_are_refused_until_a_backend_applies_it():
-    """DeepSeek-V4 clamps SwiGLU in `_apply_gate`; the dequant route must not train FP4 experts
-    on a plain act_fn(gate) * up."""
     from unsloth_zoo.temporary_patches import moe_utils_fp8 as fp8
 
     packed = torch.zeros(2, 4, 8, dtype = torch.int8)
@@ -141,7 +127,7 @@ def test_fp4_experts_with_their_own_gate_are_refused_until_a_backend_applies_it(
         pass
 
     if "_fp8_experts_own_gate" in vars(fp8):
-        fp8._refuse_fp4_with_an_unapplied_gate(Clamped(), packed)  # the backends apply it
+        fp8._refuse_fp4_with_an_unapplied_gate(Clamped(), packed)
         return
     with pytest.raises(NotImplementedError, match = "own gate"):
         fp8._refuse_fp4_with_an_unapplied_gate(Clamped(), packed)
