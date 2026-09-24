@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The device map planner keeps room for the tensors transformers 5 builds while
-it merges checkpoint tensors into one parameter (per-expert weights into an
-expert stack, gate and up into gate_up).
-
-transformers materialises every source tensor on the target card and stacks
-them there, so a card needs one merged tensor above its loaded weights, and in
-practice two to five times that because the allocator cannot reuse the holes
-the sources leave. MiniMax-M3 16-bit ran out of memory mid-load on exactly this
-while its steady-state plan fitted. Meta-device models only, no GPU needed.
-"""
+"""The device map planner keeps room for tensors transformers 5 merges on the card while loading."""
 import importlib.util
 import re
 import sys
@@ -49,7 +40,6 @@ needs_conversion_mapping = pytest.mark.skipif(
 )
 
 _HIDDEN, _INTER, _EXPERTS, _LAYERS = 64, 128, 8, 6
-# One layer's gate_up stack in bf16: experts x (gate + up) x intermediate x hidden.
 _GATE_UP_BYTES = _EXPERTS * 2 * _INTER * _HIDDEN * 2
 
 
@@ -136,7 +126,6 @@ def test_merged_expert_stacks_are_sized_per_layer():
     units, _ = _units(model)
     transient = _load_transient_by_unit(model, units)
     if not _HAS_CONVERSION_MAPPING:
-        # transformers 4.x loads the experts as they are stored: nothing to reserve.
         assert transient == {}
         return
     layers = {u: n for u, n in transient.items() if ".layers." in u}
@@ -178,12 +167,9 @@ def test_a_merging_model_with_room_to_spare_keeps_its_placement():
 
 @needs_conversion_mapping
 def test_cards_holding_merged_experts_keep_room_to_merge():
-    # With no activation reserve the in-order walk fills cuda:0 to the brim, and
-    # the first expert stack built there has nowhere to go.
     model = _meta_mixtral()
     units, total = _units(model)
     layer = max(n for u, n in units if ".layers." in u)
-    # Room for 3x on both cards plus a layer of packing slack.
     per_card = total // 2 + 3 * _GATE_UP_BYTES + layer
     budgets = {0: per_card, 1: per_card}
     plan = plan_device_map(
@@ -194,8 +180,7 @@ def test_cards_holding_merged_experts_keep_room_to_merge():
         assert free[d] >= 3 * _GATE_UP_BYTES, (d, free[d], 3 * _GATE_UP_BYTES)
     assert plan.load_transient_by_device == {d: 3 * _GATE_UP_BYTES for d in _layer_devices(plan)}
 
-    # The same request without the load transient packs cuda:0 past that point,
-    # which is the map that ran out of memory while loading.
+    # Without the transient cuda:0 is packed past that point: the map that ran out of memory.
     unguarded = plan_device_map(
         model, max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
         reserve_load_transient = False,
@@ -219,7 +204,6 @@ def test_expandable_segments_ask_for_more_room_first(monkeypatch):
 
 @needs_conversion_mapping
 def test_the_largest_multiple_that_fits_is_kept(monkeypatch):
-    # Slack for 3x on both cards but not 5x.
     monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     model = _meta_mixtral()
     _, total = _units(model)
@@ -237,7 +221,6 @@ def test_the_largest_multiple_that_fits_is_kept(monkeypatch):
 def test_a_room_no_placement_can_keep_leaves_the_old_plan_and_says_so():
     model = _meta_mixtral()
     _, total = _units(model)
-    # Room for the weights and half a merged tensor per card, no more.
     budgets = {0: total // 2 + _GATE_UP_BYTES // 2, 1: total // 2 + _GATE_UP_BYTES // 2}
     before = plan_device_map(
         model, max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
@@ -296,8 +279,7 @@ def test_a_transformers_without_conversion_mapping_reserves_nothing(monkeypatch)
 
 
 def test_a_floor_left_on_a_card_the_merge_moved_off_does_not_rule_out_a_fit(monkeypatch):
-    # Floors only grew while re-planning, so one kept on a card whose merging layer had
-    # moved elsewhere made 3x look infeasible here and the plan fell back to 1x.
+    # Regression: a stale floor on a card the merging layer left made 3x look infeasible.
     import unsloth_zoo.device_map_planner as planner
 
     with torch.device("meta"):
@@ -318,9 +300,7 @@ def test_a_floor_left_on_a_card_the_merge_moved_off_does_not_rule_out_a_fit(monk
 
 
 def test_the_packers_place_merging_units_where_their_transient_fits(monkeypatch):
-    # Validating a finished packing could only reject it: here the first weight-only fit puts
-    # the merging layer on a card without room for 3x, and 3x was dropped although another
-    # packing keeps it. The transient is now part of the packing itself.
+    # Regression: validating a finished weight-only packing dropped 3x although another packing keeps it.
     import unsloth_zoo.device_map_planner as planner
 
     with torch.device("meta"):
@@ -341,8 +321,7 @@ def test_the_packers_place_merging_units_where_their_transient_fits(monkeypatch)
 
 
 def test_a_merge_into_a_pinned_unit_keeps_its_room_on_the_head_card(monkeypatch):
-    # Pinned units skip the packers, whose peaks started at zero, so a converter merging into
-    # lm_head was reported as reserved on a head card the packing had filled to the limit.
+    # Regression: pinned units skip the packers, so a merge into lm_head went unreserved.
     import unsloth_zoo.device_map_planner as planner
 
     with torch.device("meta"):
@@ -384,7 +363,6 @@ def test_the_pretrained_helper_forwards_the_opt_out(monkeypatch):
 
 
 def test_ernie_vl_fuse_and_split_experts_count_as_merging():
-    # Ernie 4.5-VL stacks and concatenates its text and vision experts on the card in one op.
     configuration = pytest.importorskip("transformers.models.ernie4_5_vl_moe.configuration_ernie4_5_vl_moe")
     modeling = pytest.importorskip("transformers.models.ernie4_5_vl_moe.modeling_ernie4_5_vl_moe")
     from accelerate import init_empty_weights
@@ -399,9 +377,7 @@ def test_ernie_vl_fuse_and_split_experts_count_as_merging():
             vision_config = dict(hidden_size = 32, depth = 1, intermediate_size = 64, num_heads = 2),
         )
     except Exception as error:
-        # transformers 5.4's Ernie 4.5-VL config declares `use_bias: int | None` and defaults it
-        # to False, which huggingface_hub's strict dataclass validation (>= 1.x) rejects: even
-        # the default config cannot be built there.
+        # transformers 5.4 defaults `use_bias: int | None` to False, which huggingface_hub >= 1.x rejects.
         pytest.skip(f"this transformers cannot build an Ernie 4.5-VL config ({type(error).__name__})")
     with init_empty_weights():
         model = modeling.Ernie4_5_VLMoeForConditionalGeneration(config)
@@ -439,8 +415,7 @@ def test_an_op_built_around_a_concatenate_counts_as_merging(monkeypatch):
 
 @needs_conversion_mapping
 def test_a_pre_quantized_merge_is_sized_from_its_storage_dtype(monkeypatch):
-    # preprocess_model leaves a meta Params4bit at its unpacked shape in float32, so the live
-    # tensor reads 8x the packed bytes a pre-quantized checkpoint actually merges.
+    # A meta Params4bit reads as unpacked float32, 8x the packed bytes actually merged.
     pytest.importorskip("bitsandbytes")
     import unsloth_zoo.device_map_planner as planner
     from accelerate import init_empty_weights
@@ -472,14 +447,11 @@ def test_a_pre_quantized_merge_is_sized_from_its_storage_dtype(monkeypatch):
     units, _ = _units(model)
     transient = planner._load_transient_by_unit(model, units, quantizer)
     assert transient, units
-    assert max(transient.values()) == _INTER * _HIDDEN // 2  # 4-bit: half a byte per element
+    assert max(transient.values()) == _INTER * _HIDDEN // 2
 
 
 @needs_conversion_mapping
 def test_room_to_load_is_never_bought_with_activation_reserve():
-    # The planner's standing contract is that no card keeps less activation reserve than the
-    # previous planner did. The load transient must not break it: a transient plan that would
-    # lower some card's reserve (or move the head) loses to the plan without the transient.
     import random
 
     model = _meta_mixtral()

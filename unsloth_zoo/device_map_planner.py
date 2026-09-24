@@ -795,20 +795,11 @@ def _adjust_budgets_for_quantizer(
     return budgets, note
 
 
-# How many times the largest merged tensor a card must keep free while the
-# checkpoint loads. transformers 5 materialises every source tensor of a merging
-# converter (`MergeModulelist`, `Concatenate`) on the target card, then builds
-# the merged parameter next to them, so the allocated peak is one merged tensor
-# above the steady state. The caching allocator cannot reuse most of the holes
-# the freed sources leave, and the reserved peak is what hits the card's limit.
-# Measured on a B200, bf16, 128 experts of 6144 x 3072 (MiniMax-M3's shapes,
-# 9 GiB gate_up stacks): reserved peak 22.5 to 27.0 GiB above the loaded weights
-# at 4 and at 8 layers, so it does not grow with depth; 2.0x to 2.5x at 32
-# experts over 4, 8 and 16 layers. `expandable_segments:True` measured up to
-# 4.7x in one run.
+# Largest merged tensors a card keeps free while loading: transformers 5 builds the merged tensor
+# next to its sources on the card, and the allocator cannot reuse the holes they leave. Measured
+# reserved peaks (MiniMax-M3 shapes, B200): 2.0x to 2.5x default, up to 4.7x with expandable segments.
 _LOAD_TRANSIENT_MULTIPLE = 3
 _LOAD_TRANSIENT_MULTIPLE_EXPANDABLE = 5
-# Ernie 4.5-VL's fuse-and-split stacks and concatenates the text and vision experts in one op.
 _MERGING_OPS = ("MergeModulelist", "Concatenate", "ErnieFuseAndSplitTextVisionExperts")
 
 
@@ -838,12 +829,7 @@ def _expandable_segments_enabled() -> bool:
 
 
 def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> list:
-    """Target patterns of the load-time converters that build one parameter out
-    of several checkpoint tensors (per-expert weights stacked into one expert
-    tensor, gate and up concatenated). Empty when the installed transformers has
-    no conversion mapping (4.x) or the model registers none, so the planner is
-    unchanged there. Converters marked ``force_cpu`` merge on the CPU and cost
-    the card nothing."""
+    """Targets of converters merging several checkpoint tensors on the card; ``force_cpu`` ones cost it nothing."""
     try:
         from transformers.conversion_mapping import get_model_conversion_mapping
     except Exception:
@@ -873,10 +859,7 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
 
 
 def _storage_bytes_per_element(model: nn.Module, hf_quantizer: Any):
-    """Bytes per element each parameter is stored in: the quantiser's own
-    ``param_element_size`` (transformers 5), else accelerate's `compute_module_sizes` rules on
-    its `dtype` / `special_dtypes` (see :func:`_quantized_size_kwargs`). ``None`` when there
-    is nothing to say, so the caller keeps the tensor's own size."""
+    """Storage bytes per element of each parameter, or ``None`` to keep the tensor's own size."""
     per_param = getattr(hf_quantizer, "param_element_size", None)
     if callable(per_param):
         def size_of(name: str, tensor: torch.Tensor) -> float:
@@ -918,24 +901,18 @@ def _load_transient_by_unit(
     units: Sequence[tuple[str, int]],
     hf_quantizer: Any = None,
 ) -> dict[str, int]:
-    """Bytes each placement unit needs free on its card, beyond its own
-    weights, while a merging converter builds its largest parameter. Units with
-    no merged parameter are absent."""
+    """Bytes each unit needs free beyond its weights while its largest parameter is merged."""
     patterns = _merged_parameter_patterns(model, hf_quantizer)
     if not patterns:
         return {}
     load_dtype = _model_dtype(model)
-    # A quantiser that loads the checkpoint as stored merges in the storage
-    # dtype; otherwise the sources are cast to the load dtype first and a bnb
-    # quantiser runs on the merged tensor.
+    # Pre-quantized loads merge in the storage dtype; otherwise sources are cast to the load dtype first.
     as_stored = bool(getattr(hf_quantizer, "pre_quantized", False))
     load_itemsize = (
         torch.empty((), dtype=load_dtype).element_size()
         if isinstance(load_dtype, torch.dtype) else None
     )
-    # A pre-quantized load merges the checkpoint's storage tensors, but `preprocess_model` left
-    # the meta parameters at their unpacked shape (a meta Params4bit is float32), so size them
-    # the way `_compute_module_sizes` does: through the quantiser's storage dtype.
+    # A meta Params4bit is left unpacked in float32, so size it via the quantiser's storage dtype.
     stored_size = _storage_bytes_per_element(model, hf_quantizer) if as_stored else None
     unit_names = sorted((u for u, _ in units), key=len, reverse=True)
     out: dict[str, int] = {}
@@ -1123,11 +1100,9 @@ def plan_device_map(
             removes every no-split constraint, so blocks may be split at their
             children; ``None`` (default) detects the classes from the model.
         prefer_head_device: force the head onto this device index.
-        reserve_load_transient: keep room on each card for the tensors
-            transformers 5 builds while it merges checkpoint tensors into one
-            parameter (per-expert weights into an expert stack). Only models
-            whose conversion mapping merges are affected. When no placement
-            keeps that room the plan is returned without it and says so.
+        reserve_load_transient: keep room on each card for tensors transformers 5
+            merges while loading (expert stacks). When no placement keeps it the
+            plan is returned without it and says so in ``notes``.
 
     Returns:
         A :class:`DeviceMapPlan`, or ``None`` when there are fewer than two
@@ -1452,8 +1427,6 @@ def plan_device_map(
             return {d: _parse_size(value.get(d, 0)) for d in devices}
         return dict.fromkeys(devices, int(value))
 
-    # Per card, the least activation reserve a load-transient search may settle on: what the
-    # plan without the transient keeps (see below). Empty means no floor.
     reserve_floor: dict[int, int] = {}
 
     def _below_floor(kept) -> bool:
@@ -1584,8 +1557,6 @@ def plan_device_map(
         # headroom the accepted packing did not keep.
         kept = {d: reserve[d] if d == head_device else min(reserve[d], other_reserve)
                 for d in devices}
-        # While the checkpoint loads nothing else is resident, so the load
-        # transient only has to fit in what the reserve and headroom leave free.
         budget = {
             d: raw_budgets[d] - (kept[d] + headroom if d == head_device else kept[d])
             for d in devices
@@ -1631,17 +1602,14 @@ def plan_device_map(
         return assign, weight_bytes, public_budgets, kept
 
     def _transient_cap(head_device: int) -> dict[int, int]:
-        # While the checkpoint loads nothing else is resident, so a card's merge transient
-        # only has to fit in its raw budget next to the weights (the head's pinned units
-        # included), not on top of the activation reserve and logit headroom.
+        # Nothing else is resident while loading, so the transient need not fit on top of the reserve.
         return {d: raw_budgets[d] - (pinned_bytes if d == head_device else 0) for d in devices}
 
     def _group_transient(names) -> int:
         return max((transient_of.get(n, 0) for n in names), default = 0)
 
     def _start_peak(head_device: int) -> dict[int, int]:
-        # The pinned units never go through the packers, but a converter can still merge
-        # into one of them (a concatenated lm_head), so the head's card starts at their peak.
+        # Pinned units skip the packers but can still be merged into (a concatenated lm_head).
         peak = dict.fromkeys(devices, 0)
         peak[head_device] = _group_transient(pinned)
         return peak
@@ -1744,8 +1712,6 @@ def plan_device_map(
             for d in devices:
                 room = remaining[d]
                 used_d = budget[d] - room
-                # Cards alike in reserve room, transient room and transient held are
-                # interchangeable here.
                 state = (room, cap[d] - used_d, peak[d])
                 if size > room or used_d + size + max(peak[d], t) > cap[d] or state in tried:
                     continue
@@ -1763,8 +1729,7 @@ def plan_device_map(
             return False
 
         def place_plain(i: int) -> bool:
-            # No load transient in play: the search this planner ran before it, at the same
-            # speed. Cards alike in reserve room are interchangeable again.
+            # Kept separate so plans without a load transient search as fast as before.
             nonlocal visited
             if i == len(order):
                 return True
@@ -1814,13 +1779,6 @@ def plan_device_map(
                 return found, cand
         return None, None
 
-    # Load transients: the parameters transformers 5 builds on the card while it merges
-    # checkpoint tensors. Each card must keep its largest one (times the allocator's measured
-    # overhead) free next to its weights, and that is part of the packing itself, so the
-    # packers choose placements that leave it. The measured multiples are tried largest first,
-    # then the bare merged tensor (the allocated peak), and only then the plan without it,
-    # which is what this planner returned before. unsloth_zoo turns expandable segments on at
-    # import, so Unsloth's own loads start from the larger multiple.
     unit_transient: dict[str, int] = (
         _load_transient_by_unit(model, units, hf_quantizer) if reserve_load_transient else {}
     )
@@ -1828,9 +1786,7 @@ def plan_device_map(
     load_transient: dict[int, int] = {}
     result, chosen = None, None
     if unit_transient:
-        # The plan without the transient comes first, and a transient plan is only taken on
-        # its head card and when every card keeps at least that plan's activation reserve:
-        # room to load is never bought with room to train, and the search stays short.
+        # A transient plan must keep the baseline's head and per-card reserve: never trade training room.
         baseline, base_head = _search()
         multiples = (
             (_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE,) if _expandable_segments_enabled() else ()
@@ -1856,8 +1812,6 @@ def plan_device_map(
         transient_of = {} if result is None else transient_of
     fell_back = result is None
     if result is None and unit_transient:
-        # The plan without the transient was already searched: take it, or refuse as before
-        # without searching the same ladder a second time.
         transient_of = {}
         result, chosen = baseline, base_head
     elif result is None:
