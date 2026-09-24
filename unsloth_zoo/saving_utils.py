@@ -3911,34 +3911,57 @@ def _shard_keys_on_disk(save_directory, filenames):
 pass
 
 
-def _rewrite_shards_text_only(save_directory, filenames, key_map):
-    """Rewrite each shard to hold only the text tensors, under their text-only names.
+def _stage_shards_text_only(save_directory, filenames, key_map):
+    """Stage each shard's text-only tensors without touching the shard on disk.
 
-    One shard is read at a time, which is the same working set as `split_safetensors_to_shards`
-    already uses on this path. A shard that was pure vision or pure audio keeps nothing and is
-    deleted outright, which is where most of the size saving comes from.
+    One shard is read at a time, the same working set `split_safetensors_to_shards` already
+    uses on this path. Verifies the staged key set against `key_map` before returning, so a
+    caller never commits a rewrite it could not confirm. Any failure -- an OSError mid write
+    or a verification mismatch -- removes every staging file made so far and raises, leaving
+    every shard in `filenames` exactly as #1073 wrote it.
     """
     to_text_key = {base_key : text_key for text_key, base_key in key_map.items()}
-    kept_files = []
-    for filename in filenames:
-        file_path = os.path.join(save_directory, filename)
-        if not os.path.exists(file_path): continue
-        tensors = OrderedDict()
-        with safe_open(file_path, framework = "pt", device = "cpu") as f:
-            for key in f.keys():
-                text_key = to_text_key.get(key)
-                if text_key is not None: tensors[text_key] = f.get_tensor(key)
+    staged = OrderedDict()
+    staged_keys = set()
+    try:
+        for filename in filenames:
+            file_path = os.path.join(save_directory, filename)
+            if not os.path.exists(file_path):
+                staged[filename] = None
+                continue
+            tensors = OrderedDict()
+            with safe_open(file_path, framework = "pt", device = "cpu") as f:
+                for key in f.keys():
+                    text_key = to_text_key.get(key)
+                    if text_key is not None: tensors[text_key] = f.get_tensor(key)
+            pass
+            if not tensors:
+                staged[filename] = None
+                continue
+            _fd, staging_path = tempfile.mkstemp(dir = save_directory, prefix = ".unsloth-shard-")
+            os.close(_fd)
+            # Tracked before the write so a failure mid-write still reaches the cleanup below.
+            staged[filename] = staging_path
+            save_file(tensors, staging_path, metadata = {"format" : "pt"})
+            staged_keys.update(tensors.keys())
+            del tensors
         pass
-        if not tensors:
-            os.remove(file_path)
-            continue
-        temp_path = file_path + ".text_only"
-        save_file(tensors, temp_path, metadata = {"format" : "pt"})
-        del tensors
-        os.replace(temp_path, file_path)
-        kept_files.append(filename)
-    pass
-    return kept_files
+        expected = set(key_map)
+        if staged_keys != expected:
+            raise TextOnlyRemapError(
+                f"staged {len(staged_keys)} tensor(s) but the plan describes {len(expected)}. "
+                f"Missing: {sorted(expected - staged_keys)[:4]}. "
+                f"Unexpected: {sorted(staged_keys - expected)[:4]}."
+            )
+    except BaseException:
+        for staging_path in staged.values():
+            if staging_path is not None:
+                try:
+                    os.remove(staging_path)
+                except OSError:
+                    pass
+        raise
+    return staged
 pass
 
 
@@ -4801,6 +4824,7 @@ def merge_and_overwrite_lora(
             )
         else:
             _text_only_key_plan = None
+            _staged = None
             _text_only_before = _shard_keys_on_disk(save_directory, final_safetensors_list)
             try:
                 _text_only_keys, _text_only_architecture = _text_only_expected_keys(config)
@@ -4808,8 +4832,11 @@ def merge_and_overwrite_lora(
                     _text_only_keys, _text_only_before,
                     tie_word_embeddings = _merge_tie_word_embeddings,
                 )
+                _staged = _stage_shards_text_only(
+                    save_directory, final_safetensors_list, _text_only_key_plan,
+                )
             except Exception as text_only_error:
-                # Degrade to the #1073 export rather than write weights we could not place.
+                # Degrade to the #1073 export rather than commit weights we could not place or verify.
                 warnings.warn(
                     f"Unsloth: could not separate the text weights of `{model_name}` "
                     f"({text_only_error}). Keeping the full checkpoint and its own config, "
@@ -4817,32 +4844,25 @@ def merge_and_overwrite_lora(
                     f"`text_only = True` asked to skip (#969)."
                 )
             pass
-            if _text_only_key_plan is not None:
-                _kept_files = _rewrite_shards_text_only(
-                    save_directory, final_safetensors_list, _text_only_key_plan,
-                )
+            if _staged is not None:
+                _kept_files = []
+                for filename, staging_path in _staged.items():
+                    file_path = os.path.join(save_directory, filename)
+                    if staging_path is None:
+                        if os.path.exists(file_path): os.remove(file_path)
+                        continue
+                    os.replace(staging_path, file_path)
+                    _kept_files.append(filename)
+                pass
                 final_safetensors_list = renumber_safetensor_files(_kept_files, save_directory)
-                # The bug this follows from was silent, so prove the drop landed instead of
-                # trusting it: what is on disk now must be the mapped set exactly.
-                _written = _shard_keys_on_disk(save_directory, final_safetensors_list)
-                _expected = set(_text_only_key_plan)
-                if _written != _expected:
-                    raise RuntimeError(
-                        f"Unsloth: the text_only export wrote {len(_written)} tensor(s) but "
-                        f"its config describes {len(_expected)}. Missing: "
-                        f"{sorted(_expected - _written)[:4]}. Unexpected: "
-                        f"{sorted(_written - _expected)[:4]}. The shards in "
-                        f"`{save_directory}` have already been rewritten, so delete it and "
-                        f"merge again rather than loading it. Please file a bug report!"
-                    )
                 _write_text_only_index(save_directory, final_safetensors_list)
                 _export_text_only_config(save_directory, config, _text_only_architecture)
                 # Step 7 uploads by name, and the names just changed.
                 safetensors_list = final_safetensors_list
                 print(
                     f"Unsloth: text_only export dropped "
-                    f"{len(_text_only_before) - len(_written)} vision/audio "
-                    f"tensor(s) and kept {len(_written)} as {_text_only_architecture}."
+                    f"{len(_text_only_before) - len(_text_only_key_plan)} vision/audio "
+                    f"tensor(s) and kept {len(_text_only_key_plan)} as {_text_only_architecture}."
                 )
                 if push_to_hub: upload_items("config.json")
             pass
