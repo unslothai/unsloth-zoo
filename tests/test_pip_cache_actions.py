@@ -398,7 +398,11 @@ def test_no_cache_save_reaches_a_pull_request_ref():
 # sit, but any step there satisfies it, including a deliberate no-op. A save with no
 # entry fails, which is the point -- adding one is a decision.
 _EXPECTED_PRODUCER = {
-    ("gemma4-audio-probe.yml", "probe", "~/.cache/huggingface"): "probe",
+    # `hf-cache`, not `~/.cache/huggingface`. The default home is where
+    # `huggingface_hub` also writes the token, so caching it persisted a credential
+    # store; the workflow now points HF_HOME at a directory it owns and caches that.
+    # The producer is unchanged: the probe step is still what fills it.
+    ("gemma4-audio-probe.yml", "probe", "hf-cache"): "probe",
 }
 
 
