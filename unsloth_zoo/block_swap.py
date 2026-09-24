@@ -93,7 +93,7 @@ class _Block:
         """
         if self.resident:
             return
-        self.stream.wait_stream(torch.cuda.current_stream())
+        self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
         with torch.cuda.stream(self.stream):
             for dst, h in zip(slot, self.host):
                 dst.copy_(h, non_blocking = True)
@@ -104,7 +104,7 @@ class _Block:
         self.resident = True
 
     def wait(self):
-        torch.cuda.current_stream().wait_event(self.event)
+        torch.cuda.current_stream(self.stream.device).wait_event(self.event)
 
     def nbytes(self):
         return sum(h.numel() * h.element_size() for h in self.host)
@@ -114,12 +114,16 @@ class BlockSwap:
     """Install on a decoder-layer list; the tail `n` of them live on the host."""
 
     def __init__(self, layers, n, prefetch_depth = 2):
+        # Fully initialize state up front so a disabled swap (n <= 0) can still
+        # be managed through reset()/pool_bytes()/signatures() without blowing up.
         self.blocks, self.handles = [], []
+        self.depth = max(1, prefetch_depth)
+        self.streams = {}
+        self.free = {}
+        self.start = len(layers)
         if n <= 0:
             return
         n = min(n, len(layers))
-        self.depth = max(1, prefetch_depth)
-        self.streams = {}
         self.start = len(layers) - n
         self.blocks = [_Block(l, self.streams) for l in layers[self.start:]]
 
@@ -131,12 +135,15 @@ class BlockSwap:
         # depth + 1 slots per shape signature is the most that can be live at
         # once: the block being consumed plus the ones in flight. Layers are not
         # all alike -- Unsloth's dynamic 4-bit quants leave some blocks
-        # unquantized -- so each distinct signature gets its own pool.
-        self.free = {}
-        for sig in {b.sig for b in self.blocks}:
+        # unquantized -- so each distinct signature gets its own pool. Cap by the
+        # number of blocks with that signature: a signature with fewer than
+        # depth + 1 blocks can never have more than that many slots live, and
+        # over-allocating just holds extra device copies for nothing.
+        sigs = [b.sig for b in self.blocks]
+        for sig in set(sigs):
             self.free[sig] = [
                 [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
-                for _ in range(self.depth + 1)
+                for _ in range(min(self.depth + 1, sigs.count(sig)))
             ]
 
         for b in self.blocks:
