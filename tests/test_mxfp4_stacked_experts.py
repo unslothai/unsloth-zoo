@@ -700,8 +700,9 @@ def test_merged_16bit_rewrite_keeps_an_adapter_merged_in_memory(tmp_path):
 
 
 def test_merged_16bit_rewrite_computes_each_stacks_lora_per_shard(tmp_path, monkeypatch):
-    """The stacks' LoRA deltas are built as the shards that need them are rewritten, not all
-    up front (a real MoE's fp32 deltas do not fit in memory at once)."""
+    """The stacks' LoRA deltas are built one expert at a time from the low-rank factors as the
+    shards are rewritten: a real MoE's whole-stack fp32 delta (79 GB for one Kimi-K3 gate_up
+    stack) is never materialised, and each expert equals PEFT's get_delta_weight slice."""
     peft = pytest.importorskip("peft")
     import unsloth_zoo.saving_utils as saving
 
@@ -728,6 +729,10 @@ def test_merged_16bit_rewrite_computes_each_stacks_lora_per_shard(tmp_path, monk
         wrapper = model.base_model.model.layers[layer].experts
         real = wrapper.get_delta_weight
 
+        for e in range(E):
+            want = real("default").detach().float()[e]
+            assert torch.allclose(saving._one_expert_lora_delta(wrapper, "default", e), want, atol = 1e-6)
+
         def delta(adapter, real = real, layer = layer):
             events.append(("delta", layer))
             return real(adapter)
@@ -740,7 +745,7 @@ def test_merged_16bit_rewrite_computes_each_stacks_lora_per_shard(tmp_path, monk
             prefix = prefix,
         )
     saving._dequantize_compressed_mxfp4_shards(str(tmp_path), ["l0.safetensors", "l1.safetensors"], {}, model)
-    assert events == [("delta", 0), ("write", "l0.safetensors"), ("delta", 1), ("write", "l1.safetensors")]
+    assert events == [("write", "l0.safetensors"), ("write", "l1.safetensors")]
 
 
 def test_a_full_save_describes_linears_a_merge_made_dense(tmp_path):

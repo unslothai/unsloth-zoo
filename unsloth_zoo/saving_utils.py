@@ -3886,17 +3886,54 @@ def _stack_parameter(proj):
 pass
 
 
-def _stack_lora_delta(loras, parameter):
-    """The summed LoRA delta ``(E, in, out)`` of one stack parameter, in fp32 on the CPU (it is
-    built on the adapters' device, one parameter at a time)."""
+def _one_expert_lora_delta(holder, adapter, index):
+    """``get_delta_weight(adapter)[index]`` of a PEFT ParamWrapper over an expert stack, in fp32,
+    built from that expert's slice of the low-rank factors: the full ``(E, in, out)`` delta of a
+    real MoE (79 GB in fp32 for one Kimi-K3 gate_up stack) is never materialised."""
+    num = int(getattr(holder, "num_experts", 1) or 1)
+    if num <= 1:
+        return holder.get_delta_weight(adapter).detach().float()[index]
+    # In the factors' own dtype, as get_delta_weight computes it, then fp32.
+    weight_A = holder.lora_A[adapter].weight.detach()
+    weight_B = holder.lora_B[adapter].weight.detach()
+    # PEFT's layout: lora_A (experts, rank, in), lora_B (out, rank, experts).
+    weight_A = weight_A.reshape(num, -1, weight_A.shape[-1])[index]
+    grouped = False
+    from .temporary_patches.moe_utils import _cast_delta_weight_like_param
+    try:
+        from .temporary_patches.moe_utils import (
+            LORA_B_LAYOUT_GROUPED_BY_EXPERT, _legacy_lora_b_layout_requested, moe_lora_b_layout_for_wrapper,
+        )
+        grouped = _legacy_lora_b_layout_requested() and (
+            moe_lora_b_layout_for_wrapper(holder, adapter) == LORA_B_LAYOUT_GROUPED_BY_EXPERT
+        )
+    except Exception:
+        pass
+    if grouped:
+        # The legacy (out, experts, rank) packing the zoo's get_delta_weight patch reads.
+        weight_B = weight_B.reshape(weight_B.shape[0], num, -1)[:, index, :]
+    else:
+        weight_B = weight_B.reshape(weight_B.shape[0], -1, num)[:, :, index]
+    if getattr(holder, "_did_swap_in_out_features", False):
+        delta = torch.einsum("o r, r i -> o i", weight_B, weight_A)
+    else:
+        delta = torch.einsum("o r, r i -> i o", weight_B, weight_A)
+    # get_delta_weight's own tail (the parameter's dtype, unless it is a low-precision one).
+    return _cast_delta_weight_like_param(delta * holder.scaling[adapter], holder.get_param()).float()
+pass
+
+
+def _expert_lora_delta(loras, parameter, index):
+    """The summed LoRA delta of one expert of one stack parameter, as ``get_delta_weight``
+    would give it for that expert, or None when no adapter covers the parameter."""
     total = None
     for holder, name, adapters in loras:
         if name != parameter:
             continue
         for adapter in adapters:
-            delta = holder.get_delta_weight(adapter).detach().float()
+            delta = _one_expert_lora_delta(holder, adapter, index)
             total = delta if total is None else total + delta
-    return None if total is None else total.cpu()
+    return total
 pass
 
 
@@ -4020,11 +4057,6 @@ def _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype
         keys = list(f.keys())
     if not any(k.endswith(".weight_packed") or dropped(k) for k in keys):
         return
-    # Only the stack deltas this shard needs are kept, each built when first needed.
-    bases = [k[: -len(".weight_packed")] for k in keys if k.endswith(".weight_packed")]
-    now = {(targets[b][0], _stack_parameter(targets[b][2])) for b in bases if b in targets}
-    for stale in [k for k in deltas if k not in now]:
-        del deltas[stale]
     tensors = {}
     with safe_open(path, framework = "pt", device = "cpu") as f:
         metadata = f.metadata() or {"format": "pt"}
@@ -4045,11 +4077,13 @@ def _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype
             target = targets.get(base)
             if target is not None:
                 stack_path, index, proj = target
-                cache_key = (stack_path, _stack_parameter(proj))
+                # One expert's delta at a time; w1 and w3 share the gate_up one.
+                cache_key = (stack_path, _stack_parameter(proj), index)
                 if cache_key not in deltas:
-                    deltas[cache_key] = _stack_lora_delta(stacks[stack_path][1], cache_key[1])
+                    deltas.clear()
+                    deltas[cache_key] = _expert_lora_delta(stacks[stack_path][1], cache_key[1], index)
                 if deltas[cache_key] is not None:
-                    delta = _expert_slice(deltas[cache_key], stacks[stack_path][0], index, proj)
+                    delta = _expert_slice(deltas[cache_key][None], stacks[stack_path][0], 0, proj)
                     weight = weight + delta.to(weight.device)
             tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
     save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
