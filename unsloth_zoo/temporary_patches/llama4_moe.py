@@ -13,32 +13,9 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Llama-4 MoE (Scout, Maverick) on Unsloth's grouped expert path.
-
-`Llama4TextExperts` is not a transformers `@use_experts_implementation` class:
-its forward takes the routed input only, views it as (E, T, H) and runs one
-`torch.bmm` per projection over every expert, and `Llama4TextMoe` feeds it the
-whole batch repeated E times with the sigmoid router score multiplied into the
-INPUT of the selected expert (zero for the others). Two consequences:
-
-* every token runs through every expert (E x T compute, top_k = 1 on Scout and
-  Maverick), and
-* the 4-bit quantizer, which claims expert stacks structurally, packed the
-  stacks to uint8 which `bmm` cannot read ("shape [671088640, -1, 5120] is
-  invalid" on Scout).
-
-This patch keeps Llama-4's semantics (the score scales the expert input, not its
-output, which matters because the activation is not linear) while dispatching
-only the selected (token, expert) pairs through `forward_moe_backend`:
-
-    x_k = hidden[t] * sigmoid(logit[t, e_k])        one row per (token, k)
-    y   = experts(x_k, index = e_k, weight = 1)      grouped GEMM over the pairs
-    out = shared_expert(hidden) + sum_k y_k
-
-`Llama4TextExperts` stores gate_up_proj as (E, H, 2I) and down_proj as
-(E, I, H), which is grouped_mm's (E, in, out) layout: the class is marked
-`is_transposed = True`, the attribute transformers uses for the same layout, so
-PEFT's ParamWrapper and Unsloth's LoRA extractor agree on the in/out dims.
+"""Llama-4 MoE on Unsloth's grouped expert path. The native forward bmm's every token through every
+expert and cannot read 4-bit packed stacks; this dispatches only the selected (token, expert) pairs.
+The router score scales the expert INPUT, not its output: the activation is nonlinear, so do not move it.
 """
 import torch
 
@@ -52,7 +29,6 @@ from .moe_utils import (
 
 
 def _llama4_moe_lora_dims(wrapper):
-    """(in, out) of the wrapped stack: gate_up_proj (E, H, 2I), down_proj (E, I, H)."""
     if wrapper is None or not hasattr(wrapper, "get_base_layer"):
         return None, None
     base = wrapper.get_base_layer()
@@ -81,35 +57,27 @@ def _llama4_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts
 def Llama4TextMoe_forward(self, hidden_states):
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     router_scores, router_logits = self.router(hidden_states)
-    # router_scores is (T, E): sigmoid(logit) for the top_k experts, 0 elsewhere,
-    # so its own top_k recovers the selected experts and their scores exactly.
+    # router_scores is sigmoid(logit) on the top_k experts and 0 elsewhere, so topk recovers them.
     top_k = self.top_k
     top_k_weights, top_k_index = torch.topk(router_scores, top_k, dim = -1)
     n_tokens = hidden_states.shape[0]
-    # Llama-4 scales the input of the selected expert by its score.
     routed_in = hidden_states.unsqueeze(1) * top_k_weights.unsqueeze(-1).to(hidden_states.dtype)
     routed_in = routed_in.reshape(n_tokens * top_k, self.hidden_dim)
     ones = torch.ones(n_tokens * top_k, 1, device = hidden_states.device, dtype = router_scores.dtype)
     routed_out = self.experts(routed_in, top_k_index.reshape(-1, 1), ones)
     routed_out = routed_out.reshape(n_tokens, top_k, self.hidden_dim).sum(dim = 1)
     out = self.shared_expert(hidden_states)
-    # The model adds in place into the shared expert's output, which keeps the
-    # residual stream in the model dtype under autocast; a promoting add would
-    # turn it float32 and the next layer's grouped GEMM would see mixed dtypes.
+    # Keep the model dtype like the native in-place add; promoting to float32 breaks the next grouped GEMM.
     out = out + routed_out.to(out.dtype)
     return out, router_logits
 
 
 def patch_llama4_moe():
-    """Route Llama-4's experts through Unsloth's MoE backend (Split LoRA, 4-bit)."""
     patch_param_wrapper_for_moe()
 
     try:
         from transformers.models.llama4.modeling_llama4 import Llama4TextExperts, Llama4TextMoe
-        # The forward below reads (scores, logits) from the router. Before transformers 4.54 the
-        # router is a plain nn.Linear returning logits only and the MoE returns the transposed
-        # scores instead; leave those versions on their own forward (their experts then stay
-        # unpacked in 4-bit, since the quantizer only packs experts Unsloth routes).
+        # Before transformers 4.54 there is no Llama4Router returning (scores, logits); keep native.
         from transformers.models.llama4.modeling_llama4 import Llama4Router
     except Exception:
         return
@@ -117,12 +85,10 @@ def patch_llama4_moe():
     if getattr(Llama4TextExperts, "_unsloth_already_patched", False):
         return
 
-    # The two forwards only work together: the MoE forward hands the experts routing
-    # indices and weights, so install both or neither.
+    # The two forwards only work together: install both or neither.
     original_experts_forward = Llama4TextExperts.__dict__.get("forward")
     original_moe_forward = Llama4TextMoe.__dict__.get("forward")
     ok = patch_function(Llama4TextMoe, "forward", Llama4TextMoe_forward)
-    # Different signature from the model's forward, so force the patch.
     ok = ok and patch_function(Llama4TextExperts, "forward", get_forward_moe_backend(), force = True)
     if not ok:
         if original_moe_forward is not None:
@@ -130,10 +96,8 @@ def patch_llama4_moe():
         if original_experts_forward is not None:
             Llama4TextExperts.forward = original_experts_forward
     else:
-        # Separated LoRA on the stacks reads its dims from the module, not the
-        # (E, in, out) shape that the shared extractor would otherwise misread.
         Llama4TextExperts._unsloth_lora_extractor_fn = staticmethod(_llama4_moe_lora_extractor)
-        # The stacks are (E, in, out). transformers' own name for that layout.
+        # (E, H, 2I) / (E, I, H) is (E, in, out): transformers' is_transposed layout.
         Llama4TextExperts.is_transposed = True
         Llama4TextExperts.is_concatenated = True   # gate, up = chunk(2)
         Llama4TextExperts.has_bias = False

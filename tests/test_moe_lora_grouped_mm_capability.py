@@ -660,10 +660,7 @@ def _stub_triton_language(monkeypatch, has_make_tensor_descriptor):
 
 
 def test_the_triton_backend_is_not_offered_without_make_tensor_descriptor(monkeypatch):
-    """The grouped GEMM kernels name tl.make_tensor_descriptor, and Triton's JIT resolves every
-    attribute a kernel mentions while hashing it. Triton 3.3 (torch 2.7) has only the
-    _experimental_ name, so every launch raised AttributeError; the probe must say no there
-    and leave the native loop to run."""
+    """Triton 3.3 lacks tl.make_tensor_descriptor; the probe must say no and leave the native loop."""
     import sys, types
     for name in (
         "unsloth", "unsloth.kernels", "unsloth.kernels.moe",

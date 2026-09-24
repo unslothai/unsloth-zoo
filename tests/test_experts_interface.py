@@ -1,4 +1,3 @@
-# The "unsloth" experts implementation and the quantizer's handled check.
 import types
 
 import pytest
@@ -19,8 +18,7 @@ from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
 
 @pytest.fixture(autouse = True)
 def _restore_transformers_experts_state():
-    """These patches are process-global; put transformers back so later tests
-    in the same session see the stock dispatch."""
+    """Patches are process-global; restore transformers for later tests."""
     from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
     from transformers.modeling_utils import PreTrainedModel
     getter = PreTrainedModel.__dict__.get("get_correct_experts_implementation")
@@ -56,7 +54,6 @@ def test_registered_and_default():
     dummy = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True)
     getter = PreTrainedModel.get_correct_experts_implementation
     assert getter(dummy, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
-    # An explicit request is honoured, so a user can still pick transformers' own path.
     assert getter(dummy, "grouped_mm") == "grouped_mm"
 
 
@@ -76,10 +73,8 @@ def test_handled_via_decorated_class_and_config():
 
 
 def test_not_handled_when_forward_is_the_models_own():
-    # Llama-4 before its patch: plain forward, no decorator.
     m = _experts(None, "transformers.models.llama4.modeling_llama4")
     assert not expert_forward_is_handled(m)
-    # A compiled-cache copy of a model class is still the model's own code.
     m = _experts(None, "unsloth_compiled_module_llama4")
     assert not expert_forward_is_handled(m)
 
@@ -106,8 +101,6 @@ def test_ungated_falls_back_to_transformers(monkeypatch):
 
 
 def test_custom_gate_falls_back_and_is_not_packed(monkeypatch):
-    """DeepSeek-V4, MiniMax-M3 and others override _apply_gate with clamps or an
-    offset; the Unsloth backends would compute plain SiLU gating for them."""
     from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
     import unsloth_zoo.temporary_patches.moe_utils as moe_utils
     monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: True)
@@ -124,7 +117,6 @@ def test_custom_gate_falls_back_and_is_not_packed(monkeypatch):
         h = torch.zeros(2, 4)
         assert _unsloth_experts_dispatch(m, h, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)) is h
         assert calls == ["grouped_mm"]
-        # transformers' own default gate is not a custom gate.
         from transformers.integrations.moe import _default_apply_gate
         type(m)._apply_gate = _default_apply_gate
         assert expert_forward_is_handled(m)
@@ -136,8 +128,6 @@ def test_custom_gate_falls_back_and_is_not_packed(monkeypatch):
 
 
 def test_expert_parallel_keeps_transformers_default():
-    """RouterParallel sends non-local slots to a num_experts sentinel that only
-    transformers' implementations mask."""
     from transformers.modeling_utils import PreTrainedModel
     patch_experts_interface()
     getter = PreTrainedModel.get_correct_experts_implementation
@@ -151,13 +141,10 @@ def test_expert_parallel_keeps_transformers_default():
         config = types.SimpleNamespace(distributed_config = types.SimpleNamespace(enable_expert_parallel = False)),
     )
     assert getter(no_ep, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
-    # An explicit request cannot bring the sentinel-unaware path back under expert parallelism.
     assert getter(ep, UNSLOTH_EXPERTS_IMPLEMENTATION) == "grouped_mm"
 
 
 def test_fallback_uses_the_eager_forward_without_grouped_mm(monkeypatch):
-    """Without torch._grouped_mm support, transformers' grouped_mm would fail on the missing
-    operator; an ungated module then runs its own wrapped eager forward."""
     import unsloth_zoo.temporary_patches.moe_utils as moe_utils
     monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: False)
     calls = []
@@ -194,8 +181,7 @@ def test_every_transformers_custom_gate_class_is_detected():
 
 
 def test_fp8_experts_registry_resolves_the_unsloth_default(monkeypatch):
-    # The FP8Experts swap keeps config._experts_implementation, which Unsloth defaults to
-    # "unsloth"; transformers' FP8 registry must resolve it instead of raising KeyError.
+    # The FP8Experts swap keeps the "unsloth" key; the FP8 registry must not KeyError on it.
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from unsloth_zoo.temporary_patches import moe_utils_fp8
 
@@ -208,8 +194,6 @@ def test_fp8_experts_registry_resolves_the_unsloth_default(monkeypatch):
 
 
 def test_a_class_marked_for_its_own_gate_counts_as_handled():
-    # The bnb 4-bit route marks classes whose _apply_gate every backend applies; those are
-    # not custom-gate fallbacks.
     pytest.importorskip("transformers.integrations.moe")
     from unsloth_zoo.temporary_patches.moe_experts_interface import _has_custom_gate
 
@@ -223,8 +207,6 @@ def test_a_class_marked_for_its_own_gate_counts_as_handled():
 
 
 def test_bnb_handled_check_defers_to_the_generic_route(monkeypatch):
-    # With the generic bnb 4-bit route present, a class it takes over counts as handled;
-    # without one, a user-forced implementation stays unpacked as before.
     from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as mb
 
     m = _experts(None, "transformers.models.x.modeling_x", wrapped = True, implementation = "grouped_mm")
@@ -244,8 +226,6 @@ def test_bnb_handled_check_defers_to_the_generic_route(monkeypatch):
 
 
 def test_only_the_cached_dispatcher_module_counts_as_unsloth():
-    """A custom forward living in some other module whose name merely contains `moe_utils`
-    is the model's own code, and must keep its weights unpacked."""
     from unsloth_zoo.temporary_patches.moe_experts_interface import _forward_is_unsloth
     def forward(self, hidden_states, top_k_index, top_k_weights):
         return hidden_states
@@ -258,8 +238,7 @@ def test_only_the_cached_dispatcher_module_counts_as_unsloth():
 
 
 def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
-    # DeepSeek-V4 style expert_dtype = "fp4" stores two values per int8, which the Unsloth FP8
-    # backends do not decode: neither the default nor the FP8 registry may send them there.
+    # FP4 experts (two values per int8) must reach neither the default nor the FP8 registry.
     from transformers.modeling_utils import PreTrainedModel
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from unsloth_zoo.temporary_patches import moe_utils_fp8
@@ -282,21 +261,18 @@ def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
 
     experts = Experts()
     forward = fp8.ALL_FP8_EXPERTS_FUNCTIONS.get_interface("unsloth", None)
-    # Once the FP8 backend can unpack FP4 itself (#1334), FP4 experts route to it instead.
     fp4_route = "unsloth" if hasattr(moe_utils_fp8, "_dequantize_full_expert_weights_fp4") else "eager"
     experts.config = types.SimpleNamespace(expert_dtype = "fp4")
     assert forward(experts, "h", "i", "w") == fp4_route
     experts.config = types.SimpleNamespace(expert_dtype = "fp8")
     assert forward(experts, "h", "i", "w") == "unsloth"
-    # Ungated FP8 experts (up_proj only, Nemotron-H) keep transformers' path as well.
     experts.has_gate = False
     assert forward(experts, "h", "i", "w") == "eager"
     assert calls == [fp4_route, "unsloth", "eager"]
 
 
 def test_expert_parallel_reaches_the_nested_text_model():
-    # transformers sets distributed_config on the outer config only; a composite model then
-    # builds its language model from the same text_config, whose own check runs afterwards.
+    # distributed_config is set on the outer config only; nested models share its text_config.
     from transformers import PretrainedConfig
     from transformers.modeling_utils import PreTrainedModel
     patch_experts_interface()
@@ -314,14 +290,12 @@ def test_expert_parallel_reaches_the_nested_text_model():
     assert getter(types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = outer), None) == "grouped_mm"
     assert getter(nested, None) == "grouped_mm"
     assert "unsloth" not in str(text.to_dict())
-    # An unrelated config is not affected.
     other = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = PretrainedConfig())
     assert getter(other, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
 
 
 def test_the_fp8_eager_fallback_survives_repeated_decoration():
-    # replace_with_fp8_linear decorates the shared FP8Experts class once per layer, so the
-    # fallback must reach the eager forward rather than another dispatching wrapper.
+    # FP8Experts is re-decorated per layer; the fallback must reach the eager forward.
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from transformers.integrations.moe import use_experts_implementation
     from unsloth_zoo.temporary_patches import moe_utils_fp8
@@ -345,8 +319,6 @@ def test_the_fp8_eager_fallback_survives_repeated_decoration():
 
 
 def test_a_runtime_switch_is_refused_once_experts_are_packed_4bit():
-    """set_experts_implementation("grouped_mm") after a 4-bit load would hand transformers'
-    grouped GEMM the packed bytes; the switch is refused instead."""
     from transformers.modeling_utils import PreTrainedModel
 
     class Params4bit(nn.Parameter):  # stands in for bitsandbytes' class, matched by name
@@ -369,8 +341,6 @@ def test_a_runtime_switch_is_refused_once_experts_are_packed_4bit():
 
 
 def test_expert_parallel_fp8_experts_keep_transformers_path(monkeypatch):
-    # Under expert parallelism the routing carries a num_experts sentinel that only transformers'
-    # implementations mask; the FP8 registry must not send those experts to the Unsloth backend.
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from unsloth_zoo.temporary_patches import moe_utils_fp8
 
@@ -399,8 +369,6 @@ def test_expert_parallel_fp8_experts_keep_transformers_path(monkeypatch):
 
 
 def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypatch):
-    """Plain floating point stacks with nothing stashed need nothing from Unsloth's dispatcher:
-    they run transformers' grouped_mm, as every decorated class did before the "unsloth" default."""
     import unsloth_zoo.temporary_patches.moe_experts_interface as MEI
     import unsloth_zoo.temporary_patches.moe_utils as moe_utils
     calls = []
@@ -412,21 +380,18 @@ def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypat
     assert unsloth_experts_forward(m, h, i, w) is h
     assert calls == ["grouped_mm"]
 
-    # Without torch._grouped_mm on this device (pre-Hopper, CPU) the dispatcher's fallback runs.
     calls.clear()
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", False)
     unsloth_experts_forward(m, h, i, w)
     assert calls == ["unsloth"]
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", True)
 
-    # A stashed expert LoRA is only applied by Unsloth's dispatcher.
     calls.clear()
     m._unsloth_lora_gate_up_proj = ("A", "B", 1.0)
     unsloth_experts_forward(m, h, i, w)
     assert calls == ["unsloth"]
     del m._unsloth_lora_gate_up_proj
 
-    # Packed or non floating point stacks (a Parameter subclass such as Params4bit, uint8 storage).
     class Packed(nn.Parameter):
         pass
     calls.clear()
@@ -441,9 +406,7 @@ def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypat
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "grouped_mm experts forward on CUDA")
 def test_dense_experts_stay_inside_a_fullgraph_compiled_block():
-    """The compiler rewrites a MoE block's forward as fullgraph = True. A graph break inside the
-    experts call (the torch.compiler.disable'd dispatcher) sends the whole block back to eager,
-    which cost about 40% of decode speed on Granite-MoE and OLMoE in 16-bit."""
+    """A graph break in the experts call would send the fullgraph-compiled MoE block back to eager."""
     olmoe = pytest.importorskip("transformers.models.olmoe.modeling_olmoe")
     from transformers.models.olmoe.configuration_olmoe import OlmoeConfig
     patch_experts_interface()
@@ -465,10 +428,7 @@ def test_dense_experts_stay_inside_a_fullgraph_compiled_block():
 
 
 def test_nested_recheck_of_unsloth_does_not_reach_a_fixed_list_validator(monkeypatch):
-    """The outer model writes "unsloth" to the config and each nested model asks again with
-    that value. transformers 5.0 to 5.6 validates against a fixed list of names, so
-    handing it "unsloth" raised "Specified experts_implementation="unsloth" is not supported"
-    and every MoE load failed, 16-bit included."""
+    """transformers 5.0 to 5.6 validates nested re-checks against a fixed list; "unsloth" broke every MoE load."""
     from transformers.modeling_utils import PreTrainedModel
 
     def fixed_list_original(self, requested_experts):

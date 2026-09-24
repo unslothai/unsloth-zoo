@@ -13,28 +13,9 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Route every transformers `@use_experts_implementation` experts module through
-Unsloth's MoE forward, and tell the 4-bit quantizer which experts it may pack.
-
-transformers 5 dispatches the experts forward of every decorated experts class
-(Inkling, Qwen3-MoE, Mixtral, Gemma-4, ...) through `ALL_EXPERTS_FUNCTIONS`,
-keyed by `config._experts_implementation`, defaulting to its own "grouped_mm".
-Unsloth used to patch the forward of a fixed list of classes by name, while the
-4-bit quantizer claimed experts structurally (any module with 3-D gate_up_proj
-and down_proj Parameters). A class on the second list but not the first, such
-as InklingExperts, had its expert stacks packed to uint8 and then handed to
-transformers' own grouped GEMM, which raised
-"Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Byte".
-
-Two things fix that for every architecture at once:
-
-* an "unsloth" experts implementation registered with transformers and made
-  the default, so any decorated experts class takes Unsloth's grouped path,
-  with the class-name patches kept for transformers 4.x and for classes that
-  are not decorated;
-* `expert_forward_is_handled`, which the quantizer consults before packing a
-  module: only experts whose forward is Unsloth's are quantized, everything
-  else stays in the checkpoint dtype and trains through its own forward.
+"""Register an "unsloth" experts implementation as transformers' default, and tell the 4-bit
+quantizer which experts it may pack: only those whose forward is Unsloth's, since any other forward
+matmuls the packed bytes ("Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Byte").
 """
 import weakref
 
@@ -55,7 +36,6 @@ __all__ = [
 
 
 def _experts_interface():
-    """transformers' registry, or None below transformers 5."""
     if "experts_interface" not in _LAZY:
         try:
             from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
@@ -66,33 +46,19 @@ def _experts_interface():
 
 
 def _forward_is_unsloth(forward) -> bool:
-    """True when `forward` is one of Unsloth's expert forwards: a function from
-    unsloth_zoo (the per-class patches and the dispatcher), or the copy of the
-    dispatcher that lives in unsloth_compiled_cache as `unsloth_cached_moe_utils`.
-
-    A model class rewritten into `unsloth_compiled_module_<model>` keeps the
-    model's own forward, so the compiled-cache module name alone does not count."""
+    """True for Unsloth's expert forwards; `unsloth_compiled_module_*` classes keep the model's own."""
     fn = getattr(forward, "__func__", forward)
     if getattr(fn, "_unsloth_moe_forward", False):
         return True
     module = getattr(fn, "__module__", "") or ""
-    # The compiled cache copy loads as `unsloth_cached_moe_utils`, or as the bare `moe_utils`
-    # a generated module imports; any other name that merely contains it is someone's code.
+    # Exact names only: anything that merely contains `moe_utils` is someone else's code.
     if module.startswith("unsloth_zoo.") or module in ("unsloth_cached_moe_utils", "moe_utils"):
         return True
     return getattr(fn, "__name__", "") == "forward_moe_backend"
 
 
 def expert_forward_is_handled(module: nn.Module) -> bool:
-    """Whether this experts module's forward will read its weights the way
-    Unsloth's grouped path does, so that packing them to 4-bit is safe.
-
-    True for a class whose forward Unsloth patched by name (transformers 4.x and
-    the explicit patches), and for a decorated class whose config dispatches to
-    the "unsloth" implementation. False for anything else: a module whose
-    forward is the model's own code (Llama-4's per-expert bmm, an ungated
-    up-projection only module, a user-forced transformers implementation) must
-    keep its weights in a dtype that forward understands."""
+    """Whether the forward is Unsloth's, so packing the experts to 4-bit is safe."""
     cls = type(module)
     forward = getattr(cls, "forward", None)
     if forward is None:
@@ -101,7 +67,6 @@ def expert_forward_is_handled(module: nn.Module) -> bool:
         return True
     if not hasattr(forward, "__wrapped__"):
         return False
-    # Decorated by transformers: the implementation name on the config decides.
     # A class unsloth_experts_forward hands back to transformers is not handled.
     if getattr(module, "has_gate", True) is False or _has_custom_gate(module):
         return False
@@ -110,8 +75,7 @@ def expert_forward_is_handled(module: nn.Module) -> bool:
     return implementation == UNSLOTH_EXPERTS_IMPLEMENTATION
 
 
-# Resolved once: these run on every experts forward, where a function-level import
-# costs about a microsecond per MoE layer.
+# Resolved once: a function-level import on every experts forward is measurably slow.
 _LAZY = {}
 
 
@@ -134,25 +98,20 @@ def _moe_utils_module():
 
 
 def _has_custom_gate(module) -> bool:
-    """True when the experts class overrides transformers' default `_apply_gate`.
-
-    DeepSeek-V4, GLM-5-Next, HY-V4, MiniMax-M3 and others clamp or offset gate and
-    up; Unsloth's backends implement SiLU (or `act_fn`) and gpt-oss by name only."""
+    """True when the class overrides `_apply_gate` (clamped / offset SwiGLU the backends lack)."""
     _default_apply_gate = _default_apply_gate_or_none()
     if _default_apply_gate is None:
         return False
     gate = getattr(type(module), "_apply_gate", None)
     if gate is None or gate is _default_apply_gate:
         return False
-    # A class the bnb 4-bit route marked: every backend applies its own _apply_gate.
     if getattr(type(module), "_unsloth_own_apply_gate", False):
         return False
     return "GptOss" not in type(module).__name__
 
 
 def _packs_fp4_experts(model) -> bool:
-    """A config that stores experts as FP4 (``expert_dtype = "fp4"``, DeepSeek-V4): the FP8
-    experts module holds them as packed int8, which only transformers' dispatchers decode."""
+    """FP4 experts (DeepSeek-V4) are packed int8 only transformers' dispatchers decode."""
     config = getattr(model, "config", None)
     configs = [config]
     try:
@@ -166,8 +125,6 @@ _EXPERT_STACK_NAMES = ("gate_up_proj", "down_proj", "gate_proj", "up_proj")
 
 
 def _holds_packed_4bit_experts(model) -> bool:
-    """Expert stacks already packed as bitsandbytes 4-bit, which only Unsloth's dispatcher
-    decodes; transformers' implementations would multiply the packed bytes."""
     try:
         for module in model.modules():
             for name in _EXPERT_STACK_NAMES:
@@ -179,9 +136,7 @@ def _holds_packed_4bit_experts(model) -> bool:
     return False
 
 
-# ids of sub-configs (text_config, ...) of a model loaded with expert parallelism: transformers
-# sets distributed_config on the outer config only, and a composite model builds its language
-# model from the same text_config object. Kept off the configs so it is never serialized.
+# transformers sets distributed_config on the outer config only; ids kept here so nothing is serialized.
 _EXPERT_PARALLEL_SUBCONFIGS = set()
 
 
@@ -199,9 +154,7 @@ def _mark_subconfigs_expert_parallel(config) -> None:
 
 
 def _expert_parallel_requested(model) -> bool:
-    """Expert parallelism routes non-local slots to a `num_experts` sentinel that
-    only transformers' own implementations mask. The outer model's check runs
-    before its nested models are built, so it marks their sub-configs too."""
+    """Expert-parallel sentinels are masked only by transformers; marks sub-configs for nested models."""
     config = getattr(model, "config", None)
     distributed = getattr(config, "distributed_config", None)
     if bool(getattr(distributed, "enable_expert_parallel", False)):
@@ -210,20 +163,14 @@ def _expert_parallel_requested(model) -> bool:
     return config is not None and id(config) in _EXPERT_PARALLEL_SUBCONFIGS
 
 
-# transformers' own "grouped_mm" experts forward, the default this implementation replaces.
-# Resolved once in patch_experts_interface so the dense route below is a plain call Dynamo traces.
+# Resolved once in patch_experts_interface so the dense route is a plain call Dynamo traces.
 _TRANSFORMERS_GROUPED_MM = None
 
 _DENSE_STACK_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 def _dense_experts_without_expert_lora(module) -> bool:
-    """True when every expert stack is a plain floating point Parameter and no
-    Unsloth expert LoRA is stashed on the module: nothing here needs Unsloth's
-    dispatcher, so transformers' grouped_mm (what these classes ran before the
-    "unsloth" default existed) computes the same thing and stays inside a compiled
-    MoE block. Packed 4-bit stacks are Params4bit, a stashed LoRA sits under
-    `_unsloth_lora_<name>` (moe_utils.moe_lora_stash_name); both keep the dispatcher."""
+    """True when all stacks are plain float Parameters with no stashed expert LoRA (moe_lora_stash_name)."""
     params = module._parameters
     state = module.__dict__
     found = False
@@ -233,8 +180,6 @@ def _dense_experts_without_expert_lora(module) -> bool:
             continue
         if type(param) is not nn.Parameter or param.dtype not in _DENSE_STACK_DTYPES:
             return False
-        # The stash is a plain attribute: read the instance dict, not nn.Module.__getattr__,
-        # whose miss costs about 0.7 us on every dense experts forward.
         if state.get("_unsloth_lora_" + name) is not None:
             return False
         found = True
@@ -247,9 +192,7 @@ def unsloth_experts_forward(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """The "unsloth" experts implementation. Dense stacks with no expert LoRA take
-    transformers' grouped_mm, which a compiled MoE block inlines as before; packed
-    stacks and expert LoRA take Unsloth's dispatcher, which is kept out of Dynamo."""
+    """Dense stacks without expert LoRA take transformers' grouped_mm, which a compiled block inlines."""
     if (
         _TRANSFORMERS_GROUPED_MM is not None
         and _dense_experts_without_expert_lora(self)
@@ -260,9 +203,7 @@ def unsloth_experts_forward(
 
 
 def _grouped_mm_supported() -> bool:
-    """torch._grouped_mm works on this device (not pre-Hopper, CPU or an older torch); without
-    it the dispatcher's own fallback runs. Reads the cached probe first, so a compiled MoE
-    block sees a constant."""
+    """Reads the cached probe first, so a compiled MoE block sees a constant."""
     moe_utils = _moe_utils_module()
     supported = moe_utils._TORCH_GROUPED_MM_SUPPORTED
     if supported is None:
@@ -270,10 +211,7 @@ def _grouped_mm_supported() -> bool:
     return bool(supported)
 
 
-# Kept out of Dynamo like the per-model MoE block patches: a compiled MoE block
-# that inlined the dispatch (dequantization, permutation, grouped GEMM) had
-# AOT autograd save every dequantized expert stack for backward, 13 GB a layer
-# on Inkling-Small, and ran out of memory on the first forward.
+# Kept out of Dynamo: inlined, AOT autograd saves every dequantized expert stack for backward (OOM).
 @torch.compiler.disable
 def _unsloth_experts_dispatch(
     self: nn.Module,
@@ -281,17 +219,11 @@ def _unsloth_experts_dispatch(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Unsloth's backend dispatcher (bnb 4-bit, FP8, grouped_mm, Triton, or the
-    eager loop), for any decorated experts class. An ungated module (up_proj only)
-    is not a shape the grouped path knows, and a class with its own `_apply_gate`
-    (clamped or offset SwiGLU) computes an activation the backends do not
-    reproduce, so both take transformers' own implementation."""
+    """Unsloth's backend dispatcher; ungated and custom-gate classes take transformers' own path."""
     if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
         if fallback is not None:
-            # transformers' grouped_mm needs the same torch._grouped_mm support Unsloth's
-            # backend selection checks; without it take the class's own eager forward.
             if not _moe_utils_module()._check_torch_grouped_mm_supported():
                 fallback = None
         if fallback is None:
@@ -301,10 +233,9 @@ def _unsloth_experts_dispatch(
 
 
 def patch_experts_interface():
-    """Register the implementation and make it transformers' default choice."""
     interface = _experts_interface()
     if interface is None:
-        return  # transformers 4.x: the class-name patches carry the MoE path
+        return
     try:
         from transformers.modeling_utils import PreTrainedModel
     except Exception as e:
@@ -324,12 +255,9 @@ def patch_experts_interface():
         return
 
     def get_correct_experts_implementation(self, requested_experts):
-        # Only the default is ours. A user who asked for a specific implementation
-        # keeps it, and the quantizer then leaves those experts unpacked.
+        # Only the default is ours; an explicit request is honoured and its experts stay unpacked.
         if _expert_parallel_requested(self):
             if requested_experts == UNSLOTH_EXPERTS_IMPLEMENTATION:
-                # Expert parallel routing emits `num_experts` sentinels that only
-                # transformers' own implementations mask.
                 logger.warning(
                     "Unsloth: the 'unsloth' experts implementation does not support expert "
                     "parallelism; using transformers' default instead."
@@ -339,13 +267,9 @@ def patch_experts_interface():
         if requested_experts is None and not _packs_fp4_experts(self):
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         if requested_experts == UNSLOTH_EXPERTS_IMPLEMENTATION:
-            # Nested models re-check the value their outer model wrote to the config.
-            # transformers 5.0 to 5.6 validates against a fixed list of names rather
-            # than the registry, so it would reject a registered "unsloth" there.
+            # transformers 5.0 to 5.6 validates nested re-checks against a fixed list, not the registry.
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         if requested_experts not in (None, UNSLOTH_EXPERTS_IMPLEMENTATION) and _holds_packed_4bit_experts(self):
-            # A runtime switch after a 4-bit load: the experts are already packed, and the
-            # quantizer only leaves them unpacked for an implementation chosen at load time.
             raise RuntimeError(
                 f"Unsloth: cannot switch the experts implementation to {requested_experts!r} "
                 "after the experts were loaded in 4-bit; only the 'unsloth' implementation "

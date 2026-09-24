@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Step-3.7-Flash (transformers step3p7) routed experts through Unsloth's MoE backend.
-
-Step3p7Experts runs its own per-expert Python loop. Under 4-bit QLoRA that loop matmuls the
-packed bnb Params4bit ("size mismatch, got input (N), mat (N x H), vec (1)"), and in 16-bit it
-runs every expert one at a time. patch_step3p7_moe routes the class through forward_moe_backend
-(dequantize + grouped_mm, expert LoRA folded in) and keeps the class's own clamped swiglu gate,
-which Step-3.7 uses on the routed experts of its last two layers (swiglu_limits).
-"""
+"""Step-3.7-Flash (transformers step3p7) routed experts through Unsloth's MoE backend."""
 import os
 
 import pytest
@@ -37,7 +30,6 @@ def _experts(limit, seed = 0, scale = 1.5):
     module = modeling.Step3p7Experts(_config(), swiglu_limit = limit)
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
-        # Large enough that a limit of 1.0 clamps many gate and up entries.
         module.gate_up_proj.copy_(torch.randn(E, 2 * I, H, generator = g) * scale)
         module.down_proj.copy_(torch.randn(E, H, I, generator = g) * 0.05)
     return module
@@ -52,7 +44,6 @@ def _routing(n_tokens, device, seed = 1):
 
 
 def _reference(module, gate_up, down, hidden, top_k_index, top_k_weights):
-    """transformers' Step3p7Experts.forward loop, on explicit weights."""
     final = torch.zeros_like(hidden)
     mask = F.one_hot(top_k_index, num_classes = E).permute(2, 1, 0)
     for expert_idx in range(E):
@@ -66,8 +57,7 @@ def _reference(module, gate_up, down, hidden, top_k_index, top_k_weights):
 
 
 def test_the_reference_is_transformers_own_loop():
-    # Guards the transcription above against transformers' own loop, stashed by patch_function
-    # when the class is already patched in this process.
+    # Guards the transcription above against transformers' own loop.
     klass = modeling.Step3p7Experts
     candidates = [klass.forward] + [v for v in vars(klass).values() if callable(v)]
     originals = [f for f in candidates if getattr(f, "__qualname__", "") == "Step3p7Experts.forward"]
@@ -125,7 +115,6 @@ def test_every_backend_matches_the_native_loop(backend, limit, monkeypatch):
     out = module(hidden, top_k_index, top_k_weights)
     torch.testing.assert_close(out.float(), expected.float(), rtol = 2e-2, atol = 2e-2)
     if limit is not None:
-        # The clamp is really exercised: dropping it changes the answer.
         unclamped = _experts(None).to("cuda", torch.bfloat16)
         free = _reference(unclamped, module.gate_up_proj, module.down_proj, hidden, top_k_index, top_k_weights)
         assert (free.float() - expected.float()).abs().max() > 0.1
@@ -169,13 +158,10 @@ def test_bnb4bit_experts_match_the_dequantized_native_loop():
     assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
 
 
-# ---- Step-3.7-Flash-FP8: transformers swaps Step3p7Experts for FP8Experts at load ----
-
 FB = 128  # the checkpoint's 128x128 weight blocks
 
 
 def _fp8_model(limits = (0.0, 1.0), device = "meta"):
-    """Two Step3p7SparseMoeBlocks (layer 0 unclamped, layer 1 clamped), then the FP8 quantizer's swap."""
     finegrained_fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from transformers import FineGrainedFP8Config
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import patch_fp8_experts_interface
@@ -205,14 +191,10 @@ def test_fp8_swap_keeps_the_layer_clamp_and_the_lora_aware_dispatch():
     model, config = _fp8_model()
     free, clamped = model.blocks[0].experts, model.blocks[1].experts
     assert type(free).__name__ == type(clamped).__name__ == "FP8Experts"
-    # FP8Experts reads config.swiglu_limit, which step3p7 does not have: layer 1's bound must survive.
     assert clamped.limit == 1.0 and clamped._unsloth_own_apply_gate is True
     assert not getattr(free, "_unsloth_own_apply_gate", False)
-    # step3p7 is not a @use_experts_implementation model: "eager" would run FP8Experts' own
-    # per-expert fp8_linear loop, which never reads the expert LoRA.
     assert config._experts_implementation == "grouped_mm"
 
-    # The restored gate is Step3p7Experts' (clamp after the activation), not FP8Experts' (before it).
     native = modeling.Step3p7Experts(Step3p7TextConfig(
         hidden_size = FB, moe_intermediate_size = FB, n_routed_experts = E, num_attention_heads = 2,
     ), swiglu_limit = 1.0)
@@ -222,7 +204,6 @@ def test_fp8_swap_keeps_the_layer_clamp_and_the_lora_aware_dispatch():
 
 
 def _quantize_blocks(w):
-    """(E, N, K) -> fp8 weight and (E, N/FB, K/FB) weight_scale_inv, as in the FP8 checkpoint."""
     fmax = torch.finfo(torch.float8_e4m3fn).max
     e, n, k = w.shape
     blk = w.float().reshape(e, n // FB, FB, k // FB, FB)
@@ -272,8 +253,6 @@ def test_fp8_experts_run_the_clamped_gate_through_the_unsloth_backend():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "the FP8 MoE backend needs CUDA")
 def test_stock_fp8_experts_keep_the_configured_swiglu_through_the_unsloth_backend():
-    # FP8Experts reads swiglu_alpha / swiglu_limit from the config (HY-V4, GLM-5-Next,
-    # MiniMax-M3-VL); routing it through the Unsloth FP8 backend must keep that gate.
     finegrained_fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import forward_moe_backend_fp8
 

@@ -588,7 +588,6 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
     if getattr(self, "_unsloth_own_apply_gate", False):
-        # The experts module's own gate on [gate; up] (e.g. Step-3.7's post-activation clamp).
         inter = self._apply_gate(mm1_out)
     elif "GptOssExperts" in self.__class__.__name__:
         gate = mm1_out[..., ::2]
@@ -799,8 +798,6 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
 
 
 def _fp8_experts_own_gate(module) -> bool:
-    """True when the experts class defines its own gate on [gate; up] instead of the default
-    act_fn(gate) * up that use_experts_implementation installs."""
     if not getattr(module, "has_gate", True) or "GptOss" in type(module).__name__:
         return False
     apply_gate = getattr(type(module), "_apply_gate", None)
@@ -818,9 +815,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         _gate_up_is_interleaved,
     )
 
-    # transformers' FP8Experts (and model classes like MiniMax-M3 or HY-V4) apply the config's
-    # clamped / custom SwiGLU in their own _apply_gate; every backend below must call it
-    # rather than a plain SiLU. GPT-OSS keeps its interleaved gate by name.
+    # FP8Experts / MiniMax-M3 / HY-V4 put a clamped SwiGLU in _apply_gate; a plain SiLU is wrong.
     if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
         self._unsloth_own_apply_gate = True
 
@@ -852,7 +847,6 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         if backend == "grouped_mm":
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-grouped_mm.")
             forward_fn = forward_native_grouped_mm
-        # Interleaved gate_up (GPT-OSS) has no Triton path; the eager loop implements it.
         elif backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-Triton grouped GEMM.")
             forward_fn = forward_triton_grouped_gemm
@@ -1071,19 +1065,14 @@ from .utils import logger
 
 
 def _experts_are_fp4(module) -> bool:
-    """FP8Experts built for FP4-packed expert weights (DeepSeek-V4 style) that this FP8
-    backend cannot unpack. Once the backend has its FP4 dequant (#1334), they route to it."""
+    """FP4-packed experts this backend cannot unpack until it has FP4 dequant (#1334)."""
     if getattr(getattr(module, "config", None), "expert_dtype", "fp8") != "fp4":
         return False
     return globals().get("_dequantize_full_expert_weights_fp4") is None
 
 
 def _experts_are_expert_parallel(module) -> bool:
-    """Expert parallelism routes non-local slots to a `num_experts` sentinel that only
-    transformers' own implementations mask; the FP8 backends here would index with it.
-
-    Asked on every FP8 experts forward, and a module's parallel layout is fixed at load,
-    so the answer is kept on the instance, keyed on the config it was read from."""
+    """Expert-parallel sentinel routes are masked only by transformers; cached per instance and config."""
     state = getattr(module, "__dict__", None)
     config = state.get("config") if state is not None else None
     cached = state.get("_unsloth_expert_parallel") if state is not None else None
@@ -1111,10 +1100,7 @@ def patch_fp8_experts_interface():
 
     def _dispatch_for(original):
         def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
-            # FP4-packed experts (config.expert_dtype = "fp4", two values per int8), ungated
-            # ones (has_gate = False: up_proj only, e.g. Nemotron-H) and expert-parallel ones
-            # (sentinel-masked routing) are not something the FP8 backends handle; they keep
-            # transformers' own path.
+            # FP4, ungated (Nemotron-H) and expert-parallel experts keep transformers' own path.
             if (
                 _experts_are_fp4(self)
                 or getattr(self, "has_gate", True) is False
@@ -1122,15 +1108,13 @@ def patch_fp8_experts_interface():
             ):
                 if original is not None:
                     return original(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
-                # replace_with_fp8_linear re-decorates the shared FP8Experts class for every layer,
-                # so one __wrapped__ is another dispatching wrapper; unwrap to the eager forward.
+                # FP8Experts is re-decorated per layer, so one __wrapped__ is another wrapper.
                 eager = inspect.unwrap(type(self).forward)
                 return eager(self, hidden_states, top_k_index, top_k_weights)
             return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
         return _unsloth_fp8_dispatch
 
-    # "unsloth" is the default experts implementation Unsloth registers on transformers 5, and
-    # the FP8Experts swap keeps the config's key, so it has to resolve in this registry too.
+    # The FP8Experts swap keeps the config's "unsloth" key, so it must resolve here too.
     for key in ("grouped_mm", "batched_mm", "deepgemm", "unsloth"):
         try:
             original = ALL_FP8_EXPERTS_FUNCTIONS[key] if key in ALL_FP8_EXPERTS_FUNCTIONS else None

@@ -13,9 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""transformers' FP8Experts applies the config's swiglu_alpha / swiglu_limit in its own
-_apply_gate (MiniMax-M3-VL, GLM-5-Next, HY-V4). Routing it through the Unsloth FP8 backend
-must keep that gate rather than a plain SiLU."""
+"""FP8Experts' own _apply_gate (config swiglu_alpha / swiglu_limit) must survive the Unsloth FP8 backend."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -101,8 +99,7 @@ def test_stock_fp8_experts_keep_the_configured_swiglu_through_the_unsloth_backen
     err = (out - expected).abs().max().item()
     gap = (plain - expected).abs().max().item()
     if gap <= 0.1:
-        # transformers 5.5's FP8Experts gates with plain act_fn(gate) * up; there is no configured
-        # SwiGLU to keep, so only check the backend matches it (FP8 rounding is about 0.6%).
+        # transformers 5.5's FP8Experts gate is plain act_fn(gate) * up, so only match the backend to it.
         assert err < 1e-2 * expected.abs().max().item(), (err, gap)
         return
     assert err < gap / 5, (err, gap)

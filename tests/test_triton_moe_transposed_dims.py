@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""forward_triton_grouped_gemm must tune its GEMMs for the real intermediate size
-whether the experts store gate_up as (E, 2I, H) or transposed as (E, H, 2I) (Llama-4)."""
 import pytest
 import torch
 import torch.nn as nn
@@ -45,8 +43,6 @@ def test_triton_backend_tunes_for_the_real_intermediate_size(monkeypatch, transp
 
 @pytest.mark.parametrize("name, interleaved", [("GptOssExperts", True), ("Qwen3MoeExperts", False)])
 def test_triton_backend_is_skipped_for_interleaved_gate_up(monkeypatch, name, interleaved):
-    # The Triton kernels chunk gate_up into halves with SiLU and no bias, which is not
-    # GPT-OSS's interleaved, clamped, biased activation.
     calls = []
     monkeypatch.setattr(moe_utils, "select_moe_backend", lambda: "unsloth_triton")
     monkeypatch.setattr(moe_utils, "forward_triton_grouped_gemm", lambda *a: calls.append("triton"))
@@ -83,8 +79,6 @@ def test_quantized_dispatchers_skip_triton_for_interleaved_gate_up(monkeypatch, 
 
 @pytest.mark.parametrize("declared", [True, False])
 def test_square_stacks_follow_the_declared_layout(monkeypatch, declared):
-    # Llama-4 with 2I == H stores gate_up as a square (E, H, H): the shape cannot tell the
-    # orientation, so the declared is_transposed has to pick w1.
     E, H = 4, 32
     I = H // 2
     autotune_cache = pytest.importorskip("unsloth.kernels.moe.autotune_cache")
@@ -110,8 +104,6 @@ def test_square_stacks_follow_the_declared_layout(monkeypatch, declared):
 
 
 def test_native_loop_follows_the_declared_layout_for_square_stacks():
-    # native_torch fallback: a declared is_transposed square (E, H, H) gate_up must be
-    # transposed like the Triton path does.
     E, H = 2, 8
     I = H // 2
     torch.manual_seed(0)
