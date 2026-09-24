@@ -3905,8 +3905,6 @@ def merge_and_overwrite_lora(
                     logger.info(f"Unsloth: FP8 base detected; merging onto 16bit sibling `{_sibling}`.")
                 model_name = _sibling
                 final_model_name, is_local_path, source_info, base_model_is_quantized, quant_type = determine_base_model_source(model_name, token, save_method)
-        # Repo code may only be re-run for the repo the load itself trusted (see _read_export_base_config).
-        _export_source_is_loaded_repo = model_name == getattr(model.config, "_name_or_path", None)
         # merged_16bit only, which the nf4/fp4 fallback in
         # `determine_base_model_source` never answers for, so a Hub outage can never
         # arrive here carrying a local 4bit copy.
@@ -4212,8 +4210,11 @@ def merge_and_overwrite_lora(
         # a text-only config beside VLM weights and every tensor was silently re-initialized on
         # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
         try:
+            # Repo code may only be re-run for the repo the load itself trusted, compared
+            # against the source actually read here, after every sibling / local / name remap.
             base_config = _read_export_base_config(
-                model_name, token, model, source_is_loaded_repo = _export_source_is_loaded_repo,
+                model_name, token, model,
+                source_is_loaded_repo = model_name == getattr(model.config, "_name_or_path", None),
             )
         except Exception as base_config_error:
             warnings.warn(

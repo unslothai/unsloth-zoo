@@ -201,3 +201,24 @@ def test_trust_is_not_carried_to_a_different_repo(tmp_path):
     with pytest.raises(Exception):
         S._read_export_base_config(base, None, pm, source_is_loaded_repo = False)
     assert not os.path.isdir(os.path.join(str(tmp_path), "modules", "transformers_modules", "base"))
+
+
+def test_trust_is_not_carried_to_a_substituted_source(tmp_path, monkeypatch):
+    # The load trusted `base`, but the source resolution hands back another directory (a local
+    # copy found in the working directory, a sibling): its code must not run under that approval.
+    import shutil
+    from unsloth_zoo import saving_utils as S
+    H.set_offline_cpu_env()
+    os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")
+    base, state = _write_base(tmp_path)
+    other = os.path.join(str(tmp_path), "substituted")
+    shutil.copytree(base, other)
+    real = S.determine_base_model_source
+    monkeypatch.setattr(S, "determine_base_model_source", lambda name, *a, **k: (other, *real(name, *a, **k)[1:]))
+    out = os.path.join(str(tmp_path), "merged")
+    pm = _text_only_peft(base, state, trusted = True)
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        H.run_merge(pm, base, out, save_dtype = torch.float32)
+    assert any("Could not read the base config" in str(w.message) and "substituted" in str(w.message) for w in caught)
+    assert not any(f.endswith(".py") for f in os.listdir(out))
