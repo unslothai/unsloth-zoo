@@ -3564,8 +3564,17 @@ pass
 
 
 def _copy_export_remote_code(model_name, save_directory, token, model):
-    # The code of the commit the trusted load ran. A Hub repo with no recorded commit (the in-memory
-    # config fallback) is never copied from its current head: warn instead. Returns the copied names.
+    # The code of the repo and commit the trusted load ran. Another source, or a Hub repo with no
+    # recorded commit (the in-memory config fallback), is never copied: warn instead. Returns the names.
+    if not _is_export_source_loaded_repo(model_name, model):
+        # A substituted source (sibling, local copy) whose config read failed can still leave a repo-code
+        # config in memory: its files are not the code the load approved, so none are copied.
+        warnings.warn(
+            f"Unsloth: `{model_name}` is not the repo the model was loaded from, so its repo code was not "
+            f"copied into the export. Copy the loaded repo's *.py files into `{save_directory}` before "
+            f"loading it with trust_remote_code=True."
+        )
+        return []
     commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
     if not os.path.isdir(model_name) and commit is None:
         warnings.warn(

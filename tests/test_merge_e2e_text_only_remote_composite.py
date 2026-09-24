@@ -299,3 +299,21 @@ def test_hub_code_without_a_commit_is_never_copied(monkeypatch, tmp_path):
     model._unsloth_trust_remote_code_commit = "b" * 40
     assert S._copy_export_remote_code("org/repo", out, None, model) == ["modeling_x.py"]
     assert fetched == ["b" * 40, "b" * 40]
+
+
+def test_code_of_a_substituted_source_is_never_copied(tmp_path):
+    # The load trusted `base`; the export resolved to another directory whose config read failed, so a
+    # repo-code config stayed in memory. That directory's code was never approved: nothing is copied.
+    import shutil
+    from unsloth_zoo import saving_utils as S
+    base, state = _write_base(tmp_path)
+    other = os.path.join(str(tmp_path), "substituted")
+    shutil.copytree(base, other)
+    model = torch.nn.Linear(1, 1)
+    model.config = type("C", (), {"_name_or_path": base})()
+    model._unsloth_trust_remote_code = True
+    out = str(tmp_path / "out")
+    with pytest.warns(UserWarning, match = "not the repo the model was loaded from"):
+        assert S._copy_export_remote_code(other, out, None, model) == []
+    assert not os.path.isdir(out) or not any(f.endswith(".py") for f in os.listdir(out))
+    assert "modeling_tiny_omni.py" in S._copy_export_remote_code(base, out, None, model)
