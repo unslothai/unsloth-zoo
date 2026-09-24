@@ -3563,6 +3563,24 @@ def _copy_remote_code_files(model_name, save_directory, token = None, revision =
 pass
 
 
+def _copy_export_remote_code(model_name, save_directory, token, model):
+    # The code of the commit the trusted load ran. A Hub repo with no recorded commit (the in-memory
+    # config fallback) is never copied from its current head: warn instead. Returns the copied names.
+    commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
+    if not os.path.isdir(model_name) and commit is None:
+        warnings.warn(
+            f"Unsloth: `{model_name}` was loaded without a recorded commit, so its repo code was "
+            f"not copied into the export. Copy the repo's *.py files at the revision you loaded "
+            f"into `{save_directory}` before loading it with trust_remote_code=True."
+        )
+        return []
+    copied = _copy_remote_code_files(model_name, save_directory, token = token, revision = commit)
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: copied repo code {copied} from `{model_name}` into the export.")
+    return copied
+pass
+
+
 def _text_configs(config):
     # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
     # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
@@ -4262,13 +4280,7 @@ def merge_and_overwrite_lora(
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             # config.json names the repo's own classes, so the export needs their code beside it.
-            # The code beside config.json is the code of the commit that config was read at.
-            _copied = _copy_remote_code_files(
-                model_name, save_directory, token = token,
-                revision = None if os.path.isdir(model_name) else _trusted_code_commit(model),
-            )
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.info(f"Unsloth: copied repo code {_copied} from `{model_name}` into the export.")
+            _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         # #5410: keep trained eos / sampling defaults on reload.

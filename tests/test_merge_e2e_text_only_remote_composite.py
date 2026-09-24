@@ -277,3 +277,25 @@ def test_hub_repo_code_is_pinned_to_the_loaded_commit(monkeypatch, tmp_path):
                         lambda name, file, token = None, revision = None: seen.append(revision) or str(src))
     assert S._copy_remote_code_files("org/repo", str(tmp_path / "out"), revision = commit) == ["modeling_x.py"]
     assert seen == [commit, commit]
+
+
+def test_hub_code_without_a_commit_is_never_copied(monkeypatch, tmp_path):
+    # The in-memory fallback can keep a repo-code config for a Hub repo whose load recorded no commit:
+    # nothing may then be fetched from the repo's current head into the export.
+    import huggingface_hub
+    from unsloth_zoo import saving_utils as S
+    fetched = []
+    src = tmp_path / "modeling_x.py"; src.write_text("# code")
+    monkeypatch.setattr(huggingface_hub.HfApi, "list_repo_files",
+                        lambda self, *a, **k: fetched.append(k.get("revision")) or ["modeling_x.py"])
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda *a, **k: fetched.append(k.get("revision")) or str(src))
+    model = torch.nn.Linear(1, 1)
+    model.config = type("C", (), {"_name_or_path": "org/repo"})()
+    model._unsloth_trust_remote_code = True
+    out = str(tmp_path / "out")
+    with pytest.warns(UserWarning, match = "without a recorded commit"):
+        assert S._copy_export_remote_code("org/repo", out, None, model) == []
+    assert fetched == [] and not os.path.exists(os.path.join(out, "modeling_x.py"))
+    model._unsloth_trust_remote_code_commit = "b" * 40
+    assert S._copy_export_remote_code("org/repo", out, None, model) == ["modeling_x.py"]
+    assert fetched == ["b" * 40, "b" * 40]
