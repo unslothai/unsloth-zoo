@@ -20,6 +20,7 @@ Reads the Laya checkpoint layout as is and returns the decision logits of laya's
 `DecisionModel`; prompt building and calibration stay with the `laya` package."""
 
 import json
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -41,6 +42,15 @@ def _rope_base(config, layer_type):
     else:
         fallback = config.get("global_rope_theta", 160000.0)
     return float(params.get("rope_theta", fallback))
+
+
+@partial(mx.compile, shapeless = True)
+def _gelu_gate(value, gate):
+    return nn.gelu(value) * gate
+
+
+def _gather_rows(x, rows):
+    return mx.take_along_axis(x, mx.broadcast_to(rows[:, :, None], (*rows.shape, x.shape[-1])), axis = 1)
 
 
 class _EncoderAttention(nn.Module):
@@ -71,7 +81,7 @@ class _EncoderMLP(nn.Module):
 
     def __call__(self, x):
         value, gate = mx.split(self.Wi(x), 2, axis = -1)
-        return self.Wo(nn.gelu(value) * gate)
+        return self.Wo(_gelu_gate(value, gate))
 
 
 class _EncoderLayer(nn.Module):
@@ -129,13 +139,14 @@ class _HeadAttention(nn.Module):
         self.in_proj = nn.Linear(dims, 3 * dims)
         self.out_proj = nn.Linear(dims, dims)
 
-    def __call__(self, x, mask):
-        B, L, D = x.shape
-        qkv = self.in_proj(x).reshape(B, L, 3, self.heads, -1).transpose(2, 0, 3, 1, 4)
-        out = mx.fast.scaled_dot_product_attention(
-            qkv[0], qkv[1], qkv[2], scale = qkv.shape[-1]**-0.5, mask = mask
-        )
-        return self.out_proj(out.transpose(0, 2, 1, 3).reshape(B, L, D))
+    def __call__(self, x, mask, rows = None):
+        B, _, D = x.shape
+        q, k, v = mx.split(self.in_proj(x), 3, axis = -1)
+        if rows is not None:
+            q = _gather_rows(q, rows)
+        q, k, v = (t.reshape(B, t.shape[1], self.heads, -1).transpose(0, 2, 1, 3) for t in (q, k, v))
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale = q.shape[-1]**-0.5, mask = mask)
+        return self.out_proj(out.transpose(0, 2, 1, 3).reshape(B, -1, D))
 
 
 class _HeadLayer(nn.Module):
@@ -148,8 +159,10 @@ class _HeadLayer(nn.Module):
         self.linear1 = nn.Linear(dims, 4 * dims)
         self.linear2 = nn.Linear(4 * dims, dims)
 
-    def __call__(self, x, mask):
-        x = x + self.self_attn(self.norm1(x), mask)
+    def __call__(self, x, mask, rows = None):
+        # With `rows`, keys and values still span every token; attention output and feed-forward cover only those rows.
+        attended = self.self_attn(self.norm1(x), mask, rows)
+        x = (x if rows is None else _gather_rows(x, rows)) + attended
         return x + self.linear2(nn.relu(self.linear1(self.norm2(x))))
 
 
@@ -173,10 +186,11 @@ class DecisionModel(nn.Module):
     def __call__(self, input_ids, attention_mask, marker_pos, marker_mask, qtype):
         keys = attention_mask.astype(mx.bool_)[:, None, None, :]
         h = self.encoder(input_ids, keys) + self.type_emb(qtype)[:, None, :]
-        for layer in self.head.layers:
+        layers = self.head.layers
+        for layer in layers[:-1]:
             h = layer(h, keys)
-        index = marker_pos[:, :, None]
-        x = mx.take_along_axis(h, mx.broadcast_to(index, (*index.shape[:2], h.shape[-1])), axis = 1)
+        # Only the marker rows are scored, so the last head layer answers for those rows alone.
+        x = layers[-1](h, keys, marker_pos) if layers else _gather_rows(h, marker_pos)
         for layer in self.scorer:
             x = layer(x)
         return mx.where(marker_mask, x.squeeze(-1).astype(mx.float32), -1e4)

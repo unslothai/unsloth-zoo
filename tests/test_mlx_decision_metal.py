@@ -62,8 +62,9 @@ class _Reference(torch.nn.Module):
         return logits.masked_fill(~marker_mask, -1e4)
 
 
-@pytest.fixture(scope = "module")
-def checkpoint(tmp_path_factory):
+# Laya ships two head layers; with fewer the last-layer path and its fallback change shape.
+@pytest.fixture(scope = "module", params = [2, 1, 0])
+def checkpoint(request, tmp_path_factory):
     torch.manual_seed(0)
     config = transformers.ModernBertConfig(
         vocab_size = 97,
@@ -80,14 +81,14 @@ def checkpoint(tmp_path_factory):
         },
         pad_token_id = 0,
     )
-    reference = _Reference(transformers.ModernBertModel(config), head_layers = 2).eval()
+    reference = _Reference(transformers.ModernBertModel(config), head_layers = request.param).eval()
     for p in reference.parameters():
         # Default init leaves LayerNorm at identity and biases at zero, which would hide their mapping.
         p.data.add_(0.1 * torch.randn_like(p))
     folder = tmp_path_factory.mktemp("laya")
     (folder / "encoder").mkdir()
     config.save_pretrained(folder / "encoder")
-    (folder / "rl_agent_config.json").write_text(json.dumps({"head_layers": 2}))
+    (folder / "rl_agent_config.json").write_text(json.dumps({"head_layers": request.param}))
     save_file({k: v.contiguous() for k, v in reference.state_dict().items()}, folder / "model.safetensors")
     return reference, folder
 
