@@ -3969,15 +3969,56 @@ def _stage_shards_text_only(save_directory, filenames, key_map):
 pass
 
 
-def _write_text_only_index(save_directory, filenames):
-    """Point the index at the surviving shards, or remove it when a single file is left.
+def _commit_staged_shards_text_only(save_directory, staged, config, architecture):
+    """Replace each original with its staged rewrite, then regenerate the index and config.
 
-    A stale index is not a cosmetic problem: it still lists the vision keys and the shard
-    names from before the drop, so the reload it drives fails on files that no longer exist.
+    Runs only after `_stage_shards_text_only` has verified the plan, so every step here is
+    real work: os.replace can still fail on a locked file (Windows) or a full disk partway
+    through. Any failure removes every staging path still on disk and raises, naming the
+    directory as an incomplete text_only export instead of leaving it half-rewritten and
+    trusted. Rolling back the shards already replaced is out of scope; that needs a backup
+    copy of the text weights this path does not keep.
+    """
+    kept_files = []
+    try:
+        for filename, staging_path in staged.items():
+            file_path = os.path.join(save_directory, filename)
+            if staging_path is None:
+                if os.path.exists(file_path): os.remove(file_path)
+                continue
+            os.replace(staging_path, file_path)
+            kept_files.append(filename)
+        pass
+        _write_text_only_index(save_directory, kept_files)
+        _export_text_only_config(save_directory, config, architecture)
+    except Exception as commit_error:
+        for staging_path in staged.values():
+            if staging_path is not None and os.path.exists(staging_path):
+                try:
+                    os.remove(staging_path)
+                except OSError:
+                    pass
+        raise RuntimeError(
+            f"Unsloth: the text_only export in `{save_directory}` is incomplete after a "
+            f"failure while committing the rewrite ({commit_error}). Delete the directory "
+            f"and merge again rather than loading it."
+        ) from commit_error
+    return kept_files
+pass
+
+
+def _write_text_only_index(save_directory, filenames):
+    """Rewrite the index for the kept shards, unless there was never one to keep.
+
+    Shards are not renamed by the drop, so `filenames` are the surviving shards under their
+    original names. Written whenever an index already existed or more than one shard
+    survives, and never removed: a stale index still lists the vision keys and shard names
+    from before the drop, so the reload it drives fails on files that no longer exist. A
+    genuine single-file export with no prior index is left as it is; a one-entry index
+    loads fine in transformers, so there is nothing special about the one-shard case here.
     """
     index_path = os.path.join(save_directory, "model.safetensors.index.json")
-    if len(filenames) <= 1:
-        if os.path.exists(index_path): os.remove(index_path)
+    if len(filenames) <= 1 and not os.path.exists(index_path):
         return None
     weight_map = {}
     for filename in filenames:
@@ -3986,7 +4027,7 @@ def _write_text_only_index(save_directory, filenames):
             for key in f.keys(): weight_map[key] = filename
     pass
     # Same shape and atomic write the dequant/split path uses at Step 6.
-    _mode_donor = os.path.join(save_directory, filenames[0])
+    _mode_donor = os.path.join(save_directory, filenames[0]) if filenames else None
     _export_index_atomically(
         None, index_path,
         json.dumps({"metadata" : {}, "weight_map" : weight_map}, indent = 4).encode("utf-8"),
@@ -4849,19 +4890,10 @@ def merge_and_overwrite_lora(
                 )
             pass
             if _staged is not None:
-                _kept_files = []
-                for filename, staging_path in _staged.items():
-                    file_path = os.path.join(save_directory, filename)
-                    if staging_path is None:
-                        if os.path.exists(file_path): os.remove(file_path)
-                        continue
-                    os.replace(staging_path, file_path)
-                    _kept_files.append(filename)
-                pass
-                final_safetensors_list = renumber_safetensor_files(_kept_files, save_directory)
-                _write_text_only_index(save_directory, final_safetensors_list)
-                _export_text_only_config(save_directory, config, _text_only_architecture)
-                # Step 7 uploads by name, and the names just changed.
+                final_safetensors_list = _commit_staged_shards_text_only(
+                    save_directory, _staged, config, _text_only_architecture,
+                )
+                # Kept shards are not renamed, so Step 7 uploads them under their own names.
                 safetensors_list = final_safetensors_list
                 print(
                     f"Unsloth: text_only export dropped "
