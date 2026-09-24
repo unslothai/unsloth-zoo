@@ -332,6 +332,22 @@ class Mxfp4ExpertParam(torch.nn.Parameter):
         kwargs["mxfp4_scales"] = self.mxfp4_scales.to(device, non_blocking = non_blocking)
         return Mxfp4ExpertParam(self.data.to(device, non_blocking = non_blocking), **kwargs)
 
+    def copy_(self, src, non_blocking = False):
+        # load_state_dict copies into the parameter in place. The blocks are meaningless without
+        # their scales, so take both from a packed source and refuse bare uint8 blocks.
+        if not isinstance(src, Mxfp4ExpertParam):
+            raise RuntimeError(
+                "Unsloth: cannot copy bare MXFP4 blocks into a packed expert stack, their scales "
+                "would be left stale. Load a state_dict taken from a packed model, or reload the "
+                "model with UNSLOTH_MXFP4_KEEP_PACKED=0."
+            )
+        if src.mxfp4_transposed != self.mxfp4_transposed or src.mxfp4_scales.shape != self.mxfp4_scales.shape:
+            raise RuntimeError("Unsloth: MXFP4 expert stacks with different layouts cannot be copied")
+        torch.Tensor.copy_(self, src, non_blocking = non_blocking)
+        self.mxfp4_scales = src.mxfp4_scales.to(self.device, non_blocking = non_blocking, copy = True)
+        self.mxfp4_dtype = src.mxfp4_dtype
+        return self
+
     def detach(self):
         # nn.Module._apply re-wraps a moved tensor as a Parameter when it cannot assign .data
         # (a move to or from meta), and Parameter requires detach() to keep the subtype.

@@ -12,6 +12,7 @@ CUDA everything falls back to the torch dequant and the load-time path."""
 
 import copy
 import os
+import pickle
 import subprocess
 import sys
 import textwrap
@@ -733,3 +734,33 @@ def test_a_later_load_without_a_device_map_clears_the_offload_flag(monkeypatch):
     Mxfp4HfQuantizer.validate_environment(object.__new__(Mxfp4HfQuantizer), device_map = None)
     assert mx._LOAD_OFFLOADS[0] is False
 
+
+def test_load_state_dict_carries_the_scales():
+    """state_dict() holds each packed stack as an Mxfp4ExpertParam; loading it must take the
+    scales with the blocks, and bare uint8 blocks (a safetensors round trip) must be refused."""
+    a, b = nn.Module(), nn.Module()
+    a.w, b.w = _packed(4, 64, 64, seed = 1), _packed(4, 64, 64, seed = 2)
+    assert not torch.equal(a.w.mxfp4_scales, b.w.mxfp4_scales)
+    target = b.w
+    b.load_state_dict(a.state_dict())
+    assert b.w is target and isinstance(b.w, Mxfp4ExpertParam)
+    assert torch.equal(b.w.dequantize(), a.w.dequantize())
+    assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()   # copied, not aliased
+    # A pickled state_dict (torch.save / Trainer checkpoints) keeps the scales too.
+    c = nn.Module()
+    c.w = _packed(4, 64, 64, seed = 3)
+    c.load_state_dict(pickle.loads(pickle.dumps(a.state_dict())))
+    assert torch.equal(c.w.dequantize(), a.w.dequantize())
+    with pytest.raises(RuntimeError, match = "bare MXFP4 blocks"):
+        c.load_state_dict({"w": _packed(4, 64, 64, seed = 4).data.clone()})
+    assert torch.equal(c.w.dequantize(), a.w.dequantize())
+
+
+def test_load_state_dict_of_a_gpt_oss_model_takes_the_other_models_experts():
+    a, experts_a = _tiny_gpt_oss("cpu")
+    b, experts_b = _tiny_gpt_oss("cpu")
+    experts_b.gate_up_proj = _packed(4, 128, 128, seed = 21)
+    experts_b.down_proj = _packed(4, 128, 64, seed = 22)
+    b.load_state_dict(a.state_dict())
+    for name in ("gate_up_proj", "down_proj"):
+        assert torch.equal(getattr(experts_b, name).dequantize(), getattr(experts_a, name).dequantize())
