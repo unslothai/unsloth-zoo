@@ -1666,12 +1666,7 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
 
 
 def _quantization_method_is_known(quantization_config: Any) -> bool:
-    """Whether transformers can build a quantizer for a serialized config.
-
-    Mirrors ``AutoQuantizationConfig.from_dict``: bitsandbytes flags win, then
-    ``quant_method`` is looked up in the installed mapping. Anything already
-    built, or without a method, is left to transformers to accept or refuse.
-    """
+    """Mirrors ``AutoQuantizationConfig.from_dict``; unclear cases are left to transformers."""
     if not isinstance(quantization_config, Mapping):
         return True
     if quantization_config.get("load_in_8bit") or quantization_config.get("load_in_4bit"):
@@ -1683,8 +1678,7 @@ def _quantization_method_is_known(quantization_config: Any) -> bool:
         from transformers.quantizers.auto import AUTO_QUANTIZATION_CONFIG_MAPPING
     except Exception:
         return True
-    # The value itself, as from_dict looks it up: a QuantizationMethod enum equals its key
-    # while str() of it does not.
+    # Not str(method): a QuantizationMethod enum equals its key but its str() does not.
     try:
         return method in AUTO_QUANTIZATION_CONFIG_MAPPING
     except TypeError:
@@ -1701,11 +1695,8 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     the way the loader honours them, so runtime quantisation of a full-precision
     checkpoint is sized as it will really be loaded.
 
-    ``rewritten_quantization_config`` replaces the checkpoint's serialized
-    quantization block, for a caller that rewrites it on the config it loads
-    with (Unsloth turns NVIDIA ModelOpt FP8, which transformers cannot load,
-    into the equivalent ``fp8`` block): the stored weights are then sized as
-    pre-quantized under that block.
+    ``rewritten_quantization_config`` replaces the serialized quantization block
+    (e.g. ModelOpt FP8 rewritten to ``fp8``); weights are sized as pre-quantized.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
@@ -1728,8 +1719,7 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
         if serialized_qcfg is None:
             hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
         elif runtime_qcfg is not None and not _quantization_method_is_known(serialized_qcfg):
-            # As the loader does (get_hf_quantizer): a serialized method it cannot
-            # load is ignored and the caller's config quantizes at load time.
+            # Like get_hf_quantizer: an unloadable serialized method is ignored.
             hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
             config.quantization_config = runtime_qcfg
         else:

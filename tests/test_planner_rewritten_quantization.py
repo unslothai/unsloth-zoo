@@ -2,11 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""The planner rebuilds a checkpoint's config from its name. An NVIDIA ModelOpt FP8
-checkpoint serializes `quant_method: modelopt`, which transformers cannot build a
-quantizer for, so planning failed and the load fell back to `sequential`. Unsloth
-rewrites that block into the transformers fp8 form for the load and hands the same
-form to the planner, which has to size with it."""
+"""ModelOpt FP8 checkpoints (`quant_method: modelopt`) must plan via Unsloth's fp8 rewrite."""
 
 import pytest
 
@@ -64,10 +60,8 @@ def test_unknown_methods_are_recognised():
     assert not planner._quantization_method_is_known(_MODELOPT)
     assert planner._quantization_method_is_known(_FP8_PLAN)
     assert planner._quantization_method_is_known({"load_in_4bit": True})
-    # Left to transformers: no method, or an already built config object.
     assert planner._quantization_method_is_known({"bits": 4})
     assert planner._quantization_method_is_known(object())
-    # A config that normalised quant_method to transformers' enum is still known.
     from transformers.utils.quantization_config import QuantizationMethod
     assert planner._quantization_method_is_known({**_FP8_PLAN, "quant_method": QuantizationMethod.FP8})
 
@@ -82,7 +76,6 @@ def test_a_rewritten_modelopt_checkpoint_is_sized_with_the_callers_config(tmp_pa
     assert hf_quantizer.pre_quantized
     assert not hasattr(config, "rewritten_quantization_config")
     assert config.quantization_config["quant_method"] == "fp8"
-    # The quantized Linear classes are swapped in, so the size table is the fp8 one.
     proj = model.model.layers[0].self_attn.q_proj
     assert type(proj).__name__ != "Linear"
     assert type(model.lm_head).__name__ == "Linear"
@@ -90,8 +83,6 @@ def test_a_rewritten_modelopt_checkpoint_is_sized_with_the_callers_config(tmp_pa
 
 @needs_per_tensor_fp8
 def test_a_plain_runtime_config_on_an_unknown_method_quantizes_at_load_like_transformers(tmp_path):
-    # get_hf_quantizer ignores a serialized method it cannot load and applies the caller's
-    # config with pre_quantized = False; only an explicit rewrite is sized as stored weights.
     path = _modelopt_checkpoint(tmp_path)
     _, hf_quantizer, config = planner.build_meta_model(path, quantization_config = dict(_FP8_PLAN))
     assert type(hf_quantizer).__name__ == "FineGrainedFP8HfQuantizer"
