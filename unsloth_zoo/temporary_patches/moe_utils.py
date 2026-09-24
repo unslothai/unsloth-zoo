@@ -741,8 +741,32 @@ _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 _TORCH_GROUPED_MM_SUPPORTED = None
 
 
+@torch.compiler.disable
+def _run_probe_eagerly(probe):
+    """Run a one-time hardware probe outside any Dynamo trace.
+
+    The probes below are lazy: their first call is often the first MoE forward, which
+    in a compiled model (`unsloth_compiled_cache`, e.g. Ernie4_5_MoeSparseMoeBlock) is
+    inside a torch.compile trace. There `torch._grouped_mm` runs on FakeTensors, whose
+    meta check can reject what the real kernel accepts (torch 2.14 on B200: "Float16
+    grouped_mm requires cuBLASLt grouped GEMM support"), and with Unsloth's
+    `suppress_errors` / `capture_scalar_outputs` Dynamo commits the probe's own
+    `except` branch. The cached flag then latched False for the process, so
+    select_moe_backend() fell off grouped_mm and bf16 MoE output was garbage (ERNIE-4.5
+    21B bf16: PPL 1550 vs 20.7, NaN training). `torch.compiler.disable` makes a traced
+    caller graph-break here so the probe always measures the real device; the
+    cached-flag read in front of it stays traceable, so later traces see a constant.
+    """
+    return probe()
+
+
 def _check_torch_grouped_mm_supported():
     """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
+    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
+    return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
+
+
+def _probe_torch_grouped_mm_supported():
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
@@ -784,6 +808,14 @@ _TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
 
 
 def _transposed_view_grouped_mm_is_safe():
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
+        return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    # Eager for the same reason as _check_torch_grouped_mm_supported: under a trace the
+    # comparison would run on FakeTensors.
+    return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
+
+
+def _probe_transposed_view_grouped_mm_is_safe():
     global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
