@@ -3910,16 +3910,11 @@ pass
 
 
 @torch.inference_mode()
-def _dequantize_compressed_mxfp4_shards(save_directory, filenames, lora_weights, model, output_dtype = None):
-    """Rewrite every staged shard so each MXFP4 ``weight_packed`` / ``weight_scale`` pair is the
-    exact 16-bit ``weight`` (plus the packed expert stacks' LoRA), and drop the stacks' LoRA from
-    ``lora_weights`` so nothing merges them twice. Everything that can refuse is checked before
-    the first shard is rewritten; scales stored in another shard than their packed bytes are read
-    up front, so the shards can be rewritten in any order."""
-    from .mxfp4_dequant import mxfp4_dequantize_torch
-
-    dtype = output_dtype or torch.bfloat16
-    device = _active_merge_device()
+def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
+    """Everything the merged_16bit export of a compressed-tensors MXFP4 base can refuse on,
+    checked before any shard is touched, plus what the per-shard rewrite needs. Scales stored in
+    another shard than their packed bytes are read up front, so the shards can be rewritten (and,
+    in low-disk mode, uploaded and removed) one at a time in any order."""
     stacks = _packed_expert_stacks(model)
     locations, shapes, dtypes, keys_of = {}, {}, {}, {}
     for filename in filenames:
@@ -3982,53 +3977,95 @@ def _dequantize_compressed_mxfp4_shards(save_directory, filenames, lora_weights,
         for base in packed_bases
         if locations[base + ".weight_scale"] != locations[base + ".weight_packed"]
     }
+    return dict(
+        stacks = stacks, keys_of = keys_of, shapes = shapes, packed_bases = packed_bases,
+        targets = targets, elsewhere = elsewhere, deltas = {},
+        wrappers = {wrapper for _, (_, _, paths) in stacks.items() for wrapper in paths},
+    )
+pass
+
+
+def _compressed_mxfp4_disk_view(save_directory, filenames, plan):
+    """``_disk_module_shapes`` of the export as it will be once every packed pair is its 16-bit
+    ``weight``, so the LoRA completeness check can run before the rewrite."""
+    keys, shapes = _disk_module_shapes(save_directory, filenames)
+    for base in plan["packed_bases"]:
+        for suffix in (".weight_packed", ".weight_scale", ".weight_shape"):
+            keys.discard(base + suffix)
+        keys.add(base + ".weight")
+        packed_shape = plan["shapes"][base + ".weight_packed"]
+        shapes[base] = (packed_shape[0], packed_shape[1] * 2)
+    return keys, shapes
+pass
+
+
+def _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype = None):
+    """Rewrite one staged shard so each MXFP4 ``weight_packed`` / ``weight_scale`` pair is the
+    exact 16-bit ``weight``, plus the packed expert stacks' LoRA. A shard with nothing packed is
+    left alone."""
+    from .mxfp4_dequant import mxfp4_dequantize_torch
+
+    dtype = output_dtype or torch.bfloat16
+    device = _active_merge_device()
+    stacks, targets, deltas = plan["stacks"], plan["targets"], plan["deltas"]
+    packed_bases, elsewhere = plan["packed_bases"], plan["elsewhere"]
+
     def dropped(key):
         base, _, suffix = key.rpartition(".")
         return base in packed_bases and suffix in ("weight_scale", "weight_shape")
 
-    deltas = {}
+    path = os.path.join(save_directory, filename)
+    # Read now, not at planning: a trained head may have been seeded into this shard since.
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        keys = list(f.keys())
+    if not any(k.endswith(".weight_packed") or dropped(k) for k in keys):
+        return
+    # Only the stack deltas this shard needs are kept, each built when first needed.
+    bases = [k[: -len(".weight_packed")] for k in keys if k.endswith(".weight_packed")]
+    now = {(targets[b][0], _stack_parameter(targets[b][2])) for b in bases if b in targets}
+    for stale in [k for k in deltas if k not in now]:
+        del deltas[stale]
+    tensors = {}
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        metadata = f.metadata() or {"format": "pt"}
+        for key in keys:
+            base, _, suffix = key.rpartition(".")
+            if dropped(key):
+                continue
+            if suffix != "weight_packed":
+                tensors[key] = f.get_tensor(key)
+                continue
+            packed = f.get_tensor(key)
+            scale_key = base + ".weight_scale"
+            scale = elsewhere[scale_key] if scale_key in elsewhere else f.get_tensor(scale_key)
+            out_features = packed.shape[0]
+            weight = mxfp4_dequantize_torch(
+                packed.to(device).view(out_features, -1, 16), scale.to(device), dtype = torch.float32,
+            ).reshape(out_features, -1)
+            target = targets.get(base)
+            if target is not None:
+                stack_path, index, proj = target
+                cache_key = (stack_path, _stack_parameter(proj))
+                if cache_key not in deltas:
+                    deltas[cache_key] = _stack_lora_delta(stacks[stack_path][1], cache_key[1])
+                if deltas[cache_key] is not None:
+                    delta = _expert_slice(deltas[cache_key], stacks[stack_path][0], index, proj)
+                    weight = weight + delta.to(weight.device)
+            tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+    save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+    os.replace(path + ".unsloth_tmp", path)
+pass
+
+
+def _dequantize_compressed_mxfp4_shards(save_directory, filenames, lora_weights, model, output_dtype = None):
+    """Every staged shard rewritten by ``_rewrite_compressed_mxfp4_shard``, and the stacks' LoRA
+    dropped from ``lora_weights`` so nothing merges them twice. Nothing is written if anything
+    refuses."""
+    plan = _plan_compressed_mxfp4_rewrite(save_directory, filenames, model)
     for filename in filenames:
-        keys = keys_of[filename]
-        if not any(k.endswith(".weight_packed") or dropped(k) for k in keys):
-            continue
-        # Only the stack deltas this shard needs are kept, each built when first needed.
-        bases = [k[: -len(".weight_packed")] for k in keys if k.endswith(".weight_packed")]
-        now = {(targets[b][0], _stack_parameter(targets[b][2])) for b in bases if b in targets}
-        for stale in [k for k in deltas if k not in now]:
-            del deltas[stale]
-        path = os.path.join(save_directory, filename)
-        tensors = {}
-        with safe_open(path, framework = "pt", device = "cpu") as f:
-            metadata = f.metadata() or {"format": "pt"}
-            for key in keys:
-                base, _, suffix = key.rpartition(".")
-                if dropped(key):
-                    continue
-                if suffix != "weight_packed":
-                    tensors[key] = f.get_tensor(key)
-                    continue
-                packed = f.get_tensor(key)
-                scale_key = base + ".weight_scale"
-                scale = elsewhere[scale_key] if scale_key in elsewhere else f.get_tensor(scale_key)
-                out_features = packed.shape[0]
-                weight = mxfp4_dequantize_torch(
-                    packed.to(device).view(out_features, -1, 16), scale.to(device), dtype = torch.float32,
-                ).reshape(out_features, -1)
-                target = targets.get(base)
-                if target is not None:
-                    stack_path, index, proj = target
-                    cache_key = (stack_path, _stack_parameter(proj))
-                    if cache_key not in deltas:
-                        deltas[cache_key] = _stack_lora_delta(stacks[stack_path][1], cache_key[1])
-                    if deltas[cache_key] is not None:
-                        delta = _expert_slice(deltas[cache_key], stacks[stack_path][0], index, proj)
-                        weight = weight + delta.to(weight.device)
-                tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
-        save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
-        os.replace(path + ".unsloth_tmp", path)
-    for _, (_, _, wrappers) in stacks.items():
-        for wrapper in wrappers:
-            lora_weights.pop(wrapper, None)
+        _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype)
+    for wrapper in plan["wrappers"]:
+        lora_weights.pop(wrapper, None)
 pass
 
 
@@ -4719,10 +4756,15 @@ def merge_and_overwrite_lora(
     # which clears quant_type; same value either way, the two branches are mutually exclusive.
     _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
 
+    # A compressed-tensors MXFP4 base is decoded shard by shard inside the merge loop, so the
+    # low-disk upload / remove still streams. Its checks run now, and the stacks' LoRA (folded in
+    # by that decode) leaves lora_weights so nothing merges it twice.
+    _mxfp4_rewrite = _disk_view = None
     if _ct_mxfp4_dequant:
-        _dequantize_compressed_mxfp4_shards(
-            save_directory, final_safetensors_list, lora_weights, model, output_dtype,
-        )
+        _mxfp4_rewrite = _plan_compressed_mxfp4_rewrite(save_directory, final_safetensors_list, model)
+        _disk_view = _compressed_mxfp4_disk_view(save_directory, final_safetensors_list, _mxfp4_rewrite)
+        for _wrapper in _mxfp4_rewrite["wrappers"]:
+            lora_weights.pop(_wrapper, None)
 
     # Refuse a silently partial merge before any staged shard is mutated: the FP8 pre-rewrite
     # below dequantizes EVERY shard, so refusing after it rewrites the whole checkpoint first.
@@ -4732,6 +4774,7 @@ def merge_and_overwrite_lora(
         save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
         tie_word_embeddings = _merge_tie_word_embeddings,
         count_packed_mxfp4 = _count_packed_mxfp4,
+        disk = _disk_view,
     )
 
     # FP8 MoE-expert LoRA + merged_16bit: the dense FP8 rewrite cannot fuse per-expert
@@ -4789,6 +4832,8 @@ def merge_and_overwrite_lora(
             upload_items("model.safetensors.index.json")
 
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
+        if _mxfp4_rewrite is not None:
+            _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -6116,14 +6161,15 @@ pass
 
 def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights,
                                   model_class_name, tie_word_embeddings = False,
-                                  count_packed_mxfp4 = True):
+                                  count_packed_mxfp4 = True, disk = None):
     """Refuse a silently partial merge before any staged shard is touched, returning what it
     found (empty means every LoRA-bearing module can be placed).
 
     NOT ahead of everything: on a push, Step 2 has already uploaded config.json and the
     tokenizer, since `final_safetensors_list` is built after that upload.
     """
-    disk_keys, disk_module_shapes = _disk_module_shapes(save_directory, safetensors_list)
+    # `disk`: the (keys, shapes) the shards will have once a pending rewrite has run.
+    disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list)
     unresolved = _unresolved_lora_targets(
         lora_weights,
         disk_keys,

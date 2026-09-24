@@ -764,3 +764,69 @@ def test_a_full_save_describes_linears_a_merge_made_dense(tmp_path):
     model.save_pretrained(str(tmp_path / "ct"))
     assert "quantization_config" not in json.load(open(tmp_path / "ct" / "config.json"))
     assert model.config.quantization_config["format"] == "mxfp4-pack-quantized"
+    # The legacy SparseML spelling of the same config is dropped too.
+    model.config.quantization_config = dict(model.config.quantization_config, quant_method = "sparseml")
+    model.save_pretrained(str(tmp_path / "sparseml"))
+    assert "quantization_config" not in json.load(open(tmp_path / "sparseml" / "config.json"))
+    assert model.config.quantization_config["quant_method"] == "sparseml"
+
+
+def test_merged_16bit_rewrite_streams_one_shard_at_a_time(tmp_path):
+    """Low-disk exports upload and remove each shard as soon as it is merged: rewriting one shard
+    leaves the others packed, and a shard whose scales another shard needs can already be gone."""
+    from unsloth_zoo.saving_utils import _plan_compressed_mxfp4_rewrite, _rewrite_compressed_mxfp4_shard
+
+    packed_model, _ = _peft_pair()
+    ckpt = _checkpoint_bytes(0)
+    key = lambda e, w, kind: f"model.experts.{e}.{w}.weight_{kind}"  # noqa: E731
+    everything = lambda e: [key(e, w, k) for w in ("w1", "w2", "w3") for k in ("packed", "scale")]  # noqa: E731
+    files = {
+        "a.safetensors": ["model.other.weight"] + [k for e in range(E // 2) for k in everything(e)]
+        + [key(E - 1, "w1", "scale")],
+        "b.safetensors": [k for e in range(E // 2, E) for k in everything(e) if k != key(E - 1, "w1", "scale")],
+    }
+    filenames = _write_expert_shards(str(tmp_path), ckpt, files)
+    want = _stack_merge_reference(packed_model, ckpt)
+    plan = _plan_compressed_mxfp4_rewrite(str(tmp_path), filenames, packed_model)
+    b_before = (tmp_path / "b.safetensors").read_bytes()
+    _rewrite_compressed_mxfp4_shard(str(tmp_path), "a.safetensors", plan)
+    assert (tmp_path / "b.safetensors").read_bytes() == b_before
+    got = _read_shards(str(tmp_path), ["a.safetensors"])
+    os.remove(tmp_path / "a.safetensors")  # uploaded and removed, as in low-disk mode
+    _rewrite_compressed_mxfp4_shard(str(tmp_path), "b.safetensors", plan)
+    got.update(_read_shards(str(tmp_path), ["b.safetensors"]))
+    assert not any(k.endswith(("weight_packed", "weight_scale")) for k in got)
+    for k, v in want.items():
+        assert torch.equal(got[k], v), k
+
+
+def test_the_lora_completeness_check_sees_the_decoded_export_before_any_rewrite(tmp_path):
+    """merge_and_overwrite_lora checks every LoRA target against the export as it will be once
+    decoded, then rewrites: an unplaceable adapter refuses with every shard still packed."""
+    import ast
+    import inspect
+    import textwrap
+    from unsloth_zoo import saving_utils
+    from unsloth_zoo.saving_utils import (
+        _compressed_mxfp4_disk_view, _dequantize_compressed_mxfp4_shards, _disk_module_shapes,
+        _plan_compressed_mxfp4_rewrite,
+    )
+
+    packed_model, _ = _peft_pair()
+    ckpt = _checkpoint_bytes(0)
+    filenames = _write_expert_shards(
+        str(tmp_path), ckpt, {"model.safetensors": ["model.other.weight"] + _all_expert_keys()}
+    )
+    plan = _plan_compressed_mxfp4_rewrite(str(tmp_path), filenames, packed_model)
+    view = _compressed_mxfp4_disk_view(str(tmp_path), filenames, plan)
+    _dequantize_compressed_mxfp4_shards(str(tmp_path), filenames, {}, packed_model)
+    assert view == _disk_module_shapes(str(tmp_path), filenames)
+
+    # In merge_and_overwrite_lora the check runs before the first shard is rewritten.
+    source = textwrap.dedent(inspect.getsource(inspect.unwrap(saving_utils.merge_and_overwrite_lora)))
+    calls = {}
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            calls.setdefault(node.func.id, []).append(node.lineno)
+    assert "_dequantize_compressed_mxfp4_shards" not in calls
+    assert max(calls["_check_lora_merge_is_complete"]) < min(calls["_rewrite_compressed_mxfp4_shard"])
