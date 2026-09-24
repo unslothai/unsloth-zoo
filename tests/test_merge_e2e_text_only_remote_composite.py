@@ -267,7 +267,9 @@ def test_hub_repo_code_is_pinned_to_the_loaded_commit(monkeypatch, tmp_path):
     commit = "a" * 40
     model._unsloth_trust_remote_code_commit = commit
     assert S._read_export_base_config("org/repo", None, model, source_is_loaded_repo = True) == "config"
-    assert calls[-1]["revision"] == commit and calls[-1]["code_revision"] == commit
+    # The code of this repo follows `revision`; an explicit code_revision would also force the model
+    # repo's commit onto a cross-repo auto_map's code repository, where it does not exist.
+    assert calls[-1]["revision"] == commit and calls[-1].get("code_revision") is None
 
     seen = []
     monkeypatch.setattr(huggingface_hub.HfApi, "list_repo_files",
@@ -317,3 +319,12 @@ def test_code_of_a_substituted_source_is_never_copied(tmp_path):
         assert S._copy_export_remote_code(other, out, None, model) == []
     assert not os.path.isdir(out) or not any(f.endswith(".py") for f in os.listdir(out))
     assert "modeling_tiny_omni.py" in S._copy_export_remote_code(base, out, None, model)
+
+
+def test_pinned_revision_applies_to_same_repo_code_only():
+    # What the export relies on: without an explicit code_revision, transformers pins code to
+    # `revision` for code in the model repo and leaves a cross-repo auto_map's code repo alone.
+    import inspect
+    from transformers import dynamic_module_utils as D
+    src = inspect.getsource(D.get_class_from_dynamic_module)
+    assert "if code_revision is None and pretrained_model_name_or_path == repo_id:" in src

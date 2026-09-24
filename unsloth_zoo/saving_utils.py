@@ -3527,9 +3527,9 @@ def _read_export_base_config(model_name, token, model, source_is_loaded_repo = F
         if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
         commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
         if commit is None and not os.path.isdir(model_name): raise
-    return AutoConfig.from_pretrained(
-        model_name, token = token, trust_remote_code = True, revision = commit, code_revision = commit,
-    )
+    # `revision` alone: transformers pins the code to it only when the code lives in this repo. A
+    # cross-repo auto_map (`code-org/repo--configuration.Config`) keeps its own repo's revision.
+    return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = True, revision = commit)
 pass
 
 
