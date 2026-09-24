@@ -1390,6 +1390,19 @@ class UnslothVisionDataCollator:
         return self.padding_token_ids
 
     def __call__(self, examples):
+        batch = self._collate(examples)
+        # Both data formats must apply response-only masking after building labels.
+        response_masker = getattr(self, "train_on_responses_only", None)
+        if response_masker:
+            labels = batch["labels"]
+            response_labels = response_masker(batch)["labels"]
+            # Only add exclusions; preserve completion/media masks and ignore_index.
+            labels.masked_fill_(
+                response_labels.eq(-100).to(device = labels.device), self.ignore_index,
+            )
+        return batch
+
+    def _collate(self, examples):
         if self.formatting_func is not None:
             examples = [self.formatting_func(example) for example in examples]
         
@@ -1482,8 +1495,6 @@ class UnslothVisionDataCollator:
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
         batch["labels"] = labels
-        if self.train_on_responses_only:
-            batch["labels"] = self.train_on_responses_only(batch)["labels"]
         return batch
 
     def _select_messages_or_raw(self, example):
