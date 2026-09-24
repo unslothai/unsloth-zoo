@@ -37,12 +37,33 @@ recycle them underneath a copy; the hazard is instead reusing a slot while its
 last reader is still running, which is why the side stream waits on the consumer
 before writing and the consumer waits on the event before reading.
 """
+import os
 import torch
 
 __all__ = [
     "BlockSwap",
     "find_decoder_layers",
 ]
+
+# Pinning lets the H2D prefetch overlap with compute, but WSL2 caps the pinned
+# budget and a single .pin_memory() can OOM there while ordinary RAM is free.
+# Fall back to pageable host memory (slower, no overlap) instead of failing, and
+# honor UNSLOTH_DISABLE_PINNED_MEMORY, mirroring gradient_checkpointing. Kept
+# local because this module is loaded standalone (no package-relative imports).
+_PINNED_MEMORY_AVAILABLE = True
+
+
+def _to_pinned_host(t):
+    global _PINNED_MEMORY_AVAILABLE
+    host = t.to("cpu", copy = True)
+    if not _PINNED_MEMORY_AVAILABLE or os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1":
+        return host
+    try:
+        return host.pin_memory()
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower(): raise
+        _PINNED_MEMORY_AVAILABLE = False
+        return host
 
 
 def _swappable(module):
@@ -61,7 +82,7 @@ class _Block:
         self.params, self.host, self.devices = [], [], []
         for p in _swappable(layer):
             self.params.append(p)
-            self.host.append(p.data.to("cpu", copy = True).pin_memory())
+            self.host.append(_to_pinned_host(p.data))
             self.devices.append(p.data.device)
         # One side stream per device, so a sharded model keeps each card's
         # copies on that card's stream.
@@ -145,17 +166,27 @@ class BlockSwap:
         # exactly the memory-constrained setups this is meant to fit. Eviction
         # is safe here: every block's slot is still None, so _release frees
         # device storage without touching the not-yet-built pool.
-        for b in self.blocks:
-            self._release(b)
+        #
+        # Between eviction and the pool being built the layers hold empty weight
+        # tensors, so a pool allocation OOM here would leave the model broken
+        # with no object for the caller to recover through. Restore weights and
+        # pull the hooks on any failure so the caller can fall back to the
+        # untouched model, then re-raise.
+        try:
+            for b in self.blocks:
+                self._release(b)
 
-        sigs = [b.sig for b in self.blocks]
-        for sig in set(sigs):
-            self.free[sig] = [
-                [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
-                for _ in range(min(self.depth + 1, sigs.count(sig)))
-            ]
+            sigs = [b.sig for b in self.blocks]
+            for sig in set(sigs):
+                self.free[sig] = [
+                    [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
+                    for _ in range(min(self.depth + 1, sigs.count(sig)))
+                ]
 
-        self._arm(forward = True)
+            self._arm(forward = True)
+        except Exception:
+            self.remove()
+            raise
 
     def _release(self, block):
         freed = block.evict()
