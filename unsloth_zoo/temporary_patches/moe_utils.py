@@ -4080,8 +4080,10 @@ def forward_native_moe_loop(
         _module_flag(self, "is_transposed", None) is True
     )
 
-    # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
-    is_gpt_oss = _gate_up_is_interleaved(self)
+    # Interleaved [gate0, up0, ...] storage is a layout flag; GPT-OSS's clamped swiglu is
+    # its own activation. Keep them apart, as the grouped_mm path does.
+    interleaved = _gate_up_is_interleaved(self)
+    is_gpt_oss = "GptOssExperts" in self.__class__.__name__
     own_apply_gate = bool(_module_flag(self, "_unsloth_own_apply_gate", False))
 
     for expert_idx_t in expert_hit:
@@ -4101,10 +4103,10 @@ def forward_native_moe_loop(
                 lora_delta = current_state @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 gate_up = gate_up + lora_delta * scaling
-            if is_gpt_oss:
-                gate_up_bias = getattr(self, "gate_up_proj_bias", None)
-                if gate_up_bias is not None:
-                    gate_up = gate_up + gate_up_bias[expert_idx].to(gate_up.dtype)
+            gate_up_bias = getattr(self, "gate_up_proj_bias", None)
+            if gate_up_bias is not None:
+                gate_up = gate_up + gate_up_bias[expert_idx].to(gate_up.dtype)
+            if interleaved:
                 gate = gate_up[..., ::2]
                 up = gate_up[..., 1::2]
             else:
@@ -4112,16 +4114,17 @@ def forward_native_moe_loop(
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
+            gate_up = torch.cat((gate, up), dim=-1)
 
-        if is_gpt_oss:
+        if own_apply_gate:
+            # The class's own gate on its own gate_up layout (set only on generically routed classes).
+            current_hidden_states = self._apply_gate(gate_up)
+        elif is_gpt_oss:
             limit = getattr(self, "limit", 7.0)
             alpha = getattr(self, "alpha", 1.702)
             gate = gate.clamp(min=None, max=limit)
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
-        elif own_apply_gate:
-            # The class's own gate on [gate; up] (set only on generically routed classes).
-            current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):
             current_hidden_states = self.act_fn(gate) * up
         else:
@@ -4139,10 +4142,9 @@ def forward_native_moe_loop(
                 lora_delta = current_hidden_states @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 down = down + lora_delta * scaling
-            if is_gpt_oss:
-                down_bias = getattr(self, "down_proj_bias", None)
-                if down_bias is not None:
-                    down = down + down_bias[expert_idx].to(down.dtype)
+            down_bias = getattr(self, "down_proj_bias", None)
+            if down_bias is not None:
+                down = down + down_bias[expert_idx].to(down.dtype)
             current_hidden_states = down
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
