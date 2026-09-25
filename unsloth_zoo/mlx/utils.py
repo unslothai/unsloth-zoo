@@ -468,8 +468,7 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
             setattr(mx, name, current._unsloth_index_original)
 
 
-# MLX trains attention through its unfused fallback, which scores every query
-# against every key; sliding-window layers discard all but a band of them.
+# Training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
 _TRAINING_ATTENTION_BLOCK = 512
 _WINDOW_MASKS = {}
 
@@ -514,9 +513,8 @@ def _wrap_create_causal_mask(original):
 
 
 def _windowed_attention(sdpa, q, k, v, scale, window, block):
-    # One call over query blocks folded into the batch, each against its own and
-    # the previous key block: per-block slices would sum full-size gradient
-    # scatters that the compiler can fuse past Metal's kernel argument limit.
+    # Query blocks folded into the batch, each vs its own + previous key block. Not per-block
+    # slices: their full-size gradient scatters fuse past Metal's kernel argument limit.
     B, T = q.shape[0], q.shape[-2]
     n = -(-T // block)
 
@@ -539,8 +537,7 @@ def _windowed_attention(sdpa, q, k, v, scale, window, block):
 
 
 def _windowing_pays(q, k, block):
-    # Break-even measured on bf16 training attention: skipped scores against the
-    # padded, folded q/k/v copies.
+    # Skipped scores vs padded, folded q/k/v copies; 2.5 measured on bf16 training attention.
     heads, T, dim = q.shape[1], q.shape[2], q.shape[3]
     padded = -(-T // block) * block
     skipped = heads * (T * T - 2 * block * padded)
