@@ -478,7 +478,7 @@ if DEVICE_TYPE == "hip":
 pass
 
 def device_synchronize():
-    """Cross-platform torch.cuda.synchronize() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.synchronize() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -486,10 +486,13 @@ def device_synchronize():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "synchronize"):
                 torch.xpu.synchronize()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "synchronize"):
+            torch.npu.synchronize()
 pass
 
 def device_empty_cache():
-    """Cross-platform torch.cuda.empty_cache() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.empty_cache() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -497,10 +500,13 @@ def device_empty_cache():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "empty_cache"):
                 torch.xpu.empty_cache()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "empty_cache"):
+            torch.npu.empty_cache()
 pass
 
 def device_is_bf16_supported():
-    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, or HIP)."""
+    """Cross-platform torch.cuda.is_bf16_supported() (CUDA, XPU, HIP or NPU)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         if torch.cuda.is_available():
             return torch.cuda.is_bf16_supported()
@@ -508,6 +514,9 @@ def device_is_bf16_supported():
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             if hasattr(torch.xpu, "is_bf16_supported"):
                 return torch.xpu.is_bf16_supported()
+    elif DEVICE_TYPE == "npu":
+        if npu_is_available() and hasattr(torch.npu, "is_bf16_supported"):
+            return torch.npu.is_bf16_supported()
     return False
 pass
 

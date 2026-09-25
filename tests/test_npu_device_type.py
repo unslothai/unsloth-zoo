@@ -14,6 +14,8 @@ import sys
 
 import pytest
 
+pytest.importorskip("torch")
+
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 # One interpreter for every cell: the import is the slow part, and the uncached body
@@ -47,6 +49,19 @@ for cell in sys.argv[1:]:
         print("CELL", cell, "OK", dt.get_device_type.__wrapped__())
     except NotImplementedError:
         print("CELL", cell, "RAISE")
+
+# The helpers must reach torch.npu once npu is selected, not fall through to a no-op.
+calls = []
+npu = types.ModuleType("torch.npu")
+npu.is_available = lambda: True
+npu.synchronize = lambda: calls.append("synchronize")
+npu.empty_cache = lambda: calls.append("empty_cache")
+npu.is_bf16_supported = lambda: True
+torch.npu = npu
+dt.npu_is_available.cache_clear()
+dt.DEVICE_TYPE = "npu"
+dt.device_synchronize(); dt.device_empty_cache()
+print("HELPERS", ",".join(calls), dt.device_is_bf16_supported())
 """
 
 _CELLS = ("cuda", "hip", "xpu", "npu", "xpu+npu", "none")
@@ -69,12 +84,18 @@ def answers():
         if line.startswith("CELL "):
             _, cell, *rest = line.split()
             got[cell] = " ".join(rest)
-    assert set(got) == set(_CELLS), out.stderr[-2000:]
+        elif line.startswith("HELPERS "):
+            got["helpers"] = line[len("HELPERS "):]
+    assert set(got) >= set(_CELLS), out.stderr[-2000:]
     return got
 
 
 def test_an_ascend_host_gets_npu(answers):
     assert answers["npu"] == "OK npu"
+
+
+def test_npu_helpers_reach_torch_npu(answers):
+    assert answers.get("helpers") == "synchronize,empty_cache True"
 
 
 @pytest.mark.parametrize(
