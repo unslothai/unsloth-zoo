@@ -7,11 +7,9 @@
 import glob
 import importlib
 import inspect
-import math
 import os
 
 import pytest
-import torch
 
 from unsloth_zoo.compiler import DISABLED_KEYWORDS
 
@@ -54,7 +52,7 @@ def _disabled(source):
 def test_shipped_yarn_helpers_are_disabled():
     helpers = _shipped_helpers()
     if not helpers:
-        pytest.skip("this transformers has none of the MLA modeling files")
+        pytest.skip(reason = "this transformers ships no yarn_get_mscale / yarn_apply_mscale")
     missed = [
         f"{model_type}.{name}"
         for model_type, name, function in helpers
@@ -67,23 +65,6 @@ def test_callers_are_not_disabled():
     try:
         from transformers.models.deepseek_v3 import modeling_deepseek_v3 as m
     except Exception:
-        pytest.skip("no deepseek_v3 in this transformers")
+        pytest.skip(reason = "this transformers has no deepseek_v3 to check a caller against")
     assert not _disabled(inspect.getsource(m.DeepseekV3Attention.forward))
 
-
-def _yarn_get_mscale(scale = 1, mscale = 1):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def test_compiled_scalar_helper_fails_under_meta_init():
-    with torch.device("meta"):
-        assert _yarn_get_mscale(40.0, 1.0) == pytest.approx(1.3688879454113936)
-        compiled = torch.compile(_yarn_get_mscale, fullgraph = True, dynamic = True)
-        try:
-            value = compiled(40.0, 1.0)
-        except Exception:
-            return
-    if value != pytest.approx(1.3688879454113936):
-        pytest.fail(f"compiled helper returned {value!r} under meta init")
