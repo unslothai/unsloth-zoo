@@ -212,8 +212,23 @@ def test_the_largest_multiple_that_fits_is_kept(monkeypatch):
         activation_reserve_bytes = 0,
     )
     assert any(note.startswith("load transient: 3x") for note in plan.notes)
+    assert not any("may still run out of memory" in note for note in plan.notes)
     for d in _layer_devices(plan):
         assert plan.free_bytes[d] >= 3 * _GATE_UP_BYTES
+
+
+@needs_conversion_mapping
+def test_only_one_merged_tensor_of_room_still_warns():
+    # A real load with 1x free per card OOMs: the allocator reserves 2x to 3x while merging.
+    model = _meta_mixtral()
+    _, total = _units(model)
+    per_card = (total + 3 * _GATE_UP_BYTES) // 2
+    plan = plan_device_map(
+        model, max_memory = {0: per_card, 1: per_card}, headroom_bytes = 0,
+        activation_reserve_bytes = 0,
+    )
+    notes = [note for note in plan.notes if note.startswith("load transient: 1x")]
+    assert notes and "may still run out of memory" in notes[0]
 
 
 @needs_conversion_mapping

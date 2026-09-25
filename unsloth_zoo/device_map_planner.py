@@ -1803,6 +1803,11 @@ def plan_device_map(
                     "while loading ("
                     + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in sorted(load_transient.items()))
                     + ")"
+                    + (
+                        "; the allocator reserves 2x to 3x one merged tensor while merging,"
+                        " so loading may still run out of memory"
+                        if multiple < _LOAD_TRANSIENT_MULTIPLE else ""
+                    )
                 )
                 break
         reserve_floor.clear()
