@@ -627,12 +627,17 @@ def patch_transformers_masks():
         masking_utils.create_sliding_window_causal_mask,
     )
 
-    compiled_create_causal_mask = _torch_compile(
-        original_create_causal_mask, fullgraph = False, dynamic = True
-    )
-    compiled_create_sliding_window_causal_mask = _torch_compile(
-        original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
-    )
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+        # `_torch_compile` is `noop` here, i.e. torch.compiler.disable: a fullgraph user compile would refuse it.
+        compiled_create_causal_mask = original_create_causal_mask
+        compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
+    else:
+        compiled_create_causal_mask = _torch_compile(
+            original_create_causal_mask, fullgraph = False, dynamic = True
+        )
+        compiled_create_sliding_window_causal_mask = _torch_compile(
+            original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
+        )
 
     def wrap(f, original, prepared_mask_shortcut = True):
         # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
