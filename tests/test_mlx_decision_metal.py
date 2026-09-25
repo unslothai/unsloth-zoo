@@ -62,7 +62,7 @@ class _Reference(torch.nn.Module):
         return logits.masked_fill(~marker_mask, -1e4)
 
 
-# Laya ships two head layers; with fewer the last-layer path and its fallback change shape.
+# 1 and 0 head layers exercise the trimmed last layer alone and the no-head gather.
 @pytest.fixture(scope = "module", params = [2, 1, 0])
 def checkpoint(request, tmp_path_factory):
     torch.manual_seed(0)

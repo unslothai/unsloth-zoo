@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Typed-decision models (ModernBERT encoder + decision head) on MLX, inference only.
-
-Reads the Laya checkpoint layout as is and returns the decision logits of laya's torch
-`DecisionModel`; prompt building and calibration stay with the `laya` package."""
+"""Laya typed-decision models (ModernBERT encoder + decision head) on MLX, inference only; prompts and calibration stay in `laya`."""
 
 import json
 from functools import partial
@@ -132,7 +129,6 @@ class _Encoder(nn.Module):
 
 
 class _HeadAttention(nn.Module):
-    # torch.nn.MultiheadAttention: fused biased in-projection, one output projection.
     def __init__(self, dims, heads):
         super().__init__()
         self.heads = heads
@@ -160,7 +156,7 @@ class _HeadLayer(nn.Module):
         self.linear2 = nn.Linear(4 * dims, dims)
 
     def __call__(self, x, mask, rows = None):
-        # With `rows`, keys and values still span every token; attention output and feed-forward cover only those rows.
+        # `rows`: queries and feed-forward only at those rows (the scored markers); keys and values span every token.
         attended = self.self_attn(self.norm1(x), mask, rows)
         x = (x if rows is None else _gather_rows(x, rows)) + attended
         return x + self.linear2(nn.relu(self.linear1(self.norm2(x))))
@@ -189,7 +185,6 @@ class DecisionModel(nn.Module):
         layers = self.head.layers
         for layer in layers[:-1]:
             h = layer(h, keys)
-        # Only the marker rows are scored, so the last head layer answers for those rows alone.
         x = layers[-1](h, keys, marker_pos) if layers else _gather_rows(h, marker_pos)
         for layer in self.scorer:
             x = layer(x)
@@ -208,9 +203,7 @@ def _checkpoint_name(name):
 
 
 def load_decision_model(folder, dtype = mx.float32):
-    """Load a Laya checkpoint folder (`encoder/config.json`, `rl_agent_config.json`, `model.safetensors`).
-
-    float32 matches laya's torch CPU logits to ~1e-4; float16 drifts calibrated probabilities by up to ~1e-2."""
+    """Load a Laya checkpoint folder as published. float16 drifts calibrated probabilities enough to change reported values."""
     folder = Path(folder)
     encoder_config = json.loads((folder / "encoder" / "config.json").read_text())
     agent_config = json.loads((folder / "rl_agent_config.json").read_text())
