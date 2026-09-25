@@ -1244,6 +1244,30 @@ def test_a_precomputed_reference_scores_through_the_cce_scorer(monkeypatch):
         p.precompute_reference_logps(plan, TinyModel(), p.ReferencePolicy(), batch_size=2)
 
 
+def test_a_reference_adapter_without_a_scale_scores_at_one(tmp_path):
+    import json
+    import mlx.core as mx
+    from unsloth_zoo.mlx.preference import build_reference_policy
+
+    model = _tiny_model(lora=True)
+    model.q_proj.scale = 2.0
+    mx.save_safetensors(str(tmp_path / "adapters.safetensors"), {
+        "q_proj.lora_a": mx.array([[3.0]]), "q_proj.lora_b": mx.array([[4.0]]),
+    })
+    for config in (None, {"fine_tune_type": "lora", "lora_parameters": {"rank": 1}}):
+        if config is not None:
+            (tmp_path / "adapter_config.json").write_text(json.dumps(config))
+        policy, _ = build_reference_policy(
+            model, reference_free=False, resume_provenance=None,
+            ref_adapter_name=str(tmp_path),
+        )
+        assert [scale for _, scale in policy.scales] == [1.0]
+        with policy.activate(model):
+            assert model.q_proj.scale == 1.0
+            assert model.q_proj.lora_b.tolist() == [[4.0]]
+        assert model.q_proj.scale == 2.0
+
+
 def test_preference_trainers_forward_shared_constructor_state():
     import mlx.nn as nn
     from unsloth_zoo.mlx.trainer import (

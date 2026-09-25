@@ -1966,7 +1966,8 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
             "must adapt the same way."
         )
     lora_parameters = config.get("lora_parameters") or {}
-    scale = lora_parameters.get("scale", config.get("scale"))
+    # The adapter loader reads missing scale metadata as 1.0.
+    scale = float(lora_parameters.get("scale", config.get("scale", 1.0)))
     missing = sorted(name for name in adapters if name not in tensors)
     if missing:
         raise ValueError(
@@ -1997,7 +1998,7 @@ def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
             f"(first: {unused[:3]}).",
             RuntimeWarning, stacklevel=3,
         )
-    return None if scale is None else float(scale), overrides, set(tensors)
+    return scale, overrides, set(tensors)
 
 
 def _snapshot_policy(by_name, trainable, *, neftune, synced, fixed=()):
@@ -2228,7 +2229,7 @@ def build_reference_policy(
                 "so the reference would mix its adapter with this model's "
                 "trained weights."
             )
-        scales = [] if scale is None else [(module, scale) for module in modules]
+        scales = [(module, scale) for module in modules]
     overridden = {(id(module), name) for module, name, _ in overrides}
     for name in extra:
         module, attribute = _owner_of(by_name, name)
