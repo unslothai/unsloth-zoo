@@ -795,9 +795,7 @@ def _adjust_budgets_for_quantizer(
     return budgets, note
 
 
-# Largest merged tensors a card keeps free while loading: transformers 5 builds the merged tensor
-# next to its sources on the card, and the allocator cannot reuse the holes they leave. Measured
-# reserved peaks (MiniMax-M3 shapes, B200): 2.0x to 2.5x default, up to 4.7x with expandable segments.
+# transformers 5 builds merged tensors beside their sources on the card; the holes are not reusable.
 _LOAD_TRANSIENT_MULTIPLE = 3
 _LOAD_TRANSIENT_MULTIPLE_EXPANDABLE = 5
 _MERGING_OPS = ("MergeModulelist", "Concatenate", "ErnieFuseAndSplitTextVisionExperts")
@@ -1729,7 +1727,6 @@ def plan_device_map(
             return False
 
         def place_plain(i: int) -> bool:
-            # Kept separate so plans without a load transient search as fast as before.
             nonlocal visited
             if i == len(order):
                 return True

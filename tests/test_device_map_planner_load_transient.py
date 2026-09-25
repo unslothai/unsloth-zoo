@@ -180,7 +180,6 @@ def test_cards_holding_merged_experts_keep_room_to_merge():
         assert free[d] >= 3 * _GATE_UP_BYTES, (d, free[d], 3 * _GATE_UP_BYTES)
     assert plan.load_transient_by_device == {d: 3 * _GATE_UP_BYTES for d in _layer_devices(plan)}
 
-    # Without the transient cuda:0 is packed past that point: the map that ran out of memory.
     unguarded = plan_device_map(
         model, max_memory = budgets, headroom_bytes = 0, activation_reserve_bytes = 0,
         reserve_load_transient = False,
