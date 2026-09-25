@@ -24,7 +24,6 @@ standard backend after on-the-fly dequantization.
 
 import os
 import re
-import threading
 import types
 from typing import Optional, List, Union
 
@@ -1329,7 +1328,6 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
 # An experts module key with no expert index after `experts.`, and the per-expert
 # form. The leading `(?:^|\.)` keeps `shared_experts.` (DeepSeek-style) out.
 _FUSED_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.(?:gate_up_proj|gate_proj|up_proj|down_proj)(?:\.|$)")
-_KEEP_FUSED_LOCK = threading.RLock()
 _PER_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.\d+\.")
 
 
@@ -1446,21 +1444,13 @@ def patch_bnb4bit_keep_fused_experts():
             names = _swappable_fused_expert_classes(model, swap_table)
             if names and _checkpoint_expert_layout(kwargs.get("checkpoint_files")) == "fused":
                 kept = tuple(sorted(name for name in names if name in swap_table))
-        if not kept:
+        convert = _convert_without(type(self), quantizers_base, kept) if kept else None
+        if convert is None:
             return original_preprocess_model(self, model, dtype, **kwargs)
         logger.info(
             f"Unsloth: the checkpoint stores {', '.join(kept)} experts fused; "
             "keeping the fused module instead of transformers' per-expert swap."
         )
-        convert = _convert_without(type(self), quantizers_base, kept)
-        if convert is None:
-            # No per-instance hook: pop from the process-global table under a lock.
-            with _KEEP_FUSED_LOCK:
-                popped = {name: swap_table.pop(name) for name in kept if name in swap_table}
-                try:
-                    return original_preprocess_model(self, model, dtype, **kwargs)
-                finally:
-                    swap_table.update(popped)
         # Only this quantizer sees the filtered table; the global one is untouched,
         # so concurrent loads through any quantizer keep transformers' swap.
         had_own = "_convert_model_for_quantization" in vars(self)

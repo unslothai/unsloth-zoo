@@ -286,17 +286,18 @@ def test_fused_load_never_mutates_the_global_swap_table(fused_checkpoint, monkey
     assert "_convert_model_for_quantization" not in vars(model.hf_quantizer)
 
 
-def test_fused_load_falls_back_to_the_locked_pop(fused_checkpoint, monkeypatch):
-    """Without the stock convert method to rebuild, the class is popped from the
-    global table under the lock and restored afterwards."""
+def test_without_the_stock_convert_method_the_transformers_swap_runs(fused_checkpoint, monkeypatch):
+    """When transformers' convert method cannot be rebuilt over a filtered table, the
+    global table is left alone and the load takes transformers' swap, as on main."""
     import transformers.quantizers.base as quantizers_base
 
     _apply_bnb4bit_patches()
+    table = quantizers_base.MODULES_TO_PATCH_FOR_QUANTIZATION
+    before = dict(table)
     monkeypatch.setattr(moe_bnb4bit, "_convert_without", lambda *args: None)
-    model, info = _load(fused_checkpoint)
-    assert not info.get("missing_keys") and not info.get("unexpected_keys")
-    assert type(model.model.layers[0].feed_forward.experts).__name__ == "Llama4TextExperts"
-    assert "Llama4TextExperts" in quantizers_base.MODULES_TO_PATCH_FOR_QUANTIZATION
+    with pytest.raises(NotImplementedError, match = "Byte"):
+        _load(fused_checkpoint)
+    assert table == before
 
 
 def test_unpacked_expert_slot_gets_dequantized_values(fused_checkpoint, monkeypatch):
