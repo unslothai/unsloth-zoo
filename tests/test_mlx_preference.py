@@ -1212,6 +1212,38 @@ def test_a_precomputed_reference_travels_in_the_batch():
     assert not math.isclose(evaluated, float(eval_fn(model, *zeroed[1])[0]))
 
 
+def test_a_precomputed_reference_scores_through_the_cce_scorer(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx import preference as p
+
+    plan = build_plan(dataset=rows(5), num_batches=3)
+    calls = []
+
+    def scorer(model, batch, supervised, indices=None):
+        calls.append(indices)
+        ce = batch[:, 1:].astype(mx.float32) * supervised
+        return ce, mx.zeros(ce.shape)
+
+    def full_logits(*_args):
+        raise AssertionError("the reference materialized full logits")
+
+    monkeypatch.setattr(p, "_response_logps", full_logits)
+    table = p.precompute_reference_logps(
+        plan, TinyModel(), p.ReferencePolicy(), batch_size=2, scorer=scorer,
+    )
+    expected = []
+    for row in plan.rows:
+        pair = []
+        for values, prompt in ((row.chosen, row.chosen_prompt_ids),
+                               (row.rejected, row.rejected_prompt_ids)):
+            pair.append(-float(sum(values[len(prompt):])))
+        expected.append(pair)
+    assert calls == [None, None, None]
+    assert table.tolist() == expected
+    with pytest.raises(AssertionError, match="full logits"):
+        p.precompute_reference_logps(plan, TinyModel(), p.ReferencePolicy(), batch_size=2)
+
+
 def test_preference_trainers_forward_shared_constructor_state():
     import mlx.nn as nn
     from unsloth_zoo.mlx.trainer import (
@@ -1590,11 +1622,11 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
 
     precompute = trainer_module.precompute_reference_logps
 
-    def recording(plan, model, policy, *, batch_size):
+    def recording(plan, model, policy, *, batch_size, **kwargs):
         tables.append((
             len(plan.rows), batch_size, mlx_training_patches_active(), model.training,
         ))
-        return precompute(plan, model, policy, batch_size=batch_size)
+        return precompute(plan, model, policy, batch_size=batch_size, **kwargs)
 
     trainer._build_dpo_reference = capture
     monkeypatch.setattr(trainer_module, "precompute_reference_logps", recording)

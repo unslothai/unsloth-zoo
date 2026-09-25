@@ -6187,6 +6187,7 @@ class MLXTrainer:
                     precompute_reference_logps(
                         plan, model, _sampling_reference,
                         batch_size=int(_precompute_chunk or eval_batch_size),
+                        scorer=getattr(preference_eval_fn, "_unsloth_cce_scorer", None),
                     )
             finally:
                 model.train(was_training)
@@ -6323,6 +6324,7 @@ class MLXTrainer:
             _train_chunk = int(_precompute_chunk or args.per_device_train_batch_size)
             precompute_reference_logps(
                 batches, model, _sampling_reference, batch_size=_train_chunk,
+                scorer=getattr(loss_fn, "_unsloth_cce_scorer", None),
             )
             if self.eval_dataset is None and not _samples_prompts:
                 _sampling_reference.release()

@@ -807,7 +807,7 @@ def _pack_rows(rows, width, pad_id):
     return batch, lengths
 
 
-def precompute_reference_logps(plan, model, reference_policy, *, batch_size):
+def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
     """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward."""
     rows = plan.rows
     batch_size = max(1, int(batch_size))
@@ -817,7 +817,15 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size):
         batch, lengths = _pack_rows(
             chunk, _preference_width(chunk, plan.max_seq_length), plan.pad_id,
         )
-        logps = reference_policy.forward(model, mx.array(batch), mx.array(lengths))
+        batch, lengths = mx.array(batch), mx.array(lengths)
+        options = {}
+        # The live forward scores through CCE too; full logits would defeat it.
+        if scorer is not None and reference_policy.model is None:
+            mask = _response_mask(batch[:, 1:], lengths)
+            options["response_scorer"] = lambda model, batch, _lengths: -(
+                scorer(model, batch, mask > 0)[0] * mask
+            ).sum(axis=1)
+        logps = reference_policy.forward(model, batch, lengths, **options)
         mx.eval(logps)
         values = logps.tolist()
         table[start:start + len(chunk), 0] = values[:len(chunk)]
@@ -1022,6 +1030,7 @@ def _mark_cce_loss(loss_fn, scorer):
     if scorer is not None:
         loss_fn._unsloth_cce_backend = "runtime-cce"
         loss_fn._unsloth_cce_compaction = scorer.compaction
+        loss_fn._unsloth_cce_scorer = scorer
     return loss_fn
 
 
@@ -1872,6 +1881,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
         return loss, mx.array(pairs, dtype=mx.int32), stats
 
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
+    eval_fn._unsloth_cce_scorer = scorer
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
     eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
     eval_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
