@@ -197,8 +197,7 @@ def get_peft_regex(
     # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
     # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
     # so ending at the group keeps every real target and drops same-prefix non-linear modules.
-    # The "." before the group anchors whole leaf names: a bare "proj" entry otherwise matched
-    # Nemotron-H's nn.Identity fc1_latent_proj -> "Target module Identity() is not supported".
+    # "." anchors whole leaf names: bare "proj" matched Nemotron-H's Identity fc1_latent_proj (PEFT rejects it).
     if regex_model_parts == "":
         # No vision/language model-part selected (e.g. audio-only finetuning):
         # the standard matcher would degenerate into matching every attention/mlp
