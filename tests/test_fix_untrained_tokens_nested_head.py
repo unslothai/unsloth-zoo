@@ -171,3 +171,30 @@ def test_resolver_lets_a_type_error_inside_an_accessor_propagate():
             raise TypeError("something inside the model went wrong")
     with pytest.raises(TypeError, match = "something inside the model went wrong"):
         _get_embedding_modules(_Broken(_Cfg()))
+
+
+class _TwoHeadsNoPointer(PreTrainedModel):
+    """No top-level accessor answers; two nested heads (Qwen3-Omni: thinker and talker.code_predictor)."""
+
+    config_class = _Cfg
+
+    def __init__(self, config, first, second):
+        super().__init__(config)
+        setattr(self, first, _CausalLM(config))
+        setattr(self, second, _CausalLM(config))
+
+    def get_input_embeddings(self):
+        raise NotImplementedError
+
+
+def test_ambiguous_heads_pick_the_language_model_whatever_the_order():
+    model = _TwoHeadsNoPointer(_Cfg(), "vision_decoder", "language_model")
+    embeddings, head = _get_embedding_modules(model)
+    assert head is model.language_model.lm_head
+    assert embeddings is model.language_model.embed_tokens
+
+
+def test_ambiguous_heads_without_a_language_model_are_skipped():
+    model = _TwoHeadsNoPointer(_Cfg(), "vision_decoder", "audio_decoder")
+    _, head = _get_embedding_modules(model)
+    assert head is None

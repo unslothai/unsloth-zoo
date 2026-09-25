@@ -283,6 +283,9 @@ def _requires_arguments(method):
 pass
 
 
+_LANGUAGE_CORE_NAMES = frozenset(("language_model", "thinker", "text_model"))
+
+
 def _get_embedding_modules(model):
     """(input embeddings, lm_head) through headless wrappers (Nemotron-3-Nano-Omni); only arg-requiring or NotImplementedError accessors read as None."""
     def _own(module, name):
@@ -295,17 +298,20 @@ def _get_embedding_modules(model):
     lm_head    = _own(model, "get_output_embeddings")
     if lm_head is None:
         candidates = []
-        for _, module in model.named_modules():
+        for name, module in model.named_modules():
             if module is model: continue
             nested_head = _own(module, "get_output_embeddings")
             if nested_head is None: continue
-            candidates.append((nested_head, _own(module, "get_input_embeddings")))
+            candidates.append((name, nested_head, _own(module, "get_input_embeddings")))
         # Prefer the head beside the top-level embeddings: first-registered may be a vision decoder (silently corrupted).
-        for nested_head, nested_embeddings in candidates:
+        for _, nested_head, nested_embeddings in candidates:
             if embeddings is not None and nested_embeddings is embeddings:
                 return embeddings, nested_head
-        if candidates:
-            lm_head, nested_embeddings = candidates[0]
+        # Several heads (Qwen3-Omni: thinker, talker.code_predictor): only a language-model name disambiguates, else skip.
+        if len(candidates) > 1:
+            candidates = [c for c in candidates if c[0].rsplit(".", 1)[-1] in _LANGUAGE_CORE_NAMES]
+        if len(candidates) == 1:
+            _, lm_head, nested_embeddings = candidates[0]
             if nested_embeddings is not None: embeddings = nested_embeddings
     return embeddings, lm_head
 pass
