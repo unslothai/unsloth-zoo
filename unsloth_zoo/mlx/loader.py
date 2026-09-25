@@ -3041,7 +3041,11 @@ class _NativeVLMWeightSanitizer:
 
             # Snapshot 1-D values: sanitizers shift them with in-place `+=`.
             # Restore, never subtract: (w + 1) - 1 != w in bf16.
-            converted = bool(weights) and all(key in native for key in weights)
+            # The export's offset probe must see the shift, or it measures none.
+            converted = (
+                bool(weights) and all(key in native for key in weights)
+                and not getattr(model, "_unsloth_measuring_norm_offsets", False)
+            )
             source = dict(weights) if converted else None
             before = {
                 key: mx.array(value)

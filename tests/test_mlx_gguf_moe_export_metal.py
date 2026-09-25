@@ -178,6 +178,15 @@ def test_native_name_sanitizer_keeps_converted_norms(source_form):
     for key, value in expected.items():
         assert mx.array_equal(sanitized[key], value).item(), key
 
+    # GGUF export must still measure the shift it converts back.
+    from unsloth_zoo.mlx import utils as mlx_utils
+    model = Reshifting()
+    offsets = mlx_utils._mlx_measure_norm_offsets(
+        lambda probe: mlx_utils._mlx_sanitize_probe(model, probe),
+        {key: mx.array(value) for key, value in source.items()},
+    )
+    assert offsets == {"norm.weight": 1.0}
+
 
 def _stage_merged_moe_model(path, shards=1):
     from mlx_lm.models import qwen3_moe

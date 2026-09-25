@@ -15590,7 +15590,9 @@ def _mlx_sanitize_probe(model, weights):
     unmeasured; the caller treats that as unmeasurable, which is what the export
     did before this existed.
     """
-    return copy.copy(model).sanitize(weights)
+    probe = copy.copy(model)
+    probe._unsloth_measuring_norm_offsets = True
+    return probe.sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
