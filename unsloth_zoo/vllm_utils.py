@@ -3587,7 +3587,8 @@ def load_lora_directly(model):
         if s is not None: vllm_lora_B *= s
     pass
     # Must block!
-    torch.cuda.synchronize()
+    if DEVICE_TYPE == "npu": torch.npu.synchronize()
+    else: torch.cuda.synchronize()
 pass
 
 
