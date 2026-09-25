@@ -175,6 +175,144 @@ def test_recurrent_language_layers_receive_one_adapter_each(per_layer):
         assert model.low.q_proj is not model.high.q_proj
 
 
+@metal_only
+@pytest.mark.parametrize("window, T, windowed", [
+    (256, 1600, True), (640, 2000, True), (640, 1280, False), (None, 4100, False)])
+def test_training_attention_visits_only_the_window(monkeypatch, window, T, windowed):
+    from mlx_vlm.models import base as vlm_base
+
+    mx.random.seed(0)
+    B, heads, dim = 2, 4, 32
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(dim, 2 * dim)
+
+        def __call__(self, x, mask=None):
+            q, kv = mx.split(self.qkv(x), [dim], axis=-1)
+            q = q.reshape(B, T, heads, -1).transpose(0, 2, 1, 3)
+            k, v = (t.reshape(B, T, heads // 2, -1).transpose(0, 2, 1, 3)
+                    for t in mx.split(kv, 2, axis=-1))
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.3, mask=mask)
+            return out.transpose(0, 2, 1, 3).reshape(B, T, dim)
+
+    mlx_utils._patch_layer_class_for_gc(Attention)
+    layer, x = Attention(), mx.random.normal((B, T, dim))
+    windows = []
+    original = mlx_utils._windowed_attention
+    monkeypatch.setattr(mlx_utils, "_windowed_attention",
+                        lambda *a: windows.append(a[-2]) or original(*a))
+
+    def step():
+        def loss(params, x):
+            layer.update(params)
+            mask = "causal" if window is None else vlm_base.create_attention_mask(x, None, window_size=window)
+            return (layer(x, mask=mask) ** 2).sum()
+
+        params = layer.trainable_parameters()
+        out = mx.compile(mx.value_and_grad(loss, argnums=(0, 1)))(params, x)
+        mx.eval(out)
+        layer.update(params)
+        return out
+
+    try:
+        dense = step()
+        # A second run keeps the wrapper installed while this one evaluates.
+        mlx_utils.acquire_mlx_training_patches()
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            trained = step()
+            calls = len(windows)
+            paused = mlx_utils.pause_mlx_training_patches()
+            try:
+                step()
+            finally:
+                mlx_utils.resume_mlx_training_patches(paused)
+        finally:
+            mlx_utils.release_mlx_training_patches()
+            mlx_utils.release_mlx_training_patches()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Attention)
+    assert len(windows) == calls
+    assert set(windows) == ({window} if windowed else set())
+    assert not hasattr(mx.fast.scaled_dot_product_attention, "_unsloth_original")
+    assert not hasattr(vlm_base.create_causal_mask, "_unsloth_original")
+    (loss, (grads, dx)), (ref_loss, (ref_grads, ref_dx)) = trained, dense
+    assert mx.allclose(loss, ref_loss, rtol=1e-5)
+    assert mx.allclose(dx, ref_dx, atol=1e-4)
+    for key in ("weight", "bias"):
+        assert mx.allclose(grads["qkv"][key], ref_grads["qkv"][key], rtol=1e-4, atol=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("heads, T, dim, pays", [
+    (8, 1536, 256, False), (8, 2048, 256, True), (8, 2048, 512, False), (8, 4096, 512, True)])
+def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
+    q, k = mx.zeros((1, heads, T, dim)), mx.zeros((1, 1, T, dim))
+    assert mlx_utils._windowing_pays(q, k, 512) is pays
+
+
+@metal_only
+@pytest.mark.parametrize("family", ["gemma4", "gemma3n"])
+@pytest.mark.parametrize("T", [2048, 5200])
+def test_windowed_attention_trains_kv_shared_gemma(monkeypatch, family, T):
+    # gemma3n shares K/V through the zoo's slots, gemma4 through mlx-vlm itself.
+    import importlib
+    from mlx.utils import tree_flatten
+
+    config_module = importlib.import_module(f"mlx_vlm.models.{family}.config")
+    language = importlib.import_module(f"mlx_vlm.models.{family}.language")
+    mx.random.seed(0)
+    layers, types = 15, (["sliding_attention"] * 4 + ["full_attention"]) * 3
+    shape = dict(
+        num_hidden_layers=layers, num_kv_shared_layers=10, sliding_window=512, layer_types=types,
+        hidden_size=64, head_dim=32, num_attention_heads=2, num_key_value_heads=1,
+        hidden_size_per_layer_input=16, vocab_size=512, vocab_size_per_layer_input=512)
+    if family == "gemma4":
+        shape.update(intermediate_size=128, global_head_dim=64)
+    else:
+        shape.update(model_type="gemma3n_text", intermediate_size=[128] * layers, laurel_rank=8,
+                     activation_sparsity_pattern=[0.0] * layers)
+    model = language.LanguageModel(config_module.TextConfig(**shape))
+    ids = mx.random.randint(0, 512, (1, T))
+    windows = []
+    original = mlx_utils._windowed_attention
+    monkeypatch.setattr(mlx_utils, "_windowed_attention",
+                        lambda *a: windows.append(a[-2]) or original(*a))
+
+    def step():
+        def loss(params):
+            model.update(params)
+            caches = mlx_utils._build_shared_kv_caches(model)
+            return model(ids, cache=caches).logits.astype(mx.float32).mean()
+
+        params = model.trainable_parameters()
+        out = mx.compile(mx.value_and_grad(loss))(params)
+        mx.eval(out)
+        model.update(params)
+        return out
+
+    layer_class = type(model.model.layers[0])
+    mlx_utils._patch_layer_class_for_gc(layer_class)
+    try:
+        dense = step()
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            trained = step()
+        finally:
+            mlx_utils.release_mlx_training_patches()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(layer_class)
+    # Every sliding layer, in the forward and in its checkpoint recompute.
+    assert windows == [512] * 2 * types.count("sliding_attention")
+    (loss, grads), (ref_loss, ref_grads) = trained, dense
+    assert mx.allclose(loss, ref_loss, rtol=1e-5)
+    ref = dict(tree_flatten(ref_grads))
+    for name, grad in tree_flatten(grads):
+        assert (grad - ref[name]).abs().max() <= 1e-2 * ref[name].abs().max() + 1e-8, name
+
+
 def _dataset(n=24):
     return [
         {"text": f"### Question: what is {i} plus {i}?\n### Answer: {2 * i}."}
