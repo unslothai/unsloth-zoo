@@ -21,9 +21,8 @@ import torch
 import torch.nn as nn
 import os
 import math
-import contextlib
 from importlib.metadata import version as importlib_version
-from unsloth_zoo.utils import Version
+from unsloth_zoo.utils import Version, device_guard as _device_guard
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 
@@ -95,17 +94,6 @@ def get_mxfp4_config_for_training():
             logger.info("Unsloth: MXFP4 weights will remain quantized (triton_kernels available)")
 
     return Mxfp4Config(dequantize=dequantize)
-
-def _device_guard(tensor):
-    """torch.ldexp launches on the current device; off-cuda:0 experts fault without this."""
-    device = tensor.device
-    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
-    guard = getattr(backend, "device", None)
-    if guard is None or device.index is None:
-        return contextlib.nullcontext()
-    return guard(device)
-pass
-
 
 def patch_convert_moe_packed_tensors():
     """Pin the GPU convert_moe_packed_tensors with a smaller default chunk."""

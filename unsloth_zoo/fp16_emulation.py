@@ -100,8 +100,9 @@ import itertools
 import math
 import os
 
-import contextlib
 import torch
+
+from .utils import device_guard
 
 __all__ = [
     "fp16_emulation_enabled",
@@ -279,15 +280,6 @@ def _split_can_represent(x: torch.Tensor) -> bool:
     return bool(hi / lo <= _SPLIT_RANGE_LIMIT)
 
 
-def _current_device_of(tensor):
-    device = tensor.device
-    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
-    guard = getattr(backend, "device", None)
-    if guard is None or device.index is None:
-        return contextlib.nullcontext()
-    return guard(device)
-
-
 def fp16_split_mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -322,7 +314,7 @@ def fp16_split_mm(
         return _mm_float32(A32, B32)
 
     # torch.ldexp runs on the current device, not its operands', so make A's device current
-    with _current_device_of(A32):
+    with device_guard(A32):
         zero = torch.zeros((), device = A32.device, dtype = torch.int32)
         eA = pow2_exponent(A32) if scale else zero
         eB = pow2_exponent(B32) if scale else zero
