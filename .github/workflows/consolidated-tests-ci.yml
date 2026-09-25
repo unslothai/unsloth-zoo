@@ -250,6 +250,8 @@ jobs:
           # `pytest.importorskip("gguf")`: 73 of them, the whole post conversion
           # verification file, silently and with the job still green.
           pip install gguf
+          # For the planner compressed-tensors gate; torch cap repeated or a newer release swaps in CUDA torch.
+          pip install compressed-tensors "torch>=2.4.0,<2.11.0"
 
       - uses: ./.github/actions/pip-cache-save
         with:
@@ -414,6 +416,7 @@ jobs:
         # test_compiled_cache_fail_closed pins that the compiled cache refuses bytes
         # it did not generate, bytecode included: the digest covers the .py, so the
         # pyc has to be dropped before every verified import.
+        # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -482,6 +485,7 @@ jobs:
             tests/test_undefined_name_gate.py \
             tests/test_safe_serialization_none.py \
             tests/test_published_version_window.py \
+            tests/test_device_map_planner_compressed_tensors.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

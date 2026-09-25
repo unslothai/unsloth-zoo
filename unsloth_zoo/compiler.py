@@ -149,6 +149,9 @@ DISABLED_KEYWORDS = [
     "apply_mask_to_padding_states",  # falcon h1
     "reshape_into_chunks",  # falcon h1
     "pad_tensor_by_size",  # falcon h1
+    # MLA __init__ calls these float helpers under meta init; compiled, they fail on .item()
+    "def yarn_get_mscale(",
+    "def yarn_apply_mscale(",
 ]
 
 DISABLE_COMPILE_FUNCTIONS = [

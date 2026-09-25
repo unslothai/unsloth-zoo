@@ -2281,6 +2281,44 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
     )
 
 
+@pytest.mark.parametrize("model_type,forwarded", [
+    ("gemma4", True), ("gemma4_unified", False),
+])
+def test_cce_forwards_mm_token_types_where_the_model_does(model_type, forwarded):
+    """CCE loss passes `mm_token_type_ids` only where `Model.__call__` does."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _vlm_cce_forward
+
+    mx_ = _utils_mx()
+    seen = {}
+
+    class _Backbone:
+        config = SimpleNamespace(model_type=f"{model_type}_text")
+
+        def __call__(self, inputs=None, inputs_embeds=None, mask=None, cache=None,
+                     mm_token_type_ids=None, token_type_ids=None):
+            seen["ids"] = mm_token_type_ids
+            return inputs_embeds
+
+    class _Model:
+        language_model = SimpleNamespace(model=_Backbone())
+        config = SimpleNamespace(model_type=model_type)
+
+        def get_input_embeddings(self, inputs, pixel_values=None, **_kwargs):
+            return SimpleNamespace(
+                inputs_embeds=mx_.zeros((*inputs.shape, 4), dtype=mx_.float32))
+
+    ids = mx_.array([[5, 6, 7, 8], [5, 6, 7, 8]], dtype=mx_.int32)
+    types = mx_.array([[0, 1, 1, 0], [0, 0, 1, 1]], dtype=mx_.int32)
+    _vlm_cce_forward(_Model(), {
+        "input_ids": ids, "attention_mask": mx_.ones_like(ids), "mm_token_type_ids": types,
+    })
+    if forwarded:
+        assert seen["ids"] is not None and seen["ids"].tolist() == types.tolist()
+    else:
+        assert seen["ids"] is None
+
+
 # --- paligemma: a prefix-LM mask, not a padding outer product ---------------
 
 
