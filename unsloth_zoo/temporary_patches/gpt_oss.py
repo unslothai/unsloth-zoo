@@ -2028,6 +2028,12 @@ def forward_mxfp4_gpt_oss_with_lora(
 ) -> torch.Tensor:
     """
     MXFP4 GPT OSS MoE forward with LoRA: output = base_output (frozen MXFP4, no grad) + lora_delta.
+
+    Without LoRA adapters, delegates to the patched ``Mxfp4GptOssExperts.forward`` saved as
+    ``_original_forward`` (training with ``requires_grad`` uses ``Mxfp4GptOssExperts_Training``,
+    whose backward raises a clear ``NotImplementedError`` — native MXFP4 base-weight backward is
+    not supported; use bnb-4bit / dequantized bf16 for full training).
+
     Requires triton_kernels for native MXFP4 matmul; else load with Mxfp4Config(dequantize=True).
     """
     if not is_triton_kernels_available():
@@ -2062,8 +2068,15 @@ def forward_mxfp4_gpt_oss_with_lora(
             f"Tip: Increase batch_size for better GPU utilization."
         )
 
-    # If no LoRA, use the original MXFP4 forward (inference path)
+    # No LoRA: use the class forward installed by patch_gpt_oss (inference vs
+    # Mxfp4GptOssExperts_Training when hidden_states.requires_grad). The LoRA patch
+    # replaces forward on the class, so we must call _original_forward explicitly.
     if not has_lora:
+        original_forward = getattr(self.__class__, "_original_forward", None)
+        if original_forward is not None:
+            return original_forward(
+                self, hidden_states, routing_data, gather_idx, scatter_idx
+            )
         with torch_cuda_device(hidden_states.device):
             if not hasattr(self, "act"):
                 self.act = FusedActivation(
