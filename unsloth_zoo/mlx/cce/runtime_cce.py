@@ -746,7 +746,7 @@ def _build_smoothing_dlogits_kernel() -> Callable:
             d_logits[elem] = static_cast<O>(grad);
         }
     """
-    kernel = mx.fast.metal_kernel(
+    return mx.fast.metal_kernel(
         name="cce_runtime_smoothing_dlogits",
         input_names=["logits", "lse", "targets", "grad_output", "start_arr",
                      "ignore_arr", "softcap_arr", "smoothing"],
@@ -754,13 +754,6 @@ def _build_smoothing_dlogits_kernel() -> Callable:
         header=_SOFTCAP_HEADER,
         ensure_row_contiguous=True,
     )
-
-    def call(*, inputs, **kwargs):
-        dtype = inputs[0].dtype
-        kwargs["output_dtypes"] = [dtype]
-        kwargs["template"] = [("O", dtype)]
-        return kernel(inputs=inputs, **kwargs)
-    return call
 
 
 def _build_kernel_set(
