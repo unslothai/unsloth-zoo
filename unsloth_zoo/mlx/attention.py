@@ -133,8 +133,7 @@ def _qsa_attention_training_over(original):
     backend = original.__globals__
     signature = inspect.signature(original)
 
-    # Pass-through signature: the wrapper outlives training, so a kwarg a newer
-    # mlx-vlm adds must still reach `original` at inference.
+    # *args pass-through: the wrapper outlives training, so newer mlx-vlm kwargs must reach `original`.
     @functools.wraps(original)
     def attention(*args, **kwargs):
         from .utils import mlx_training_patches_active
