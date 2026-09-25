@@ -191,17 +191,6 @@ class BlockSwap:
                         "layer; exclude the shared layer or reduce the swap depth.")
                 seen.add(id(p))
 
-        for i, layer in enumerate(layers[self.start:]):
-            self.handles.append(layer.register_forward_pre_hook(self._pre(i)))
-            self.handles.append(layer.register_forward_hook(self._post(i)))
-            self.handles.append(layer.register_full_backward_hook(self._bwd(i)))
-            # Evicted blocks hold empty weight tensors, so a state_dict() taken
-            # mid-training (periodic full-model checkpoints, save_pretrained on a
-            # merged model) would serialize zero-length base weights. The host
-            # copy is authoritative for these frozen params, so substitute it for
-            # every swapped weight regardless of residency.
-            self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
-
         # depth + 1 slots per shape signature is the most that can be live at
         # once: the block being consumed plus the ones in flight. Layers are not
         # all alike -- Unsloth's dynamic 4-bit quants leave some blocks
@@ -222,6 +211,22 @@ class BlockSwap:
         # pull the hooks on any failure so the caller can fall back to the
         # untouched model, then re-raise.
         try:
+            # register_full_backward_hook rejects a layer that already carries a
+            # legacy register_backward_hook, so hook installation can raise partway
+            # through. Keep it inside the rollback: otherwise the already-installed
+            # forward hooks are left dangling with no object to remove() them, and a
+            # later no-grad forward evicts into an unbuilt pool.
+            for i, layer in enumerate(layers[self.start:]):
+                self.handles.append(layer.register_forward_pre_hook(self._pre(i)))
+                self.handles.append(layer.register_forward_hook(self._post(i)))
+                self.handles.append(layer.register_full_backward_hook(self._bwd(i)))
+                # Evicted blocks hold empty weight tensors, so a state_dict() taken
+                # mid-training (periodic full-model checkpoints, save_pretrained on a
+                # merged model) would serialize zero-length base weights. The host
+                # copy is authoritative for these frozen params, so substitute it for
+                # every swapped weight regardless of residency.
+                self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
+
             for b in self.blocks:
                 self._release(b)
 
@@ -365,7 +370,9 @@ def find_decoder_layers(model):
             inner = getattr(m, attr, None)
             if inner is not None and hasattr(inner, "layers"):
                 return inner.layers
-            if inner is not None:
+            # A base_model property that resolves to self would otherwise pin m
+            # here and never reach language_model; skip self-references.
+            if inner is not None and inner is not m:
                 m = inner
                 break
         else:
