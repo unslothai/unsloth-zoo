@@ -284,10 +284,7 @@ pass
 
 
 def _get_embedding_modules(model):
-    """(input embeddings, lm_head), looking through wrappers with no head (Nemotron-3-Nano-Omni).
-
-    Only an accessor needing arguments or raising NotImplementedError reads as None; other errors propagate.
-    """
+    """(input embeddings, lm_head) through headless wrappers (Nemotron-3-Nano-Omni); only arg-requiring or NotImplementedError accessors read as None."""
     def _own(module, name):
         getter = getattr(module, name, None)
         if not callable(getter): return None
@@ -303,8 +300,7 @@ def _get_embedding_modules(model):
             nested_head = _own(module, "get_output_embeddings")
             if nested_head is None: continue
             candidates.append((nested_head, _own(module, "get_input_embeddings")))
-        # Prefer the sub-model owning the top-level input embeddings; first-registered could be a
-        # vision decoder, silently corrupted since vocab sizes are only compared by min(len).
+        # Prefer the head beside the top-level embeddings: first-registered may be a vision decoder (silently corrupted).
         for nested_head, nested_embeddings in candidates:
             if embeddings is not None and nested_embeddings is embeddings:
                 return embeddings, nested_head
@@ -327,8 +323,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     # for composite models (Qwen3-Omni), and remote code can declare a signature
     # that cannot be called (stepfun-ai/Step-3.7-Flash).
     embeddings, lm_head = _get_embedding_modules(model)
-    # None is a legitimate "I have none", and `.weight` on it is an
-    # AttributeError several frames from the cause.
     if embeddings is None or lm_head is None or \
         getattr(embeddings, "weight", None) is None or getattr(lm_head, "weight", None) is None:
         # Warning, not info: the logger sits at WARNING by default and this run

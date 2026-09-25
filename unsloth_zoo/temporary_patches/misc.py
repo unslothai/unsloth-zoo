@@ -635,8 +635,7 @@ def patch_transformers_masks():
     )
 
     def wrap(f, original, prepared_mask_shortcut = True):
-        # Remote code uses either `input_embeds` (<= 5.1) or `inputs_embeds` (5.2+, transformers#43916),
-        # and passes `cache_position`, removed in 5.9 (#45884). Decide from the signature, not the version.
+        # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
         try:
             parameters = inspect.signature(original).parameters
         except (TypeError, ValueError):
