@@ -14,19 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gpt-oss sliding-window layers must get the sliding-window mask.
-
-patch_GptOssModel's forward picked each layer's mask with
-`getattr(decoder_layer, "attention_type", None)`. transformers 5 removed that
-attribute (stock indexes `config.layer_types[i]`), so every layer got the full
-causal mask and the window-128 layers attended to the whole context. On
-gpt-oss-20b (wikitext, ctx 512) that is PPL 1082.7 instead of 214.7, the same
-as stock transformers with sliding attention disabled (1081.0). Restoring the
-attribute alone then crashes on `mask_a or mask_b` (truthiness of a tensor).
-
-CPU-only: a tiny config with sliding_window=4 and 16-token inputs, compared
-against stock transformers in a clean subprocess (the patches rewrite classes).
-"""
+# transformers 5 dropped GptOssDecoderLayer.attention_type, so the patched forward sent every
+# layer the full causal mask (gpt-oss-20b wikitext PPL 1082.7 vs stock 214.7). CPU, tiny config.
 from __future__ import annotations
 
 import os
@@ -43,33 +32,21 @@ def _gpt_oss():
     return gpt_oss
 
 
-def _layer(attention_type = None, layer_idx = None, layer_type = None,
-           sliding_window = None, is_sliding = None):
-    self_attn = types.SimpleNamespace()
-    if layer_idx is not None: self_attn.layer_idx = layer_idx
-    if layer_type is not None: self_attn.layer_type = layer_type
-    self_attn.sliding_window = sliding_window
-    if is_sliding is not None: self_attn.is_sliding = is_sliding
-    layer = types.SimpleNamespace(self_attn = self_attn)
+def _layer(attention_type = None, sliding_window = None):
+    layer = types.SimpleNamespace(self_attn = types.SimpleNamespace(sliding_window = sliding_window))
     if attention_type is not None: layer.attention_type = attention_type
     return layer
 
 
 def test_layer_type_matches_every_transformers_layout():
     f = _gpt_oss()._gpt_oss_layer_attention_type
-    types_ = ["sliding_attention", "full_attention"]
-    cfg = types.SimpleNamespace(layer_types = types_)
-    # 4.x: the decoder layer carries it.
+    cfg = types.SimpleNamespace(layer_types = ["sliding_attention", "full_attention"])
     assert f(_layer(attention_type = "full_attention"), cfg, 0) == "full_attention"
-    # 5.x: stock indexes config.layer_types by layer index.
-    assert f(_layer(layer_idx = 0), cfg, 1) == "sliding_attention"
+    assert f(_layer(), cfg, 0) == "sliding_attention"
     assert f(_layer(), cfg, 1) == "full_attention"
-    # No layer_types on the config: fall back to the attention module.
     bare = types.SimpleNamespace()
-    assert f(_layer(layer_type = "sliding_attention"), bare, 0) == "sliding_attention"
     assert f(_layer(sliding_window = 128), bare, 0) == "sliding_attention"
-    assert f(_layer(sliding_window = None), bare, 0) == "full_attention"
-    assert f(_layer(is_sliding = True), bare, 0) == "sliding_attention"
+    assert f(_layer(), bare, 0) == "full_attention"
 
 
 def test_select_mask_never_tests_tensor_truthiness():
@@ -79,7 +56,6 @@ def test_select_mask_never_tests_tensor_truthiness():
     masks = {"full_attention": full, "sliding_attention": sliding}
     assert f(masks, "sliding_attention") is sliding
     assert f(masks, "full_attention") is full
-    # A present None (causal fast path) is the answer, not a reason to fall back.
     assert f({"full_attention": full, "sliding_attention": None}, "sliding_attention") is None
     assert f(masks, "chunked_attention") is full
     assert f(full, "sliding_attention") is full
@@ -172,8 +148,7 @@ print('RESULT ' + json.dumps(res))
 @pytest.mark.parametrize("attention", ["unsloth_attention", "stock_attention"])
 def test_patched_forward_matches_stock_with_sliding_window(attention):
     env = dict(os.environ)
-    # CPU is enough, and forcing it keeps the parity exact. The NVML check would
-    # report GPUs that CUDA_VISIBLE_DEVICES hides from the CUDA runtime.
+    # CPU keeps parity exact; NVML would report GPUs CUDA_VISIBLE_DEVICES hides.
     env["CUDA_VISIBLE_DEVICES"] = ""
     env.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
     proc = subprocess.run(
@@ -186,15 +161,8 @@ def test_patched_forward_matches_stock_with_sliding_window(attention):
     )
     import json
     res = json.loads(lines[-1][len("RESULT "):])
-    # The inputs are long enough that ignoring the window moves the logits.
+    # Ignoring the window must move the logits, else the parity check is vacuous.
     assert res["oracle"] > 1e-3, res
     for key, diff in res["diff"].items():
         assert diff < 1e-5, (key, res)
 
-
-def test_no_tensor_truthiness_in_mask_selection():
-    import inspect
-    src = inspect.getsource(_gpt_oss())
-    assert 'getattr(decoder_layer, "attention_type", None)\n' not in src.split("def _gpt_oss_layer_attention_type")[0]
-    assert ".values()))" not in src.replace("next(iter(attention_mask.values()), None)", "")
-    assert "attention_mask.get(_attn_type) or" not in src

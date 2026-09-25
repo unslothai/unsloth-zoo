@@ -61,39 +61,19 @@ _TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
 
 
 def _gpt_oss_layer_attention_type(decoder_layer, config, layer_idx):
-    """The key of the mask mapping this decoder layer attends with.
-
-    transformers 4.x sets `GptOssDecoderLayer.attention_type`; 5.x removed it and
-    stock picks `config.layer_types[i]`, keeping `self_attn.layer_type` and
-    `self_attn.sliding_window` on the attention module. Reading only the removed
-    attribute sent every layer the full causal mask, so sliding-window layers
-    attended past their window.
-    """
+    # 4.x sets decoder_layer.attention_type; 5.x dropped it and stock indexes config.layer_types.
     attention_type = getattr(decoder_layer, "attention_type", None)
     if isinstance(attention_type, str):
         return attention_type
-    self_attn = getattr(decoder_layer, "self_attn", None)
     layer_types = getattr(config, "layer_types", None)
-    idx = getattr(self_attn, "layer_idx", None)
-    if not isinstance(idx, int):
-        idx = layer_idx
-    if layer_types is not None and isinstance(idx, int) and 0 <= idx < len(layer_types):
-        return layer_types[idx]
-    attention_type = getattr(self_attn, "layer_type", None)
-    if isinstance(attention_type, str):
-        return attention_type
-    is_sliding = getattr(self_attn, "is_sliding", None)
-    if is_sliding is None:
-        is_sliding = getattr(self_attn, "sliding_window", None) is not None
-    return "sliding_attention" if is_sliding else "full_attention"
+    if layer_types is not None and 0 <= layer_idx < len(layer_types):
+        return layer_types[layer_idx]
+    self_attn = getattr(decoder_layer, "self_attn", None)
+    return "sliding_attention" if getattr(self_attn, "sliding_window", None) is not None else "full_attention"
 
 
 def _gpt_oss_select_mask(attention_mask, attention_type):
-    """Pick one layer's mask without truthiness on tensors.
-
-    A mapping value may legitimately be None (SDPA / flash causal fast paths), so
-    presence of the key decides, never the value.
-    """
+    # Key presence decides, never tensor truthiness: a None value is a valid causal fast path.
     if not isinstance(attention_mask, dict):
         return attention_mask
     if attention_type in attention_mask:
@@ -3117,17 +3097,14 @@ def patch_GptOssModel():
         except:
             pass
 
-        # It may already have been prepared by e.g. `generate`. Training under
-        # flex_attention_with_sink builds its own windowed BlockMask from
-        # self_attn.sliding_window; every other forward needs the per-type mapping,
-        # as stock does, or the raw 2D mask reaches attention.
+        # May already be prepared by `generate`. flex_attention_with_sink training windows its own
+        # BlockMask; every other forward needs the per-type mapping or the raw 2D mask reaches attention.
         _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
         if not _flex_sink_training and not isinstance(attention_mask, dict):
             # Inference uses eager attention. If the config still has
             # _attn_implementation="flex_attention" (set for training), the
             # mask factory returns a BlockMask which eager cannot consume.
             # Temporarily swap to "eager" so a dense 4D float mask is built.
-            # Stock attention in training consumes whatever the config names.
             _orig_attn_impl = getattr(self.config, "_attn_implementation", None)
             _swap_attn_impl = (not self.training) and _orig_attn_impl == "flex_attention"
             if _swap_attn_impl:
