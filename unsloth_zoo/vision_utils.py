@@ -1522,22 +1522,7 @@ class UnslothVisionDataCollator:
             proc_kwargs["audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
-        try:
-            batch = self.processor(**proc_kwargs)
-        except ValueError as e:
-            # Dynamic-resolution processors (e.g. Nemotron Omni) return one pixel tensor per
-            # image when sizes differ, and their outer BatchFeature then fails to stack them.
-            # Such models take the list; convert everything else ourselves.
-            if "Unable to convert output" not in str(e) or not images:
-                raise
-            proc_kwargs["return_tensors"] = None
-            batch = _tensorize_ragged_batch(self.processor(**proc_kwargs))
-            if not torch.is_tensor(batch.get("input_ids")):
-                raise ValueError(
-                    f"Unsloth: {type(self.processor).__name__} returned unpadded input_ids for a "
-                    "batch, so it cannot collate more than one example; use "
-                    "per_device_train_batch_size = 1."
-                ) from e
+        batch = self._call_processor(proc_kwargs, bool(images))
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
         if audios and self.truncation and self.max_seq_length:
@@ -1618,6 +1603,25 @@ class UnslothVisionDataCollator:
             )
         return messages
 
+    def _call_processor(self, proc_kwargs, has_images):
+        try:
+            return self.processor(**proc_kwargs)
+        except ValueError as e:
+            # Dynamic-resolution processors (e.g. Nemotron Omni) return one pixel tensor per
+            # image when sizes differ, and their outer BatchFeature then fails to stack them.
+            # Such models take the list; convert everything else ourselves.
+            if "Unable to convert output" not in str(e) or not has_images:
+                raise
+            proc_kwargs = dict(proc_kwargs, return_tensors = None)
+            batch = _tensorize_ragged_batch(self.processor(**proc_kwargs))
+            if not torch.is_tensor(batch.get("input_ids")):
+                raise ValueError(
+                    f"Unsloth: {type(self.processor).__name__} returned unpadded input_ids for a "
+                    "batch, so it cannot collate more than one example; use "
+                    "per_device_train_batch_size = 1."
+                ) from e
+            return batch
+
     def _collapse_assistant_content(self, messages):
         for message in messages:
             if message["role"] == "assistant":
@@ -1625,7 +1629,8 @@ class UnslothVisionDataCollator:
                     # Only extract text from items that have type "text"
                     text_parts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
                     if text_parts:
-                        message["content"] = text_parts[0]
+                        # A chat template renders every text part in order, so keep them all.
+                        message["content"] = "".join(text_parts)
                     elif len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
                         message["content"] = content[0]["text"]
         return messages
@@ -2061,7 +2066,7 @@ class UnslothVisionDataCollator:
         if audios:
             prompt_kwargs["audio"] = audios
 
-        proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
+        proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), len(images) > 0)
         # Encode completions (RIGHT pad) text-only
         proc_completions = self.processor(text=completion_texts, **completion_kwargs)
 

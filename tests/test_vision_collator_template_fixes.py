@@ -196,3 +196,40 @@ def test_processor_with_a_differently_named_image_component_is_accepted():
 
     assert _processor_takes_images(_StepLike())
     assert not _processor_takes_images(_TextOnly())
+
+
+def test_string_content_keeps_every_assistant_text_part():
+    collator = _bare_collator()
+    messages = [{"role": "assistant", "content": [
+        {"type": "text", "text": "first "}, {"type": "image"}, {"type": "text", "text": "second"}]}]
+    assert collator._collapse_assistant_content(messages)[0]["content"] == "first second"
+
+
+class _RaggedProcessor:
+    """Stacks like a dynamic-resolution processor: fails with tensors when images differ."""
+    def __call__(self, text = None, images = None, return_tensors = None, **kwargs):
+        if images and return_tensors == "pt":
+            raise ValueError("Unable to convert output to PyTorch tensors format")
+        out = {"input_ids": [[1, 2, 3] for _ in text], "attention_mask": [[1, 1, 1] for _ in text]}
+        if images:
+            out["pixel_values"] = [torch.zeros(3, 8 + 8 * i, 8) for i in range(len(images))]
+        return out
+
+
+def test_the_ragged_fallback_serves_every_processor_call():
+    # Message batches and the prompt side of prompt/completion batches share one helper.
+    collator = _bare_collator()
+    collator.processor = _RaggedProcessor()
+    batch = collator._call_processor(
+        {"text": ["a", "b"], "images": ["x", "y"], "return_tensors": "pt"}, True)
+    assert torch.is_tensor(batch["input_ids"]) and batch["input_ids"].shape == (2, 3)
+    assert isinstance(batch["pixel_values"], list)
+    with pytest.raises(ValueError, match = "Unable to convert"):
+        collator._call_processor({"text": ["a"], "images": ["x"], "return_tensors": "pt"}, False)
+
+
+def test_prompt_completion_path_goes_through_the_shared_processor_call():
+    import inspect
+    from unsloth_zoo.vision_utils import UnslothVisionDataCollator
+    source = inspect.getsource(UnslothVisionDataCollator._collate_prompt_completion)
+    assert "self._call_processor(" in source
