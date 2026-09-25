@@ -1666,22 +1666,12 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
 
 
 def _quantization_method_is_known(quantization_config: Any) -> bool:
-    """Mirrors ``AutoQuantizationConfig.from_dict``; unclear cases are left to transformers."""
-    if not isinstance(quantization_config, Mapping):
-        return True
-    if quantization_config.get("load_in_8bit") or quantization_config.get("load_in_4bit"):
-        return True
-    method = quantization_config.get("quant_method")
-    if method is None:
-        return True
+    """``get_hf_quantizer``'s own check; anything it cannot judge is left to transformers."""
+    from transformers.quantizers import AutoHfQuantizer
+
     try:
-        from transformers.quantizers.auto import AUTO_QUANTIZATION_CONFIG_MAPPING
+        return bool(AutoHfQuantizer.supports_quant_method(quantization_config))
     except Exception:
-        return True
-    # Not str(method): a QuantizationMethod enum equals its key but its str() does not.
-    try:
-        return method in AUTO_QUANTIZATION_CONFIG_MAPPING
-    except TypeError:
         return True
 
 
