@@ -35,10 +35,16 @@ def test_mask_builder_stays_traceable_under_compile_disable():
         embeds = torch.zeros(1, 4, 16)
         position_ids = torch.arange(4)[None]
 
+        import inspect
+        original = getattr(mu, "_unsloth_original_create_causal_mask", mu.create_causal_mask)
+        takes = inspect.signature(original).parameters
+        extra = {"cache_position": torch.arange(4)} if "cache_position" in takes else {}
+        embeds_name = "inputs_embeds" if "inputs_embeds" in takes else "input_embeds"
+
         def build(embeds, position_ids):
             return mu.create_causal_mask(
-                config = config, inputs_embeds = embeds, attention_mask = torch.tensor([[0, 1, 1, 1]]),
-                past_key_values = None, position_ids = position_ids,
+                config = config, attention_mask = torch.tensor([[0, 1, 1, 1]]),
+                past_key_values = None, position_ids = position_ids, **{embeds_name: embeds}, **extra,
             )
 
         eager = build(embeds, position_ids)
