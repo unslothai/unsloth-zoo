@@ -1711,14 +1711,7 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
             if trust_remote_code else auto_cls.from_config(config)
     model.eval()
     if hf_quantizer is not None:
-        # transformers runs `validate_environment` before `preprocess_model`, and
-        # some quantisers set state there that `preprocess_model` then reads:
-        # compressed-tensors resolves `use_fp8_kernel` in it, and without that
-        # attribute its preprocess raises, the swallow below keeps the
-        # full-precision Linears, and a pack-quantized INT4 checkpoint is sized
-        # at bf16 (2.9x its real bytes, refusing a 595 GB model that fits).
-        # The plan has no device map to validate, so whatever the check would
-        # refuse for one is not this call's concern.
+        # Loader order: compressed-tensors sets `use_fp8_kernel` here, else preprocess raises and Linears stay bf16.
         try:
             hf_quantizer.validate_environment(device_map=None)
         except Exception:

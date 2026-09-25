@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The planner sizes a compressed-tensors pack-quantized checkpoint at its packed bytes.
-
-transformers runs the quantiser's `validate_environment` before `preprocess_model`, and the
-compressed-tensors quantiser resolves `use_fp8_kernel` in the former; the planner used to skip
-straight to the latter, which raised, was swallowed, and left every Linear at full precision.
-A 4-bit INT4 checkpoint was then sized at bf16 (2.9x), and unsloth/Kimi-K2.7-Code (595 GB
-packed) was refused on 8 x 183 GB cards with "slack after weights: -558 GiB". Config only, no
-weights, meta device."""
+"""Pack-quantized compressed-tensors checkpoints are planned at packed bytes, not bf16."""
 
 import json
 import os
@@ -100,12 +93,10 @@ def test_pack_quantized_int4_is_sized_at_its_packed_bytes():
         _write_config(d, quantized = True)
         packed, model, hf_quantizer = _total_bytes(d)
     assert type(hf_quantizer).__name__ == "CompressedTensorsHfQuantizer"
-    # The packed layout really was installed: int32 `weight_packed` on the quantized Linears.
     q_proj = model.model.layers[0].self_attn.q_proj
     names = dict(q_proj.named_parameters(recurse = False))
     assert "weight_packed" in names, sorted(names)
     assert names["weight_packed"].dtype == torch.int32
-    # The linears are 4 bits per weight plus a bf16 group scale; the embedding and the ignored head stay bf16, so the whole model lands well under half the bf16 size.
     linear_params = _LAYERS * (4 * _HIDDEN * _HIDDEN + 3 * _HIDDEN * _INTER)
     bf16_linears = linear_params * 2
     assert plain - packed > bf16_linears * 0.6, (plain, packed, bf16_linears)
