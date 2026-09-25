@@ -215,6 +215,39 @@ def calls_mask_creation_function(source):
     return calls_disable_compile_function(source, get_mask_functions())
 
 
+def has_data_dependent_call(source):
+    """True if `source` pulls tensor data into Python via `.nonzero()`, `.tolist()` or
+    `.item()`. Under fullgraph = True these give a data-dependent output shape or an
+    unbacked SymInt that Dynamo cannot guard on."""
+    return (
+        ".nonzero()" in source
+        or ".tolist()" in source
+        or ".item()" in source
+    )
+
+
+def data_dependent_helpers(modeling_file, called_functions):
+    """Names in `called_functions` whose source makes a data-dependent call.
+
+    The module forward screen never sees standalone helpers, so without this they get
+    `@torch_compile_with_fallback(fullgraph = True)` and, like Qwen3-Omni's
+    `chunk_and_pad_features` (`split(chunk_lengths.tolist())`), die on the first
+    forward with GuardOnDataDependentSymNode. Helpers without readable source (C
+    extensions, builtins, generated code) are skipped; classes are left alone."""
+    found = []
+    for name in called_functions:
+        function = getattr(modeling_file, name, None)
+        if function is None or inspect.isclass(function):
+            continue
+        try:
+            source = inspect.getsource(function)
+        except Exception:
+            continue
+        if has_data_dependent_call(source):
+            found.append(name)
+    return found
+
+
 # Re-exported from .model_lists so callers can keep using
 # `from unsloth_zoo.compiler import FORCE_FLOAT32`.
 from .model_lists import FORCE_FLOAT32  # noqa: E402,F401
@@ -5669,6 +5702,20 @@ def unsloth_compile_transformers(
             called_functions.append(function)
     pass
 
+    # Give helpers the same data-dependent screen module forwards get below. Treating
+    # them like a DISABLE_COMPILE_FUNCTIONS name emits them under
+    # `@torch.compiler.disable(recursive = False)` and demotes compiled callers off
+    # fullgraph (Tier 3); torch_compile_with_fallback only falls back on recompile
+    # limits, so a fullgraph = True helper is a hard error on the first forward.
+    for function in data_dependent_helpers(modeling_file, called_functions):
+        if function not in disable_compile_functions:
+            print(
+                f"Unsloth: Will not compile function {function} since "
+                f"data-dependent operations are done."
+            )
+            disable_compile_functions.add(function)
+    pass
+
     # Check if fullgraph can be used
     torch_modules = {x: True for x in torch_modules}
     for module in torch_modules.keys():
@@ -5875,11 +5922,7 @@ def unsloth_compile_transformers(
         # Tier 2: MoE expert dispatch via torch.where + index_add
         #   1-arg torch.where returns data-dependent indices; combined with
         #   index_add this is the standard MoE routing loop pattern
-        if (
-            ".nonzero()" in source
-            or ".tolist()" in source
-            or ".item()" in source
-        ):
+        if has_data_dependent_call(source):
             print(
                 f"Unsloth: Will not compile {module} since data-dependent operations are done."
             )
