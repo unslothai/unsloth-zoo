@@ -428,6 +428,26 @@ def test_an_op_built_around_a_concatenate_counts_as_merging(monkeypatch):
 
 
 @needs_conversion_mapping
+def test_a_quantizer_whose_conversions_raise_still_finds_the_merges():
+    # Regression: an unvalidated compressed-tensors quantizer raised in its conversion hook, reserving nothing.
+    pytest.importorskip("compressed_tensors")
+    from transformers.quantizers import AutoHfQuantizer
+    from transformers.utils.quantization_config import CompressedTensorsConfig
+
+    config = CompressedTensorsConfig(
+        config_groups = {"group_0": {
+            "targets": ["Linear"],
+            "weights": {"num_bits": 8, "type": "float", "strategy": "tensor", "symmetric": True},
+        }},
+        quant_method = "compressed-tensors", format = "float-quantized",
+    )
+    quantizer = AutoHfQuantizer.from_config(config, pre_quantized = True)
+    model = _meta_mixtral(layers = 2)
+    found = {p.pattern for p in _merged_parameter_patterns(model, quantizer)}
+    assert found == {p.pattern for p in _merged_parameter_patterns(model)} != set()
+
+
+@needs_conversion_mapping
 def test_a_pre_quantized_merge_is_sized_from_its_storage_dtype(monkeypatch):
     # A meta Params4bit reads as unpacked float32, 8x the packed bytes actually merged.
     bnb = pytest.importorskip("bitsandbytes")

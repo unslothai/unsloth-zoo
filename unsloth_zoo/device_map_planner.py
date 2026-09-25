@@ -834,12 +834,21 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
         return []
     try:
         accepted = inspect.signature(get_model_conversion_mapping).parameters
-        kwargs = {"hf_quantizer": hf_quantizer} if (
-            hf_quantizer is not None and "hf_quantizer" in accepted
-        ) else {}
-        conversions = get_model_conversion_mapping(model, **kwargs) or []
     except Exception:
         return []
+    conversions = None
+    if hf_quantizer is not None and "hf_quantizer" in accepted:
+        try:
+            conversions = get_model_conversion_mapping(model, hf_quantizer = hf_quantizer) or []
+        except Exception:
+            # An unvalidated quantizer can raise here (compressed-tensors reads `use_fp8_kernel`);
+            # its hooks only prepend ops, so the model's own converters still name the merges.
+            conversions = None
+    if conversions is None:
+        try:
+            conversions = get_model_conversion_mapping(model) or []
+        except Exception:
+            return []
     patterns = []
     for conversion in conversions:
         if getattr(conversion, "force_cpu", False):
