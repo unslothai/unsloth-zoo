@@ -1660,7 +1660,7 @@ def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
     """Chunked cross entropy over a LoRA-adapted classifier."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-    update, finalize, dlogits = _build_kernel_set(logit_softcap)
+    update, finalize, dlogits = _build_kernel_set(logit_softcap=logit_softcap)
     if update is None:
         raise RuntimeError("head CCE requires Metal")
     ignore_arr = mx.array([-100], dtype=mx.int32)
