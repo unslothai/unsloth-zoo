@@ -173,8 +173,10 @@ if Version(torch_version) < Version("2.4.0"):
     torch_amp_custom_fwd = torch.cuda.amp.custom_fwd
     torch_amp_custom_bwd = torch.cuda.amp.custom_bwd
 else:
-    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = "cuda")
-    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "cuda")
+    # NPU autocast state is its own; recomputation must restore that, not CUDA's.
+    _amp_device_type = "npu" if DEVICE_TYPE == "npu" else "cuda"
+    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = _amp_device_type)
+    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = _amp_device_type)
 pass
 
 
@@ -776,7 +778,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
 
     BACKWARD_PASS = True
     if DEVICE_TYPE == "npu":
-        EXTRA_STREAMS = tuple([torch.npu.Stream() for i in range(n_gpus)])
+        EXTRA_STREAMS = tuple([torch.npu.Stream(device = i) for i in range(n_gpus)])
     else:
         EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
     if DEVICE_TYPE in ("cuda", "hip"):

@@ -60,11 +60,13 @@ print("HELPERS", ",".join(calls), dt.device_is_bf16_supported())
 npu.stream = lambda s: s
 import unsloth_zoo.gradient_checkpointing as gc
 npu.device_count = lambda: 1
-npu.Stream = npu.Event = lambda *a, **k: calls.append("stream_or_event")
+npu.Event = lambda *a, **k: "event"
+npu.Stream = lambda device = None, **k: ("stream", device)
 npu.default_stream = lambda i: "main"
 gc.DEVICE_TYPE, gc.DEVICE_TYPE_TORCH = "npu", "cpu"
 gc.initialize_unsloth_gradient_checkpointing()
-print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS)
+amp = getattr(gc.torch_amp_custom_fwd, "keywords", {}).get("device_type")
+print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS, gc.EXTRA_STREAMS, amp)
 """
 
 _CELLS = ("cuda", "hip", "xpu", "npu", "xpu+npu", "none")
@@ -103,7 +105,8 @@ def test_npu_helpers_reach_torch_npu(answers):
 
 
 def test_npu_gradient_checkpointing_initializes(answers):
-    assert answers.get("gc") == "1 torch.bfloat16 ('main',)"
+    # One stream per device, and autocast bound to npu rather than cuda.
+    assert answers.get("gc") == "1 torch.bfloat16 ('main',) (('stream', 0),) npu"
 
 
 @pytest.mark.parametrize(
