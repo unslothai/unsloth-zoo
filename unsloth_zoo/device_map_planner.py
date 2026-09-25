@@ -1262,7 +1262,7 @@ def plan_device_map(
         plan = plan_device_map(model, **call, _colocate = ())
         plan.notes.append(
             f"sub-model towers {towers}: no plan keeps their embeddings together, so they are "
-            "split per unit; a tower that reads a child's weight in its own forward will hit a "
+            "split per unit; a tower whose forward reads a child's weight directly may hit a "
             "device mismatch"
         )
         return plan
