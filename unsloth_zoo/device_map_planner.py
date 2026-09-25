@@ -127,8 +127,10 @@ Nothing here is specific to one architecture:
   the tied input embedding is pinned to the head's device; any other group of
   modules sharing a parameter is placed as one unit, since the size table counts
   a shared tensor once,
-* vision towers / multimodal projectors / final norms are just ordinary split
-  units and are placed by the same greedy walk.
+* multimodal projectors / final norms are just ordinary split units and are
+  placed by the same greedy walk; a non-text sub-model tower (vision, audio) is
+  placed as one group, since its forward reads its children's weights directly
+  (see :func:`_sub_model_towers`).
 """
 
 from __future__ import annotations
@@ -1043,6 +1045,101 @@ def _split_units(
     return units
 
 
+def _sub_model_towers(model: nn.Module) -> list[str]:
+    """Names of the non-text sub-model towers (vision, audio, ...), outermost first.
+
+    A tower's own ``forward`` reads its children's weights directly instead of
+    calling them: Qwen2.5-VL / Qwen3-VL / Qwen3.5 add ``self.pos_embed.weight``
+    (through ``fast_pos_embed_interpolate``) to the ``patch_embed`` output inside
+    the vision model's forward, and SigLIP-style embeddings index
+    ``position_embedding.weight`` the same way. No accelerate hook sits on that
+    read, so a tower split between ``patch_embed`` and ``pos_embed`` raises
+    "Expected all tensors to be on the same device" on the first image, while the
+    same model on one card works. Such towers are placed as one unit.
+
+    Detected from structure, not names: a submodule (never the root) that is a
+    ``PreTrainedModel`` whose config class is one of the root config's nested
+    sub-configs, is not a text config (``text_config`` / ``decoder`` /
+    ``text_encoder``) and holds neither the output head, the input embedding nor
+    a text-config sub-model. The config is compared by class because
+    ``_from_config`` deep-copies it, so identity never matches. Composites that
+    nest a whole thinker (Qwen Omni) are skipped by that test and the towers
+    inside them are found instead.
+    Plain ``nn.Module`` towers (older remote code) are not detected and keep the
+    old per-unit placement. Never raises: anything unreadable returns ``[]``.
+    """
+    try:
+        from transformers import PreTrainedModel, PretrainedConfig
+    except Exception:
+        return []
+    try:
+        config = _config_attr(model, "config")
+        if not isinstance(config, PretrainedConfig):
+            return []
+        text_types = {type(c) for c in _text_configs(config)}
+        tower_types: set[type] = set()
+        stack, seen = [config], set()
+        while stack:
+            holder = stack.pop()
+            if id(holder) in seen:
+                continue
+            seen.add(id(holder))
+            for key, value in vars(holder).items():
+                if not isinstance(value, PretrainedConfig):
+                    continue
+                if key in _TEXT_CONFIG_ATTRS:
+                    text_types.add(type(value))
+                else:
+                    tower_types.add(type(value))
+                stack.append(value)
+        tower_types -= text_types | {type(config)}
+        if not tower_types:
+            return []
+        text_modules = []
+        for getter_name in ("get_output_embeddings", "get_input_embeddings"):
+            getter = getattr(model, getter_name, None)
+            if callable(getter):
+                try:
+                    found = getter()
+                except Exception:
+                    found = None
+                if isinstance(found, nn.Module):
+                    text_modules.append(found)
+        towers: list[str] = []
+        for name, module in model.named_modules():
+            if not name or any(name.startswith(t + ".") for t in towers):
+                continue
+            if not isinstance(module, PreTrainedModel):
+                continue
+            if type(_config_attr(module, "config")) not in tower_types:
+                continue
+            # A sub-model wrapping a language model (Qwen Omni's thinker) is not
+            # a tower; its own towers are found further down instead.
+            if any(
+                any(m is t for t in text_modules)
+                or (isinstance(m, PreTrainedModel)
+                    and type(_config_attr(m, "config")) in text_types)
+                for m in module.modules()
+            ):
+                continue
+            towers.append(name)
+        return towers
+    except Exception:
+        return []
+
+
+def _tower_blocks(model: nn.Module, tower: str, no_split_classes: Sequence[str]) -> list[str]:
+    """The outermost no-split blocks inside ``tower``, in definition order."""
+    no_split = set(no_split_classes)
+    blocks: list[str] = []
+    for name, module in _module_by_name(model, tower).named_modules(prefix = tower):
+        if name == tower or any(name.startswith(b + ".") for b in blocks):
+            continue
+        if type(module).__name__ in no_split:
+            blocks.append(name)
+    return blocks
+
+
 def _usable_devices(max_memory: Mapping[Any, Any] | None) -> list[int]:
     if max_memory is not None:
         devs = sorted(int(k) for k in max_memory if isinstance(k, int) or str(k).isdigit())
@@ -1074,6 +1171,7 @@ def plan_device_map(
     no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
     reserve_load_transient: bool = True,
+    _colocate: Sequence[tuple[str, Sequence[str]]] | None = None,
 ) -> DeviceMapPlan | None:
     """Build an explicit device map that reserves logit headroom on the head's card.
 
@@ -1115,7 +1213,10 @@ def plan_device_map(
             exact.
         no_split_module_classes: override the detected block classes. ``[]``
             removes every no-split constraint, so blocks may be split at their
-            children; ``None`` (default) detects the classes from the model.
+            children; ``None`` (default) detects the classes from the model and
+            also keeps each non-text sub-model tower (vision, audio) on one
+            card, falling back to a split tower only when no plan fits
+            otherwise (see :func:`_sub_model_towers`).
         prefer_head_device: force the head onto this device index.
         reserve_load_transient: keep room on each card for tensors transformers 5
             merges while loading (expert stacks). When no placement keeps it the
@@ -1128,9 +1229,43 @@ def plan_device_map(
     Raises:
         DeviceMapInfeasible: when no assignment fits without CPU/disk offload.
     """
+    # First statement, so it holds the arguments and nothing else.
+    call = {k: v for k, v in locals().items() if k not in ("model", "_colocate")}
     devices = _usable_devices(max_memory)
     if len(devices) < 2:
         return None
+
+    # `_colocate` is internal: ``(tower, excluded blocks)`` pairs whose units
+    # must share a device. `None` means "decide here": keep every sub-model
+    # tower whole, else only its loose parts (patch / position embeddings,
+    # rotary tables, merger) with its first block, else the old per-unit split,
+    # so a model that planned before still plans. An explicit
+    # `no_split_module_classes` is taken as the caller owning granularity.
+    if _colocate is None:
+        towers = [] if no_split_module_classes is not None else _sub_model_towers(model)
+        if not towers:
+            return plan_device_map(model, **call, _colocate = ())
+        whole = [(t, ()) for t in towers]
+        no_split = resolve_no_split_classes(model)
+        anchored = [(t, tuple(_tower_blocks(model, t, no_split)[1:])) for t in towers]
+        steps = [
+            (whole, "placed whole on one device"),
+            (anchored, "split at its blocks; the parts outside them stay with its first block"),
+        ]
+        for spec, how in steps[: 1 if anchored == whole else 2]:
+            try:
+                plan = plan_device_map(model, **call, _colocate = spec)
+            except DeviceMapInfeasible:
+                continue
+            plan.notes.append(f"sub-model towers {towers}: {how}")
+            return plan
+        plan = plan_device_map(model, **call, _colocate = ())
+        plan.notes.append(
+            f"sub-model towers {towers}: no plan keeps their embeddings together, so they are "
+            "split per unit; a tower that reads a child's weight in its own forward will hit a "
+            "device mismatch"
+        )
+        return plan
 
     notes: list[str] = []
 
@@ -1255,6 +1390,19 @@ def plan_device_map(
         ))
         for other in owners[1:]:
             a, b = _root(owners[0]), _root(other)
+            if a != b:
+                parent[a] = b
+
+    # Same mechanism for the sub-model towers chosen above: one group per tower,
+    # minus the blocks it is allowed to spread.
+    def _under(u: str, p: str) -> bool:
+        return u == p or u.startswith(p + ".")
+
+    for tower, excluded in _colocate:
+        members = [u for u in unit_names
+                   if _under(u, tower) and not any(_under(u, e) for e in excluded)]
+        for other in members[1:]:
+            a, b = _root(members[0]), _root(other)
             if a != b:
                 parent[a] = b
 
