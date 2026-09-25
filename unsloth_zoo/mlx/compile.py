@@ -4989,7 +4989,10 @@ def _install_gemma4_compile_patches():
     language_module = _try_import_module("mlx_vlm.models.gemma4.language")
     text_model_cls = getattr(language_module, "Gemma4TextModel", None)
     original_make_masks = getattr(text_model_cls, "_make_masks", None)
-    if original_make_masks is None:
+    # mlx-vlm < 0.6.1 has no vision overlay and a two-argument `_make_masks`: nothing to fix.
+    if original_make_masks is None or not hasattr(
+        text_model_cls, "_apply_blockwise_bidirectional_overlay"
+    ):
         return
     from .utils import _SharedKVSlot
 
