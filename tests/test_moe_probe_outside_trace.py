@@ -1,12 +1,4 @@
-"""The lazy grouped_mm probes must never be evaluated inside a Dynamo trace.
-
-Their first call is usually the first MoE forward, which in a compiled model runs inside
-torch.compile. Traced, `torch._grouped_mm` sees FakeTensors and can raise where the real
-kernel works (torch 2.14 / B200: "Float16 grouped_mm requires cuBLASLt grouped GEMM
-support"); with Unsloth's dynamo config the probe's `except` branch was committed and
-`_TORCH_GROUPED_MM_SUPPORTED` latched False, sending bf16 ERNIE-4.5 MoE to a wrong backend
-(PPL 1550 vs 20.7).
-"""
+"""Lazy grouped_mm probes must run eagerly, never on FakeTensors inside a Dynamo trace."""
 import pytest
 import torch
 import torch.nn as nn
@@ -14,7 +6,7 @@ import torch.nn.functional as F
 
 import unsloth_zoo.temporary_patches.moe_utils as M
 
-# The Dynamo settings `import unsloth` applies, under which the bug reproduced.
+# Dynamo settings `import unsloth` applies.
 _UNSLOTH_DYNAMO = dict(suppress_errors=True, capture_scalar_outputs=True, capture_dynamic_output_shape_ops=True)
 
 
@@ -39,12 +31,10 @@ def test_probe_body_runs_eagerly_under_compile(fresh_probes, monkeypatch, check,
     def fake_probe():
         compiling = torch.compiler.is_compiling()
         seen.append(compiling)
-        # A traced probe answers differently from the device, as the FakeTensor one did.
         monkeypatch.setattr(M, flag, not compiling)
         return not compiling
 
     monkeypatch.setattr(M, probe, fake_probe)
-    # Pretend an accelerator with the op exists, so the check reaches its (fake) kernel probe.
     monkeypatch.setattr(M, "_TORCH_GROUPED_MM_AVAILABLE", True)
     monkeypatch.setattr(M, "_grouped_mm_probe_device", lambda: torch.device("cpu"))
     fn = getattr(M, check)
@@ -54,10 +44,9 @@ def test_probe_body_runs_eagerly_under_compile(fresh_probes, monkeypatch, check,
 
     with torch._dynamo.config.patch(**_UNSLOTH_DYNAMO):
         out = torch.compile(f, backend="eager", dynamic=True)(torch.zeros(3))
-    assert seen == [False], seen            # probed once, eagerly
-    assert getattr(M, flag) is True         # the real answer was cached
-    assert torch.equal(out, torch.ones(3))  # and the compiled branch used it
-    # Cached now: a second trace reads the flag and never re-probes.
+    assert seen == [False], seen
+    assert getattr(M, flag) is True
+    assert torch.equal(out, torch.ones(3))
     torch._dynamo.reset()
     with torch._dynamo.config.patch(**_UNSLOTH_DYNAMO):
         torch.compile(f, backend="eager", dynamic=True)(torch.zeros(3))
@@ -81,7 +70,7 @@ def test_first_moe_forward_inside_compile_matches_reference(fresh_probes):
     torch.manual_seed(0)
     E, H, I, T, K = 8, 64, 32, 48, 2
 
-    class Experts(nn.Module):  # ERNIE-4.5 / Qwen3-MoE fused layout
+    class Experts(nn.Module):
         def __init__(self):
             super().__init__()
             self.num_experts, self.hidden_dim, self.intermediate_dim = E, H, I
@@ -93,7 +82,7 @@ def test_first_moe_forward_inside_compile_matches_reference(fresh_probes):
     m = Experts().cuda().to(torch.bfloat16)
     hs = torch.randn(T, H, device="cuda", dtype=torch.bfloat16)
     idx = torch.stack([torch.randperm(E, device="cuda")[:K] for _ in range(T)])
-    w = torch.softmax(torch.randn(T, K, device="cuda"), -1)  # fp32 router weights, as ERNIE's
+    w = torch.softmax(torch.randn(T, K, device="cuda"), -1)
     ref = torch.zeros(T, H, device="cuda")
     for e in range(E):
         t, p = torch.where(idx == e)
@@ -112,8 +101,6 @@ def test_first_moe_forward_inside_compile_matches_reference(fresh_probes):
 
 
 def test_definitive_negative_does_not_break_a_fullgraph_trace(monkeypatch):
-    """With no accelerator (or no torch._grouped_mm) the answer is known without a kernel
-    probe, so a fullgraph trace must get False instead of an Unsupported graph break."""
     import torch
     from unsloth_zoo.temporary_patches import moe_utils
 

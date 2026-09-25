@@ -743,25 +743,12 @@ _TORCH_GROUPED_MM_SUPPORTED = None
 
 @torch.compiler.disable
 def _run_probe_eagerly(probe):
-    """Run a one-time hardware probe outside any Dynamo trace.
-
-    The probes below are lazy: their first call is often the first MoE forward, which
-    in a compiled model (`unsloth_compiled_cache`, e.g. Ernie4_5_MoeSparseMoeBlock) is
-    inside a torch.compile trace. There `torch._grouped_mm` runs on FakeTensors, whose
-    meta check can reject what the real kernel accepts (torch 2.14 on B200: "Float16
-    grouped_mm requires cuBLASLt grouped GEMM support"), and with Unsloth's
-    `suppress_errors` / `capture_scalar_outputs` Dynamo commits the probe's own
-    `except` branch. The cached flag then latched False for the process, so
-    select_moe_backend() fell off grouped_mm and bf16 MoE output was garbage (ERNIE-4.5
-    21B bf16: PPL 1550 vs 20.7, NaN training). `torch.compiler.disable` makes a traced
-    caller graph-break here so the probe always measures the real device; the
-    cached-flag read in front of it stays traceable, so later traces see a constant.
-    """
+    """Graph-break so lazy probes never run on FakeTensors, whose meta check can reject what the real
+    kernel accepts and latch the cached flag False (pytorch/pytorch#196075)."""
     return probe()
 
 
 def _grouped_mm_probe_device():
-    """The accelerator a grouped_mm probe would run on, or None when there is none."""
     # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
@@ -774,8 +761,7 @@ def _check_torch_grouped_mm_supported():
     """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
-    # Definitive negatives stay traceable, so a fullgraph trace on a host without the op or an
-    # accelerator is not broken; only a real kernel probe needs the eager helper.
+    # Definitive negatives stay traceable so fullgraph traces don't break.
     if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
@@ -822,8 +808,6 @@ def _transposed_view_grouped_mm_is_safe():
     if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
         _TRANSPOSED_VIEW_GROUPED_MM_SAFE = False
         return False
-    # Eager for the same reason as _check_torch_grouped_mm_supported: under a trace the
-    # comparison would run on FakeTensors.
     return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
 
 
