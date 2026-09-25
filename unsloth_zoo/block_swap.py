@@ -80,7 +80,7 @@ def _swappable(module):
 
 
 class _Block:
-    __slots__ = ("params", "host", "devices", "names", "stream", "event", "resident", "slot", "sig")
+    __slots__ = ("params", "host", "devices", "names", "streams", "events", "resident", "slot", "sig")
 
     def __init__(self, layer, streams):
         self.params, self.host, self.devices, self.names = [], [], [], []
@@ -89,13 +89,15 @@ class _Block:
             self.host.append(_to_pinned_host(p.data))
             self.devices.append(p.data.device)
             self.names.append(name)
-        # One side stream per device, so a sharded model keeps each card's
-        # copies on that card's stream.
-        dev = self.devices[0] if self.devices else torch.device("cuda", 0)
-        if dev not in streams:
-            streams[dev] = torch.cuda.Stream(device = dev)
-        self.stream = streams[dev]
-        self.event = torch.cuda.Event()
+        # One side stream and one event per device: a block whose frozen params
+        # are sharded across cards keeps each card's copies on that card's
+        # stream, and the consumer waits on every device's event -- one event on
+        # only the first device's stream leaves the other cards' copies unsynced.
+        for d in self.devices:
+            if d not in streams:
+                streams[d] = torch.cuda.Stream(device = d)
+        self.streams = streams
+        self.events = {d: torch.cuda.Event() for d in self.devices}
         self.resident = True
         self.slot = None
         # Hashable shape signature; blocks with the same one share a pool.
@@ -119,18 +121,22 @@ class _Block:
         """
         if self.resident:
             return
-        self.stream.wait_stream(torch.cuda.current_stream(self.stream.device))
-        with torch.cuda.stream(self.stream):
-            for dst, h in zip(slot, self.host):
-                dst.copy_(h, non_blocking = True)
-            self.event.record(self.stream)
+        for d, event in self.events.items():
+            stream = self.streams[d]
+            stream.wait_stream(torch.cuda.current_stream(d))
+            with torch.cuda.stream(stream):
+                for dst, h, pd in zip(slot, self.host, self.devices):
+                    if pd == d:
+                        dst.copy_(h, non_blocking = True)
+                event.record(stream)
         for p, dst in zip(self.params, slot):
             p.data = dst
         self.slot = slot
         self.resident = True
 
     def wait(self):
-        torch.cuda.current_stream(self.stream.device).wait_event(self.event)
+        for d, event in self.events.items():
+            torch.cuda.current_stream(d).wait_event(event)
 
     def nbytes(self):
         return sum(h.numel() * h.element_size() for h in self.host)
@@ -152,6 +158,20 @@ class BlockSwap:
         n = min(n, len(layers))
         self.start = len(layers) - n
         self.blocks = [_Block(l, self.streams) for l in layers[self.start:]]
+
+        # A Parameter shared across two swapped blocks (cross-layer weight tying,
+        # or the same layer object listed twice) is owned by both: prefetching
+        # the later block repoints p.data and the earlier block's post-hook then
+        # evicts it out from under the still-resident later one. The scheduler
+        # can't coordinate that, so reject it before any hooks are installed.
+        seen = set()
+        for b in self.blocks:
+            for p in b.params:
+                if id(p) in seen:
+                    raise ValueError(
+                        "block_swap: a Parameter is shared across two swapped decoder "
+                        "layers; exclude the shared layer or reduce the swap depth.")
+                seen.add(id(p))
 
         for i, layer in enumerate(layers[self.start:]):
             self.handles.append(layer.register_forward_pre_hook(self._pre(i)))
