@@ -95,3 +95,29 @@ def test_cache_copy_replaces_read_only_destination(tmp_path):
     assert _mode(out / "tokenizer.model") == 0o644
     assert not [p for p in out.iterdir() if p.name.startswith(".unsloth-copy-")]
     assert _mode(src) == 0o444
+
+
+def test_local_read_only_source_merges_over_read_only_tokenizer(tmp_path):
+    import pytest
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the read-only bit")
+    import _merge_e2e_helpers as H
+    H.set_offline_cpu_env()
+    spec = H.make_spec("llama")
+    base_dir, out_dir = str(tmp_path / "base"), str(tmp_path / "merged")
+    model = H.build_and_save_base(spec, base_dir)
+    base_tensors = H.read_safetensors_dir(base_dir)
+    (tmp_path / "base" / "tokenizer.model").write_bytes(b"spm")
+    for name in os.listdir(base_dir):
+        os.chmod(os.path.join(base_dir, name), 0o444)
+    os.makedirs(out_dir)
+    (tmp_path / "merged" / "tokenizer.model").write_bytes(b"stale")
+    os.chmod(out_dir + "/tokenizer.model", 0o444)
+    peft_model = H.attach_lora(model, spec, "full")
+    adapted = H.extract_adapted(peft_model)
+    H.run_merge(peft_model, base_dir, out_dir, save_dtype = H.torch.float32)
+    H.assert_merge_correct(
+        family = "llama", base_tensors = base_tensors, out_dir = out_dir,
+        save_dtype = H.torch.float32, adapted = adapted, base_dir = base_dir,
+    )
+    assert (tmp_path / "merged" / "tokenizer.model").read_bytes() == b"spm"
