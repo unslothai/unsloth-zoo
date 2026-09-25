@@ -2611,28 +2611,31 @@ def test_nested_text_decoder_qualification_decides_its_parent():
     assert unqualified[0] in refused.reason
 
 
-def test_gemma4_training_masks_match_upstream_without_a_host_read(monkeypatch):
-    """Upstream's mask builder asks the host whether a vision token is present;
-    while training the masks must match upstream's under mx.compile."""
+def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch):
+    """With `use_bidirectional_attention="vision"` the reference implementation
+    overlays an image's block only on sliding layers, within the window. Loss
+    forwards must build that under mx.compile; generation keeps upstream's masks."""
     _skip_if_mlx_core_was_replaced()
     from functools import partial
     from types import SimpleNamespace as NS
 
     import unsloth_zoo.mlx.compile as mc
+    from unsloth_zoo.mlx.utils import _SharedKVSlot
 
     language = pytest.importorskip("mlx_vlm.models.gemma4.language")
+    from mlx_vlm.models.cache import BatchKVCache, KVCache
     text_model = language.Gemma4TextModel
     upstream = text_model._make_masks
     monkeypatch.setattr(text_model, "_make_masks", upstream)
     monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
     monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
-    assert "gemma4_training_masks_runtime" in {
+    assert "gemma4_vision_masks_runtime" in {
         name for bundle in mc._matching_pattern_bundles("gemma4")
         for name in bundle.runtime_primitive_names}
-    mc._runtime_patch_primitive_installers()["gemma4_training_masks_runtime"]()
+    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
     patched = text_model._make_masks
 
-    def stack(bidirectional, training):
+    def stack(bidirectional, training=True):
         model = NS(config=NS(use_bidirectional_attention=bidirectional), window_size=2,
                    training=training, layers=[NS(layer_type="sliding_attention"),
                                               NS(layer_type="full_attention")])
@@ -2643,34 +2646,32 @@ def test_gemma4_training_masks_match_upstream_without_a_host_read(monkeypatch):
     def arrays(masks):
         return [m.tolist() if isinstance(m, mx.array) else m for m in masks]
 
-    h, cache = mx.zeros((2, 5, 1)), [None, None]
-    # Row 0 carries a 3-token image block wider than the sliding window.
-    ids = mx.array([[0, 1, 1, 1, 0], [0, 0, 0, 2, 2]])
-    for bidirectional in ("vision", None):
-        want = arrays(upstream(stack(bidirectional, False), h, cache, ids))
-        traced = mx.compile(lambda h, ids: [
-            m for m in patched(stack(bidirectional, True), h, cache, ids)
-            if isinstance(m, mx.array)])
-        assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
-        assert arrays(patched(stack(bidirectional, True), h, cache, ids)) == want
-    # The CCE loss hands the trainer's shared K/V slots in as the cache.
-    from unsloth_zoo.mlx.utils import _SharedKVSlot
-    slots = [_SharedKVSlot(), None]
-    traced = mx.compile(lambda h, ids: patched(stack("vision", True), h, slots, ids))
-    assert arrays(traced(h, ids)) == arrays(upstream(stack("vision", False), h, cache, ids))
-    # A cache holding a prefix, or a batch cache's per-row offsets, is left to
-    # upstream even in training mode.
-    from mlx_vlm.models.cache import BatchKVCache, KVCache
+    def reference(types, window=2):
+        types = np.asarray(types)
+        vision = (types == 1) | (types == 2)
+        block = np.cumsum(vision & ~np.pad(vision, ((0, 0), (1, 0)))[:, :-1], axis=1) * vision
+        q, k = np.indices((types.shape[1],) * 2)
+        same = (block[:, :, None] == block[:, None, :]) & (block[:, :, None] > 0)
+        return (((k <= q) | same) & (abs(q - k) < window))[:, None].tolist()
+
+    h = mx.zeros((2, 6, 1))
+    # Row 0's image block is wider than the window both ways; row 1 has two blocks.
+    ids = mx.array([[0, 1, 1, 1, 1, 0], [1, 1, 0, 2, 2, 0]])
+    text_only = mx.zeros((2, 6), dtype=mx.int32)
+    for loss_cache in ([None, None], [_SharedKVSlot(), None]):
+        for types in (ids, text_only):
+            want = [reference(types), "causal"]
+            # Evaluation runs in eval mode and must see the masks training does.
+            for training in (True, False):
+                assert arrays(patched(stack("vision", training), h, loss_cache, types)) == want
+            traced = mx.compile(lambda h, t: patched(stack("vision"), h, loss_cache, t)[0])
+            assert traced(h, types).tolist() == want[0]
+    want = arrays(upstream(stack(None), h, [None, None], ids))
+    traced = mx.compile(lambda h, t: [
+        m for m in patched(stack(None), h, [None, None], t) if isinstance(m, mx.array)])
+    assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
     prefix = KVCache()
     prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
-    for held in ([prefix, None], [BatchKVCache([1, 0]), None]):
-        assert arrays(patched(stack("vision", True), h, held, ids)) == arrays(
-            upstream(stack("vision", True), h, held, ids))
-    # Without a vision token the overlay adds nothing to the causal masks, while
-    # inference keeps upstream's cheaper string form.
-    text_only = mx.zeros((2, 5), dtype=mx.int32)
-    traced = mx.compile(lambda h, ids: patched(stack("vision", True), h, cache, ids))
-    assert arrays(traced(h, text_only)) == [
-        mx.broadcast_to(language.create_causal_mask(5, window_size=window), (2, 1, 5, 5)).tolist()
-        for window in (2, None)]
-    assert patched(stack("vision", False), h, cache, text_only)[1] == "causal"
+    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None]):
+        assert arrays(patched(stack("vision"), h, held, ids)) == arrays(
+            upstream(stack("vision"), h, held, ids))
