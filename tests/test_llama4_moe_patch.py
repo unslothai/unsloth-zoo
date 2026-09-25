@@ -211,3 +211,20 @@ def test_per_expert_experts_keep_the_models_own_forward():
         ref_out[t] += moe.experts[e](flat[t : t + 1] * torch.sigmoid(top_value[t, 0]))[0]
     assert torch.equal(logits, ref_logits)
     assert torch.allclose(out, ref_out, atol = 1e-5, rtol = 1e-5), (out - ref_out).abs().max()
+
+
+@pytest.mark.parametrize("top_k", [1, 2])
+def test_lora_wrapped_experts_take_the_routed_path(top_k):
+    peft = pytest.importorskip("peft")
+    patch_llama4_moe()
+    moe = make_moe(top_k, torch.float32)
+    x = torch.randn(3, 5, HIDDEN, device = DEVICE)
+    ref_out, ref_logits = reference_forward(moe, x.clone())
+    config = peft.LoraConfig(r = 4, lora_alpha = 8, target_modules = [],
+                             target_parameters = ["experts.gate_up_proj", "experts.down_proj"])
+    moe = peft.inject_adapter_in_model(config, moe)
+    assert not isinstance(moe.experts, Llama4TextExperts)
+    out, logits = moe(x)
+    assert torch.equal(logits, ref_logits)
+    tol = _fp32_tolerance(1e-5)
+    assert torch.allclose(out, ref_out, atol = tol, rtol = tol), (out - ref_out).abs().max()

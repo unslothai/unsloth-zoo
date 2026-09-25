@@ -53,7 +53,10 @@ def _llama4_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts
 
 @torch.compiler.disable
 def Llama4TextMoe_forward(self, hidden_states):
-    if not getattr(type(self.experts), "_unsloth_already_patched", False):
+    experts = self.experts
+    # LoRA on the stacks wraps the experts in PEFT's ParamWrapper; the flag lives on the base class.
+    base = experts.get_base_layer() if hasattr(experts, "get_base_layer") else experts
+    if not getattr(type(base), "_unsloth_already_patched", False):
         # Pre-quantized per-expert checkpoints get SequentialLlama4TextExperts (hidden states only): run dense routing.
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         router_scores, router_logits = self.router(hidden_states)
