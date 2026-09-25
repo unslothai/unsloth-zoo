@@ -77,8 +77,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma3",
     "gemma3n",
     "gemma4",
-    # A qualified parent still needs its nested `text_config` decoder
-    # qualified, so gemma4 stays on the eager path without this entry.
+    # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
     "gemma4_text",
     "glm_ocr",
     "idefics2",
@@ -4985,13 +4984,7 @@ def _install_gemma3n_compile_patches():
 
 
 def _install_gemma4_compile_patches():
-    """Build gemma4's masks for cache-free forwards as the reference does, without a host read.
-
-    For `use_bidirectional_attention="vision"`, the reference implementation lets an
-    image's tokens attend to each other only on sliding-window layers, within the
-    window; global layers stay causal. Upstream overlays every layer, and asks the
-    host whether a vision token is present first, which raises under mx.compile.
-    """
+    """Vision overlay on sliding layers only, no host read (upstream's raises under mx.compile)."""
 
     language_module = _try_import_module("mlx_vlm.models.gemma4.language")
     text_model_cls = getattr(language_module, "Gemma4TextModel", None)
@@ -5001,11 +4994,9 @@ def _install_gemma4_compile_patches():
     from .utils import _SharedKVSlot
 
     def patched_make_masks(self, h, cache, mm_token_type_ids=None):
-        # Loss forwards, training or evaluation, carry no cache or only the trainer's
-        # shared K/V slots; a generation cache keeps upstream's masks.
+        # Only generation caches keep upstream's masks.
         if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
             return original_make_masks(self, h, cache, mm_token_type_ids)
-        # Upstream reads the ids only for the vision overlay.
         masks = original_make_masks(self, h, cache, None)
         n = h.shape[1]
         if (
@@ -5016,7 +5007,6 @@ def _install_gemma4_compile_patches():
             return masks
         positions = mx.arange(n)
         in_window = mx.abs(positions[:, None] - positions[None]) < self.window_size
-        # Overlaid unconditionally: without a vision token it adds nothing.
         sliding = in_window & self._apply_blockwise_bidirectional_overlay(
             language_module.create_causal_mask(n),
             mm_token_type_ids,

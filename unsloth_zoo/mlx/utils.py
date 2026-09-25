@@ -2973,8 +2973,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
-# Families whose `Model.__call__` hands `mm_token_type_ids` to the text model for its
-# bidirectional vision blocks; gemma4_unified shares that text model but drops them.
+# gemma4_unified shares the text model but its `Model.__call__` drops `mm_token_type_ids`.
 _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
 
 

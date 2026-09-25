@@ -2285,9 +2285,7 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
     ("gemma4", True), ("gemma4_unified", False),
 ])
 def test_cce_forwards_mm_token_types_where_the_model_does(model_type, forwarded):
-    """gemma4's text model builds its bidirectional vision blocks from
-    `mm_token_type_ids`; the CCE loss has to hand them over as `Model.__call__`
-    does, and only for families whose own call does."""
+    """CCE loss passes `mm_token_type_ids` only where `Model.__call__` does."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.utils import _vlm_cce_forward
 

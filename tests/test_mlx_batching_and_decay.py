@@ -2535,8 +2535,7 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
 
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
 def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
-    """These two need no compile patch, so only the qualification decides; the
-    source scan still reports blockers for both."""
+    """No compile patch needed: qualification alone decides."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
 
@@ -2562,7 +2561,6 @@ def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
     assert decision.enabled, decision.reason
     assert not decision.backend_qualifications
 
-    # The same blockers still decide it for a family that carries no entry.
     unqualified = sorted(
         name for name, report in build_compile_trait_reports().items()
         if report.blocker_categories and name not in _VERIFIED_TRAINING_ARCHES
@@ -2575,8 +2573,7 @@ def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
 
 
 def test_nested_text_decoder_qualification_decides_its_parent():
-    """A VLM reaches its decoder through `text_config`, and compile requires
-    both: an unqualified decoder keeps a qualified parent on the eager path."""
+    """An unqualified `text_config` decoder keeps a qualified parent eager."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
 
@@ -2600,7 +2597,6 @@ def test_nested_text_decoder_qualification_decides_its_parent():
 
     decision = resolve_training_compile(gemma4_over("gemma4_text"), policy=policy)
     assert decision.enabled, decision.reason
-    # mlx-vlm releases before gemma4_text was split out have no decoder to qualify.
     decoders = ["gemma4_text"] if "gemma4_text" in discover_architectures() else []
     assert [q.arch for q in decision.backend_qualifications] == decoders
     assert all(q.training_compile for q in decision.backend_qualifications)
@@ -2614,9 +2610,7 @@ def test_nested_text_decoder_qualification_decides_its_parent():
 
 
 def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch):
-    """With `use_bidirectional_attention="vision"` the reference implementation
-    overlays an image's block only on sliding layers, within the window. Loss
-    forwards must build that under mx.compile; generation keeps upstream's masks."""
+    """Reference overlays vision blocks on sliding layers only, within the window."""
     _skip_if_mlx_core_was_replaced()
     from functools import partial
     from types import SimpleNamespace as NS
@@ -2657,13 +2651,11 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
         return (((k <= q) | same) & (abs(q - k) < window))[:, None].tolist()
 
     h = mx.zeros((2, 6, 1))
-    # Row 0's image block is wider than the window both ways; row 1 has two blocks.
     ids = mx.array([[0, 1, 1, 1, 1, 0], [1, 1, 0, 2, 2, 0]])
     text_only = mx.zeros((2, 6), dtype=mx.int32)
     for loss_cache in ([None, None], [_SharedKVSlot(), None]):
         for types in (ids, text_only):
             want = [reference(types), "causal"]
-            # Evaluation runs in eval mode and must see the masks training does.
             for training in (True, False):
                 assert arrays(patched(stack("vision", training), h, loss_cache, types)) == want
             traced = mx.compile(lambda h, t: patched(stack("vision"), h, loss_cache, t)[0])
