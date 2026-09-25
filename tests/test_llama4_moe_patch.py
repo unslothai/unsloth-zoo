@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import pytest
 import torch
 
@@ -15,8 +31,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _fp32_tolerance(default):
-    # Triton grouped GEMM accumulates to ~1e-3 in fp32 on every MoE; the other backends match to 1e-6.
-    # Each experts forward copy (compiled cache or unsloth_zoo) caches its own backend choice.
+    # Triton grouped GEMM accumulates at ~1e-3 in fp32; grouped_mm and the native loop match to 1e-6.
     import sys
     module = sys.modules.get(getattr(Llama4TextExperts.forward, "__module__", ""), None)
     select = getattr(module, "select_moe_backend", None)
@@ -56,7 +71,7 @@ def reference_forward(moe, hidden_states):
     return out, router_logits
 
 
-# Tile multiples (Triton asserts K % BLOCK_SIZE_K == 0); 2 * 128 == 256 makes gate_up square.
+# Multiples of the Triton tiles (K % BLOCK_SIZE_K == 0); 2 * 128 == 256 makes gate_up square on purpose.
 HIDDEN = 256
 
 
@@ -113,7 +128,6 @@ def test_backward_matches_reference_fp32():
             assert torch.allclose(got[name], ref[name], atol = 1e-4, rtol = 1e-4), \
                 (name, (got[name] - ref[name]).abs().max())
             continue
-        # Triton: ~4e-3 of the largest gradient; a wrong orientation is off by the gradient itself.
         assert (got[name] - ref[name]).abs().max() <= 1e-2 * ref[name].abs().max(), \
             (name, (got[name] - ref[name]).abs().max())
 
@@ -152,7 +166,6 @@ def test_a_failed_moe_patch_leaves_both_forwards_alone(monkeypatch):
 
 
 def test_no_patch_before_the_tuple_returning_router(monkeypatch):
-    # Before transformers 4.54 the router returns logits only; the patched forward would give NaN.
     import transformers.models.llama4.modeling_llama4 as modeling_llama4
 
     def experts_forward(self, hidden_states):
@@ -168,3 +181,33 @@ def test_no_patch_before_the_tuple_returning_router(monkeypatch):
     patch_llama4_moe()
     assert Llama4TextExperts.forward is experts_forward
     assert Llama4TextMoe.forward is moe_forward
+
+
+def test_per_expert_experts_keep_the_models_own_forward():
+    try:
+        from transformers.quantizers.base import SequentialLlama4TextExperts
+    except Exception as e:
+        pytest.skip(f"no SequentialLlama4TextExperts in this transformers: {e}")
+    patch_llama4_moe()
+    assert Llama4TextMoe.forward is Llama4TextMoe_forward
+    moe = make_moe(1, torch.float32)
+    config = Llama4TextConfig(
+        hidden_size = HIDDEN, intermediate_size = 128, intermediate_size_mlp = 256,
+        num_local_experts = 4, num_experts_per_tok = 1, num_hidden_layers = 1,
+        num_attention_heads = 2, num_key_value_heads = 1, head_dim = 32, vocab_size = 256,
+    )
+    moe.experts = SequentialLlama4TextExperts(config).to(DEVICE)
+    with torch.no_grad():
+        for p in moe.experts.parameters():
+            p.normal_(0, 0.05)
+    x = torch.randn(3, 5, HIDDEN, device = DEVICE)
+    out, logits = moe(x)
+    flat = x.reshape(-1, HIDDEN)
+    ref_logits = torch.nn.functional.linear(flat, moe.router.weight)
+    top_value, top_index = torch.topk(ref_logits, 1, dim = 1)
+    ref_out = moe.shared_expert(flat)
+    for t in range(flat.shape[0]):
+        e = int(top_index[t, 0])
+        ref_out[t] += moe.experts[e](flat[t : t + 1] * torch.sigmoid(top_value[t, 0]))[0]
+    assert torch.equal(logits, ref_logits)
+    assert torch.allclose(out, ref_out, atol = 1e-5, rtol = 1e-5), (out - ref_out).abs().max()

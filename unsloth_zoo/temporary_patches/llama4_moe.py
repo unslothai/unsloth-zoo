@@ -2,21 +2,19 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Lesser General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Llama-4 MoE on Unsloth's grouped expert path. The native forward bmm's every token through every
-expert and cannot read 4-bit packed stacks; this dispatches only the selected (token, expert) pairs.
-The router score scales the expert INPUT, not its output: the activation is nonlinear, so do not move it.
-"""
+
+"""Route Llama-4 MoE (Scout, Maverick) through Unsloth's grouped expert path instead of dense bmm over every expert."""
 import torch
 
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
@@ -55,9 +53,18 @@ def _llama4_moe_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts
 
 @torch.compiler.disable
 def Llama4TextMoe_forward(self, hidden_states):
+    if not getattr(type(self.experts), "_unsloth_already_patched", False):
+        # Pre-quantized per-expert checkpoints get SequentialLlama4TextExperts (hidden states only): run dense routing.
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_scores, router_logits = self.router(hidden_states)
+        routed_in = hidden_states.repeat(router_scores.shape[1], 1)
+        routed_in = routed_in * router_scores.transpose(0, 1).reshape(-1, 1)
+        routed_out = self.experts(routed_in)
+        out = self.shared_expert(hidden_states)
+        out.add_(routed_out.reshape(router_scores.shape[1], -1, routed_out.shape[-1]).sum(dim = 0))
+        return out, router_logits
     hidden_states = hidden_states.reshape(-1, self.hidden_dim)
     router_scores, router_logits = self.router(hidden_states)
-    # router_scores is sigmoid(logit) on the top_k experts and 0 elsewhere, so topk recovers them.
     top_k = self.top_k
     top_k_weights, top_k_index = torch.topk(router_scores, top_k, dim = -1)
     n_tokens = hidden_states.shape[0]
@@ -67,7 +74,7 @@ def Llama4TextMoe_forward(self, hidden_states):
     routed_out = self.experts(routed_in, top_k_index.reshape(-1, 1), ones)
     routed_out = routed_out.reshape(n_tokens, top_k, self.hidden_dim).sum(dim = 1)
     out = self.shared_expert(hidden_states)
-    # Keep the model dtype like the native in-place add; promoting to float32 breaks the next grouped GEMM.
+    # Add in place: a promoting add turns the residual float32 under autocast and mixes dtypes in the next GEMM.
     out = out + routed_out.to(out.dtype)
     return out, router_logits
 
@@ -77,7 +84,7 @@ def patch_llama4_moe():
 
     try:
         from transformers.models.llama4.modeling_llama4 import Llama4TextExperts, Llama4TextMoe
-        # Before transformers 4.54 there is no Llama4Router returning (scores, logits); keep native.
+        # Before transformers 4.54 the router returns logits only: those versions keep their own forward.
         from transformers.models.llama4.modeling_llama4 import Llama4Router
     except Exception:
         return
@@ -85,10 +92,11 @@ def patch_llama4_moe():
     if getattr(Llama4TextExperts, "_unsloth_already_patched", False):
         return
 
-    # The two forwards only work together: install both or neither.
+    # The MoE forward feeds the experts routing indices: install both or neither.
     original_experts_forward = Llama4TextExperts.__dict__.get("forward")
     original_moe_forward = Llama4TextMoe.__dict__.get("forward")
     ok = patch_function(Llama4TextMoe, "forward", Llama4TextMoe_forward)
+    # Signature differs from the model's forward, so force.
     ok = ok and patch_function(Llama4TextExperts, "forward", get_forward_moe_backend(), force = True)
     if not ok:
         if original_moe_forward is not None:
@@ -96,10 +104,10 @@ def patch_llama4_moe():
         if original_experts_forward is not None:
             Llama4TextExperts.forward = original_experts_forward
     else:
+        # Separated LoRA reads dims from the module; the shared extractor misreads (E, in, out).
         Llama4TextExperts._unsloth_lora_extractor_fn = staticmethod(_llama4_moe_lora_extractor)
-        # (E, H, 2I) / (E, I, H) is (E, in, out): transformers' is_transposed layout.
         Llama4TextExperts.is_transposed = True
-        Llama4TextExperts.is_concatenated = True   # gate, up = chunk(2)
+        Llama4TextExperts.is_concatenated = True
         Llama4TextExperts.has_bias = False
         Llama4TextExperts.has_gate = True
         Llama4TextExperts._unsloth_already_patched = True

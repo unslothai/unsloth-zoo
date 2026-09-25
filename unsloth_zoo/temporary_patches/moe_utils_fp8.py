@@ -815,7 +815,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         _gate_up_is_interleaved,
     )
 
-    # FP8Experts / MiniMax-M3 / HY-V4 put a clamped SwiGLU in _apply_gate; a plain SiLU is wrong.
+    # Every backend must call the class's own _apply_gate (clamped / custom SwiGLU), not plain SiLU.
     if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
         self._unsloth_own_apply_gate = True
 
@@ -1065,14 +1065,12 @@ from .utils import logger
 
 
 def _experts_are_fp4(module) -> bool:
-    """FP4-packed experts this backend cannot unpack until it has FP4 dequant (#1334)."""
     if getattr(getattr(module, "config", None), "expert_dtype", "fp8") != "fp4":
         return False
     return globals().get("_dequantize_full_expert_weights_fp4") is None
 
 
 def _experts_are_expert_parallel(module) -> bool:
-    """Expert-parallel sentinel routes are masked only by transformers; cached per instance and config."""
     state = getattr(module, "__dict__", None)
     config = state.get("config") if state is not None else None
     cached = state.get("_unsloth_expert_parallel") if state is not None else None
@@ -1100,7 +1098,7 @@ def patch_fp8_experts_interface():
 
     def _dispatch_for(original):
         def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
-            # FP4, ungated (Nemotron-H) and expert-parallel experts keep transformers' own path.
+            # FP4-packed, ungated (up_proj only) and expert-parallel experts keep transformers' own path.
             if (
                 _experts_are_fp4(self)
                 or getattr(self, "has_gate", True) is False
@@ -1108,13 +1106,13 @@ def patch_fp8_experts_interface():
             ):
                 if original is not None:
                     return original(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
-                # FP8Experts is re-decorated per layer, so one __wrapped__ is another wrapper.
+                # replace_with_fp8_linear re-decorates FP8Experts per layer: unwrap to the eager forward.
                 eager = inspect.unwrap(type(self).forward)
                 return eager(self, hidden_states, top_k_index, top_k_weights)
             return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
         return _unsloth_fp8_dispatch
 
-    # The FP8Experts swap keeps the config's "unsloth" key, so it must resolve here too.
+    # "unsloth" is the default implementation and FP8Experts keeps the config's key, so it must resolve here too.
     for key in ("grouped_mm", "batched_mm", "deepgemm", "unsloth"):
         try:
             original = ALL_FP8_EXPERTS_FUNCTIONS[key] if key in ALL_FP8_EXPERTS_FUNCTIONS else None

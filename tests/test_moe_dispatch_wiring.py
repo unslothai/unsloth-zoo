@@ -1,4 +1,19 @@
-# Call-site wiring only; the helpers themselves are tested in test_moe_dispatch_helpers.py.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import json
 import os
 import subprocess
@@ -66,7 +81,6 @@ def test_quantizer_leaves_experts_it_cannot_route_unpacked():
     if not moe_utils_bnb4bit.HAS_BNB:
         pytest.skip("bitsandbytes 4-bit is not usable here, so no 4-bit load reaches the quantizer")
     if not moe_utils_bnb4bit.is_transformers_v5_moe_quantization_available():
-        # transformers 4.x quantizes experts through its own path; this hook is never installed there.
         pytest.skip("transformers has no v5 MoE quantization hooks")
     from bitsandbytes.nn import Params4bit
     from transformers import BitsAndBytesConfig

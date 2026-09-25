@@ -202,8 +202,7 @@ def calls_disable_compile_function(source, disable_compile_functions):
 
 
 def function_has_tensor_inputs(source: str) -> bool:
-    """False when every parameter is typed or defaulted as a non-tensor. Such config helpers
-    (Inkling's `plan_out_scales`) fail fullgraph compile on `math.isqrt` and break model load."""
+    """False when every parameter has a non-tensor annotation: nothing for Dynamo to trace."""
     try:
         tree = ast.parse(textwrap.dedent(source))
     except Exception:
@@ -220,6 +219,7 @@ def function_has_tensor_inputs(source: str) -> bool:
         return True
     if parameters[0].arg in ("self", "cls"):
         return True
+    # A literal default types an unannotated parameter; anything else may be a tensor.
     defaults = {}
     for parameter, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
         defaults[parameter.arg] = default

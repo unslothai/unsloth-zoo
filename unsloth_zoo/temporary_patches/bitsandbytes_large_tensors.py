@@ -2,21 +2,19 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Lesser General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""4-bit quantize / dequantize of tensors with 2^31+ elements, whose int32 count bitsandbytes' kernels wrap
-("Error invalid argument ... ops.cu"). Blocks are independent, so block-aligned pieces are quantized
-separately and nested absmax compression is applied once over the joined absmax: bit-identical output.
-"""
+
+"""Chunked 4-bit quantize / dequantize for tensors past bitsandbytes' int32 element count."""
 import inspect
 import math
 
@@ -28,7 +26,7 @@ from .utils import logger
 __all__ = ["patch_bitsandbytes_large_tensors", "BNB_INT32_ELEMENT_LIMIT"]
 
 BNB_INT32_ELEMENT_LIMIT = 2**31 - 1
-# Half the limit, so packed row counts and absmax offsets also stay inside int32.
+# 2^30 elements: half the int32 limit, so packed rows and absmax offsets stay in range too.
 _PIECE_ELEMENTS = 2**30
 
 
@@ -50,7 +48,7 @@ def patch_bitsandbytes_large_tensors():
     original_quantize = F.quantize_4bit
     original_dequantize = F.dequantize_4bit
 
-    # Pass small calls through untouched: bnb 0.45/0.46 reject an explicit blocksize = None.
+    # Below the limit pass args through untouched: bitsandbytes 0.45 / 0.46 reject blocksize=None.
     quantize_signature = inspect.signature(original_quantize)
     dequantize_signature = inspect.signature(original_dequantize)
 
@@ -143,7 +141,7 @@ def patch_bitsandbytes_large_tensors():
         values_per_storage = storage_itemsize * 2
         piece = _piece_elements(bs, storage_itemsize)
         flat_packed = A.reshape(-1)
-        # A non-contiguous out would make reshape(-1) a copy, so fill a scratch buffer and copy back.
+        # reshape(-1) of a non-contiguous out copies: fill a scratch buffer, then copy back.
         in_place = out is not None and out.is_contiguous()
         result = out.view(-1) if in_place else torch.empty(n, device = A.device, dtype = quant_state.dtype)
         for start in range(0, n, piece):
@@ -160,7 +158,6 @@ def patch_bitsandbytes_large_tensors():
             if not in_place:
                 out.copy_(result.reshape(out.shape))
             result = out
-        # Same orientation as bitsandbytes, which transposes a row-packed A with or without out.
         if A.shape[0] == 1:
             return result.t()
         return result

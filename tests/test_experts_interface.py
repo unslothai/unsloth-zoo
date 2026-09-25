@@ -1,10 +1,26 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import types
 
 import pytest
 import torch
 import torch.nn as nn
 
-pytest.importorskip("transformers.integrations.moe")  # transformers 5; a no-op on 4.x
+pytest.importorskip("transformers.integrations.moe")
 
 from unsloth_zoo.temporary_patches.moe_experts_interface import (
     UNSLOTH_EXPERTS_IMPLEMENTATION,
@@ -18,7 +34,6 @@ from unsloth_zoo.temporary_patches.moe_utils import forward_moe_backend
 
 @pytest.fixture(autouse = True)
 def _restore_transformers_experts_state():
-    """Patches are process-global; restore transformers for later tests."""
     from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
     from transformers.modeling_utils import PreTrainedModel
     getter = PreTrainedModel.__dict__.get("get_correct_experts_implementation")
@@ -181,7 +196,6 @@ def test_every_transformers_custom_gate_class_is_detected():
 
 
 def test_fp8_experts_registry_resolves_the_unsloth_default(monkeypatch):
-    # The FP8Experts swap keeps the "unsloth" key; the FP8 registry must not KeyError on it.
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from unsloth_zoo.temporary_patches import moe_utils_fp8
 
@@ -238,7 +252,6 @@ def test_only_the_cached_dispatcher_module_counts_as_unsloth():
 
 
 def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
-    # FP4 experts (two values per int8) must reach neither the default nor the FP8 registry.
     from transformers.modeling_utils import PreTrainedModel
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from unsloth_zoo.temporary_patches import moe_utils_fp8
@@ -272,7 +285,6 @@ def test_fp4_experts_keep_transformers_dispatchers(monkeypatch):
 
 
 def test_expert_parallel_reaches_the_nested_text_model():
-    # distributed_config is set on the outer config only; nested models share its text_config.
     from transformers import PretrainedConfig
     from transformers.modeling_utils import PreTrainedModel
     patch_experts_interface()
@@ -286,7 +298,7 @@ def test_expert_parallel_reaches_the_nested_text_model():
     outer.text_config = text
     outer.distributed_config = types.SimpleNamespace(enable_expert_parallel = True)
     nested = types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = text)
-    assert getter(nested, None) == UNSLOTH_EXPERTS_IMPLEMENTATION  # before the outer check
+    assert getter(nested, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
     assert getter(types.SimpleNamespace(_grouped_mm_can_dispatch = lambda: True, config = outer), None) == "grouped_mm"
     assert getter(nested, None) == "grouped_mm"
     assert "unsloth" not in str(text.to_dict())
@@ -295,7 +307,6 @@ def test_expert_parallel_reaches_the_nested_text_model():
 
 
 def test_the_fp8_eager_fallback_survives_repeated_decoration():
-    # FP8Experts is re-decorated per layer; the fallback must reach the eager forward.
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     from transformers.integrations.moe import use_experts_implementation
     from unsloth_zoo.temporary_patches import moe_utils_fp8
@@ -321,7 +332,7 @@ def test_the_fp8_eager_fallback_survives_repeated_decoration():
 def test_a_runtime_switch_is_refused_once_experts_are_packed_4bit():
     from transformers.modeling_utils import PreTrainedModel
 
-    class Params4bit(nn.Parameter):  # stands in for bitsandbytes' class, matched by name
+    class Params4bit(nn.Parameter):
         pass
 
     def model(packed):
@@ -382,6 +393,11 @@ def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypat
 
     calls.clear()
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", False)
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK", True)
+    unsloth_experts_forward(m, h, i, w)
+    assert calls == ["grouped_mm"]
+    calls.clear()
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK", False)
     unsloth_experts_forward(m, h, i, w)
     assert calls == ["unsloth"]
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", True)
@@ -406,7 +422,6 @@ def test_dense_stacks_without_expert_lora_take_transformers_grouped_mm(monkeypat
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "grouped_mm experts forward on CUDA")
 def test_dense_experts_stay_inside_a_fullgraph_compiled_block():
-    """A graph break in the experts call would send the fullgraph-compiled MoE block back to eager."""
     olmoe = pytest.importorskip("transformers.models.olmoe.modeling_olmoe")
     from transformers.models.olmoe.configuration_olmoe import OlmoeConfig
     patch_experts_interface()
@@ -428,7 +443,6 @@ def test_dense_experts_stay_inside_a_fullgraph_compiled_block():
 
 
 def test_nested_recheck_of_unsloth_does_not_reach_a_fixed_list_validator(monkeypatch):
-    """transformers 5.0 to 5.6 validates nested re-checks against a fixed list; "unsloth" broke every MoE load."""
     from transformers.modeling_utils import PreTrainedModel
 
     def fixed_list_original(self, requested_experts):
@@ -444,3 +458,61 @@ def test_nested_recheck_of_unsloth_does_not_reach_a_fixed_list_validator(monkeyp
     assert getter(model, None) == UNSLOTH_EXPERTS_IMPLEMENTATION
     assert getter(model, UNSLOTH_EXPERTS_IMPLEMENTATION) == UNSLOTH_EXPERTS_IMPLEMENTATION
     assert getter(model, "eager") == "eager"
+
+
+def test_dense_stacks_follow_generates_decode_switch_to_batched_mm(monkeypatch):
+    import unsloth_zoo.temporary_patches.moe_experts_interface as MEI
+    calls = []
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM", lambda self, h, i, w: calls.append("grouped_mm") or h)
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_BATCHED_MM", lambda self, h, i, w: calls.append("batched_mm") or h)
+    monkeypatch.setattr(MEI, "_unsloth_experts_dispatch", lambda self, h, i, w: calls.append("unsloth") or h)
+    monkeypatch.setattr(MEI, "_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK", True)
+    m = _experts(None, "transformers.models.x.modeling_x", implementation = "unsloth")
+    h, i, w = torch.zeros(2, 4), torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)
+
+    monkeypatch.setattr(MEI, "_DECODING_DEPTH", 1)
+    with torch.no_grad():
+        unsloth_experts_forward(m, h, i, w)
+    unsloth_experts_forward(m, h, i, w)
+    m._unsloth_lora_gate_up_proj = ("A", "B", 1.0)
+    with torch.no_grad():
+        unsloth_experts_forward(m, h, i, w)
+    assert calls == ["batched_mm", "grouped_mm", "unsloth"]
+
+
+def test_decode_switch_wrapper_counts_only_unsloth_models_off_cpu(monkeypatch):
+    import contextlib
+    import unsloth_zoo.temporary_patches.moe_experts_interface as MEI
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except Exception:
+        pytest.skip("no GenerationMixin")
+    seen = []
+
+    @contextlib.contextmanager
+    def original(self, *args, **kwargs):
+        seen.append(self.device.type)
+        yield
+
+    monkeypatch.setattr(GenerationMixin, "_optimize_model_for_decode", original, raising = False)
+    MEI._patch_decode_switch()
+    wrapped = GenerationMixin.__dict__["_optimize_model_for_decode"]
+    assert getattr(wrapped, "_unsloth_patched", False)
+    MEI._patch_decode_switch()
+    assert GenerationMixin.__dict__["_optimize_model_for_decode"] is wrapped
+
+    def model(device, impl):
+        return types.SimpleNamespace(
+            device = torch.device(device), get_experts_implementation = lambda: impl,
+        )
+    depths = []
+    for device, impl in [("cuda", "unsloth"), ("cuda", {"text": "unsloth"}), ("cpu", "unsloth"), ("cuda", "grouped_mm")]:
+        with wrapped(model(device, impl)):
+            depths.append(MEI._DECODING_DEPTH)
+        assert MEI._DECODING_DEPTH == 0
+    assert depths == [1, 1, 0, 0]
+    assert seen == ["cuda", "cuda", "cpu", "cuda"]
+    with pytest.raises(RuntimeError):
+        with wrapped(model("cuda", "unsloth")):
+            raise RuntimeError
+    assert MEI._DECODING_DEPTH == 0

@@ -2,21 +2,21 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Lesser General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Register an "unsloth" experts implementation as transformers' default, and tell the 4-bit
-quantizer which experts it may pack: only those whose forward is Unsloth's, since any other forward
-matmuls the packed bytes ("Expected mat_a to be Float32, BFloat16 or Float16 matrix, got Byte").
-"""
+
+"""Route transformers @use_experts_implementation experts through Unsloth's MoE forward; tell the 4-bit quantizer which it may pack."""
+import contextlib
+import functools
 import weakref
 
 import torch
@@ -46,19 +46,17 @@ def _experts_interface():
 
 
 def _forward_is_unsloth(forward) -> bool:
-    """True for Unsloth's expert forwards; `unsloth_compiled_module_*` classes keep the model's own."""
     fn = getattr(forward, "__func__", forward)
     if getattr(fn, "_unsloth_moe_forward", False):
         return True
     module = getattr(fn, "__module__", "") or ""
-    # Exact names only: anything that merely contains `moe_utils` is someone else's code.
+    # Compiled cache copy loads as `unsloth_cached_moe_utils` or bare `moe_utils`; other names are user code.
     if module.startswith("unsloth_zoo.") or module in ("unsloth_cached_moe_utils", "moe_utils"):
         return True
     return getattr(fn, "__name__", "") == "forward_moe_backend"
 
 
 def expert_forward_is_handled(module: nn.Module) -> bool:
-    """Whether the forward is Unsloth's, so packing the experts to 4-bit is safe."""
     cls = type(module)
     forward = getattr(cls, "forward", None)
     if forward is None:
@@ -67,7 +65,6 @@ def expert_forward_is_handled(module: nn.Module) -> bool:
         return True
     if not hasattr(forward, "__wrapped__"):
         return False
-    # A class unsloth_experts_forward hands back to transformers is not handled.
     if getattr(module, "has_gate", True) is False or _has_custom_gate(module):
         return False
     config = getattr(module, "config", None)
@@ -75,7 +72,6 @@ def expert_forward_is_handled(module: nn.Module) -> bool:
     return implementation == UNSLOTH_EXPERTS_IMPLEMENTATION
 
 
-# Resolved once: a function-level import on every experts forward is measurably slow.
 _LAZY = {}
 
 
@@ -98,7 +94,6 @@ def _moe_utils_module():
 
 
 def _has_custom_gate(module) -> bool:
-    """True when the class overrides `_apply_gate` (clamped / offset SwiGLU the backends lack)."""
     _default_apply_gate = _default_apply_gate_or_none()
     if _default_apply_gate is None:
         return False
@@ -111,7 +106,6 @@ def _has_custom_gate(module) -> bool:
 
 
 def _packs_fp4_experts(model) -> bool:
-    """FP4 experts (DeepSeek-V4) are packed int8 only transformers' dispatchers decode."""
     config = getattr(model, "config", None)
     configs = [config]
     try:
@@ -136,7 +130,7 @@ def _holds_packed_4bit_experts(model) -> bool:
     return False
 
 
-# transformers sets distributed_config on the outer config only; ids kept here so nothing is serialized.
+# Sub-config ids under expert parallelism (distributed_config is set on the outer config only); kept off configs so never serialized.
 _EXPERT_PARALLEL_SUBCONFIGS = set()
 
 
@@ -154,7 +148,6 @@ def _mark_subconfigs_expert_parallel(config) -> None:
 
 
 def _expert_parallel_requested(model) -> bool:
-    """Expert-parallel sentinels are masked only by transformers; marks sub-configs for nested models."""
     config = getattr(model, "config", None)
     distributed = getattr(config, "distributed_config", None)
     if bool(getattr(distributed, "enable_expert_parallel", False)):
@@ -163,14 +156,17 @@ def _expert_parallel_requested(model) -> bool:
     return config is not None and id(config) in _EXPERT_PARALLEL_SUBCONFIGS
 
 
-# Resolved once in patch_experts_interface so the dense route is a plain call Dynamo traces.
 _TRANSFORMERS_GROUPED_MM = None
+# transformers 5.3+ run grouped_mm anywhere via their own fallback; 5.2 needs torch._grouped_mm itself.
+_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK = False
+# generate() swaps grouped_mm for batched_mm while decoding; this depth counter lets the dense route follow.
+_TRANSFORMERS_BATCHED_MM = None
+_DECODING_DEPTH = 0
 
 _DENSE_STACK_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 
 def _dense_experts_without_expert_lora(module) -> bool:
-    """True when all stacks are plain float Parameters with no stashed expert LoRA (moe_lora_stash_name)."""
     params = module._parameters
     state = module.__dict__
     found = False
@@ -192,18 +188,18 @@ def unsloth_experts_forward(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Dense stacks without expert LoRA take transformers' grouped_mm, which a compiled block inlines."""
     if (
         _TRANSFORMERS_GROUPED_MM is not None
         and _dense_experts_without_expert_lora(self)
-        and _grouped_mm_supported()
+        and (_TRANSFORMERS_GROUPED_MM_HAS_FALLBACK or _grouped_mm_supported())
     ):
+        if _DECODING_DEPTH and _TRANSFORMERS_BATCHED_MM is not None and not torch.is_grad_enabled():
+            return _TRANSFORMERS_BATCHED_MM(self, hidden_states, top_k_index, top_k_weights)
         return _TRANSFORMERS_GROUPED_MM(self, hidden_states, top_k_index, top_k_weights)
     return _unsloth_experts_dispatch(self, hidden_states, top_k_index, top_k_weights)
 
 
 def _grouped_mm_supported() -> bool:
-    """Reads the cached probe first, so a compiled MoE block sees a constant."""
     moe_utils = _moe_utils_module()
     supported = moe_utils._TORCH_GROUPED_MM_SUPPORTED
     if supported is None:
@@ -211,7 +207,7 @@ def _grouped_mm_supported() -> bool:
     return bool(supported)
 
 
-# Kept out of Dynamo: inlined, AOT autograd saves every dequantized expert stack for backward (OOM).
+# Out of Dynamo: inlining the dispatch made AOT autograd save every dequantized expert stack (OOM on Inkling-Small).
 @torch.compiler.disable
 def _unsloth_experts_dispatch(
     self: nn.Module,
@@ -219,17 +215,53 @@ def _unsloth_experts_dispatch(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Unsloth's backend dispatcher; ungated and custom-gate classes take transformers' own path."""
     if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
         if fallback is not None:
+            # Without torch._grouped_mm support transformers' grouped_mm fails: take the eager forward.
             if not _moe_utils_module()._check_torch_grouped_mm_supported():
                 fallback = None
         if fallback is None:
             return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
         return fallback(self, hidden_states, top_k_index, top_k_weights)
     return _moe_utils_module().get_forward_moe_backend()(self, hidden_states, top_k_index, top_k_weights)
+
+
+def _implementation_values(model):
+    getter = getattr(model, "get_experts_implementation", None)
+    try:
+        implementation = getter() if callable(getter) else getattr(model.config, "_experts_implementation", None)
+    except Exception:
+        implementation = getattr(getattr(model, "config", None), "_experts_implementation", None)
+    return list(implementation.values()) if isinstance(implementation, dict) else [implementation]
+
+
+def _patch_decode_switch():
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except Exception:
+        return
+    original = GenerationMixin.__dict__.get("_optimize_model_for_decode")
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    @functools.wraps(original)
+    @contextlib.contextmanager
+    def _optimize_model_for_decode(self, *args, **kwargs):
+        global _DECODING_DEPTH
+        with original(self, *args, **kwargs):
+            switch = self.device.type != "cpu" and UNSLOTH_EXPERTS_IMPLEMENTATION in _implementation_values(self)
+            if switch:
+                _DECODING_DEPTH += 1
+            try:
+                yield
+            finally:
+                if switch:
+                    _DECODING_DEPTH -= 1
+
+    _optimize_model_for_decode._unsloth_patched = True
+    GenerationMixin._optimize_model_for_decode = _optimize_model_for_decode
 
 
 def patch_experts_interface():
@@ -241,12 +273,19 @@ def patch_experts_interface():
     except Exception as e:
         return logger.warning(f"Unsloth: could not patch the experts interface: {e}")
 
-    global _TRANSFORMERS_GROUPED_MM
+    global _TRANSFORMERS_GROUPED_MM, _TRANSFORMERS_BATCHED_MM, _TRANSFORMERS_GROUPED_MM_HAS_FALLBACK
     if _TRANSFORMERS_GROUPED_MM is None:
         try:
             _TRANSFORMERS_GROUPED_MM = interface["grouped_mm"] if "grouped_mm" in interface else None
+            _TRANSFORMERS_BATCHED_MM = interface["batched_mm"] if "batched_mm" in interface else None
         except Exception:
-            _TRANSFORMERS_GROUPED_MM = None
+            _TRANSFORMERS_GROUPED_MM = _TRANSFORMERS_BATCHED_MM = None
+        try:
+            import transformers.integrations.moe as transformers_moe
+            _TRANSFORMERS_GROUPED_MM_HAS_FALLBACK = hasattr(transformers_moe, "_can_use_grouped_mm")
+        except Exception:
+            _TRANSFORMERS_GROUPED_MM_HAS_FALLBACK = False
+    _patch_decode_switch()
     if UNSLOTH_EXPERTS_IMPLEMENTATION not in interface:
         interface[UNSLOTH_EXPERTS_IMPLEMENTATION] = unsloth_experts_forward
 
@@ -255,9 +294,10 @@ def patch_experts_interface():
         return
 
     def get_correct_experts_implementation(self, requested_experts):
-        # Only the default is ours; an explicit request is honoured and its experts stay unpacked.
+        # Only the default is ours: a user-chosen implementation is kept and its experts stay unpacked.
         if _expert_parallel_requested(self):
             if requested_experts == UNSLOTH_EXPERTS_IMPLEMENTATION:
+                # Expert parallel routing emits `num_experts` sentinels that only transformers' implementations mask.
                 logger.warning(
                     "Unsloth: the 'unsloth' experts implementation does not support expert "
                     "parallelism; using transformers' default instead."
@@ -267,9 +307,10 @@ def patch_experts_interface():
         if requested_experts is None and not _packs_fp4_experts(self):
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         if requested_experts == UNSLOTH_EXPERTS_IMPLEMENTATION:
-            # transformers 5.0 to 5.6 validates nested re-checks against a fixed list, not the registry.
+            # transformers 5.0 to 5.6 validate nested re-checks against a fixed name list, not the registry.
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         if requested_experts not in (None, UNSLOTH_EXPERTS_IMPLEMENTATION) and _holds_packed_4bit_experts(self):
+            # After a 4-bit load the experts are already packed; only a load-time choice leaves them unpacked.
             raise RuntimeError(
                 f"Unsloth: cannot switch the experts implementation to {requested_experts!r} "
                 "after the experts were loaded in 4-bit; only the 'unsloth' implementation "

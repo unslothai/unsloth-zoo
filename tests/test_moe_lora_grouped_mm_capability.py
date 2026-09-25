@@ -660,7 +660,6 @@ def _stub_triton_language(monkeypatch, has_make_tensor_descriptor):
 
 
 def test_the_triton_backend_is_not_offered_without_make_tensor_descriptor(monkeypatch):
-    """Triton 3.3 lacks tl.make_tensor_descriptor; the probe must say no and leave the native loop."""
     import sys, types
     for name in (
         "unsloth", "unsloth.kernels", "unsloth.kernels.moe",
@@ -672,6 +671,7 @@ def test_the_triton_backend_is_not_offered_without_make_tensor_descriptor(monkey
     interface.supports_tma = lambda *a, **kw: False
     monkeypatch.setattr(M, "_init_triton_allocator", lambda *a, **kw: None, raising = False)
     monkeypatch.setattr(M.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(M, "is_mlx_available", lambda: False)
     monkeypatch.delenv("UNSLOTH_DISABLE_MOE_TRITON", raising = False)
 
     _stub_triton_language(monkeypatch, has_make_tensor_descriptor = False)
@@ -712,6 +712,7 @@ def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
     interface.supports_tma = lambda *a, **kw: False
     monkeypatch.setattr(M, "_init_triton_allocator", lambda *a, **kw: None, raising = False)
     _stub_triton_language(monkeypatch, has_make_tensor_descriptor = True)
+    monkeypatch.setattr(M, "is_mlx_available", lambda: False)
 
     monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_MOE_TRITON", raising = False)

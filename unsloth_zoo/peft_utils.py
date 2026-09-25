@@ -64,8 +64,7 @@ SKIP_QUANTIZATION_MODULES = [
 _LINEAR_FORWARD_RETURNS_TENSOR_CACHE = {}
 
 def _linear_forward_returns_tensor(cls) -> bool:
-    """False for an nn.Linear subclass returning a tuple (MoE routers like Llama4Router), which
-    LoRA cannot add to: PEFT fails with "'tuple' object has no attribute 'to'"."""
+    """False for an nn.Linear subclass whose forward returns a tuple, which LoRA cannot add to."""
     cached = _LINEAR_FORWARD_RETURNS_TENSOR_CACHE.get(cls)
     if cached is not None:
         return cached

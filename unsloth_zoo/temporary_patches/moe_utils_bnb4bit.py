@@ -100,8 +100,6 @@ def _is_expert_module(module: nn.Module) -> bool:
 
 
 def _expert_forward_is_handled(module: nn.Module) -> bool:
-    """Whether 4-bit packing is safe: only if the forward is Unsloth's. Shape alone is not enough:
-    Llama-4's 3-D experts run their own bmm, which cannot read packed bytes."""
     try:
         from unsloth_zoo.temporary_patches.moe_experts_interface import expert_forward_is_handled
     except ImportError:

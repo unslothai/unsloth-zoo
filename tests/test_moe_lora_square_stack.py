@@ -1,4 +1,19 @@
-# Separated expert LoRA on a SQUARE stack (2I == H) must equal PEFT's merged per-expert delta.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import sys
 
 import pytest
@@ -13,7 +28,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _peft_original_wrapper_forward():
-    # Read module dicts: getattr on a lazy transformers module imports optional vision deps.
+    # Read module dicts: getattr on a transformers lazy module imports optional vision deps.
     for module in [MU, *list(sys.modules.values())]:
         if not isinstance(module, type(sys)):
             continue
@@ -92,10 +107,10 @@ def _stacked_experts(hidden, intermediate, stored_in_out, flag):
         def __init__(self):
             super().__init__()
             self.num_experts = E
-            if stored_in_out:   # (E, in, out)
+            if stored_in_out:
                 self.gate_up_proj = torch.nn.Parameter(torch.randn(E, hidden, 2 * intermediate) * 0.1)
                 self.down_proj = torch.nn.Parameter(torch.randn(E, intermediate, hidden) * 0.1)
-            else:               # (E, out, in)
+            else:
                 self.gate_up_proj = torch.nn.Parameter(torch.randn(E, 2 * intermediate, hidden) * 0.1)
                 self.down_proj = torch.nn.Parameter(torch.randn(E, hidden, intermediate) * 0.1)
 
@@ -122,7 +137,6 @@ def _stacked_experts(hidden, intermediate, stored_in_out, flag):
 @pytest.mark.parametrize("hidden,intermediate", [(64, 32), (64, 48)])
 @pytest.mark.parametrize("parameter_name", ["gate_up_proj", "down_proj"])
 def test_extractor_matches_peft_delta_for_every_stored_layout(flag, hidden, intermediate, parameter_name):
-    """Each square cell was wrong on some PEFT 0.19.0-0.21.0 under a rule keyed on either flag alone."""
     from peft.tuners.lora.layer import ParamWrapper
     stored_in_out = flag is not None
     torch.manual_seed(0)
