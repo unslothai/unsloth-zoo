@@ -102,8 +102,7 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
         # may take the causal window; a bidirectional call (is_causal False) must
         # stay bidirectional instead of being forced causal.
         causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
-        # No `Sq > w` gate: at seq_len == window transformers still passes a band mask,
-        # which sends SDPA to the slow memory-efficient kernel instead of flash.
+        # No `Sq > w` gate: at seq_len == window transformers still passes a band mask (slow SDPA kernel).
         if (w and Sq == Sk
                 and (attention_mask is not None or causal)
                 and _mask_is_plain_band(attention_mask, Sq, w)):

@@ -1759,14 +1759,7 @@ def _get_base_weight(param, target_dtype=None):
                 param.data, param.quant_state, getattr(param, "_original_shape", None),
             )
         if weight is None:
-            # An expert stack of 2**31 elements or more aborts inside the
-            # bitsandbytes dequantize kernel (csrc/ops.cu line 93), and this is the
-            # read the recompute and grouped-mm providers take on every forward and
-            # again on every backward recomputation. Slice it the same way the load
-            # does; the helper returns None for everything smaller, which leaves the
-            # single call below untouched.
-            # Resolved once and memoized rather than imported per call, since this
-            # is a read on every forward and every backward recomputation.
+            # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
             slicer = _get_dequantize_4bit_in_slices()
             weight = slicer(param) if slicer is not None else None
         if weight is None:

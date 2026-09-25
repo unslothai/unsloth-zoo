@@ -340,8 +340,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     if not target_dtype.is_floating_point:
         target_dtype = torch.bfloat16
 
-    # Same recompute-vs-pin policy as forward_native_grouped_mm: when recomputing, keep the
-    # packed Params4bit so a dense stack is never built and then re-held for backward.
+    # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
         select_moe_backend() == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)

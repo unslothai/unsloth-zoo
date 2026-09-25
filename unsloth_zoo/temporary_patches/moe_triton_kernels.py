@@ -101,8 +101,7 @@ def _kernels():
         t_mask = offs_t < T
         offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
         h_mask = offs_h < H
-        # torch.sum over top_k uses four interleaved partial sums, ((a0 + a1) + a2) + a3;
-        # the same order keeps this bit-identical to the eager combine.
+        # Same ((a0 + a1) + a2) + a3 partial-sum order as torch.sum over top_k: bit-identical to eager.
         acc0 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
         acc1 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
         acc2 = tl.zeros((BLOCK_T, BLOCK_H), dtype = tl.float32)
