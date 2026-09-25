@@ -7,21 +7,8 @@
 # by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""A post-lm_head scale must survive the fused-loss AST rewrite.
-
-Falcon-H1 and HyperCLOVAX end the canonical triplet with a muP-style scalar on
-the logits assignment itself:
-
-    logits = self.lm_head(hidden_states[:, slice_indices, :]) * self.model.lm_head_multiplier
-
-The fused path never materialises those logits, so the scale has to be handed to
-the kernel as ``logit_scale_multiply``. Peeling straight through to the inner
-``self.lm_head(...)`` call drops it, and training then optimises a loss computed
-on logits off by a constant factor (1/0.0078125 = 128x for Falcon-H1-34B), which
-overflows to NaN on the first optimizer step.
-
-CPU-only: the fused kernel has a CPU path, so these run without a GPU.
-"""
+"""Post-lm_head scales (Falcon-H1, HyperCLOVAX) must reach the fused kernel; dropping
+one trained on 128x-off logits and NaN'd on step 1. CPU-only."""
 
 from __future__ import annotations
 
@@ -72,7 +59,6 @@ FLOAT_FORWARD = PLAIN_FORWARD.replace(
 
 
 def _fused_call_src(new_src: str) -> str:
-    """The unsloth_fused_lm_head_loss(...) call as emitted by the rewrite."""
     tree = ast.parse(new_src)
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -82,16 +68,12 @@ def _fused_call_src(new_src: str) -> str:
 
 
 def _loss_function_call_src(new_src: str) -> str:
-    """The self.loss_function(...) call kept for the UNSLOTH_RETURN_LOGITS branch."""
     tree = ast.parse(new_src)
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "loss_function"):
             return ast.unparse(node)
     raise AssertionError("no loss_function call kept:\n" + new_src)
-
-
-# ---------------------------------------------------------------- structural
 
 
 def test_multiplier_reaches_the_fused_call():
@@ -116,13 +98,11 @@ def test_scale_on_the_left_is_still_a_multiply():
 
 
 def test_scale_is_not_applied_twice_in_the_return_logits_branch():
-    """That branch evaluates the original RHS, which already carries the scale."""
     new_src, _ = rewrite_forward_source(SCALED_FORWARD)
     assert "logit_scale_multiply" not in _loss_function_call_src(new_src)
 
 
 def test_unscaled_forward_is_unchanged():
-    """No scale means no new kwarg: other architectures keep today's behaviour."""
     new_src, cap = rewrite_forward_source(PLAIN_FORWARD)
     assert new_src is not None
     assert cap.scale_kws == []
@@ -136,7 +116,6 @@ def test_float_wrapper_still_rewrites():
 
 
 def test_repeated_scale_bails_out():
-    """Two multiplies would emit `logit_scale_multiply=` twice, a syntax error."""
     chained = SCALED_FORWARD.replace(
         ") * self.model.lm_head_multiplier",
         ") * self.model.lm_head_multiplier * self.config.extra_scale",
@@ -146,13 +125,8 @@ def test_repeated_scale_bails_out():
 
 
 def test_additive_bias_bails_out():
-    """`+ self.final_logits_bias` cannot be expressed as a logit scale, so the
-    rewrite must decline rather than silently drop the bias."""
     new_src, cap = rewrite_forward_source(BIASED_FORWARD)
     assert new_src is None and cap is None
-
-
-# ---------------------------------------------------------------- numerical
 
 
 class _Config:
@@ -167,8 +141,6 @@ class _Inner(torch.nn.Module):
 
 
 class _Tiny(torch.nn.Module):
-    """Minimal stand-in for a *ForCausalLM carrying a post-head multiplier."""
-
     def __init__(self, hidden=16, vocab=32, multiplier=0.0078125):
         super().__init__()
         torch.manual_seed(0)
@@ -196,7 +168,6 @@ class _Tiny(torch.nn.Module):
 
 
 def _install_rewritten(cls):
-    """Apply the rewrite to cls.forward the way forward_install does."""
     import os
 
     from unsloth_zoo.fused_losses.forward_adapter import (
@@ -224,8 +195,6 @@ def inspect_source(fn):
 
 
 def test_rewritten_forward_matches_the_reference_loss():
-    """The end-to-end check: on a dropped multiplier the fused loss is the loss of
-    logits 1/multiplier times too large, which is what made Falcon-H1 diverge."""
     model = _Tiny()
     torch.manual_seed(1)
     hidden = torch.randn(1, 8, 16, dtype=torch.float32)
@@ -245,8 +214,7 @@ def test_rewritten_forward_matches_the_reference_loss():
 
 
 def test_unscaled_model_is_unaffected():
-    """Same harness with multiplier 1.0: proves the check above is not vacuous and
-    that models without a scale keep matching."""
+    """Multiplier 1.0 control: proves the check above is not vacuous."""
     model = _Tiny(multiplier=1.0)
     torch.manual_seed(1)
     hidden = torch.randn(1, 8, 16, dtype=torch.float32)

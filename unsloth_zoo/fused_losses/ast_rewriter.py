@@ -54,8 +54,7 @@ class TripletCapture:
     lm_head_assign_idx: int   # index in the function body of the `logits = self.lm_head(...)` stmt
     if_block_idx: int         # index of the `if labels is not None:` stmt
     loss_init_idx: int | None # index of the `loss = None` stmt that we delete (may be None)
-    # [(name, ast.AST), ...] post-head scaling, passed to the fused call only.
-    # Defaulted and last so existing constructions keep working.
+    # [(name, ast.AST)] post-head scaling; fused call only. Defaulted + last for existing callers.
     scale_kws: list = field(default_factory = list)
 
 
@@ -72,27 +71,16 @@ def _contains_self_attr_call(node: ast.AST) -> bool:
     return any(_is_self_attr_call(n) for n in ast.walk(node))
 
 
-# Methods that may wrap the head call without changing what cross entropy sees:
-# the fused kernel casts to the head dtype and accumulates in float32 itself, and
-# contiguity is irrelevant to it.
+# Wrappers the fused kernel makes redundant (it casts + accumulates in fp32 itself).
 _TRANSPARENT_METHODS = frozenset(("float", "contiguous", "to"))
 
 
 def _unwrap_logits_rhs(value: ast.AST):
-    """Peel the `logits = ...` RHS down to its `self.<HEAD>(<HIDDEN>)` call.
+    """Peel the logits RHS to ``(self.<HEAD>(...) call, scale_kws)``, or ``None``.
 
-    Returns ``(call, scale_kws)``, where ``scale_kws`` carries any post-head
-    scaling that the fused kernel must reapply because the fused path never
-    materialises the logits the scaling was written against:
-
-        logits = self.lm_head(h) * self.model.lm_head_multiplier   # Falcon-H1
-        logits = self.lm_head(h) * self.config.logits_scaling      # HyperCLOVAX
-
-    Returns ``None`` for any other wrapper (e.g. `+ self.final_logits_bias`, or
-    a subscript that would slice logits without slicing labels). The caller then
-    leaves the class alone and the normal loss path runs, which is slower but
-    correct. Peeling blindly - the old behaviour - silently dropped the wrapper
-    and trained on logits off by a constant factor.
+    ``* s`` / ``/ s`` (Falcon-H1, HyperCLOVAX) become fused-kernel scale kwargs; any
+    other wrapper (bias add, subscript) returns None, since peeling blindly dropped
+    it and trained on wrongly scaled logits.
     """
     scale_kws: list = []
     node = value
@@ -112,16 +100,14 @@ def _unwrap_logits_rhs(value: ast.AST):
                 _contains_self_attr_call(node.right),
             )
             if left_has and not right_has:
-                # head * scale, or head / scale.
                 kw = "logit_scale_multiply" if isinstance(node.op, ast.Mult) else "logit_scale_divide"
                 scale, node = node.right, node.left
             elif right_has and not left_has and isinstance(node.op, ast.Mult):
-                # scale * head. `scale / head` is not a scaling, so Div is excluded.
+                # `scale / head` is not a scaling.
                 kw, scale, node = "logit_scale_multiply", node.left, node.right
             else:
                 return None
-            # The kernel takes one of each, and a repeat would emit a duplicate
-            # keyword argument. Chained scales are not worth folding; bail.
+            # A repeat would emit a duplicate keyword argument.
             if any(name == kw for name, _ in scale_kws):
                 return None
             scale_kws.append((kw, scale))
@@ -264,11 +250,8 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
             continue
         unwrapped = _unwrap_logits_rhs(stmt.value)
         if unwrapped is None:
-            # Either logits are re-assigned by a non-lm_head expr (e.g. Cohere's
-            # `logits = logits * self.logit_scale`), so removing the lm_head call
-            # would leave it referencing an undefined `logits`; or the head call is
-            # wrapped in something the fused kernel cannot reproduce. Bail and let
-            # LOSS_MAPPING handle this class.
+            # Non-lm_head reassign (Cohere's `logits * self.logit_scale`) or an
+            # unreproducible wrapper: bail to LOSS_MAPPING.
             return None
         inner, scale_kws = unwrapped
         head_attr = inner.func.attr
@@ -329,10 +312,8 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
-    # Post-head scaling goes to the fused call only. The RETURN_LOGITS and
-    # generation branches evaluate the original RHS, which already applies it;
-    # passing it there too would scale twice. An explicit kwarg of the same name
-    # on the model's own loss_function call wins, so we never emit a duplicate.
+    # Fused call only: other branches evaluate the original RHS (would scale twice).
+    # An explicit same-name loss_function kwarg wins, avoiding a duplicate.
     already = {name for name, _ in cap.extra_loss_kws}
     scale_extra = "".join(
         f", {name}={ast.unparse(value)}"
