@@ -83,12 +83,21 @@ class _Block:
     __slots__ = ("params", "host", "devices", "names", "streams", "events", "resident", "slot", "sig")
 
     def __init__(self, layer, streams):
-        self.params, self.host, self.devices, self.names = [], [], [], []
+        self.params, self.host, self.devices = [], [], []
+        index = {}
         for name, p in _swappable(layer):
+            index[id(p)] = len(self.params)
             self.params.append(p)
             self.host.append(_to_pinned_host(p.data))
             self.devices.append(p.data.device)
-            self.names.append(name)
+        # named_parameters() dedups shared params, but state_dict() emits every
+        # registered alias. Record all alias names per swapped param (name, host
+        # index) so _state_dict substitutes the host copy for each one, not just
+        # the first -- otherwise the other aliases serialize as empty tensors.
+        self.names = []
+        for name, p in layer.named_parameters(recurse = True, remove_duplicate = False):
+            if id(p) in index:
+                self.names.append((name, index[id(p)]))
         # One side stream and one event per device: a block whose frozen params
         # are sharded across cards keeps each card's copies on that card's
         # stream, and the consumer waits on every device's event -- one event on
@@ -164,13 +173,22 @@ class BlockSwap:
         # the later block repoints p.data and the earlier block's post-hook then
         # evicts it out from under the still-resident later one. The scheduler
         # can't coordinate that, so reject it before any hooks are installed.
+        #
+        # The same object shared with an *unswapped* layer is just as unsafe:
+        # eviction sets its data to an empty tensor, and no hook manages the
+        # unswapped layer, so it runs with a zero-length weight. Scan every
+        # supplied layer, not just the swapped tail, and reject either case.
+        unswapped = set()
+        for layer in layers[:self.start]:
+            for _, p in _swappable(layer):
+                unswapped.add(id(p))
         seen = set()
         for b in self.blocks:
             for p in b.params:
-                if id(p) in seen:
+                if id(p) in seen or id(p) in unswapped:
                     raise ValueError(
-                        "block_swap: a Parameter is shared across two swapped decoder "
-                        "layers; exclude the shared layer or reduce the swap depth.")
+                        "block_swap: a Parameter is shared with another decoder "
+                        "layer; exclude the shared layer or reduce the swap depth.")
                 seen.add(id(p))
 
         for i, layer in enumerate(layers[self.start:]):
@@ -289,10 +307,10 @@ class BlockSwap:
     def _state_dict(self, i):
         def hook(module, state_dict, prefix, local_metadata):
             b = self.blocks[i]
-            for name, host in zip(b.names, b.host):
+            for name, idx in b.names:
                 key = prefix + name
                 if key in state_dict:
-                    state_dict[key] = host
+                    state_dict[key] = b.host[idx]
         return hook
 
     def reset(self):
