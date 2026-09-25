@@ -404,7 +404,7 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
 # MLX raises instead of returning zero when a backward pass reaches a
 # gather/scatter index, aborting every graph that derives indices from activations:
 # MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
-# forward value; producers are wrapped too, since `__getitem__` hides the consumer.
+# forward value; producers, consumers and integer `__getitem__` keys are all detached.
 _MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
 _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
     "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
