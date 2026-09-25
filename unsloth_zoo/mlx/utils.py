@@ -2973,6 +2973,11 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
+# Families whose `Model.__call__` hands `mm_token_type_ids` to the text model for its
+# bidirectional vision blocks; gemma4_unified shares that text model but drops them.
+_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
+
+
 def _drop_pair_token_type_ids(batch_dict, kwargs):
     """Keep suffix/prefix pair markers out of the text stack.
 
@@ -3142,6 +3147,12 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
+    if (
+        "mm_token_type_ids" in extra_kwargs
+        and _config_get(getattr(model, "config", None), "model_type")
+        in _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES
+    ):
+        backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:

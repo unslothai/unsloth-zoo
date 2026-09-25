@@ -2612,9 +2612,8 @@ def test_nested_text_decoder_qualification_decides_its_parent():
 
 
 def test_gemma4_training_masks_match_upstream_without_a_host_read(monkeypatch):
-    """`use_cce=False` runs upstream `Model.__call__`, whose mask builder asks the
-    host whether a vision token is present; while training the masks must match
-    upstream's under mx.compile."""
+    """Upstream's mask builder asks the host whether a vision token is present;
+    while training the masks must match upstream's under mx.compile."""
     _skip_if_mlx_core_was_replaced()
     from functools import partial
     from types import SimpleNamespace as NS
@@ -2654,6 +2653,19 @@ def test_gemma4_training_masks_match_upstream_without_a_host_read(monkeypatch):
             if isinstance(m, mx.array)])
         assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
         assert arrays(patched(stack(bidirectional, True), h, cache, ids)) == want
+    # The CCE loss hands the trainer's shared K/V slots in as the cache.
+    from unsloth_zoo.mlx.utils import _SharedKVSlot
+    slots = [_SharedKVSlot(), None]
+    traced = mx.compile(lambda h, ids: patched(stack("vision", True), h, slots, ids))
+    assert arrays(traced(h, ids)) == arrays(upstream(stack("vision", False), h, cache, ids))
+    # A cache holding a prefix, or a batch cache's per-row offsets, is left to
+    # upstream even in training mode.
+    from mlx_vlm.models.cache import BatchKVCache, KVCache
+    prefix = KVCache()
+    prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
+    for held in ([prefix, None], [BatchKVCache([1, 0]), None]):
+        assert arrays(patched(stack("vision", True), h, held, ids)) == arrays(
+            upstream(stack("vision", True), h, held, ids))
     # Without a vision token the overlay adds nothing to the causal masks, while
     # inference keeps upstream's cheaper string form.
     text_only = mx.zeros((2, 5), dtype=mx.int32)

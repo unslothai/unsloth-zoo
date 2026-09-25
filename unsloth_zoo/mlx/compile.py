@@ -4988,8 +4988,8 @@ def _install_gemma4_compile_patches():
     """Build gemma4's training attention masks without a host read.
 
     Upstream asks the host whether any vision token is present before it
-    overlays bidirectional vision blocks, which raises under mx.compile on the
-    `use_cce=False` loss, the one that forwards `mm_token_type_ids`.
+    overlays bidirectional vision blocks, which raises under mx.compile whenever
+    the loss forwards `mm_token_type_ids`.
     """
 
     language_module = _try_import_module("mlx_vlm.models.gemma4.language")
@@ -4998,8 +4998,14 @@ def _install_gemma4_compile_patches():
     if original_make_masks is None:
         return
 
+    def left_to_upstream(c):
+        # Only a scalar offset of 0, like the trainer's shared K/V slots, is known to
+        # hold no prefix; batch caches keep per-row offset arrays.
+        offset = getattr(c, "offset", None)
+        return c is not None and not (isinstance(offset, int) and offset == 0)
+
     def patched_make_masks(self, h, cache, mm_token_type_ids=None):
-        if not getattr(self, "training", False) or any(c is not None for c in cache):
+        if not getattr(self, "training", False) or any(map(left_to_upstream, cache)):
             return original_make_masks(self, h, cache, mm_token_type_ids)
         if (
             getattr(self.config, "use_bidirectional_attention", None) != "vision"
