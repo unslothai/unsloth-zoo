@@ -895,9 +895,7 @@ _BNB_SKIP_MATCH = '(key + "." in current_key_name_str) or (key == current_key_na
 
 
 def _add_suffix_match_to_bnb_skip(source: str) -> str:
-    """transformers 4.x matches a skip entry only as a parent prefix or the full path, so a
-    dotted leaf entry such as `moe.gate` or `mlp.gate` never matches `model.layers.N.moe.gate`
-    and the router is quantized anyway. Add the suffix match transformers 5 does itself."""
+    # 4.x never matches a dotted leaf like `moe.gate`; add the suffix match 5.x already does.
     return source.replace(
         _BNB_SKIP_MATCH,
         _BNB_SKIP_MATCH + ' or current_key_name_str.endswith("." + key)',

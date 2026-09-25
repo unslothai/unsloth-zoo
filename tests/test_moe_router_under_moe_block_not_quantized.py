@@ -12,15 +12,8 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A MoE router that lives under a `moe` block must stay out of 4-bit.
-
-stepfun-ai/Step-3.7-Flash keeps its router at `layers.N.moe.gate` and reads
-its weight directly (`hidden @ self.gate.weight.t()`), so a Linear4bit there
-hands the matmul packed bytes: "mat1 and mat2 shapes cannot be multiplied
-(512x4096 and 1x589824)". The skip list already covered `mlp.gate` and
-`block_sparse_moe.gate`; this pins `moe.gate` and checks that the suffix
-does not swallow the `moe.gate_proj` / `moe.up_proj` expert stacks next to it.
-"""
+"""Step-3.7-Flash reads `moe.gate.weight` directly, so a Linear4bit router fails with
+"mat1 and mat2 shapes cannot be multiplied (512x4096 and 1x589824)"."""
 import pytest
 import torch
 import torch.nn as nn
@@ -45,12 +38,7 @@ EXPERT_NAMES = [
 
 
 def _should_convert_module():
-    """transformers' own matcher, or a skip.
-
-    `quantizers_utils` exists on transformers 4.x too, so importorskip on the
-    module resolves there and the attribute access then raises AttributeError:
-    `should_convert_module` first ships in transformers 5.0. Gate on the symbol.
-    """
+    # quantizers_utils exists on 4.x too; should_convert_module ships in 5.0, so gate on the symbol.
     module = pytest.importorskip("transformers.quantizers.quantizers_utils")
     function = getattr(module, "should_convert_module", None)
     if function is None:
@@ -75,21 +63,12 @@ def test_neighbouring_projections_still_convert(name):
 
 
 def test_legacy_match_reaches_no_router_and_no_expert():
-    """What transformers 4.x really does with this entry.
-
-    `_replace_with_bnb_linear` there tests `(key + "." in current_key_name_str)
-    or (key == current_key_name_str)` on the UNPADDED path, so a pattern can
-    only match something BELOW the key, never a leaf: `moe.gate` does not reach
-    `model.layers.3.moe.gate`, exactly as the pre-existing `mlp.gate` and
-    `block_sparse_moe.gate` entries do not. The entry is inert on 4.x and the
-    router is still quantized there; what matters is that it is inert in the
-    SAFE direction, i.e. it never captures an expert or attention projection.
-    Copied from transformers 4.57.6 integrations/bitsandbytes.py."""
+    """Unpatched transformers 4.57.6 matcher: never reaches a dotted leaf, and never an expert."""
     def legacy_skip(full_name, keys):
         return any((key + "." in full_name) or (key == full_name) for key in keys)
 
     for name in ROUTER_NAMES:
-        if name == "moe.gate":   # a root-level router is an exact-equality hit
+        if name == "moe.gate":
             assert legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
         else:
             assert not legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
@@ -98,7 +77,6 @@ def test_legacy_match_reaches_no_router_and_no_expert():
 
 
 class _MoELinear(nn.Module):
-    """Step-3.7's per-expert stack: one 3-D weight, indexed by expert id."""
     def __init__(self, num_experts, in_features, out_features):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(num_experts, out_features, in_features))
@@ -131,7 +109,7 @@ class _Model(nn.Module):
 
 
 def test_replace_with_bnb_linear_leaves_the_router_alone():
-    _should_convert_module()   # the entry only reaches a leaf on transformers >= 5.0
+    _should_convert_module()
     bnb = pytest.importorskip("bitsandbytes")
     integrations = pytest.importorskip("transformers.integrations.bitsandbytes")
     from transformers import BitsAndBytesConfig
@@ -146,14 +124,10 @@ def test_replace_with_bnb_linear_leaves_the_router_alone():
     for layer in model.layers:
         assert type(layer.moe.gate) is nn.Linear, type(layer.moe.gate)
         assert isinstance(layer.share_expert.gate_proj, bnb.nn.Linear4bit)
-        # Expert stacks are bare parameters: not a Linear, so untouched here.
         assert isinstance(layer.moe.up_proj.weight, nn.Parameter)
 
 
 def test_the_4x_matcher_gains_a_suffix_match():
-    """On transformers 4.x the bitsandbytes skip check is `key + "." in path or key == path`, so
-    a dotted leaf entry never matched the leaf itself. The rewritten check also takes the
-    entry as a suffix."""
     from unsloth_zoo.patching_utils import _add_suffix_match_to_bnb_skip, _BNB_SKIP_MATCH
 
     snippet = (
@@ -167,5 +141,5 @@ def test_the_4x_matcher_gains_a_suffix_match():
     exec("def matches(current_key_name_str, modules_to_not_convert):\n    return any(" + _BNB_SKIP_MATCH + ' or current_key_name_str.endswith("." + key)' + " for key in modules_to_not_convert)", namespace)
     assert namespace["matches"]("model.layers.3.moe.gate", ["moe.gate"]) is True
     assert namespace["matches"]("model.layers.3.moe.gate_proj", ["moe.gate"]) is False
-    assert namespace["matches"]("model.layers.3.moe.gate.weight", ["moe.gate"]) is True   # parent prefix, as before
+    assert namespace["matches"]("model.layers.3.moe.gate.weight", ["moe.gate"]) is True 
     assert _add_suffix_match_to_bnb_skip("nothing here") == "nothing here"
