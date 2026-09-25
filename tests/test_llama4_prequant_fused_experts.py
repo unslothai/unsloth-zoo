@@ -70,6 +70,8 @@ from safetensors.torch import save_file
 import unsloth_zoo.temporary_patches.moe_utils_bnb4bit as moe_bnb4bit
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
 
+_REAL_FUSED_FORWARD_AVAILABLE = moe_bnb4bit._fused_forward_available
+
 NUM_EXPERTS, HIDDEN = 4, 64
 
 
@@ -174,6 +176,12 @@ def _load(path):
     return Llama4ForCausalLM.from_pretrained(path, device_map = "cpu", output_loading_info = True)
 
 
+@pytest.fixture(autouse = True)
+def _fused_forward_present(monkeypatch):
+    # The kept-fused path needs the Llama-4 MoE forward patch; these tests exercise the load itself.
+    monkeypatch.setattr(moe_bnb4bit, "_fused_forward_available", lambda name: True)
+
+
 @pytest.fixture(scope = "module")
 def fused_checkpoint(tmp_path_factory):
     return _build_checkpoint(tmp_path_factory.mktemp("llama4_fused"), "fused")
@@ -219,6 +227,28 @@ def test_without_the_layout_decision_the_fused_checkpoint_still_fails(fused_chec
     monkeypatch.setattr(moe_bnb4bit, "_checkpoint_expert_layout", lambda checkpoint_files: None)
     with pytest.raises(NotImplementedError, match = "Byte"):
         _load(fused_checkpoint)
+
+
+def test_without_the_fused_forward_the_transformers_swap_still_runs(fused_checkpoint, monkeypatch):
+    """Without a MoE forward that reads kept-fused stacks, keeping them would only move the
+    failure to the first forward, so the load takes transformers' swap as before."""
+    _apply_bnb4bit_patches()
+    monkeypatch.setattr(moe_bnb4bit, "_fused_forward_available", lambda name: False)
+    with pytest.raises(NotImplementedError, match = "Byte"):
+        _load(fused_checkpoint)
+
+
+def test_fused_forward_available_follows_the_llama4_patch_module(monkeypatch):
+    import importlib.util
+
+    seen = []
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: seen.append(name) or None)
+    assert _REAL_FUSED_FORWARD_AVAILABLE("Llama4TextExperts") is False
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: seen.append(name) or object())
+    assert _REAL_FUSED_FORWARD_AVAILABLE("Llama4TextExperts") is True
+    # Classes without a registered forward patch are not gated.
+    assert _REAL_FUSED_FORWARD_AVAILABLE("SomeOtherExperts") is True
+    assert seen == ["unsloth_zoo.temporary_patches.llama4_moe"] * 2
 
 
 def test_per_expert_checkpoint_keeps_the_transformers_swap(tmp_path):

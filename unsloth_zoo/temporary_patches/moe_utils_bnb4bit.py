@@ -1359,13 +1359,29 @@ def _checkpoint_expert_layout(checkpoint_files) -> Optional[str]:
     return None
 
 
+# A kept-fused expert stack is only usable with a MoE forward that reads it; keep the
+# class fused only when that patch ships in this unsloth_zoo, else transformers' swap runs.
+_FUSED_FORWARD_PATCHES = {"Llama4TextExperts": "unsloth_zoo.temporary_patches.llama4_moe"}
+
+
+def _fused_forward_available(name) -> bool:
+    module = _FUSED_FORWARD_PATCHES.get(name)
+    if module is None:
+        return True
+    try:
+        import importlib.util
+        return importlib.util.find_spec(module) is not None
+    except Exception:
+        return False
+
+
 def _swappable_fused_expert_classes(model, swap_table) -> set:
     """Class names in transformers' pre-quantized module swap table that this model
     holds as fused expert stacks (3-D gate_up_proj / down_proj parameters)."""
     names = set()
     for module in model.modules():
         name = type(module).__name__
-        if name in swap_table and _is_expert_module(module):
+        if name in swap_table and _is_expert_module(module) and _fused_forward_available(name):
             names.add(name)
     return names
 
