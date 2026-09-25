@@ -121,6 +121,11 @@ def test_native_name_sanitizer_preserves_vlm_expert_export(monkeypatch, tmp_path
 @pytest.mark.parametrize("source_form", ["converted", "unsanitized_layout", "extra_key"])
 def test_native_name_sanitizer_keeps_converted_norms(source_form):
     import mlx.nn as nn
+    from mlx_simulation import mlx_is_simulated
+
+    # A sibling module can install the torch shim mid-session; it has no nn.RMSNorm.
+    if mlx_is_simulated() or "mlx_simulation" in str(getattr(nn, "__file__", "")):
+        pytest.skip("needs real MLX, the torch shim is installed")
     from unsloth_zoo.mlx import loader
 
     class Reshifting(nn.Module):
