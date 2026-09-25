@@ -61,7 +61,11 @@ def _to_pinned_host(t):
     try:
         return host.pin_memory()
     except RuntimeError as e:
-        if "out of memory" not in str(e).lower(): raise
+        # Some torch/CUDA builds report pinned exhaustion as the compact
+        # "cudaErrorMemoryAllocation" with no spaced "out of memory" phrase;
+        # treat both as host-alloc OOM, mirroring gradient_checkpointing.
+        text = str(e).lower()
+        if "out of memory" not in text and "cudaerrormemoryallocation" not in text: raise
         _PINNED_MEMORY_AVAILABLE = False
         return host
 
@@ -267,14 +271,21 @@ class BlockSwap:
         for h in self.handles:
             h.remove()
         self.handles = []
-        # Restoring every block at once needs real allocations, not pool slots.
+        # Free the pool before restoring: the full restore needs real
+        # allocations, not pool slots, and holding the unused free slots while
+        # allocating them can OOM on a card sized for the swapped model (and
+        # would fire again inside the constructor's rollback, which calls here).
+        self.free = {}
         for b in self.blocks:
             if not b.resident:
                 for p, h, d in zip(b.params, b.host, b.devices):
                     p.data = h.to(d, copy = True)
                 b.resident = True
-        self.free = {}
-        torch.cuda.synchronize()
+        # Sync every device we prefetched on, not just the current one: a sharded
+        # model can have an in-flight copy on another card, and the pre-hook that
+        # would have waited on its event is already removed above.
+        for dev in self.streams:
+            torch.cuda.synchronize(dev)
 
     def host_bytes(self):
         return sum(b.nbytes() for b in self.blocks)
