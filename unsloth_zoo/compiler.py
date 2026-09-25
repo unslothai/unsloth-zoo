@@ -4406,9 +4406,13 @@ def patch_lora_forwards(torch_compile_options):
 
         # Check failed upcasting
         source = _patch_lora_input_cast(source)
+        # getsource unwrapped the integer-input wrapper, so on 4-bit re-add the cast inline.
+        check_forward_args = "self._check_forward_args(x, *args, **kwargs)"
+        integer_input_inline = "4bit" in child.lower() and check_forward_args in source
         source = source.replace(
-            "self._check_forward_args(x, *args, **kwargs)",
-            "",
+            check_forward_args,
+            "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
+            if integer_input_inline else "",
         )
 
         if hash(source) != old_hash:
@@ -4467,6 +4471,11 @@ def patch_lora_forwards(torch_compile_options):
                     "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
                 )
 
+            if integer_input_inline:
+                extra_prepend += (
+                    "\nfrom unsloth_zoo.temporary_patches.misc import "
+                    "_lora_integer_input as _unsloth_lora_integer_input\n"
+                )
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
@@ -4475,10 +4484,18 @@ def patch_lora_forwards(torch_compile_options):
                 prepend=f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n"
                 + extra_prepend,
             ).unsloth_forward
+            if integer_input_inline:
+                forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
     pass
+    try:
+        from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
+
+        patch_peft_lora_integer_input()
+    except Exception:
+        pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
 

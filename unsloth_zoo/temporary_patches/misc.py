@@ -2630,3 +2630,69 @@ def patch_longrope_impossible_attention_factor():
         return
 pass
 TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
+
+
+def patch_relu_squared_activation_dtype():
+    """`torch.square` autocasts to float32, breaking Nemotron-H's bf16 `index_add_`; use y * y."""
+    try:
+        import transformers.activations as activations_module
+    except Exception:
+        return
+    activation_class = getattr(activations_module, "ReLUSquaredActivation", None)
+    if activation_class is None or getattr(activation_class, "_unsloth_dtype_patched", False):
+        return
+
+    def forward(self, input):
+        relu_applied = torch.nn.functional.relu(input)
+        return relu_applied * relu_applied
+
+    activation_class.forward = forward
+    activation_class._unsloth_dtype_patched = True
+pass
+TEMPORARY_PATCHES.append(patch_relu_squared_activation_dtype)
+
+
+def _lora_integer_input(self, x):
+    """Prefer the autocast dtype: casting to compute_dtype (float32 default) promotes the output."""
+    if x.is_floating_point() or x.is_complex():
+        return x
+    dtype = None
+    try:
+        if torch.is_autocast_enabled(x.device.type):
+            dtype = torch.get_autocast_dtype(x.device.type)
+    except Exception:
+        dtype = None
+    if dtype is None:
+        dtype = getattr(self.base_layer, "compute_dtype", None)
+    if dtype is None:
+        for adapter in self.active_adapters:
+            if adapter in self.lora_A:
+                dtype = self.lora_A[adapter].weight.dtype
+                break
+    return x.to(dtype) if dtype is not None else x
+pass
+
+
+def patch_peft_lora_integer_input():
+    """Nemotron-H feeds uint8 zeros to idle 4-bit experts; PEFT LoRA under autocast then fails."""
+    try:
+        import peft.tuners.lora.bnb as peft_bnb
+        Linear4bit = getattr(peft_bnb, "Linear4bit", None)
+    except Exception:
+        return
+    if Linear4bit is None:
+        return
+    original_forward = Linear4bit.__dict__.get("forward")
+    if original_forward is None or getattr(original_forward, "_unsloth_integer_input", False):
+        return
+
+    @functools.wraps(original_forward)
+    def forward(self, x, *args, **kwargs):
+        if isinstance(x, torch.Tensor) and not x.is_floating_point():
+            x = _lora_integer_input(self, x)
+        return original_forward(self, x, *args, **kwargs)
+
+    forward._unsloth_integer_input = True
+    Linear4bit.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
