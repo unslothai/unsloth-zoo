@@ -53,6 +53,20 @@ jobs:
       fail-fast: false
       matrix:
         mlx_vlm: ['0.4.4', '0.5.0', '0.6.0', '0.6.1', '0.6.2', '0.6.3', '0.6.4']
+    env:
+      # Point HF_HOME at a directory inside the workspace, and cache that, which is how
+      # every model cache in unslothai/unsloth is arranged (studio-api-smoke.yml:114,
+      # studio-ui-smoke.yml:182 and the rest all use `${{ github.workspace }}/hf-cache`).
+      #
+      # This used to cache `~/.cache/huggingface` directly. That is huggingface_hub's
+      # DEFAULT credential home, so the token file it writes on login lives at
+      # `~/.cache/huggingface/token`, i.e. inside the cached path. Nothing here logs in
+      # and this workflow holds no secret, so nothing was ever written -- the protection
+      # was the absence of a token rather than anything about the cache. Caching a
+      # purpose-made directory instead means the cached tree is one this workflow creates
+      # and nothing else in the runner's home shares, and it is the arrangement the guard
+      # in tests/security/test_cached_paths_hold_no_credentials.py can check.
+      HF_HOME: ${{ github.workspace }}/hf-cache
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
@@ -104,8 +118,8 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         continue-on-error: true
         with:
-          path: ~/.cache/huggingface
-          key: hf-gemma4-e2b-4bit-v1
+          path: hf-cache
+          key: hf-gemma4-e2b-4bit-v2
 
       - name: Probe
         # No torchvision, matching what a Mac user installing zoo[mlx] gets.
@@ -140,5 +154,5 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         continue-on-error: true
         with:
-          path: ~/.cache/huggingface
-          key: hf-gemma4-e2b-4bit-v1
+          path: hf-cache
+          key: hf-gemma4-e2b-4bit-v2

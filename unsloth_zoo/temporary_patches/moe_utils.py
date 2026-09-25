@@ -873,6 +873,16 @@ def _check_grouped_gemm_available():
     global _GROUPED_GEMM_AVAILABLE
     if _GROUPED_GEMM_AVAILABLE is not None: return _GROUPED_GEMM_AVAILABLE
 
+    # The kernel asserts `X.device.type == "cuda"` on entry, so importable is not the
+    # same as usable: on a CPU box with unsloth installed this used to answer yes,
+    # select_moe_backend picked "unsloth_triton", and the first expert forward died on
+    # "X and W must be on CUDA" instead of taking the native loop. Asked here rather
+    # than at the call site, the way _check_torch_grouped_mm_supported already refuses
+    # without an accelerator.
+    if not torch.cuda.is_available():
+        _GROUPED_GEMM_AVAILABLE = False
+        return False
+
     try:
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
         _GROUPED_GEMM_AVAILABLE = True

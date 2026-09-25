@@ -40,6 +40,8 @@ device from a config.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -52,6 +54,16 @@ from unsloth_zoo.temporary_patches.common import RESCOPE_PATCH_FLAG, WRAPPER_INN
 
 def _core_model_loading():
     core = pytest.importorskip("transformers.core_model_loading")
+    # On a transformers that predates the module (4.x), importing unsloth installs an inert
+    # stand-in under this name so peft can import (`_build_transformers_core_model_loading_stub`
+    # in unsloth/import_fixes.py). Its WeightRenaming stores its patterns and renames nothing,
+    # so every assertion below would measure the stand-in rather than transformers. A real
+    # module is a file on disk; the stand-in's `__file__` is `<unsloth stub: ...>`.
+    if not os.path.isfile(getattr(core, "__file__", None) or ""):
+        pytest.skip(
+            f"transformers.core_model_loading is a stand-in ({getattr(core, '__file__', None)!r}), "
+            "not a module this transformers ships"
+        )
     if not hasattr(core, "WeightRenaming"):
         pytest.skip("this transformers has no WeightRenaming")
     return core
