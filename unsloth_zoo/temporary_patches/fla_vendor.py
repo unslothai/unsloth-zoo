@@ -852,12 +852,7 @@ _NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
 
 
 def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING):
-    """RDNA1: make every later kernel-hub decoration bind the torch function, never fla.
-
-    The decorator resolves fla once, when it is applied, and unsloth's compiler re-applies it
-    in unsloth_compiled_module_* (importing the name from the modeling module) after the last
-    patch phase, so rebinding existing wrappers alone still reached fla on the first load.
-    """
+    """RDNA1: later kernel-hub decorations bind the torch function; the decorator resolves fla when applied, and unsloth's compiler re-applies it after the last patch phase."""
     try:
         from transformers.integrations import hub_kernels
     except Exception:
