@@ -33,7 +33,10 @@ import pathlib
 import textwrap
 
 import pytest
-import torch
+
+# torch is intentionally NOT imported at module level: the CPU-safe structural
+# tests (AST / source checks) must still collect on a host without torch. The few
+# tensor tests below import it locally, and unsloth_zoo's own init pulls it in.
 
 # Importing unsloth_zoo on a GPU host runs its full init, which asserts Unsloth
 # is present. Set the flag defensively so the test is self-contained.
@@ -1280,11 +1283,13 @@ def test_gpus_with_dot_instructions_do_not_trip_the_rdna1_path(monkeypatch):
 
 def _transformers_style_l2norm(x, dim = -1, eps = 1e-6):
     """Verbatim shape of transformers' pure-torch l2norm: reduction in the input dtype."""
+    import torch
     inv_norm = torch.rsqrt((x * x).sum(dim = dim, keepdim = True) + eps)
     return x * inv_norm
 
 
 def test_fp32_l2norm_matches_fp32_reference_and_keeps_dtype():
+    import torch
     from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
 
     x = torch.randn(4, 128, dtype = torch.float16)
@@ -1302,6 +1307,7 @@ def test_fp32_l2norm_survives_the_float16_overflow_that_gives_nan_grads():
     loss-scaled gradient; sum(x * grad) overflows to inf in float16 and inf * 0 inside
     RsqrtBackward is the NaN seen on the RX 5700 XT. The loss itself is float32 in a
     real trainer, so the scale is applied to a float32 sum here as well."""
+    import torch
     from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
 
     loss_scale = 1024.0

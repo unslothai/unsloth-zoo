@@ -1238,7 +1238,7 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
     return tuple(repaired)
 
 
-def _force_kernel_hub_fallback(packages=_REPAIR_MODELING):
+def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING):
     """Bind the kernel-hub decorators straight to their pure-torch fallback.
 
     The RDNA1 counterpart to ``_repair_kernel_hub_closures``. On a GPU without dot
@@ -1247,6 +1247,12 @@ def _force_kernel_hub_fallback(packages=_REPAIR_MODELING):
     to a user-installed fla. Rebinding each wrapper to its ``__wrapped__`` (the torch
     implementation the decorator falls back to) keeps the model on pure torch without
     importing fla at all. Returns the names forced, for logging and tests.
+
+    Scope is ``_GATED_DELTA_MODELING``, not ``_REPAIR_MODELING``: unlike the repair,
+    which only rebinds vendor-covered models onto the live fla, here every gated-delta
+    consumer that carries the decorator must be forced off it. olmo_hybrid is not
+    vendor-covered, but its wrapper still resolves to an installed fla that would abort,
+    so it must fall back too (the loop is a no-op when it lacks the attribute).
 
     unsloth's compiler copies the gated-delta source (including the kernel-hub
     decorators, which are only marked ``torch.compiler.disable``, not stripped) into
