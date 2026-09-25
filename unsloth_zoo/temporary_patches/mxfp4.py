@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import functools
 import re
 from typing import Union, List, Optional, Tuple
 import inspect
@@ -94,6 +95,59 @@ def get_mxfp4_config_for_training():
             logger.info("Unsloth: MXFP4 weights will remain quantized (triton_kernels available)")
 
     return Mxfp4Config(dequantize=dequantize)
+
+
+def _is_native_mxfp4_gpt_oss_model_name(model_name) -> bool:
+    lowered = str(model_name).lower()
+    if "gpt-oss" not in lowered:
+        return False
+    if lowered.endswith("-bf16") or "-bnb-4bit" in lowered:
+        return False
+    return True
+
+
+def apply_mxfp4_quantization_config_to_from_pretrained_kwargs(model_name, kwargs):
+    """Wire ``UNSLOTH_MXFP4_NO_DEQUANTIZE`` only for Unsloth ``from_pretrained`` loads.
+
+    Called from patched ``FastLanguageModel`` / ``FastModel`` entry points. Leaves
+    checkpoint and caller ``quantization_config`` untouched so packed MXFP4 inference
+    loads are not forced to bf16.
+    """
+    if kwargs.get("quantization_config") is not None:
+        return kwargs
+    if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
+        return kwargs
+    if not _is_native_mxfp4_gpt_oss_model_name(model_name):
+        return kwargs
+    kwargs["quantization_config"] = get_mxfp4_config_for_training()
+    return kwargs
+
+
+def patch_unsloth_from_pretrained_mxfp4_quantization_config():
+    """Patch Unsloth loaders only (not global ``Mxfp4Config.from_dict``)."""
+    try:
+        from unsloth.models import loader as unsloth_loader
+    except ImportError:
+        return
+
+    for class_name in ("FastLanguageModel", "FastModel"):
+        model_cls = getattr(unsloth_loader, class_name, None)
+        if model_cls is None:
+            continue
+        original = model_cls.from_pretrained
+        if getattr(original, "_unsloth_mxfp4_from_pretrained_patched", False):
+            continue
+
+        @functools.wraps(original)
+        def from_pretrained(model_name, *args, _original=original, **kwargs):
+            apply_mxfp4_quantization_config_to_from_pretrained_kwargs(
+                model_name, kwargs
+            )
+            return _original(model_name, *args, **kwargs)
+
+        from_pretrained._unsloth_mxfp4_from_pretrained_patched = True
+        model_cls.from_pretrained = from_pretrained
+
 
 def patch_convert_moe_packed_tensors():
     """Pin the GPU convert_moe_packed_tensors with a smaller default chunk."""
@@ -325,4 +379,5 @@ def patch_convert_moe_packed_tensors():
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("Unsloth: Failed to add convert_moe_packed_tensors_cpu - original function not found.")
 pass
+TEMPORARY_PATCHES.append(patch_unsloth_from_pretrained_mxfp4_quantization_config)
 TEMPORARY_PATCHES.append(patch_convert_moe_packed_tensors)
