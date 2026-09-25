@@ -3097,8 +3097,7 @@ def patch_GptOssModel():
         except:
             pass
 
-        # May already be prepared by `generate`. flex_attention_with_sink training windows its own
-        # BlockMask; every other forward needs the per-type mapping or the raw 2D mask reaches attention.
+        # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
         _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
         if not _flex_sink_training and not isinstance(attention_mask, dict):
             # Inference uses eager attention. If the config still has

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# transformers 5 dropped GptOssDecoderLayer.attention_type, so the patched forward sent every
-# layer the full causal mask (gpt-oss-20b wikitext PPL 1082.7 vs stock 214.7). CPU, tiny config.
+# transformers 5 dropped GptOssDecoderLayer.attention_type, so sliding layers got the full causal mask.
 from __future__ import annotations
 
 import os
