@@ -171,12 +171,10 @@ def _dequantize_expert_slice(
     if expert_quant_state is None:
         return expert_weight.to(target_dtype)
 
+    # `weight_scale_inv` is already the dequant multiplier (w = q * s), as for FP8Linear.
     s = expert_quant_state
     if not isinstance(s, torch.Tensor):
         return expert_weight.to(target_dtype)
-
-    if quant_kind == "weight_scale_inv":
-        s = s.reciprocal()
 
     w = expert_weight.to(target_dtype)
 
@@ -680,8 +678,7 @@ def _slice_fp8_linear_quant_state(experts_module, param_name: str, expert_idx: i
     expert_quant_state = _slice_fp8_quant_state(weight, quant_state, expert_idx)
     if not isinstance(expert_quant_state, torch.Tensor):
         return expert_quant_state
-    if quant_kind == "weight_scale_inv":
-        expert_quant_state = expert_quant_state.reciprocal()
+    # fp8_linear multiplies by the scale, and `weight_scale_inv` is that multiplier.
     if expert_quant_state.ndim == 1:
         expert_quant_state = expert_quant_state.view(-1, 1)
     return expert_quant_state

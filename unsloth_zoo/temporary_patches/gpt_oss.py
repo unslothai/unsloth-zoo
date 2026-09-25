@@ -60,6 +60,29 @@ _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
 _TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
 
 
+def _gpt_oss_layer_attention_type(decoder_layer, config, layer_idx):
+    # 4.x sets decoder_layer.attention_type; 5.x dropped it and stock indexes config.layer_types.
+    attention_type = getattr(decoder_layer, "attention_type", None)
+    if isinstance(attention_type, str):
+        return attention_type
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None and 0 <= layer_idx < len(layer_types):
+        return layer_types[layer_idx]
+    self_attn = getattr(decoder_layer, "self_attn", None)
+    return "sliding_attention" if getattr(self_attn, "sliding_window", None) is not None else "full_attention"
+
+
+def _gpt_oss_select_mask(attention_mask, attention_type):
+    # Key presence decides, never tensor truthiness: a None value is a valid causal fast path.
+    if not isinstance(attention_mask, dict):
+        return attention_mask
+    if attention_type in attention_mask:
+        return attention_mask[attention_type]
+    if "full_attention" in attention_mask:
+        return attention_mask["full_attention"]
+    return next(iter(attention_mask.values()), None)
+
+
 def _check_triton_kernels_available():
     """Is OpenAI's triton_kernels package available for MXFP4."""
     try:
@@ -3074,14 +3097,15 @@ def patch_GptOssModel():
         except:
             pass
 
-        # It may already have been prepared by e.g. `generate`
-        if not self.training and not isinstance(attention_mask, dict):
+        # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
+        _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
+        if not _flex_sink_training and not isinstance(attention_mask, dict):
             # Inference uses eager attention. If the config still has
             # _attn_implementation="flex_attention" (set for training), the
             # mask factory returns a BlockMask which eager cannot consume.
             # Temporarily swap to "eager" so a dense 4D float mask is built.
             _orig_attn_impl = getattr(self.config, "_attn_implementation", None)
-            _swap_attn_impl = _orig_attn_impl == "flex_attention"
+            _swap_attn_impl = (not self.training) and _orig_attn_impl == "flex_attention"
             if _swap_attn_impl:
                 self.config._attn_implementation = "eager"
             try:
@@ -3112,12 +3136,11 @@ def patch_GptOssModel():
             torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
-            for decoder_layer in self.layers:
-                _attn_type = getattr(decoder_layer, "attention_type", None)
-                if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
-                else:
-                    mask = attention_mask
+            for layer_idx, decoder_layer in enumerate(self.layers):
+                mask = _gpt_oss_select_mask(
+                    attention_mask,
+                    _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
+                )
                 hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
@@ -3158,15 +3181,14 @@ def patch_GptOssModel():
             )
             all_hidden_states = () if output_hidden_states else None
 
-            for decoder_layer in self.layers:
+            for layer_idx, decoder_layer in enumerate(self.layers):
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
 
-                _attn_type = getattr(decoder_layer, "attention_type", None)
-                if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
-                else:
-                    mask = attention_mask
+                mask = _gpt_oss_select_mask(
+                    attention_mask,
+                    _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
+                )
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=mask,

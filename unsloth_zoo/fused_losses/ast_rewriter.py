@@ -8,9 +8,11 @@
 
 """AST-level rewriter for the canonical HF lm_head / loss_function triplet.
 
-Matches ``<LOGITS> = self.<HEAD>(<HIDDEN>)`` (optional .float()/[slice]/
-.contiguous() wrappers) followed by an ``if labels is not None:`` branch
-computing ``self.loss_function(<LOGITS>, labels, vocab_size=..., **kwargs)``.
+Matches ``<LOGITS> = self.<HEAD>(<HIDDEN>)`` (optional .float()/.contiguous()/
+.to() wrappers, and a ``* scale`` / ``/ scale`` the fused kernel reapplies as
+``logit_scale_multiply`` / ``logit_scale_divide``) followed by an ``if labels is
+not None:`` branch computing ``self.loss_function(<LOGITS>, labels,
+vocab_size=..., **kwargs)``. Any other wrapper bails out of the rewrite.
 
 Rewrites the labels branch to two paths:
   - default (``UNSLOTH_RETURN_LOGITS`` unset): ``unsloth_fused_lm_head_loss``
@@ -36,7 +38,7 @@ __all__ = [
 
 import ast
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -52,6 +54,8 @@ class TripletCapture:
     lm_head_assign_idx: int   # index in the function body of the `logits = self.lm_head(...)` stmt
     if_block_idx: int         # index of the `if labels is not None:` stmt
     loss_init_idx: int | None # index of the `loss = None` stmt that we delete (may be None)
+    # [(name, ast.AST)] post-head scaling; fused call only. Defaulted + last for existing callers.
+    scale_kws: list = field(default_factory = list)
 
 
 def _is_self_attr_call(node: ast.AST) -> bool:
@@ -63,13 +67,48 @@ def _is_self_attr_call(node: ast.AST) -> bool:
     )
 
 
-def _find_inner_self_call(value: ast.AST) -> ast.Call | None:
-    """First Call descendant whose func is `self.<X>`, seeing through
-    `.float()` / `[slice]` / `.contiguous()` chains."""
-    for node in ast.walk(value):
+def _contains_self_attr_call(node: ast.AST) -> bool:
+    return any(_is_self_attr_call(n) for n in ast.walk(node))
+
+
+# Wrappers the fused kernel makes redundant (it casts + accumulates in fp32 itself).
+_TRANSPARENT_METHODS = frozenset(("float", "contiguous", "to"))
+
+
+def _unwrap_logits_rhs(value: ast.AST):
+    """``(self.<HEAD>(...) call, scale_kws)``, or None for any wrapper besides ``* s`` / ``/ s``
+    (peeling blindly dropped it and trained on wrongly scaled logits)."""
+    scale_kws: list = []
+    node = value
+    while True:
         if _is_self_attr_call(node):
-            return node
-    return None
+            return node, scale_kws
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _TRANSPARENT_METHODS
+        ):
+            node = node.func.value
+            continue
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Div)):
+            left_has, right_has = (
+                _contains_self_attr_call(node.left),
+                _contains_self_attr_call(node.right),
+            )
+            if left_has and not right_has:
+                kw = "logit_scale_multiply" if isinstance(node.op, ast.Mult) else "logit_scale_divide"
+                scale, node = node.right, node.left
+            elif right_has and not left_has and isinstance(node.op, ast.Mult):
+                # `scale / head` is not a scaling.
+                kw, scale, node = "logit_scale_multiply", node.left, node.right
+            else:
+                return None
+            # A repeat would emit a duplicate keyword argument.
+            if any(name == kw for name, _ in scale_kws):
+                return None
+            scale_kws.append((kw, scale))
+            continue
+        return None
 
 
 def _find_loss_function_call(if_block: ast.If) -> ast.Call | None:
@@ -197,6 +236,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     hidden_expr = None
     logits_rhs_src = None
     lm_head_assign_idx = None
+    scale_kws: list = []
     for j in range(if_idx - 1, -1, -1):
         stmt = body[j]
         if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
@@ -204,13 +244,11 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
         tgt = stmt.targets[0]
         if not (isinstance(tgt, ast.Name) and tgt.id == logits_name):
             continue
-        inner = _find_inner_self_call(stmt.value)
-        if inner is None:
-            # logits re-assigned by a non-lm_head expr (e.g. Cohere's
-            # `logits = logits * self.logit_scale`); removing the lm_head call
-            # would leave it referencing an undefined `logits`. Bail and let
-            # LOSS_MAPPING handle this class.
+        unwrapped = _unwrap_logits_rhs(stmt.value)
+        if unwrapped is None:
+            # Non-lm_head reassign (Cohere's `logits * self.logit_scale`) or unreproducible wrapper.
             return None
+        inner, scale_kws = unwrapped
         head_attr = inner.func.attr
         if not inner.args:
             return None
@@ -253,6 +291,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
         vocab_expr=vocab_expr,
         kwargs_name=kwargs_name,
         extra_loss_kws=extra_loss_kws,
+        scale_kws=scale_kws,
         lm_head_assign_idx=lm_head_assign_idx,
         if_block_idx=if_idx,
         loss_init_idx=loss_init_idx,
@@ -267,6 +306,13 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     vocab = ast.unparse(cap.vocab_expr) if cap.vocab_expr is not None else "None"
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
+    )
+    # Fused call only (other branches re-evaluate the RHS); an explicit same-name kwarg wins.
+    already = {name for name, _ in cap.extra_loss_kws}
+    scale_extra = "".join(
+        f", {name}={ast.unparse(value)}"
+        for name, value in cap.scale_kws
+        if name not in already
     )
     kwargs_unpack = f", **{cap.kwargs_name}" if cap.kwargs_name else ""
     hidden_src = ast.unparse(cap.hidden_expr)
@@ -284,7 +330,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             else:
                 {loss} = unsloth_fused_lm_head_loss(
                     {hidden_src}, self.{head_attr}, labels,
-                    vocab_size={vocab}{extra}{kwargs_unpack},
+                    vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack},
                 )
                 {logits} = EMPTY_LOGITS
         else:
