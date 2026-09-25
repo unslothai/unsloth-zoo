@@ -15633,8 +15633,6 @@ def _mlx_measure_norm_offsets(replay, weights):
             continue
         candidates[key] = (value, offset)
     if not candidates:
-        # Nothing to confirm. Shifting nothing is the common case, so skip
-        # the second replay rather than pay for it on every model.
         return {}
 
     raised = replay(_mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE))

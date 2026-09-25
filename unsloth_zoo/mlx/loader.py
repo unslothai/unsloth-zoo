@@ -3040,6 +3040,7 @@ class _NativeVLMWeightSanitizer:
             import mlx.core as mx
 
             # Snapshot 1-D values: sanitizers shift them with in-place `+=`.
+            # Restore, never subtract: (w + 1) - 1 != w in bf16.
             converted = bool(weights) and all(key in native for key in weights)
             source = dict(weights) if converted else None
             before = {
@@ -3069,12 +3070,8 @@ class _NativeVLMWeightSanitizer:
 
 
 def _restore_reapplied_offsets(source, before, sanitized, replay):
-    """Undo a constant sanitize adds again to an already-converted checkpoint.
-
-    If every key is native and sanitize moves no multi-dimensional tensor, the
-    checkpoint was written after conversion, so a 1-D shift it measures
-    (mlx-vlm 0.6.4's Qwen3.5 RMSNorm +1) is being applied a second time.
-    """
+    """All-native keys and no moved N-D tensor = already converted, so a measured
+    1-D shift (mlx-vlm 0.6.4 Qwen3.5 RMSNorm +1) is being applied twice."""
     import mlx.core as mx
     from .utils import _mlx_measure_norm_offsets
 
@@ -3082,7 +3079,6 @@ def _restore_reapplied_offsets(source, before, sanitized, replay):
         if value.ndim != 1 and key in sanitized and sanitized[key] is not value:
             return
     try:
-        # Copies, so an in-place sanitizer cannot write through the replay.
         offsets = _mlx_measure_norm_offsets(
             replay, {key: mx.array(value) for key, value in source.items()}
         )

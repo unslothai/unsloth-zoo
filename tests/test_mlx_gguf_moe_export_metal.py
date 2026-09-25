@@ -132,10 +132,8 @@ def test_native_name_sanitizer_keeps_converted_norms(source_form):
             self.head = nn.Linear(2, 2, bias=False)
 
         def sanitize(self, weights):
-            # Like mlx-vlm 0.6.4's Qwen3.5: an unconditional in-place norm shift.
             out = {}
             for key, value in weights.items():
-                # Dropped like a tied lm_head, which does not mean unconverted.
                 if key.startswith("mtp.") or key == "head.weight":
                     continue
                 if key == "proj.weight" and value.shape != (2, 3):
@@ -163,7 +161,6 @@ def test_native_name_sanitizer_keeps_converted_norms(source_form):
         source["mtp.0.norm.weight"] = mx.array([0.5, 0.25])
     expected = {
         "norm.weight": mx.array(norm) if source_form == "converted" else norm + 1.0,
-        # Not an added constant, so never restored.
         "dt_bias": mx.array([1.0, 0.5]),
         "proj.weight": proj,
         "proj.bias": mx.zeros((2,)),
