@@ -134,6 +134,8 @@ Nothing here is specific to one architecture:
 from __future__ import annotations
 
 import inspect
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -410,6 +412,8 @@ class DeviceMapPlan:
     """Reserve the accepted packing really kept free, per device."""
     tied_to_head: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    load_transient_by_device: dict[int, int] = field(default_factory=dict)
+    """Room kept free per device for tensors merged while the checkpoint loads."""
 
     @property
     def free_bytes(self) -> dict[int, int]:
@@ -482,7 +486,18 @@ def resolve_no_split_classes(model: nn.Module) -> list[str]:
     # transformers models do (camembert, colpali, colqwen2, efficientnet, fuyu).
     # Only `None`, the base-class default, means "not declared, go and detect".
     if classes is not None:
-        return sorted(str(c) for c in classes)
+        declared = {str(c) for c in classes}
+        # Siblings of a declared block (Ling-2.6-flash's MTP layer) are blocks too: split, their attention hits a device mismatch.
+        if declared:
+            for _, mod in model.named_modules():
+                if not isinstance(mod, nn.ModuleList):
+                    continue
+                if not any(type(child).__name__ in declared for child in mod):
+                    continue
+                for child in mod:
+                    if any(True for _ in child.parameters(recurse=True)):
+                        declared.add(type(child).__name__)
+        return sorted(declared)
     # Fallback: every distinct child class of every nn.ModuleList that holds
     # more than one entry. That is where repeated transformer blocks live.
     found: set[str] = set()
@@ -791,6 +806,152 @@ def _adjust_budgets_for_quantizer(
     return budgets, note
 
 
+# transformers 5 builds merged tensors beside their sources on the card; the holes are not reusable.
+_LOAD_TRANSIENT_MULTIPLE = 3
+_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE = 5
+_MERGING_OPS = ("MergeModulelist", "Concatenate", "ErnieFuseAndSplitTextVisionExperts")
+
+
+def _is_merging_op(op, depth: int = 1) -> bool:
+    """A merging op itself, or one built around one (a fuse op holding a ``Concatenate``)."""
+    if any(base.__name__ in _MERGING_OPS for base in type(op).__mro__):
+        return True
+    if depth <= 0:
+        return False
+    try:
+        members = list(vars(op).values())
+    except TypeError:
+        return False
+    return any(
+        _is_merging_op(member, depth - 1)
+        for member in members
+        if not isinstance(member, (str, bytes, int, float, bool, type(None), torch.Tensor))
+    )
+
+
+def _expandable_segments_enabled() -> bool:
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        value = os.environ.get(var, "").replace(" ", "").lower()
+        if "expandable_segments:true" in value:
+            return True
+    return False
+
+
+def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> list:
+    """Targets of converters merging several checkpoint tensors on the card; ``force_cpu`` ones cost it nothing."""
+    try:
+        from transformers.conversion_mapping import get_model_conversion_mapping
+    except Exception:
+        return []
+    try:
+        accepted = inspect.signature(get_model_conversion_mapping).parameters
+    except Exception:
+        return []
+    conversions = None
+    if hf_quantizer is not None and "hf_quantizer" in accepted:
+        try:
+            conversions = get_model_conversion_mapping(model, hf_quantizer = hf_quantizer) or []
+        except Exception:
+            # Unvalidated compressed-tensors raises here; quantizer hooks only prepend ops to the model's merges.
+            conversions = None
+    if conversions is None:
+        try:
+            conversions = get_model_conversion_mapping(model) or []
+        except Exception:
+            return []
+    patterns = []
+    for conversion in conversions:
+        if getattr(conversion, "force_cpu", False):
+            continue
+        operations = getattr(conversion, "operations", None) or []
+        if not any(_is_merging_op(op) for op in operations):
+            continue
+        for target in getattr(conversion, "target_patterns", None) or []:
+            try:
+                # A backreference to a source capture group matches any text here.
+                patterns.append(re.compile(re.sub(r"\\\d", ".*", str(target))))
+            except re.error:
+                continue
+    return patterns
+
+
+def _storage_bytes_per_element(model: nn.Module, hf_quantizer: Any):
+    """Storage bytes per element of each parameter, or ``None`` to keep the tensor's own size."""
+    per_param = getattr(hf_quantizer, "param_element_size", None)
+    if callable(per_param):
+        def size_of(name: str, tensor: torch.Tensor) -> float:
+            try:
+                return float(per_param(model, name, tensor))
+            except Exception:
+                return tensor.element_size()
+        return size_of
+    size_kwargs = _quantized_size_kwargs(model, hf_quantizer)
+    if not size_kwargs:
+        return None
+    try:
+        from accelerate.utils.modeling import dtype_byte_size, _get_proper_dtype
+    except Exception:
+        return None
+    try:
+        target = size_kwargs.get("dtype")
+        target_size = dtype_byte_size(_get_proper_dtype(target)) if target is not None else None
+        special = {
+            key: dtype_byte_size(_get_proper_dtype(value))
+            for key, value in (size_kwargs.get("special_dtypes") or {}).items()
+        }
+    except Exception:
+        return None
+
+    def size(name: str, tensor: torch.Tensor) -> float:
+        own = dtype_byte_size(tensor.dtype)
+        if name in special:
+            return special[name]
+        if target_size is None or not (tensor.dtype.is_floating_point or tensor.dtype.is_complex):
+            return own
+        return min(target_size, own)
+
+    return size
+
+
+def _load_transient_by_unit(
+    model: nn.Module,
+    units: Sequence[tuple[str, int]],
+    hf_quantizer: Any = None,
+) -> dict[str, int]:
+    """Bytes each unit needs free beyond its weights while its largest parameter is merged."""
+    patterns = _merged_parameter_patterns(model, hf_quantizer)
+    if not patterns:
+        return {}
+    load_dtype = _model_dtype(model)
+    # Pre-quantized loads merge in the storage dtype; otherwise sources are cast to the load dtype first.
+    as_stored = bool(getattr(hf_quantizer, "pre_quantized", False))
+    load_itemsize = (
+        torch.empty((), dtype=load_dtype).element_size()
+        if isinstance(load_dtype, torch.dtype) else None
+    )
+    # A meta Params4bit is left unpacked in float32, so size it via the quantiser's storage dtype.
+    stored_size = _storage_bytes_per_element(model, hf_quantizer) if as_stored else None
+    unit_names = sorted((u for u, _ in units), key=len, reverse=True)
+    out: dict[str, int] = {}
+    for name, tensor in model.named_parameters():
+        if not any(p.search(name) for p in patterns):
+            continue
+        if stored_size is not None:
+            itemsize = stored_size(name, tensor)
+        elif as_stored or load_itemsize is None or not tensor.dtype.is_floating_point:
+            itemsize = tensor.element_size()
+        else:
+            itemsize = load_itemsize
+        owner = next(
+            (u for u in unit_names if u == "" or name == u or name.startswith(u + ".")),
+            None,
+        )
+        if owner is None:
+            continue
+        out[owner] = max(out.get(owner, 0), int(tensor.numel() * itemsize))
+    return out
+
+
 def _tied_parameter_groups(model: nn.Module) -> list[list[str]]:
     """Names of every tensor that is one shared object under several names.
 
@@ -912,6 +1073,7 @@ def plan_device_map(
     hf_quantizer: Any = None,
     no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
+    reserve_load_transient: bool = True,
 ) -> DeviceMapPlan | None:
     """Build an explicit device map that reserves logit headroom on the head's card.
 
@@ -955,6 +1117,9 @@ def plan_device_map(
             removes every no-split constraint, so blocks may be split at their
             children; ``None`` (default) detects the classes from the model.
         prefer_head_device: force the head onto this device index.
+        reserve_load_transient: keep room on each card for tensors transformers 5
+            merges while loading (expert stacks). When no placement keeps it the
+            plan is returned without it and says so in ``notes``.
 
     Returns:
         A :class:`DeviceMapPlan`, or ``None`` when there are fewer than two
@@ -1279,6 +1444,11 @@ def plan_device_map(
             return {d: _parse_size(value.get(d, 0)) for d in devices}
         return dict.fromkeys(devices, int(value))
 
+    reserve_floor: dict[int, int] = {}
+
+    def _below_floor(kept) -> bool:
+        return bool(reserve_floor) and any(kept[d] < reserve_floor.get(d, 0) for d in devices)
+
     def attempt(head_device: int):
         """Try progressively smaller activation reserves on the non-head devices.
 
@@ -1381,12 +1551,16 @@ def plan_device_map(
         # head whole AND lifting the small card 114 over the old answer.
         legacy_kept = None
         for kept in _ordered(legacy):
+            if _below_floor(kept):
+                continue
             if _try(kept) is not None:
                 legacy_kept = kept
                 break
 
         for kept in _ordered(candidates):
             if legacy_kept is not None and any(kept[d] < legacy_kept[d] for d in devices):
+                continue
+            if _below_floor(kept):
                 continue
             r = _try(kept)
             if r is not None:
@@ -1407,6 +1581,8 @@ def plan_device_map(
         budget[head_device] -= pinned_bytes
         if any(b < 0 for b in budget.values()):
             return None
+        if _group_transient(pinned) > _transient_cap(head_device)[head_device]:
+            return None
         used, assign = _walk_in_order(free_groups, budget, head_device)
         if used is None:
             # The in-order walk is next-fit with a first-fit rescue, and neither
@@ -1420,13 +1596,13 @@ def plan_device_map(
             # failed, so a plan that already worked is never rewritten: layout
             # in definition order keeps consecutive layers together, which
             # costs fewer cross-device hops than a size-sorted one.
-            used, assign = _best_fit(free_groups, budget)
+            used, assign = _best_fit(free_groups, budget, head_device)
         if used is None:
             # Best-fit is not exact either: capacities 10 and 10 with units
             # 6, 5, 3, 2, 2, 2 pack 6+3 and 5+2+2 and then reject the last 2,
             # although 6+2+2 and 5+3+2 both fit. Last resort before refusing a
             # model that demonstrably fits.
-            used, assign = _exact_fit(free_groups, budget)
+            used, assign = _exact_fit(free_groups, budget, head_device)
         if used is None:
             return None
         for p in pinned:
@@ -1442,6 +1618,19 @@ def plan_device_map(
         public_budgets[head_device] += pinned_bytes
         return assign, weight_bytes, public_budgets, kept
 
+    def _transient_cap(head_device: int) -> dict[int, int]:
+        # Nothing else is resident while loading, so the transient need not fit on top of the reserve.
+        return {d: raw_budgets[d] - (pinned_bytes if d == head_device else 0) for d in devices}
+
+    def _group_transient(names) -> int:
+        return max((transient_of.get(n, 0) for n in names), default = 0)
+
+    def _start_peak(head_device: int) -> dict[int, int]:
+        # Pinned units skip the packers but can still be merged into (a concatenated lm_head).
+        peak = dict.fromkeys(devices, 0)
+        peak[head_device] = _group_transient(pinned)
+        return peak
+
     def _walk_in_order(free, budget, head_device: int):
         # `head_max` means "push as much weight off the head's card as possible".
         # Walking plain device order defeats that whenever the head is not the
@@ -1452,15 +1641,23 @@ def plan_device_map(
         if free_space_policy == "head_max":
             order = [d for d in devices if d != head_device] + [head_device]
         used = dict.fromkeys(devices, 0)
+        peak = _start_peak(head_device)
+        cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         cursor = 0
+
+        def fits(d, size, t):
+            return used[d] + size <= budget[d] and used[d] + size + max(peak[d], t) <= cap[d]
+
         for names, size in free:
+            t = _group_transient(names)
             placed = False
             while cursor < len(order):
                 d = order[cursor]
-                if used[d] + size <= budget[d]:
+                if fits(d, size, t):
                     assign.update(dict.fromkeys(names, d))
                     used[d] += size
+                    peak[d] = max(peak[d], t)
                     placed = True
                     break
                 cursor += 1
@@ -1468,30 +1665,36 @@ def plan_device_map(
                 # Sequential cursor exhausted: try any earlier device that still
                 # has room rather than falling off to CPU.
                 for d in order:
-                    if used[d] + size <= budget[d]:
+                    if fits(d, size, t):
                         assign.update(dict.fromkeys(names, d))
                         used[d] += size
+                        peak[d] = max(peak[d], t)
                         placed = True
                         break
             if not placed:
                 return None, None
         return used, assign
 
-    def _best_fit(free, budget):
+    def _best_fit(free, budget, head_device: int):
         """Largest unit first into the device it leaves least room on."""
         used = dict.fromkeys(devices, 0)
+        peak = _start_peak(head_device)
+        cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         for names, size in sorted(free, key=lambda item: -item[1]):
+            t = _group_transient(names)
             room = [(budget[d] - used[d] - size, d) for d in devices
-                    if used[d] + size <= budget[d]]
+                    if used[d] + size <= budget[d]
+                    and used[d] + size + max(peak[d], t) <= cap[d]]
             if not room:
                 return None, None
             _, d = min(room)
             assign.update(dict.fromkeys(names, d))
             used[d] += size
+            peak[d] = max(peak[d], t)
         return used, assign
 
-    def _exact_fit(free, budget, node_budget=20000, max_units=512):
+    def _exact_fit(free, budget, head_device: int, node_budget=20000, max_units=512):
         """Bounded depth-first packing, largest unit first.
 
         Runs only after both heuristics have failed, so it can turn a refusal
@@ -1508,10 +1711,41 @@ def plan_device_map(
         if sum(size for _, size in order) > sum(budget[d] for d in devices):
             return None, None
         remaining = {d: budget[d] for d in devices}
+        peak = _start_peak(head_device)
+        cap = _transient_cap(head_device)
         assign: dict[str, int] = {}
         visited = 0
 
         def place(i: int) -> bool:
+            nonlocal visited
+            if i == len(order):
+                return True
+            visited += 1
+            if visited > node_budget:
+                raise _SearchExhausted
+            names, size = order[i]
+            t = _group_transient(names)
+            tried: set[tuple[int, int, int]] = set()
+            for d in devices:
+                room = remaining[d]
+                used_d = budget[d] - room
+                state = (room, cap[d] - used_d, peak[d])
+                if size > room or used_d + size + max(peak[d], t) > cap[d] or state in tried:
+                    continue
+                tried.add(state)
+                previous = peak[d]
+                remaining[d] -= size
+                peak[d] = max(previous, t)
+                assign.update(dict.fromkeys(names, d))
+                if place(i + 1):
+                    return True
+                remaining[d] += size
+                peak[d] = previous
+                for n in names:
+                    assign.pop(n, None)
+            return False
+
+        def place_plain(i: int) -> bool:
             nonlocal visited
             if i == len(order):
                 return True
@@ -1527,7 +1761,7 @@ def plan_device_map(
                 tried.add(room)
                 remaining[d] -= size
                 assign.update(dict.fromkeys(names, d))
-                if place(i + 1):
+                if place_plain(i + 1):
                     return True
                 remaining[d] += size
                 for n in names:
@@ -1535,7 +1769,7 @@ def plan_device_map(
             return False
 
         try:
-            fitted = place(0)
+            fitted = place(0) if transient_of else place_plain(0)
         except (_SearchExhausted, RecursionError):
             return None, None
         if not fitted:
@@ -1551,15 +1785,69 @@ def plan_device_map(
             f"devices {devices}"
         )
     order = [prefer_head_device] if prefer_head_device is not None else list(reversed(devices))
-    result = None
-    chosen = None
-    for cand in order:
-        if cand not in devices:
-            continue
-        result = attempt(cand)
-        if result is not None:
-            chosen = cand
-            break
+
+    def _search():
+        for cand in order:
+            if cand not in devices:
+                continue
+            found = attempt(cand)
+            if found is not None:
+                return found, cand
+        return None, None
+
+    unit_transient: dict[str, int] = (
+        _load_transient_by_unit(model, units, hf_quantizer) if reserve_load_transient else {}
+    )
+    transient_of: dict[str, int] = {}
+    load_transient: dict[int, int] = {}
+    result, chosen = None, None
+    if unit_transient:
+        # A transient plan must keep the baseline's head and per-card reserve: never trade training room.
+        baseline, base_head = _search()
+        multiples = (
+            (_LOAD_TRANSIENT_MULTIPLE_EXPANDABLE,) if _expandable_segments_enabled() else ()
+        ) + (_LOAD_TRANSIENT_MULTIPLE, 1)
+        if baseline is not None:
+            reserve_floor.update(baseline[3])
+        for multiple in multiples if baseline is not None else ():
+            transient_of = {u: n * multiple for u, n in unit_transient.items()}
+            found = attempt(base_head)
+            result, chosen = (found, base_head) if found is not None else (None, None)
+            if result is not None:
+                for unit, device in result[0].items():
+                    if transient_of.get(unit, 0):
+                        load_transient[device] = max(load_transient.get(device, 0), transient_of[unit])
+                notes.append(
+                    f"load transient: {multiple}x the largest merged tensor kept free per card "
+                    "while loading ("
+                    + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in sorted(load_transient.items()))
+                    + ")"
+                    + (
+                        "; the allocator reserves 2x to 3x one merged tensor while merging,"
+                        " so loading may still run out of memory"
+                        if multiple < _LOAD_TRANSIENT_MULTIPLE else ""
+                    )
+                )
+                break
+        reserve_floor.clear()
+        transient_of = {} if result is None else transient_of
+    fell_back = result is None
+    if result is None and unit_transient:
+        transient_of = {}
+        result, chosen = baseline, base_head
+    elif result is None:
+        transient_of = {}
+        result, chosen = _search()
+    if result is not None and unit_transient and fell_back:
+        need = dict.fromkeys(devices, 0)
+        for unit, device in result[0].items():
+            need[device] = max(need[device], unit_transient.get(unit, 0))
+        notes.append(
+            "load transient: no placement keeps "
+            + ", ".join(f"cuda:{d}={n / _GiB:.2f} GiB" for d, n in need.items() if n)
+            + " free for merging checkpoint tensors without lowering the activation reserve;"
+            " loading may run out of memory"
+        )
     if result is None:
         # Report the reserve of the first candidate actually tried; it is what
         # the failing arithmetic used.
@@ -1615,6 +1903,7 @@ def plan_device_map(
         activation_reserve_by_device=reserve_kept,
         tied_to_head=tied_to_head,
         notes=notes,
+        load_transient_by_device=load_transient,
     )
 
 
@@ -1675,7 +1964,70 @@ def _quantization_method_is_known(quantization_config: Any) -> bool:
         return True
 
 
-def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
+def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
+    """Copy of ``config`` with overrides applied as ``PretrainedConfig.from_dict`` does."""
+    import copy
+
+    config = copy.deepcopy(config)
+    # from_pretrained gives a non-None `dtype` precedence over the older `torch_dtype`.
+    dtype = overrides.get("dtype", None)
+    if dtype is None:
+        dtype = overrides.get("torch_dtype", None)
+    if isinstance(dtype, Mapping):
+        # Per-module form: from_pretrained uses the "" entry's dtype
+        import torch
+
+        dtype = dtype.get("", torch.get_default_dtype())
+        if isinstance(dtype, str) and dtype != "auto":
+            dtype = getattr(torch, dtype)
+    if dtype is not None and dtype != "auto":
+        # 5.x keeps `torch_dtype` as an alias of `dtype`; 4.x stores `torch_dtype` only.
+        for name in ("torch_dtype", "dtype"):
+            try:
+                setattr(config, name, dtype)
+            except Exception:
+                pass
+    for key, value in overrides.items():
+        if key in _HUB_KWARGS or key in ("trust_remote_code", "dtype", "torch_dtype"):
+            continue
+        if not hasattr(config, key):
+            continue
+        current = getattr(config, key)
+        if isinstance(value, Mapping) and hasattr(current, "to_dict") and not isinstance(current, Mapping):
+            setattr(config, key, _merge_sub_config(current, value))
+            continue
+        setattr(config, key, value)
+    return config
+
+
+def _merge_sub_config(current: Any, override: Mapping[str, Any]) -> Any:
+    """Deep-merge ``override``; rebuilt as the same class so derived fields regenerate."""
+    merged = current.to_dict()
+    for key, value in override.items():
+        child = getattr(current, key, None)
+        if isinstance(value, Mapping) and hasattr(child, "to_dict") and not isinstance(child, Mapping):
+            value = _merge_sub_config(child, value)
+        merged[key] = value
+    try:
+        return current.__class__(**merged)
+    except Exception:
+        for key, value in override.items():
+            child = getattr(current, key, None)
+            if isinstance(value, Mapping) and hasattr(child, "to_dict") and not isinstance(child, Mapping):
+                value = _merge_sub_config(child, value)
+            try:
+                setattr(current, key, value)
+            except Exception:
+                pass
+        return current
+
+
+def build_meta_model(
+    model_name_or_path: str,
+    *,
+    config: Any = None,
+    **from_pretrained_kwargs: Any,
+):
     """Instantiate the model on the meta device, quantiser included.
 
     Returns ``(model, hf_quantizer, config)``. Costs no GPU memory and no weight
@@ -1683,15 +2035,21 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
 
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` are honoured
     the way the loader honours them, so runtime quantisation of a full-precision
-    checkpoint is sized as it will really be loaded. ``rewritten_quantization_config``
-    replaces the serialized block (ModelOpt FP8 -> ``fp8``), sized as pre-quantized.
+    checkpoint is sized as it will really be loaded.
+
+    ``config`` overrides the repo's config (eg a VLM's ``text_config``).
+    ``rewritten_quantization_config`` replaces the serialized block (ModelOpt FP8 ->
+    ``fp8``), sized as pre-quantized.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
     rewritten_qcfg = from_pretrained_kwargs.pop("rewritten_quantization_config", None)
     runtime_qcfg = _runtime_quantization_config(from_pretrained_kwargs)
-    config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
+    if config is not None:
+        config = _apply_config_overrides(config, from_pretrained_kwargs)
+    else:
+        config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
     if rewritten_qcfg is not None:
         config.quantization_config = rewritten_qcfg
     trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
@@ -1729,6 +2087,11 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
             if trust_remote_code else auto_cls.from_config(config)
     model.eval()
     if hf_quantizer is not None:
+        # Loader order: compressed-tensors sets `use_fp8_kernel` here, else preprocess raises and Linears stay bf16.
+        try:
+            hf_quantizer.validate_environment(device_map=None)
+        except Exception:
+            pass
         # Swap in the quantised Linear classes so the size table matches the
         # bytes the loader will really allocate.
         try:
@@ -1854,7 +2217,9 @@ def plan_device_map_for_pretrained(
     free_space_policy: str = "balanced",
     no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
+    reserve_load_transient: bool = True,
     trust_remote_code: bool = False,
+    config: Any = None,
     **config_kwargs: Any,
 ) -> DeviceMapPlan | None:
     """Plan a device map straight from a checkpoint id or path.
@@ -1862,19 +2227,23 @@ def plan_device_map_for_pretrained(
     Builds the model on the meta device, so this is cheap and touches no GPU.
     Returns ``None`` when fewer than two GPUs are usable.
 
-    Takes the same ``no_split_module_classes`` override as :func:`plan_device_map`
-    (``[]`` to allow splitting inside a block that fits on no single card). It has
-    to be declared here: routed through ``**config_kwargs`` it would go to
-    ``AutoConfig`` instead, and the plan would silently use the detected classes.
+    Takes the same ``no_split_module_classes`` override and ``reserve_load_transient``
+    switch as :func:`plan_device_map` (``[]`` to allow splitting inside a block that
+    fits on no single card). Both have to be declared here: routed through
+    ``**config_kwargs`` they would go to ``AutoConfig`` instead, and the plan would
+    silently use the detected classes and reserve the load transient anyway.
 
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` pass through to
     :func:`build_meta_model`, so a full-precision checkpoint you intend to load
     quantised is sized as it will really be loaded.
+
+    ``config`` plans from an already resolved config; see :func:`build_meta_model`.
     """
     if len(_usable_devices(max_memory)) < 2:
         return None
     model, hf_quantizer, _config = build_meta_model(
-        model_name_or_path, trust_remote_code=trust_remote_code, **config_kwargs
+        model_name_or_path, config=config,
+        trust_remote_code=trust_remote_code, **config_kwargs
     )
     return plan_device_map(
         model,
@@ -1892,4 +2261,5 @@ def plan_device_map_for_pretrained(
         hf_quantizer=hf_quantizer,
         no_split_module_classes=no_split_module_classes,
         prefer_head_device=prefer_head_device,
+        reserve_load_transient=reserve_load_transient,
     )

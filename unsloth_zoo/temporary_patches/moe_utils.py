@@ -741,21 +741,39 @@ _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 _TORCH_GROUPED_MM_SUPPORTED = None
 
 
+@torch.compiler.disable
+def _run_probe_eagerly(probe):
+    """Graph-break so lazy probes never run on FakeTensors, whose meta check can reject what the real
+    kernel accepts and latch the cached flag False (torch 2.14 `_grouped_mm_fp16_cublaslt_supported` needs CUDA 13.3+)."""
+    return probe()
+
+
+def _grouped_mm_probe_device():
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu", torch.xpu.current_device())
+    return None
+
+
 def _check_torch_grouped_mm_supported():
     """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
-
-    if not _TORCH_GROUPED_MM_AVAILABLE:
+    # Definitive negatives stay traceable so fullgraph traces don't break.
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
+    return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
-    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
-    if torch.cuda.is_available():
-        device = torch.device("cuda", torch.cuda.current_device())
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        device = torch.device("xpu", torch.xpu.current_device())
-    else:
+
+def _probe_torch_grouped_mm_supported():
+    global _TORCH_GROUPED_MM_SUPPORTED
+    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
+
+    device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
+    if device is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -787,15 +805,20 @@ def _transposed_view_grouped_mm_is_safe():
     global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
+        _TRANSPOSED_VIEW_GROUPED_MM_SAFE = False
+        return False
+    return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
+
+
+def _probe_transposed_view_grouped_mm_is_safe():
+    global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
+        return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
 
     safe = False
     try:
-        if torch.cuda.is_available():
-            device = torch.device("cuda", torch.cuda.current_device())
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = torch.device("xpu", torch.xpu.current_device())
-        else:
-            device = None
+        device = _grouped_mm_probe_device()
         if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
@@ -3402,6 +3425,14 @@ class _MoEGateGradIdentity(torch.autograd.Function):
         return grad_inter, grad_gate
 
 
+def _uses_own_apply_gate(module) -> bool:
+    """Own-gate flag on the class or (FP8) instance; hot path, so no nn.Module.__getattr__."""
+    return bool(
+        module.__dict__.get("_unsloth_own_apply_gate", False)
+        or getattr(type(module), "_unsloth_own_apply_gate", False)
+    )
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -3458,6 +3489,7 @@ def forward_native_grouped_mm(
             self.gate_up_proj, num_experts=self.num_experts, experts_module=self
         )
 
+    own_gate_up = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _gate_up_src = self.gate_up_proj
@@ -3532,6 +3564,7 @@ def forward_native_grouped_mm(
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
+        own_gate_up = mm1_out if _uses_own_apply_gate(self) else None
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -3573,7 +3606,9 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
 
     # Activation
-    if "GptOssExperts" in self.__class__.__name__:
+    if own_gate_up is not None:
+        inter = self._apply_gate(own_gate_up)
+    elif "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
         alpha = getattr(self, "alpha", 1.702)
@@ -3844,7 +3879,9 @@ def forward_triton_grouped_gemm(
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
     # Activation + gate*up.
-    if hasattr(self, 'act_fn') and callable(self.act_fn):
+    if _uses_own_apply_gate(self):
+        intermediate = self._apply_gate(first_gemm_output)
+    elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
     else:
@@ -3988,6 +4025,7 @@ def forward_native_moe_loop(
 
     # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
     is_gpt_oss = "GptOssExperts" in self.__class__.__name__
+    own_apply_gate = _uses_own_apply_gate(self)
 
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()
@@ -4024,6 +4062,8 @@ def forward_native_moe_loop(
             gate = gate.clamp(min=None, max=limit)
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
+        elif own_apply_gate:
+            current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):
             current_hidden_states = self.act_fn(gate) * up
         else:
