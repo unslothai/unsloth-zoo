@@ -817,6 +817,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             accumulated_flat_is_ratio = None
         accumulated_coef_1  = torch.cat(accumulated_coef_1, dim=0)
         ctx.save_for_backward(grad_inputs)
+        ctx.scaling = scaling
         return (
             accumulated_loss,
             accumulated_completion_length,
@@ -830,6 +831,8 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl, ddelta, ddflat_is_ratio, dcoef_1):
         (grad_input,) = ctx.saved_tensors
+        # Apply the upstream gradient without repeating the forward's AMP scaling.
+        grad_input = grad_input * (grad_output / ctx.scaling)
         return (grad_input, None, None, None, None, None, None, None, None, None, None, None)
     pass
 pass
