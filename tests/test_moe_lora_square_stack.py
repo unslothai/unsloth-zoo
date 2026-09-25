@@ -1,7 +1,3 @@
-# Separated expert LoRA on a SQUARE stack (2 * intermediate == hidden, as on
-# Inkling-Small's (256, 4096, 4096) gate_up_proj) must equal PEFT's merged
-# per-expert delta. Both layout readings match a square stack by shape, and the
-# tie used to be broken the wrong way, applying the LoRA through swapped dims.
 import sys
 
 import pytest
@@ -16,8 +12,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _peft_original_wrapper_forward():
-    # Read module dicts directly: getattr on a transformers lazy module imports the attribute,
-    # which fails for vision models when their optional dependencies are absent.
+    # Read module dicts: getattr on a transformers lazy module imports optional vision deps.
     for module in [MU, *list(sys.modules.values())]:
         if not isinstance(module, type(sys)):
             continue
@@ -76,7 +71,6 @@ def test_separated_lora_matches_merged_delta(hidden, intermediate):
             if "lora_B" in name:
                 p.copy_(torch.randn(p.shape, generator = generator).to(DEVICE) * 0.3)
 
-    # PEFT's own merged forward (per-expert delta from get_delta_weight) is the reference.
     installed = ParamWrapper.forward
     try:
         ParamWrapper.forward = original_forward
@@ -97,10 +91,10 @@ def _stacked_experts(hidden, intermediate, stored_in_out, flag):
         def __init__(self):
             super().__init__()
             self.num_experts = E
-            if stored_in_out:   # (E, in, out)
+            if stored_in_out:
                 self.gate_up_proj = torch.nn.Parameter(torch.randn(E, hidden, 2 * intermediate) * 0.1)
                 self.down_proj = torch.nn.Parameter(torch.randn(E, intermediate, hidden) * 0.1)
-            else:               # (E, out, in)
+            else:
                 self.gate_up_proj = torch.nn.Parameter(torch.randn(E, 2 * intermediate, hidden) * 0.1)
                 self.down_proj = torch.nn.Parameter(torch.randn(E, hidden, intermediate) * 0.1)
 
@@ -127,10 +121,6 @@ def _stacked_experts(hidden, intermediate, stored_in_out, flag):
 @pytest.mark.parametrize("hidden,intermediate", [(64, 32), (64, 48)])
 @pytest.mark.parametrize("parameter_name", ["gate_up_proj", "down_proj"])
 def test_extractor_matches_peft_delta_for_every_stored_layout(flag, hidden, intermediate, parameter_name):
-    """Which layouts PEFT swaps in/out for changed between releases: 0.19.0 swaps an
-    is_transposed stack, 0.19.1 and later swap the (E, out, in) ones. The canonical reading
-    holds exactly when PEFT's choice and the stored layout disagree, so each square cell here
-    was wrong on some PEFT between 0.19.0 and 0.21.0 under a rule keyed on either flag alone."""
     from peft.tuners.lora.layer import ParamWrapper
     stored_in_out = flag is not None
     torch.manual_seed(0)

@@ -1,6 +1,3 @@
-# Llama-4 MoE on Unsloth's grouped expert path must reproduce the model's own
-# dense forward: the sigmoid router score scales the expert INPUT, top_k pairs
-# only, shared expert added, router logits returned.
 import pytest
 import torch
 
@@ -18,10 +15,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _fp32_tolerance(default):
-    # The Triton grouped GEMM accumulates at about 1e-3 in fp32 on every MoE (Qwen3-MoE and
-    # Mixtral included); torch grouped_mm and the native loop match the dense forward to 1e-6.
-    # Ask the module the installed experts forward comes from (the compiled cache copy or
-    # unsloth_zoo), since each keeps its own cached backend choice.
+    # Triton grouped GEMM accumulates at ~1e-3 in fp32; grouped_mm and the native loop match to 1e-6.
     import sys
     module = sys.modules.get(getattr(Llama4TextExperts.forward, "__module__", ""), None)
     select = getattr(module, "select_moe_backend", None)
@@ -44,8 +38,6 @@ def _restore_llama4_classes():
 
 
 def reference_forward(moe, hidden_states):
-    """transformers' Llama4TextMoe.forward as shipped (dense over all experts,
-    router score multiplied into the input), written against the raw params."""
     hidden_states = hidden_states.reshape(-1, moe.hidden_dim)
     router_logits = torch.nn.functional.linear(hidden_states, moe.router.weight)
     top_value, top_index = torch.topk(router_logits, moe.top_k, dim = 1)
@@ -63,9 +55,7 @@ def reference_forward(moe, hidden_states):
     return out, router_logits
 
 
-# Multiples of the Triton grouped GEMM tiles, which is the backend chosen where torch._grouped_mm
-# is unavailable; its kernels assert K % BLOCK_SIZE_K == 0. 2 * 128 == 256 also makes gate_up
-# square, so the declared (E, in, out) layout decides the orientation, not the shape.
+# Multiples of the Triton tiles (K % BLOCK_SIZE_K == 0); 2 * 128 == 256 makes gate_up square on purpose.
 HIDDEN = 256
 
 
@@ -122,8 +112,6 @@ def test_backward_matches_reference_fp32():
             assert torch.allclose(got[name], ref[name], atol = 1e-4, rtol = 1e-4), \
                 (name, (got[name] - ref[name]).abs().max())
             continue
-        # Triton: about 4e-3 of the largest gradient on square and non-square stacks alike, where
-        # a wrong orientation would be off by the order of the gradient itself.
         assert (got[name] - ref[name]).abs().max() <= 1e-2 * ref[name].abs().max(), \
             (name, (got[name] - ref[name]).abs().max())
 
@@ -136,8 +124,6 @@ def test_patch_is_idempotent():
 
 
 def test_a_failed_moe_patch_leaves_both_forwards_alone(monkeypatch):
-    # The patched experts forward needs routing indices and weights that only the patched MoE
-    # forward passes, so a refused MoE patch must not leave the experts one installed.
     import unsloth_zoo.temporary_patches.llama4_moe as llama4_moe
 
     def experts_forward(self, hidden_states):
@@ -164,9 +150,6 @@ def test_a_failed_moe_patch_leaves_both_forwards_alone(monkeypatch):
 
 
 def test_no_patch_before_the_tuple_returning_router(monkeypatch):
-    # Before transformers 4.54 the router is a plain nn.Linear returning logits only and the MoE
-    # returns transposed scores; the patched forward unpacks (scores, logits) and would raise or,
-    # with exactly two tokens, run and return NaN. Those versions keep their own forwards.
     import transformers.models.llama4.modeling_llama4 as modeling_llama4
 
     def experts_forward(self, hidden_states):
@@ -185,9 +168,6 @@ def test_no_patch_before_the_tuple_returning_router(monkeypatch):
 
 
 def test_per_expert_experts_keep_the_models_own_forward():
-    """Pre-quantized per-expert checkpoints get transformers' SequentialLlama4TextExperts,
-    which only takes hidden states: the patched MoE forward must run the model's dense
-    routing for them instead of calling them with routing arguments."""
     try:
         from transformers.quantizers.base import SequentialLlama4TextExperts
     except Exception as e:
@@ -206,7 +186,6 @@ def test_per_expert_experts_keep_the_models_own_forward():
             p.normal_(0, 0.05)
     x = torch.randn(3, 5, HIDDEN, device = DEVICE)
     out, logits = moe(x)
-    # Per token: shared expert plus each selected expert on the input scaled by its score.
     flat = x.reshape(-1, HIDDEN)
     ref_logits = torch.nn.functional.linear(flat, moe.router.weight)
     top_value, top_index = torch.topk(ref_logits, 1, dim = 1)

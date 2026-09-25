@@ -192,8 +192,7 @@ def test_extractor_disambiguates_square_dims_via_did_swap(did_swap):
     assert first.shape == (E, dim, R)
     assert second.shape == (E, R, dim)
 
-    # Reference: what PEFT's own get_delta_weight adds to an (E, out, in) square stack.
-    # PEFT 0.19+ (swap flag set) adds B @ A per expert; PEFT 0.18 adds (B @ A).T.
+    # PEFT 0.19+ adds B @ A per expert; PEFT 0.18 adds (B @ A).T.
     x = torch.randn(5, dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]

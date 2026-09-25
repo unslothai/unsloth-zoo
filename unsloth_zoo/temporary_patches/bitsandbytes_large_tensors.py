@@ -13,23 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""4-bit quantize / dequantize of tensors with 2^31 elements or more.
-
-bitsandbytes passes the element count of `quantize_4bit` and `dequantize_4bit`
-to its CUDA kernels as a C `int32`. A fused expert stack larger than that,
-such as Inkling-Small's gate_up_proj (256 experts x 4096 x 4096 = 4.29e9
-values), wraps the count negative and the load stops with
-"Error invalid argument at line 74 in file /src/csrc/ops.cu".
-
-Block-wise quantization is independent per block, so a tensor is quantized
-here in pieces whose sizes are multiples of the block size and below the
-limit, and the pieces' packed bytes and absmax are concatenated. The nested
-absmax compression (`compress_statistics`) is applied once over the joined
-absmax, exactly as bitsandbytes does for a small tensor, so the result is
-bit-identical to what one kernel call would produce. Dequantization resolves
-the (possibly nested) absmax once and dequantizes the same pieces. Tensors
-below the limit take bitsandbytes' own path untouched.
-"""
+"""Chunked 4-bit quantize / dequantize for tensors past bitsandbytes' int32 element count."""
 import inspect
 import math
 
@@ -41,8 +25,7 @@ from .utils import logger
 __all__ = ["patch_bitsandbytes_large_tensors", "BNB_INT32_ELEMENT_LIMIT"]
 
 BNB_INT32_ELEMENT_LIMIT = 2**31 - 1
-# Pieces of at most 2^30 elements: half the limit, so the packed row count and
-# absmax offsets of every piece stay far inside int32 as well.
+# 2^30 elements: half the int32 limit, so packed rows and absmax offsets stay in range too.
 _PIECE_ELEMENTS = 2**30
 
 
@@ -64,8 +47,7 @@ def patch_bitsandbytes_large_tensors():
     original_quantize = F.quantize_4bit
     original_dequantize = F.dequantize_4bit
 
-    # Below the limit the caller's own arguments go through untouched: bitsandbytes 0.45 and
-    # 0.46 declare blocksize = 64 and reject an explicit None, 0.47 and later default to None.
+    # Below the limit pass args through untouched: bitsandbytes 0.45 / 0.46 reject blocksize=None.
     quantize_signature = inspect.signature(original_quantize)
     dequantize_signature = inspect.signature(original_dequantize)
 
@@ -124,7 +106,6 @@ def patch_bitsandbytes_large_tensors():
         return out, state
 
     def dequantize_4bit(A, *args, **kwargs):
-        # Positional order (A, quant_state, absmax, out, ...) is the same on every bitsandbytes.
         quant_state = kwargs["quant_state"] if "quant_state" in kwargs else (args[0] if len(args) > 0 else None)
         if quant_state is not None:
             n = math.prod(quant_state.shape)
@@ -159,7 +140,7 @@ def patch_bitsandbytes_large_tensors():
         values_per_storage = storage_itemsize * 2
         piece = _piece_elements(bs, storage_itemsize)
         flat_packed = A.reshape(-1)
-        # A non-contiguous out would make reshape(-1) a copy, so fill a scratch buffer and copy back.
+        # reshape(-1) of a non-contiguous out copies: fill a scratch buffer, then copy back.
         in_place = out is not None and out.is_contiguous()
         result = out.view(-1) if in_place else torch.empty(n, device = A.device, dtype = quant_state.dtype)
         for start in range(0, n, piece):
@@ -176,7 +157,6 @@ def patch_bitsandbytes_large_tensors():
             if not in_place:
                 out.copy_(result.reshape(out.shape))
             result = out
-        # Same orientation as bitsandbytes, which transposes a row-packed A with or without out.
         if A.shape[0] == 1:
             return result.t()
         return result

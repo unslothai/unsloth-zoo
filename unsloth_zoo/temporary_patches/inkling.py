@@ -13,23 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Inkling (thinkingmachines/Inkling-Small) checkpoint config compatibility.
-
-The published config.json carries `intermediate_size` (the MoE expert width,
-2048 on Inkling-Small) and `dense_intermediate_size` (the width of the leading
-dense layers, 16384), and no `moe_intermediate_size`. transformers'
-`InklingTextConfig` overwrites `intermediate_size` with the dense width and
-leaves `moe_intermediate_size` at its class default of 3072, so every routed
-and shared expert is built at the wrong width and loading stops with
-"You set `ignore_mismatched_sizes` to `False`" (gate_up_proj ckpt
-(256, 4096, 4096) vs model (256, 6144, 4096)). Plain transformers fails the
-same way.
-
-When a config supplies `dense_intermediate_size` and `intermediate_size` but
-not `moe_intermediate_size`, its `intermediate_size` is the MoE width: that is
-what a separate dense width means. A config that spells out
-`moe_intermediate_size` is left alone.
-"""
+"""Inkling-Small config fix: its intermediate_size is the MoE width, not the dense width."""
 import functools
 
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING

@@ -1,6 +1,3 @@
-# Small helpers behind the structural MoE dispatch: LoRA target regex skips
-# Linear subclasses that return tuples, the compiler leaves scalar-only helper
-# functions alone, compiled classes stay native, Inkling's config split.
 import pytest
 import torch
 import torch.nn as nn
@@ -90,14 +87,11 @@ def test_inkling_config_moe_width_from_split():
     from unsloth_zoo.temporary_patches.inkling import patch_inkling_text_config
     saved_init = InklingTextConfig.__init__
     patch_inkling_text_config()
-    # The published Inkling-Small shape: MoE width in intermediate_size, dense width separate.
     c = InklingTextConfig(hidden_size = 64, num_hidden_layers = 2, intermediate_size = 2048, dense_intermediate_size = 16384)
     assert c.moe_intermediate_size == 2048
     assert c.intermediate_size == 16384
-    # Explicit MoE width wins.
     c = InklingTextConfig(hidden_size = 64, num_hidden_layers = 2, intermediate_size = 2048, dense_intermediate_size = 16384, moe_intermediate_size = 512)
     assert c.moe_intermediate_size == 512
-    # No split: defaults untouched.
     c = InklingTextConfig(hidden_size = 64, num_hidden_layers = 2)
     assert c.moe_intermediate_size == 3072
     InklingTextConfig.__init__ = saved_init

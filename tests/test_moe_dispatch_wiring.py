@@ -1,7 +1,3 @@
-# The helpers behind the structural MoE dispatch are tested on their own in
-# test_moe_dispatch_helpers.py and test_experts_interface.py. These tests check the
-# places that CALL them, so taking a call site or a patch registration out fails here
-# even though the helper itself still behaves.
 import json
 import os
 import subprocess
@@ -32,8 +28,6 @@ def test_new_patches_are_registered():
 
 
 def test_tuple_returning_linear_is_skipped_under_any_name():
-    """#1318 already drops the leaf name `router`; a router registered under another
-    name is only kept out by the structural rule."""
     import re
     from unsloth_zoo.peft_utils import get_peft_regex
 
@@ -67,14 +61,10 @@ def test_tuple_returning_linear_is_skipped_under_any_name():
 
 
 def test_quantizer_leaves_experts_it_cannot_route_unpacked():
-    """Only experts whose forward is Unsloth's are packed: a module with its own forward
-    (Llama-4's bmm before its patch, a user-forced transformers implementation) keeps
-    its checkpoint dtype."""
     from unsloth_zoo.temporary_patches import moe_utils_bnb4bit
     if not moe_utils_bnb4bit.HAS_BNB:
         pytest.skip("bitsandbytes 4-bit is not usable here, so no 4-bit load reaches the quantizer")
     if not moe_utils_bnb4bit.is_transformers_v5_moe_quantization_available():
-        # transformers 4.x quantizes experts through its own path; this hook is never installed there.
         pytest.skip("transformers has no v5 MoE quantization hooks")
     from bitsandbytes.nn import Params4bit
     from transformers import BitsAndBytesConfig
@@ -120,8 +110,6 @@ print("@@@" + json.dumps({"found": where != -1, "line_above": line_above}))
 
 
 def test_compiler_emits_scalar_only_helpers_uncompiled(tmp_path):
-    """Inkling's `plan_out_scales(temporal_patch_size: int, ...)` runs from `__init__`;
-    compiled with fullgraph = True it fails on `math.isqrt` and ends the load."""
     pytest.importorskip("transformers.models.inkling.modeling_inkling")
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"

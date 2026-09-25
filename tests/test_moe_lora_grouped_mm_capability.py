@@ -660,10 +660,6 @@ def _stub_triton_language(monkeypatch, has_make_tensor_descriptor):
 
 
 def test_the_triton_backend_is_not_offered_without_make_tensor_descriptor(monkeypatch):
-    """The grouped GEMM kernels name tl.make_tensor_descriptor, and Triton's JIT resolves every
-    attribute a kernel mentions while hashing it. Triton 3.3 (torch 2.7) has only the
-    _experimental_ name, so every launch raised AttributeError; the probe must say no there
-    and leave the native loop to run."""
     import sys, types
     for name in (
         "unsloth", "unsloth.kernels", "unsloth.kernels.moe",
@@ -716,8 +712,6 @@ def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
     interface.supports_tma = lambda *a, **kw: False
     monkeypatch.setattr(M, "_init_triton_allocator", lambda *a, **kw: None, raising = False)
     _stub_triton_language(monkeypatch, has_make_tensor_descriptor = True)
-    # An Apple Silicon runner has MLX installed and the probe answers no before the device
-    # check; this is about the CUDA decision.
     monkeypatch.setattr(M, "is_mlx_available", lambda: False)
 
     monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)

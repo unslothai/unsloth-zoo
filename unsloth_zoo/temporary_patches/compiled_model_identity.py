@@ -13,26 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Compiled model classes are still transformers' own code.
-
-The compiler rewrites a modeling file into `unsloth_compiled_cache/
-unsloth_compiled_module_<model>.py` and installs those classes back into the
-transformers module, so a loaded model's classes have
-`__module__ == "unsloth_compiled_module_<model>"`. transformers 5 decides
-several things from `PreTrainedModel.is_custom_code()`, which is
-`not cls.__module__.startswith("transformers.")`:
-
-* `get_model_conversion_mapping` skips the architecture's checkpoint key
-  conversions for custom code. Inkling's checkpoint stores `model.llm.*`,
-  `w13_weight` / `w2_weight` keys that only exist through that mapping, so with
-  the compiler on every key came back UNEXPECTED and every module MISSING, and
-  the model trained from random weights;
-* `_initialize_weights` and the missing-key accounting for tied modules take
-  the custom-code branch.
-
-A class the compiler generated from a native transformers class is native
-code, so `is_custom_code` answers for it as for the original.
-"""
+"""Keep compiled-cache model classes counted as transformers' own code (is_custom_code)."""
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
 from .utils import logger
 
@@ -58,7 +39,6 @@ def patch_compiled_model_is_custom_code():
         if module.startswith("transformers."):
             return False
         if module.startswith(UNSLOTH_COMPILED_MODULE_PREFIX):
-            # Generated from a transformers modeling file: not user code.
             return False
         return bool(original_function(cls))
 

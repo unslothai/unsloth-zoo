@@ -100,19 +100,12 @@ def _is_expert_module(module: nn.Module) -> bool:
 
 
 def _expert_forward_is_handled(module: nn.Module) -> bool:
-    """Whether packing this module's expert stacks to 4-bit is safe: only when
-    its forward is Unsloth's (patched by name, or a transformers-decorated class
-    whose config dispatches to the "unsloth" implementation). A structural match
-    alone is not enough: Llama-4's experts have 3-D gate_up_proj / down_proj too,
-    but their forward is the model's own bmm, which cannot read packed bytes."""
     try:
         from unsloth_zoo.temporary_patches.moe_experts_interface import expert_forward_is_handled
     except ImportError:
         return False
     if expert_forward_is_handled(module):
         return True
-    # The generic bnb 4-bit route, where this module has one, gives a decorated class a
-    # forward that dequantizes; it then counts as Unsloth's.
     route = globals().get("_route_generic_bnb4bit_experts_class")
     return route is not None and route(module) and expert_forward_is_handled(module)
 
@@ -393,7 +386,6 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
     if backend == "grouped_mm":
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-grouped_mm.")
         forward_fn = forward_native_grouped_mm
-    # Interleaved gate_up (GPT-OSS) has no Triton path; the eager loop implements it.
     elif backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-Triton grouped GEMM.")
         forward_fn = forward_triton_grouped_gemm

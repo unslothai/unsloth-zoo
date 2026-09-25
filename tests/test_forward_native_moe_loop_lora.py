@@ -301,8 +301,6 @@ def test_forward_native_moe_loop_gpt_oss_matches_naive():
 
 
 class _InterleavedExperts(nn.Module):
-    """A non-GPT-OSS experts class that stores gate_up interleaved (is_concatenated=False)
-    with biases and a plain SiLU gate: it must not get GPT-OSS's clamped activation."""
 
     is_concatenated = False
 

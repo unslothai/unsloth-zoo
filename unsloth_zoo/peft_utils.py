@@ -64,14 +64,7 @@ SKIP_QUANTIZATION_MODULES = [
 _LINEAR_FORWARD_RETURNS_TENSOR_CACHE = {}
 
 def _linear_forward_returns_tensor(cls) -> bool:
-    """False for an nn.Linear subclass whose own forward returns a tuple.
-
-    A LoRA adapter adds lora_B(lora_A(x)) to whatever the base layer returns, so
-    a Linear subclass that returns more than one tensor cannot take one: MoE
-    routers such as Llama4Router and PhimoeTopKRouter return (scores, logits)
-    and PEFT then fails inside the adapter forward ("'tuple' object has no
-    attribute 'to'"). Plain nn.Linear and subclasses that keep its forward are
-    always fine; a subclass whose source cannot be read is assumed fine."""
+    """False for an nn.Linear subclass whose forward returns a tuple, which LoRA cannot add to."""
     cached = _LINEAR_FORWARD_RETURNS_TENSOR_CACHE.get(cls)
     if cached is not None:
         return cached

@@ -202,14 +202,7 @@ def calls_disable_compile_function(source, disable_compile_functions):
 
 
 def function_has_tensor_inputs(source: str) -> bool:
-    """False when every parameter of the function carries a non-tensor
-    annotation (ints, strs, bools, lists of them), so Dynamo has nothing to
-    trace and Inductor nothing to fuse. Such functions are configuration
-    helpers, like Inkling's `plan_out_scales(temporal_patch_size: int, ...)`
-    called from `__init__`; compiling them with fullgraph = True fails on the
-    first Python-int operation (`math.isqrt`) and takes the model load with it.
-    An unannotated parameter, *args or **kwargs, or unparseable source counts
-    as a tensor input, so only fully annotated scalar helpers are skipped."""
+    """False when every parameter has a non-tensor annotation: nothing for Dynamo to trace."""
     try:
         tree = ast.parse(textwrap.dedent(source))
     except Exception:
@@ -226,8 +219,7 @@ def function_has_tensor_inputs(source: str) -> bool:
         return True
     if parameters[0].arg in ("self", "cls"):
         return True
-    # A default that is a literal (device = "cpu", eps = 1e-6) tells the type
-    # of an unannotated parameter; anything else unannotated may be a tensor.
+    # A literal default types an unannotated parameter; anything else may be a tensor.
     defaults = {}
     for parameter, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
         defaults[parameter.arg] = default
