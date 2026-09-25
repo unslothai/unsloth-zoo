@@ -2,10 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""YaRN mscale helpers called from MLA attention __init__ must stay uncompiled.
-
-Under meta init a compiled float helper returns a meta tensor and `.item()` fails.
-"""
+"""MLA attention __init__ calls the YaRN mscale helpers under meta init, where a compiled float helper fails."""
 
 import glob
 import importlib
@@ -22,7 +19,6 @@ _HELPERS = ("yarn_get_mscale", "yarn_apply_mscale")
 
 
 def _modeling_files_defining_helpers():
-    # Discovered rather than listed so new MLA models are covered automatically.
     import transformers.models
 
     root = os.path.dirname(transformers.models.__file__)
@@ -68,7 +64,6 @@ def test_shipped_yarn_helpers_are_disabled():
 
 
 def test_callers_are_not_disabled():
-    # Keywords match the definitions only, so callers keep compiling.
     try:
         from transformers.models.deepseek_v3 import modeling_deepseek_v3 as m
     except Exception:
@@ -83,7 +78,6 @@ def _yarn_get_mscale(scale = 1, mscale = 1):
 
 
 def test_compiled_scalar_helper_fails_under_meta_init():
-    # Eager is fine under meta init, compiled is not.
     with torch.device("meta"):
         assert _yarn_get_mscale(40.0, 1.0) == pytest.approx(1.3688879454113936)
         compiled = torch.compile(_yarn_get_mscale, fullgraph = True, dynamic = True)
