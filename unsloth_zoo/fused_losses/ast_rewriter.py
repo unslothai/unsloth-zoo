@@ -76,12 +76,8 @@ _TRANSPARENT_METHODS = frozenset(("float", "contiguous", "to"))
 
 
 def _unwrap_logits_rhs(value: ast.AST):
-    """Peel the logits RHS to ``(self.<HEAD>(...) call, scale_kws)``, or ``None``.
-
-    ``* s`` / ``/ s`` (Falcon-H1, HyperCLOVAX) become fused-kernel scale kwargs; any
-    other wrapper (bias add, subscript) returns None, since peeling blindly dropped
-    it and trained on wrongly scaled logits.
-    """
+    """``(self.<HEAD>(...) call, scale_kws)``, or None for any wrapper besides ``* s`` / ``/ s``
+    (peeling blindly dropped it and trained on wrongly scaled logits)."""
     scale_kws: list = []
     node = value
     while True:
@@ -250,8 +246,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
             continue
         unwrapped = _unwrap_logits_rhs(stmt.value)
         if unwrapped is None:
-            # Non-lm_head reassign (Cohere's `logits * self.logit_scale`) or an
-            # unreproducible wrapper: bail to LOSS_MAPPING.
+            # Non-lm_head reassign (Cohere's `logits * self.logit_scale`) or unreproducible wrapper.
             return None
         inner, scale_kws = unwrapped
         head_attr = inner.func.attr
@@ -312,8 +307,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
-    # Fused call only: other branches evaluate the original RHS (would scale twice).
-    # An explicit same-name loss_function kwarg wins, avoiding a duplicate.
+    # Fused call only (other branches re-evaluate the RHS); an explicit same-name kwarg wins.
     already = {name for name, _ in cap.extra_loss_kws}
     scale_extra = "".join(
         f", {name}={ast.unparse(value)}"
