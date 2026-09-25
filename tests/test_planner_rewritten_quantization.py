@@ -75,7 +75,9 @@ def test_a_rewritten_modelopt_checkpoint_is_sized_with_the_callers_config(tmp_pa
     assert not hasattr(config, "rewritten_quantization_config")
     assert config.quantization_config["quant_method"] == "fp8"
     proj = model.model.layers[0].self_attn.q_proj
-    assert type(proj).__name__ != "Linear"
+    # validate_environment dequantizes without a GPU of compute capability >= 8.9, as the load does.
+    dequantized = getattr(hf_quantizer.quantization_config, "dequantize", False)
+    assert (type(proj).__name__ == "Linear") == bool(dequantized)
     assert type(model.lm_head).__name__ == "Linear"
 
 
