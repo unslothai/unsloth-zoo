@@ -1354,3 +1354,34 @@ def test_l2norm_patch_rebinds_only_imported_gated_delta_modules(monkeypatch):
     # Idempotent: a second pass finds nothing left to do.
     assert fla_vendor._patch_l2norm_fp32_on_torch_path(packages = (fake_pkg, plain_pkg)) == []
     assert mod.l2norm is fla_vendor._fp32_l2norm
+
+
+def test_rdna1_later_kernel_hub_decorations_never_resolve_fla(monkeypatch):
+    # unsloth's compiler re-applies the decorator after the last patch phase; an installed fla
+    # bound there aborts the first forward on RDNA1 (FDOT2).
+    hub_kernels = pytest.importorskip("transformers.integrations.hub_kernels")
+    import types
+    import transformers.integrations as integrations
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    original = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
+    if original is None:
+        pytest.skip("transformers predates the kernel-hub fallback decorator")
+    monkeypatch.setattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", original)
+    monkeypatch.setattr(integrations, "use_kernel_func_from_hub_with_fallback", original, raising = False)
+    fake = types.ModuleType("fla")
+    def kernel(*a, **k):
+        raise RuntimeError("fla kernel reached")
+    fake.chunk_gated_delta_rule = kernel
+    monkeypatch.setitem(sys.modules, "fla", fake)
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: True)
+
+    assert fla_vendor._block_fla_hub_decorator() is True
+    assert fla_vendor._block_fla_hub_decorator() is True
+    from transformers.integrations import use_kernel_func_from_hub_with_fallback as decorate
+
+    def torch_path(q):
+        return q + 1
+    bound = decorate("chunk_gated_delta_rule", "fla")(torch_path)
+    assert bound is torch_path and bound(1) == 2
+    assert hub_kernels.use_kernel_func_from_hub_with_fallback.__wrapped__ is original

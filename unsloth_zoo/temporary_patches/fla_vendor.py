@@ -848,6 +848,47 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
     return tuple(repaired)
 
 
+_NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
+
+
+def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING):
+    """RDNA1: make every later kernel-hub decoration bind the torch function, never fla.
+
+    The decorator resolves fla once, when it is applied, and unsloth's compiler re-applies it
+    in unsloth_compiled_module_* (importing the name from the modeling module) after the last
+    patch phase, so rebinding existing wrappers alone still reached fla on the first load.
+    """
+    try:
+        import transformers.integrations.hub_kernels as hub_kernels
+    except Exception:
+        return False
+    original = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
+    if original is None:
+        return False
+    if getattr(original, _NO_FLA_HUB_MARK, False):
+        patched = original
+    else:
+        @functools.wraps(original)
+        def patched(func_name, package, *args, **kwargs):
+            if package == "fla":
+                return lambda torch_function: torch_function
+            return original(func_name, package, *args, **kwargs)
+        setattr(patched, _NO_FLA_HUB_MARK, True)
+        hub_kernels.use_kernel_func_from_hub_with_fallback = patched
+    holders = ["transformers.integrations"] + _l2norm_modules(packages)
+    for modname in holders:
+        module = sys.modules.get(modname)
+        if module is None or modname != "transformers.integrations" and (
+            "use_kernel_func_from_hub_with_fallback" not in vars(module)
+        ):
+            continue
+        try:
+            setattr(module, "use_kernel_func_from_hub_with_fallback", patched)
+        except Exception:
+            continue
+    return True
+
+
 def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING):
     """RDNA1: bind kernel-hub wrappers (incl. compiled copies) to their torch fallback."""
     try:
@@ -896,6 +937,7 @@ def patch_vendor_fla(phase=None):
         if _gpu_lacks_dot_instructions():
             # RDNA1: never make fla reachable; force the torch fallback, no alias/repair.
             try:
+                _block_fla_hub_decorator()
                 _force_kernel_hub_fallback()
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
