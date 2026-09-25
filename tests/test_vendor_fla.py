@@ -305,11 +305,6 @@ _HYGIENE_SUBPROCESS = textwrap.dedent(
 )
 
 
-@pytest.mark.skipif(
-    not _injection_supported(),
-    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
-)
-
 def _rdna1_gpu_visible():
     """These subprocess tests assert that the vendored fla IS injected. On a host with an
     RDNA1 GPU visible unsloth routes gated-delta to the pure-torch path on purpose (no dot
@@ -326,6 +321,10 @@ _skip_on_rdna1 = pytest.mark.skipif(
     reason = "an RDNA1 GPU is visible: fla is routed to the pure-torch path here by design",
 )
 
+@pytest.mark.skipif(
+    not _injection_supported(),
+    reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
+)
 @_skip_on_rdna1
 def test_import_hygiene_subprocess():
     env = dict(os.environ)
