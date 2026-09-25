@@ -1954,7 +1954,70 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     return quantization_config
 
 
-def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
+def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
+    """Copy of ``config`` with overrides applied as ``PretrainedConfig.from_dict`` does."""
+    import copy
+
+    config = copy.deepcopy(config)
+    # from_pretrained gives a non-None `dtype` precedence over the older `torch_dtype`.
+    dtype = overrides.get("dtype", None)
+    if dtype is None:
+        dtype = overrides.get("torch_dtype", None)
+    if isinstance(dtype, Mapping):
+        # Per-module form: from_pretrained uses the "" entry's dtype
+        import torch
+
+        dtype = dtype.get("", torch.get_default_dtype())
+        if isinstance(dtype, str) and dtype != "auto":
+            dtype = getattr(torch, dtype)
+    if dtype is not None and dtype != "auto":
+        # 5.x keeps `torch_dtype` as an alias of `dtype`; 4.x stores `torch_dtype` only.
+        for name in ("torch_dtype", "dtype"):
+            try:
+                setattr(config, name, dtype)
+            except Exception:
+                pass
+    for key, value in overrides.items():
+        if key in _HUB_KWARGS or key in ("trust_remote_code", "dtype", "torch_dtype"):
+            continue
+        if not hasattr(config, key):
+            continue
+        current = getattr(config, key)
+        if isinstance(value, Mapping) and hasattr(current, "to_dict") and not isinstance(current, Mapping):
+            setattr(config, key, _merge_sub_config(current, value))
+            continue
+        setattr(config, key, value)
+    return config
+
+
+def _merge_sub_config(current: Any, override: Mapping[str, Any]) -> Any:
+    """Deep-merge ``override``; rebuilt as the same class so derived fields regenerate."""
+    merged = current.to_dict()
+    for key, value in override.items():
+        child = getattr(current, key, None)
+        if isinstance(value, Mapping) and hasattr(child, "to_dict") and not isinstance(child, Mapping):
+            value = _merge_sub_config(child, value)
+        merged[key] = value
+    try:
+        return current.__class__(**merged)
+    except Exception:
+        for key, value in override.items():
+            child = getattr(current, key, None)
+            if isinstance(value, Mapping) and hasattr(child, "to_dict") and not isinstance(child, Mapping):
+                value = _merge_sub_config(child, value)
+            try:
+                setattr(current, key, value)
+            except Exception:
+                pass
+        return current
+
+
+def build_meta_model(
+    model_name_or_path: str,
+    *,
+    config: Any = None,
+    **from_pretrained_kwargs: Any,
+):
     """Instantiate the model on the meta device, quantiser included.
 
     Returns ``(model, hf_quantizer, config)``. Costs no GPU memory and no weight
@@ -1963,12 +2026,17 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` are honoured
     the way the loader honours them, so runtime quantisation of a full-precision
     checkpoint is sized as it will really be loaded.
+
+    ``config`` overrides the repo's config (eg a VLM's ``text_config``).
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
     runtime_qcfg = _runtime_quantization_config(from_pretrained_kwargs)
-    config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
+    if config is not None:
+        config = _apply_config_overrides(config, from_pretrained_kwargs)
+    else:
+        config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
     trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
     auto_cls = _auto_class_for(config, trust_remote_code=trust_remote_code)
     hf_quantizer = None
@@ -2132,6 +2200,7 @@ def plan_device_map_for_pretrained(
     prefer_head_device: int | None = None,
     reserve_load_transient: bool = True,
     trust_remote_code: bool = False,
+    config: Any = None,
     **config_kwargs: Any,
 ) -> DeviceMapPlan | None:
     """Plan a device map straight from a checkpoint id or path.
@@ -2148,11 +2217,14 @@ def plan_device_map_for_pretrained(
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` pass through to
     :func:`build_meta_model`, so a full-precision checkpoint you intend to load
     quantised is sized as it will really be loaded.
+
+    ``config`` plans from an already resolved config; see :func:`build_meta_model`.
     """
     if len(_usable_devices(max_memory)) < 2:
         return None
     model, hf_quantizer, _config = build_meta_model(
-        model_name_or_path, trust_remote_code=trust_remote_code, **config_kwargs
+        model_name_or_path, config=config,
+        trust_remote_code=trust_remote_code, **config_kwargs
     )
     return plan_device_map(
         model,
