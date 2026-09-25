@@ -3980,7 +3980,7 @@ def merge_and_overwrite_lora(
             if os.path.exists(tokenizer_model_path):
                 os.makedirs(save_directory, exist_ok=True)
                 # Copy from local
-                shutil.copy2(tokenizer_model_path, os.path.join(save_directory, "tokenizer.model"))
+                _copy_file_from_source(tokenizer_model_path, save_directory, "tokenizer.model")
                 print(f"Copied tokenizer.model from local model directory")
         else:
             # Original HF repo logic
