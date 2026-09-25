@@ -383,15 +383,16 @@ def _dequantize_full_expert_weights_fp4(weight: torch.Tensor, scale, target_dtyp
     if scale.shape[1] != M or K % scale.shape[2] != 0:
         return None
     group = K // scale.shape[2]
-    table = _fp4_pair_table(target_dtype, weight.device)
+    # Multiply in fp32 and cast once, as transformers does; bf16 scales would round twice.
+    table = _fp4_pair_table(torch.float32, weight.device)
     out = torch.empty(E, M, K, dtype = target_dtype, device = weight.device)
     scale_f = _fp4_scale_to_float(scale)
     for start in range(0, E, _FP4_EXPERT_CHUNK):
         stop = min(start + _FP4_EXPERT_CHUNK, E)
         codes = weight[start:stop].contiguous().view(torch.uint8).to(torch.int32)
         values = F.embedding(codes.view(-1), table).view(stop - start, M, K)
-        s = scale_f[start:stop].to(target_dtype).repeat_interleave(group, dim = -1)
-        out[start:stop] = values * s
+        values.mul_(scale_f[start:stop].repeat_interleave(group, dim = -1))
+        out[start:stop] = values
     return out
 
 

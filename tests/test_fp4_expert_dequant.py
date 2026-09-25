@@ -67,6 +67,14 @@ def test_the_generic_entry_point_now_handles_fp4():
     torch.testing.assert_close(out.float(), _reference_dequant(packed, scale, torch.bfloat16).float())
 
 
+@needs_fp4_reference
+def test_float_scales_round_once_like_transformers():
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import _dequantize_full_expert_weights_fp4
+    packed, _ = _fixture(E = 3, M = 16, K = 128)
+    scale = torch.rand(3, 16, 4, generator = torch.Generator().manual_seed(1)) * 0.3 + 0.01
+    out = _dequantize_full_expert_weights_fp4(packed, scale, torch.bfloat16)
+    torch.testing.assert_close(out, _reference_dequant(packed, scale, torch.bfloat16), rtol = 0, atol = 0)
+
 def test_chunking_over_experts_is_seamless():
     from unsloth_zoo.temporary_patches import moe_utils_fp8
     packed, scale = _fixture(E = 5)
