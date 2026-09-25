@@ -1238,6 +1238,46 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
     return tuple(repaired)
 
 
+def _force_kernel_hub_fallback(packages=_REPAIR_MODELING):
+    """Bind the kernel-hub decorators straight to their pure-torch fallback.
+
+    The RDNA1 counterpart to ``_repair_kernel_hub_closures``. On a GPU without dot
+    instructions every fla kernel aborts the process at compile (FDOT2), so on the
+    post-#47630 layout we must not let the closure repair re-resolve the decorators
+    to a user-installed fla. Rebinding each wrapper to its ``__wrapped__`` (the torch
+    implementation the decorator falls back to) keeps the model on pure torch without
+    importing fla at all. Returns the names forced, for logging and tests.
+    """
+    try:
+        from transformers.integrations.hub_kernels import (  # noqa: F401
+            use_kernel_func_from_hub_with_fallback,
+        )
+    except Exception:
+        return ()               # transformers predates the decorator
+
+    forced = []
+    for package in packages:
+        module = sys.modules.get(f"transformers.models.{package}.modeling_{package}")
+        if module is None:
+            continue
+        for attribute in _KERNEL_HUB_DECORATED:
+            wrapper = getattr(module, attribute, None)
+            original = getattr(wrapper, "__wrapped__", None)
+            if original is None:
+                continue        # not decorated on this transformers
+            if wrapper is original:
+                continue        # already the bare fallback
+            setattr(module, attribute, original)
+            forced.append(f"{package}.{attribute}")
+
+    if forced and UNSLOTH_ENABLE_LOGGING:
+        logger.info(
+            f"Unsloth: forced the fla kernels on {', '.join(forced)} to the pure-torch "
+            f"fallback (no dot instructions on this GPU)."
+        )
+    return tuple(forced)
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
@@ -1246,20 +1286,34 @@ def patch_vendor_fla(phase=None):
     try:
         return _patch_vendor_fla(phase)
     finally:
-        # Every early return in _patch_vendor_fla leaves some fla live, and all of
-        # them are missing the decode name, so the alias goes on the way out rather
-        # than at each return, where the next one added would quietly skip it.
-        # The closure repair follows the alias, since it resolves through it.
-        try:
-            _alias_missing_gated_delta_names()
-        except Exception as e:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
-        try:
-            _repair_kernel_hub_closures()
-        except Exception as e:
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
+        if _gpu_lacks_dot_instructions():
+            # RDNA1: every fla kernel aborts at compile, so fla must never be made
+            # reachable. Skip the alias (it imports fla and would bind its equally
+            # dead decode kernel) and force the kernel-hub decorators onto their
+            # pure-torch fallback, rather than letting _repair_kernel_hub_closures
+            # re-resolve them to a user-installed fla on the post-#47630 layout.
+            try:
+                _force_kernel_hub_fallback()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(
+                        f"Unsloth: could not force fla kernel closures to the pure-torch fallback: {e}"
+                    )
+        else:
+            # Every early return in _patch_vendor_fla leaves some fla live, and all of
+            # them are missing the decode name, so the alias goes on the way out rather
+            # than at each return, where the next one added would quietly skip it.
+            # The closure repair follows the alias, since it resolves through it.
+            try:
+                _alias_missing_gated_delta_names()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
+            try:
+                _repair_kernel_hub_closures()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
 
 
 def _patch_vendor_fla(phase=None):
@@ -1285,9 +1339,10 @@ def _patch_vendor_fla(phase=None):
         if _transformers_uses_availability_probe():
             _patch_is_available(_unavailable_probe)
         # else: post-#47630 the kernel-hub decorator resolves fla with importlib, so no
-        # probe steers it. Not injecting is what keeps it on pure torch here:
-        # _repair_kernel_hub_closures (in the finally) re-resolves the decorators to
-        # the fallback, because no fla is importable once we skip injection.
+        # probe steers it. Skipping injection is not enough on its own: a user-installed
+        # fla is still importable, and the finally would re-resolve the decorators back
+        # to it. _force_kernel_hub_fallback (in the finally) instead binds them to the
+        # pure-torch fallback, so no fla kernel is ever reached.
         _disable_already_imported_gated_delta(why="no dot instructions on this GPU (RDNA1)")
         # The pure-torch path is only correct in float16 (all these GPUs have) with the
         # q/k l2norm reducing in float32, as the fla kernel it replaces does.
