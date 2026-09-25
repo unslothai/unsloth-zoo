@@ -79,6 +79,9 @@ def checkpoint(request, tmp_path_factory):
             "full_attention": {"rope_type": "default", "rope_theta": 160000.0},
             "sliding_attention": {"rope_type": "default", "rope_theta": 50.0},
         },
+        # transformers 4.x reads only these, 5.x only rope_parameters.
+        global_rope_theta = 160000.0,
+        local_rope_theta = 50.0,
         pad_token_id = 0,
     )
     reference = _Reference(transformers.ModernBertModel(config), head_layers = request.param).eval()
