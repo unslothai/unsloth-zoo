@@ -504,3 +504,16 @@ def test_sparse_training_installs_for_imported_aliases_and_missing_modules(monke
     for path in ("mlx_vlm.models.sparse_attention", "mlx_vlm.models.qwen4_exp.qsa_kernel"):
         monkeypatch.delitem(sys.modules, path, raising=False)
     attention.install_sparse_attention_training()
+
+
+def test_qsa_wrapper_forwards_unknown_kwargs_outside_training():
+    from unsloth_zoo.mlx import attention
+
+    def dispatch(queries, keys, values, block_indices, query_ends, *, cache, scale,
+                 block_size, causal, mask, mask_factory, allow_sparse_decode=False,
+                 future_flag=None):
+        return future_flag
+
+    wrapped = attention._qsa_attention_training_over(dispatch)
+    assert wrapped(*[None] * 5, cache=None, scale=1., block_size=4, causal=True,
+                   mask=None, mask_factory=None, future_flag="kept") == "kept"

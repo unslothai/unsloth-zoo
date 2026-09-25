@@ -129,28 +129,31 @@ def _indexed_attention_training_over(original):
 
 
 def _qsa_attention_training_over(original):
+    import inspect
     backend = original.__globals__
+    signature = inspect.signature(original)
 
+    # Pass-through signature: the wrapper outlives training, so a kwarg a newer
+    # mlx-vlm adds must still reach `original` at inference.
     @functools.wraps(original)
-    def attention(queries, keys, values, block_indices, query_ends, *, cache,
-                  scale, block_size, causal, mask, mask_factory,
-                  allow_sparse_decode=False):
+    def attention(*args, **kwargs):
         from .utils import mlx_training_patches_active
         if mlx_training_patches_active():
+            call = signature.bind(*args, **kwargs)
+            call.apply_defaults()
+            a = call.arguments
+            q, k, v = a["queries"], a["keys"], a["values"]
             plan = backend["select_qsa_execution_plan"](
-                queries, keys, values, block_indices, query_ends,
-                block_size=block_size, causal=causal,
-                allow_sparse_decode=allow_sparse_decode)
+                q, k, v, a["block_indices"], a["query_ends"],
+                block_size=a["block_size"], causal=a["causal"],
+                allow_sparse_decode=a.get("allow_sparse_decode", False))
             if plan is backend["QSAExecutionPlan"].INDEXED_SPARSE_PREFILL:
                 # The fused path ignores `mask`; its selection owns the sparse mask.
-                sparse_mask = mask_factory()
+                sparse_mask = a["mask_factory"]()
                 output = backend["scaled_dot_product_attention"](
-                    queries, keys, values, cache=cache, scale=scale, mask=sparse_mask)
+                    q, k, v, cache=a["cache"], scale=a["scale"], mask=sparse_mask)
                 return mx.where(mx.any(sparse_mask, axis=-1, keepdims=True), output, 0)
-        return original(
-            queries, keys, values, block_indices, query_ends, cache=cache,
-            scale=scale, block_size=block_size, causal=causal, mask=mask,
-            mask_factory=mask_factory, allow_sparse_decode=allow_sparse_decode)
+        return original(*args, **kwargs)
     return attention
 
 
