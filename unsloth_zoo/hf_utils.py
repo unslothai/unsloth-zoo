@@ -129,11 +129,7 @@ def _transformers_model_module_name_set() -> frozenset:
 
 
 def _standardize_model_types(model_types) -> list:
-    """Normalize and validate model_type candidates.
-
-    Empty ones are dropped since sub-configs default to "". The rest must be plain
-    module names, since they are interpolated into an import path and cache filename.
-    """
+    # Drops "" (sub-config default); the rest go into an import path, so plain names only
     final_model_types = []
     for model_type in (model_types or []):
         model_type = model_type.lower()
@@ -153,12 +149,8 @@ _MAX_INSTANCE_CONFIG_NODES = 1024
 
 
 def _instance_attribute_model_types(config) -> list:
-    """`model_type` read off the live config objects instead of `to_dict()`.
-
-    `to_dict()` reports the class attribute, so remote configs that set `model_type = ""`
-    on the class and the real name in `__init__` (eg Ling-2.6-flash) serialize as "".
-    Breadth-first over `__dict__` so the top-level type comes first.
-    """
+    # to_dict() writes the class model_type, so remote configs naming themselves only in
+    # __init__ (Ling-2.6-flash: class "", instance "bailing_hybrid") serialize as ""
     try:
         from transformers import PretrainedConfig
         config_types = (PretrainedConfig,)
@@ -175,7 +167,6 @@ def _instance_attribute_model_types(config) -> list:
             hasattr(value, "__dict__")
         )
 
-    # Cap bounds pathological objects so the fallback cannot hang
     found, seen, stack = [], set(), [config]
     while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
         obj = stack.pop(0)
@@ -299,13 +290,9 @@ def get_transformers_model_type(config, trust_remote_code=False):
                     stack.extend(obj)
         model_types = list(find(getattr(config, "to_dict", lambda *args, **kwargs: {})(), "model_type"))
     pass
-    # `find` above returns a list, so an unresolved config arrives here as [], never
-    # None - an `is None` check would let it through and every consumer indexes [0]
-    # or joins the list. Treat empty and None the same.
     from_instance_attribute = False
     final_model_types = _standardize_model_types(model_types)
     if not final_model_types:
-        # Nothing usable from to_dict(), so read the live object instead
         final_model_types = _standardize_model_types(
             _instance_attribute_model_types(config)
         )

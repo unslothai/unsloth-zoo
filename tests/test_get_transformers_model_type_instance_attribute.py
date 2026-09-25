@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`model_type` set on the config instance instead of the class (eg Ling-2.6-flash).
-
-CPU-only and network-free.
-"""
+# model_type set on the config instance, not the class (Ling-2.6-flash). CPU only.
 
 import pytest
 
@@ -17,7 +14,6 @@ _UNRESOLVED_MESSAGE = "Cannot determine model type for config file"
 
 
 class _SubConfig(PretrainedConfig):
-    """Names itself on the instance only."""
     model_type = ""
 
     def __init__(self, model_type = "bailing_hybrid_text", **kwargs):
@@ -26,7 +22,6 @@ class _SubConfig(PretrainedConfig):
 
 
 class _BailingLikeConfig(PretrainedConfig):
-    """Empty class attribute, real instance one."""
     model_type = ""
 
     def __init__(self, model_type = "bailing_hybrid", **kwargs):
@@ -37,11 +32,8 @@ class _BailingLikeConfig(PretrainedConfig):
 
 
 class _EmptyEverywhereConfig(PretrainedConfig):
-    """Nothing names this architecture."""
     model_type = ""
 
-
-# --- the defect ---------------------------------------------------------------
 
 def test_instance_only_model_type_resolves():
     config = _BailingLikeConfig()
@@ -52,7 +44,6 @@ def test_instance_only_model_type_resolves():
 
 
 def test_unknown_remote_type_is_not_prefix_truncated():
-    """An unknown remote type is returned whole."""
     import transformers.models
     assert "bailing_hybrid" not in set(dir(transformers.models))
 
@@ -60,7 +51,6 @@ def test_unknown_remote_type_is_not_prefix_truncated():
 
 
 def test_prefix_colliding_remote_type_is_not_rewritten():
-    """A remote name sharing a prefix with a shipped module is not trimmed to it."""
     import transformers.models
     assert "llama" in set(dir(transformers.models))
 
@@ -71,7 +61,6 @@ def test_prefix_colliding_remote_type_is_not_rewritten():
 
 
 def test_nested_sub_config_instance_attribute_is_reached():
-    """The only real name may sit on a sub-config."""
     config = _EmptyEverywhereConfig()
     config.text_config = _SubConfig()
 
@@ -85,10 +74,7 @@ def test_sub_config_inside_a_list_is_reached():
     assert get_transformers_model_type(config) == ["some_remote_type"]
 
 
-# --- nothing that resolved before may change ----------------------------------
-
 def test_to_dict_answer_wins_over_instance_attribute():
-    """The fallback is only used when `to_dict` yields nothing."""
     class _NamedOnClass(PretrainedConfig):
         model_type = "llama"
 
@@ -122,8 +108,6 @@ def test_plain_config_unchanged():
     assert get_transformers_model_type(config) == ["llama"]
 
 
-# --- the fallback is behind the same guards as the to_dict path ---------------
-
 @pytest.mark.parametrize("model_type", [
     "llama'); import os; os.system('touch /tmp/pwned",
     "llama import os",
@@ -131,7 +115,6 @@ def test_plain_config_unchanged():
     "llama)",
 ])
 def test_injected_instance_model_type_is_rejected(model_type):
-    """The import-path guard also covers the instance attribute."""
     config = _EmptyEverywhereConfig()
     config.model_type = model_type
 
@@ -150,7 +133,6 @@ def test_instance_model_type_path_traversal_cannot_survive():
 
 
 def test_cyclic_config_graph_terminates():
-    """`__dict__` walks can be cyclic."""
     parent = _EmptyEverywhereConfig()
     child = _EmptyEverywhereConfig()
     parent.child = child
@@ -161,7 +143,6 @@ def test_cyclic_config_graph_terminates():
 
 
 def test_non_config_attributes_are_not_walked():
-    """Only config objects are followed."""
     class _NotAConfig:
         model_type = "definitely_not_the_model"
 
