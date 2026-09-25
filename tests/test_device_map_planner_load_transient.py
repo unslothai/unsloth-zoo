@@ -430,7 +430,9 @@ def test_an_op_built_around_a_concatenate_counts_as_merging(monkeypatch):
 @needs_conversion_mapping
 def test_a_pre_quantized_merge_is_sized_from_its_storage_dtype(monkeypatch):
     # A meta Params4bit reads as unpacked float32, 8x the packed bytes actually merged.
-    pytest.importorskip("bitsandbytes")
+    bnb = pytest.importorskip("bitsandbytes")
+    if getattr(bnb, "IS_UNSLOTH_STUB", False):
+        pytest.skip("bitsandbytes is unsloth_zoo's Apple Silicon stub, which cannot quantize")
     import unsloth_zoo.device_map_planner as planner
     from accelerate import init_empty_weights
     from transformers import LlamaConfig, LlamaForCausalLM
