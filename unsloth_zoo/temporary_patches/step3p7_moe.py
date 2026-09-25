@@ -96,7 +96,6 @@ def _adopt_step3p7_fp8_experts(model, limits):
 
 
 def patch_step3p7_fp8_experts():
-    """Read each block's clamp before the FP8Experts swap, which loses the layer index."""
     try:
         import transformers.integrations.finegrained_fp8 as finegrained_fp8
         import transformers.models.step3p7.modeling_step3p7  # noqa: F401
@@ -124,7 +123,6 @@ def patch_step3p7_fp8_experts():
 
 
 def patch_step3p7_moe():
-    """Step3p7Experts' own loop is slow and matmuls packed 4-bit weights; route it through the MoE backend."""
     patch_param_wrapper_for_moe()
 
     try:
@@ -139,12 +137,10 @@ def patch_step3p7_moe():
 
     _step3p7_lora_extractor = _make_step3p7_moe_lora_extractor()
     Step3p7Experts._unsloth_lora_extractor_fn = staticmethod(_step3p7_lora_extractor)
-    # Last two layers clamp the swiglu (`swiglu_limits`); act_fn(gate) * up would drop it.
     Step3p7Experts._unsloth_own_apply_gate = True
 
     # No closure: patch_function serializes the source, so a closure var is a NameError there.
     if not patch_function(Step3p7Experts, "forward", get_forward_moe_backend()):
-        # Drop the markers so the backends ignore them and a later call can retry.
         for name in ("_unsloth_lora_extractor_fn", "_unsloth_own_apply_gate"):
             if name in vars(Step3p7Experts):
                 delattr(Step3p7Experts, name)

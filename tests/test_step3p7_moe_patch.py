@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Step-3.7-Flash (transformers step3p7) routed experts through Unsloth's MoE backend."""
 import os
 
 import pytest
@@ -57,7 +56,6 @@ def _reference(module, gate_up, down, hidden, top_k_index, top_k_weights):
 
 
 def test_the_reference_is_transformers_own_loop():
-    # Guards the transcription above against transformers' own loop.
     klass = modeling.Step3p7Experts
     candidates = [klass.forward] + [v for v in vars(klass).values() if callable(v)]
     originals = [f for f in candidates if getattr(f, "__qualname__", "") == "Step3p7Experts.forward"]
