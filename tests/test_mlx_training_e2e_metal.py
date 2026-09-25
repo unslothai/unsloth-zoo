@@ -777,7 +777,6 @@ def test_trainer_compiled_step_uses_lora_head_cce(monkeypatch, tmp_path):
     )
     trainer.save_model = lambda output_dir=None: None
     trainer.train()
-    # One trace of the compiled step; compaction must not hand this loss cce_indices.
     assert calls == [3]
 
 
@@ -805,7 +804,6 @@ def test_lora_head_cce_live_gradients_and_early_fallback(quantized, tokens, soft
     grad = nn.value_and_grad(model, getattr(loss, "_unsloth_compiled_loss_fn", loss))
     compiled = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
     native_loss = make_baseline_loss_fn()
-    # Compare against float32 CE rather than rounded bf16 loss values.
     reference = nn.value_and_grad(model, lambda m, *b: native_loss(lambda ids: m(ids).astype(mx.float32), *b))
     first_loss = None
     for iteration in range(2):

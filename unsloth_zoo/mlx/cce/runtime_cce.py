@@ -115,12 +115,7 @@ _RECOMPUTE_LOGITS_BYTES: int | None = None
 
 
 def _recomputes_logits(n_tokens: int, vocab_size: int, bytes_per_element: int) -> bool:
-    """Whether a compiled backward should recompute chunk logits.
-
-    mx.compile merges the backward's chunk projection with the identical forward
-    one, which keeps every chunk's logits alive. That is faster, so it is kept
-    until those logits would take a tenth of the working set.
-    """
+    """Recompute once compile-merged forward/backward logits would exceed a tenth of the working set."""
     global _RECOMPUTE_LOGITS_BYTES
     if _RECOMPUTE_LOGITS_BYTES is None:
         try:
@@ -1481,14 +1476,7 @@ def supported_lora_head(head):
 def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
                        logit_scale=1.0, logit_softcap=0.0,
                        group_size=None, bits=None, mode="affine"):
-    """Chunked cross entropy over a LoRA-adapted classifier.
-
-    In a compiled step the backward keeps each chunk's logits, which measures
-    about 3.9x lower peak than compiled dense cross entropy at a slightly faster
-    step. Once those logits would pass a tenth of the working set it reprojects
-    every chunk instead, for about 7.5x lower peak at roughly 1.2x the dense
-    step time.
-    """
+    """Chunked cross entropy over a LoRA-adapted classifier."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     update, finalize, dlogits = _build_kernel_set(logit_softcap)
@@ -1594,8 +1582,7 @@ def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
             chunk_grads = [grad_h, grad_rank, (rank_h.T @ grad_delta).astype(b.dtype)]
             if bias is not None:
                 chunk_grads.append(dg.sum(axis=0).astype(bias.dtype))
-            # Evaluating each chunk's consumers together lets its dg be freed;
-            # a compiled graph would otherwise keep every chunk's buffers alive.
+            # mx.depends frees each chunk's dg; compiled graphs otherwise keep every chunk alive.
             chunk_grads = mx.depends(chunk_grads, [dg])
             grad_h, grad_rank = chunk_grads[:2]
             grad_b.append(chunk_grads[2])
