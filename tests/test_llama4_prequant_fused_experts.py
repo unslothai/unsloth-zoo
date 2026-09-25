@@ -261,11 +261,41 @@ def test_per_expert_checkpoint_keeps_the_transformers_swap(tmp_path):
         assert type(layer.feed_forward.experts).__name__ == "SequentialLlama4TextExperts"
 
 
-def test_swap_table_is_restored_after_a_fused_load(fused_checkpoint):
+def test_fused_load_never_mutates_the_global_swap_table(fused_checkpoint, monkeypatch):
+    """The kept class is filtered from a per-quantizer copy only, so a concurrent
+    pre-quantized load through any quantizer still sees transformers' full table."""
+    import transformers.quantizers.base as quantizers_base
+    from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+
+    _apply_bnb4bit_patches()
+    table = quantizers_base.MODULES_TO_PATCH_FOR_QUANTIZATION
+    before = dict(table)
+    seen = []
+    original = Bnb4BitHfQuantizer._process_model_before_weight_loading
+
+    def spy(self, model, *args, **kwargs):
+        # Runs inside preprocess_model, right after the swap step.
+        seen.append(("Llama4TextExperts" in table, "_convert_model_for_quantization" in vars(self)))
+        return original(self, model, *args, **kwargs)
+
+    monkeypatch.setattr(Bnb4BitHfQuantizer, "_process_model_before_weight_loading", spy)
+    model, info = _load(fused_checkpoint)
+    assert seen == [(True, True)]
+    assert quantizers_base.MODULES_TO_PATCH_FOR_QUANTIZATION is table and table == before
+    assert type(model.model.layers[0].feed_forward.experts).__name__ == "Llama4TextExperts"
+    assert "_convert_model_for_quantization" not in vars(model.hf_quantizer)
+
+
+def test_fused_load_falls_back_to_the_locked_pop(fused_checkpoint, monkeypatch):
+    """Without the stock convert method to rebuild, the class is popped from the
+    global table under the lock and restored afterwards."""
     import transformers.quantizers.base as quantizers_base
 
     _apply_bnb4bit_patches()
-    _load(fused_checkpoint)
+    monkeypatch.setattr(moe_bnb4bit, "_convert_without", lambda *args: None)
+    model, info = _load(fused_checkpoint)
+    assert not info.get("missing_keys") and not info.get("unexpected_keys")
+    assert type(model.model.layers[0].feed_forward.experts).__name__ == "Llama4TextExperts"
     assert "Llama4TextExperts" in quantizers_base.MODULES_TO_PATCH_FOR_QUANTIZATION
 
 

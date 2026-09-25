@@ -25,6 +25,7 @@ standard backend after on-the-fly dequantization.
 import os
 import re
 import threading
+import types
 from typing import Optional, List, Union
 
 import torch
@@ -1399,6 +1400,28 @@ def _model_keeps_swappable_fused_experts(model) -> bool:
     return bool(_swappable_fused_expert_classes(model, swap_table))
 
 
+def _convert_without(quantizer_cls, quantizers_base, kept):
+    """transformers' `_convert_model_for_quantization` rebuilt over a copy of the
+    swap table without `kept`; None when the method is not the stock one."""
+    method = getattr(quantizer_cls, "_convert_model_for_quantization", None)
+    fn = getattr(method, "__func__", method)
+    table_name = "MODULES_TO_PATCH_FOR_QUANTIZATION"
+    if (
+        not isinstance(fn, types.FunctionType)
+        or table_name not in fn.__code__.co_names
+        or fn.__globals__.get(table_name) is not getattr(quantizers_base, table_name, None)
+    ):
+        return None
+    table = {k: v for k, v in fn.__globals__[table_name].items() if k not in kept}
+    rebuilt = types.FunctionType(
+        fn.__code__, {**fn.__globals__, table_name: table},
+        fn.__name__, fn.__defaults__, fn.__closure__,
+    )
+    rebuilt.__kwdefaults__ = fn.__kwdefaults__
+    return rebuilt
+pass
+
+
 def patch_bnb4bit_keep_fused_experts():
     """Skip transformers' per-expert swap of a fused experts module when the
     pre-quantized checkpoint stores that module's experts fused."""
@@ -1418,26 +1441,38 @@ def patch_bnb4bit_keep_fused_experts():
         return
 
     def patched_preprocess_model(self, model, dtype = None, **kwargs):
-        # The swap table is process-global: hold one lock across pop, load and
-        # restore so a concurrent pre-quantized load never sees it popped.
-        with _KEEP_FUSED_LOCK:
-            return _keep_fused_preprocess(self, model, dtype, **kwargs)
-
-    def _keep_fused_preprocess(self, model, dtype = None, **kwargs):
-        kept = {}
+        kept = ()
         if getattr(self, "pre_quantized", False):
             names = _swappable_fused_expert_classes(model, swap_table)
             if names and _checkpoint_expert_layout(kwargs.get("checkpoint_files")) == "fused":
-                kept = {name: swap_table.pop(name) for name in names if name in swap_table}
-                if kept:
-                    logger.info(
-                        f"Unsloth: the checkpoint stores {', '.join(sorted(kept))} experts fused; "
-                        "keeping the fused module instead of transformers' per-expert swap."
-                    )
+                kept = tuple(sorted(name for name in names if name in swap_table))
+        if not kept:
+            return original_preprocess_model(self, model, dtype, **kwargs)
+        logger.info(
+            f"Unsloth: the checkpoint stores {', '.join(kept)} experts fused; "
+            "keeping the fused module instead of transformers' per-expert swap."
+        )
+        convert = _convert_without(type(self), quantizers_base, kept)
+        if convert is None:
+            # No per-instance hook: pop from the process-global table under a lock.
+            with _KEEP_FUSED_LOCK:
+                popped = {name: swap_table.pop(name) for name in kept if name in swap_table}
+                try:
+                    return original_preprocess_model(self, model, dtype, **kwargs)
+                finally:
+                    swap_table.update(popped)
+        # Only this quantizer sees the filtered table; the global one is untouched,
+        # so concurrent loads through any quantizer keep transformers' swap.
+        had_own = "_convert_model_for_quantization" in vars(self)
+        previous = vars(self).get("_convert_model_for_quantization")
+        self._convert_model_for_quantization = types.MethodType(convert, self)
         try:
             return original_preprocess_model(self, model, dtype, **kwargs)
         finally:
-            swap_table.update(kept)
+            if had_own:
+                self._convert_model_for_quantization = previous
+            else:
+                del self._convert_model_for_quantization
 
     patched_preprocess_model._unsloth_keep_fused_patched = True
     patch_function(Bnb4BitHfQuantizer, "preprocess_model", patched_preprocess_model, match_level = "relaxed")
