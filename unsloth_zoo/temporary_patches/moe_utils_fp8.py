@@ -862,6 +862,7 @@ def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
     )
 
 
+@torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
         select_moe_backend,

@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """FP4-packed experts (DeepSeek-V4) dequantize to the same values transformers produces."""
 import pytest
 import torch
@@ -136,3 +152,8 @@ def test_fp4_experts_with_their_own_gate_are_refused_until_a_backend_applies_it(
     fp8._refuse_fp4_with_an_unapplied_gate(flagged, packed)
     fp8._refuse_fp4_with_an_unapplied_gate(Plain(), packed)
     fp8._refuse_fp4_with_an_unapplied_gate(Clamped(), torch.zeros(2, 4, 8, dtype = torch.bfloat16))
+
+
+def test_fp8_moe_forward_stays_compiler_disabled():
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import forward_moe_backend_fp8
+    assert getattr(forward_moe_backend_fp8, "_torchdynamo_disable", False)
