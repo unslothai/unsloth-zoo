@@ -1622,6 +1622,72 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
             _run_generation_trainer(trainer, monkeypatch, [])
 
 
+def test_mismatched_referenced_resume_rejects_before_adapter_hydration(tmp_path):
+    import json
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+
+    class Adapter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_a = mx.array([[1.0]])
+            self.lora_b = mx.array([[0.0]])
+            self.scale = 1.0
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.adapter = Adapter()
+            self._config = {"model_type": "tiny"}
+            self._hf_repo = "base/repo"
+            self._unsloth_base_revision = "main"
+            self._unsloth_base_commit_hash = "abc123"
+            self.loaded = False
+
+        def named_modules(self):
+            return [("", self), ("q_proj", self.adapter)]
+
+        def parameters(self):
+            return {
+                "q_proj": {
+                    "lora_a": self.adapter.lora_a,
+                    "lora_b": self.adapter.lora_b,
+                }
+            }
+
+        trainable_parameters = parameters
+
+        def load_weights(self, *_args, **_kwargs):
+            self.loaded = True
+            self.adapter.lora_b = mx.array([[9.0]])
+
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / "adapters.safetensors").touch()
+    (checkpoint / "optimizer_state.safetensors").touch()
+    (checkpoint / "trainer_state.json").write_text(json.dumps({
+        "global_step": 1,
+        "preference_reference": {"kind": "reference_free"},
+    }))
+    model = Model()
+    trainer = MLXDPOTrainer(
+        model, Tokenizer(), rows(1),
+        args=MLXDPOConfig(
+            max_steps=2, compile=False, gradient_checkpointing=False,
+            cast_norm_output_to_input_dtype=False, disable_memory_limits=True,
+            output_dir=str(tmp_path / "output"),
+        ),
+    )
+    trainer._build_optimizer = lambda _steps: types.SimpleNamespace(
+        learning_rate=mx.array(1e-5), state={}, update=lambda *_args: None,
+    )
+    with pytest.raises(ValueError, match="provenance does not match"):
+        trainer.train(resume_from_checkpoint=str(checkpoint))
+    assert model.loaded is False
+    assert model.adapter.lora_b.tolist() == [[0.0]]
+
+
 def _tiny_model(lora=False, tail=False):
     import mlx.core as mx
     import mlx.nn as nn
