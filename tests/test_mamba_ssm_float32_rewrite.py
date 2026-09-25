@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests fix_mamba_ssm_float32 in temporary_patches/misc.py.
-
-The patch rewrites mamba_ssm/ops/triton/ssd_chunk_scan.py inside site-packages
-on every import. Rewriting it in place (open "w") truncates the file first, so a
-second process importing or patching at the same moment reads an empty module
-and writes the empty string back. The installed mamba_ssm then fails with
-"cannot import name '_chunk_scan_fwd' from 'mamba_ssm.ops.triton.ssd_chunk_scan'"
-for every later process, including Nemotron-H remote code.
-
-The function is extracted by AST and run against a fake mamba_ssm package, so
-neither a GPU, Triton nor mamba_ssm is needed.
-"""
+"""fix_mamba_ssm_float32 must rewrite ssd_chunk_scan.py atomically: an in-place write let a
+concurrent reader see an empty module (issue: "cannot import name '_chunk_scan_fwd'")."""
 
 import ast
 import builtins
@@ -45,7 +35,6 @@ _SRC = MISC.read_text(encoding = "utf-8")
 _NAME = "fix_mamba_ssm_float32"
 _MODS = ("mamba_ssm", "mamba_ssm.ops", "mamba_ssm.ops.triton", "mamba_ssm.ops.triton.ssd_chunk_scan")
 
-# Enough kernel-like lines that a write takes a while, like the real 107 KB file.
 _KERNEL = "".join(
     f"@_Autotune\n"
     f"@_JIT\n"
@@ -226,8 +215,6 @@ def _upcast_text(text):
 
 
 def test_a_module_imported_before_a_peer_rewrite_is_reloaded(fake_mamba):
-    # This process imports the original, another process then upcasts the file: the file needs no
-    # rewrite, but the kernels this process holds are still the original ones and must be reloaded.
     import mamba_ssm.ops.triton.ssd_chunk_scan as mod
     assert mod.UPCAST is False
     tmp = fake_mamba.with_name(".peer.tmp")

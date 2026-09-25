@@ -1558,14 +1558,12 @@ def fix_mamba_ssm_float32():
         file = file.replace(old, new)
     pass
 
-    # Already upcast (every import after the first), so leave the installed file alone. Another
-    # process may have rewritten it after this one imported the original, so reload unless the
-    # kernels in memory were compiled from upcast source (Triton keeps it on each JIT function).
+    # File already upcast; a peer may have rewritten it after we imported, so reload unless loaded kernels are upcast.
     if file == original_file:
         module = mamba_ssm.ops.triton.ssd_chunk_scan
         sources = []
         for value in list(vars(module).values()):
-            # Autotuner / Heuristics wrap the JITFunction in `.fn`; the JITFunction holds `.src`.
+            # Triton: Autotuner / Heuristics wrap the JITFunction in `.fn`, which holds its source in `.src`.
             for _ in range(4):
                 src = getattr(value, "src", None)
                 if isinstance(src, str):
@@ -1581,11 +1579,7 @@ def fix_mamba_ssm_float32():
             return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
         return
 
-    # This edits site-packages, and other processes may import or patch the same file
-    # at the same moment. Writing in place truncates it first: a concurrent reader then
-    # sees an empty module and writes the empty string back, which leaves mamba_ssm
-    # permanently broken ("cannot import name '_chunk_scan_fwd'"). Write a sibling file
-    # and rename it over the original so readers see the old or the new source only.
+    # Atomic rename, not open("w"): truncation lets a concurrent patcher read and write back an empty module.
     import tempfile
     tmp_file = None
     try:
