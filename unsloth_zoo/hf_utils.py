@@ -149,24 +149,8 @@ _MAX_INSTANCE_CONFIG_NODES = 1024
 
 
 def _instance_attribute_model_types(config) -> list:
-    # to_dict() writes the class model_type, so remote configs naming themselves only in
-    # __init__ (Ling-2.6-flash: class "", instance "bailing_hybrid") serialize as ""
-    try:
-        from transformers import PretrainedConfig
-        config_types = (PretrainedConfig,)
-    except Exception:
-        config_types = ()
-
-    def _is_config(value):
-        # Duck typing would accept Mock objects, which mint children forever
-        if config_types: return isinstance(value, config_types)
-        return (
-            not isinstance(value, type) and
-            hasattr(value, "to_dict") and
-            hasattr(value, "model_type") and
-            hasattr(value, "__dict__")
-        )
-
+    # to_dict() writes the class model_type, so remote configs naming themselves only on
+    # the instance (Ling-2.6-flash: class "", instance "bailing_hybrid") serialize as ""
     found, seen, stack = [], set(), [config]
     while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
         obj = stack.pop(0)
@@ -185,7 +169,8 @@ def _instance_attribute_model_types(config) -> list:
             else:
                 candidates = (value,)
             for candidate in candidates:
-                if _is_config(candidate): stack.append(candidate)
+                # Not duck typed: Mock objects would mint children forever
+                if isinstance(candidate, PretrainedConfig): stack.append(candidate)
         pass
     pass
     return found
