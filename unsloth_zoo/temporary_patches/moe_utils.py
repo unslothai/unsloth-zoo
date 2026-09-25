@@ -744,7 +744,7 @@ _TORCH_GROUPED_MM_SUPPORTED = None
 @torch.compiler.disable
 def _run_probe_eagerly(probe):
     """Graph-break so lazy probes never run on FakeTensors, whose meta check can reject what the real
-    kernel accepts and latch the cached flag False (pytorch/pytorch#196075)."""
+    kernel accepts and latch the cached flag False (torch 2.14 `_grouped_mm_fp16_cublaslt_supported` needs CUDA 13.3+)."""
     return probe()
 
 
