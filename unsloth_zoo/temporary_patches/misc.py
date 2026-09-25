@@ -1673,6 +1673,47 @@ pass
 TEMPORARY_PATCHES.append(patch_MllamaVisionEncoderLayer)
 
 
+def patch_GradientCheckpointingLayer_keyword_inputs():
+    # GradientCheckpointingLayer checkpoints partial(layer.__call__, **kwargs) with only the
+    # positional arguments. A tensor that requires grad but arrives by keyword is invisible to
+    # a reentrant checkpoint: the Llama 4 and Mllama vision encoders call their layers purely by
+    # keyword (encoder_layer(hidden_state = ...)), so those layers get no gradient at all, and
+    # Mllama's cross-attention layers take the vision states as a keyword, so once the vision
+    # tower trains the nested backward walks the shared vision graph twice. Pass such tensors
+    # to the checkpoint function positionally and put them back into keyword position.
+    try:
+        from functools import partial
+        from transformers.modeling_layers import GradientCheckpointingLayer
+        from ..gradient_checkpointing import _KeywordArgumentCall
+    except Exception as e:
+        return raise_error("transformers.modeling_layers.GradientCheckpointingLayer", e)
+    original = GradientCheckpointingLayer.__call__
+    if getattr(original, "_unsloth_keyword_inputs", False): return
+
+    def __call__(self, *args, **kwargs):
+        if not (self.gradient_checkpointing and self.training):
+            return original(self, *args, **kwargs)
+        keys = tuple(k for k, v in kwargs.items() if torch.is_tensor(v) and v.requires_grad)
+        if not keys:
+            return original(self, *args, **kwargs)
+        # The cache handling GradientCheckpointingLayer does before checkpointing.
+        if kwargs.get("use_cache"):
+            kwargs["use_cache"] = False
+        if not getattr(self, "_can_checkpoint_with_cache", False):
+            for name in ("past_key_values", "layer_past"):
+                if kwargs.get(name) is not None:
+                    kwargs[name] = None
+        constants = {k: v for k, v in kwargs.items() if k not in keys}
+        function = _KeywordArgumentCall(partial(nn.Module.__call__, self), keys, constants)
+        return self._gradient_checkpointing_func(function, *args, *(kwargs[k] for k in keys))
+    pass
+    __call__._unsloth_keyword_inputs = True
+    __call__._unsloth_original = original
+    GradientCheckpointingLayer.__call__ = __call__
+pass
+TEMPORARY_PATCHES.append(patch_GradientCheckpointingLayer_keyword_inputs)
+
+
 # Patch Siglip for forced float32 / float16 only
 def patch_SiglipEncoderLayer():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
