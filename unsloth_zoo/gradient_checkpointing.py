@@ -1275,7 +1275,8 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         BUFFER_EVENTS_A = None
         BUFFER_EVENTS_B = None
         NEXT_BUFFER_SLOT = None
-        torch.cuda.empty_cache()
+        if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+        else: torch.cuda.empty_cache()
         gc.collect()
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
@@ -1394,7 +1395,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
         except RuntimeError:
             pass
 
-    torch.cuda.empty_cache()
+    if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+    else: torch.cuda.empty_cache()
     gc.collect()
 pass
 
