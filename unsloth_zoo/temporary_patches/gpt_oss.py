@@ -279,6 +279,26 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
+def _mxfp4_hub_kernel_unreachable():
+    """True when transformers loads MXFP4 kernels via the `kernels` hub and it is unusable."""
+    try:
+        import inspect
+        import transformers.integrations.mxfp4 as mxfp4_integration
+        source = inspect.getsource(mxfp4_integration.replace_with_mxfp4_linear)
+    except Exception:
+        return False
+    if "get_kernel" not in source:
+        return False
+    if hasattr(mxfp4_integration, "_replace_with_mxfp4_linear"):
+        return False
+    try:
+        from transformers.utils import is_kernels_available as _real_is_kernels_available
+        return not _real_is_kernels_available()
+    except Exception:
+        return True
+pass
+
+
 def patch_gpt_oss():
     try:
         import triton_kernels
@@ -295,7 +315,15 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
-    if HAS_TRITON_KERNELS:
+    if HAS_TRITON_KERNELS and _mxfp4_hub_kernel_unreachable():
+        # Claiming kernels skips the bf16 fallback, then the hub load raises ImportError (vLLM triton_kernels).
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(
+                "Unsloth: triton_kernels is importable but transformers cannot load the MXFP4 "
+                "hub kernels, so MXFP4 GPT OSS weights will be dequantized to bf16."
+            )
+        return
+    elif HAS_TRITON_KERNELS:
         # Only override is_kernels_available when triton_kernels IS available
         try:
             def is_kernels_available(): return True
