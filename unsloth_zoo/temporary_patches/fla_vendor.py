@@ -859,7 +859,7 @@ def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING):
     patch phase, so rebinding existing wrappers alone still reached fla on the first load.
     """
     try:
-        import transformers.integrations.hub_kernels as hub_kernels
+        from transformers.integrations import hub_kernels
     except Exception:
         return False
     original = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
@@ -883,7 +883,7 @@ def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING):
         ):
             continue
         try:
-            setattr(module, "use_kernel_func_from_hub_with_fallback", patched)
+            module.use_kernel_func_from_hub_with_fallback = patched
         except Exception:
             continue
     return True
