@@ -129,3 +129,17 @@ def test_npu_gradient_checkpointing_initializes(answers):
 )
 def test_every_other_host_answers_as_before(answers, cell, expected):
     assert answers[cell] == expected
+
+
+def test_unsloth_train_takes_its_device_from_the_backend():
+    # Source-level: importing training_utils needs datasets, which not every runner has.
+    import ast
+    tree = ast.parse((_ROOT / "unsloth_zoo" / "training_utils.py").read_text(encoding = "utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "unsloth_train")
+    # No call may be handed a literal cuda device: GradScaler, autocast, zeros, .to().
+    passed = [
+        a.value for c in ast.walk(fn) if isinstance(c, ast.Call)
+        for a in [*c.args, *(k.value for k in c.keywords)]
+        if isinstance(a, ast.Constant)
+    ]
+    assert not {"cuda", "cuda:0"} & set(passed)

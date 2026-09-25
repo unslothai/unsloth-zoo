@@ -1014,9 +1014,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    # AMD ROCm (gfx9xx) and XPU: SM architecture (SM80/SM90) concepts don't apply.
+    # AMD ROCm (gfx9xx), XPU and NPU: SM architecture (SM80/SM90) concepts don't apply.
     # CUTLASS block FP8 and DeepGEMM are NVIDIA Hopper (SM90) only.
-    if not is_hip() and DEVICE_TYPE != "xpu":
+    if not is_hip() and DEVICE_TYPE not in ("xpu", "npu"):
         capability = torch.cuda.get_device_capability()
         sm_cap = capability[0] * 10 + capability[1]
     else:
