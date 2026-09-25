@@ -1273,11 +1273,21 @@ def _patch_vendor_fla(phase=None):
     optout_degraded = False
     # Not an opt-out: on an RDNA1 GPU no fla kernel can compile (see
     # _NO_DOT_INSTRUCTION_GFX), so the only working path is transformers' pure-torch
-    # one. Same two-part switch as the Hopper case below: probe answers False and any
-    # already-imported gated-delta module is unbound from the kernel.
-    if _gpu_lacks_dot_instructions() and _transformers_uses_availability_probe():
+    # one. Unlike the Hopper switch below, injection itself is the harm here: any fla
+    # the loader makes reachable aborts the process at compile inside LLVM, so the
+    # vendored tree must never be injected, on EITHER Transformers layout. That is why
+    # this gate returns regardless of _transformers_uses_availability_probe(), where
+    # the Hopper opt-out falls through to injection on the post-#47630 layout.
+    if _gpu_lacks_dot_instructions():
         _mark_fla_disabled_no_dot_instructions()
-        _patch_is_available(_unavailable_probe)
+        # Sample the layout BEFORE _patch_is_available, which assigns the probe
+        # attribute unconditionally (see _transformers_uses_availability_probe).
+        if _transformers_uses_availability_probe():
+            _patch_is_available(_unavailable_probe)
+        # else: post-#47630 the kernel-hub decorator resolves fla with importlib, so no
+        # probe steers it. Not injecting is what keeps it on pure torch here:
+        # _repair_kernel_hub_closures (in the finally) re-resolves the decorators to
+        # the fallback, because no fla is importable once we skip injection.
         _disable_already_imported_gated_delta(why="no dot instructions on this GPU (RDNA1)")
         # The pure-torch path is only correct in float16 (all these GPUs have) with the
         # q/k l2norm reducing in float32, as the fla kernel it replaces does.
