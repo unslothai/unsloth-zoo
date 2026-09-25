@@ -640,8 +640,8 @@ def test_both_halves_declare_the_floor_that_peft_needs() -> None:
     )
 
 
-# unsloth's patch_datasets refuses this range at import; restated since the zoo cannot import unsloth.
-UNSLOTH_REFUSES_DATASETS = (Version("4.4.0"), Version("4.5.0"))
+# unsloth's patch_datasets raises at import on 4.4.0 <= v <= 4.5.0.
+UNSLOTH_REFUSED_DATASETS = ("4.4.0", "4.4.1", "4.4.2", "4.5.0")
 
 
 def _datasets_lists() -> dict[str, list[Requirement]]:
@@ -652,14 +652,16 @@ def _datasets_lists() -> dict[str, list[Requirement]]:
     }
 
 
-# Named, not discovered: _datasets_lists drops a list with no datasets, so a deletion would pass.
+def _refused_admitted_by(specifier: SpecifierSet) -> list[str]:
+    return [r for r in UNSLOTH_REFUSED_DATASETS if r in specifier]
+
+
+# Named, not discovered: a list that drops datasets vanishes from _datasets_lists.
 DATASETS_LOCATIONS = ("dependencies", "optional-dependencies.core")
 
 
 def test_every_list_declares_the_same_datasets_window() -> None:
-    """Both lists carry the datasets requirement with the same specifier."""
     lists = _datasets_lists()
-    assert lists, "pyproject.toml declares no datasets requirement at all"
     missing = [where for where in DATASETS_LOCATIONS if where not in lists]
     assert not missing, (
         f"{missing} no longer declares datasets, so pip would take the window from the other "
@@ -673,28 +675,50 @@ def test_every_list_declares_the_same_datasets_window() -> None:
 
 
 def test_the_datasets_window_excludes_what_unsloth_refuses_at_import() -> None:
-    """A window admitting 4.4.0-4.5.0 resolves, then dies at `import unsloth`."""
     lists = _datasets_lists()
     assert lists, "pyproject.toml declares no datasets requirement at all"
-    low, high = UNSLOTH_REFUSES_DATASETS
-    admitted = set()
-    for reqs in lists.values():
-        for req in reqs:
-            for release in ("4.4.0", "4.4.1", "4.4.2", "4.5.0"):
-                if low <= Version(release) <= high and release in req.specifier:
-                    admitted.add(release)
+    admitted = sorted(
+        {
+            r
+            for reqs in lists.values()
+            for req in reqs
+            for r in _refused_admitted_by(req.specifier)
+        }
+    )
     assert not admitted, (
-        f"the declared datasets window admits {sorted(admitted)}, which unsloth's "
+        f"the declared datasets window admits {admitted}, which unsloth's "
         f"patch_datasets refuses at import, so pip can resolve a release that cannot run"
     )
 
 
 def test_the_datasets_checker_rejects_the_window_that_would_ship_the_defect() -> None:
-    """Negative control: the probe must still flag a permissive window."""
-    low, high = UNSLOTH_REFUSES_DATASETS
-    permissive = SpecifierSet(">=3.4.1,<5.0.0")
-    admitted = [
-        r for r in ("4.4.0", "4.4.1", "4.4.2", "4.5.0")
-        if low <= Version(r) <= high and r in permissive
-    ]
-    assert admitted, "the refused-range probe no longer finds the releases it is about"
+    assert _refused_admitted_by(SpecifierSet(">=3.4.1,<5.0.0")) == list(
+        UNSLOTH_REFUSED_DATASETS
+    )
+    assert _refused_admitted_by(SpecifierSet(">=3.4.1,!=4.4.*,<5.0.0")) == ["4.5.0"]
+
+
+# Every trl 1.x declares datasets>=4.7.0 (PyPI metadata).
+TRL_1_DATASETS_FLOOR = Version("4.7.0")
+DATASETS_RELEASES = (
+    "4.3.0", "4.4.0", "4.4.1", "4.4.2", "4.5.0", "4.6.0", "4.6.1", "4.7.0", "4.8.0", "4.8.5",
+)
+
+
+def test_every_trl_ceiling_is_reachable_under_the_datasets_window() -> None:
+    """pip silently backtracks to trl 0.x rather than erroring on an unreachable ceiling."""
+    for where, raws in _requirement_lists().items():
+        datasets = _named(raws, "datasets")
+        for trl in _named(raws, "trl"):
+            if _ceiling(trl.specifier) < Version("1.0.0"):
+                continue
+            usable = [
+                v
+                for v in DATASETS_RELEASES
+                if Version(v) >= TRL_1_DATASETS_FLOOR
+                and all(v in d.specifier for d in datasets)
+            ]
+            assert usable, (
+                f"{where}: trl ceiling {_ceiling(trl.specifier)} needs datasets>="
+                f"{TRL_1_DATASETS_FLOOR}, which {[str(d.specifier) for d in datasets]} excludes"
+            )
