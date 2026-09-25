@@ -39,11 +39,25 @@ before writing and the consumer waits on the event before reading.
 """
 import os
 import torch
+from contextlib import contextmanager, nullcontext
 
 __all__ = [
     "BlockSwap",
     "find_decoder_layers",
 ]
+
+
+@contextmanager
+def _no_inference_mode():
+    # Allocate pool slots outside inference_mode (but in no_grad) so a later
+    # prefetch copy_ does not raise on an inference tensor and autograd can save
+    # the assigned p.data for backward, mirroring gradient_checkpointing.
+    try:
+        leave_inference = torch.inference_mode(False)
+    except (TypeError, AttributeError):
+        leave_inference = nullcontext()  # older torch lacks inference_mode(bool)
+    with leave_inference, torch.no_grad():
+        yield
 
 # Pinning lets the H2D prefetch overlap with compute, but WSL2 caps the pinned
 # budget and a single .pin_memory() can OOM there while ordinary RAM is free.
@@ -231,11 +245,12 @@ class BlockSwap:
                 self._release(b)
 
             sigs = [b.sig for b in self.blocks]
-            for sig in set(sigs):
-                self.free[sig] = [
-                    [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
-                    for _ in range(min(self.depth + 1, sigs.count(sig)))
-                ]
+            with _no_inference_mode():
+                for sig in set(sigs):
+                    self.free[sig] = [
+                        [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
+                        for _ in range(min(self.depth + 1, sigs.count(sig)))
+                    ]
 
             self._arm(forward = True)
         except Exception:
