@@ -1228,11 +1228,9 @@ def patch_peft_param_wrapper_fp4_expert_shape():
 
     def _patched_get_param(self):
         param = _original_get_param(self)
-        # Hot path on every expert LoRA forward: keep the non-FP4 exit to one dtype check.
         if getattr(param, "dtype", None) not in _FP4_PACKED_DTYPES:
             return param
         base_layer = self.get_base_layer()
-        # MegaMoE runs its own EP kernel on the packed bytes and never reads an expert LoRA.
         config = getattr(base_layer, "config", None)
         if getattr(config, "_experts_implementation", None) == "deepgemm_megamoe":
             raise NotImplementedError(
