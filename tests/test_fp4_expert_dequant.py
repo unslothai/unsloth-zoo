@@ -134,8 +134,12 @@ def test_megamoe_fp4_experts_refuse_a_lora_its_kernel_would_skip():
     module.config = SimpleNamespace(_experts_implementation = "deepgemm_megamoe")
     with pytest.raises(NotImplementedError, match = "deepgemm_megamoe"):
         ParamWrapper(module, "default", parameter_name = "gate_up_proj", config = LoraConfig(r = 4, target_parameters = ["gate_up_proj"]), r = 4)
-    module.config = SimpleNamespace(_experts_implementation = "grouped_mm")
-    ParamWrapper(module, "default", parameter_name = "gate_up_proj", config = LoraConfig(r = 4, target_parameters = ["gate_up_proj"]), r = 4)
+    module.config = SimpleNamespace(_experts_implementation = "eager")
+    with pytest.raises(NotImplementedError, match = "'eager'"):
+        ParamWrapper(module, "default", parameter_name = "gate_up_proj", config = LoraConfig(r = 4, target_parameters = ["gate_up_proj"]), r = 4)
+    for impl in ("grouped_mm", "batched_mm"):
+        module.config = SimpleNamespace(_experts_implementation = impl)
+        ParamWrapper(module, "default", parameter_name = "gate_up_proj", config = LoraConfig(r = 4, target_parameters = ["gate_up_proj"]), r = 4)
 
 
 def test_fp4_experts_with_their_own_gate_are_refused_until_a_backend_applies_it():

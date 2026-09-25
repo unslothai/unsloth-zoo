@@ -1119,6 +1119,9 @@ from .common import (
 from .utils import logger
 
 
+_UNSLOTH_FP8_EXPERTS_KEYS = ("grouped_mm", "batched_mm", "deepgemm")
+
+
 def patch_fp8_experts_interface():
     try:
         from transformers.integrations.finegrained_fp8 import ALL_FP8_EXPERTS_FUNCTIONS
@@ -1132,7 +1135,7 @@ def patch_fp8_experts_interface():
     def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
         return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
-    for key in ("grouped_mm", "batched_mm", "deepgemm"):
+    for key in _UNSLOTH_FP8_EXPERTS_KEYS:
         try:
             ALL_FP8_EXPERTS_FUNCTIONS[key] = _unsloth_fp8_dispatch
         except Exception:
@@ -1234,11 +1237,14 @@ def patch_peft_param_wrapper_fp4_expert_shape():
             return param
         base_layer = self.get_base_layer()
         config = getattr(base_layer, "config", None)
-        if getattr(config, "_experts_implementation", None) == "deepgemm_megamoe":
+        # Only the implementations patch_fp8_experts_interface reroutes read the expert LoRA;
+        # eager (transformers' fallback when grouped_mm cannot dispatch) and megamoe would drop it.
+        experts_impl = getattr(config, "_experts_implementation", None)
+        if experts_impl is not None and experts_impl not in _UNSLOTH_FP8_EXPERTS_KEYS:
             raise NotImplementedError(
                 "Unsloth: LoRA on FP4 experts is not supported with experts_implementation = "
-                "'deepgemm_megamoe', whose kernel would skip the adapter. Load with "
-                "experts_implementation = 'grouped_mm' to train them."
+                f"{experts_impl!r}, whose forward would skip the adapter. Load with "
+                "experts_implementation = 'grouped_mm' or 'batched_mm' to train them."
             )
         try:
             shape = fp4_packed_expert_logical_shape(base_layer, self.parameter_name, param)
