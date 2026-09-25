@@ -2000,6 +2000,11 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
             if trust_remote_code else auto_cls.from_config(config)
     model.eval()
     if hf_quantizer is not None:
+        # Loader order: compressed-tensors sets `use_fp8_kernel` here, else preprocess raises and Linears stay bf16.
+        try:
+            hf_quantizer.validate_environment(device_map=None)
+        except Exception:
+            pass
         # Swap in the quantised Linear classes so the size table matches the
         # bytes the loader will really allocate.
         try:
