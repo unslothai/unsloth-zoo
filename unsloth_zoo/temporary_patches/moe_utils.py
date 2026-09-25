@@ -741,21 +741,39 @@ _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 _TORCH_GROUPED_MM_SUPPORTED = None
 
 
+@torch.compiler.disable
+def _run_probe_eagerly(probe):
+    """Graph-break so lazy probes never run on FakeTensors, whose meta check can reject what the real
+    kernel accepts and latch the cached flag False (torch 2.14 `_grouped_mm_fp16_cublaslt_supported` needs CUDA 13.3+)."""
+    return probe()
+
+
+def _grouped_mm_probe_device():
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu", torch.xpu.current_device())
+    return None
+
+
 def _check_torch_grouped_mm_supported():
     """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
-
-    if not _TORCH_GROUPED_MM_AVAILABLE:
+    # Definitive negatives stay traceable so fullgraph traces don't break.
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
+    return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
-    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
-    if torch.cuda.is_available():
-        device = torch.device("cuda", torch.cuda.current_device())
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        device = torch.device("xpu", torch.xpu.current_device())
-    else:
+
+def _probe_torch_grouped_mm_supported():
+    global _TORCH_GROUPED_MM_SUPPORTED
+    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
+
+    device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
+    if device is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -787,15 +805,20 @@ def _transposed_view_grouped_mm_is_safe():
     global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
+        _TRANSPOSED_VIEW_GROUPED_MM_SAFE = False
+        return False
+    return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
+
+
+def _probe_transposed_view_grouped_mm_is_safe():
+    global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
+        return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
 
     safe = False
     try:
-        if torch.cuda.is_available():
-            device = torch.device("cuda", torch.cuda.current_device())
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = torch.device("xpu", torch.xpu.current_device())
-        else:
-            device = None
+        device = _grouped_mm_probe_device()
         if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
