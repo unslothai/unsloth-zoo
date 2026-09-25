@@ -350,11 +350,15 @@ class BlockSwap:
         # allocating them can OOM on a card sized for the swapped model (and
         # would fire again inside the constructor's rollback, which calls here).
         self.free = {}
-        for b in self.blocks:
-            if not b.resident:
-                for p, h, d in zip(b.params, b.host, b.devices):
-                    p.data = h.to(d, copy = True)
-                b.resident = True
+        # Restore outside inference_mode (rollback may run under an enclosing one)
+        # so the frozen weights can be saved for backward when training resumes,
+        # mirroring the pool allocation above.
+        with _no_inference_mode():
+            for b in self.blocks:
+                if not b.resident:
+                    for p, h, d in zip(b.params, b.host, b.devices):
+                        p.data = h.to(d, copy = True)
+                    b.resident = True
         # Sync every device we prefetched on, not just the current one: a sharded
         # model can have an in-flight copy on another card, and the pre-hook that
         # would have waited on its event is already removed above.
