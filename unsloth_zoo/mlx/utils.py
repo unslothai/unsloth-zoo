@@ -15809,7 +15809,9 @@ def _mlx_sanitize_probe(model, weights):
     unmeasured; the caller treats that as unmeasurable, which is what the export
     did before this existed.
     """
-    return copy.copy(model).sanitize(weights)
+    probe = copy.copy(model)
+    probe._unsloth_measuring_norm_offsets = True
+    return probe.sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
@@ -15834,38 +15836,39 @@ def _mlx_sanitizer_norm_offsets(model):
             weights.update(mx.load(str(weight_file)))
         if not weights:
             return None
-
-        zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
-        candidates = {}
-        for key, value in zeroed.items():
-            offset = _mlx_constant_1d_value(value)
-            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            candidates[key] = (value, offset)
-        if not candidates:
-            # Nothing to confirm. Shifting nothing is the common case, so skip
-            # the second replay rather than pay for it on every model.
-            return {}
-
-        raised = _mlx_sanitize_probe(
-            model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
+        return _mlx_measure_norm_offsets(
+            lambda probe: _mlx_sanitize_probe(model, probe), weights
         )
-
-        offsets = {}
-        for key, (value, offset) in candidates.items():
-            raised_value = raised.get(key)
-            if getattr(raised_value, "shape", None) != value.shape:
-                continue
-            delta = _mlx_constant_1d_value(raised_value - value)
-            if delta is None:
-                continue
-            if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            offsets[key] = offset
     except Exception as exc:
         print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
         return None
 
+
+def _mlx_measure_norm_offsets(replay, weights):
+    """The additive constants ``replay`` (a sanitizer) applies to ``weights``' 1-D floats."""
+    zeroed = replay(_mlx_norm_offset_probe(weights, 0.0))
+    candidates = {}
+    for key, value in zeroed.items():
+        offset = _mlx_constant_1d_value(value)
+        if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        candidates[key] = (value, offset)
+    if not candidates:
+        return {}
+
+    raised = replay(_mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE))
+
+    offsets = {}
+    for key, (value, offset) in candidates.items():
+        raised_value = raised.get(key)
+        if getattr(raised_value, "shape", None) != value.shape:
+            continue
+        delta = _mlx_constant_1d_value(raised_value - value)
+        if delta is None:
+            continue
+        if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        offsets[key] = offset
     return offsets
 
 
