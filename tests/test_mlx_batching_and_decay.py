@@ -2600,7 +2600,9 @@ def test_nested_text_decoder_qualification_decides_its_parent():
 
     decision = resolve_training_compile(gemma4_over("gemma4_text"), policy=policy)
     assert decision.enabled, decision.reason
-    assert [q.arch for q in decision.backend_qualifications] == ["gemma4_text"]
+    # mlx-vlm releases before gemma4_text was split out have no decoder to qualify.
+    decoders = ["gemma4_text"] if "gemma4_text" in discover_architectures() else []
+    assert [q.arch for q in decision.backend_qualifications] == decoders
     assert all(q.training_compile for q in decision.backend_qualifications)
 
     unqualified = sorted(set(discover_architectures()) - _VERIFIED_TRAINING_ARCHES)
