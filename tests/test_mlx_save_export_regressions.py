@@ -4657,7 +4657,7 @@ def test_processor_runtime_completes_older_stopping_criteria(monkeypatch):
     utils_module = types.ModuleType("mlx_vlm.utils")
     utils_module.StoppingCriteria = lambda eos, t: (eos, t)
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils_module)
-    tokenizer = types.SimpleNamespace(eos_token_id=7)
+    tokenizer = types.SimpleNamespace(eos_token_id=7, decode=lambda ids: "")
     processor = types.SimpleNamespace(tokenizer=tokenizer, detokenizer=object())
     loader._complete_mlx_vlm_processor_runtime(processor, "unused")
     assert tokenizer.stopping_criteria == (7, tokenizer)
@@ -4667,7 +4667,8 @@ def test_processor_runtime_failure_names_processor_and_cause(monkeypatch):
     import unsloth_zoo.mlx.loader as loader
 
     class BrokenProcessor:
-        pass
+        def decode(self, ids):
+            return ""
 
     module = types.ModuleType("mlx_vlm.tokenizer_utils")
     def broken(*args, **kwargs):
@@ -4719,3 +4720,30 @@ def test_processor_save_serializes_components_or_names_source_fallback(tmp_path,
     else:
         assert config == {"processor_class":"SourceProcessor"}
         assert "copied processor source assets: processor_config.json" in capsys.readouterr().out
+
+
+def test_processor_runtime_leaves_decodeless_processors_bare(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    module = types.ModuleType("mlx_vlm.tokenizer_utils")
+    def detokenizer(tokenizer):
+        return tokenizer.decode([0])
+    module.load_tokenizer = lambda *a, **k: detokenizer
+    module.NaiveStreamingDetokenizer = detokenizer
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", module)
+    processor = types.SimpleNamespace(image_processor=object())
+    assert loader._complete_mlx_vlm_processor_runtime(processor, "unused") is processor
+    assert not hasattr(processor, "detokenizer")
+
+
+def test_clean_processor_save_does_not_invent_processor_config(tmp_path):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    class Processor:
+        def save_pretrained(self, path):
+            (Path(path) / "preprocessor_config.json").write_text('{"size": 32}')
+        def to_dict(self):
+            return {"processor_class": "Processor"}
+    _save_vlm_processor_assets(Processor(), tmp_path)
+    assert (tmp_path / "preprocessor_config.json").is_file()
+    assert not (tmp_path / "processor_config.json").exists()

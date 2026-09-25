@@ -1718,6 +1718,9 @@ def _inherit_mlx_vlm_processor_runtime(processor, repaired):
 
 def _complete_mlx_vlm_processor_runtime(processor, model_path, eos_token_ids=None):
     tokenizer = getattr(processor, "tokenizer", processor)
+    # mlx-vlm's load_processor leaves processors without decode() (depth, detection) bare.
+    if not callable(getattr(tokenizer, "decode", None)):
+        return processor
     try:
         if getattr(processor, "detokenizer", None) is None:
             from mlx_vlm.tokenizer_utils import load_tokenizer, NaiveStreamingDetokenizer

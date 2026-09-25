@@ -5038,7 +5038,6 @@ def _render_vlm_messages(
         yield marked
         yield _flatten_vlm_content_for_text_template(messages, image_token)
         yield _flatten_vlm_messages_to_content_parts(marked)
-        # Preserve even the legacy best-effort render before trying typed roles.
         if rendered is None:
             yield messages
             yield _mark_vlm_image_parts(messages, image_token)
@@ -17397,7 +17396,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             success = False
         return success
 
-    if not save_component(processor, overwrite=True):
+    native_saved = save_component(processor, overwrite=True)
+    if not native_saved:
         if not failures:
             failures.append(f"{type(processor).__name__} has no save_pretrained")
     # Some processors' save methods omit components or are entirely no-ops.
@@ -17410,7 +17410,9 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             seen.add(id(component))
             save_component(component)
 
-    if Path("processor_config.json") not in saved and callable(getattr(processor, "to_dict", None)):
+    # A clean legacy save omits processor_config.json on purpose; only a failed one is rebuilt.
+    if (not native_saved and Path("processor_config.json") not in saved
+            and callable(getattr(processor, "to_dict", None))):
         def serialize_component(value):
             to_dict = getattr(value, "to_dict", None)
             if callable(to_dict):
@@ -17418,7 +17420,6 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             raise TypeError(f"{type(value).__name__} has no JSON serialization")
 
         try:
-            # Some native components expose to_dict without Transformers' hub mixin.
             payload = json.dumps(processor.to_dict(), default=serialize_component, indent=2)
             (path / "processor_config.json").write_text(payload, encoding="utf-8")
             saved.add(Path("processor_config.json"))
