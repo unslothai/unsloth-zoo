@@ -30,6 +30,7 @@ import torch.nn as nn
 from .common import (
     TEMPORARY_PATCHES,
     UNSLOTH_ENABLE_LOGGING,
+    WRAPPER_INNER_ATTR,
     is_transformers_v5_moe_quantization_available,
     logger,
 )
@@ -1238,6 +1239,14 @@ def patch_bnb4bit_model_conversion_mapping():
         return conversions
 
     patched_get_model_conversion_mapping._unsloth_moe_patched = True
+    # Publish the link to what we wrapped, so a later reader can walk past this wrapper. Without
+    # it this closure is an opaque lid: `conversion_mapping_rescope.py` installs underneath us on
+    # the same function, and its "am I already installed" probe and the one in `bitsandbytes.py`
+    # both walk the chain, find no link here, and conclude the repair is absent. Measured on
+    # transformers 5.5.4 before this line existed: pass 1 left the repair invisible, so the
+    # Linear4bit error still blamed the transformers version for a load the repair had fixed,
+    # and pass 2 stacked a second rescope wrapper on top.
+    setattr(patched_get_model_conversion_mapping, WRAPPER_INNER_ATTR, original)
     conversion_mapping.get_model_conversion_mapping = patched_get_model_conversion_mapping
     if getattr(modeling_utils, "get_model_conversion_mapping", None) is original:
         modeling_utils.get_model_conversion_mapping = patched_get_model_conversion_mapping

@@ -6,26 +6,18 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""CPU-pure behavioural tests for the `use_cache` handling in
+"""CPU-pure behavioural tests for `use_cache` handling in
 `prepare_model_for_training` (unsloth_zoo/training_utils.py).
 
-KV cache is unused under gradient checkpointing, so the prepare step
-walks `model.config` and every nested transformers config (composite
-VLM configs expose `text_config` / `vision_config` attributes) and
-sets truthy `use_cache` flags to False. These tests pin the contract:
-
-  - top-level `use_cache=True` flips to False for both
-    `use_gradient_checkpointing=True` and `"unsloth"`;
-  - nested sub-configs of composite configs flip too;
-  - `use_cache=None` and `use_cache=False` are preserved (None means
-    "defer to the model default" and must not become False);
-  - nothing is touched when gradient checkpointing is disabled;
-  - non-config attachments with a `use_cache` attribute are ignored;
-  - self-referencing config graphs terminate (visited-id guard).
+The prepare step walks `model.config` and every nested transformers config and
+disables the KV cache, which gradient checkpointing makes dead weight. These
+tests pin that contract, including its restore half.
 """
 
 from __future__ import annotations
 
+import copy
+import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -69,10 +61,7 @@ class _ConfigCarrier(nn.Module):
 
 
 def _none_use_cache_supported() -> bool:
-    """transformers v5 configs are strict huggingface_hub dataclasses whose
-    use_cache field is typed bool, so None ("defer to the model default") is
-    unrepresentable there and the legacy preserve-None contract only applies
-    to stacks that accept it."""
+    """v5 configs type use_cache as bool, so None is unrepresentable there."""
     try:
         LlamaConfig(use_cache = None)
     except Exception:
@@ -173,8 +162,7 @@ def test_restore_without_prepare_is_noop():
 
 @requires_none_use_cache
 def test_restore_preserves_falsy_values():
-    # Configs whose use_cache was None/False are never recorded, so a
-    # restore after prepare must not invent True values for them.
+    # falsy values are never recorded, so restore must not invent True
     model = _tiny_llama(use_cache = None)
     prepare_model_for_training(model, use_gradient_checkpointing = True)
     restore_use_cache(model)
@@ -196,5 +184,121 @@ def test_double_prepare_keeps_first_originals():
     model = _tiny_llama(use_cache = True)
     prepare_model_for_training(model, use_gradient_checkpointing = True)
     prepare_model_for_training(model, use_gradient_checkpointing = True)
+    restore_use_cache(model)
+    assert model.config.use_cache is True
+
+
+# Configs that never declared use_cache: transformers sub-configs inherit no
+# default, so a forward reading self.config.use_cache raised AttributeError.
+# stepfun-ai/Step-3.7-Flash ships a text config of exactly this shape.
+
+
+class _NoUseCacheConfig(PreTrainedConfig):
+    model_type = "unsloth_no_use_cache_probe"
+
+
+def _composite_without_use_cache():
+    config = LlamaConfig(use_cache = True)
+    config.text_config = _NoUseCacheConfig()
+    assert not hasattr(config.text_config, "use_cache")
+    return config
+
+
+def test_absent_use_cache_is_set_so_forward_can_read_it():
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    # the attribute now exists, so the read returns False instead of raising
+    assert config.text_config.use_cache is False
+
+
+def test_restore_removes_an_invented_use_cache_rather_than_inventing_False():
+    """Without _ABSENT, restore writes False back and disables the KV cache on
+    a config the checkpoint never shipped one for."""
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    assert config.text_config.use_cache is False
+    restore_use_cache(model)
+    assert not hasattr(config.text_config, "use_cache")
+    # the sibling that really had one is restored to its own value, not deleted
+    assert config.use_cache is True
+
+
+def test_absent_use_cache_survives_a_disable_restore_cycle():
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    restore_use_cache(model)
+    disable_use_cache(model)
+    assert config.text_config.use_cache is False
+    restore_use_cache(model)
+    assert not hasattr(config.text_config, "use_cache")
+
+
+@pytest.mark.parametrize(
+    "clone",
+    [
+        pytest.param(lambda m: copy.deepcopy(m), id = "deepcopy"),
+        pytest.param(lambda m: pickle.loads(pickle.dumps(m)), id = "pickle"),
+    ],
+)
+def test_absent_marker_survives_copying_the_model(clone):
+    """The record is copied with the model, so an object() sentinel would lose
+    identity and restore would write the unserializable sentinel into the
+    config. TRL deepcopies a prepared model for its reference model."""
+    config = _composite_without_use_cache()
+    model = _ConfigCarrier(config)
+    prepare_model_for_training(
+        model, use_gradient_checkpointing = True, use_reentrant = False,
+    )
+    copied = clone(model)
+    restore_use_cache(copied)
+    assert not hasattr(copied.config.text_config, "use_cache")
+    # and the config is still serializable, which the sentinel leak broke
+    copied.config.text_config.to_json_string()
+
+
+# A config first reached on a LATER disable_use_cache call: recording once
+# meant it was disabled but never recorded, so restore could not undo it.
+
+_ABSENT_PARAM = object()
+
+
+@pytest.mark.parametrize(
+    "initial",
+    [pytest.param(True, id = "had_True"), pytest.param(_ABSENT_PARAM, id = "absent")],
+)
+def test_config_first_seen_after_the_first_disable_is_restorable(initial):
+    model = _tiny_llama(use_cache = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+
+    late = _NoUseCacheConfig()
+    if initial is not _ABSENT_PARAM:
+        late.use_cache = initial
+    model.config.text_config = late      # attached while already prepared
+
+    disable_use_cache(model)
+    assert late.use_cache is False       # still disabled for training
+
+    restore_use_cache(model)
+    if initial is _ABSENT_PARAM:
+        assert not hasattr(late, "use_cache")
+    else:
+        assert late.use_cache is initial
+
+
+def test_late_config_does_not_disturb_the_first_baseline():
+    # the config recorded on the first pass keeps its own original value
+    model = _tiny_llama(use_cache = True)
+    prepare_model_for_training(model, use_gradient_checkpointing = True)
+    model.config.text_config = _NoUseCacheConfig()
+    disable_use_cache(model)
     restore_use_cache(model)
     assert model.config.use_cache is True

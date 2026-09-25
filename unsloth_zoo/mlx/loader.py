@@ -5212,6 +5212,8 @@ def _dequantize_selected_mlx_modules(model, predicate):
     for path, module in model.named_modules():
         if not predicate(path, module):
             continue
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            _materialize_weights(module)
         if isinstance(module, nn.QuantizedLinear):
             weight = mx.dequantize(
                 module.weight,
@@ -5351,6 +5353,7 @@ def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, pre
         weight = getattr(module, "weight", None)
         if weight is None or len(getattr(weight, "shape", ())) != 2:
             continue
+        _materialize_weights(module)
         module.weight = _nf4_dense_dequantize_weight(weight, spec.group_size or 64)
         quantized[path] = {
             "bits": 4,
@@ -5517,6 +5520,8 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
         model._unsloth_quantized_source = "none"
         return model, config
 
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
     from mlx_lm.utils import quantize_model
 
     predicate = _compose_mlx_quant_predicate(
@@ -5548,6 +5553,7 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
         config.setdefault("quantization", {})
     if spec.mode == "nf4_dense":
         return _apply_dense_nf4_quantization(model, config, spec, predicate)
+    sources = dict(tree_flatten(model.leaf_modules(), is_leaf=lambda node: isinstance(node, nn.Module)))
     model, updated_config = quantize_model(
         model,
         config,
@@ -5556,6 +5562,7 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
         mode=spec.mode or "affine",
         quant_predicate=predicate,
     )
+    _evaluate_quantized_modules(model, sources)
     model._config = updated_config
     model._unsloth_quantization_config = updated_config.get(
         "quantization_config", updated_config.get("quantization")
@@ -7896,9 +7903,41 @@ def _coerce_list_extra_special_tokens():
     PreTrainedTokenizerBase.__init__ = patched_init
 
 
+_LAZY_WEIGHTS_ENV = "UNSLOTH_MLX_LAZY_WEIGHTS"
+
+
+def _materialize_weights(model):
+    """Left mapped, the first GPU kernel to touch a weight can stall long enough for
+    Apple's watchdog to kill the process's queue."""
+    if os.environ.get(_LAZY_WEIGHTS_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    import mlx.core as mx
+
+    try:
+        mx.eval(model.parameters())
+    except Exception as error:
+        # Not fatal: the weights stay lazy, as before.
+        print(f"Unsloth: Could not read {type(model).__name__} weights at load time: {error}")
+
+
+def _evaluate_quantized_modules(model, sources):
+    """Evaluate a lazily quantized model module by module, each one's source weights read
+    first: a read still pending when its kernel runs keeps a GPU command buffer waiting on
+    the disk. One module at a time also keeps a single module's unquantized weights live."""
+    import mlx.core as mx
+
+    quantized = dict(model.named_modules())
+    for path in list(sources):
+        _materialize_weights(sources.pop(path))
+        target = quantized.get(path)
+        if target is not None:
+            mx.eval(target.parameters())
+
+
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
+    _materialize_weights(model)
     return model, tokenizer
 
 

@@ -690,6 +690,64 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
     assert plan.prepare_cce_batch(1, batch) is batch
 
 
+@metal_only
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 7.0])
+def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compiled, softcap):
+    import gc
+    from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx.cce.runtime_cce import make_chunked_cross_entropy_loss
+
+    stored, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(runtime_cce, "_forward_with_hidden_gradient",
+                        lambda *args, **kwargs: (out := forward(*args, **kwargs), stored.append(out[1].dtype))[0])
+
+    mx.random.seed(719)
+    hidden = (mx.random.normal((256, 128)) * 0.2).astype(mx.bfloat16)
+    weight = (mx.random.normal((8192, 128)) * 0.1).astype(mx.bfloat16)
+    targets = mx.where(mx.arange(256) % 5 == 0, -100, mx.arange(256) * 29)
+    cotangent = mx.where(mx.arange(256) % 2 == 0, 1.0, -0.5)
+    mx.eval(hidden, weight, targets, cotangent)
+    functions = []
+    for frozen, precompute in ((False, False), (True, False), (True, True)):
+        runtime, _ = make_chunked_cross_entropy_loss(
+            chunk_size=2048, weight_is_frozen=frozen, logit_softcap=softcap,
+            precompute_hidden_gradient=precompute,
+        )
+        def loss(h, runtime=runtime):
+            return (runtime(h, weight, targets) * cotangent).sum()
+        grad = mx.value_and_grad(loss)
+        functions.append(mx.compile(grad) if compiled else grad)
+    expected, actual, precomputed = [fn(hidden) for fn in functions]
+    reference, _ = make_chunked_cross_entropy_loss(chunk_size=2048, logit_softcap=softcap)
+    exact = mx.grad(lambda h: (reference(h, weight.astype(mx.float32), targets) * cotangent).sum())(
+        hidden.astype(mx.float32)
+    )
+    mx.eval(expected, actual, precomputed, exact)
+    for left, right in zip(expected, actual):
+        assert mx.array_equal(left, right).item()
+    assert mx.array_equal(precomputed[0], expected[0]).item()
+    assert mx.allclose(precomputed[1].astype(mx.float32), exact, atol=2e-3, rtol=0).item()
+    # Held until the backward, the gradient is stored at the hidden dtype.
+    assert stored == [mx.bfloat16]
+    assert mx.all(actual[1][::5] == 0).item()
+    assert mx.any(actual[1][1:] > 0).item() and mx.any(actual[1][1:] < 0).item()
+    del expected, actual, precomputed, exact, left, right
+    # Head-only peaks cover the release; precomputing saves memory only across a compiled model step.
+    peaks = []
+    for fn in functions[:2]:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        result = fn(hidden)
+        mx.eval(result)
+        peaks.append(mx.get_peak_memory() - resident)
+        del result
+    assert peaks[1] < peaks[0]
+
+
 def _norm_model(seed=77, dtype=None):
     class _TinyLM(nn.Module):
         def __init__(self):
@@ -1407,6 +1465,9 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
 def test_vlm_cce_compaction_preserves_aligned_rows(monkeypatch, quantized):
     mx.random.seed(735)
     model = _cce_text_model(2053, 64, quantized=quantized)
+    def embed_forward(self, ids, inputs_embeds=None):
+        return self.embed_tokens(ids) if inputs_embeds is None else inputs_embeds
+    monkeypatch.setattr(type(model.model), "__call__", embed_forward)
     model.get_input_embeddings = lambda *args, **kwargs: None
     ids = mx.arange(1026).reshape(2, 513)
     batch = {"input_ids": ids, "labels": mx.where((ids % 11) == 5, ids, -100)}
@@ -1482,6 +1543,9 @@ def test_vlm_evaluation_compacts_sparse_batches(monkeypatch, quantized):
 
     mx.random.seed(412)
     model = _cce_text_model(2053, 64, quantized=quantized)
+    def embed_forward(self, ids, inputs_embeds=None):
+        return self.embed_tokens(ids) if inputs_embeds is None else inputs_embeds
+    monkeypatch.setattr(type(model.model), "__call__", embed_forward)
     model.get_input_embeddings = lambda *args, **kwargs: None
     ids = mx.arange(2050).reshape(2, 1025)
     batch = {"input_ids": ids, "labels": mx.where(ids % 17 == 5, ids, -100)}
@@ -1883,6 +1947,29 @@ def test_every_text_loss_accepts_a_wrapped_model_output():
 
 
 @metal_only
+def test_cce_loss_precomputes_the_hidden_gradient_only_in_training(monkeypatch):
+    from unsloth_zoo.mlx.cce import runtime_cce
+    from unsloth_zoo.mlx.utils import make_cce_loss_fn
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    ids = mx.array([tokenizer.encode("the capital of France is Paris")])
+    lengths = mx.array([[0, ids.shape[1]]], dtype=mx.int32)
+    calls, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(
+        runtime_cce, "_forward_with_hidden_gradient",
+        lambda *args, **kwargs: (calls.append(model.training), forward(*args, **kwargs))[1],
+    )
+    loss_fn = make_cce_loss_fn(model)
+    losses = []
+    for training in (True, False):
+        model.train(training)
+        losses.append(loss_fn(model, ids, lengths)[0])
+    mx.eval(losses)
+    assert calls == [True]
+    assert mx.array_equal(*losses).item()
+
+
+@metal_only
 @pytest.mark.parametrize("softcap", (0.0, 20.0), ids=("no-softcap", "softcap"))
 def test_post_head_multiplier_reaches_the_fused_cce_loss(softcap):
     """A model whose forward scales logits after the head must have that scale
@@ -2195,3 +2282,155 @@ def test_checkpointing_keeps_cacheless_kv_shared_gradients():
             del Gemma3Model._kv_sharing_patched
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
+
+
+@metal_only
+def test_cce_hidden_forward_preserves_wrapper_embeddings_and_image_mask():
+    from types import SimpleNamespace
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(32, 64)
+
+        def __call__(self, ids, inputs_embeds=None, per_layer_inputs=None, image_mask=None):
+            h = self.embed_tokens(ids) * 8 if inputs_embeds is None else inputs_embeds
+            if per_layer_inputs is not None:
+                h = h + per_layer_inputs
+            if image_mask is not None:
+                h = h * mx.where(image_mask[..., None], 2, 1)
+            return h
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.model = Backbone()
+            self._unsloth_text_only_vlm = True
+
+        def get_input_embeddings(self, ids, pixels):
+            h = self.language_model.model.embed_tokens(ids)
+            return SimpleNamespace(inputs_embeds=h, per_layer_inputs=h * 0.3)
+
+    model = Wrapper()
+    for rows in ([[2, 3, 4], [5, 6, 7]], [[7, 6, 5], [4, 3, 2]]):
+        ids = mx.array(rows)
+        features = model.get_input_embeddings(ids, None)
+        mask = ids % 2 == 0
+        expected = model.language_model.model(ids, inputs_embeds=features.inputs_embeds,
+            per_layer_inputs=features.per_layer_inputs, image_mask=mask)
+        actual = mlx_utils._forward_text_hidden_states(model, ids, visual_pos_masks=mask)
+        assert mx.array_equal(actual, expected).item()
+        inverse = mlx_utils._forward_text_hidden_states(model, ids, visual_pos_masks=~mask)
+        assert not mx.array_equal(inverse, expected).item()
+
+
+@metal_only
+@pytest.mark.parametrize("media_key", ["pixel_values", "pixel_values_videos"])
+def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatch, media_key):
+    calls = []
+    factory = mlx_utils._get_runtime_cce
+    def counted_factory(**kwargs):
+        runtime = factory(**kwargs)
+        def run(*args):
+            calls.append(True)
+            return runtime(*args)
+        return run
+    monkeypatch.setattr(mlx_utils, "_get_runtime_cce", counted_factory)
+    base = _cce_text_model(32, 64, quantized=False)
+    class Model(type(base)):
+        def __init__(self):
+            super().__init__()
+            self.model.encoder = nn.Identity()
+        def __call__(self, ids, pixel_values=None, **kwargs):
+            pixel_values = kwargs.get("pixel_values_videos", pixel_values)
+            h = self.model(ids)
+            return self.lm_head(h if pixel_values is None else h + pixel_values)
+        def get_input_embeddings(self, *args, **kwargs):
+            pytest.fail("token-ID CCE must not request merged embeddings")
+    model = Model()
+    assert mlx_utils._get_backbone_embed_kwarg(model.model) is None
+    loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert loss._unsloth_cce_backend == "runtime-cce"
+    baseline = mlx_utils.make_vlm_baseline_loss_fn(model)
+    for pixels in (None, mx.ones((2, 3, 64)), None):
+        batch = dict(input_ids=mx.array([[2, 3, 4], [7, 6, 5]]), **{media_key: pixels})
+        before = len(calls)
+        actual, ntoks = loss(model, batch)
+        expected, expected_ntoks = baseline(model, batch)
+        assert mx.allclose(actual, expected, atol=1e-5).item()
+        assert ntoks.item() == expected_ntoks.item() == 4
+        assert len(calls) - before == int(pixels is None)
+    assert capsys.readouterr().out.count("cannot accept multimodal embeddings") == 1
+
+    class Alias:
+        def __call__(self, ids, input_embeddings=None):
+            pass
+    class Unknown:
+        def __call__(self, ids, **kwargs):
+            pass
+    class Positional:
+        def __call__(self, ids, inputs_embeds=None, /):
+            pass
+    assert mlx_utils._get_backbone_embed_kwarg(Alias()) == "input_embeddings"
+    assert mlx_utils._get_backbone_embed_kwarg(Unknown()) is None
+    assert mlx_utils._get_backbone_embed_kwarg(Positional()) is None
+
+
+@metal_only
+@pytest.mark.parametrize("conditioning", ["self_conditioning_logits", "self_conditioning_embeddings"])
+def test_encoder_decoder_cce_matches_full_forward_and_gradients(conditioning, request):
+    mlx_utils.acquire_mlx_training_patches()
+    request.addfinalizer(mlx_utils.release_mlx_training_patches)
+    config = pytest.importorskip("mlx_vlm.models.diffusion_gemma.config")
+    module = pytest.importorskip("mlx_vlm.models.diffusion_gemma.diffusion_gemma")
+    model = module.Model(config.ModelConfig(canvas_length=4, text_config=config.TextConfig(
+        vocab_size=64, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+        num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1,
+        num_global_key_value_heads=1, head_dim=32, global_head_dim=32,
+        num_experts=2, top_k_experts=1, final_logit_softcapping=0.5,
+        layer_types=["sliding_attention", "full_attention"],
+    )))
+    cce = mlx_utils.make_vlm_cce_loss_fn(model, ignore_token_ids=[])
+    assert cce._unsloth_cce_backend == "runtime-cce"
+    ce = mlx_utils.make_vlm_baseline_loss_fn(model, ignore_token_ids=[])
+    for rows in ([[2, 3, 4, 5], [6, 7, 8, 9]], [[9, 8, 7, 6], [5, 4, 3, 2]]):
+        ids = mx.array(rows)
+        batch = dict(input_ids=ids, labels=mx.where(ids % 3 == 0, -100, ids),
+                     attention_mask=mx.ones_like(ids), canvas_ids=ids[:, ::-1],
+                     decoder_attention_mask=mx.ones((2, 8), dtype=mx.bool_))
+        batch[conditioning] = mx.random.normal((2, 4, 64)) * 0.1
+        (expected, n1), g1 = nn.value_and_grad(model, ce)(model, batch)
+        (actual, n2), g2 = nn.value_and_grad(model, cce)(model, batch)
+        assert n1.item() == n2.item()
+        assert mx.allclose(actual, expected, atol=1e-5).item()
+        for (name, a), (_, b) in zip(tree_flatten(g1), tree_flatten(g2)):
+            assert mx.allclose(a, b, atol=2e-5, rtol=2e-3).item(), name
+
+
+@metal_only
+def test_training_refuses_batch_axis_vocabulary_mask():
+    class Unsafe(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._dummy_tokenizer_ids = mx.array([3, 7])
+
+        def __call__(self, logits):
+            logits[self._dummy_tokenizer_ids] = -float("inf")
+            return logits
+
+    class Corrected(Unsafe):
+        def __call__(self, logits):
+            logits[..., self._dummy_tokenizer_ids] = -float("inf")
+            return logits
+
+    with pytest.raises(ValueError, match="unsafe output token mask.*batch axis"):
+        mlx_utils._validate_output_token_mask(Unsafe())
+    mlx_utils._validate_output_token_mask(Corrected())
+    empty = Unsafe()
+    empty._dummy_tokenizer_ids = mx.array([], mx.int32)
+    mlx_utils._validate_output_token_mask(empty)
+    logits = Corrected()(mx.zeros((2, 3, 8)))
+    assert mx.isneginf(logits[..., 3]).all().item()
+    assert mx.isneginf(logits[..., 7]).all().item()
+    assert (logits[..., 2] == 0).all().item()

@@ -96,6 +96,7 @@ import json
 import ntpath
 import os
 import posixpath
+import re
 import stat
 from pathlib import Path
 from typing import Union, List, Optional
@@ -114,6 +115,224 @@ def find_skipped_quantized_modules(model):
         elif isinstance(module, torch.nn.Linear):
             skipped_modules.append(name)
     return skipped_modules, quantized_modules
+pass
+
+# vLLM fuses these before reading `llm_int8_skip_modules`, and its
+# `is_layer_skipped_bnb` matches only a module's own dotted ancestors, so the
+# fused name must be present verbatim or the layer is quantized despite being
+# saved dense (vllm/model_executor/layers/quantization/bitsandbytes.py).
+_VLLM_FUSED_SKIP_MODULES = (
+    (("q_proj", "k_proj", "v_proj"), "qkv_proj"),
+    (("gate_proj", "up_proj"),       "gate_up_proj"),
+)
+
+# Transformers >= 4.52 nests multimodal text stacks as `model.language_model.*`
+# while vLLM keeps `language_model.model.*`: an entry in one is invisible in the
+# other. Save-time twin of `_get_gemma4_bnb_skip_module_aliases` (vllm_utils.py).
+_VLLM_SKIP_MODULE_NAMESPACES = (
+    ("model.language_model.", ("language_model.model.", "model.")),
+    ("language_model.model.", ("model.language_model.", "model.")),
+    ("model.visual.",         ("visual.",)),
+    ("model.vision_tower.",   ("vision_tower.",)),
+    ("model.audio_tower.",    ("audio_tower.",)),
+)
+
+def add_vllm_namespace_skip_module_aliases(skipped_modules):
+    """Return `skipped_modules` plus the equivalent names in vLLM's namespace.
+
+    Additive. "Inert for Transformers" is decided by the matchers in
+    `_SKIP_MATCHERS`, not by whether the name exists in the tree.
+    """
+    if not skipped_modules: return skipped_modules
+    seen = set(skipped_modules)
+    aliases = []
+    for module_name in skipped_modules:
+        if not isinstance(module_name, str): continue
+        for prefix, replacements in _VLLM_SKIP_MODULE_NAMESPACES:
+            if not module_name.startswith(prefix): continue
+            tail = module_name[len(prefix):]
+            # A bare namespace root matches every module under it, leaving the
+            # whole model unquantized. Guards hand-built lists only.
+            if not tail: continue
+            for replacement in replacements:
+                alias = replacement + tail
+                if alias in seen: continue
+                seen.add(alias)
+                aliases.append(alias)
+        pass
+    pass
+    if not aliases: return skipped_modules
+    return list(skipped_modules) + sorted(aliases)
+pass
+
+def add_vllm_fused_skip_module_aliases(skipped_modules):
+    """Return `skipped_modules` plus the fused-module aliases vLLM needs.
+
+    Purely additive. These two are inert for Transformers because a model
+    exposing `gate_up_proj`/`qkv_proj` has no `gate_proj`/`up_proj` or
+    `q/k/v_proj` siblings under the same parent, so this never fires for it.
+    Non-existence alone would NOT be enough: see `_SKIP_MATCHERS`. A new entry
+    in `_VLLM_FUSED_SKIP_MODULES` or `_VLLM_SKIP_MODULE_NAMESPACES` must be
+    re-checked against those matchers.
+
+    An alias is only added when *every* shard is skipped: vLLM cannot express a
+    partially skipped fused module, and claiming otherwise corrupts the
+    quantized shard.
+    """
+    if not skipped_modules: return skipped_modules
+
+    by_parent = {}
+    for module_name in skipped_modules:
+        if not isinstance(module_name, str) or "." not in module_name: continue
+        parent, _, leaf = module_name.rpartition(".")
+        by_parent.setdefault(parent, set()).add(leaf)
+    pass
+
+    aliases = []
+    seen = set(skipped_modules)
+    for parent, leaves in by_parent.items():
+        for shard_names, fused_name in _VLLM_FUSED_SKIP_MODULES:
+            if not set(shard_names).issubset(leaves): continue
+            alias = f"{parent}.{fused_name}"
+            if alias in seen: continue
+            seen.add(alias)
+            aliases.append(alias)
+        pass
+    pass
+    if not aliases: return skipped_modules
+    return list(skipped_modules) + sorted(aliases)
+pass
+
+def drop_skip_module_aliases_that_widen(skipped_modules, aliased, module_names):
+    """Drop any alias that changes a Transformers conversion decision.
+
+    Transformers matches a skip entry by prefix and suffix, not by exact name,
+    so an alias need not name a real module to change what gets quantized. On a
+    tower named `model.vision_tower.vision_model.layers.N.mlp.gate_proj` the
+    `model.` namespace alias reaches the leaf under 5.x and, in parent form,
+    every leaf under it on 4.x. That weight is quantized on disk, so skipping it
+    rebuilds a plain `Linear` for a packed checkpoint entry.
+
+    No shipping architecture names a tower that way, so this is a guard, not a
+    fix for an observed break.
+    """
+    if not module_names: return aliased
+    added = [name for name in aliased if name not in set(skipped_modules)]
+    if not added: return aliased
+
+    # Checked against the semantics directly, not the installed function: the
+    # transformers that RELOADS this checkpoint is not the one saving it, and no
+    # matcher is a superset of the others.
+    # Matching is monotone, so per matcher an alias is safe exactly when it hits
+    # nothing that list already left convertible, and each can be tested alone.
+    safe = set(added)
+    for build in _SKIP_MATCHERS:
+        try:
+            matches_any = build(list(skipped_modules))
+            convertible = [name for name in module_names if not matches_any(name)]
+        except Exception:
+            # Cannot evaluate this matcher, so it cannot clear anything either.
+            safe = set()
+            break
+        for alias in sorted(safe):
+            try:
+                widens = any(build([alias])(name) for name in convertible)
+            except Exception:
+                # A pathological entry can make a matcher's `re.match` raise.
+                # Treat that as unsafe and drop the alias.
+                widens = True
+            if widens: safe.discard(alias)
+        pass
+    pass
+    if len(safe) == len(added): return aliased
+    return list(skipped_modules) + [alias for alias in added if alias in safe]
+pass
+
+def _transformers_4x_skip_matcher(entries):
+    """transformers 4.x, `integrations/bitsandbytes.py::replace_with_bnb_linear`.
+
+    4.x has no `should_convert_module`; it decides inline:
+
+        name not in modules_to_not_convert      # the module's own short name
+        (key + "." in current_key_name_str) or (key == current_key_name_str)
+
+    That first clause is an UNANCHORED substring, unlike 5.x's anchored prefix,
+    so `model.layers.0.mlp` matches `...vision_model.layers.0.mlp.gate_proj`
+    here but not there. Neither generation is a subset of the other.
+    """
+    entries = [e for e in entries if isinstance(e, str)]
+    if not entries:
+        return lambda name: False
+    exact = set(entries)
+    dotted = tuple(e + "." for e in entries)
+
+    def matches(name):
+        if name in exact: return True
+        if name.rpartition(".")[2] in exact: return True   # the short-name clause
+        return any(d in name for d in dotted)
+    return matches
+pass
+
+def _transformers_5x_skip_matcher(entries):
+    """transformers 5.x, `quantizers/quantizers_utils.py::should_convert_module`.
+
+    Mirrors its three clauses exactly: `re.match(key + ".", name)`,
+    `re.match(key, name)`, `name.endswith(key)`. Entries are regexes there, so
+    each alternative is wrapped rather than escaped. Folded into one alternation
+    plus one `endswith` tuple because the per-pair call is quadratic.
+    """
+    entries = [e for e in entries if isinstance(e, str)]
+    if not entries:
+        return lambda name: False
+    suffixes = tuple(entries)
+    try:
+        pattern = re.compile("|".join(f"(?:{e})\\.|(?:{e})" for e in entries))
+    except re.error:
+        def slow(name):
+            return any(re.match(f"{k}\\.", name) or re.match(f"{k}", name) or
+                       name.endswith(k) for k in entries)
+        return slow
+
+    def matches(name):
+        return bool(pattern.match(name)) or name.endswith(suffixes)
+    return matches
+pass
+
+def _unsloth_patched_skip_matcher(entries):
+    """5.x plus the whole-dot-component clause patching_utils.py adds, which is
+    what a model reloaded inside Unsloth sees."""
+    entries = [e for e in entries if isinstance(e, str)]
+    if not entries:
+        return lambda name: False
+    base = _transformers_5x_skip_matcher(entries)
+    exact = set(entries)
+
+    def matches(name):
+        return base(name) or bool(exact.intersection(name.split(".")))
+    return matches
+pass
+
+# Every matcher a checkpoint written by this module can later be loaded with.
+_SKIP_MATCHERS = (
+    _transformers_4x_skip_matcher,
+    _transformers_5x_skip_matcher,
+    _unsloth_patched_skip_matcher,
+)
+
+def vllm_compatible_skip_modules(skipped_modules, module_names = None):
+    """Every spelling of `skipped_modules` that vLLM's matcher can hit.
+
+    Fused aliases first, then namespace aliases over the result, so a fused
+    alias from a `model.language_model.*` entry also gets its
+    `language_model.model.*` twin.
+
+    `module_names`, the live module tree, drops any alias that would change what
+    Transformers quantizes. Omitting it keeps every alias, as callers had before.
+    """
+    aliased = add_vllm_namespace_skip_module_aliases(
+        add_vllm_fused_skip_module_aliases(skipped_modules)
+    )
+    return drop_skip_module_aliases_that_widen(skipped_modules, aliased, module_names)
 pass
 
 def create_huggingface_repo(
@@ -3891,7 +4110,15 @@ def merge_and_overwrite_lora(
             # Ensure quantization_config exists before modifying
             if not hasattr(merged_model.config, "quantization_config"):
                 merged_model.config.quantization_config = {} # Initialize if somehow missing
-            merged_model.config.quantization_config["llm_int8_skip_modules"] = skipped_modules
+            # These are leaf projections; vLLM only ever sees the fused modules, so
+            # without the aliases a dynamic-quant merge loads under Unsloth but dies in
+            # vLLM on `assert param_data.shape == loaded_weight.shape`. The live tree
+            # drops any alias that would change what Transformers quantizes on reload.
+            merged_model.config.quantization_config["llm_int8_skip_modules"] = \
+                vllm_compatible_skip_modules(
+                    skipped_modules,
+                    module_names = [name for name, _ in merged_model.named_modules()],
+                )
 
         print(f"Unsloth: Saving merged 4bit model to {save_directory}...")
         try:
