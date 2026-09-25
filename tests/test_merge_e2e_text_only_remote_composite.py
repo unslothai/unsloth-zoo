@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""merged_16bit of a text_only load of a repo-code composite (Nemotron-Omni, InternVL).
-
-Same contract as #969 for Gemma 3: the merge writes the checkpoint's own tensors
-(language_model.* plus the vision parts), so the config beside them must be the
-composite's. For a repo-code composite that config only loads with the repo's code,
-so it has to be read with the load's trust_remote_code and the code files copied.
-Before: AutoConfig(trust_remote_code=False) raised, the text config was saved, and a
-reload initialised every text weight at random without an error.
-"""
+"""merged_16bit of a text_only repo-code composite must save the composite config plus its code (#969)."""
 
 from __future__ import annotations
 
@@ -106,8 +98,6 @@ def _write_base(tmp_path):
 
 
 def _text_only_peft(base, state, trusted):
-    """What Unsloth's text_only branch leaves in memory: the bare causal LM with the checkpoint's
-    weights, _name_or_path pointing at the composite, and the load's trust decision recorded."""
     import transformers as T
     from peft import LoraConfig, get_peft_model
     model = T.LlamaForCausalLM(T.LlamaConfig(**_LLM)).to(torch.float32)
@@ -156,7 +146,6 @@ def test_remote_composite_export_is_the_composite_with_its_code(tmp_path):
 
 
 def test_untrusted_load_keeps_the_warned_fallback(tmp_path):
-    # A load that never ran the repo's code must not start running it at export time.
     H.set_offline_cpu_env()
     os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")
     base, state = _write_base(tmp_path)
@@ -185,13 +174,10 @@ def test_trust_marker_found_through_peft_layers():
     inner = NS(_unsloth_trust_remote_code = True)
     assert SU._loaded_with_trust_remote_code(NS(base_model = NS(model = inner)))
     assert not SU._loaded_with_trust_remote_code(NS(base_model = NS(model = NS())))
-    # Only a real True counts (a MagicMock-like truthy attribute does not).
     assert not SU._loaded_with_trust_remote_code(NS(_unsloth_trust_remote_code = "yes"))
 
 
 def test_trust_is_not_carried_to_a_different_repo(tmp_path):
-    # The load trusted `base`; an export reading another repo (a resolved FP8 -> 16bit sibling, a
-    # name-mapped repo) must not run that repo's code on the strength of the first approval.
     from unsloth_zoo import saving_utils as S
     H.set_offline_cpu_env()
     os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")
@@ -204,8 +190,6 @@ def test_trust_is_not_carried_to_a_different_repo(tmp_path):
 
 
 def test_trust_is_not_carried_to_a_substituted_source(tmp_path, monkeypatch):
-    # The load trusted `base`, but the source resolution hands back another directory (a local
-    # copy found in the working directory, a sibling): its code must not run under that approval.
     import shutil
     from unsloth_zoo import saving_utils as S
     H.set_offline_cpu_env()
@@ -225,8 +209,6 @@ def test_trust_is_not_carried_to_a_substituted_source(tmp_path, monkeypatch):
 
 
 def test_a_relative_load_path_is_the_same_trusted_source(tmp_path, monkeypatch):
-    # Loaded as `./base`, resolved to an absolute directory by the source lookup: still the repo the
-    # load trusted, so the export is the composite with its code, not the text-only fallback.
     H.set_offline_cpu_env()
     os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")
     base, state = _write_base(tmp_path)
@@ -243,8 +225,6 @@ def test_a_relative_load_path_is_the_same_trusted_source(tmp_path, monkeypatch):
 
 
 def test_hub_repo_code_is_pinned_to_the_loaded_commit(monkeypatch, tmp_path):
-    # A Hub repo is re-read, and its code copied, at the commit the trusted load ran, never the
-    # branch head; with no known commit the trusted re-read is refused.
     import transformers
     import huggingface_hub
     from unsloth_zoo import saving_utils as S
@@ -267,8 +247,6 @@ def test_hub_repo_code_is_pinned_to_the_loaded_commit(monkeypatch, tmp_path):
     commit = "a" * 40
     model._unsloth_trust_remote_code_commit = commit
     assert S._read_export_base_config("org/repo", None, model, source_is_loaded_repo = True) == "config"
-    # The code of this repo follows `revision`; an explicit code_revision would also force the model
-    # repo's commit onto a cross-repo auto_map's code repository, where it does not exist.
     assert calls[-1]["revision"] == commit and calls[-1].get("code_revision") is None
 
     seen = []
@@ -282,8 +260,6 @@ def test_hub_repo_code_is_pinned_to_the_loaded_commit(monkeypatch, tmp_path):
 
 
 def test_hub_code_without_a_commit_is_never_copied(monkeypatch, tmp_path):
-    # The in-memory fallback can keep a repo-code config for a Hub repo whose load recorded no commit:
-    # nothing may then be fetched from the repo's current head into the export.
     import huggingface_hub
     from unsloth_zoo import saving_utils as S
     fetched = []
@@ -304,8 +280,6 @@ def test_hub_code_without_a_commit_is_never_copied(monkeypatch, tmp_path):
 
 
 def test_code_of_a_substituted_source_is_never_copied(tmp_path):
-    # The load trusted `base`; the export resolved to another directory whose config read failed, so a
-    # repo-code config stayed in memory. That directory's code was never approved: nothing is copied.
     import shutil
     from unsloth_zoo import saving_utils as S
     base, state = _write_base(tmp_path)
@@ -322,8 +296,7 @@ def test_code_of_a_substituted_source_is_never_copied(tmp_path):
 
 
 def test_pinned_revision_applies_to_same_repo_code_only():
-    # What the export relies on: without an explicit code_revision, transformers pins code to
-    # `revision` for code in the model repo and leaves a cross-repo auto_map's code repo alone.
+    # Drift guard for the no-code_revision contract in _read_export_base_config.
     import inspect
     from transformers import dynamic_module_utils as D
     src = inspect.getsource(D.get_class_from_dynamic_module)

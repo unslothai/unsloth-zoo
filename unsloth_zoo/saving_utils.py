@@ -3473,7 +3473,6 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
 def _loaded_with_trust_remote_code(model):
-    # The load's own trust_remote_code decision (Unsloth records it), found through PEFT wrappers.
     return _find_load_marker(model, "_unsloth_trust_remote_code") is True
 pass
 
@@ -3492,8 +3491,7 @@ pass
 
 
 def _trusted_code_commit(model):
-    # The commit whose repo code the trusted load ran: Unsloth stamps it (the composite's own commit
-    # under text_only, whose nested config carries none); else the loaded config's resolved commit.
+    # Stamped marker first: under text_only the nested config carries no _commit_hash.
     commit = _find_load_marker(model, "_unsloth_trust_remote_code_commit")
     if commit is None:
         commit = getattr(getattr(model, "config", None), "_commit_hash", None)
@@ -3502,8 +3500,6 @@ pass
 
 
 def _is_export_source_loaded_repo(model_name, model):
-    # The export reads the very checkpoint the load trusted: the same Hub id, or the same local
-    # directory however it is spelled (`./base` at load, an absolute path after source resolution).
     loaded = getattr(getattr(model, "config", None), "_name_or_path", None)
     if not isinstance(loaded, str) or not isinstance(model_name, str): return False
     if os.path.isdir(model_name) or os.path.isdir(loaded):
@@ -3514,12 +3510,7 @@ pass
 
 
 def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False):
-    # Config of the checkpoint the merged weights come from. Built-in configs read exactly as before;
-    # only when that fails, the load itself ran repo code (a text_only load of a repo-code composite
-    # such as Nemotron-Omni or InternVL), AND the export reads the very repo that load trusted, is its
-    # config read with its code again. A resolved sibling (FP8 -> 16bit) or a name-mapped repo is a
-    # different repository, whose code was never approved, so it keeps the untrusted path. A Hub repo
-    # is re-read at the commit the load ran, never its current head; without a known commit, not at all.
+    # Repo code re-runs only for the exact repo (and Hub commit) the load trusted; siblings were never approved.
     from transformers import AutoConfig
     try:
         return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
@@ -3527,8 +3518,7 @@ def _read_export_base_config(model_name, token, model, source_is_loaded_repo = F
         if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
         commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
         if commit is None and not os.path.isdir(model_name): raise
-    # `revision` alone: transformers pins the code to it only when the code lives in this repo. A
-    # cross-repo auto_map (`code-org/repo--configuration.Config`) keeps its own repo's revision.
+    # No code_revision: transformers pins code to `revision` only when it lives in this repo, not cross-repo auto_map.
     return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = True, revision = commit)
 pass
 
@@ -3540,8 +3530,6 @@ pass
 
 
 def _copy_remote_code_files(model_name, save_directory, token = None, revision = None):
-    # A repo-code config.json is only loadable next to its code: carry the repo's top-level *.py files
-    # (auto_map modules and the files they import) into the export. Returns the copied names.
     os.makedirs(save_directory, exist_ok = True)
     copied = []
     if os.path.isdir(model_name):
@@ -3564,11 +3552,7 @@ pass
 
 
 def _copy_export_remote_code(model_name, save_directory, token, model):
-    # The code of the repo and commit the trusted load ran. Another source, or a Hub repo with no
-    # recorded commit (the in-memory config fallback), is never copied: warn instead. Returns the names.
     if not _is_export_source_loaded_repo(model_name, model):
-        # A substituted source (sibling, local copy) whose config read failed can still leave a repo-code
-        # config in memory: its files are not the code the load approved, so none are copied.
         warnings.warn(
             f"Unsloth: `{model_name}` is not the repo the model was loaded from, so its repo code was not "
             f"copied into the export. Copy the loaded repo's *.py files into `{save_directory}` before "
@@ -3597,7 +3581,7 @@ def _text_configs(config):
     try: holders.append(config.get_text_config())
     except Exception: pass
     holders.append(getattr(config, "text_config", None))
-    # Repo-code composites (InternVL, Nemotron-Nano-VL) keep the decoder under llm_config / language_config.
+    # InternVL / Nemotron-Nano-VL.
     holders.append(getattr(config, "llm_config", None))
     holders.append(getattr(config, "language_config", None))
     seen = []
@@ -4271,8 +4255,6 @@ def merge_and_overwrite_lora(
         # a text-only config beside VLM weights and every tensor was silently re-initialized on
         # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
         try:
-            # Repo code may only be re-run for the repo the load itself trusted, compared
-            # against the source actually read here, after every sibling / local / name remap.
             base_config = _read_export_base_config(
                 model_name, token, model,
                 source_is_loaded_repo = _is_export_source_loaded_repo(model_name, model),
@@ -4288,7 +4270,6 @@ def merge_and_overwrite_lora(
             _carry_over_vocab_size(base_config, config)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
-            # config.json names the repo's own classes, so the export needs their code beside it.
             _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
