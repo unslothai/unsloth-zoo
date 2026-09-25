@@ -251,7 +251,8 @@ jobs:
           # verification file, silently and with the job still green.
           pip install gguf
           # Same for tests/test_device_map_planner_compressed_tensors.py (importorskip).
-          pip install compressed-tensors
+          # Torch cap repeated: else a newer compressed-tensors swaps in a CUDA torch.
+          pip install compressed-tensors "torch>=2.4.0,<2.11.0"
 
       - uses: ./.github/actions/pip-cache-save
         with:
