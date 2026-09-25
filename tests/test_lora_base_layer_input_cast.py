@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The outside-autocast cast of x to the LoRA base layer's weight dtype.
-
-It exists for float32 base weights under a float16 activation (SiGLIP). An FP8 base layer
-(transformers FP8Linear after Unsloth's patch, or any Linear holding a float8 weight) quantizes
-the activation itself, so casting x to float8 made the wrapped layer return float8 and a plain
-no-grad forward after get_peft_model failed with "Promotion for Float8 Types is not supported".
-"""
+"""LoRA base-layer input cast: SiGLIP fp32 weights keep it, FP8 weights must skip it."""
 
 from __future__ import annotations
 
@@ -78,7 +72,6 @@ def test_fp8_base_weight_keeps_the_activation_dtype():
 
 
 def test_float32_base_weight_still_casts_the_activation():
-    """Negative arm: the SiGLIP case the cast was written for is unchanged."""
     assert _run(torch.zeros(4, 4, dtype = torch.float32), x_dtype = torch.float16) == [torch.float32]
     assert _run(torch.zeros(4, 4, dtype = torch.bfloat16), x_dtype = torch.float32) == [torch.bfloat16]
 

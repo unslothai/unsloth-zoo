@@ -14,20 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The real generated PEFT LoRA forward over an FP8 base layer, outside autocast.
-
-FP8 MoE checkpoints (Qwen3-30B-A3B-FP8, Qwen3.5-122B-A10B-FP8, Mistral-Small-4 FP8) keep
-their attention and shared-expert projections as FP8 linears that quantize the activation
-themselves. After get_peft_model, a plain `model.eval()` + `torch.no_grad()` forward (an eval
-loss, or trainer.evaluate() before training) runs without autocast; the generated LoRA forward
-cast x to the float8 weight dtype, the projection returned float8, and the next op failed:
-RMSNorm with "Promotion for Float8 Types is not supported", the shared-expert SiLU with
-'"silu_cuda" not implemented for Float8_e4m3fn'. Inside trainer.train() accelerate wraps
-forward in autocast, which skips the cast, so the same eval worked only after training.
-
-These tests run patch_lora_forwards on the installed peft, wrap a small FP8 layer, and drive
-the gate / up / down projections of a SwiGLU block with and without autocast.
-"""
+"""Generated LoRA forward over an FP8 base: no-autocast eval must not cast x to float8
+(RMSNorm "Promotion for Float8 Types is not supported" on FP8 MoE checkpoints)."""
 
 from __future__ import annotations
 
@@ -42,12 +30,7 @@ peft = pytest.importorskip("peft")
 
 
 class _BlockFP8Linear(torch.nn.Linear):
-    """A frozen per-tensor FP8 linear that quantizes nothing and dequantizes its own weight.
-
-    Like transformers FP8Linear under Unsloth's patch (and FbgemmFp8Linear), it accepts a
-    16/32-bit activation and returns the activation dtype. Fed a float8 activation it returns
-    float8, which is what the pre-fix LoRA input cast produced.
-    """
+    """Like FP8Linear / FbgemmFp8Linear: returns the activation dtype, float8 in -> float8 out."""
 
     def __init__(self, in_features, out_features, generator):
         super().__init__(in_features, out_features, bias = False)
@@ -77,7 +60,6 @@ class _SwiGLU(torch.nn.Module):
 
 
 def _reference(weights, x):
-    """bf16 math on the dequantized weights; zero-init LoRA adds nothing."""
     gate = x @ weights["gate_proj"].to(x.dtype).t()
     up = x @ weights["up_proj"].to(x.dtype).t()
     return (F.silu(gate) * up) @ weights["down_proj"].to(x.dtype).t()
@@ -85,7 +67,6 @@ def _reference(weights, x):
 
 @pytest.fixture
 def unsloth_lora_forwards(tmp_path, monkeypatch):
-    """Install the generated LoRA forwards, then put peft's own forwards back."""
     from unsloth_zoo import compiler
 
     monkeypatch.chdir(tmp_path)
@@ -134,7 +115,6 @@ def test_lora_layer_is_the_generated_forward(unsloth_lora_forwards):
 
 @pytest.mark.parametrize("training", [False, True])
 def test_no_grad_forward_without_autocast_keeps_bf16(unsloth_lora_forwards, training):
-    """The eval-before-train forward: no autocast, grad off, either module mode."""
     model, weights = _peft_block()
     model.train(training)
     x = torch.randn(3, 5, 32, generator = torch.Generator().manual_seed(1)).to(torch.bfloat16)
@@ -152,12 +132,7 @@ _AUTOCAST_DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 @pytest.mark.parametrize("device", _AUTOCAST_DEVICES)
 def test_autocast_forward_keeps_bf16(unsloth_lora_forwards, device):
-    """The training / generate forward runs under autocast.
-
-    On CUDA the guard's `torch.is_autocast_enabled()` already skipped the cast, so this arm is
-    unchanged. That call reports CUDA autocast only, so under CPU autocast the old guard still
-    cast x to float8; the dtype clauses cover that too.
-    """
+    """is_autocast_enabled() reports CUDA only, so CPU autocast needs the dtype clauses."""
     model, weights = _peft_block()
     model.to(device)
     x = torch.randn(3, 5, 32, generator = torch.Generator().manual_seed(2)).to(device, torch.bfloat16)
@@ -169,7 +144,6 @@ def test_autocast_forward_keeps_bf16(unsloth_lora_forwards, device):
 
 
 def test_lora_delta_is_applied_after_the_fp8_base(unsloth_lora_forwards):
-    """A nonzero adapter still adds its delta on top of the bf16 base output."""
     model, weights = _peft_block()
     layer = model.base_model.model.mlp.gate_proj
     with torch.no_grad():
@@ -184,7 +158,6 @@ def test_lora_delta_is_applied_after_the_fp8_base(unsloth_lora_forwards):
 
 
 def test_float32_base_under_half_activation_still_casts(unsloth_lora_forwards):
-    """Negative arm: the SiGLIP fp32 base / fp16 activation case keeps its cast."""
     from peft import LoraConfig, get_peft_model
 
     seen = []
