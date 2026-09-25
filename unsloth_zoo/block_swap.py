@@ -75,19 +75,20 @@ def _swappable(module):
     for name, p in module.named_parameters(recurse = True):
         if p.requires_grad or "lora_" in name:
             continue
-        out.append(p)
+        out.append((name, p))
     return out
 
 
 class _Block:
-    __slots__ = ("params", "host", "devices", "stream", "event", "resident", "slot", "sig")
+    __slots__ = ("params", "host", "devices", "names", "stream", "event", "resident", "slot", "sig")
 
     def __init__(self, layer, streams):
-        self.params, self.host, self.devices = [], [], []
-        for p in _swappable(layer):
+        self.params, self.host, self.devices, self.names = [], [], [], []
+        for name, p in _swappable(layer):
             self.params.append(p)
             self.host.append(_to_pinned_host(p.data))
             self.devices.append(p.data.device)
+            self.names.append(name)
         # One side stream per device, so a sharded model keeps each card's
         # copies on that card's stream.
         dev = self.devices[0] if self.devices else torch.device("cuda", 0)
@@ -156,6 +157,12 @@ class BlockSwap:
             self.handles.append(layer.register_forward_pre_hook(self._pre(i)))
             self.handles.append(layer.register_forward_hook(self._post(i)))
             self.handles.append(layer.register_full_backward_hook(self._bwd(i)))
+            # Evicted blocks hold empty weight tensors, so a state_dict() taken
+            # mid-training (periodic full-model checkpoints, save_pretrained on a
+            # merged model) would serialize zero-length base weights. The host
+            # copy is authoritative for these frozen params, so substitute it for
+            # every swapped weight regardless of residency.
+            self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
 
         # depth + 1 slots per shape signature is the most that can be live at
         # once: the block being consumed plus the ones in flight. Layers are not
@@ -257,6 +264,15 @@ class BlockSwap:
             # forward + backward, so gradient accumulation needs nothing extra.
             if i == 0:
                 self._arm(forward = True)
+        return hook
+
+    def _state_dict(self, i):
+        def hook(module, state_dict, prefix, local_metadata):
+            b = self.blocks[i]
+            for name, host in zip(b.names, b.host):
+                key = prefix + name
+                if key in state_dict:
+                    state_dict[key] = host
         return hook
 
     def reset(self):

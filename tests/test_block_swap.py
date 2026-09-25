@@ -181,6 +181,25 @@ def test_find_decoder_layers_through_common_wrappers():
         assert len(find_decoder_layers(m)) == 1
 
 
+def test_state_dict_substitutes_host_copies_for_evicted_blocks():
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+    torch.manual_seed(0)
+    layers = nn.ModuleList([nn.Linear(8, 8, bias = False) for _ in range(4)]).to("cuda")
+    ref = {k: v.clone() for k, v in layers.state_dict().items()}
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    sw = BlockSwap(layers, 4, prefetch_depth = 1)
+    # Most blocks are evicted now (empty p.data), yet state_dict must still see
+    # the real base weights via the pinned host copies.
+    sd = layers.state_dict()
+    for k, v in ref.items():
+        assert sd[k].shape == v.shape, k
+        assert torch.equal(sd[k].to(v.device), v), k
+    sw.remove()
+
+
 def test_params4bit_round_trip_is_bitwise():
     if not torch.cuda.is_available():
         print("[SKIP] CUDA not available")
