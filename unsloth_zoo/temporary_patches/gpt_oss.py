@@ -267,7 +267,6 @@ def _mxfp4_hub_kernel_unreachable():
     if "get_kernel" not in source:
         return False
     if hasattr(mxfp4_integration, "_replace_with_mxfp4_linear"):
-        # Our replace_with_mxfp4_linear builds on this and uses triton_kernels directly
         return False
     try:
         from transformers.utils import is_kernels_available as _real_is_kernels_available
@@ -294,8 +293,7 @@ def patch_gpt_oss():
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
     if HAS_TRITON_KERNELS and _mxfp4_hub_kernel_unreachable():
-        # Claiming kernels here skips the bf16 fallback and the hub load raises ImportError.
-        # Common when vLLM registers its bundled `triton_kernels`.
+        # Claiming kernels skips the bf16 fallback, then the hub load raises ImportError (vLLM triton_kernels).
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(
                 "Unsloth: triton_kernels is importable but transformers cannot load the MXFP4 "

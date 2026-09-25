@@ -288,7 +288,6 @@ def _current_device_of(tensor):
     return guard(device)
 
 
-
 def fp16_split_mm(
     A: torch.Tensor,
     B: torch.Tensor,

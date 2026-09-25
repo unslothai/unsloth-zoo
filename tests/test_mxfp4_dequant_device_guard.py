@@ -15,10 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MXFP4 dequantization of experts that live on a non-current GPU.
-
-Each GPU case runs in a subprocess so a faulting kernel cannot poison the test process.
-"""
+"""MXFP4 dequant on a non-current GPU; subprocess per case so a faulting kernel stays contained."""
 import os
 import subprocess
 import sys

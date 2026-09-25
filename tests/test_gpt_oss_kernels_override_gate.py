@@ -15,10 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_gpt_oss must not claim MXFP4 kernels when transformers cannot load them from the hub.
-
-Each case runs in a subprocess because the patch mutates transformers module state.
-"""
+"""patch_gpt_oss must not claim MXFP4 kernels transformers cannot load; subprocess per case."""
 import subprocess
 import sys
 import textwrap
@@ -82,6 +79,5 @@ def test_reachable_hub_kernels_still_take_the_native_path():
 
 @pytest.mark.skipif(not _loader_uses_hub_kernel(), reason = "transformers loads MXFP4 kernels without the hub")
 def test_a_direct_replacement_keeps_the_native_path_without_the_hub():
-    """_replace_with_mxfp4_linear uses triton_kernels directly, so no hub is needed."""
     out = _run("hub_missing", "direct")
     assert "OVERRIDDEN" in out and "CLAIMS True" in out, out

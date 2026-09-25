@@ -97,8 +97,7 @@ def get_mxfp4_config_for_training():
     return Mxfp4Config(dequantize=dequantize)
 
 def _device_guard(tensor):
-    """Make ``tensor``'s device current: torch.ldexp launches on the current device,
-    so experts placed off cuda:0 hit an illegal memory access otherwise."""
+    """torch.ldexp launches on the current device; off-cuda:0 experts fault without this."""
     device = tensor.device
     backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
     guard = getattr(backend, "device", None)
