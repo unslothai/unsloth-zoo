@@ -127,6 +127,14 @@ def test_after_a_supervised_batch_an_empty_example_only_warns():
     collator._check_supervised(partial)
 
 
+def test_a_partially_supervised_first_batch_counts_as_supervised():
+    collator = _bare_collator()
+    partial = torch.full((2, 5), -100)
+    partial[0, 3] = 7
+    collator._check_supervised(partial)
+    collator._check_supervised(torch.full((2, 5), -100))
+
+
 def test_ragged_pixel_values_stay_a_list_and_text_fields_become_tensors():
     from unsloth_zoo.vision_utils import _tensorize_ragged_batch
     batch = _tensorize_ragged_batch({

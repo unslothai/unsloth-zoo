@@ -1568,8 +1568,9 @@ class UnslothVisionDataCollator:
         if not torch.is_tensor(labels) or labels.dim() != 2 or labels.shape[0] == 0:
             return
         empty = int(((labels != self.ignore_index).sum(dim = 1) == 0).sum())
-        if empty == 0:
+        if empty < labels.shape[0]:
             self._seen_supervised = True
+        if empty == 0:
             return
         msg = (
             f"Unsloth: {empty} of {labels.shape[0]} examples in this batch have no trainable "
