@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""An Ascend host must get DEVICE_TYPE "npu" instead of raising at import.
-
-unsloth.device_type already had an npu branch, but unsloth/_gpu_init.py takes DEVICE_TYPE
-from this module, which checked cuda and xpu and then raised. Each case runs in a fresh
-interpreter because get_device_type is cached and the torch stubs are process-global.
-"""
+"""An Ascend host must get DEVICE_TYPE "npu" instead of raising at import."""
 
 import os
 import pathlib
@@ -18,10 +13,7 @@ pytest.importorskip("torch")
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# One interpreter for every cell: the import is the slow part, and the uncached body
-# re-reads the patched torch on each call. Import under UNSLOTH_ALLOW_CPU=1 so this runs on a
-# GPU-less runner, then drop it: the fallback is read at call time, and leaving it set would
-# answer "cuda" for the none cell.
+# Import under UNSLOTH_ALLOW_CPU=1 for GPU-less runners, then drop it or the none cell answers "cuda".
 _CHILD = r"""
 import os, sys, types
 import unsloth_zoo.device_type as dt
@@ -104,7 +96,6 @@ def test_npu_helpers_reach_torch_npu(answers):
         ("cuda", "OK cuda"),
         ("hip", "OK hip"),
         ("xpu", "OK xpu"),
-        # A host exposing both keeps xpu, as core does: NPU only widens.
         ("xpu+npu", "OK xpu"),
         ("none", "RAISE"),
     ],
