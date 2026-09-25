@@ -585,8 +585,7 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return
+    # No UNSLOTH_COMPILE_DISABLE early return: `_torch_compile` is already a no-op there, and the kwarg fixes still apply.
     try:
         import transformers.masking_utils as masking_utils
         import transformers.generation.utils as generation_utils
@@ -628,17 +627,48 @@ def patch_transformers_masks():
         masking_utils.create_sliding_window_causal_mask,
     )
 
-    compiled_create_causal_mask = _torch_compile(
-        original_create_causal_mask, fullgraph = False, dynamic = True
-    )
-    compiled_create_sliding_window_causal_mask = _torch_compile(
-        original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
-    )
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+        # `_torch_compile` is `noop` here, i.e. torch.compiler.disable: a fullgraph user compile would refuse it.
+        compiled_create_causal_mask = original_create_causal_mask
+        compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
+    else:
+        compiled_create_causal_mask = _torch_compile(
+            original_create_causal_mask, fullgraph = False, dynamic = True
+        )
+        compiled_create_sliding_window_causal_mask = _torch_compile(
+            original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
+        )
 
-    def wrap(f):
+    def wrap(f, original, prepared_mask_shortcut = True):
+        # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
+        try:
+            parameters = inspect.signature(original).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepted = set(parameters)
+        takes_var_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        embeds_name = None
+        if "inputs_embeds" in accepted and "input_embeds" not in accepted:
+            embeds_name = "inputs_embeds"
+        elif "input_embeds" in accepted and "inputs_embeds" not in accepted:
+            embeds_name = "input_embeds"
+        drop = () if takes_var_kwargs or not parameters else tuple(
+            name for name in ("cache_position",) if name not in accepted
+        )
+
         def return_attention_mask(*args, **kwargs):
-            input_embeds = kwargs.get("input_embeds", None)
-            if input_embeds is not None and getattr(input_embeds, "requires_grad", False):
+            if embeds_name is not None:
+                for other in ("input_embeds", "inputs_embeds"):
+                    if other != embeds_name and other in kwargs and embeds_name not in kwargs:
+                        kwargs[embeds_name] = kwargs.pop(other)
+            for name in drop:
+                kwargs.pop(name, None)
+            input_embeds = kwargs.get("inputs_embeds", kwargs.get("input_embeds", None))
+            if (
+                prepared_mask_shortcut
+                and input_embeds is not None
+                and getattr(input_embeds, "requires_grad", False)
+            ):
                 attention_mask = kwargs.get("attention_mask", None)
                 if isinstance(attention_mask, BlockMask) or (
                     isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
@@ -650,9 +680,33 @@ def patch_transformers_masks():
 
     masking_utils._unsloth_original_create_causal_mask = original_create_causal_mask
     masking_utils._unsloth_original_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
-    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask)
-    masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
-    masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
+    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask, original_create_causal_mask)
+    masking_utils.create_sliding_window_causal_mask = wrap(
+        compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
+    )
+    # Llama 4 (attention_chunk_size) routes here too; not every supported transformers has it.
+    if hasattr(masking_utils, "create_chunked_causal_mask"):
+        original_create_chunked_causal_mask = getattr(
+            masking_utils, "_unsloth_original_create_chunked_causal_mask",
+            masking_utils.create_chunked_causal_mask,
+        )
+        masking_utils._unsloth_original_create_chunked_causal_mask = original_create_chunked_causal_mask
+        masking_utils.create_chunked_causal_mask = wrap(
+            masking_utils.create_chunked_causal_mask, original_create_chunked_causal_mask
+        )
+    pass
+    # Stash the original: a re-apply must read its signature, not the wrapper's (*args, **kwargs).
+    original_create_masks_for_generate = getattr(
+        masking_utils, "_unsloth_original_create_masks_for_generate",
+        masking_utils.create_masks_for_generate,
+    )
+    masking_utils._unsloth_original_create_masks_for_generate = original_create_masks_for_generate
+    # No prepared-mask shortcut: hybrid configs need the per-layer-type dict this returns.
+    masking_utils.create_masks_for_generate = wrap(
+        masking_utils.create_masks_for_generate,
+        original_create_masks_for_generate,
+        prepared_mask_shortcut = False,
+    )
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
     # Multi-GPU device_map flex_attention fix: offset tensors may live on a
     # different device than inner_mask runs on. Move them inside the closure
