@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The per-expert FP8 fallbacks multiply by `weight_scale_inv`, the dequant multiplier.
-
-transformers stores `weight_scale_inv` as max_abs / 448 and dequantizes as q * s (FP8Linear
-and the Triton / vectorized full-stack dequant here do the same). `_slice_fp8_linear_quant_state`
-and `_dequantize_expert_slice` took its reciprocal first, so they divided. That reciprocal was
-also the only operation without a CUDA kernel for UE8M0 (float8_e8m0fnu) scales, as stored by
-unsloth/DeepSeek-V4-Flash-0731: `"reciprocal_cuda" not implemented for 'Float8_e8m0fnu'`.
-"""
+"""Per-expert FP8 paths must multiply by `weight_scale_inv` (w = q * s, as FP8Linear), never invert it; e8m0 has no CUDA reciprocal."""
 
 import pytest
 import torch
@@ -56,17 +49,15 @@ class _Experts(torch.nn.Module):
 def test_linear_quant_state_slice_accepts_e8m0_on_cuda():
     s = _pow2_scales((4, 2, 2), "cuda")
     with pytest.raises(NotImplementedError, match = "Float8_e8m0fnu"):
-        s.to(E8M0).reciprocal()  # premise: the op the helper used to run on it
+        s.to(E8M0).reciprocal()
     from_e8m0 = F._slice_fp8_linear_quant_state(_Experts(s.to(E8M0)), "gate_up_proj", 1)
     from_f32 = F._slice_fp8_linear_quant_state(_Experts(s.clone()), "gate_up_proj", 1)
     assert torch.equal(from_e8m0.to(torch.float32), from_f32)
 
 
 @needs_e8m0
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks = needs_cuda)])
 def test_expert_slice_dequant_matches_the_float32_scale(device):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("needs CUDA")
     torch.manual_seed(0)
     w = (torch.randn(256, 256, device = device) * 4).to(torch.float8_e4m3fn)
     s = _pow2_scales((2, 2), device)
@@ -75,13 +66,6 @@ def test_expert_slice_dequant_matches_the_float32_scale(device):
         want = F._dequantize_expert_slice(w, s.clone(), torch.bfloat16, quant_kind = kind)
         assert torch.equal(got, want)
 
-
-# ---- the per-expert paths read `weight_scale_inv` as the dequant multiplier ----
-#
-# transformers stores `weight_scale_inv = max_abs / 448` (finegrained_fp8 Fp8Quantize),
-# so w = q * weight_scale_inv; FP8Linear feeds it to the same fp8_linear unchanged,
-# and the vectorized / Triton full-stack dequant multiply by it. The per-expert paths
-# took its reciprocal first, which divided instead: inf on a real scale grid.
 
 _B = 128
 
@@ -131,11 +115,9 @@ def _hide_unsloth_fp8_linear(monkeypatch):
 
 
 @needs_cuda
-@pytest.mark.parametrize("e8m0", [False, True])
+@pytest.mark.parametrize("e8m0", [False, pytest.param(True, marks = needs_e8m0)])
 @pytest.mark.parametrize("fp8_linear", ["unsloth", "dequant"])
 def test_per_expert_loop_matches_the_dequantized_reference(e8m0, fp8_linear, monkeypatch):
-    if e8m0 and E8M0 is None:
-        pytest.skip("torch without float8_e8m0fnu")
     if fp8_linear == "unsloth":
         pytest.importorskip("unsloth.kernels.fp8")
     else:
@@ -151,11 +133,9 @@ def test_per_expert_loop_matches_the_dequantized_reference(e8m0, fp8_linear, mon
     assert ((out - ref).norm() / ref.norm()).item() < 0.05
 
 
-@pytest.mark.parametrize("e8m0", [False, True])
+@pytest.mark.parametrize("e8m0", [False, pytest.param(True, marks = needs_e8m0)])
 def test_per_expert_fallback_agrees_with_the_vectorized_dequant(e8m0):
     """Fallback 2 of _dequantize_full_expert_weights (2-D scale plus block_size) against fallback 1."""
-    if e8m0 and E8M0 is None:
-        pytest.skip("torch without float8_e8m0fnu")
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     q, s = _quantize((2, 256, 256), device, e8m0)
