@@ -14,26 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""An offloaded activation must come back in the dtype it went out in.
-
-The staging buffers are allocated in the dtype checkpointing was initialised with. That is
-not always the dtype the model runs in: a FORCE_FLOAT32 family (qwen3_5, gemma3) on a GPU
-without bfloat16 initialises bfloat16 and runs float16, or float32. Forward stored the
-float16 hidden states, backward copied them into the bfloat16 GPU buffer and handed THAT to
-the recompute.
-
-So the recompute ran on bfloat16 hidden states against float16 weights. Usually that is
-`RuntimeError: expected mat1 and mat2 to have the same dtype, but got: BFloat16 != Half`.
-On ROCm gfx10 (RX 6500 XT, found there) the bf16 tensor reached fla's gated-delta Triton
-kernel first, which LLVM cannot compile, and the training process died with no Python
-exception: `LLVM ERROR: Cannot select: intrinsic %llvm.amdgcn.fdot2.bf16.bf16`.
-
-Only offloaded activations are affected, so it needs a sequence length of 512 or more and an
-activation over 2 MB. Every short test passes.
-
-The fix treats the buffers as raw bytes, so the tests here drive the real checkpoint
-function and look only at what the recompute receives and what comes back.
-"""
+"""Offloaded activations must come back in their own dtype, not the staging buffer's
+(FORCE_FLOAT32 loads init bf16 buffers but run fp16/fp32; ROCm gfx10 hit an LLVM abort)."""
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -50,7 +32,6 @@ _MISSING = object()
 
 @pytest.fixture
 def offload(request):
-    """Initialise checkpointing in the dtype the test asks for, restore every global after."""
     saved = {name: getattr(gc, name, _MISSING) for name in _STATE}
     gc.initialize_unsloth_gradient_checkpointing(request.param)
     try:
@@ -65,10 +46,6 @@ def offload(request):
 
 
 def _round_trip(activation_dtype):
-    """Two checkpointed layers over a 2 x 1024 x 2048 activation, big enough to be offloaded.
-
-    Returns the dtypes the layer was re-run with, what the recompute was handed, and the grad.
-    """
     seen = []
     handed_back = []
 
@@ -83,8 +60,7 @@ def _round_trip(activation_dtype):
     out.float().sum().backward()
     torch.cuda.synchronize()
     assert gc.CPU_INDEX >= 1, "nothing was offloaded, so this test proved nothing"
-    # Backward runs layer 2's recompute first ([2], fed layer 1's output [1]) then layer 1's
-    # ([3], fed the original input [0]). Both went through the buffers and must be untouched.
+    # Recompute order: [2] = layer 2 (input [1]), [3] = layer 1 (input [0]).
     assert len(handed_back) == 4, "expected two forwards and two recomputes"
     return seen, handed_back, hidden.grad
 
@@ -92,7 +68,6 @@ def _round_trip(activation_dtype):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "drives the real offload path")
 @pytest.mark.parametrize("offload", [torch.bfloat16], indirect = True)
 def test_the_recompute_sees_the_dtype_the_forward_saw(offload):
-    """Initialised bfloat16, like a FORCE_FLOAT32 load; the model then runs float16."""
     seen, handed_back, grad = _round_trip(torch.float16)
     assert set(seen) == {torch.float16}, f"the recompute ran in {sorted(map(str, set(seen)))}"
     assert torch.equal(handed_back[2], handed_back[1]), "layer 2's input was changed by the offload"
@@ -104,7 +79,6 @@ def test_the_recompute_sees_the_dtype_the_forward_saw(offload):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "drives the real offload path")
 @pytest.mark.parametrize("offload", [torch.float16], indirect = True)
 def test_a_wider_activation_is_still_offloaded_exactly(offload):
-    """float32 activations over 16-bit buffers: offloaded as bytes, never squeezed into 16 bits."""
     seen, handed_back, grad = _round_trip(torch.float32)
     assert set(seen) == {torch.float32}, f"the recompute ran in {sorted(map(str, set(seen)))}"
     assert torch.equal(handed_back[2], handed_back[1]), "layer 2's input was changed by the offload"
@@ -114,8 +88,6 @@ def test_a_wider_activation_is_still_offloaded_exactly(offload):
 
 
 def test_the_byte_view_reinterprets_without_casting():
-    """What the fix relies on, on a CPU box: 16-bit storage viewed as another dtype loses nothing,
-    where the old float16 -> bfloat16 cast dropped mantissa bits on the way out and back."""
     storage = torch.empty(4096, dtype = torch.bfloat16)
     for dtype in (torch.float16, torch.float32):
         values = torch.randn(1024, dtype = torch.float32).to(dtype).view(4, 256)
@@ -128,11 +100,7 @@ def test_the_byte_view_reinterprets_without_casting():
 
 
 def test_elements_for_rounds_up_so_an_odd_byte_count_still_fits():
-    """The buffers are sized in their OWN elements but measured in the activation's bytes,
-    so the conversion has to round up. Floor division loses the last partial element, and
-    the failure is not an exception: the byte view is then a byte short of the shape it is
-    asked for. An odd byte count is ordinary, any 1-byte dtype with an odd number of
-    elements produces one."""
+    # Floor division would silently leave the byte view short of its shape.
     for dtype in (torch.bfloat16, torch.float16, torch.float32):
         storage = torch.empty(8, dtype = dtype)
         esize = storage.element_size()
@@ -145,14 +113,7 @@ def test_elements_for_rounds_up_so_an_odd_byte_count_still_fits():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "initialisation allocates GPU buffers")
 @pytest.mark.parametrize("offload", [torch.bfloat16], indirect = True)
 def test_the_offload_cutoff_is_two_megabytes_whatever_the_dtype(offload):
-    """The cutoff used to be 2MB divided by the INIT dtype's width, in elements, and then
-    compared against an element count of the ACTIVATION's width. Those are the same number
-    only while the two dtypes match. In bytes on both sides it is 2MB of memory for every
-    activation, which is what the comment always claimed.
-
-    The concrete case is gemma3: float32 hidden states over bfloat16 buffers. A 3MB one sat
-    under the old element cutoff and was left on the GPU, costing the VRAM this feature
-    exists to save."""
+    # Old cutoff was in init-dtype elements, so a 3MB fp32 activation (gemma3) stayed on GPU.
     assert gc.MINIMUM_SIZE == 2 * 1024 * 1024
     for dtype in (torch.float16, torch.float32):
         gc.initialize_unsloth_gradient_checkpointing(dtype)

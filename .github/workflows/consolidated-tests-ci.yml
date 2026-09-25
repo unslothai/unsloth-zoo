@@ -343,12 +343,8 @@ jobs:
         # runs the dtype decision alone on CPU; left to --collect-only it would prove
         # only that it imports, which is the failure this comment already lists twice.
         #
-        # test_offload_recompute_dtype is its follow-up, and the same reasoning applies.
-        # The buffers can still be bf16 when a FORCE_FLOAT32 load passes that dtype in,
-        # and backward handed the recompute the BUFFER rather than the activation. Its
-        # two GPU cases skip on this runner; what runs here is the byte view itself and
-        # the byte threshold, which is the part a refactor can silently undo while every
-        # job stays green.
+        # test_offload_recompute_dtype: follow-up; GPU cases skip here, the CPU byte-view
+        # and rounding checks still guard against a refactor reintroducing the cast.
         #
         # The two compiled-cache files cover create_new_function's distributed
         # protocol: the rank-local guard that let one rank skip a broadcast and

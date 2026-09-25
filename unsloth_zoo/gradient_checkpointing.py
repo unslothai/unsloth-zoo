@@ -163,13 +163,7 @@ def _elements_for(buffer, nbytes):
 
 
 def _view_bytes_as(buffer, nbytes, dtype, shape):
-    """The first `nbytes` of `buffer` reinterpreted as a `dtype` tensor of `shape`.
-
-    The staging buffers are raw storage. They were allocated in whatever dtype checkpointing
-    was initialised with, which is not always the dtype the model runs in (a FORCE_FLOAT32
-    family initialises bfloat16 and runs float16, or float32), so they are never read or
-    written in their own dtype: every activation is copied in and out as the bytes it is.
-    """
+    """Reinterpret raw buffer bytes, never cast: the init dtype can differ from the activation's."""
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
@@ -786,8 +780,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     elif DEVICE_TYPE == "xpu":
         MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])
 
-    # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB. In bytes, so the
-    # cutoff is the same amount of memory whatever dtype an activation arrives in.
+    # Minimum size to enable Unsloth GC is 2MB (in bytes) -> 32 layers = 64MB
     MINIMUM_SIZE = 2 * 1024 * 1024
     USE_UNSLOTH_GC = True
 
@@ -859,7 +852,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    new_size = arg.numel() * arg.element_size()   # bytes
+                    new_size = arg.numel() * arg.element_size()
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
@@ -901,7 +894,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFERS_B = None
                         pass
 
-                        # Extend buffer size. Sizes are in each buffer's own elements, holding new_size bytes.
+                        # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
                                 x = _new_host_buffer(_elements_for(GPU_BUFFER, new_size), GPU_BUFFER.dtype)
@@ -949,10 +942,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Read the cached flag off the slot itself, before the view is
                         # taken: a view is a fresh object and does not carry the attribute.
                         host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
-                        # Viewed as bytes, never cast (see _view_bytes_as). A cast here came back out
-                        # of backward as the BUFFER's dtype, so the recompute saw bfloat16 hidden
-                        # states: a dtype mismatch at best, and on ROCm gfx10, where Triton cannot
-                        # compile bf16, an LLVM abort with no Python exception.
+                        # Casting here made the recompute see the buffer dtype (LLVM abort on ROCm gfx10).
                         x = _view_bytes_as(x, new_size, arg.dtype, shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
