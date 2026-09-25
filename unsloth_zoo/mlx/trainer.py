@@ -5114,7 +5114,12 @@ class MLXTrainer:
             if use_cce:
                 loss_fn = make_cce_loss_fn(model, label_smoothing=label_smoothing)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                if cce_backend == "baseline-fallback":
+                if hasattr(loss_fn, "_unsloth_compiled_loss_fn"):
+                    _main_print(
+                        "Unsloth: LoRA head CCE is available for compiled steps; "
+                        "eager steps use standard cross-entropy."
+                    )
+                elif cce_backend == "baseline-fallback":
                     use_cce = False
                     # The factory already printed the specific reason (topology,
                     # head eligibility, or logit transform); keep this generic.
@@ -5547,6 +5552,11 @@ class MLXTrainer:
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        _compiled_loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", None)
+        _compiled_loss_and_grad_fn = (
+            nn.value_and_grad(model, _compiled_loss_fn)
+            if _compiled_loss_fn is not None else None
+        )
 
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
@@ -5797,9 +5807,14 @@ class MLXTrainer:
             return grad_norm
 
         def _loss_and_grad(batch_data):
+            compute = (
+                _compiled_loss_and_grad_fn
+                if _use_compile and _compiled_loss_and_grad_fn is not None
+                else loss_and_grad_fn
+            )
             if isinstance(batch_data, dict):
-                return loss_and_grad_fn(model, batch_data)
-            return loss_and_grad_fn(model, *batch_data)
+                return compute(model, batch_data)
+            return compute(model, *batch_data)
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
@@ -6321,7 +6336,7 @@ class MLXTrainer:
         features = []
         if is_vlm:
             features.append("VLM")
-        if use_cce:
+        if use_cce and (_compiled_loss_fn is None or _use_compile):
             features.append("CCE")
         if args.gradient_checkpointing:
             features.append("GC")

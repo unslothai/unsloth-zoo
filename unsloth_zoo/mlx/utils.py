@@ -2207,6 +2207,66 @@ def _is_lm_head_trainable(model):
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
+def _supports_text_lora_cce(desc, label_smoothing):
+    if (desc.status == "unknown" or desc.raw or label_smoothing != 0.0
+            or not mx.metal.is_available()):
+        return False
+    from .cce.runtime_cce import supported_lora_head
+
+    head = desc.module
+    if (not supported_lora_head(head) or not 1024 <= head.lora_a.shape[0] <= 4096
+            or head.linear.weight.shape[0] < 8192):
+        return False
+    return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+    from .cce.runtime_cce import make_lora_head_cce
+
+    head = head_desc.module
+    quantized = type(head.linear) is nn.QuantizedLinear
+    kernel = make_lora_head_cce(
+        chunk_size=4096 if head.lora_a.shape[0] > 2048 else 2048,
+        adapter_scale=head.scale,
+        logit_scale=1.0 if logit_scale is None else logit_scale,
+        logit_softcap=softcap,
+        group_size=head.linear.group_size if quantized else None,
+        bits=head.linear.bits if quantized else None,
+        mode=head.linear.mode if quantized else "affine",
+    )
+    baseline = make_baseline_loss_fn()
+    vocab_size = head.linear.weight.shape[0]
+    head_path = head_desc.path
+
+    def loss_fn(model, batch, lengths, labels=None):
+        n_tokens = batch.shape[0] * max(0, batch.shape[1] - 1)
+        if n_tokens < 1024 or n_tokens * vocab_size < 16 * 1024 * 1024:
+            return baseline(model, batch, lengths, labels)
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:] if labels is None else labels[:, 1:]
+        hidden = _forward_text_hidden_states(model, inputs)
+        targets = _normalize_cce_label_dtype(targets)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
+        if labels is not None:
+            mask = mask & (targets != -100)
+        targets = mx.where(mask, targets, mx.array(-100, dtype=targets.dtype))
+        count = mask.sum()
+        live_head = _resolve_module_path(model, head_path)
+        base = live_head.linear
+        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
+        losses = kernel(
+            hidden, base.weight, base.scales if quantized else None,
+            base.get("biases") if quantized else None,
+            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
+        )
+        return losses.sum() / _safe_token_denominator(count), count
+
+    loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
+    return loss_fn
+
+
 def _runtime_cce_by_mode(**kwargs):
     loss_only = _get_runtime_cce(**kwargs)
     if not (kwargs.get("quantized") or kwargs.get("weight_is_frozen")):
@@ -2241,7 +2301,8 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
     head_desc = describe_output_head(model)
-    _ineligible = _cce_head_ineligibility(head_desc)
+    _lora_cce = _supports_text_lora_cce(head_desc, label_smoothing)
+    _ineligible = None if _lora_cce else _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
         print(f"Unsloth: fused CCE cannot faithfully use this model's output "
               f"head ({_ineligible}); falling back to standard cross-entropy.")
@@ -2261,6 +2322,14 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
+    if _lora_cce:
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
+            head_desc, logit_scale, softcap,
+        )
+        return loss_fn
+
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
