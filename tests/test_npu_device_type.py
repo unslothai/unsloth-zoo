@@ -35,8 +35,9 @@ for cell in sys.argv[1:]:
     if hasattr(dt, "npu_is_available"):
         dt.npu_is_available.cache_clear()
     acc = {"npu": "npu", "xpu+npu": "xpu", "cuda": "cuda", "hip": "cuda"}.get(cell)
-    torch.accelerator.is_available = lambda acc=acc: acc is not None
-    torch.accelerator.current_accelerator = lambda acc=acc: acc
+    if hasattr(torch, "accelerator"):  # absent before torch 2.6
+        torch.accelerator.is_available = lambda acc=acc: acc is not None
+        torch.accelerator.current_accelerator = lambda acc=acc: acc
     try:
         print("CELL", cell, "OK", dt.get_device_type.__wrapped__())
     except NotImplementedError:
@@ -54,6 +55,16 @@ dt.npu_is_available.cache_clear()
 dt.DEVICE_TYPE = "npu"
 dt.device_synchronize(); dt.device_empty_cache()
 print("HELPERS", ",".join(calls), dt.device_is_bf16_supported())
+
+# Gradient checkpointing init on npu; buffers land on cpu since the stub registers no device.
+npu.stream = lambda s: s
+import unsloth_zoo.gradient_checkpointing as gc
+npu.device_count = lambda: 1
+npu.Stream = npu.Event = lambda *a, **k: calls.append("stream_or_event")
+npu.default_stream = lambda i: "main"
+gc.DEVICE_TYPE, gc.DEVICE_TYPE_TORCH = "npu", "cpu"
+gc.initialize_unsloth_gradient_checkpointing()
+print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS)
 """
 
 _CELLS = ("cuda", "hip", "xpu", "npu", "xpu+npu", "none")
@@ -76,8 +87,9 @@ def answers():
         if line.startswith("CELL "):
             _, cell, *rest = line.split()
             got[cell] = " ".join(rest)
-        elif line.startswith("HELPERS "):
-            got["helpers"] = line[len("HELPERS "):]
+        elif line.startswith(("HELPERS ", "GC ")):
+            key, _, rest = line.partition(" ")
+            got[key.lower()] = rest
     assert set(got) >= set(_CELLS), out.stderr[-2000:]
     return got
 
@@ -88,6 +100,10 @@ def test_an_ascend_host_gets_npu(answers):
 
 def test_npu_helpers_reach_torch_npu(answers):
     assert answers.get("helpers") == "synchronize,empty_cache True"
+
+
+def test_npu_gradient_checkpointing_initializes(answers):
+    assert answers.get("gc") == "1 torch.bfloat16 ('main',)"
 
 
 @pytest.mark.parametrize(

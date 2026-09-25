@@ -669,6 +669,8 @@ if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
 elif DEVICE_TYPE == "xpu":
     torch_gpu_stream = torch.xpu.stream
+elif DEVICE_TYPE == "npu":
+    torch_gpu_stream = torch.npu.stream
 
 CPU_BUFFERS = []
 CPU_INDEX = None
@@ -706,6 +708,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
             SUPPORTS_BFLOAT16 = True
+        elif DEVICE_TYPE == "npu":
+            SUPPORTS_BFLOAT16 = torch.npu.is_bf16_supported()
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
@@ -722,7 +726,12 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     pass
 
     # Allocate one buffer per GPU
-    n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+    if DEVICE_TYPE in ("cuda", "hip"):
+        n_gpus = torch.cuda.device_count()
+    elif DEVICE_TYPE == "npu":
+        n_gpus = torch.npu.device_count()
+    else:
+        n_gpus = torch.xpu.device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
         with _no_inference_mode():
@@ -744,6 +753,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
                     event_ctor = torch.cuda.Event
                 elif DEVICE_TYPE == "xpu":
                     event_ctor = torch.xpu.Event
+                elif DEVICE_TYPE == "npu":
+                    event_ctor = torch.npu.Event
                 else:
                     raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
                 BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
@@ -764,11 +775,16 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         raise
 
     BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
+    if DEVICE_TYPE == "npu":
+        EXTRA_STREAMS = tuple([torch.npu.Stream() for i in range(n_gpus)])
+    else:
+        EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
     if DEVICE_TYPE in ("cuda", "hip"):
         MAIN_STREAMS  = tuple([torch.cuda.default_stream(torch.device(f"cuda:{i}")) for i in range(n_gpus)])
     elif DEVICE_TYPE == "xpu":
         MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])
+    elif DEVICE_TYPE == "npu":
+        MAIN_STREAMS  = tuple([torch.npu.default_stream(i) for i in range(n_gpus)])
 
     # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB
     n_bytes = torch.finfo(dtype).bits // 8
@@ -872,6 +888,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                         free_mem, _ = torch.cuda.mem_get_info(device_index)
                                     elif DEVICE_TYPE == "xpu":
                                         free_mem, _ = torch.xpu.mem_get_info(device_index)
+                                    elif DEVICE_TYPE == "npu":
+                                        free_mem, _ = torch.npu.mem_get_info(device_index)
                                     else:
                                         free_mem = 0
                                 except Exception as e:
@@ -1364,6 +1382,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
                 event_ctor = torch.cuda.Event
             elif DEVICE_TYPE == "xpu":
                 event_ctor = torch.xpu.Event
+            elif DEVICE_TYPE == "npu":
+                event_ctor = torch.npu.Event
             else:
                 raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
             BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
