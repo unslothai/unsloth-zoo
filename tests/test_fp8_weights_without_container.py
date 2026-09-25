@@ -127,7 +127,6 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
     with torch.no_grad():
         model.proj.weight.copy_(q)
         model.proj.weight_scale_inv.copy_(scale)
-        # Loading through the op is what marks the stack for re-quantization on save.
         eq, escale = _block_quantize(torch.randn(3, 8, 8), (4, 4))
         loaded = op.convert({"weight$": [eq], "weight_scale_inv": [escale]}, full_layer_name = "experts.weight", model = model)
         model.experts.weight.copy_(loaded["experts.weight"])
@@ -371,7 +370,7 @@ def test_an_fp4_packed_weight_is_not_marked_for_fp8_requantization():
     try:
         op.convert({"weight$": [packed], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
     except Exception:
-        pass  # only the provenance is under test
+        pass
     assert "experts.weight" not in _dequantized_targets(model)
     fp8 = torch.zeros(8, 8).to(E4M3)
     op.convert({"weight$": [fp8], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)

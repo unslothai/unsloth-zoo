@@ -12,8 +12,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Dequantize FP8 weights with no FP8 container (Step-3.7-Flash-FP8's bare 3-D `MoELinear.weight`), which the
-loader would otherwise cast to bf16 unscaled. FP8Linear / FP8Experts targets keep their packed weights."""
+"""Dequantize FP8 weights with no FP8 container (Step-3.7-Flash-FP8 `MoELinear`); the loader drops their scale."""
 import torch
 
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
@@ -71,9 +70,9 @@ def _make_op(Fp8Dequantize):
             if _target_owns_scale(model, full_layer_name):
                 return self._pass_through(input_dict, full_layer_name, model)
             out = super().convert(input_dict, full_layer_name = full_layer_name, model = model, **kwargs)
-            # Only a weight that arrived with a scale is quantized back on save (modules_to_not_convert ones have none).
+            # Only weights that arrived with a scale are re-quantized on save.
             has_scale = any("scale_inv" in (k[:-1] if k.endswith("$") else k) for k in input_dict)
-            # Packed FP4 is not recorded: the reverse op only writes e4m3. Skip scales, MXFP8's E8M0 scale is uint8.
+            # Reverse op only writes e4m3, so skip packed FP4; skip scales (MXFP8 E8M0 is uint8).
             arrived_packed_fp4 = any(
                 isinstance(_first(v), torch.Tensor) and _first(v).dtype in _PACKED_FP4_DTYPES
                 for k, v in input_dict.items()
@@ -84,7 +83,6 @@ def _make_op(Fp8Dequantize):
             return out
 
         def _pass_through(self, input_dict, full_layer_name, model):
-            # Full names give the loader an empty prefix and suffix, so every key lands as written.
             module, attr = _module_and_attr(model, full_layer_name)
             base = full_layer_name[: -len(attr)] if attr and full_layer_name.endswith(attr) else full_layer_name + "."
             out = {}
@@ -104,7 +102,7 @@ def _make_op(Fp8Dequantize):
                 else:
                     out[base + pattern] = value
             if scale is None and weight is not None and module is not None:
-                # Ones, not the uninitialised scale the container would otherwise quantize with.
+                # Else the container quantizes against uninitialised scale memory.
                 container_scale = getattr(module, _scale_attr_for(attr), None)
                 if isinstance(container_scale, torch.Tensor):
                     out[base + _scale_attr_for(attr)] = torch.ones(
@@ -137,7 +135,7 @@ def _make_reverse_op(Fp8Dequantize):
 
     class Fp8RequantizeWithoutContainer(Fp8Quantize):
         def convert(self, input_dict, full_layer_name = None, model = None, **kwargs):
-            # Every tensor arrives under the key `weight`; only `full_layer_name` says what it is.
+            # Every tensor arrives keyed `weight`; only `full_layer_name` identifies it.
             name = full_layer_name or ""
             dequantized = _dequantized_targets(model)
             out = {}
