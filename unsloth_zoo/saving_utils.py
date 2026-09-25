@@ -3713,13 +3713,9 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
 
 
 def _ensure_shard_writable(file_path):
-    """Make a shard in the output directory safe to overwrite in place.
+    """Make an output shard owner-writable for the in-place "r+b" merge (hf_hub 1.x blobs are 0444).
 
-    huggingface_hub 1.x stores cache blobs read-only (0444), and every way a shard gets here
-    keeps that mode: `shutil.copy2` and `copystat` from the cache or a local model directory,
-    and `hf_hub_download(local_dir = ...)`. The in-place merge then opens it "r+b" and fails
-    with EACCES. A shard sharing its inode with another link (a hard link into the cache) is
-    first replaced by a private copy, so the in-place write can never change the other link.
+    A hard-linked shard gets a private copy first so the write never mutates the cache blob.
     """
     st = os.stat(file_path)
     mode = stat.S_IMODE(st.st_mode) | stat.S_IWUSR
@@ -4766,9 +4762,7 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
     if not os.access(src_path, os.R_OK):
          raise PermissionError(f"No read permission for source file: {src_path}")
     # Target dir creation and permission check is handled by caller (_try_copy_all_from_cache)
-    # Staged then `os.replace`d: `copy2` straight onto `dst_path` opens it for writing, which
-    # fails when an earlier step already put a read-only copy there (cache blobs are 0444).
-    # The staged copy keeps the source's mode plus owner-write, so later in-place writers work.
+    # copy2 onto an existing read-only dst fails, so stage + os.replace; add owner-write for in-place writers.
     _staging = None
     try:
         _fd, _staging = tempfile.mkstemp(
