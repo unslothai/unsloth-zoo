@@ -1905,9 +1905,7 @@ class _MTPLayer(nn.Module):
 
 
 def test_a_sibling_of_a_declared_block_is_atomic_too():
-    """Ling-2.6-flash declares only its decoder layer class but appends a multi-token-
-    prediction layer of another class to the same ModuleList. Split across cards, that
-    layer's attention adds a mask no hook moved and raises a device mismatch."""
+    """Ling-2.6-flash appends an undeclared MTP layer class to its decoder ModuleList."""
     model = _meta(layers = 8)
     with torch.device("meta"):
         model.layers.append(_MTPLayer(64))

@@ -201,10 +201,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
     ):
         if labels is None: return None
-        # Stock ForCausalLMLoss flattens, so callers may pass (tokens, vocab) logits (the
-        # Ling-2.6-flash MTP head passes flat labels too). The fast kernel wants (batch, seq,
-        # vocab). Stock shifts along the last label dim, so give the logits the labels' rows:
-        # flat labels are one row, batched labels keep their row boundaries.
+        # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
         if logits.dim() == 2:
             labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
             logits = logits.view(*labels.shape, logits.shape[-1])

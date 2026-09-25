@@ -6,13 +6,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""The patched ForCausalLM loss accepts flat (tokens, vocab) logits like the stock loss.
-
-Remote inclusionAI/Ling-2.6-flash computes its multi-token-prediction loss as
-self.loss_function(logits.view(-1, vocab), labels.view(-1), vocab). Stock
-ForCausalLMLoss flattens anyway, but the Unsloth kernel unpacked (batch, seq, vocab)
-and raised "not enough values to unpack (expected 3, got 2)" on the first step.
-"""
+"""Patched ForCausalLM loss accepts flat (tokens, vocab) logits like stock (Ling-2.6-flash MTP head)."""
 
 from __future__ import annotations
 
@@ -21,7 +15,7 @@ import torch
 
 
 def _fast_ce_3d(logits, labels, n_items = None, **kw):
-    batch, seq_len, vocab = logits.shape  # same contract as unsloth's fast kernel
+    batch, seq_len, vocab = logits.shape
     assert labels.shape == (batch, seq_len)
     loss = torch.nn.functional.cross_entropy(
         logits.reshape(-1, vocab).float(), labels.reshape(-1), ignore_index = -100, reduction = "sum",
@@ -80,8 +74,7 @@ def test_num_items_in_batch_is_honoured_for_flat_logits(patched_loss):
 
 
 def test_flat_logits_with_batched_labels_keep_row_boundaries(patched_loss):
-    """Stock shifts each label row on its own, so the last token of a row predicts
-    nothing, not the first token of the next row."""
+    """The last token of a row predicts nothing, not the next row's first token."""
     stock, unsloth = patched_loss
     logits, labels, vocab = _inputs()
     flat_logits = logits.reshape(-1, vocab)
